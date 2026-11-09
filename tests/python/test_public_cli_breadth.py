@@ -1538,11 +1538,77 @@ class SystemAmbientGapTests(unittest.TestCase):
         result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
         self.assertIn("lossy or unknown observation gap class", result["detail"])
 
-    def test_skip_only_still_fails_strict(self):
-        # Only the exact pair qualifies; a lone named skip stays a failure.
+    def test_quiet_lone_skip_passes_strict_mt_system(self):
+        # Round-2 ruling 2026-11-09 (supersedes the round-1 lone-skip
+        # pin): every vng guest leg is quiet (pid_descendant_gaps=0),
+        # so mt-system deterministically carries the lone named
+        # discovery skip on all five guest kernels with zero loss and
+        # exact owned counts. The quiet half qualifies strict on
+        # mt-system only, with both counts printed.
         def mutate(d, l, r):
             self.disclose(d, gaps=0, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_quiet_two_skips_fail(self):
+        # Exactly one named skip: a second one is an unobserved shape.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=2)
         result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_nonzero_gaps_fail(self):
+        # The quiet half pins gaps at zero; a nonzero count under a
+        # lone-skipped claim is inconsistent and stays a failure.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            d["evidence"]["pid_descendant_gaps"] = 3
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_wrong_skip_name_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=0)
+            d["evidence"]["skipped"] = [{
+                "name": "C_Digest", "reason": "function entry unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_inexact_owned_count_fails(self):
+        # The exact-count check is never weakened on the quiet path.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            d["functions"][5].update(calls=41)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("owned target count differs from independent ledger",
+                      result["detail"])
+
+    def test_quiet_owned_loss_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            d["evidence"]["event_loss"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"] = [
+                "skipped", "event_loss"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("loss or unknown event_loss", result["detail"])
+
+    def test_quiet_lone_skip_fails_on_system_cell(self):
+        # The quiet half is mt-system-only: no other system-scope cell
+        # has shown the lone skip in strict mode.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_lone_skip_fails_on_pid_cell(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-shared", want=1)
         self.assertIn("lossy or unknown observation gap class", result["detail"])
 
     def test_provider_linked_hints_fail(self):

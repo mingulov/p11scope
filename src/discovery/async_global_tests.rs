@@ -313,10 +313,7 @@ fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
     case.engine.owned_run_pid = Some(case.child.id());
     let slot_object = case.engine.plan.slots[0].object;
     let summary = case.engine.pinned.summary(slot_object).unwrap();
-    let (path, sha) = (
-        summary.path.to_string(),
-        summary.sha256.to_string(),
-    );
+    let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
     assert!(!sha.is_empty(), "the accepted pin carries a digest");
     assert!(
         case.engine.modules[0]

@@ -977,6 +977,24 @@ inside virtme-ng guests rather than under `TMPDIR`, so a host `TMPDIR`
 naming the shared 9p tree cannot lend the fixtures remapped ownership
 or device identity.
 
+A provider file replaced on disk while a program still runs it (an
+upgrade that unlinks and recreates the file, or renames a new file
+over it) is named, not counted: the running copy keeps its old code
+mapped with a ` (deleted)` maps entry the observer cannot open or
+identify, so inventory names the running copy with the `replaced on
+disk while running; not examined, calls not counted` gap and PARTIAL
+coverage, and the program's calls are not counted. The same gap names
+any other replaced executable file, not only providers. Restart the
+program so it maps the on-disk file.
+
+If the file is replaced during a running inventory capture instead,
+inventory ends the program's edge at the next pass ("absent from a
+complete rescan of the live caller", module "unloaded") and the
+program's later calls are not counted. `profile` counts through the
+same replacement with PARTIAL coverage and a "provider file changed
+during capture" gap. Re-run an inventory capture after the upgrade
+settles.
+
 ## Planned for later versions
 
 Shipped in 0.6.0 and no longer planned: live key operations

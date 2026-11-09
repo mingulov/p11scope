@@ -624,7 +624,7 @@ class JudgeFlagTests(unittest.TestCase):
 
     def test_flag_not_passed_for_select_endpoint_off_66(self):
         for release in ("7.3.1-070301-generic", "6.12.111-0612111-generic",
-                        "6.1.188-0601188-generic"):
+                        "6.1.188-0601188-generic", "6.60.1-060600-generic"):
             with self.subTest(release=release):
                 argv = run_judge_case("select-endpoint-system", release)
                 self.assertNotIn(self.FLAG, argv)

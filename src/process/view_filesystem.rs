@@ -302,7 +302,7 @@ fn observer_root_identity() -> Option<(u64, u64)> {
         .map(|metadata| (metadata.dev(), metadata.ino()))
 }
 
-fn observer_mount_namespace() -> io::Result<MountNamespaceId> {
+pub(crate) fn observer_mount_namespace() -> io::Result<MountNamespaceId> {
     let metadata = std::fs::metadata("/proc/self/ns/mnt")?;
     Ok(MountNamespaceId {
         device: metadata.dev(),

@@ -6787,6 +6787,11 @@ pub fn view_object_key(
 
 /// The cached-table form of the rule above: a missing mount row still forces
 /// exactly one fresh read of the table, under the same retained view checks.
+/// When the row stays missing and the view shares the observer's mount
+/// namespace, one observer-table retry follows: a chrooted view's table is
+/// root-filtered by the kernel, so a host fallback fd's mount is
+/// systematically absent from it (not churn). A foreign namespace never takes
+/// this path: mount IDs number different mounts there.
 fn identity_in_cached_table(
     view: &ProcessView,
     file: &std::fs::File,
@@ -6794,13 +6799,32 @@ fn identity_in_cached_table(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<MappingFileKey, String> {
-    reread_on_missing_mount(first, file, || {
+    let retried = reread_on_missing_mount(first, file, || {
         mounts.invalidate();
         Ok(view
             .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)?
             .1
             .to_owned())
-    })
+    });
+    if !matches!(&retried, Err(error) if is_missing_mount_id_error(error)) {
+        return retried;
+    }
+    if !shared_namespace_with_observer(view) {
+        return retried;
+    }
+    match mapping_file_key(file) {
+        Ok(key) => Ok(key),
+        Err(_) => retried,
+    }
+}
+
+/// Whether `view` shares the observer's mount namespace: the only case in
+/// which the observer table numbers the same mounts as the view's table.
+/// Reads the observer side fresh (one stat, failure path only); any failure
+/// refuses the observer-table retry.
+fn shared_namespace_with_observer(view: &ProcessView) -> bool {
+    crate::process::observer_mount_namespace()
+        .is_ok_and(|observer| observer == view.mount_namespace())
 }
 
 /// The same identity for a descriptor already retained across a pre-exec

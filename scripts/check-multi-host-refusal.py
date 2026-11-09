@@ -8,6 +8,11 @@ this driver verifies the transferred observer/script and actual kernel.
 With --libtest/--denial the guest also runs the dual-outcome identity
 cell for one named branch (denied on 5.15, eligible elsewhere) and fails
 on any other marker.
+
+`inventory --capture auto` rows expect the scan fallback (exit 0 with a
+valid inventory/v1 document that names the unavailable counts); every
+other live row (doctor, profile, counter, run, `inventory --capture
+native`) still refuses before any capture side effect.
 """
 import argparse
 from contextlib import contextmanager
@@ -34,6 +39,40 @@ REFUSAL_LEADS = (
 def refused(output):
     """Whether the observer refused with its finite live-capture refusal."""
     return any(lead in output for lead in REFUSAL_LEADS)
+
+
+FALLBACK_GAP_SUBJECT = "native usage feed unavailable"
+FALLBACK_REASON_FRAGMENT = "call counts unavailable on this host"
+
+
+def fallback_document(sink):
+    """The scan-fallback inventory document, or None when absent/invalid.
+
+    A pre-Multi `inventory --capture auto` run exits 0 with modules and
+    callers but no counts: the schema must be inventory/v1, the
+    observation must not claim a usage feed, and one gap must name the
+    unavailable counts. No refusal-lead check applies here: the stderr
+    fallback notice embeds the host summary, which carries a lead.
+    """
+    try:
+        document = json.loads(sink.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    if document.get("schema") != "p11scope/inventory/v1":
+        return None
+    observation = document.get("observation")
+    if not isinstance(observation, dict) or observation.get("usage_feed") is not False:
+        return None
+    gaps = document.get("gaps")
+    if not isinstance(gaps, list):
+        return None
+    for gap in gaps:
+        if (isinstance(gap, dict) and gap.get("subject") == FALLBACK_GAP_SUBJECT
+                and FALLBACK_REASON_FRAGMENT in str(gap.get("reason", ""))):
+            return document
+    return None
 DENIAL_CELL = "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed"
 DENIAL_MARKER = "IDENTITY_515_DENIAL outcome="
 OUTPUT_LIMIT = 4096
@@ -120,6 +159,16 @@ def check_commands(observer, work, progress=None, doctor_timeout=60):
         except OSError:
             sink_unchanged = False
         output = result.stdout + result.stderr
+        if case.startswith("inventory-auto-"):
+            complete(case, result, "fallback", [
+                ("fallback_exit", result.returncode == 0,
+                 "expected scan fallback: nonzero exit"),
+                ("fallback_document", fallback_document(sink) is not None,
+                 "expected scan-fallback inventory document with the named counts gap"),
+                ("workload_not_run", not sentinel.exists(),
+                 "user workload executed before fallback"),
+            ], "scan fallback")
+            continue
         complete(case, result, "refused", [
             ("refusal_exit", result.returncode > 0, "expected nonzero setup refusal"),
             ("named_refusal", refused(output), "missing live-capture refusal"),

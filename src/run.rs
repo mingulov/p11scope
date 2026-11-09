@@ -4012,6 +4012,12 @@ struct Owned {
     exit_code: Option<i32>,
     requested_kill: bool,
     still_running: bool,
+    /// Settlement failed after capture: the child's final disposition is
+    /// unknown. The terminal still seals the report (with
+    /// `child_still_running` absent and a named gap) instead of
+    /// suppressing it; the run returns the settlement error to exit
+    /// nonzero.
+    settlement_unknown: bool,
     /// The terminal handoff note the settlement returned when it
     /// committed a handoff: the terminal path prints it once, so the
     /// operator reads the true reason, never a reworded guess.
@@ -4181,6 +4187,11 @@ impl Owned {
             self.error_handoff = end == CaptureEnd::Error && note.is_some();
             self.handoff_note = note;
         });
+        if settled.is_err() {
+            // The child's disposition could not be settled: the terminal
+            // still seals with status unknown (see `settlement_unknown`).
+            self.settlement_unknown = true;
+        }
         // A reaped child is an expected target exit: without the mark, a
         // terminal pass that runs after the release bails on the empty
         // PID scope instead of sealing the report. A handed-back (living)
@@ -4779,10 +4790,11 @@ fn finish_capture_loop(
     if let Some(owned) = owned.take() {
         if let Err(error) = owned.finish(engine, session, end, signals) {
             // A handoff the settlement committed before the failure must
-            // still name its survivor: the `None` error path below cannot
-            // print the stored note.
+            // still name its survivor. The report still seals (with child
+            // status unknown when the settlement failed): detach runs after
+            // the terminal in the caller, so it must not run here.
             emit_stored_handoff_note(owned);
-            return Err(finish_capture_error(error, engine, session, None, signals));
+            return Err(error);
         }
         // An error end may never reach the terminal block (a sealed
         // failed-loop report returns an error after publication), so
@@ -4838,12 +4850,9 @@ fn finish_quiesce_error<C>(
             // A quiesce failure after a clean loop end still publishes: the
             // report seals from partial state (drain unproven) so a second
             // signal during teardown keeps the "report already written"
-            // contract. Settlement must succeed first: the child's
-            // disposition is a fact the document reports, never a guess.
-            let published = match &finish {
-                Ok(()) => Some(publish(context)),
-                Err(_) => None,
-            };
+            // contract. A failed settlement seals with child status unknown
+            // instead of skipping publication; every error is kept.
+            let published = Some(publish(context));
             let detach = detach(context);
             combine_quiesce_failure(error, finish, published, detach)
         }
@@ -4856,13 +4865,10 @@ fn finish_quiesce_error<C>(
             let finish = settle(context, CaptureEnd::Error);
             // Every stop seals from partial state even behind a failed
             // loop, signalled or not: calls happened, so the report shows
-            // what was captured and the error names what failed.
-            // Settlement still gates the seal, exactly as above; both
-            // errors stay in the returned chain.
-            let published = match &finish {
-                Ok(()) => Some(publish(context)),
-                Err(_) => None,
-            };
+            // what was captured and the error names what failed. A failed
+            // settlement seals with child status unknown, exactly as above;
+            // both errors stay in the returned chain.
+            let published = Some(publish(context));
             let detach = detach(context);
             combine_quiesce_failure(combined, finish, published, detach)
         }
@@ -4893,6 +4899,28 @@ fn seal_terminal_discovery_or_gap(
             // unchanged plan is a harmless refresh.
             Ok(true)
         }
+    }
+}
+
+/// Seals a terminal read from the last good value when the final read
+/// fails: on `Ok(value)` returns `(value, None)`; on `Err` with a last
+/// good value, runs the caller's diagnostic (naming the failure and the
+/// fallback) and returns `(last_good.clone(), Some(error))` — the caller
+/// still seals from it, files its named gap, then returns the error to
+/// exit nonzero. With no last good value there is nothing to seal from
+/// and the error is returned.
+fn seal_terminal_or_last_good<T: Clone>(
+    last_good: Option<&T>,
+    acquired: Result<T>,
+    diagnose: impl FnOnce(&anyhow::Error),
+) -> Result<(T, Option<anyhow::Error>)> {
+    match (acquired, last_good) {
+        (Ok(value), _) => Ok((value, None)),
+        (Err(error), Some(last)) => {
+            diagnose(&error);
+            Ok((last.clone(), Some(error)))
+        }
+        (Err(error), None) => Err(error),
     }
 }
 
@@ -5321,6 +5349,7 @@ fn run_owned_inner_with_host(
         exit_code: None,
         requested_kill: false,
         still_running: false,
+        settlement_unknown: false,
         handoff_note: None,
         error_handoff: false,
         prearm_scope_start_ns: scope_start_ns,
@@ -7349,33 +7378,44 @@ fn finish_capture_with<C, T>(
     // the terminal callback through its captured `TerminalQuiescence`.
     let loop_error = match loop_result {
         Ok(end) => {
-            let end = finish(context, Ok(end))?;
-            let terminal_result = terminal(context, end, false);
-            let detach_result = detach(context);
-            return combine_detach(terminal_result, detach_result);
+            match finish(context, Ok(end)) {
+                Ok(end) => {
+                    let terminal_result = terminal(context, end, false);
+                    let detach_result = detach(context);
+                    return combine_detach(terminal_result, detach_result);
+                }
+                Err(finish_error) => {
+                    // The child disposition is unknown (settlement failed)
+                    // or pause cleanup failed: the report still seals from
+                    // what was captured (the terminal reads the settlement
+                    // flag for unknown status), then detach runs, and every
+                    // error is kept for the nonzero exit.
+                    let terminal_result = terminal(context, end, false);
+                    let detach_result = detach(context);
+                    return Err(combine_quiesce_failure(
+                        finish_error,
+                        Ok(()),
+                        Some(terminal_result.map(|_| ())),
+                        detach_result,
+                    ));
+                }
+            }
         }
         Err(loop_error) => loop_error,
     };
     // A failed capture loop behind a successful quiescence still seals
     // what was captured, signalled or not: calls happened, so the report
     // shows them and the run's error names what failed. Settlement runs
-    // as an error end first and gates the seal (the child's disposition
-    // is a fact the document reports, never a guess); a failed
-    // settlement has already detached inside `finish`. The loop error
-    // stays the outer error, so the exit status still reports it.
+    // as an error end first; a failed settlement seals with child status
+    // unknown instead of suppressing the report. The loop error stays the
+    // outer error, so the exit status still reports it.
     loop_gap(context);
-    if let Err(settle_error) = finish(context, Ok(CaptureEnd::Error)) {
-        return Err(also_failed(
-            loop_error,
-            settle_error,
-            "owned cleanup/settlement",
-        ));
-    }
+    let finish_result = finish(context, Ok(CaptureEnd::Error));
     let published = terminal(context, CaptureEnd::Error, false).map(|_| ());
     let detach_result = detach(context);
     Err(combine_quiesce_failure(
         loop_error,
-        Ok(()),
+        finish_result.map(|_| ()),
         Some(published),
         detach_result,
     ))
@@ -8188,6 +8228,7 @@ fn capture_profile(
                         k0,
                         select_endpoint.map(|_| &mut selection_ledger),
                         &target_caller,
+                        last_snapshot.as_ref(),
                     )
                     .map(|_| ())
                 },
@@ -8404,6 +8445,7 @@ fn capture_profile(
                         k0,
                         select_endpoint.map(|_| &mut selection_ledger),
                         &target_caller,
+                        last_snapshot.as_ref(),
                     )
                 },
             )
@@ -8437,38 +8479,44 @@ fn capture_profile(
         k0: Option<metrics::selected_detail_driver::K0Close>,
         mut selection_ledger: Option<&mut metrics::selected_detail_driver::SelectionLedger>,
         target_caller: &Option<render::CaptureCaller>,
+        last_good: Option<&metrics::CaptureSnapshot>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let maps_start = Instant::now();
-        let snapshot =
-            match context
-                .6
-                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)
+        let acquired = context
+            .6
+            .terminal(context.1, context.0.plan(), context.0.pinned(), profile);
+        if acquired.is_err() {
+            // K0 on the terminal-failure path (m5): the close
+            // boundary is unprovable, but the opted-in debug line still
+            // prints, so a quiesce-error void shows its counts instead of
+            // failing the live cells with a parse error. Best-effort facts:
+            // the terminal read never landed. The report still seals from
+            // the last good snapshot below (when one exists).
+            if let Some(close) = &k0
+                && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
             {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    // K0 on the terminal-failure path (m5): the close
-                    // boundary is unprovable and no report seals, but the
-                    // opted-in debug line still prints, so a quiesce-error
-                    // void shows its counts instead of failing the live
-                    // cells with a parse error. Best-effort facts: the
-                    // terminal read never landed.
-                    if let Some(close) = &k0
-                        && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
-                    {
-                        let failed_facts = context.0.capture_facts();
-                        let failed_losses =
-                            metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
-                        emit_capture_diagnostic(&format_k0_debug_line(
-                            &close.window.before_losses(),
-                            &failed_facts,
-                            &failed_losses,
-                        ));
-                    }
-                    return Err(error);
-                }
-            };
+                let failed_facts = context.0.capture_facts();
+                let failed_losses =
+                    metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
+                emit_capture_diagnostic(&format_k0_debug_line(
+                    &close.window.before_losses(),
+                    &failed_facts,
+                    &failed_losses,
+                ));
+            }
+        }
+        let (snapshot, snapshot_error) = seal_terminal_or_last_good(
+            last_good,
+            acquired,
+            |error| {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: terminal snapshot failed; sealing the report from the last good snapshot: {}",
+                    crate::render::escape_controls(&format!("{error:#}")),
+                ));
+            },
+        )?;
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,
@@ -8589,19 +8637,51 @@ fn capture_profile(
                 .2
                 .as_deref()
                 .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
-            context.2.as_deref().map(|owned| owned.still_running),
+            context.2.as_deref().and_then(|owned| {
+                if owned.settlement_unknown {
+                    None
+                } else {
+                    Some(owned.still_running)
+                }
+            }),
             capture_tracking_degraded,
             consumers
                 .scheduling
                 .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
             uretprobe_override.clone(),
-            context
-                .2
-                .as_deref()
-                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+            context.2.as_deref().and_then(|owned| {
+                if owned.settlement_unknown {
+                    None
+                } else {
+                    owned.still_running.then_some(owned.pid)
+                }
+            }),
             None,
             context.1.unpublished_mechanisms(),
         );
+        // An unsettled child (settlement failed) and a failed terminal
+        // snapshot (sealed from the last good snapshot above) both force
+        // PARTIAL via the `skipped` cause with the existing generic
+        // vocabulary; the specific failure is on stderr and in the returned
+        // error. `run_tree_handed_back` stays present (it was measured
+        // before settlement) even though the child flag is absent.
+        let settlement_unknown = context
+            .2
+            .as_deref()
+            .is_some_and(|owned| owned.settlement_unknown);
+        if settlement_unknown {
+            ev.skipped.push(crate::render::SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            });
+            ev.run_tree_handed_back = Some(context.0.run_tree_handed_back());
+        }
+        if snapshot_error.is_some() {
+            ev.skipped.push(crate::render::SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            });
+        }
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
@@ -8690,6 +8770,12 @@ fn capture_profile(
             poll_terminal_cancellation();
             out_file.commit().map_err(anyhow::Error::msg)?;
             poll_terminal_cancellation();
+        }
+        if let Some(error) = snapshot_error {
+            // The report above sealed from the last good snapshot; the run
+            // still exits nonzero with the snapshot failure.
+            return Err(error
+                .context("terminal snapshot failed; report sealed from the last good snapshot"));
         }
         Ok(ev)
     }
@@ -9424,7 +9510,22 @@ fn capture_trace(
                         .map_err(anyhow::Error::msg)?;
                     report_trace_loss(context.1, context.4, context.5, context.6, context.7)?;
                     let maps_start = Instant::now();
-                    let reports = metrics::read(context.1, context.0.plan())?;
+                    // A failed aggregate read seals with unknown counts
+                    // (empty reports) and a named gap instead of suppressing
+                    // the terminal EVIDENCE; the per-call lines the tracer
+                    // already streamed stay exact.
+                    let empty_reports: Vec<metrics::SlotReport> = Vec::new();
+                    let (reports, reports_error) = seal_terminal_or_last_good(
+                        Some(&empty_reports),
+                        metrics::read(context.1, context.0.plan()),
+                        |error| {
+                            emit_capture_diagnostic(&format!(
+                                "p11scope: terminal reports read failed; sealing the trace report with unknown aggregate counts: {}",
+                                crate::render::escape_controls(&format!("{error:#}")),
+                            ));
+                        },
+                    )
+                    .expect("a synthetic empty fallback always seals");
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
@@ -9463,7 +9564,21 @@ fn capture_trace(
                     );
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
                     let maps_start = Instant::now();
-                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
+                    // A failed kernel-evidence read seals with unknown
+                    // evidence (defaulted) and a named gap, like the reports
+                    // above.
+                    let default_kernel = metrics::KernelEvidence::default();
+                    let (terminal_kernel, kernel_error) = seal_terminal_or_last_good(
+                        Some(&default_kernel),
+                        metrics::kernel_evidence(context.1),
+                        |error| {
+                            emit_capture_diagnostic(&format!(
+                                "p11scope: terminal kernel-evidence read failed; sealing the trace report with unknown kernel evidence: {}",
+                                crate::render::escape_controls(&format!("{error:#}")),
+                            ));
+                        },
+                    )
+                    .expect("a synthetic default fallback always seals");
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
@@ -9514,19 +9629,48 @@ fn capture_trace(
                             true,
                             context.2.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
                             context.2.as_deref().map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
-                            context.2.as_deref().map(|owned| owned.still_running),
+                            context.2.as_deref().and_then(|owned| {
+                                if owned.settlement_unknown {
+                                    None
+                                } else {
+                                    Some(owned.still_running)
+                                }
+                            }),
                             capture_tracking_degraded,
                             consumers
                                 .scheduling
                                 .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
                             uretprobe_override.clone(),
-                            context
-                                .2
-                                .as_deref()
-                                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                            context.2.as_deref().and_then(|owned| {
+                                if owned.settlement_unknown {
+                                    None
+                                } else {
+                                    owned.still_running.then_some(owned.pid)
+                                }
+                            }),
                             None,
                             context.1.unpublished_mechanisms(),
                         );
+                    // An unsettled child and failed terminal reads (sealed
+                    // with unknown counts/evidence above) force PARTIAL via
+                    // the `skipped` cause, like the profile terminal.
+                    let settlement_unknown = context
+                        .2
+                        .as_deref()
+                        .is_some_and(|owned| owned.settlement_unknown);
+                    if settlement_unknown {
+                        evidence.skipped.push(crate::render::SkippedOut {
+                            name: "discovery subject".into(),
+                            reason: "discovery unavailable".into(),
+                        });
+                        evidence.run_tree_handed_back = Some(context.0.run_tree_handed_back());
+                    }
+                    if reports_error.is_some() || kernel_error.is_some() {
+                        evidence.skipped.push(crate::render::SkippedOut {
+                            name: "discovery subject".into(),
+                            reason: "discovery unavailable".into(),
+                        });
+                    }
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();
@@ -9581,6 +9725,20 @@ fn capture_trace(
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
                     emit_timing_summaries(&evidence.scheduling, &summaries);
+                    let snapshot_error = match (reports_error, kernel_error) {
+                        (None, None) => None,
+                        (Some(error), None) | (None, Some(error)) => Some(error),
+                        (Some(reports), Some(kernel)) => {
+                            Some(also_failed(reports, kernel, "terminal snapshot"))
+                        }
+                    };
+                    if let Some(error) = snapshot_error {
+                        // The EVIDENCE above sealed with unknown counts; the
+                        // run still exits nonzero with the read failure.
+                        return Err(error.context(
+                            "terminal snapshot failed; trace report sealed with unknown counts",
+                        ));
+                    }
                     Ok(evidence)
                 },
             )

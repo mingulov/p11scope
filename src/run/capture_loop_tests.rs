@@ -438,19 +438,24 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
                 assert_eq!(phases, ["gap", "finish", "terminal", "detach"]);
             }
             Case::LoopErrorSettleFails => {
-                // The settled disposition gates the seal: no report on a
-                // guessed child state, and both errors are kept.
+                // A failed settlement seals with child status unknown
+                // instead of suppressing the report, and both errors are
+                // kept.
                 let message = format!("{:#}", result.unwrap_err());
                 assert!(
                     message.contains("loop failure") && message.contains("finish failure"),
                     "{message}"
                 );
-                assert_eq!(observed, None);
-                assert_eq!(phases, ["gap", "finish"]);
+                assert_eq!(observed, Some((CaptureEnd::Error, false)));
+                assert_eq!(phases, ["gap", "finish", "terminal", "detach"]);
             }
             Case::FinishError => {
-                assert_eq!(result.unwrap_err().to_string(), "finish failure");
-                assert_eq!(phases, ["finish"]);
+                // The terminal still seals (with unknown child status) and
+                // detach still runs; the finish error stays the error.
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(message.contains("finish failure"), "{message}");
+                assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
             Case::ErrorEnd => {
                 assert_eq!(result.unwrap(), 17);
@@ -475,8 +480,9 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
 /// Settlement (pause cleanup plus policy settlement in production) runs
 /// with the loop's real end, then publication seals the report from
 /// partial state, then detach runs. Every error — quiesce, settlement,
-/// publication, detach — is retained in the returned error. Publication
-/// needs the settled disposition, so a settlement failure skips it.
+/// publication, detach — is retained in the returned error. A settlement
+/// failure seals with child status unknown instead of skipping
+/// publication.
 #[test]
 fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
     #[derive(Clone, Copy)]
@@ -522,13 +528,10 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
         );
         // Settlement runs (not skipped) with the loop's real end, before
         // detach — the `--duration` handoff end survives a quiesce failure.
-        // Publication runs between them exactly when settlement succeeded.
+        // Publication runs between them even when settlement failed (with
+        // unknown child status).
         assert_eq!(settled_end, Some(CaptureEnd::DurationExpired));
-        if matches!(case, Case::SettleError | Case::BothError) {
-            assert_eq!(phases, ["settle", "detach"]);
-        } else {
-            assert_eq!(phases, ["settle", "publish", "detach"]);
-        }
+        assert_eq!(phases, ["settle", "publish", "detach"]);
         let message = format!("{error:#}");
         assert!(
             message.contains("quiesce failure"),
@@ -3303,4 +3306,162 @@ fn pause_cancellation_loop_failure_still_seals_the_report() {
         };
         assert!(text.contains("pause coordination cancelled"), "{text}");
     }
+}
+
+/// v070: a settled finish still seals (healthy twin for the settlement-
+/// unknown path). The terminal runs before detach and the evidence is
+/// returned.
+#[test]
+fn settlement_success_still_seals_the_report() {
+    let mut phases = Vec::new();
+    let mut observed = None;
+    let result = finish_capture_with(
+        &mut phases,
+        Ok(CaptureEnd::DurationExpired),
+        |phases| phases.push("gap"),
+        |phases, result| {
+            phases.push("finish");
+            result
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+        |phases, end, detached| {
+            phases.push("terminal");
+            observed = Some((end, detached));
+            Ok(17)
+        },
+    );
+    assert_eq!(result.unwrap(), 17);
+    assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
+    assert_eq!(phases, ["finish", "terminal", "detach"]);
+}
+
+/// v070 RED: a finish (settlement) failure after capture must still seal
+/// the report with child status unknown, then detach, then return the
+/// error. The terminal runs even though the child disposition is unknown.
+#[test]
+fn settlement_failure_still_seals_the_report_with_unknown_child() {
+    for loop_failed in [false, true] {
+        let mut phases = Vec::new();
+        let mut observed = None;
+        let loop_result: Result<CaptureEnd> = if loop_failed {
+            Err(anyhow::anyhow!("loop failure"))
+        } else {
+            Ok(CaptureEnd::DurationExpired)
+        };
+        let result = finish_capture_with(
+            &mut phases,
+            loop_result,
+            |phases| phases.push("gap"),
+            |phases, result| {
+                phases.push("finish");
+                let _ = result?;
+                anyhow::bail!("finish failure");
+            },
+            |phases| {
+                phases.push("detach");
+                Ok(())
+            },
+            |phases, end, detached| {
+                phases.push("terminal");
+                observed = Some((end, detached));
+                Ok(17)
+            },
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("finish failure"),
+            "loop_failed={loop_failed}: settlement error dropped: {message}"
+        );
+        if loop_failed {
+            assert!(
+                message.contains("loop failure"),
+                "loop error dropped: {message}"
+            );
+            assert_eq!(observed, Some((CaptureEnd::Error, false)));
+            assert_eq!(phases, ["gap", "finish", "terminal", "detach"]);
+        } else {
+            assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
+            assert_eq!(phases, ["finish", "terminal", "detach"]);
+        }
+    }
+}
+
+/// v070 RED: a quiesce-block settlement failure must still publish (with
+/// unknown child) before detach, keeping every error.
+#[test]
+fn quiesce_settlement_failure_still_publishes_with_unknown_child() {
+    let mut phases = Vec::new();
+    let error = finish_quiesce_error(
+        anyhow::anyhow!("quiesce failure"),
+        Ok(CaptureEnd::DurationExpired),
+        &mut phases,
+        |phases| phases.push("gap"),
+        |phases, _| {
+            phases.push("settle");
+            anyhow::bail!("settle failure");
+        },
+        |phases| {
+            phases.push("publish");
+            Ok(())
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+    );
+    assert_eq!(phases, ["settle", "publish", "detach"]);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("quiesce failure") && message.contains("settle failure"),
+        "an error was dropped: {message}"
+    );
+}
+
+/// v070: a clean terminal read seals fresh (healthy twin for the snapshot
+/// fallback). No diagnostic, no error.
+#[test]
+fn terminal_snapshot_success_seals_fresh_with_no_gap() {
+    let diagnosed = std::cell::Cell::new(false);
+    let (value, error) = seal_terminal_or_last_good(Some(&5u64), Ok(8u64), |_| diagnosed.set(true))
+        .expect("a clean read seals");
+    assert_eq!(value, 8);
+    assert!(error.is_none());
+    assert!(!diagnosed.get(), "a clean read names no failure");
+}
+
+/// v070: a failed terminal read with a last good value seals from it with
+/// a diagnostic and the error, so the caller files its named gap and
+/// still exits nonzero.
+#[test]
+fn terminal_snapshot_failure_seals_from_last_good_with_gap() {
+    let diagnosed = std::cell::Cell::new(false);
+    let (value, error) =
+        seal_terminal_or_last_good(Some(&5u64), Err(anyhow::anyhow!("STATS map gone")), |_| {
+            diagnosed.set(true)
+        })
+        .expect("a last good value always seals");
+    assert_eq!(value, 5);
+    let message = format!("{:#}", error.expect("the failure stays an error"));
+    assert!(message.contains("STATS map gone"), "{message}");
+    assert!(diagnosed.get(), "the fallback must name the failure");
+}
+
+/// v070: a failed terminal read with no last good value has nothing to
+/// seal from and returns the error.
+#[test]
+fn terminal_snapshot_failure_without_last_good_returns_the_error() {
+    let diagnosed = std::cell::Cell::new(false);
+    let result: Result<(u64, Option<anyhow::Error>)> =
+        seal_terminal_or_last_good(None, Err(anyhow::anyhow!("STATS map gone")), |_| {
+            diagnosed.set(true)
+        });
+    let message = format!("{:#}", result.unwrap_err());
+    assert!(message.contains("STATS map gone"), "{message}");
+    assert!(
+        !diagnosed.get(),
+        "with nothing to seal from there is no fallback to name"
+    );
 }

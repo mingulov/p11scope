@@ -860,10 +860,16 @@ captured, whether the stop was a signal, the command's own exit or
   nonzero with the error on stderr.
 - A failure while waiting for in-flight calls to finish at the stop seals the
   report with stop quiescence `unproven` rather than a named gap.
+- A child whose final status cannot be settled seals the report with that
+  status unknown (`child_still_running` absent in `run` documents, plus a
+  named gap); p11scope then exits nonzero with the error on stderr.
+- A failed final snapshot seals the report from the last good snapshot
+  with a named gap for the failed read (the terminal counts are stale as
+  of that snapshot); p11scope then exits nonzero with the error on stderr.
+  When no snapshot was ever acquired, there is no aggregate state to seal
+  from and the error names the failure without a report.
 
-The report is not written when the child's final status cannot be settled,
-or when the final snapshot itself fails; the error then names every failed
-step.
+In every case the error names every failed step.
 
 A stop that arrives during `profile` or `trace` startup, before anything is
 attached (discovery can take seconds), is honoured once discovery returns:

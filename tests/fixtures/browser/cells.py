@@ -3,7 +3,12 @@
 
 Two observation modes, both against a controlled SoftHSM provider:
 
-- ``run_direct``: ``p11scope run`` owns the browser child directly.
+- ``run_direct``: ``p11scope run`` owns the tree supervisor
+  (``reap_tree.py``), which spawns the browser and ends the run at
+  flow completion (the screenshot's PNG trailer) or the browser's
+  exit, whichever first, then SIGKILLs the tree and reaps to ECHILD
+  before exiting with the browser's code (0 for a completed flow),
+  so capture always ends on a quiesced tree.
   The flow is the browser's own deterministic CLI (``--screenshot``
   exits 0 with PNG bytes on success). Firefox runs ``--pause auto``;
   Chromium runs ``--pause never`` (it aborts under the barrier).
@@ -170,8 +175,11 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         raise CellError(f"unknown browser: {browser}")
     # `run` scrubs the child environment (usage.md "run safety boundary"):
     # SOFTHSM2_CONF passes through; HOME/TMPDIR ride via /usr/bin/env.
+    # The owned child is the tree supervisor, not the browser directly
+    # (see the module docstring); the browser inherits env through it.
     tmpdir = workdir / "tmp"
     tmpdir.mkdir(exist_ok=True)
+    supervisor = Path(__file__).resolve().parent / "reap_tree.py"
     argv = ["sudo", "-n"]
     for key, value in (browser_env or {}).items():
         argv.append(f"{key}={value}")
@@ -181,6 +189,8 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         "--duration", str(duration_seconds), "--kill-on-timeout",
         "--", "/usr/bin/env",
         f"HOME={child_env['HOME']}", f"TMPDIR={tmpdir}",
+        sys.executable, str(supervisor),
+        "--flow-done", str(screenshot),
         *browser_argv, *extra_browser_args,
     ]
     proc = subprocess.run(argv, capture_output=True, text=True, check=False,

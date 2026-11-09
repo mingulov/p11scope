@@ -2143,9 +2143,9 @@ class BrowserReapTree(unittest.TestCase):
     def test_supervisor_supervises_when_already_a_group_leader(self):
         """A leader (the observer's pre-exec setsid) still supervises.
 
-        The observer's owned child already leads its session, so the
-        supervisor must accept a private group it did not found (a bare
-        setsid fails EPERM there) and still kill+reap the tree.
+        The observer's owned child already leads its session; the
+        supervisor takes no session of its own (the browser founds
+        one) and still kills+reaps the tree there.
         """
         setsid = shutil.which("setsid")
         if setsid is None:

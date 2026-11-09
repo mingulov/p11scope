@@ -1308,7 +1308,7 @@ fn joint_finish_service_stages_nothing() {
     }
     assert!(
         published,
-        "the finish loop reached Published, so the empty-stops check tested the real finish"
+        "finish never reached Published in 64 polls; the empty-stops check would be vacuous"
     );
     assert!(
         probe.stops.is_empty(),

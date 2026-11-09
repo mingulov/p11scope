@@ -5353,7 +5353,7 @@ mod tests {
             "run help must document the user flag"
         );
         assert!(
-            RUN_HELP.contains("sudo p11scope run --user alice -- pkcs11-tool --module ... -L"),
+            RUN_HELP.contains("sudo p11scope run --pause auto --user alice -- pkcs11-tool --module ... -L"),
             "run help must carry the --user example"
         );
     }

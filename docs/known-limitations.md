@@ -289,15 +289,19 @@ names the source SHA behind each check the release rounds re-measured.
   with `inventory --system` (or `--cgroup`), which admits short-lived
   processes, or run the leaf command that loads the provider directly
   under `run`.
-- Chromium as an owned `run` child may abort (SIGABRT) under either
-  pause policy: its spawn storm races the loader hooks, so run-direct
-  capture is flaky with `--pause auto` and `--pause never` alike (the
-  harness note records about 3 aborts in 4 for `never`; a 2026-11-09
-  default/never pair aborted on both legs). The pause default neither
-  causes nor worsens it. An aborted run still reports honestly (exit
-  134, PARTIAL). Capture Chromium attach-driven instead (`--system`
-  or `--pid` on the running browser); the browser cells are
-  attach-drive only for this reason.
+- Chromium as an owned `run` child needs a short `TMPDIR`. Chromium
+  itself aborts (SIGABRT, exit 134) when its
+  `$TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket` path exceeds
+  the 107-byte Unix socket limit, with or without p11scope, so a deep
+  `TMPDIR` makes every launch fail. With a short `TMPDIR`, a
+  2026-11-09 check (Fedora, kernel 7.2.9, headless Chromium 1248 on
+  `about:blank`, no `--module`) completed 4 of 4 runs under the default
+  `--pause auto` and 4 of 4 under `--pause never`. The `auto` runs
+  report `pause: partial`: one of their six pause cycles ends at its
+  deadline while the engine is still applying the attach batch
+  (`pause_diag=deadline_during_engine_apply`), so that cycle's load is
+  not protected. Flows with a registered provider were not rechecked;
+  the browser cells capture Chromium attach-driven.
 - Container providers carry named unproven cases: the container checks
   use one kind node, and multi-node clusters, CRI-O and the cgroupfs
   driver are not exercised. Docker shared image layers and copy-up, the

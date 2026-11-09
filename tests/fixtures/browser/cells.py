@@ -123,13 +123,15 @@ def _reown_report(report: Path) -> None:
                    capture_output=True, check=False)
 
 
-#: Pause policy per browser. Chromium aborts (SIGABRT) under the `auto`
-#: barrier during its spawn storm (single-process included), so it runs
-#: `never`. Even `never` is flaky for Chromium run-direct (loader hooks vs
-#: spawn storm, ~3/4 abort); v1 Chromium cells are attach-drive only.
-#: Re-verified 2026-11-09: a default/auto run-direct pair aborted on both
-#: legs, so the abort is not auto-specific and the pause default changes
-#: nothing for Chromium. Firefox tolerates `auto`.
+#: Pause policy per browser. The old note (Chromium aborts under `auto`,
+#: and about 3 in 4 launches under `never`) was not reproduced on
+#: 2026-11-09: with a TMPDIR short enough for Chromium's singleton socket
+#: (``child_tmpdir``), `about:blank` without a registered module completed
+#: 4/4 under `auto` (pause: partial, one deadline during engine apply per
+#: run) and 4/4 under `never`; a deep TMPDIR aborted both legs with
+#: "Socket path too long". Chromium keeps `never` until a module flow is
+#: rechecked under `auto`; v1 Chromium cells are attach-drive only.
+#: Firefox tolerates `auto`.
 PAUSE_POLICY = {"firefox": "auto", "chromium": "never"}
 
 

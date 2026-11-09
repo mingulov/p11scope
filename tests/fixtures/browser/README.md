@@ -135,12 +135,14 @@ What the catalog proves:
    reproduced Marionette-only, so no Playwright/Juggler involvement;
    no-login controls navigate fine). A sign-positive Firefox cell
    therefore also needs a SoftHSM build without that crash.
-2. **`p11scope run` + Chromium aborts (SIGABRT, 3/4 launches).** The
-   abort precedes any mapping (single-process included; stabilized flags
-   do not help), implicating the observer's loader hooks during
-   Chromium's spawn storm. Chromium v1 cells are attach-drive only;
-   `run_direct` stays supported for Firefox. Product-side loader-hook
-   robustness for Chromium spawn is the follow-up.
+2. **`p11scope run` + Chromium aborts (SIGABRT, 3/4 launches).** First
+   attributed to the loader hooks during Chromium's spawn storm. On
+   2026-11-09 the abort was reproduced only with a deep `TMPDIR`: Chromium
+   aborts by itself ("Socket path too long") when its SingletonSocket path
+   exceeds the Unix socket limit. With a short `TMPDIR` (`run_direct` now
+   picks one, `cells.child_tmpdir`) `about:blank` completed 4/4 under
+   `--pause auto` and 4/4 under `--pause never`. Module flows were not
+   rechecked, so Chromium v1 cells stay attach-drive only.
 3. **Firefox `--screenshot` + self-signed HTTPS hangs** (cert-error page
    never completes for the screenshot frontend; packet proof: fatal TLS
    alert, clean close, then silence). Firefox run-direct cells use HTTP;

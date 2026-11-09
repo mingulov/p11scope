@@ -1284,6 +1284,7 @@ fn joint_finish_service_stages_nothing() {
         live_discovery: live_discovery.as_mut(),
         stage_probe: Some(&mut probe),
     };
+    let mut published = false;
     for _ in 0..64 {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 100_000,
@@ -1297,11 +1298,18 @@ fn joint_finish_service_stages_nothing() {
         ) {
             Ok(
                 crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_),
-            ) => break,
+            ) => {
+                published = true;
+                break;
+            }
             Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending) => {}
             Err(reason) => panic!("finish polls pass, got {reason:?}"),
         }
     }
+    assert!(
+        published,
+        "the finish loop reached Published, so the empty-stops check tested the real finish"
+    );
     assert!(
         probe.stops.is_empty(),
         "the finish service never stages: {:?}",

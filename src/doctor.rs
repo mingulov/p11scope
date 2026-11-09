@@ -2185,6 +2185,58 @@ fn counter_modes_for_host(
     counter_modes_footer_with_preflight(&loop_probe, preflight)
 }
 
+/// One slow stretch of `p11scope doctor`, announced on an interactive
+/// stderr so a 10 s BPF preflight does not read as a hang. Labels are
+/// short fixed strings; only the phase varies, never any target detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoctorPhase {
+    Host,
+    BpfSelfProbe,
+    UretprobeConfinement,
+    AttachPreflight,
+    InventoryPreflight,
+    Target,
+    CounterModes,
+}
+
+impl DoctorPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Host => "host checks",
+            Self::BpfSelfProbe => "BPF self-probe",
+            Self::UretprobeConfinement => "uretprobe confinement probe",
+            Self::AttachPreflight => "attach preflight",
+            Self::InventoryPreflight => "inventory preflight",
+            Self::Target => "target checks",
+            Self::CounterModes => "counter modes",
+        }
+    }
+}
+
+/// Progress announcements for the multi-second BPF preflights: one short
+/// stderr line per check phase on an interactive stderr, silence anywhere
+/// else (pipes, files, `--quiet`). Best-effort like every stderr note; a
+/// lost line never changes the verdict, the table, or the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DoctorProgress {
+    enabled: bool,
+}
+
+impl DoctorProgress {
+    /// The pure seam: enabled only on a terminal outside `--quiet`.
+    pub(crate) fn for_state(stderr_is_terminal: bool, quiet: bool) -> Self {
+        // RED stub: always silent until the wiring commit enables it.
+        let _ = (stderr_is_terminal, quiet);
+        Self { enabled: false }
+    }
+
+    /// The bytes one phase announcement writes, or `None` for silence.
+    pub(crate) fn phase_line(self, phase: DoctorPhase) -> Option<String> {
+        self.enabled
+            .then(|| format!("p11scope: doctor: {}...", phase.label()))
+    }
+}
+
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
@@ -4984,5 +5036,54 @@ mod tests {
         assert_eq!(read_cap_eff(), Ok(0xdeadbeef));
         crate::caps::clear_invoking_effective_for_test();
         assert_ne!(read_cap_eff().ok(), Some(0xdeadbeef));
+    }
+
+    /// On an interactive stderr every phase announces exactly one short
+    /// `p11scope: doctor:` line, so the 10 s preflight shows movement.
+    #[test]
+    fn doctor_progress_announces_one_line_per_phase_on_a_terminal() {
+        let progress = DoctorProgress::for_state(true, false);
+        for (phase, label) in [
+            (DoctorPhase::Host, "host checks"),
+            (DoctorPhase::BpfSelfProbe, "BPF self-probe"),
+            (
+                DoctorPhase::UretprobeConfinement,
+                "uretprobe confinement probe",
+            ),
+            (DoctorPhase::AttachPreflight, "attach preflight"),
+            (DoctorPhase::InventoryPreflight, "inventory preflight"),
+            (DoctorPhase::Target, "target checks"),
+            (DoctorPhase::CounterModes, "counter modes"),
+        ] {
+            assert_eq!(
+                progress.phase_line(phase),
+                Some(format!("p11scope: doctor: {label}...")),
+                "phase {phase:?} must announce",
+            );
+        }
+    }
+
+    /// Off a terminal (pipes, files, scripts) and under `--quiet` the
+    /// progress seam stays silent: no new stderr bytes for machines.
+    #[test]
+    fn doctor_progress_stays_silent_off_terminal_or_quiet() {
+        for (is_terminal, quiet) in [(false, false), (true, true), (false, true)] {
+            let progress = DoctorProgress::for_state(is_terminal, quiet);
+            for phase in [
+                DoctorPhase::Host,
+                DoctorPhase::BpfSelfProbe,
+                DoctorPhase::UretprobeConfinement,
+                DoctorPhase::AttachPreflight,
+                DoctorPhase::InventoryPreflight,
+                DoctorPhase::Target,
+                DoctorPhase::CounterModes,
+            ] {
+                assert_eq!(
+                    progress.phase_line(phase),
+                    None,
+                    "terminal={is_terminal} quiet={quiet} phase={phase:?} must stay silent",
+                );
+            }
+        }
     }
 }

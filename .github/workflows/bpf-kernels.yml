@@ -270,7 +270,7 @@ jobs:
           # Combined refusal controls, never an old positive campaign.
           - kernel: v6.1.188
             refusal_control: true
-          # 5.15 refuses with the same named reason (OD32) and additionally
+          # 5.15 follows the same fallback/refusal contract (OD32) and additionally
           # runs the identity cell for its denied branch.
           - kernel: v5.15.221
             refusal_control: true
@@ -353,7 +353,7 @@ jobs:
           # driver's own verdict line, pinning the pass to OVERALL: PASS
           # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
-      - name: Check each stock pre-Multi host refuses before capture side effects
+      - name: Check each stock pre-Multi host falls back or refuses without side effects
         if: matrix.refusal_control == true
         shell: bash
         run: |

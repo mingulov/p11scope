@@ -697,9 +697,11 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertTrue(relaxed["pass"])
         self.assertIn("disclosed runner noise", relaxed["detail"])
 
-    def test_skip_family_fails_on_system_when_allowed(self):
-        # Ruling U1 is mt-system-only: the `system` cell keeps the
-        # CI-GAP-1 cause set (pid_descendant_gaps alone).
+    def test_skip_family_passes_on_system_when_allowed(self):
+        # Controller ruling 2026-11-09 07:50 (supersedes the U1
+        # mt-system-only pin): every system-scope cell discloses
+        # exactly the named family; the flag keeps its runner-noise
+        # qualification and now prints both counts.
         def mutate(d, l, r):
             d["evidence"]["pid_descendant_gaps"] = 41
             d["evidence"]["skipped"] = [{"name": "discovery subject",
@@ -707,9 +709,10 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True,
-                               want=1)
-        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=41", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
 
 
 # Test-only independent mapping code runs in both separate lifecycle children.

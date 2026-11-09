@@ -54,7 +54,9 @@ class CheckCellResultsTests(unittest.TestCase):
     def test_public_cli_qualified_kinds_accepted(self):
         result = run_checker([row("run-prearm", True, "prearm-exactness", "held [] with 3/3 ledger"),
                               row("system", True, "owned-provider-counts-with-runner-noise",
-                                  "counts match; disclosed runner noise")])
+                                  "counts match; disclosed runner noise"),
+                              row("mt-system", True, "owned-provider-counts-with-ambient-gap",
+                                  "counts match; disclosed honest ambient gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_66_discovery_gap_qualification_accepted(self):

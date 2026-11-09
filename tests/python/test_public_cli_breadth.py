@@ -1336,7 +1336,9 @@ class MtSystemSkipFamilyTests(unittest.TestCase):
     """Ruling U1 (controller): mt-system discloses the named discovery-skip
     pair plus pid_descendant_gaps the same way CI-GAP-1 discloses runner
     noise. Each named cause may be present or absent with its count
-    printed; every owned count stays exact and any other cause fails."""
+    printed; every owned count stays exact and any other cause fails.
+    The 2026-11-09 ambient-gap ruling additionally qualifies the exact
+    pair strict on every system-scope cell (see SystemAmbientGapTests)."""
     run_case_mt = MtOracleTests.run_case_mt
 
     NAMED_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
@@ -1436,10 +1438,127 @@ class MtSystemSkipFamilyTests(unittest.TestCase):
                                   allow_pid_descendant_gaps=True)
         self.assertIn("loss or unknown task_uprobe_link_losses", result["detail"])
 
-    def test_skip_family_strict_fails(self):
+    def test_skip_family_strict_honest_gap_passes(self):
+        # Controller ruling 2026-11-09 07:50 (supersedes the U1
+        # strict pin): the exact named family qualifies strict on
+        # system-scope cells as an honest ambient-generation gap.
         def mutate(d, l, r):
             self.disclose(d, gaps=2, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=2", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+
+class SystemAmbientGapTests(unittest.TestCase):
+    """Controller ruling 2026-11-09 07:50: every system-scope cell
+    qualifies the honest ambient-generation gap -- exactly causes
+    ["skipped", "pid_descendant_gaps"] with every skip the named
+    redacted discovery pair -- when, and only when, every
+    owned-provider count is exact, owned loss is zero and no other
+    gap class is present. Anything else still fails."""
+    run_case_mt = MtOracleTests.run_case_mt
+    run_case = BreadthTests.run_case
+
+    NAMED_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
+
+    def disclose(self, report, *, gaps, skips):
+        report["evidence"].update(
+            completeness="PARTIAL", verdict_detail="concrete_gap",
+            pid_descendant_gaps=gaps,
+            skipped=[dict(self.NAMED_SKIP) for _ in range(skips)])
+        causes = []
+        if skips:
+            causes.append("skipped")
+        if gaps:
+            causes.append("pid_descendant_gaps")
+        report["evidence"]["gap_classes"]["observation"] = {
+            "status": "lossy", "causes": causes}
+
+    def test_healthy_exact_keeps_plain_qualification(self):
+        # The new gate must not hijack exact shapes: a clean
+        # system-scope capture keeps the plain qualification.
+        result = self.run_case_mt(cell="mt-system", calls=40)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_system_cell_honest_gap_passes_strict(self):
+        # "Any other --system cell that hits the same family": the
+        # single-workload system cell qualifies strict too.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=41, skips=1)
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=41", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_extra_gap_class_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"].append(
+                "multi_rebuild_gaps")
         result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_inexact_owned_count_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["functions"][5].update(calls=41)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("owned target count differs from independent ledger",
+                      result["detail"])
+
+    def test_owned_loss_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["event_loss"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"] = [
+                "skipped", "event_loss", "pid_descendant_gaps"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("loss or unknown event_loss", result["detail"])
+
+    def test_wrong_skip_name_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=0)
+            d["evidence"]["skipped"] = [{
+                "name": "C_Digest", "reason": "function entry unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_skip_extra_key_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=0)
+            d["evidence"]["skipped"] = [dict(self.NAMED_SKIP, extra=1)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_skip_only_still_fails_strict(self):
+        # Only the exact pair qualifies; a lone named skip stays a failure.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_provider_linked_hints_fail(self):
+        # A gap subject that links the watched provider is not ambient noise.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["gap_exe_hints"] = {"links_provider": 1}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("links the watched provider", result["detail"])
+
+    def test_pid_scope_family_still_fails(self):
+        # The qualifier is system-scope only: a pid cell showing the
+        # same pair stays a failure.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-shared", want=1)
         self.assertIn("lossy or unknown observation gap class", result["detail"])
 
 

@@ -427,6 +427,55 @@ fn async_global_owned_only_retire_covers_module_first_seen_in_candidate() {
 }
 
 #[test]
+fn async_global_owned_only_retire_covers_candidate_module_without_entry_objects() {
+    // The live pre-6.8 shape: the transition candidate's module has no
+    // table entry objects bound yet, so only the module's own object ties
+    // the retiring static slot (on that same file) to the owned child.
+    let mut case = Case::new();
+    case.engine.owned_run_pid = Some(case.child.id());
+    let mut candidate = case.candidate();
+    let retiring = candidate.delta.retire[0].object;
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.object == retiring),
+        "the retiring slot sits on a candidate module's own file"
+    );
+    for module in &mut candidate.modules {
+        for ids in &mut module.entry_objects {
+            ids.clear();
+        }
+    }
+    case.engine.modules.clear();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "the module's own object still owns the retire"
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0
+    );
+    assert!(
+        case.session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| !slots.is_empty()),
+        "the retire detaches synchronously inside the tick"
+    );
+    assert_ne!(outcome.disposition, ApplyDisposition::Deferred);
+}
+
+#[test]
 fn async_global_candidate_module_of_unowned_view_keeps_async_ticket() {
     // Guard twin: the candidate's module belongs to a view that is not
     // the owned run child, so the same module-first-seen retire keeps

@@ -331,7 +331,11 @@ names the source SHA behind each check the release rounds re-measured.
   scan lane (exit 0 with modules and callers, counts unknown under the
   `native usage feed unavailable` gap), while `profile`, `trace`, `run`
   and `inventory --capture native` refuse with a `live capture ...`
-  refusal (`unavailable` or `did not start`).
+  refusal (`unavailable` or `did not start`). A short `--cgroup` fallback
+  there can still report an empty view: when the run ends before the
+  first pass completes, the collection is discarded with the `no complete
+  collection pass` gap (0 callers), because the kept first pass covers
+  `--pid`/`--system` only.
 - Per-key rows cover operations that start after the attach.
   Attaching to an already-running process (for example a running
   Firefox or Chromium) works: operations that start after the attach

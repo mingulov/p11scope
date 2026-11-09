@@ -3993,6 +3993,10 @@ struct Owned {
     exit_code: Option<i32>,
     requested_kill: bool,
     still_running: bool,
+    /// The terminal handoff note the settlement returned when it
+    /// committed a handoff: the terminal path prints it once, so the
+    /// operator reads the true reason, never a reworded guess.
+    handoff_note: Option<String>,
     /// The run's own pre-spawn scope start: the claim start the terminal
     /// pre-arm hold composes with the coordinator's proven segment.
     prearm_scope_start_ns: Option<u64>,
@@ -4124,7 +4128,10 @@ impl Owned {
             &mut self.exit_code,
             &mut self.requested_kill,
             &mut self.still_running,
-        );
+        )
+        .map(|note| {
+            self.handoff_note = note;
+        });
         // A reaped child is an expected target exit: without the mark, a
         // terminal pass that runs after the release bails on the empty
         // PID scope instead of sealing the report. A handed-back (living)
@@ -4161,7 +4168,8 @@ fn format_observer_end_handoff_note(end: CaptureEnd, pid: u32) -> String {
 /// the forwarded signal reaches the child as today; anything else reaps a
 /// natural exit and hands a live child back running. A pre-exec child is
 /// still this process's fork, never the command: it is killed where it
-/// stands so nothing can release it late.
+/// stands so nothing can release it late. Returns the terminal handoff
+/// note when a live child was handed back — `None` otherwise.
 #[allow(clippy::too_many_arguments)]
 fn settle_observer_end_without_kill(
     retained: &mut Option<OwnedChild>,
@@ -4171,7 +4179,7 @@ fn settle_observer_end_without_kill(
     exit_code: &mut Option<i32>,
     requested_kill: &mut bool,
     still_running: &mut bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     *requested_kill = false;
     {
         let child = retained
@@ -4179,7 +4187,8 @@ fn settle_observer_end_without_kill(
             .context("owned child missing during settlement")?;
         if signals.interrupted() && child.still_running() {
             let settled = settle_after_signal(child, signals);
-            return record_settlement_result(child, settled, exit_code, still_running);
+            return record_settlement_result(child, settled, exit_code, still_running)
+                .map(|()| None);
         }
         // Resume before the liveness check, so a child the pause holds
         // stopped is handed back running, never left in T.
@@ -4189,14 +4198,15 @@ fn settle_observer_end_without_kill(
                 .terminate_and_reap()
                 .map(ChildOutcome::Exited)
                 .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
-            return record_settlement_result(child, settled, exit_code, still_running);
+            return record_settlement_result(child, settled, exit_code, still_running)
+                .map(|()| None);
         }
     }
     match stage_handoff(retained, pending)? {
         ChildOutcome::Exited(code) => {
             *exit_code = Some(code);
             *still_running = false;
-            Ok(())
+            Ok(None)
         }
         ChildOutcome::TimedOutRunning => {
             commit_staged_observer_handoff(pending, end, exit_code, still_running)
@@ -4204,6 +4214,10 @@ fn settle_observer_end_without_kill(
     }
 }
 
+/// Settles the owned child for one capture end. Returns the terminal
+/// handoff note when a handoff was committed — `None` for every end that
+/// reaps or kills instead. A `--duration` handoff is staged here and
+/// committed by the caller, but its note is already exact.
 #[allow(clippy::too_many_arguments)]
 fn settle_owned_child(
     retained: &mut Option<OwnedChild>,
@@ -4215,7 +4229,7 @@ fn settle_owned_child(
     exit_code: &mut Option<i32>,
     requested_kill: &mut bool,
     still_running: &mut bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     *requested_kill = false;
     let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
         CaptureEnd::Signal
@@ -4245,13 +4259,18 @@ fn settle_owned_child(
             ChildOutcome::Exited(code) => {
                 *exit_code = Some(code);
                 *still_running = false;
+                return Ok(None);
             }
             ChildOutcome::TimedOutRunning => {
+                let pid = pending
+                    .as_ref()
+                    .map(|child| child.pid())
+                    .context("owned child missing during settlement")?;
                 *exit_code = None;
                 *still_running = true;
+                return Ok(Some(format_handoff_note(pid)));
             }
         }
-        return Ok(());
     }
     let child = retained
         .as_mut()
@@ -4279,7 +4298,7 @@ fn settle_owned_child(
         let kill_kill = *code == 128 + libc::SIGKILL && child.sent_kill;
         *requested_kill = was_alive && signalled && (term_kill || kill_kill);
     }
-    record_settlement_result(child, settled, exit_code, still_running)
+    record_settlement_result(child, settled, exit_code, still_running).map(|()| None)
 }
 
 fn record_settlement_result(
@@ -4341,15 +4360,17 @@ fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
 }
 
 /// Commits a staged observer-side handoff: a live child is handed back
-/// running with this end's terminal note, while a child that exited
-/// between the stage and the commit keeps its natural exit, reaped here
-/// instead of failing the settlement.
+/// running, while a child that exited between the stage and the commit
+/// keeps its natural exit, reaped here instead of failing the
+/// settlement. Returns this end's terminal handoff note on a committed
+/// handoff — `None` on a reaped exit — so the terminal path prints the
+/// true reason exactly once.
 fn commit_staged_observer_handoff(
     pending: &mut Option<OwnedChild>,
     end: CaptureEnd,
     exit_code: &mut Option<i32>,
     still_running: &mut bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let pid = pending
         .as_ref()
         .map(|child| child.pid())
@@ -4357,8 +4378,7 @@ fn commit_staged_observer_handoff(
     if commit_handoff(pending).is_ok() {
         *exit_code = None;
         *still_running = true;
-        emit_capture_diagnostic(&format_observer_end_handoff_note(end, pid));
-        return Ok(());
+        return Ok(Some(format_observer_end_handoff_note(end, pid)));
     }
     // The child exited between the stage and the commit: reap the
     // natural exit instead of failing the settlement.
@@ -4376,7 +4396,7 @@ fn commit_staged_observer_handoff(
         // refuse the reaped child and fail an already-published run.
         drop(pending.take());
     }
-    outcome
+    outcome.map(|()| None)
 }
 
 fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<ChildOutcome> {
@@ -4623,7 +4643,15 @@ fn finish_capture_error(
     signals: &SignalState,
 ) -> anyhow::Error {
     let finish = match owned {
-        Some(owned) => owned.finish(engine, session, CaptureEnd::Error, signals),
+        Some(owned) => {
+            let finish = owned.finish(engine, session, CaptureEnd::Error, signals);
+            // The error path never reaches the terminal print: name the
+            // handed-back survivor here, before the error surfaces.
+            if let Some(note) = owned.handoff_note.as_deref() {
+                emit_capture_diagnostic(note);
+            }
+            finish
+        }
         None => Ok(()),
     };
     let detach = session.detach_producers_driven(
@@ -4647,6 +4675,12 @@ fn finish_capture_loop(
     if let Some(owned) = owned.take()
         && let Err(error) = owned.finish(engine, session, end, signals)
     {
+        // A handoff the settlement committed before the failure must
+        // still name its survivor: the `None` error path below cannot
+        // print the stored note.
+        if let Some(note) = owned.handoff_note.as_deref() {
+            emit_capture_diagnostic(note);
+        }
         return Err(finish_capture_error(error, engine, session, None, signals));
     }
     Ok(end)
@@ -5179,6 +5213,7 @@ fn run_owned_inner_with_host(
         exit_code: None,
         requested_kill: false,
         still_running: false,
+        handoff_note: None,
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
         run_cgroup,
@@ -5296,9 +5331,11 @@ fn run_owned_inner_with_host(
     // A handed-back child is named on the terminal path (SYSPLAN residual
     // F-15): the evidence already carries `handoff_child_pid`, and the
     // operator reading stderr gets the same PID plus the handoff state.
+    // The note is the one the settlement stored when it committed the
+    // handoff, so an event-budget handoff never prints the duration text.
     // Still exit 0 — a deliberate handoff is observer success.
-    if owned.still_running {
-        emit_capture_diagnostic(&format_handoff_note(owned.pid));
+    if let Some(note) = owned.handoff_note.as_deref() {
+        emit_capture_diagnostic(note);
     }
     // A nonzero child status is named on stderr: the observer exits
     // with it, and that exit must never be silent about whose status
@@ -14675,7 +14712,7 @@ mod tests {
         );
         let mut exit_code = Some(999);
         let mut still_running = false;
-        commit_staged_observer_handoff(
+        let note = commit_staged_observer_handoff(
             &mut pending,
             CaptureEnd::LimitReached,
             &mut exit_code,
@@ -14686,6 +14723,13 @@ mod tests {
         assert!(still_running);
         assert!(retained.is_none());
         assert!(pending.is_none());
+        assert_eq!(
+            note,
+            Some(format_observer_end_handoff_note(
+                CaptureEnd::LimitReached,
+                pid
+            ))
+        );
         // Still our unreaped child, so kill(pid, 0) proves it survived.
         assert_eq!(
             unsafe { libc::kill(pid as libc::pid_t, 0) },
@@ -14721,13 +14765,14 @@ mod tests {
         );
         let mut exit_code = None;
         let mut still_running = true;
-        commit_staged_observer_handoff(
+        let note = commit_staged_observer_handoff(
             &mut pending,
             CaptureEnd::LimitReached,
             &mut exit_code,
             &mut still_running,
         )
         .unwrap();
+        assert_eq!(note, None);
         assert_eq!(exit_code, Some(128 + libc::SIGKILL));
         assert!(!still_running);
         assert!(retained.is_none());
@@ -14742,6 +14787,118 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD),
             "the raced exit was not reaped"
+        );
+    }
+
+    /// Observer-side settlements return the terminal handoff note for
+    /// their own end, so the terminal path prints the true reason: an
+    /// exhausted event budget must never read as an expired `--duration`.
+    #[test]
+    fn observer_end_settlements_return_their_own_handoff_note() {
+        for end in [CaptureEnd::Error, CaptureEnd::LimitReached] {
+            let mut child = spawn("/bin/sleep", &["30"]);
+            let pid = child.pid();
+            child.release().unwrap();
+            let signals = SignalState::new();
+            let mut retained = Some(child);
+            let mut pending = None;
+            let mut exit_code = Some(999);
+            let mut requested_kill = true;
+            let mut still_running = false;
+            let note = settle_owned_child(
+                &mut retained,
+                end,
+                true,
+                false,
+                &signals,
+                &mut pending,
+                &mut exit_code,
+                &mut requested_kill,
+                &mut still_running,
+            )
+            .unwrap();
+            assert_eq!(exit_code, None, "{end:?} must not report a status");
+            assert!(still_running, "{end:?} must hand back the live child");
+            assert_eq!(
+                note,
+                Some(format_observer_end_handoff_note(end, pid)),
+                "{end:?} must return its own terminal note"
+            );
+            if end == CaptureEnd::LimitReached {
+                assert!(
+                    !note.as_deref().unwrap_or_default().contains("duration expired"),
+                    "{end:?} printed the duration note: {note:?}"
+                );
+            }
+            drop(retained);
+            drop(pending);
+            assert_eq!(
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+                0,
+                "{end:?} killed the observed program"
+            );
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                pid as libc::pid_t
+            );
+        }
+    }
+
+    /// A `--duration` expiry without `--kill-on-timeout` stages the
+    /// handoff and returns the duration note for the terminal path.
+    #[test]
+    fn duration_expiry_settlement_returns_the_duration_handoff_note() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = Some(999);
+        let mut requested_kill = true;
+        let mut still_running = false;
+        let note = settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, None);
+        assert!(still_running);
+        assert_eq!(note, Some(format_handoff_note(pid)));
+        let mut staged = pending.take().expect("a staged running handoff");
+        staged.terminate_and_reap().unwrap();
+    }
+
+    /// The owned-run terminal block prints the note the settlement stored
+    /// when it committed the handoff — never a reason text formatted at
+    /// the terminal site, which cannot know which end handed the child
+    /// back.
+    #[test]
+    fn terminal_handoff_prints_the_settlement_stored_note() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let terminal = production
+            .split_once("// Still exit 0 — a deliberate handoff is observer success.")
+            .expect("terminal handoff block moved")
+            .1
+            .split_once("Ok(OwnedRunOutcome {")
+            .expect("terminal handoff block end moved")
+            .0;
+        assert!(
+            terminal.contains("owned.handoff_note"),
+            "the terminal handoff note must come from the settlement"
+        );
+        assert!(
+            !terminal.contains("format_handoff_note("),
+            "the terminal path must not format its own handoff note"
         );
     }
 
@@ -15671,6 +15828,7 @@ int main(int argc, char **argv) {
                         &mut requested_kill,
                         &mut still_running,
                     )
+                    .map(|_| ())
                 },
                 |_| {
                     published.set(true);

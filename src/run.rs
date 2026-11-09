@@ -23080,14 +23080,14 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// Every rendered profile frame reclaims its transient heap. A
-    /// `--system` frame pins module files and buffers the match, like a
-    /// classic inventory pass; without the release glibc retains the freed
-    /// peak and long profile captures blow the soak RSS bound. Pinned as
-    /// source text like the frame-decision test above: the real loop needs
-    /// attached BPF, which unit tests cannot drive.
+    /// Every rendered profile frame finishes through the reclaiming helper,
+    /// passing the real heap hook. The helper's once-per-call composition is
+    /// execution-tested; the call itself stays pinned as source text like the
+    /// frame-decision test above: the real loop needs attached BPF, which unit
+    /// tests cannot drive. Comment-stripped, so keeping the call as a comment
+    /// still fails; the `if` count pins the call against an `if false` guard.
     #[test]
-    fn rendered_profile_frames_reclaim_their_transient_heap() {
+    fn rendered_profile_frames_finish_through_the_reclaiming_helper() {
         let source = include_str!("run.rs");
         let profile = source
             .split_once("fn capture_profile(")
@@ -23103,10 +23103,25 @@ int main(int argc, char **argv) {
             .split_once("request_profile_recovery_frame(")
             .unwrap()
             .0;
+        let code = render
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(
-            render.matches("reclaim_pass_heap()").count(),
+            code.matches("finish_profile_render_frame(").count(),
             1,
-            "capture_profile reclaims the transient heap once per rendered frame"
+            "capture_profile finishes each rendered frame through the helper once"
+        );
+        assert_eq!(
+            code.matches("crate::inventory::reclaim_pass_heap").count(),
+            1,
+            "the finish call passes the real heap hook"
+        );
+        assert_eq!(
+            code.matches("if ").count(),
+            2,
+            "the render block holds only its frame-bytes check and the finish call"
         );
     }
 

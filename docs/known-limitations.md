@@ -196,6 +196,14 @@ fallback entry stands as written), and the historical 5.15
 physical-identity and non-leader-exec qualifications under
 [Kernels and backends](#kernels-and-backends).
 
+### Pid-scope caller name after exec
+
+`profile --pid` and `metrics --pid` name the target executable read
+when probes attach; if the target execs another program during the
+capture, `capture.caller` and the stderr `target:` line keep the
+attach-time name while the new program's calls still count. Reporting
+the end-of-capture executable is 0.7.x work.
+
 ### Key-tracking rate ceiling
 
 Key-operation rows keep the v0.6.0 ceiling: exact rows at 6,250

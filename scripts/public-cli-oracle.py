@@ -599,6 +599,20 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and len(skip_entries) >= 1
         and all(skip == DISCLOSABLE_DISCOVERY_SKIP for skip in skip_entries)
         and evidence.get("modules_skipped") == [])
+    # Round-2 ruling 2026-11-09: the vng guest legs are quiet
+    # (pid_descendant_gaps=0), so mt-system deterministically carries
+    # the lone named discovery skip on every guest kernel with zero
+    # loss and exact owned counts. The quiet half qualifies strict on
+    # mt-system only, with exactly one named skip and gaps pinned at
+    # zero; owned counts stay exact (checked below), owned loss stays
+    # zero (checked above) and any other class still fails.
+    ok_quiet = (
+        cell == "mt-system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped"]
+        and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) == 0)
     if relaxed:
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
@@ -621,7 +635,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         require(ok_exact or ok_gap or ok_ambient,
                 "lossy or unknown observation gap class")
     elif scope == "system":
-        require(ok_exact or ok_ambient, "lossy or unknown observation gap class")
+        require(ok_exact or ok_ambient or ok_quiet, "lossy or unknown observation gap class")
     else:
         require(ok_exact, "lossy or unknown observation gap class")
     kernel = evidence.get("kernel_control", {})
@@ -635,7 +649,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     ambient = (not relaxed and scope == "system" and
-               observation.get("causes") == ["skipped", "pid_descendant_gaps"])
+               (observation.get("causes") == ["skipped", "pid_descendant_gaps"] or
+                (cell == "mt-system" and observation.get("causes") == ["skipped"])))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps
@@ -775,7 +790,8 @@ def main(argv=None):
                              "ruling U1: on `mt-system` only, also disclose the named "
                              "{discovery subject, discovery unavailable} skips; "
                              "the 2026-11-09 ambient-gap ruling qualifies exactly that "
-                             "skip family on every system-scope cell with or without this flag")
+                             "skip family on every system-scope cell with or without this flag; "
+                             "the quiet lone-skip half qualifies strict on mt-system only")
     parser.add_argument("--allow-66-discovery-gap", action="store_true",
                         help="flake-66: on select-endpoint-system only, disclose exactly one "
                              "redacted discovery skip as a 6.6 transient instead of failing")

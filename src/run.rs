@@ -14433,9 +14433,167 @@ mod tests {
         unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
     }
 
+    /// Settles one observer-side end over a live released child with no
+    /// operator stop: the child must be handed back running, never killed.
+    /// Shared by the Error and LimitReached ends, which take one branch.
+    fn assert_observer_end_hands_off_live_child(end: CaptureEnd) {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = Some(999);
+        let mut requested_kill = true;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            end,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, None, "{end:?} must not report a status");
+        assert!(still_running, "{end:?} must hand back the live child");
+        assert!(!requested_kill, "{end:?} must not mark a requested kill");
+        drop(retained);
+        drop(pending);
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "{end:?} killed the observed program"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
     #[test]
-    fn terminal_failure_aborts_staged_handoff_and_reaps_child() {
-        let mut child = spawn("/bin/sleep", &["10"]);
+    fn capture_error_hands_off_the_live_child_instead_of_killing_it() {
+        assert_observer_end_hands_off_live_child(CaptureEnd::Error);
+    }
+
+    #[test]
+    fn limit_reached_hands_off_the_live_child_instead_of_killing_it() {
+        assert_observer_end_hands_off_live_child(CaptureEnd::LimitReached);
+    }
+
+    /// A stop the operator requested still settles through the signal path
+    /// on an observer-side end: the forwarded signal reaches the child.
+    #[test]
+    fn capture_error_with_operator_stop_still_forwards_the_signal() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        child.release().unwrap();
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = true;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::Error,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(128 + libc::SIGTERM));
+        assert!(!still_running);
+        assert!(!requested_kill);
+    }
+
+    /// A child that already exited keeps its own status on an observer-side
+    /// end: the settlement reaps, it never signals.
+    #[test]
+    fn capture_error_reaps_an_already_exited_child() {
+        let mut child = spawn("/bin/true", &[]);
+        child.release().unwrap();
+        wait_until(
+            || !child.still_running(),
+            "the true child never exited on its own",
+        );
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = true;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::Error,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(0));
+        assert!(!still_running);
+        assert!(!requested_kill);
+    }
+
+    /// Dropping a released child detaches it without killing: the panic path
+    /// leaves the observed program running for init to adopt.
+    #[test]
+    fn dropping_a_released_child_leaves_it_running() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        drop(child);
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "dropping the owner killed the released command"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
+    /// A pre-exec child never ran the command: dropping it still kills it
+    /// where it stands, so nothing can release it late.
+    #[test]
+    fn dropping_an_unreleased_child_still_kills_it_where_it_stands() {
+        let child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        wait_for_session_leader(&child);
+        drop(child);
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    /// A terminal failure hands a live staged child back instead of killing
+    /// it: the observed program outlives the failed capture.
+    #[test]
+    fn terminal_failure_hands_off_a_live_staged_child() {
+        let mut child = spawn("/bin/sleep", &["30"]);
         let pid = child.pid();
         child.release().unwrap();
         let mut pending = None;
@@ -14450,14 +14608,19 @@ mod tests {
         );
         let rendered = format!("{error:#}");
         assert!(rendered.contains("terminal failed"), "{rendered}");
-        assert!(pending.is_none(), "pending handoff was not aborted");
+        assert!(pending.is_none(), "pending handoff was not settled");
 
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-        assert_eq!(waited, -1);
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
         assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::ECHILD)
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "aborting the handoff killed the observed program"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
         );
 
         let synthetic = combine_handoff_failure(
@@ -14473,6 +14636,125 @@ mod tests {
             synthetic_rendered.contains("aborting pending handoff failed"),
             "{synthetic_rendered}"
         );
+    }
+
+    /// A staged child that exited on its own is reaped, never signalled.
+    #[test]
+    fn terminal_failure_reaps_an_exited_staged_child() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut Some(child), &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        wait_until(
+            || !pending.as_ref().unwrap().pin.still_the_same(),
+            "the staged child never died from the direct kill",
+        );
+
+        let error = combine_handoff_failure(
+            anyhow!("terminal failed"),
+            abort_pending_handoff(&mut pending),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("terminal failed"), "{rendered}");
+        assert!(pending.is_none(), "pending handoff was not settled");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    /// The probe reports its own parent-death signal, then sleeps so the
+    /// parent can settle it. Written inline like the backend.c precedent.
+    const PARENT_DEATH_PROBE_C: &str = r#"
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+#ifndef PR_GET_PDEATHSIG
+#define PR_GET_PDEATHSIG 2
+#endif
+int main(int argc, char **argv) {
+    int signal_number = -1;
+    if (argc != 2) return 4;
+    if (prctl(PR_GET_PDEATHSIG, &signal_number) != 0) return 2;
+    FILE *stream = fopen(argv[1], "w");
+    if (stream == 0) return 3;
+    if (fprintf(stream, "%d\n", signal_number) < 0) return 3;
+    if (fclose(stream) != 0) return 3;
+    sleep(30);
+    return 0;
+}
+"#;
+
+    /// Compiles the parent-death probe and spawns it with or without the
+    /// test-only SIGKILL arm, returning the signal it reports for itself.
+    fn probe_parent_death_signal(production: bool) -> i32 {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pdeathsig_probe.c");
+        let binary = directory.path().join("pdeathsig_probe");
+        let report = directory.path().join("pdeathsig.report");
+        std::fs::write(&source, PARENT_DEATH_PROBE_C).unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+                .arg(&binary)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success(),
+            "the parent-death probe did not compile"
+        );
+        let mut child = if production {
+            spawn_with_production_parent_death(
+                binary.into_os_string(),
+                vec![report.clone().into_os_string()],
+            )
+            .unwrap()
+        } else {
+            OwnedChild::spawn(
+                binary.into_os_string(),
+                vec![report.clone().into_os_string()],
+            )
+            .unwrap()
+        };
+        child.release().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reported = loop {
+            if let Ok(text) = std::fs::read_to_string(&report)
+                && !text.trim().is_empty()
+            {
+                break text.trim().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the probe never reported its parent-death signal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        child.terminate_and_reap().unwrap();
+        reported.parse().unwrap()
+    }
+
+    /// The production spawn arms SIGCONT: a pause-held child resumes when
+    /// the observer dies, and a running child never notices.
+    #[test]
+    fn production_parent_death_signal_is_sigcont() {
+        assert_eq!(probe_parent_death_signal(true), libc::SIGCONT);
+    }
+
+    /// Control: the test-only arm stays SIGKILL, so abrupt test deaths
+    /// still clean up their fixtures.
+    #[test]
+    fn test_parent_death_signal_stays_sigkill() {
+        assert_eq!(probe_parent_death_signal(false), libc::SIGKILL);
     }
 
     #[test]
@@ -14689,16 +14971,9 @@ mod tests {
                 true,
                 false,
                 None,
-                Some(128 + libc::SIGTERM),
-            ),
-            (
-                "/bin/sleep",
-                CaptureEnd::Error,
-                true,
-                false,
                 None,
-                Some(128 + libc::SIGTERM),
             ),
+            ("/bin/sleep", CaptureEnd::Error, true, false, None, None),
             (
                 "/bin/sleep",
                 CaptureEnd::DurationExpired,
@@ -14769,9 +15044,24 @@ mod tests {
                 pending.is_some(),
                 end == CaptureEnd::DurationExpired && cleanup_ok && !kill_on_timeout
             );
-            if let Some(pending) = pending {
+            if let Some(mut pending) = pending {
                 assert!(pending.still_running());
                 assert_eq!(pending.pid(), pid);
+                pending.terminate_and_reap().unwrap();
+            } else if still_running {
+                // A committed handoff is no longer owned: settle the
+                // survivor by PID so no case leaks a live sleeper.
+                assert_eq!(
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+                    0,
+                    "{program} {end:?}"
+                );
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                    pid as libc::pid_t,
+                    "{program} {end:?}"
+                );
             }
         }
     }
@@ -15083,10 +15373,10 @@ mod tests {
 
     /// I1: a quiesce failure after `--duration` without
     /// `--kill-on-timeout` settles with the loop's real end, so the live
-    /// child is handed back (not reaped by an `Error` settlement, and not
-    /// SIGKILLed by a skipped settlement's `Drop`). A failed loop still
-    /// reaps. The real `settle_owned_child` runs behind the combiner with
-    /// a real sleeper child.
+    /// child is handed back (never reaped, and never SIGKILLed by a skipped
+    /// settlement's `Drop`). A failed loop settles through the same
+    /// observer-side handoff. The real `settle_owned_child` runs behind the
+    /// combiner with a real sleeper child.
     #[test]
     fn quiesce_error_after_duration_expiry_hands_back_the_living_child() {
         for loop_failed in [false, true] {
@@ -15143,18 +15433,30 @@ mod tests {
                     message.contains("loop failure") && message.contains("quiesce failure"),
                     "either error dropped: {message}"
                 );
-                assert_eq!(exit_code, Some(128 + libc::SIGTERM));
-                assert!(!still_running);
+                // An Error settlement hands the live child back, never
+                // kills it; the handoff commits, so nothing stays pending.
+                assert_eq!(exit_code, None);
+                assert!(still_running);
                 assert!(pending.is_none());
+                assert!(retained.is_none());
+                assert_eq!(
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+                    0,
+                    "the failed loop killed the observed program"
+                );
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                    pid as libc::pid_t
+                );
             } else {
                 assert_eq!(message, "quiesce failure");
                 assert_eq!(exit_code, None);
                 assert!(still_running);
-                let pending = pending.expect("the live child must be handed back");
+                let mut pending = pending.expect("the live child must be handed back");
                 assert_eq!(pending.pid(), pid);
                 assert!(pending.still_running());
-                // Dropping the pending handoff SIGKILLs the sleeper, as in
-                // the disposition test above.
+                pending.terminate_and_reap().unwrap();
             }
         }
     }
@@ -15985,6 +16287,7 @@ mod tests {
             ] {
                 let case = format!("{policy:?}/{end:?}");
                 let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+                let pid = child.pid();
                 let signals = SignalState::new();
                 let mut held = HeldPause::default();
                 let mut coordinator = {
@@ -16088,12 +16391,35 @@ mod tests {
                     // `--duration` without `--kill-on-timeout` hands it back.
                     assert_eq!(exit_code, None, "{case}");
                     assert!(still_running, "{case}");
-                    let staged = pending.as_ref().expect("a staged running handoff");
+                    let staged = pending.as_mut().expect("a staged running handoff");
                     assert!(
                         !original_child_is_stopped(staged.pin().pidfd().unwrap()),
                         "{case}: a handed-back child is never left stopped"
                     );
-                    // Uncommitted: dropping the staged child kills and reaps it.
+                    staged.terminate_and_reap().unwrap();
+                } else if end == CaptureEnd::Error {
+                    // A capture error hands the live child back running,
+                    // never stopped and never killed.
+                    assert_eq!(exit_code, None, "{case}");
+                    assert!(still_running, "{case}");
+                    assert!(pending.is_none(), "{case}: the error handoff commits");
+                    assert!(retained.is_none(), "{case}: the error handoff commits");
+                    assert_eq!(
+                        unsafe { libc::kill(pid as libc::pid_t, 0) },
+                        0,
+                        "{case}: the error settlement killed the observed program"
+                    );
+                    assert_eq!(
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+                        0,
+                        "{case}"
+                    );
+                    let mut status = 0;
+                    assert_eq!(
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                        pid as libc::pid_t,
+                        "{case}"
+                    );
                 } else {
                     assert_eq!(
                         exit_code,
@@ -23666,14 +23992,14 @@ mod tests {
         }
     }
 
-    /// F-T4-4 observation (no production change): what happens to a stopped
-    /// owned child when the observer dies by SIGKILL. A forked intermediate
-    /// plays the observer — it spawns, releases, and stops a sleeper in its
-    /// own session, reports its pid, then waits to be SIGKILLed — while this
-    /// process, briefly a subreaper, reaps the orphan and records whether the
-    /// orphaned-process-group rule hung it up or left it stranded in T.
+    /// F-T4-4 observation: what happens to a stopped owned child when the
+    /// observer dies by SIGKILL. A forked intermediate plays the observer —
+    /// it spawns, releases, and stops a sleeper in its own session, reports
+    /// its pid, then waits to be SIGKILLed — while this process, briefly a
+    /// subreaper, reaps the orphan and records that the SIGCONT
+    /// parent-death signal resumes it instead of stranding it in T.
     #[test]
-    fn sigkill_of_the_observer_strands_a_stopped_owned_child() {
+    fn sigkill_of_the_observer_resumes_a_stopped_owned_child() {
         use std::io::Read as _;
 
         let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
@@ -23712,41 +24038,45 @@ mod tests {
         );
 
         // The orphaned-process-group rule, if it fires, delivers SIGHUP and
-        // SIGCONT promptly at orphaning. Anything still stopped after this
+        // SIGCONT promptly at orphaning; the SIGCONT parent-death signal
+        // lands with the death itself. Anything still stopped after this
         // window was stranded, not hung up.
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut seen = Vec::new();
-        let stranded = loop {
+        let resumed = loop {
             match child_stat_state(orphan) {
                 None => break false,
                 Some(state) => {
                     if seen.last() != Some(&state) {
                         seen.push(state);
                     }
+                    if state != 'T' {
+                        break true;
+                    }
                     if Instant::now() >= deadline {
-                        break state == 'T';
+                        break false;
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
         };
         assert!(
-            stranded,
-            "the orphaned stopped child did not stay stopped (states seen: {seen:?})"
+            resumed,
+            "the orphaned stopped child stayed stopped (states seen: {seen:?})"
         );
 
-        // Cleanup, and the stranding proof: the orphan must be alive until
+        // Cleanup, and the resume proof: the orphan must be alive until
         // this SIGKILL lands, then reaped without residue.
         // SAFETY: signaling the exact orphan only.
         assert_eq!(
             unsafe { libc::kill(orphan as libc::pid_t, libc::SIGKILL) },
             0,
-            "the stranded orphan died before cleanup"
+            "the resumed orphan died before cleanup"
         );
         let orphan_status = reap_blocking(orphan as libc::pid_t);
         assert!(
             libc::WIFSIGNALED(orphan_status) && libc::WTERMSIG(orphan_status) == libc::SIGKILL,
-            "the stranded orphan did not die by the cleanup SIGKILL: status {orphan_status:#x}"
+            "the resumed orphan did not die by the cleanup SIGKILL: status {orphan_status:#x}"
         );
     }
 

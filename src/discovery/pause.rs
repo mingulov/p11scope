@@ -3425,6 +3425,20 @@ pub(crate) struct TimedItem {
     terminal_batch: Option<TerminalBatch>,
 }
 
+#[cfg(test)]
+impl TimedItem {
+    /// A received discovery record stamped at `at_ns`, for seam tests that
+    /// script the pause I/O (post-release revalidation deferrals).
+    pub(crate) fn record_for_test(record: DiscoveryRecord, at_ns: u64) -> Self {
+        Self {
+            before_ns: at_ns,
+            after_ns: at_ns,
+            item: DiscoveryItem::Record(record),
+            terminal_batch: None,
+        }
+    }
+}
+
 fn exact_pid(record: &DiscoveryRecord) -> u32 {
     (record.pid_tgid >> 32) as u32
 }
@@ -10746,6 +10760,42 @@ mod tests {
         assert!(
             document["functions"].as_array().is_some(),
             "the report carries the function table"
+        );
+
+        // The `always` twin: a required pause keeps refusing. The same stop
+        // during the same hold fails the run with the cancellation and
+        // publishes no report.
+        let mut argv: Vec<std::ffi::OsString> = vec![
+            "run".into(),
+            "--pause".into(),
+            "always".into(),
+            "-o".into(),
+            dir.join("sigint-hold-always.json").into(),
+            "--".into(),
+        ];
+        argv.extend([
+            "/usr/bin/env".into(),
+            format!("SOFTHSM2_CONF={}", conf.display()).into(),
+            format!("LD_PRELOAD={module}").into(),
+            "/usr/bin/sleep".into(),
+            "30".into(),
+        ]);
+        let parsed = crate::cli::parse(argv).expect("the always run parses");
+        let crate::cli::Command::Run(args) = parsed else {
+            panic!("expected an owned run");
+        };
+        assert_eq!(args.pause, PausePolicy::Always);
+        drop(_hook);
+        let _hook = SigintWhileHeldGuard::arm();
+        let error = crate::run::run_owned(&args)
+            .expect_err("a required pause refuses a stop during its hold");
+        assert!(
+            format!("{error:#}").contains("pause coordination cancelled"),
+            "the refusal names the cancellation: {error:#}"
+        );
+        assert!(
+            !dir.join("sigint-hold-always.json").exists(),
+            "a refused required pause publishes no report"
         );
     }
 

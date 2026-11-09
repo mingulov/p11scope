@@ -15254,6 +15254,9 @@ mod tests {
         authorization_reads: usize,
         dequeues: usize,
         arm_error: Option<String>,
+        /// Post-release revalidation hands the queued record back as a
+        /// deferred pause-owned item (the first hold right after release).
+        deferred_revalidation: bool,
     }
 
     /// The helper's stop, as the kernel performs it: a loader hook in the
@@ -15382,6 +15385,15 @@ mod tests {
             _: bool,
         ) -> std::result::Result<crate::discovery::pause::PauseRevalidationOutcome, String>
         {
+            if self.held.deferred_revalidation
+                && let Some(crate::discovery::pause::DiscoveryItem::Record(record)) =
+                    self.held.queue.pop_front()
+            {
+                let at = self.held.now_ns;
+                return Ok(crate::discovery::pause::PauseRevalidationOutcome::Deferred(
+                    crate::discovery::pause::TimedItem::record_for_test(record, at),
+                ));
+            }
             Err("post-release revalidation is not part of shutdown".into())
         }
 
@@ -16009,6 +16021,119 @@ mod tests {
             "the cancelled cycle resumes the held child"
         );
         // Dropping the child kills and reaps it.
+    }
+
+    /// Arms a held-pause coordinator under `policy` for a freshly spawned
+    /// sleeper, releases the child and holds it stopped through the helper.
+    fn armed_and_held(
+        policy: cli::PausePolicy,
+        child: &mut OwnedChild,
+        held: &mut HeldPause,
+        signals: &SignalState,
+    ) -> PauseCoordinator {
+        let coordinator = {
+            let mut io = HeldPauseIo {
+                child: &*child,
+                held: &mut *held,
+                signals,
+            };
+            let mut coordinator = PauseCoordinator::preflight(policy, &*child, &mut io).unwrap();
+            assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+            coordinator
+        };
+        child.release().unwrap();
+        helper_stop(child, held);
+        assert!(
+            original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the helper stop must hold the child before the stop lands"
+        );
+        coordinator
+    }
+
+    /// The `always` twin of the held-cycle stop: a required pause keeps
+    /// refusing. The between-frames step fails the capture with the
+    /// cancellation (no report under `always`), and the child is resumed,
+    /// never stranded stopped.
+    #[test]
+    fn a_stop_during_a_held_always_cycle_still_refuses_with_the_cancellation() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause {
+            batch_changes_plan: true,
+            ..HeldPause::default()
+        };
+        let mut coordinator =
+            armed_and_held(cli::PausePolicy::Always, &mut child, &mut held, &signals);
+        signals.observe(libc::SIGTERM);
+        let mut io = HeldPauseIo {
+            child: &child,
+            held: &mut held,
+            signals: &signals,
+        };
+        let error = pending_stop_pass(&mut coordinator, &mut io)
+            .expect_err("a required pause refuses a stop during its hold");
+        assert!(
+            format!("{error:#}").contains("pause coordination cancelled"),
+            "the refusal names the cancellation: {error:#}"
+        );
+        assert!(
+            !original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the cancelled cycle resumes the held child"
+        );
+    }
+
+    /// A stop landing in the first hold right after release (post-release
+    /// revalidation services a deferred stop) is the same signal end as a
+    /// stop during a tick's hold: under `auto` the step hands back so the
+    /// loop observes the stop and writes the report, counting one partial;
+    /// under `always` it still refuses with the cancellation. The child is
+    /// resumed either way.
+    #[test]
+    fn a_stop_during_the_post_release_hold_ends_auto_by_signal_and_refuses_always() {
+        use crate::discovery::pause::PauseCounters;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        for policy in [cli::PausePolicy::Auto, cli::PausePolicy::Always] {
+            let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+            let signals = SignalState::new();
+            let mut held = HeldPause {
+                deferred_revalidation: true,
+                ..HeldPause::default()
+            };
+            let mut coordinator = armed_and_held(policy, &mut child, &mut held, &signals);
+            signals.observe(libc::SIGTERM);
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            let revalidated = post_release_pass(&mut coordinator, &mut io);
+            if policy == cli::PausePolicy::Auto {
+                revalidated.expect("auto: a stop during the post-release hold is a signal end");
+                assert_eq!(
+                    coordinator.counters(),
+                    PauseCounters {
+                        attempts: 1,
+                        confirmed: 0,
+                        partial: 1,
+                        unavailable: 0,
+                    },
+                    "auto: the cancelled attempt counts one partial"
+                );
+            } else {
+                let error = revalidated.expect_err("always: a required pause refuses");
+                assert!(
+                    format!("{error:#}").contains("pause coordination cancelled"),
+                    "always: the refusal names the cancellation: {error:#}"
+                );
+            }
+            assert!(
+                !original_child_is_stopped(child.pin().pidfd().unwrap()),
+                "{policy:?}: the cancelled cycle resumes the held child"
+            );
+        }
     }
 
     /// Settling an owned-run pause preflight: success passes the coordinator

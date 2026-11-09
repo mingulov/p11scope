@@ -1683,9 +1683,10 @@ Limits that matter in pods:
   (exit 1) naming why; `auto` (the default) runs `native` when it can
   start and, for `--pid`, otherwise falls back to `scan` with the gap
   `native usage feed unavailable` (`--system` and `--cgroup` fail the
-  run with the refusal instead, except on kernels without `uprobe_multi`
-  where they also fall back to `scan` with the same gap and the reason
-  names the unavailable call counts). Under the interactive `--dashboard` the native lane
+  run with the refusal instead, except on hosts where `uprobe_multi` is
+  unavailable, where they also fall back to `scan` with the same gap and
+  the reason names the unavailable call counts). Under the interactive
+  `--dashboard` the native lane
   runs exactly as on the classic path; the dashboard gives the terminal
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the

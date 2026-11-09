@@ -11399,6 +11399,28 @@ mod tests {
         );
     }
 
+    /// Every preflight miss fails with its named reason; nothing skips.
+    /// Unprivileged this observes the root gate; privileged it observes
+    /// the pass (or a later named probe).
+    #[test]
+    fn nschroot_preflight_fails_named_never_skips() {
+        match nschroot_preflight() {
+            Ok(()) => {
+                assert_eq!(
+                    unsafe { libc::geteuid() },
+                    0,
+                    "preflight passes only with privilege"
+                );
+            }
+            Err(reason) => {
+                assert!(
+                    reason.starts_with("NSCHROOT-PREFLIGHT "),
+                    "named reason, never a skip: {reason}"
+                );
+            }
+        }
+    }
+
     /// Re-exec channel for the self-chrooting scan fixture below. The parent
     /// half respawns this same test binary with these variables set; the child
     /// half enters the new root and sleeps until the parent kills it. Its

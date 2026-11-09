@@ -5153,7 +5153,7 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
         segments.push(format!(
             "found {} PKCS#11 {noun} {scope_bit} but could not count calls: {}",
             confirmed.len(),
-            empty_plan_pairs(&confirmed),
+            empty_plan_pairs(&confirmed, false),
         ));
     }
     if !unexamined.is_empty() {
@@ -5167,13 +5167,13 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
                 "no PKCS#11 modules discovered {scope_bit}, but {} mapped {noun} could not be \
                  examined, so providers among them would be missed: {}",
                 unexamined.len(),
-                empty_plan_pairs(&unexamined),
+                empty_plan_pairs(&unexamined, false),
             ));
         } else {
             segments.push(format!(
                 "{} mapped {noun} could not be examined: {}",
                 unexamined.len(),
-                empty_plan_pairs(&unexamined),
+                empty_plan_pairs(&unexamined, false),
             ));
         }
     }
@@ -5182,12 +5182,12 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
             segments.push(format!(
                 "no PKCS#11 modules discovered {scope_bit}, but capture discovery stopped \
                  before it could examine every mapping: {}",
-                empty_plan_pairs(&discovery_stops),
+                empty_plan_pairs(&discovery_stops, true),
             ));
         } else {
             segments.push(format!(
                 "capture discovery stopped early: {}",
-                empty_plan_pairs(&discovery_stops),
+                empty_plan_pairs(&discovery_stops, true),
             ));
         }
     }
@@ -5205,17 +5205,23 @@ fn empty_plan_skip_is_verified_absence(skip: &crate::discovery::scan::Skipped) -
 
 /// One `subject — reason` pair per skip, control-escaped, at most two
 /// shown plus an "and K more" tail (the concise module-gaps width).
-fn empty_plan_pairs(skips: &[&crate::discovery::scan::Skipped]) -> String {
+/// With `reasons_only` (discovery stops, whose segment lead already
+/// names the subject), only the bare reasons are listed.
+fn empty_plan_pairs(skips: &[&crate::discovery::scan::Skipped], reasons_only: bool) -> String {
     const SHOWN: usize = 2;
     let shown: Vec<String> = skips
         .iter()
         .take(SHOWN)
         .map(|skip| {
-            format!(
-                "{} — {}",
-                crate::render::escape_controls(&skip.subject),
-                crate::render::escape_controls(&skip.reason),
-            )
+            if reasons_only {
+                crate::render::escape_controls(&skip.reason).into_owned()
+            } else {
+                format!(
+                    "{} — {}",
+                    crate::render::escape_controls(&skip.subject),
+                    crate::render::escape_controls(&skip.reason),
+                )
+            }
         })
         .collect();
     if skips.len() > SHOWN {

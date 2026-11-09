@@ -218,7 +218,7 @@ def load_inputs(root, recipe):
 
 def make_config(metadata, root, recipe):
     inputs = root / "third-party/licenses"
-    text = 'accepted = ["MIT", "ISC", "Zlib", "Unicode-3.0", "Apache-2.0", "GPL-2.0-or-later", "GPL-3.0-or-later", "GPL-2.0-only"]\n'
+    text = 'accepted = ["MIT", "MIT-0", "ISC", "Zlib", "Unicode-3.0", "Apache-2.0", "GPL-2.0-or-later", "GPL-3.0-or-later", "GPL-2.0-only"]\n'
     text += 'ignore-build-dependencies = false\nignore-dev-dependencies = false\nignore-transitive-dependencies = false\nmax-depth = 10\n'
     project = {"p11scope", "p11scope-discover", "p11scope-bpf-multi", "p11scope-manifest", "p11scope-ebpf", "p11scope-ebpf-common"}
     clarified = set()

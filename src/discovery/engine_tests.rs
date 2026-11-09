@@ -10181,6 +10181,95 @@ fn a_dead_stale_view_with_a_new_attach_target_stays_loud() {
     );
 }
 
+/// Twin (guard) of the exited-generation silence: one dead stale view
+/// that owns no target plus a LIVE view whose newcomer owns a pending
+/// attach target in `delta.new`. The abort defers the live attach and
+/// loses its module from `attach_gap_ms`, so the apply must keep the
+/// named mark: the silence is for an empty delta only.
+#[test]
+fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
+    let (_fixture, live_view, module, pins) = loaded_seed_provider();
+    let live_id = live_view.id();
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_view = ProcessView::open(ProcessViewId(4400), dead.id()).unwrap();
+    let dead_id = dead_view.id();
+    let mut engine = Engine::empty();
+    engine.views.push(live_view);
+    engine.views.push(dead_view);
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    candidate.views.insert(live_id);
+    candidate.views.insert(dead_id);
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert_eq!(
+        outcome.stale_views,
+        BTreeSet::from([dead_id]),
+        "only the reaped view aborts the apply; the newcomer's view is live"
+    );
+    assert!(
+        !outcome.static_failures.is_empty(),
+        "the live newcomer's module is lost from the gap accounting: {:?}",
+        outcome.static_failures
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "a deferred live attach target keeps the named mark: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .all(|line| !line.contains("candidate generation exited before mutation")),
+        "no silence note when a live target is deferred: {:?}",
+        engine.counters.noise.lines()
+    );
+}
+
 /// The H2 silence gate, case by case: all-dead reads silent; anything
 /// live, mixed, or unknown reads loud (fail-closed). Direct unit cover
 /// for the predicate the candidate test above wires through the apply.

@@ -4786,7 +4786,7 @@ pub struct CaptureMeta<'a> {
 /// operator's own target pid is named on stderr diagnostics only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureCaller {
-    /// Target executable path, verbatim from the exe link.
+    /// Target executable path, lossy UTF-8 from the exe link.
     pub exe: Option<String>,
     /// Finite reason when `exe` is `None`, else `None`.
     pub exe_unknown_reason: Option<&'static str>,

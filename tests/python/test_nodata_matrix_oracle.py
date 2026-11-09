@@ -250,6 +250,7 @@ class OracleCase(unittest.TestCase):
                               extra=("--caller-pid", "4242"))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: zero calls", text)
 
     # RED: exact multiset mismatch (one call missing).
     def test_profile_exact_mismatch_fail(self):
@@ -263,6 +264,7 @@ class OracleCase(unittest.TestCase):
             extra=("--exact", "{expected}", "--caller-pid", "4242"))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: exact multiset mismatch", text)
 
     # RED: provider module absent from the document.
     def test_profile_provider_absent_fail(self):
@@ -274,6 +276,7 @@ class OracleCase(unittest.TestCase):
             extra=("--caller-pid", "4242"))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: provider libnodata.so absent", text)
 
     # RED: trace truncated below the promised exact counts.
     def test_trace_truncated_fail(self):
@@ -281,10 +284,14 @@ class OracleCase(unittest.TestCase):
         counts["C_GenerateRandom"] = 10
         body = trace_text(counts, extra="TRUNCATED at 1000 events "
                                        "(--max-events 1000)")
-        rc, text = self.judge("trace", "pid", body,
-                              extra=("--exact", "{expected}"))
+        rc, text = self.judge(
+            "trace", "pid", body,
+            stderr_body="note: /work/cells/x/libnodata.so attached\n",
+            extra=("--exact", "{expected}"))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: exact event multiset mismatch", text)
+        self.assertNotIn("FAIL: provider", text)
 
     # RED: the trigger shape — inventory attaches zero endpoints.
     def test_inventory_zero_endpoints_fail(self):
@@ -294,6 +301,7 @@ class OracleCase(unittest.TestCase):
                               min_calls=0)
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: zero endpoints attached", text)
 
     # RED: refused admission without a named reason.
     def test_inventory_unnamed_refusal_fail(self):
@@ -305,6 +313,7 @@ class OracleCase(unittest.TestCase):
                               min_calls=0)
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: unnamed refusal", text)
 
     # RED: caller missing with no named gap anywhere.
     def test_inventory_caller_missing_unnamed_fail(self):
@@ -314,12 +323,14 @@ class OracleCase(unittest.TestCase):
                               min_calls=0)
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: caller 'harness' absent", text)
 
     # RED: valid JSON the oracle does not understand must not pass.
     def test_unrecognized_shape_fail(self):
         rc, text = self.judge("profile", "pid", json.dumps({"hello": 1}))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: oracle: unrecognized shape", text)
 
     # GREEN: trace with unknown-only exe but a named attribution cause
     # (manifest-less runs withhold exe labels as semantic_unverified_slots).
@@ -339,9 +350,13 @@ class OracleCase(unittest.TestCase):
         body = trace_text(EXPECTED_COUNTS,
                           caller="Unknown executable").replace(
             'exe="/work/harness" ', "")
-        rc, text = self.judge("trace", "pid", body)
+        rc, text = self.judge(
+            "trace", "pid", body,
+            stderr_body="note: /work/cells/x/libnodata.so attached\n")
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: caller 'harness' unnamed on all", text)
+        self.assertNotIn("FAIL: provider", text)
 
 
 if __name__ == "__main__":

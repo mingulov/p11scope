@@ -37230,7 +37230,11 @@ fn cgroup_walk_reports_zero_listed_members_as_invisible_losses() {
     );
     assert!(lost[0].reason.contains("listed as 0"), "{lost:?}");
     assert!(lost[0].reason.contains("PID namespace"), "{lost:?}");
-    assert_eq!(lost[0].subject, root.path().display().to_string());
+    assert_eq!(
+        lost[0].subject,
+        format!("{}/", root.path().display()),
+        "the loss names the operator path of the cgroup that listed them"
+    );
 }
 
 #[test]

@@ -3607,20 +3607,24 @@ fn capture_with_host(
     if engine.plan().modules.is_empty() && !named_pid_gone {
         // DR-K8S-5: a nested observer that found nothing cannot tell "no
         // providers" from "providers only on the invisible host": refuse
-        // by name (nonzero, no report) instead of an empty view.
+        // by name (nonzero, no report) instead of an empty view — unless
+        // this is a --cgroup capture whose every member was proven
+        // visible and readable, which ends as an ordinary empty capture
+        // naming its proof.
         let what = match &a.scope {
             ScopeArg::Pid(pid) => format!("--pid {pid}"),
             ScopeArg::Cgroup(_) => "a --cgroup capture".to_string(),
             ScopeArg::System => "a --system capture".to_string(),
         };
-        crate::pidns::refuse_nested_empty_capture(
-            crate::pidns::numbering(),
-            &what,
-            engine.plan().modules.is_empty(),
-        )?;
+        refuse_nested_empty_capture_for_scope(crate::pidns::numbering(), &a.scope, &what, &engine)?;
     }
-    let empty_hint = (engine.plan().modules.is_empty() && !named_pid_gone)
-        .then(|| empty_plan_hint(&a.scope, engine.plan()));
+    let empty_hint =
+        (engine.plan().modules.is_empty() && !named_pid_gone).then(|| match &a.scope {
+            ScopeArg::Cgroup(path) if cgroup_empty_proof(&a.scope, &engine) => {
+                proven_cgroup_empty_hint(path, engine.scanned_view_count())
+            }
+            _ => empty_plan_hint(&a.scope, engine.plan()),
+        });
     for line in capture_start_hint_lines(empty_hint, named_pid_gone, &engine.plan().skipped) {
         emit_capture_diagnostic(&line);
     }
@@ -5776,17 +5780,25 @@ fn replaced_file_hint_lines(skipped: &[crate::discovery::scan::Skipped]) -> Vec<
 /// (a loud loss, never a silent pid) and every listed member is
 /// either scanned into a view, provably gone, or a loud skip — so a
 /// clean plan with an available scan is proof, not absence of data.
-/// (RED stub: never proven.)
-#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
-fn cgroup_empty_proof(_scope: &ScopeArg, _engine: &Engine) -> bool {
-    false
+/// Any member unproven, unreadable or invisible fails this, as does
+/// every non-cgroup scope.
+fn cgroup_empty_proof(scope: &ScopeArg, engine: &Engine) -> bool {
+    if !matches!(scope, ScopeArg::Cgroup(_)) {
+        return false;
+    }
+    if !engine.plan().modules.is_empty() {
+        return false;
+    }
+    if engine.discovery().scan_unavailable.is_some() {
+        return false;
+    }
+    empty_plan_is_clean(engine.plan())
 }
 
 /// DR-K8S-5 refusal with the `--cgroup` carve-out: a nested observer
 /// whose `--cgroup` capture proved every member visible and readable
 /// ends as an ordinary empty capture; every other empty nested
 /// capture refuses by name exactly as before.
-#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
 fn refuse_nested_empty_capture_for_scope(
     numbering: &crate::pidns::PidNumbering,
     scope: &ScopeArg,
@@ -5801,7 +5813,6 @@ fn refuse_nested_empty_capture_for_scope(
 
 /// The carved-out empty line: the existing nothing-found sentence
 /// plus the proof (data-always): how many members were scanned.
-#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
 fn proven_cgroup_empty_hint(path: &Path, scanned: usize) -> String {
     let members = if scanned == 1 {
         "1 process scanned".to_string()

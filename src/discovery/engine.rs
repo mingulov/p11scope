@@ -6035,10 +6035,39 @@ pub(crate) fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
         let dir = io_root.join(&relative);
         let label_dir = path.join(&relative);
         match std::fs::read_to_string(dir.join("cgroup.procs")) {
-            Ok(text) => pids.extend(
-                text.lines()
-                    .filter_map(|line| line.trim().parse::<u32>().ok()),
-            ),
+            Ok(text) => {
+                // A member outside this observer's PID namespace is
+                // listed as 0: loud, never a pid to scan. Pid 0 reads
+                // as provably dead downstream, so passing it through
+                // would silence invisibility into a fake clean walk.
+                let mut invisible = 0usize;
+                pids.extend(
+                    text.lines()
+                        .filter_map(|line| match line.trim().parse::<u32>() {
+                            Ok(0) => {
+                                invisible += 1;
+                                None
+                            }
+                            Ok(pid) => Some(pid),
+                            Err(_) => None,
+                        }),
+                );
+                if invisible > 0 {
+                    let members = if invisible == 1 {
+                        "1 member is".to_string()
+                    } else {
+                        format!("{invisible} members are")
+                    };
+                    lost.push(Skipped {
+                        subject: label_dir.display().to_string(),
+                        reason: format!(
+                            "{members} listed as 0 in cgroup.procs: outside this observer's PID \
+                             namespace, so none of them was scanned; a provider only they map \
+                             is never discovered"
+                        ),
+                    });
+                }
+            }
             // Absent is not unreadable: a directory in the tree that is not a
             // cgroup has no `cgroup.procs` and hides nothing. Anything else —
             // permission, I/O — means processes exist here that were never listed.
@@ -30889,7 +30918,6 @@ impl Engine {
     /// Members fully scanned into retained views by [`Engine::discover`]:
     /// the count the carved-out `--cgroup` empty line names. Read at the
     /// empty-plan site only — later ticks admit and retire views.
-    #[allow(dead_code)] // Read at the empty-plan site by the fix commit.
     pub(crate) fn scanned_view_count(&self) -> usize {
         self.views.len()
     }

@@ -15478,10 +15478,9 @@ fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
                         if let Some(entry) = chunk
                             .strip_prefix('"')
                             .and_then(|entry| entry.strip_suffix('"'))
+                            && !entry.is_empty()
                         {
-                            if !entry.is_empty() {
-                                paths.push(entry.to_string());
-                            }
+                            paths.push(entry.to_string());
                         }
                         if closed {
                             in_paths = false;

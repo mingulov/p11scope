@@ -2536,6 +2536,14 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
+    // A chrooted-target failure that attempted the verified host-root
+    // fallback names a live process whose object missed (or was refused)
+    // under both roots — never an exit race, even when the target half
+    // reads ENOENT. Name the fallback; verbose keeps the machine error
+    // beside the plain words, JSON verbatim.
+    if reason.contains("(host-root fallback:") {
+        return "object unavailable from the process's root or the host-root fallback";
+    }
     // Exited-process races surface as file errors on present system
     // files; word them as the race, not a missing library. Verbose
     // keeps the machine error beside the plain words, JSON verbatim.

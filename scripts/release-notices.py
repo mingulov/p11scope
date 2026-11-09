@@ -332,9 +332,10 @@ def generate(root, cargo_about, musl_archives, output):
     if recipe.get("schema_version") != 3:
         raise NoticeError("unsupported notice recipe schema")
     disabled = recipe.get("feature_disabled")
-    if not isinstance(disabled, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str) or not value.strip()
-            for key, value in disabled.items()):
+    if (not isinstance(disabled, dict) or set(disabled) != {"host", "bpf"}
+            or any(not isinstance(pins, dict) for pins in disabled.values())
+            or any(not isinstance(key, str) or not isinstance(value, str) or not value.strip()
+                   for pins in disabled.values() for key, value in pins.items())):
         raise NoticeError("notice recipe feature-disabled pins are invalid")
     verified = load_inputs(root, recipe)
     payload, toolchains = toolchain_payload(root, recipe)
@@ -357,7 +358,7 @@ def generate(root, cargo_about, musl_archives, output):
             config.write_text(make_config(metadata, root, recipe))
             raw = json.loads(run([str(cargo_about), "generate", "--locked", "--offline", "--workspace", "--no-default-features", "--fail", "--format", "json", "--config", str(config), "--manifest-path", str(manifest)], root, environment))
             graphs[graph] = normalize_report(raw, metadata, root, root / "third-party/licenses",
-                                               frozenset(disabled))
+                                               frozenset(disabled[graph]))
             originals, additional_payload = collect_license_files(metadata, root)
             graphs[graph]["original_license_files"] = originals
             payload.update(additional_payload)

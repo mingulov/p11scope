@@ -272,7 +272,10 @@
     }
   },
   "feature_disabled": {
-    "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63": "optional zerocopy/derive feature; nothing in the locked graph enables it (ahash 0.8.12 uses zerocopy with simd only, default-features off), so cargo-about/krates filters it from the feature-unified graph while cargo metadata still resolves it"
+    "bpf": {},
+    "host": {
+      "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63": "optional zerocopy/derive feature; nothing in the locked graph enables it (ahash 0.8.12 uses zerocopy with simd only, default-features off), so cargo-about/krates filters it from the feature-unified graph while cargo metadata still resolves it"
+    }
   },
   "files": {
     "aya-302985c-apache.txt": {

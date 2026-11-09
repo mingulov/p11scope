@@ -5273,7 +5273,9 @@ fn replaced_notices_deduplicate_same_program_and_file() {
         "the duplicated pair prints once, the distinct pair prints too: {out}"
     );
     assert_eq!(
-        out.lines().filter(|line| line.contains("/prov/dup.so")).count(),
+        out.lines()
+            .filter(|line| line.starts_with("not counted:") && line.contains("/prov/dup.so"))
+            .count(),
         1,
         "the duplicated pair names one notice line: {out}"
     );

@@ -20308,6 +20308,35 @@ mod tests {
         assert_eq!(caller.exe_unknown_reason, None);
     }
 
+    #[test]
+    fn resolve_pid_caller_names_unreaped_zombie_exited() {
+        // A zombie answers `kill(pid, 0)` but its exe link is gone: the
+        // exit must be named, never misreported as hidepid/unreadable.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .expect("spawning the zombie fixture");
+        let pid = child.id();
+        child.kill().expect("killing the zombie fixture");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::process::process_is_zombie(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "the killed child is unreaped"
+        );
+        let caller = resolve_pid_caller(pid);
+        child.wait().expect("reaping the zombie fixture");
+        assert_eq!(caller.exe, None, "{caller:?}");
+        assert_eq!(
+            caller.exe_unknown_reason,
+            Some(TARGET_CALLER_EXITED),
+            "{caller:?}"
+        );
+    }
+
     /// CLI text: with nothing attached yet, the readiness line says
     /// what the capture waits for instead of reading as a failure.
     #[test]

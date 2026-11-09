@@ -15209,6 +15209,29 @@ pub(crate) mod tests {
         assert_eq!(facts.heading(), "none attached (1 found, refused)");
     }
 
+    /// A proxy closure still awaiting publication reads like nothing
+    /// mapped yet (the start gate's own rule), so the empty heading
+    /// says nothing was discovered instead of counting it found.
+    #[test]
+    fn the_empty_heading_ignores_a_closure_awaiting_publication() {
+        let reason = "(a proxy closure array is admitted whole, but no table is published yet)";
+        assert!(
+            crate::plan::is_closure_awaiting_publication(reason),
+            "the fixture must carry the awaiting-publication marker"
+        );
+        let facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules_skipped: vec![SkippedOut {
+                    name: "/opt/proxy/libproxy.so".into(),
+                    reason: reason.into(),
+                }],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(facts.heading(), "no modules discovered");
+    }
+
     #[test]
     fn headings_and_live_frames_escape_module_path_controls() {
         let mut facts = CaptureFacts {

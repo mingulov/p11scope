@@ -2016,6 +2016,59 @@ fn gaps_block_lists_scope_gaps_before_frequent_object_gaps() {
     );
 }
 
+/// A `stopped before attach` gap explains missing counts, so it
+/// ranks above pid-less per-object groups (attach-set refusals,
+/// catalog skips): with twenty-five refusal groups it still reads
+/// first, never folds out of the block.
+#[test]
+fn gaps_block_ranks_stopped_before_attach_above_pidless_refusals() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    presentation.gaps.push(named_gap(
+        "stopped before attach",
+        "the completed collection applied scan-only",
+    ));
+    for index in 0..25 {
+        presentation.gaps.push(named_gap(
+            "inventory attach set refused module",
+            &format!("fixture refusal {index:02}"),
+        ));
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(block[0], "gaps: 26");
+    assert!(
+        block[1].contains("stopped before attach"),
+        "the count-explaining gap reads first: {block:?}"
+    );
+}
+
+/// The stopped-before-attach gap keeps its counts clause in full:
+/// "counts not attached" survives the 100-char cap and the internal
+/// `pass-0` term stays out of the concise line, while verbose keeps
+/// the stored reason beside the plain words.
+#[test]
+fn concise_gap_line_keeps_counts_clause_for_stopped_before_attach() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    presentation.gaps.push(named_gap(
+        "stopped before attach",
+        "operator stop during pass-0 collection (5.21s elapsed); the completed collection applied scan-only: modules and callers shown, counts not attached",
+    ));
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(block.len(), 2);
+    assert!(block[1].contains("counts not attached"), "{block:?}");
+    assert!(!block[1].contains("pass-0"), "{block:?}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("operator stop during pass-0 collection"),
+        "{verbose}"
+    );
+}
+
 /// CLI-1: the concise gaps block stays bounded — beyond twenty
 /// distinct groups it shows the first twenty (most frequent first)
 /// plus one fold line, while the header count stays exact.

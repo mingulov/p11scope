@@ -24117,6 +24117,52 @@ mod tests {
         assert!(hint.contains("capture discovery"), "{hint}");
     }
 
+    /// A discovery stop lists its reasons without repeating the
+    /// "capture discovery" subject: the segment lead already names it.
+    #[test]
+    fn an_empty_plan_with_a_discovery_stop_lists_reasons_without_subjects() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.to_string(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(
+            hint.contains(&format!(
+                "examine every mapping: {}",
+                crate::discovery::scan::WORK_CEILING_REASON
+            )),
+            "{hint}"
+        );
+        assert!(!hint.contains("capture discovery — "), "{hint}");
+    }
+
+    /// A stop beside an unexamined file takes the "stopped early"
+    /// branch and lists its reason bare, next to the file segment.
+    #[test]
+    fn an_empty_plan_with_a_stop_and_an_unexamined_file_names_both() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "/opt/provider/libx.so (deleted)".into(),
+            reason: "deleted mapping".into(),
+        });
+        plan.skipped.push(Skipped {
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.to_string(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(hint.contains("could not be examined"), "{hint}");
+        assert!(
+            hint.contains(&format!(
+                "capture discovery stopped early: {}",
+                crate::discovery::scan::WORK_CEILING_REASON
+            )),
+            "{hint}"
+        );
+    }
+
     /// P1-3 twin: a refused whole module is a confirmed provider by
     /// construction (it was admitted, then refused), so it counts as
     /// found-but-refused too.

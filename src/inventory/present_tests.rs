@@ -3684,6 +3684,104 @@ fn concise_limits_line_says_recorded_when_no_endpoint_attached() {
     assert!(!limits.contains("watched"), "{limits}");
 }
 
+/// A live `--cgroup` capture attaches probes but stages every edge
+/// unknown with membership unproven: the limits line keeps the
+/// "watched" wording, never "recorded, 0 attached".
+#[test]
+fn concise_limits_line_says_watched_when_membership_unproven() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-limits-unproven",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 75_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
+    assert!(!presentation.edges.is_empty(), "fixture needs edges");
+    for edge in &mut presentation.edges {
+        edge.coverage = UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven);
+    }
+    presentation.budgets.endpoints_occupied = 0;
+    presentation.budgets.inventory_endpoints_occupied = 213;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(limits.contains("213 functions watched"), "{limits}");
+    assert!(!limits.contains("recorded, 0 attached"), "{limits}");
+}
+
+/// A live capture whose every edge is unknown for a non-scan reason
+/// (an uncounted feed here) still ran a producer: "watched" stays.
+#[test]
+fn concise_limits_line_says_watched_when_every_edge_is_uncounted() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-limits-uncounted",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 76_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
+    assert!(!presentation.edges.is_empty(), "fixture needs edges");
+    for edge in &mut presentation.edges {
+        edge.coverage =
+            UseCoverage::Unknown(UnknownReason::Uncounted("fixture pair insert failed".into()));
+    }
+    presentation.budgets.endpoints_occupied = 0;
+    presentation.budgets.inventory_endpoints_occupied = 213;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(limits.contains("213 functions watched"), "{limits}");
+    assert!(!limits.contains("recorded, 0 attached"), "{limits}");
+}
+
+/// Guard twin: a capture with a counted edge keeps "watched" — the
+/// scan-only wording must never leak onto a producing capture.
+#[test]
+fn concise_limits_line_keeps_watched_when_an_edge_is_counted() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-limits-counted",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 77_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
+    assert!(!presentation.edges.is_empty(), "fixture needs edges");
+    presentation.edges[0].coverage = UseCoverage::Counted {
+        since_ns: 1,
+        lossy: false,
+        pid_exit: false,
+    };
+    presentation.usage_feed = true;
+    presentation.budgets.endpoints_occupied = 0;
+    presentation.budgets.inventory_endpoints_occupied = 213;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(limits.contains("213 functions watched"), "{limits}");
+    assert!(!limits.contains("recorded, 0 attached"), "{limits}");
+}
+
 /// CLI-1: the verbose snapshot keeps the full `Details:` tail and no hint.
 #[test]
 fn verbose_snapshot_keeps_details_without_hint() {

@@ -359,7 +359,7 @@ pub fn refuse_nested_empty_capture(
         return Ok(());
     }
     Err(anyhow::Error::new(NumberingMismatch(format!(
-        "{MISMATCH_CODE}: refusing {what}: it found no PKCS#11 modules, but this observer runs \
+        "{MISMATCH_CODE}: refusing {what}: it found no countable modules, but this observer runs \
          in a container PID namespace with its own /proc, so host processes are not visible and \
          providers only they map are never discovered — an empty result here cannot mean \
          nothing uses PKCS#11. Run p11scope in the host's initial PID namespace with its own \

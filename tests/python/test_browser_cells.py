@@ -2088,6 +2088,9 @@ class BrowserReapTree(unittest.TestCase):
     #: How long the synthetic stragglers would sleep unreaped; the
     #: supervisor must finish well before it (kill+reap, not waiting).
     STRAGGLER_SLEEP_SECONDS = 30
+    #: How long the flow-completion child would linger past its
+    #: screenshot; the supervisor must kill at completion, not wait.
+    POST_SHOT_SLEEP_SECONDS = 10
     #: Promptness bound for the supervisor (loaded-CI margin included).
     PROMPT_SECONDS = 20
 
@@ -2166,6 +2169,47 @@ class BrowserReapTree(unittest.TestCase):
                          "the browser's exit code is the supervisor's")
         self.assertLess(elapsed, self.PROMPT_SECONDS,
                         "kill+reap must not wait out the straggler")
+        ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
+        self.assertTrue(ready, "the supervisor never relayed its child's output")
+        grandchild = int(proc.stdout.readline().strip())
+        self.addCleanup(_kill_quietly, grandchild)
+        with self.assertRaises(
+                ProcessLookupError,
+                msg="the orphaned grandchild must be dead"):
+            os.kill(grandchild, 0)
+
+    def test_supervisor_kills_the_tree_at_flow_completion(self):
+        """A complete screenshot ends the run: kill, reap, exit 0.
+
+        The browser's remaining work after its screenshot is pure
+        teardown, so the supervisor SIGKILLs the whole tree (main
+        included) at the PNG trailer instead of waiting for a slow
+        natural cascade it would then sample mid-teardown.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="g33-reap-flow-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shot = tmp / "flow.png"
+        child = (
+            "import subprocess, sys, time; "
+            "grandchild = subprocess.Popen([sys.executable, '-c', "
+            f"'import time; time.sleep({self.STRAGGLER_SLEEP_SECONDS})']); "
+            "print(grandchild.pid, flush=True); "
+            "time.sleep(0.5); "
+            f"__import__('pathlib').Path({str(shot)!r}).write_bytes(bytes.fromhex("
+            "'89504e470d0a1a0a0000000049454e44ae426082')); "
+            f"time.sleep({self.POST_SHOT_SLEEP_SECONDS})"
+        )
+        argv = [sys.executable, self.supervisor, "--flow-done", str(shot),
+               sys.executable, "-c", child]
+        start = time.monotonic()
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(_reap_quietly, proc)
+        self.addCleanup(proc.stdout.close)
+        code = proc.wait(timeout=self.PROMPT_SECONDS + 5)
+        elapsed = time.monotonic() - start
+        self.assertEqual(code, 0, "a completed flow exits 0")
+        self.assertLess(elapsed, self.PROMPT_SECONDS,
+                        "the kill lands at completion, not at child exit")
         ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
         self.assertTrue(ready, "the supervisor never relayed its child's output")
         grandchild = int(proc.stdout.readline().strip())

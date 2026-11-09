@@ -11705,6 +11705,13 @@ fn observer_images_run_on_scratch_with_pinned_busybox() {
             allowlist, applets,
             "{path} installs exactly the applets the pod needs"
         );
+        assert_eq!(
+            dockerfile
+                .matches("/bin/busybox ls /bin | grep -c .")
+                .count(),
+            1,
+            "{path} must check the /bin entry count exactly once"
+        );
     }
 }
 

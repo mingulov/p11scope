@@ -3,6 +3,7 @@
 """Public packages must preserve tested bytes and exclude private evidence."""
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -502,6 +503,34 @@ class PackageReleaseTests(unittest.TestCase):
         self.notice_manifest["recipe_sha256"] = "0" * 64
         self.write_notice_manifest()
         self.refused("notice.*recipe")
+
+    def validate_with_pins(self, pins, extra_package=None):
+        recipe = dict(self.recipe, schema_version=3, feature_disabled=pins)
+        recipe_bytes = json.dumps(recipe).encode()
+        (self.root / "third-party/licenses/sources.json").write_bytes(recipe_bytes)
+        self.git("add", ".")
+        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "pins")
+        manifest = copy.deepcopy(self.notice_manifest)
+        manifest["recipe_sha256"] = digest(recipe_bytes)
+        if extra_package is not None:
+            manifest["graphs"]["host"]["packages"].append({"id": extra_package})
+        payload = {}
+        for name in manifest["files"]:
+            payload[name] = (self.notices / name).read_bytes()
+        PACKAGE.validate_notice_contents(self.root, manifest, payload)
+
+    def test_pinned_textless_package_passes_notice_validation(self):
+        self.validate_with_pins({"host": {"pinned-id": "fixture justification"}, "bpf": {}},
+                                extra_package="pinned-id")
+
+    def test_unpinned_textless_package_refuses_notice_validation(self):
+        with self.assertRaisesRegex(ValueError, "coverage is incomplete"):
+            self.validate_with_pins({"host": {}, "bpf": {}}, extra_package="pinned-id")
+
+    def test_stale_feature_disabled_pin_refuses_notice_validation(self):
+        with self.assertRaisesRegex(ValueError, "stale feature-disabled pin"):
+            self.validate_with_pins({"host": {"host": "fixture justification"}, "bpf": {}})
 
     def test_source_content_must_match_committed_git_blobs(self):
         self.write_source(altered={"LICENSE": b"forged license"})

@@ -182,17 +182,17 @@ const IDENTITY_INPUTS: [(&str, &[u8], &str); 3] = [
     (
         "vma_identity.c",
         include_bytes!("../crates/ebpf/native/vma_identity.c"),
-        "bcfc9b5627b4c4612902915149fb5dfa4e883611fcb7d4779bf473b0f73de64c",
+        "9d4f12b251f2de7b941f43e757f9bf5817be7bb2dca12e2f2ae6ea5b4a5894fd",
     ),
     (
         "vma_identity.h",
         include_bytes!("../crates/ebpf/native/vma_identity.h"),
-        "0119f1371e0149202580259e0ebbde98b2f4a434a8d58e5f02ef2f40adc8d318",
+        "8409e73f5924004b34bc138a16e59c739feb6e175d6e22cab90aee6f15a73b38",
     ),
     (
         "uapi_check.c",
         include_bytes!("../crates/ebpf/native/uapi_check.c"),
-        "69b17fde1f8755865dee1f79286d0378a6c6431a09a91b565a9ef674e248a963",
+        "fa48e3951bc81d21f1e7ab92dd6359be8e03eae75b0e3a363b6005f4da4a00dd",
     ),
 ];
 

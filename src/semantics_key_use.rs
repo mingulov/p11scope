@@ -424,6 +424,12 @@ impl JointStaging {
         self.mode
     }
 
+    /// Consumed-H0-position frontier for replay tests.
+    #[cfg(test)]
+    pub(crate) fn frontier_for_test(&self) -> u64 {
+        self.frontier
+    }
+
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,

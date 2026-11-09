@@ -2325,6 +2325,66 @@ fn loss_gap_count(gaps: &[GapView]) -> usize {
     gaps.len()
 }
 
+/// True for a foreign-root open failure: the retained-root prefix plus
+/// the target-root suffix the scan appends. Only these fold by reason;
+/// size-cap and precondition refusals never match.
+fn is_foreign_root_reason(reason: &str) -> bool {
+    reason.starts_with("opening object within retained target root:")
+        && reason.contains("(target root ")
+}
+
+/// One foreign-root group's concise display: the cause with its target
+/// root, a single keeping its object subject, a group folding to one
+/// counted `mapped objects` line that points at JSON for each object.
+/// A malformed stored reason falls back to the verbatim text rather
+/// than a wrong fold.
+fn foreign_fold_display(stored: &str, group: &[&GapView]) -> (String, String) {
+    let Some((cause, root)) = foreign_fold_parts(stored) else {
+        let subject = group
+            .first()
+            .map(|gap| gap_plain_subject(&gap.subject).to_string())
+            .unwrap_or_else(|| "mapped objects".to_string());
+        return (subject, stored.to_string());
+    };
+    // The `in root` wording keeps the counted line within the summary
+    // width so the `--json` pointer survives; verbose and JSON carry the
+    // full `target root … differs from the observer root` suffix.
+    if group.len() == 1 {
+        let subject = gap_plain_subject(&group[0].subject).to_string();
+        let reason = format!("{cause} in root {root}");
+        (subject, reason)
+    } else {
+        let reason = format!("{cause} in root {root} (--json lists each)");
+        ("mapped objects".to_string(), reason)
+    }
+}
+
+/// The concise cause and target root behind a foreign-root stored
+/// reason. Without a fallback attempt the cause is the target open's
+/// own error; with one it is the host-root fallback's outcome (the
+/// last attempt; JSON and verbose keep both halves). `None` when the
+/// stored text does not parse.
+fn foreign_fold_parts(stored: &str) -> Option<(String, String)> {
+    let (before, after) = stored.split_once(" (target root ")?;
+    let root = after.strip_suffix(" differs from the observer root)")?;
+    if root.is_empty() {
+        return None;
+    }
+    if let Some((target, fallback)) = before.split_once(" (host-root fallback: ") {
+        if !target.starts_with("opening object within retained target root:") {
+            return None;
+        }
+        let outcome = fallback.strip_suffix(")")?;
+        Some((format!("host-root fallback {outcome}"), root.to_string()))
+    } else {
+        let cause = before.strip_prefix("opening object within retained target root: ")?;
+        if cause.is_empty() {
+            return None;
+        }
+        Some((cause.to_string(), root.to_string()))
+    }
+}
+
 /// Concise gap groups listed before the block folds: per-PID
 /// subjects (one group per unreadable `/proc/{pid}/mem`) could
 /// otherwise print hundreds of lines on a `--system` scan. The
@@ -2366,13 +2426,37 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
+    // Foreign-root open failures (retained-root prefix plus the
+    // target-root suffix) fold by stored reason — one counted line per
+    // distinct reason naming its root — while size-cap and precondition
+    // refusals keep their per-object subject/reason rows below.
+    let mut foreign: std::collections::BTreeMap<&str, Vec<&GapView>> =
+        std::collections::BTreeMap::new();
+    let mut rest: Vec<&GapView> = Vec::new();
     for gap in gaps.iter() {
+        if is_foreign_root_reason(&gap.reason) {
+            foreign.entry(gap.reason.as_str()).or_default().push(gap);
+        } else {
+            rest.push(gap);
+        }
+    }
+    for gap in rest {
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += 1;
         entry.1 = entry.1 && scope;
+    }
+    for (stored, group) in &foreign {
+        let (subject, reason) = foreign_fold_display(stored, group);
+        let subject = escape_controls(&subject).into_owned();
+        let reason = escape_controls(&reason).into_owned();
+        // Foreign-root rows always name an object, so the group is never
+        // a scope group.
+        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        entry.0 += group.len();
+        entry.1 = false;
     }
     if groups.is_empty() {
         return Vec::new();
@@ -2543,6 +2627,14 @@ fn gap_plain_reason(reason: &str) -> &str {
     // beside the plain words, JSON verbatim.
     if reason.contains("(host-root fallback:") {
         return "object unavailable from the process's root or the host-root fallback";
+    }
+    // A foreign-root open failure names its target root (the chroot or
+    // container it missed under) — never an exit race, even when the
+    // target half reads ENOENT. Concise folds these per distinct reason
+    // with the root; verbose keeps the machine error beside the words,
+    // JSON verbatim.
+    if reason.contains("(target root ") {
+        return "object unavailable in foreign target root";
     }
     // Exited-process races surface as file errors on present system
     // files; word them as the race, not a missing library. Verbose

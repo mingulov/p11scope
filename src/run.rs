@@ -5096,7 +5096,7 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
     let mut confirmed: Vec<&Skipped> = plan
         .modules_skipped
         .iter()
-        .filter(|skip| !crate::plan::is_closure_awaiting_publication(&skip.reason))
+        .filter(|skip| crate::plan::skip_is_found_provider(&skip.reason))
         .collect();
     let mut unexamined: Vec<&Skipped> = Vec::new();
     let mut discovery_stops: Vec<&Skipped> = Vec::new();

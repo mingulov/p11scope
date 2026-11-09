@@ -417,13 +417,19 @@ impl CaptureFacts {
     /// calls; only a capture that never accepted a provider says it — and
     /// when refused providers were found, the heading says none attached
     /// with the found count instead of contradicting the refusal line.
+    /// The found count shares the stderr hint's classifier: a proxy
+    /// closure still awaiting publication reads like nothing mapped
+    /// yet, never as a found provider.
     pub fn heading(&self) -> String {
+        let found = self
+            .discovery
+            .modules_skipped
+            .iter()
+            .filter(|skipped| crate::plan::skip_is_found_provider(&skipped.reason))
+            .count();
         match self.discovery.modules.as_slice() {
-            [] if self.discovery.modules_skipped.is_empty() => "no modules discovered".to_string(),
-            [] => format!(
-                "none attached ({} found, refused)",
-                self.discovery.modules_skipped.len()
-            ),
+            [] if found == 0 => "no modules discovered".to_string(),
+            [] => format!("none attached ({found} found, refused)"),
             [only] => escape_controls(&only.path).into_owned(),
             [first, rest @ ..] => {
                 format!("{} (+{} more)", escape_controls(&first.path), rest.len())

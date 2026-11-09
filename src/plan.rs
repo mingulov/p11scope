@@ -349,6 +349,16 @@ pub(crate) fn is_closure_awaiting_publication(reason: &str) -> bool {
     is_closure_array_refusal(reason) && reason.contains(CLOSURE_UNPUBLISHED)
 }
 
+/// A module skip that names a found-but-refused provider for the
+/// empty-view heading/hint pair: every module skip except a proxy
+/// closure still awaiting publication (which reads like nothing
+/// mapped yet). Shared by `CaptureFacts::heading` and
+/// `empty_plan_hint` so the report and the stderr line count found
+/// providers the same way.
+pub(crate) fn skip_is_found_provider(reason: &str) -> bool {
+    !is_closure_awaiting_publication(reason)
+}
+
 /// The typed kind of one refused-module record, set at merge time beside
 /// its display reason and shared with the engine. Pause completeness and
 /// the awaiting-replacement history leg decide by the kind; the reason is

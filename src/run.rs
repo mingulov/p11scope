@@ -15183,10 +15183,7 @@ mod tests {
             || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
         );
         assert!(gap.get(), "the failure must file its named gap");
-        assert!(
-            changed.unwrap(),
-            "the seal syncs to the committed plan"
-        );
+        assert!(changed.unwrap(), "the seal syncs to the committed plan");
     }
 
     /// Without an observed stop, a terminal discovery failure still

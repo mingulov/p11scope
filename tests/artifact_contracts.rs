@@ -15459,8 +15459,38 @@ fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
             let mut license = String::new();
             for line in block {
                 let line = line.trim();
-                if line.starts_with("path") {
+                if let Some(rest) = line.strip_prefix("path") {
+                    // Both TOML shapes occur: multi-line `path = [` lists
+                    // (entries on the following lines) and single-line
+                    // `path = ["..."]` lists (the committed `.log`
+                    // annotation uses it), so entries on this line are
+                    // parsed too instead of silently dropping the block.
+                    let rest = rest.trim().trim_start_matches('=').trim();
+                    assert!(
+                        rest.starts_with('['),
+                        "unexpected REUSE path line: {line}"
+                    );
+                    let rest = rest.strip_prefix('[').unwrap_or("").trim();
                     in_paths = true;
+                    for chunk in rest.split(',') {
+                        let chunk = chunk.trim();
+                        let (chunk, closed) = match chunk.strip_suffix(']') {
+                            Some(chunk) => (chunk.trim(), true),
+                            None => (chunk, false),
+                        };
+                        if let Some(entry) = chunk
+                            .strip_prefix('"')
+                            .and_then(|entry| entry.strip_suffix('"'))
+                        {
+                            if !entry.is_empty() {
+                                paths.push(entry.to_string());
+                            }
+                        }
+                        if closed {
+                            in_paths = false;
+                            break;
+                        }
+                    }
                     continue;
                 }
                 if in_paths {
@@ -15486,6 +15516,10 @@ fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
                     }
                 }
             }
+            assert!(
+                !paths.is_empty(),
+                "REUSE annotation block parsed with no paths: {block:?}"
+            );
             LicenseReuseAnnotation {
                 paths,
                 precedence,

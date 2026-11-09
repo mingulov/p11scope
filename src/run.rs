@@ -4439,11 +4439,15 @@ fn combine_quiesce_failure(
 fn finish_quiesce_error<C>(
     error: anyhow::Error,
     loop_result: Result<CaptureEnd>,
+    signalled: bool,
     context: &mut C,
     settle: impl FnOnce(&mut C, CaptureEnd) -> Result<()>,
     publish: impl FnOnce(&mut C) -> Result<()>,
     detach: impl FnOnce(&mut C) -> Result<()>,
 ) -> anyhow::Error {
+    // Scaffolding: the signalled-stop publish decision lands with the F3
+    // fix; until then the quiesce combiner keeps today's behavior.
+    let _ = signalled;
     match loop_result {
         Ok(end) => {
             let finish = settle(context, end);
@@ -4467,6 +4471,22 @@ fn finish_quiesce_error<C>(
             combine_capture_failure(combined, finish, detach)
         }
     }
+}
+
+/// A terminal discovery batch that degrades to a named gap on a
+/// signalled stop: a poisoned terminal batch must not suppress the
+/// report the signal asked for. The caller records the gap and the
+/// terminal seal proceeds with the committed plan.
+///
+/// Scaffolding: always propagates; the signalled-stop degradation
+/// lands with the F3 fix.
+#[allow(dead_code)]
+fn seal_terminal_discovery_or_gap(
+    _signalled: bool,
+    _note_gap: impl FnMut(),
+    apply: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    apply()
 }
 
 /// A marker probe is not wired in this slice, so the coordinator is told the
@@ -7501,6 +7521,7 @@ fn capture_profile(
             return Err(finish_quiesce_error(
                 error,
                 loop_result,
+                interrupted.interrupted(),
                 &mut settle_context,
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
@@ -8586,6 +8607,7 @@ fn capture_trace(
             return Err(finish_quiesce_error(
                 error,
                 loop_result,
+                interrupted.interrupted(),
                 &mut settle_context,
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
@@ -14127,6 +14149,67 @@ mod tests {
         }
     }
 
+    /// A `#!` console-script entry point (the `pkcs11-check` shape:
+    /// executable, no extension) spawns like any program: the kernel
+    /// handles the shebang and the observer never rewrites the launch
+    /// through an interpreter.
+    #[test]
+    fn owned_child_spawns_a_console_script_like_any_program() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("probe-tool");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = OwnedChild::spawn(command.into_os_string(), Vec::new())
+            .expect("a console script must spawn like any program");
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+    }
+
+    /// The fail-fast name check accepts a console script: it refuses
+    /// only what cannot run (a snap wrapper keeps its own refusal).
+    #[test]
+    fn runnable_check_accepts_a_console_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe-tool");
+        std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check_owned_target_runnable(script.as_os_str(), &[], None)
+            .expect("a console script must pass the name check");
+    }
+
+    /// A script swapped between the observer's check and exec is
+    /// refused at the barrier: the child re-verifies the path still
+    /// names the pinned file and runs nothing unchecked.
+    #[test]
+    fn swapped_script_is_refused_at_exec_instead_of_running_unchecked() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("probe-tool");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = OwnedChild::spawn(command.clone().into_os_string(), Vec::new())
+            .expect("a console script must spawn like any program");
+        // Swap the path behind the pinned descriptor while the barrier
+        // holds the child: the release must refuse, never exec either file.
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &command).unwrap();
+        let failure = child.release().unwrap_err();
+        let ExecHandoffError::Io { phase, source } = &failure else {
+            panic!("a swapped script must fail identity, not exec: {failure}");
+        };
+        assert_eq!(*phase, "script identity");
+        assert!(
+            source
+                .to_string()
+                .contains("the script changed between the observer's check and exec"),
+            "{failure}"
+        );
+    }
+
     #[test]
     fn release_error_defers_settlement_for_owned_cleanup() {
         let directory = tempfile::tempdir().unwrap();
@@ -14842,6 +14925,7 @@ mod tests {
             let error = finish_quiesce_error(
                 anyhow::anyhow!("quiesce failure"),
                 loop_result,
+                false,
                 &mut (),
                 |_, end| {
                     settle_owned_child(
@@ -14889,6 +14973,96 @@ mod tests {
                 // the disposition test above.
             }
         }
+    }
+
+    /// A quiesce failure behind an already-failed loop still seals
+    /// the report when a stop was observed: the signal asked for
+    /// whatever was captured, not for silence. Both errors stay in
+    /// the returned chain; the publication is best-effort.
+    #[test]
+    fn quiesce_error_behind_a_failed_loop_still_publishes_on_a_signalled_stop() {
+        let published = std::cell::Cell::new(false);
+        let error = finish_quiesce_error(
+            anyhow::anyhow!("terminal quiescence failed"),
+            Err(anyhow::anyhow!("loop failure")),
+            true,
+            &mut (),
+            |_, _| Ok(()),
+            |_| {
+                published.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert!(
+            published.get(),
+            "a signalled stop must publish whatever it has: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("loop failure") && message.contains("terminal quiescence"),
+            "either error dropped: {message}"
+        );
+    }
+
+    /// Without an observed stop, a quiesce failure behind a failed
+    /// loop keeps settle-and-detach with no report: nothing asked
+    /// for partial state.
+    #[test]
+    fn quiesce_error_behind_a_failed_loop_without_a_signal_keeps_no_report() {
+        let published = std::cell::Cell::new(false);
+        let error = finish_quiesce_error(
+            anyhow::anyhow!("terminal quiescence failed"),
+            Err(anyhow::anyhow!("loop failure")),
+            false,
+            &mut (),
+            |_, _| Ok(()),
+            |_| {
+                published.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert!(
+            !published.get(),
+            "an unsignalled failed loop must not publish: {error:#}"
+        );
+    }
+
+    /// A poisoned terminal discovery batch on a signalled stop
+    /// degrades to the recorded gap with the committed plan: it must
+    /// not suppress the report the signal asked for.
+    #[test]
+    fn terminal_discovery_failure_on_a_signalled_stop_degrades_to_a_gap() {
+        let gap = std::cell::Cell::new(false);
+        let changed = seal_terminal_discovery_or_gap(
+            true,
+            || gap.set(true),
+            || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
+        );
+        assert!(gap.get(), "the failure must file its named gap");
+        assert_eq!(
+            changed.unwrap(),
+            false,
+            "the seal proceeds with the committed plan"
+        );
+    }
+
+    /// Without an observed stop, a terminal discovery failure still
+    /// propagates: only a signal turns it into a gap.
+    #[test]
+    fn terminal_discovery_failure_without_a_signal_still_propagates() {
+        let gap = std::cell::Cell::new(false);
+        let changed: Result<bool> = seal_terminal_discovery_or_gap(
+            false,
+            || gap.set(true),
+            || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
+        );
+        assert!(!gap.get(), "no signal, no gap");
+        assert!(
+            format!("{:#}", changed.unwrap_err()).contains("unknown candidate module"),
+            "the failure must propagate unchanged"
+        );
     }
 
     #[test]
@@ -16458,6 +16632,7 @@ mod tests {
         let quiesce = finish_quiesce_error(
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
+            false,
             &mut (),
             |_, _| Ok(()),
             |_| Ok(()),
@@ -16466,6 +16641,7 @@ mod tests {
         let quiesce_publish_failed = finish_quiesce_error(
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
+            false,
             &mut (),
             |_, _| Ok(()),
             |_| Err(anyhow!("seal failed")),

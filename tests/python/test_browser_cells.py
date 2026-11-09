@@ -2137,6 +2137,44 @@ class BrowserReapTree(unittest.TestCase):
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 3)
 
+    def test_supervisor_supervises_when_already_a_group_leader(self):
+        """A leader (the observer's pre-exec setsid) still supervises.
+
+        The observer's owned child already leads its session, so the
+        supervisor must accept a private group it did not found (a bare
+        setsid fails EPERM there) and still kill+reap the tree.
+        """
+        setsid = shutil.which("setsid")
+        if setsid is None:
+            self.skipTest("setsid(1) is not installed")
+        child = (
+            "import subprocess, sys; "
+            "grandchild = subprocess.Popen([sys.executable, '-c', "
+            f"'import time; time.sleep({self.STRAGGLER_SLEEP_SECONDS})']); "
+            "print(grandchild.pid, flush=True); "
+            "sys.exit(7)"
+        )
+        argv = [setsid, sys.executable, self.supervisor,
+               sys.executable, "-c", child]
+        start = time.monotonic()
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(_reap_quietly, proc)
+        self.addCleanup(proc.stdout.close)
+        code = proc.wait(timeout=self.PROMPT_SECONDS + 5)
+        elapsed = time.monotonic() - start
+        self.assertEqual(code, 7,
+                         "the browser's exit code is the supervisor's")
+        self.assertLess(elapsed, self.PROMPT_SECONDS,
+                        "kill+reap must not wait out the straggler")
+        ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
+        self.assertTrue(ready, "the supervisor never relayed its child's output")
+        grandchild = int(proc.stdout.readline().strip())
+        self.addCleanup(_kill_quietly, grandchild)
+        with self.assertRaises(
+                ProcessLookupError,
+                msg="the orphaned grandchild must be dead"):
+            os.kill(grandchild, 0)
+
     def test_supervisor_forwards_termination_to_the_tree(self):
         """SIGTERM kills the whole tree; nothing leaks (the timeout path)."""
         child = (

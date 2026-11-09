@@ -19,9 +19,12 @@ import inspect
 import io
 import json
 import os
+import select
 import shutil
+import signal
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2039,6 +2042,125 @@ def strict_attach_grace_literals(source):
                         continue
                     violations.append((item.name, getattr(keyword, "lineno", 0)))
     return violations
+
+
+def _kill_quietly(pid, sig=signal.SIGKILL):
+    """Best-effort kill for twin-process cleanup (never fails the test)."""
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _reap_quietly(proc):
+    """Best-effort Popen cleanup: kill, then reap (never fails the test)."""
+    try:
+        proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+class BrowserReapTree(unittest.TestCase):
+    """Owned-child supervisor twins: unprivileged, run everywhere (no gate).
+
+    ``run_direct`` cells execute the browser as ``p11scope run``'s owned
+    child, and the run ends when that child exits. Firefox's multiprocess
+    teardown trails the main process, so the bare browser child ends
+    capture while descendants are still present or mid-teardown: the
+    report then honestly carries RUN_TREE_SURVIVORS plus whatever
+    leader-exit assessment sampled a live group
+    (``task_uprobe_link_losses``), and the never-mapped oracle fails
+    closed on both (the v0.7.0 browser-cells flake: FF-NOMOD failed 2 of
+    13 hosted runs on ``task_uprobe_link_losses``, once with survivors).
+    The supervisor (``tests/fixtures/browser/reap_tree.py``) is the owned
+    child instead: a private process group plus the child-subreaper bit,
+    then wait for the browser's exit, SIGKILL the stragglers, and reap to
+    ECHILD before exiting with the browser's code, so capture always ends
+    on a quiesced tree. The readiness signal is ECHILD (no descendants
+    remain); the reap bound only fails loud on a wedged tree. These twins
+    pin that contract with synthetic workloads (no browser, no root).
+    """
+
+    #: How long the synthetic stragglers would sleep unreaped; the
+    #: supervisor must finish well before it (kill+reap, not waiting).
+    STRAGGLER_SLEEP_SECONDS = 30
+    #: Promptness bound for the supervisor (loaded-CI margin included).
+    PROMPT_SECONDS = 20
+
+    @property
+    def supervisor(self):
+        return str(ROOT / "tests" / "fixtures" / "browser" / "reap_tree.py")
+
+    def setUp(self):
+        if sys.platform != "linux":
+            self.skipTest("the owned-child supervisor is Linux-only")
+        if not Path(self.supervisor).exists():
+            self.fail(f"the owned-child supervisor is missing: {self.supervisor}")
+
+    def test_supervisor_kills_and_reaps_an_orphaned_tree(self):
+        """Stragglers die by SIGKILL and are reaped; the exit code passes."""
+        child = (
+            "import subprocess, sys; "
+            "grandchild = subprocess.Popen([sys.executable, '-c', "
+            f"'import time; time.sleep({self.STRAGGLER_SLEEP_SECONDS})']); "
+            "print(grandchild.pid, flush=True); "
+            "sys.exit(7)"
+        )
+        argv = [sys.executable, self.supervisor, sys.executable, "-c", child]
+        start = time.monotonic()
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(_reap_quietly, proc)
+        self.addCleanup(proc.stdout.close)
+        code = proc.wait(timeout=self.PROMPT_SECONDS + 5)
+        elapsed = time.monotonic() - start
+        self.assertEqual(code, 7,
+                         "the browser's exit code is the supervisor's")
+        self.assertLess(elapsed, self.PROMPT_SECONDS,
+                        "kill+reap must not wait out the straggler")
+        ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
+        self.assertTrue(ready, "the supervisor never relayed its child's output")
+        grandchild = int(proc.stdout.readline().strip())
+        self.addCleanup(_kill_quietly, grandchild)
+        with self.assertRaises(
+                ProcessLookupError,
+                msg="the orphaned grandchild must be dead"):
+            os.kill(grandchild, 0)
+
+    def test_supervisor_passes_through_a_clean_exit(self):
+        """Healthy twin: a clean child exit passes through with its code."""
+        argv = [sys.executable, self.supervisor,
+                sys.executable, "-c", "import sys; sys.exit(3)"]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 3)
+
+    def test_supervisor_forwards_termination_to_the_tree(self):
+        """SIGTERM kills the whole tree; nothing leaks (the timeout path)."""
+        child = (
+            "import subprocess, sys, time; "
+            "grandchild = subprocess.Popen([sys.executable, '-c', "
+            f"'import time; time.sleep({self.STRAGGLER_SLEEP_SECONDS})']); "
+            "print(grandchild.pid, flush=True); "
+            f"time.sleep({self.STRAGGLER_SLEEP_SECONDS})"
+        )
+        argv = [sys.executable, self.supervisor, sys.executable, "-c", child]
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(_reap_quietly, proc)
+        self.addCleanup(proc.stdout.close)
+        ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
+        self.assertTrue(ready, "the supervisor never started its child")
+        grandchild = int(proc.stdout.readline().strip())
+        self.addCleanup(_kill_quietly, grandchild)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(timeout=self.PROMPT_SECONDS)
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        with self.assertRaises(
+                ProcessLookupError,
+                msg="the grandchild must not outlive termination"):
+            os.kill(grandchild, 0)
 
 
 if __name__ == "__main__":

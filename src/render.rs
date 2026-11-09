@@ -414,10 +414,16 @@ impl CaptureFacts {
     /// this capture accepted over its lifetime, never the currently active
     /// topology. A target that exited keeps its provider in the heading, so
     /// "no modules discovered" can never print beside retained historical
-    /// calls; only a capture that never accepted a provider says it.
+    /// calls; only a capture that never accepted a provider says it — and
+    /// when refused providers were found, the heading says none attached
+    /// with the found count instead of contradicting the refusal line.
     pub fn heading(&self) -> String {
         match self.discovery.modules.as_slice() {
-            [] => "no modules discovered".to_string(),
+            [] if self.discovery.modules_skipped.is_empty() => "no modules discovered".to_string(),
+            [] => format!(
+                "none attached ({} found, refused)",
+                self.discovery.modules_skipped.len()
+            ),
             [only] => escape_controls(&only.path).into_owned(),
             [first, rest @ ..] => {
                 format!("{} (+{} more)", escape_controls(&first.path), rest.len())

@@ -5702,8 +5702,8 @@ fn drain_discovery_tick(
         Ok(Some(changed)) => Ok((changed, true)),
         Ok(None) => Ok((engine.drain_discovery(session)?, false)),
         Err(error) => {
-            if cancelled_pause_cycle(&error, interrupted.interrupted()) {
-                owned.coordinator.note_cancelled_cycle();
+            if hand_back_cancelled_cycle(&mut owned.coordinator, &error, interrupted.interrupted())
+            {
                 return Ok((engine.drain_discovery(session)?, false));
             }
             let always = error.required() && !error.lifecycle();
@@ -5746,8 +5746,7 @@ fn pending_stop_pass(
     let paused = match service_pause(coordinator, io) {
         Ok(serviced) => serviced,
         Err(error) => {
-            if cancelled_pause_cycle(&error, io.cancelled().unwrap_or(false)) {
-                coordinator.note_cancelled_cycle();
+            if hand_back_cancelled_cycle(coordinator, &error, io.cancelled().unwrap_or(false)) {
                 return Ok((io.plan_changed(), false));
             }
             let always = error.required() && !error.lifecycle();
@@ -5763,10 +5762,29 @@ fn pending_stop_pass(
 
 /// An operator stop that lands inside a best-effort (`auto`) pause cycle
 /// cancels it with a lifecycle error; that is a signal end, not a capture
-/// failure: the tick hands back so the loop observes the stop and still
-/// writes the report. Required (`always`) pauses keep refusing.
-fn cancelled_pause_cycle(error: &PauseError, cancelled: bool) -> bool {
-    cancelled && error.lifecycle() && !error.required()
+/// failure. Returns `true` when the step hands back so the loop observes the
+/// stop and still writes the report: the stop is pending, the failure is a
+/// lifecycle one, and the coordinator closed the attempt as one counted
+/// partial, which it does only under `auto`. Required (`always`) pauses keep
+/// refusing: the caller propagates the failure. The failure text is still
+/// emitted on hand-back, so a lifecycle failure that merely coincided with
+/// the stop (a resume or authorization-read failure) is never dropped
+/// silently.
+fn hand_back_cancelled_cycle(
+    coordinator: &mut PauseCoordinator,
+    error: &PauseError,
+    cancelled: bool,
+) -> bool {
+    if !(cancelled && error.lifecycle()) || !coordinator.note_cancelled_cycle() {
+        return false;
+    }
+    // The pause error chain can quote target-named records; escape at this
+    // terminal boundary as `retire_pause_policy` does.
+    emit_capture_diagnostic(&format!(
+        "p11scope: pause: {}; the run ends on the stop and reports pause: partial",
+        render::escape_controls(&error.to_string())
+    ));
+    true
 }
 
 /// The post-release revalidation step of an owned run, generic over the

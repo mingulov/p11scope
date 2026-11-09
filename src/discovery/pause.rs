@@ -2304,20 +2304,24 @@ impl PauseCoordinator {
     }
 
     /// Closes the attempt a cancelled cycle left behind as one counted
-    /// partial under `auto`: the run ends by signal with a report, so the
-    /// lattice must stay valid (an unclosed attempt would render
-    /// `sigstop` with no confirmed stop, and a stop cancelled before its
-    /// attempt opened would vanish a consumed stop). Only the run loop's
-    /// cancelled conversion calls this; every other lifecycle failure
-    /// still aborts before any report renders.
-    pub(crate) fn note_cancelled_cycle(&mut self) {
+    /// partial under `auto` and returns `true`: the run then ends by signal
+    /// with a report, so the lattice must stay valid (an unclosed attempt
+    /// would render `sigstop` with no confirmed stop, and a stop cancelled
+    /// before its attempt opened would vanish a consumed stop). Any other
+    /// policy returns `false` and changes nothing: a required (`always`)
+    /// pause keeps refusing, so the caller must propagate the failure.
+    /// Only the run loop's cancelled conversion calls this; every other
+    /// lifecycle failure still aborts before any report renders.
+    #[must_use]
+    pub(crate) fn note_cancelled_cycle(&mut self) -> bool {
         if self.policy != PausePolicy::Auto {
-            return;
+            return false;
         }
         self.begin_attempt();
         self.attempt_open = false;
         self.counters.partial = self.counters.partial.saturating_add(1);
         debug_assert!(self.counters.valid());
+        true
     }
 
     /// Records a stopped-sample instant toward the first hold: the child

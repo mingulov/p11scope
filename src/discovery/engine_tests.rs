@@ -11955,6 +11955,186 @@ fn loader_service_orders_freshest_first() {
     assert_eq!(order, vec![key(2), key(3), key(1)]);
 }
 
+/// Churn regression (system-churn P0): three short-lived workers map the
+/// SAME provider file. Discovery proves the file once (one module, not
+/// one per worker); scripted calls from the two live workers count
+/// (never 0 when calls happened); the worker that exits before its
+/// deferred scan leaves a NAMED gap (exit-only truncation citing the
+/// expected exit) instead of silent loss. Deterministic: live holders
+/// (maps-verified), scripted events, synchronous kill+wait — no timing.
+#[test]
+fn churned_workers_share_one_file_proof_and_count_calls_with_named_gaps() {
+    let (mut fixture, view, library) = loaded_tabled_provider();
+    let pid0 = view.pid();
+    let pid1 = fixture.spawn_peer_library(&library);
+    let pid2 = fixture.spawn_peer_library(&library);
+    let pids = [pid0, pid1, pid2];
+    let peer_view1 = ProcessView::open(ProcessViewId(1), pid1).unwrap();
+    let peer_view2 = ProcessView::open(ProcessViewId(2), pid2).unwrap();
+    let (cgroup_engine, _scope_dir) = engine_over_cgroup_naming(&pids);
+    let mut engine = Engine::empty();
+    engine.scope = cgroup_engine.scope;
+    engine.next_view_id = 3;
+    engine.module_hints = vec![library.clone(), library.clone(), library];
+    engine.views.push(view);
+    engine.views.push(peer_view1);
+    engine.views.push(peer_view2);
+    engine.seed_initial_cgroup_views();
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    assert!(engine.request_refresh(pid0, crate::attach::monotonic_ns()));
+    assert!(engine.request_refresh(pid1, crate::attach::monotonic_ns()));
+    assert!(engine.request_refresh(pid2, crate::attach::monotonic_ns()));
+    let outcome =
+        apply_unpaced_setup_tick(&mut engine, &mut session).expect("the churn setup tick applies");
+    assert!(
+        outcome.required_complete,
+        "the setup tick must complete: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(engine.views.len(), 3, "three workers are retained");
+    assert_eq!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .filter(|module| module.path.ends_with("tabled-provider.so"))
+            .count(),
+        1,
+        "one shared file proves once, not once per worker"
+    );
+    assert!(
+        !engine.plan.slots.is_empty(),
+        "the proven file offers slots to count on"
+    );
+    assert_eq!(
+        engine.plan.slots[0].index, 0,
+        "scripted calls target the first slot"
+    );
+
+    // Calls by the two live workers count through the real reducer.
+    let mut state = semantics::State::new(&engine.plan);
+    for pid in [pids[0], pids[1]] {
+        let call = || p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::CALL,
+            pid_tgid: u64::from(pid) << 32,
+            session: 7,
+            slot_id: 0,
+            slot: 0,
+            capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::events([call(), call()], usize::MAX),
+            1,
+        );
+        let process = semantics::ProcessKey::from_pid(pid);
+        let may_remain = drain.poll(None, |ev| {
+            state.observe_process(process, &ev);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(!may_remain, "the scripted drain consumes its whole script");
+        assert_eq!(drain.malformed(), 0, "the script decodes cleanly");
+    }
+    assert_eq!(
+        state
+            .cgroups()
+            .values()
+            .map(|cgroup| cgroup.calls)
+            .sum::<u64>(),
+        4,
+        "calls by churned workers count (never 0 when calls happened)"
+    );
+
+    // The worker that exits before its deferred scan leaves a named gap.
+    // The setup tick already armed every worker's loader (twin route).
+    for view in engine.views.iter() {
+        assert_eq!(
+            engine.loader_registry.ids_for_view(view.id()).len(),
+            1,
+            "the setup tick arms each worker's loader"
+        );
+    }
+    session.counters.loader_hits = 1;
+    let view3 = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pids[2])
+        .expect("exiting worker admitted")
+        .id();
+    let context = engine.loader_registry.ids_for_view(view3)[0];
+    let spec = engine
+        .loader_registry
+        .context(context)
+        .unwrap()
+        .spec
+        .clone();
+    let mapping = spec.mapping.as_ref().unwrap();
+    let mut record = loader_record_for(context, pids[2]);
+    record.table_ptr = mapping.start + (spec.hook.file_offset - mapping.file_offset);
+    record.hook_ts_ns = engine
+        .views
+        .iter()
+        .find(|view| view.id() == view3)
+        .unwrap()
+        .admitted_ns();
+    record.announced_count = 1;
+    let pending_before = engine.pending_loader_scans.len();
+    let losses_before = engine.capture_facts().discovery_losses()[3];
+    let exit_before = engine.capture_facts().exit_ended_truncations();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(
+        engine.pending_loader_scans.len(),
+        pending_before + 1,
+        "the exiting worker files one deferred scan"
+    );
+    fixture.peers[1].kill().unwrap();
+    fixture.peers[1].wait().unwrap();
+    assert!(engine.original_exited(view3));
+    let due: BTreeSet<PendingLoaderScanKey> = engine
+        .pending_loader_scans
+        .keys()
+        .filter(|key| key.view == view3)
+        .copied()
+        .collect();
+    assert_eq!(due.len(), 1, "only the exiting worker's scan is due");
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    engine
+        .service_pending_loader_scans(
+            due,
+            &mut session,
+            &mut additions_allowed,
+            &mut pending_views,
+        )
+        .unwrap();
+    assert!(
+        !engine
+            .pending_loader_scans
+            .keys()
+            .any(|key| key.view == view3),
+        "the dead worker's scan settles instead of retrying"
+    );
+    assert!(
+        engine.views.iter().any(|view| view.id() == view3),
+        "the miss keeps its view (no retirement cascade)"
+    );
+    assert_eq!(
+        engine.capture_facts().discovery_losses()[3],
+        losses_before + 1,
+        "the miss counts loss exactly once"
+    );
+    assert_eq!(
+        engine.capture_facts().exit_ended_truncations(),
+        exit_before + 1,
+        "the miss names the exit (exit-only)"
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("expected process exit")
+    }));
+}
+
 /// Task 3.1b: ordinary rotation admits unscanned views into free slots and
 /// never displaces a retained view. Five members under a cap of two: the
 /// first ordinary pass fills the free slot (if any) with the lowest

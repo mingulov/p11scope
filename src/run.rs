@@ -15023,6 +15023,37 @@ mod tests {
         );
     }
 
+    /// Dropping a released child the pause holds stopped resumes it
+    /// before detaching: the survivor is never left in T.
+    #[test]
+    fn dropping_a_stopped_released_child_resumes_it() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        child.pin().send_signal(libc::SIGSTOP).unwrap();
+        wait_until(
+            || original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the released child never stopped",
+        );
+        drop(child);
+        wait_until(
+            || child_stat_state(pid) != Some('T'),
+            "dropping the owner left the released command stopped",
+        );
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "dropping the owner killed the released command"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
     /// A pre-exec child never ran the command: dropping it still kills it
     /// where it stands, so nothing can release it late.
     #[test]

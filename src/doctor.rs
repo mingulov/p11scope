@@ -166,13 +166,19 @@ const CAP_BITS: [(u32, &str); 6] = [
 /// `verdict`) so the table layout and exit code are testable without any of
 /// these probes running.
 pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
-    probe_with_host(pid, cgroup, crate::attach::require_multi_capable_host())
+    probe_with_host(
+        pid,
+        cgroup,
+        crate::attach::require_multi_capable_host(),
+        DoctorProgress::for_state(false, false),
+    )
 }
 
 fn probe_with_host(
     pid: Option<u32>,
     cgroup: Option<&Path>,
     host: crate::attach::MultiHostVerdict,
+    progress: DoctorProgress,
 ) -> Vec<Check> {
     let held = |bit: u32| read_cap_eff().is_ok_and(|mask| mask & (1u64 << bit) != 0);
     let mut checks = vec![
@@ -198,13 +204,15 @@ fn probe_with_host(
         object_capture_check(),
     ];
     let loads_capture = capture_loads_assessed(host);
+    progress.announce(DoctorPhase::BpfSelfProbe);
     checks.extend(if loads_capture {
-        bpf_checks(host)
+        bpf_checks(host, progress)
     } else {
         premulti_bpf_checks(host)
     });
+    progress.announce(DoctorPhase::AttachPreflight);
     let attach_preflight = if loads_capture {
-        attach_preflight_checks(pid, cgroup)
+        attach_preflight_checks(pid, cgroup, progress)
     } else {
         premulti_preflight_checks(
             pid.is_some() || cgroup.is_some(),
@@ -215,6 +223,7 @@ fn probe_with_host(
         .iter()
         .chain(attach_preflight.iter())
         .any(|c| is_capture_row(&c.name) && matches!(c.status, Status::Fail(_)));
+    progress.announce(DoctorPhase::Target);
     checks.extend(live_discovery_checks(pid, capture_lane));
     checks.push(match pid {
         Some(pid) => target_readability_check(pid),
@@ -374,7 +383,11 @@ fn inventory_preflight_check() -> Check {
     }
 }
 
-fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
+fn attach_preflight_checks(
+    pid: Option<u32>,
+    cgroup: Option<&Path>,
+    progress: DoctorProgress,
+) -> Vec<Check> {
     let self_pid = std::process::id();
     let host = crate::attach::Session::preflight(&crate::attach::Scope::Pid(self_pid));
     let lifecycle = host.as_ref().is_ok_and(|fact| fact.lifecycle);
@@ -418,6 +431,7 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
             }
         }
     };
+    progress.announce(DoctorPhase::InventoryPreflight);
     vec![
         host_check,
         inventory_preflight_check(),
@@ -941,11 +955,14 @@ fn capabilities_status(read: Result<u64, String>) -> Status {
 
 /// Uses capture's complete preparation and mandatory lifecycle ownership. The
 /// diagnostic link shares Session teardown ordering.
-fn bpf_checks(host: crate::attach::MultiHostVerdict) -> Vec<Check> {
+fn bpf_checks(host: crate::attach::MultiHostVerdict, progress: DoctorProgress) -> Vec<Check> {
     bpf_checks_with_seccomp(
         crate::attach::Session::diagnostic(),
         attach_self_probe,
-        uretprobe_seccomp_check,
+        || {
+            progress.announce(DoctorPhase::UretprobeConfinement);
+            uretprobe_seccomp_check()
+        },
         || uprobe_multi_check(host),
     )
 }
@@ -2223,17 +2240,34 @@ pub(crate) struct DoctorProgress {
 }
 
 impl DoctorProgress {
+    /// The live decision: interactive stderr, unless `--quiet` silenced it.
+    pub(crate) fn for_stderr() -> Self {
+        use std::io::IsTerminal as _;
+        Self::for_state(
+            std::io::stderr().is_terminal(),
+            crate::cli::text_verbosity() == crate::cli::TextVerbosity::Quiet,
+        )
+    }
+
     /// The pure seam: enabled only on a terminal outside `--quiet`.
     pub(crate) fn for_state(stderr_is_terminal: bool, quiet: bool) -> Self {
-        // RED stub: always silent until the wiring commit enables it.
-        let _ = (stderr_is_terminal, quiet);
-        Self { enabled: false }
+        Self {
+            enabled: stderr_is_terminal && !quiet,
+        }
     }
 
     /// The bytes one phase announcement writes, or `None` for silence.
     pub(crate) fn phase_line(self, phase: DoctorPhase) -> Option<String> {
         self.enabled
             .then(|| format!("p11scope: doctor: {}...", phase.label()))
+    }
+
+    /// Best-effort announce through the bounded stderr sink: a full or
+    /// closed descriptor drops the line, never the verdict.
+    pub(crate) fn announce(self, phase: DoctorPhase) {
+        if let Some(line) = self.phase_line(phase) {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
 }
 
@@ -2246,8 +2280,10 @@ impl DoctorProgress {
 /// (`p11scope doctor | head`, EPIPE) must not turn the verdict into a panic
 /// (HIGH-4), so a broken pipe still exits with the verdict code.
 pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
+    let progress = DoctorProgress::for_stderr();
+    progress.announce(DoctorPhase::Host);
     let host = crate::attach::require_multi_capable_host();
-    let checks = probe_with_host(pid, cgroup, host);
+    let checks = probe_with_host(pid, cgroup, host, progress);
     let verbosity = crate::cli::text_verbosity();
     let (mut text, code) = if extra_strict {
         (
@@ -2271,6 +2307,7 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Resul
     // builds refuse at the probe sentence. Full detail only: the concise
     // and quiet renders stay short.
     if extra_strict || matches!(verbosity, crate::cli::TextVerbosity::Verbose) {
+        progress.announce(DoctorPhase::CounterModes);
         text.push_str(&counter_modes_for_host(
             host,
             crate::attach::kernel_bpf_loop_probe,

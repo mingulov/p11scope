@@ -289,6 +289,15 @@ names the source SHA behind each check the release rounds re-measured.
   with `inventory --system` (or `--cgroup`), which admits short-lived
   processes, or run the leaf command that loads the provider directly
   under `run`.
+- Chromium as an owned `run` child may abort (SIGABRT) under either
+  pause policy: its spawn storm races the loader hooks, so run-direct
+  capture is flaky with `--pause auto` and `--pause never` alike (the
+  harness note records about 3 aborts in 4 for `never`; a 2026-11-09
+  default/never pair aborted on both legs). The pause default neither
+  causes nor worsens it. An aborted run still reports honestly (exit
+  134, PARTIAL). Capture Chromium attach-driven instead (`--system`
+  or `--pid` on the running browser); the browser cells are
+  attach-drive only for this reason.
 - Container providers carry named unproven cases: the container checks
   use one kind node, and multi-node clusters, CRI-O and the cgroupfs
   driver are not exercised. Docker shared image layers and copy-up, the

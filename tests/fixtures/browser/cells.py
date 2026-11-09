@@ -126,7 +126,9 @@ def _reown_report(report: Path) -> None:
 #: barrier during its spawn storm (single-process included), so it runs
 #: `never`. Even `never` is flaky for Chromium run-direct (loader hooks vs
 #: spawn storm, ~3/4 abort); v1 Chromium cells are attach-drive only.
-#: Firefox tolerates `auto`.
+#: Re-verified 2026-11-09: a default/auto run-direct pair aborted on both
+#: legs, so the abort is not auto-specific and the pause default changes
+#: nothing for Chromium. Firefox tolerates `auto`.
 PAUSE_POLICY = {"firefox": "auto", "chromium": "never"}
 
 

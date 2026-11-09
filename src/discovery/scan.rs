@@ -4020,30 +4020,32 @@ struct ForeignOpenFailure {
     root: String,
 }
 
-/// Subject of the single gap a foreign-root scan files when two or more
-/// mapped objects are unopenable (see [`collapse_foreign_root_skips`]).
-const FOREIGN_ROOT_COLLAPSED_SUBJECT: &str = "mapped objects unopenable in foreign target root";
-
-/// Collapse two or more foreign-root open failures into one counted process
-/// gap: an unresolvable foreign view (a container-like mount namespace, or a
-/// chroot whose host fallback failed) must not file one gap per object on
-/// every pass. Zero or one failure keeps the per-object rows (a single
-/// failure is already a single gap, with its object detail intact).
-fn collapse_foreign_root_skips(failures: &[ForeignOpenFailure]) -> Option<Skipped> {
-    if failures.len() < 2 {
-        return None;
-    }
-    let first = &failures[0];
-    Some(Skipped {
-        subject: FOREIGN_ROOT_COLLAPSED_SUBJECT.into(),
-        reason: format!(
-            "{} mapped objects unopenable: target root {} differs from the observer root (first: {}: {})",
-            failures.len(),
-            first.root,
-            first.subject,
-            first.reason,
-        ),
-    })
+/// Per-object gaps for foreign-root open failures: JSON and `-v`
+/// keep every object (the fold belongs to concise rendering only, grouped
+/// per distinct reason there). Only a retained-root open failure gains the
+/// target-root suffix that names the foreign root; a size-cap or
+/// precondition refusal keeps its exact wording and its own record.
+fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
+    failures
+        .into_iter()
+        .map(|failure| {
+            let reason = if failure
+                .reason
+                .starts_with("opening object within retained target root:")
+            {
+                format!(
+                    "{} (target root {} differs from the observer root)",
+                    failure.reason, failure.root
+                )
+            } else {
+                failure.reason
+            };
+            Skipped {
+                subject: failure.subject,
+                reason,
+            }
+        })
+        .collect()
 }
 
 /// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
@@ -6945,13 +6947,7 @@ fn scan_view_examined_mode(
         modules.push(module);
     }
 
-    match collapse_foreign_root_skips(&foreign_failures) {
-        Some(single) => skipped.push(single),
-        None => skipped.extend(foreign_failures.into_iter().map(|failure| Skipped {
-            subject: failure.subject,
-            reason: failure.reason,
-        })),
-    }
+    skipped.extend(foreign_root_skips(foreign_failures));
 
     for (hint, matched) in request.hints.iter().zip(hint_matched) {
         if !matched {
@@ -11361,15 +11357,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn foreign_root_collapse_needs_two_failures() {
-        assert!(collapse_foreign_root_skips(&[]).is_none());
-        assert!(
-            collapse_foreign_root_skips(&[foreign_failure("/lib/a.so", "enoent", "/etc/avahi")])
-                .is_none()
-        );
-    }
-
     /// Foreign-root open failures stay per-object (JSON and `-v` keep
     /// every object; concise folds): only the retained-root prefix
     /// gains the target-root suffix, grouped per distinct reason by the
@@ -11416,35 +11403,6 @@ mod tests {
             "target-root object requires an absolute path without parent traversal",
             "a precondition refusal keeps its own record: {:#?}",
             skips[3]
-        );
-    }
-
-    #[test]
-    fn foreign_root_collapse_counts_and_names_its_first_failure() {
-        let single = collapse_foreign_root_skips(&[
-            foreign_failure("/lib/a.so", "enoent a", "/etc/avahi"),
-            foreign_failure("/lib/b.so", "enoent b", "/etc/avahi"),
-            foreign_failure("/bin/daemon", "enoent c", "/etc/avahi"),
-        ])
-        .expect("three failures collapse");
-        assert_eq!(single.subject, FOREIGN_ROOT_COLLAPSED_SUBJECT);
-        assert!(
-            single.reason.contains("3 mapped objects unopenable")
-                && single.reason.contains("/etc/avahi")
-                && single.reason.contains("/lib/a.so")
-                && single.reason.contains("enoent a"),
-            "unexpected collapse text: {}",
-            single.reason
-        );
-        let two = collapse_foreign_root_skips(&[
-            foreign_failure("/lib/a.so", "enoent a", "/root-a"),
-            foreign_failure("/lib/b.so", "enoent b", "/root-b"),
-        ])
-        .expect("two failures collapse even across roots");
-        assert!(
-            two.reason.contains("2 mapped objects unopenable") && two.reason.contains("/root-a"),
-            "unexpected collapse text: {}",
-            two.reason
         );
     }
 
@@ -11734,9 +11692,11 @@ mod tests {
     }
 
     /// Twin: when the target root is foreign AND the mount namespace differs
-    /// (a container-like view), the host root must not be trusted at all, and
-    /// the unopenable objects must collapse into one counted process gap
-    /// instead of one gap per object per pass.
+    /// (a container-like view), the host root must not be trusted at all:
+    /// no fallback is attempted, and every unopenable object keeps its own
+    /// per-object gap naming the foreign root (JSON and `-v` stay complete).
+    /// The retained reasons are identical, so concise rendering folds them
+    /// into one counted line per distinct reason.
     #[test]
     #[ignore = "root: self-chrooting scan child in a fresh mount namespace"]
     fn privileged_foreign_mount_namespace_scan_collapses_unopenable_objects() {
@@ -11776,19 +11736,33 @@ mod tests {
             "no provider can be proven from unopenable objects: {:#?}",
             outcome.modules()
         );
+        assert!(
+            outcome.skipped().iter().all(|skip| {
+                !skip.subject.contains("unopenable in foreign target root")
+                    && !skip.reason.contains("mapped objects unopenable")
+            }),
+            "the scan files per-object gaps, never a merged row: {:#?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("(host-root fallback:")),
+            "a foreign mount namespace never attempts the host fallback: {:#?}",
+            outcome.skipped()
+        );
         let retained: Vec<_> = outcome
             .skipped()
             .iter()
             .filter(|skip| {
                 skip.reason
                     .contains("opening object within retained target root")
-                    || skip.subject == "mapped objects unopenable in foreign target root"
             })
             .collect();
-        assert_eq!(
-            retained.len(),
-            1,
-            "unopenable foreign-root objects collapse into one counted gap: {:#?}",
+        assert!(
+            retained.len() >= 2,
+            "several objects stay per-object for JSON and -v: {:#?}",
             outcome.skipped()
         );
         let root = subject
@@ -11798,25 +11772,21 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let expected_suffix = format!("(target root {root} differs from the observer root)");
+        for skip in &retained {
+            assert!(
+                skip.reason.contains(expected_suffix.as_str()),
+                "every per-object gap names its foreign root: {:#?}",
+                skip
+            );
+        }
+        // Identical per-object reasons are what concise folds: one counted
+        // line per distinct reason, with every object kept in JSON and -v.
+        let first = &retained[0].reason;
         assert!(
-            retained[0].reason.contains("mapped objects unopenable")
-                && retained[0].reason.contains(root.as_str()),
-            "the collapsed gap names its count and target root: {:#?}",
-            retained[0]
-        );
-        // The collapsed gap proves it merged failures: its embedded
-        // count is at least the collapse threshold (two), never one
-        // per-object row wearing the collapsed subject.
-        let merged: usize = retained[0]
-            .reason
-            .split_whitespace()
-            .next()
-            .and_then(|count| count.parse().ok())
-            .expect("the collapsed gap states how many objects it merged");
-        assert!(
-            merged >= 2,
-            "collapse merges at least two failures, saw {merged}: {:#?}",
-            retained[0]
+            retained.iter().all(|skip| &skip.reason == first),
+            "identical reasons fold to one concise line: {:#?}",
+            retained
         );
     }
 

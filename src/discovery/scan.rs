@@ -11754,6 +11754,20 @@ mod tests {
             "the collapsed gap names its count and target root: {:#?}",
             retained[0]
         );
+        // The collapsed gap proves it merged failures: its embedded
+        // count is at least the collapse threshold (two), never one
+        // per-object row wearing the collapsed subject.
+        let merged: usize = retained[0]
+            .reason
+            .split_whitespace()
+            .next()
+            .and_then(|count| count.parse().ok())
+            .expect("the collapsed gap states how many objects it merged");
+        assert!(
+            merged >= 2,
+            "collapse merges at least two failures, saw {merged}: {:#?}",
+            retained[0]
+        );
     }
 
     /// H-3 regression: one scan read its view's `/proc/<pid>/mountinfo` once

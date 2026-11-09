@@ -10093,6 +10093,94 @@ fn a_candidate_stale_only_by_exited_views_marks_no_generation_gap() {
     );
 }
 
+/// Twin (guard): a dead stale view that owns a pending attach target
+/// keeps the named mark. A newcomer that mapped a provider must never
+/// vanish silently: its calls were never observed, so the aborted apply
+/// is a real discovery gap even though the process exit is proven.
+#[test]
+fn a_dead_stale_view_with_a_new_attach_target_stays_loud() {
+    let (mut fixture, view, module, pins) = loaded_seed_provider();
+    let id = view.id();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    candidate.views.insert(id);
+    // The seed's table is not published yet, so stage its first attach
+    // target exactly like the static-seed tests: the pending slot is
+    // owned by the seed view through its plan module.
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "the seed candidate carries an attach target for the stale view"
+    );
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert!(
+        !engine
+            .views
+            .iter()
+            .any(|view| view.id() == id && view.still_the_same()),
+        "the reaped seed runner reads stale"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert!(
+        outcome.stale_views.contains(&id),
+        "the dead view aborts the apply as stale: {:?}",
+        outcome.stale_views
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "a dropped attach target keeps the named mark: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .all(|line| !line.contains("candidate generation exited before mutation")),
+        "no silence note when a target is dropped: {:?}",
+        engine.counters.noise.lines()
+    );
+}
+
 /// The H2 silence gate, case by case: all-dead reads silent; anything
 /// live, mixed, or unknown reads loud (fail-closed). Direct unit cover
 /// for the predicate the candidate test above wires through the apply.
@@ -10112,7 +10200,33 @@ fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
     let dead_view = ProcessView::open(ProcessViewId(21), dead.id()).unwrap();
     dead.kill().unwrap();
     dead.wait().unwrap();
-    let views = [live_view, dead_view];
+    // A pid reused by a live process: the original generation is gone
+    // but the pid reads live.
+    let reused_view =
+        crate::process::reused_process_view_for_test(ProcessViewId(23), live.id()).unwrap();
+    // An unanswerable pin on a zombie: the generation reads dead but
+    // the pin verdict is an error, so the set stays loud. The zombie is
+    // never waited until the end, so its pid cannot be reused mid-test.
+    let mut zombie = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let zombie_pid = zombie.id();
+    let zombie_view =
+        crate::process::unprovable_process_view_for_test(ProcessViewId(24), zombie_pid).unwrap();
+    zombie.kill().unwrap();
+    for _ in 0..200 {
+        if crate::process::generation_dead(zombie_pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        crate::process::generation_dead(zombie_pid),
+        "the unwaited zombie reads dead, so only the pin verdict keeps it loud"
+    );
+    let views = [live_view, dead_view, reused_view, zombie_view];
     let extra: [&ProcessView; 0] = [];
     let set = |ids: &[ProcessViewId]| ids.iter().copied().collect::<BTreeSet<_>>();
     assert!(
@@ -10122,6 +10236,14 @@ fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
     assert!(
         !stale_views_all_dead(&set(&[ProcessViewId(20)]), &views, &extra),
         "a live generation reads live"
+    );
+    assert!(
+        !stale_views_all_dead(&set(&[ProcessViewId(23)]), &views, &extra),
+        "a pid reused by a live process reads live"
+    );
+    assert!(
+        !stale_views_all_dead(&set(&[ProcessViewId(24)]), &views, &extra),
+        "an unanswerable pin on a dead pid reads unproven"
     );
     assert!(
         !stale_views_all_dead(
@@ -10137,6 +10259,7 @@ fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
     );
     live.kill().unwrap();
     live.wait().unwrap();
+    zombie.wait().unwrap();
 }
 
 #[test]

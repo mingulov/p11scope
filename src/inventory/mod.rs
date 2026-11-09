@@ -7167,14 +7167,18 @@ fn open_native_lane_with(
         {
             // An auto capture on a host without live support (old
             // kernels) falls back on every scope: counting is
-            // impossible there, but the inventory still answers.
+            // impossible there, but the inventory still answers. The
+            // gap names the host (ENOSYS may be a seccomp mask rather
+            // than kernel age) and carries the short host summary
+            // without the scan advice the fatal refusal prints: this
+            // run already continued on the scan lane.
             if mode == CaptureMode::Auto
-                && error
+                && let Some(summary) = error
                     .downcast_ref::<crate::attach::MultiHostRefusal>()
-                    .is_some_and(|refusal| refusal.scan_fallback_eligible())
+                    .filter(|refusal| refusal.scan_fallback_eligible())
+                    .map(crate::attach::MultiHostRefusal::unsupported_host_summary)
             {
-                let summary = crate::attach::summarize_native_preparation_error(&error);
-                let reason = format!("call counts unavailable on this kernel: {summary}");
+                let reason = format!("call counts unavailable on this host: {summary}");
                 return unavailable(coordinator, reason);
             }
             // A host-wide BPF refusal stays fatal, except that an auto PID
@@ -10755,7 +10759,7 @@ mod tests {
                 .find(|(subject, _)| subject == "native usage feed unavailable")
                 .expect("fallback records a named gap");
             assert!(
-                reason.contains("call counts unavailable on this kernel"),
+                reason.contains("call counts unavailable on this host"),
                 "{reason}"
             );
         }
@@ -10823,7 +10827,7 @@ mod tests {
             .find(|(subject, _)| subject == "native usage feed unavailable")
             .expect("fallback records a named gap");
         assert!(
-            reason.contains("call counts unavailable on this kernel"),
+            reason.contains("call counts unavailable on this host"),
             "{reason}"
         );
     }
@@ -10931,7 +10935,7 @@ mod tests {
             gap["reason"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("call counts unavailable on this kernel"),
+                .contains("call counts unavailable on this host"),
             "{}",
             gap["reason"]
         );

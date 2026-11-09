@@ -701,10 +701,8 @@ fn concise_gap_summary_folds_old_kernel_counts_gap() {
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.gaps.clear();
-    let stored = "call counts unavailable on this kernel: live capture unavailable: attaching \
-        p11scope's probes is not supported on this host (Invalid argument); run 'p11scope \
-        doctor' for host readiness, or use 'p11scope inventory --capture scan' or 'p11scope \
-        inspect --pid N' for a scan without capture.";
+    let stored = "call counts unavailable on this host: live capture unavailable: attaching \
+        p11scope's probes is not supported on this host (Operation not supported)";
     presentation
         .gaps
         .push(named_gap("native usage feed unavailable", stored));
@@ -714,7 +712,7 @@ fn concise_gap_summary_folds_old_kernel_counts_gap() {
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavailable — call counts unavailable on this kernel (see \
+            "  1 × native usage feed unavailable — call counts unavailable on this host (see \
              'p11scope doctor')",
         ],
         "the concise gaps block:\n{concise}"

@@ -76,6 +76,48 @@ impl MultiHostRefusal {
         self.cause == MultiHostCause::Unavailable || self.is_premulti_kernel()
     }
 
+    /// The in-progress operation phrase shared by the full refusal
+    /// and the short fallback summary.
+    fn doing(&self) -> &'static str {
+        match self.stage {
+            MultiHostStage::Anchor => "preparing p11scope's self-probe",
+            MultiHostStage::ProgramLoad => "loading p11scope's BPF programs",
+            MultiHostStage::SelfLink => "attaching p11scope's probes",
+        }
+    }
+
+    /// The errno suffix shared by the full refusal and the short
+    /// fallback summary: ` (Name)` or empty when errno is unknown.
+    fn errno_reason(&self) -> String {
+        let reason = self.errno.map(errno_name).unwrap_or_default();
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({reason})")
+        }
+    }
+
+    /// Short host summary for the old-kernel scan-fallback gap: the
+    /// refusal lead plus what failed, without the operator advice tail.
+    /// The fallback run already continued on the scan lane, so advising
+    /// `inventory --capture scan` there is noise; [`Display`] keeps the
+    /// full guidance for the fatal paths.
+    pub(crate) fn unsupported_host_summary(&self) -> String {
+        let doing = self.doing();
+        let reason = self.errno_reason();
+        match self.cause {
+            MultiHostCause::Unavailable => {
+                format!("live capture unavailable: {doing} is not supported on this host{reason}")
+            }
+            MultiHostCause::Unproven => {
+                format!("live capture did not start: {doing} failed{reason}")
+            }
+            // Unreachable on the fallback path (Denied never qualifies),
+            // kept total so callers cannot misrender a new cause.
+            MultiHostCause::Denied => self.to_string(),
+        }
+    }
+
     /// Whether the probe shape proves the kernel itself lacks Multi: the
     /// scratch self-link refusal observed on 6.1, an explicit unsupported
     /// answer at load or link time, or a load refusal for the unknown
@@ -153,17 +195,8 @@ impl std::fmt::Display for MultiHostRefusal {
             MultiHostStage::ProgramLoad => "load p11scope's BPF programs",
             MultiHostStage::SelfLink => "attach p11scope's probes",
         };
-        let doing = match self.stage {
-            MultiHostStage::Anchor => "preparing p11scope's self-probe",
-            MultiHostStage::ProgramLoad => "loading p11scope's BPF programs",
-            MultiHostStage::SelfLink => "attaching p11scope's probes",
-        };
-        let reason = self.errno.map(errno_name).unwrap_or_default();
-        let reason = if reason.is_empty() {
-            String::new()
-        } else {
-            format!(" ({reason})")
-        };
+        let doing = self.doing();
+        let reason = self.errno_reason();
         match self.cause {
             MultiHostCause::Denied => {
                 let effective = crate::caps::read_effective().unwrap_or(0);

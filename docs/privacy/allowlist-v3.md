@@ -69,7 +69,9 @@ module row with the finite `pre_copy_up` marker,
 and [caller launcher chain](#caller-launcher-chain-v070),
 which publishes the implemented per-caller parentage below,
 and [pid-scope caller executable](#pid-scope-caller-executable-v070),
-which names the pid-scope target exe in profile/metrics below.**
+which names the pid-scope target exe in profile/metrics below,
+and [foreign target root path in gap reasons](#foreign-target-root-path-in-gap-reasons-v070),
+which documents the implemented chroot/container gap publication below; owner approval pending.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -2054,3 +2056,18 @@ around the comm field and comm is discarded, never kept or published.
 The exe names the observed image, not a desktop application, script,
 package, service, or trust identity, and proves no operator
 attestation. Counts, joins, admissions, and completeness never change.
+
+## Foreign target root path in gap reasons (v0.7.0)
+
+When a process runs under a different filesystem root than the observer
+(a chroot or a container), its mapped objects can fail to open under
+that root on every pass. Each such failure keeps its own per-object gap
+record naming the foreign root, so the operator sees which root missed;
+concise text folds identical reasons into one counted line per distinct
+reason, while JSON and verbose text list every object. This section
+documents that one new gap-reason suffix in plain words; it is not
+owner sign-off. Allowlist-v1 bytes are unchanged.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Target root path in foreign-root gap reasons (`(target root … differs from the observer root)` suffix) | The `/proc/<pid>/root` link text (readlink) of a process view whose root differs from the observer's, read at most once per failed mapping open and only when the root is already known foreign. The link is display-only: no file is opened through it, and the open's identity guards (mount-table resolution, the self-mapping probe, `mapped_file_guard`) still verify the held descriptor against the maps key. A container target's root renders as `/`; a chroot's as its chroot path. | Public in per-object gap reasons (JSON reports and `-v` text list every object with its suffix) and in concise folded lines (one counted line per distinct reason naming the root, with a `--json lists each` pointer). The suffix appears only on retained-root open failures; size-cap and precondition refusals carry no root and keep their own records. No retention beyond the gap record itself. | An unreadable link publishes `(target root unreadable: …)` and never blocks the scan. No PID, argv, environ, PIN, key or payload value reaches output. Required evidence: per-object JSON/`-v` completeness twins, concise-fold twins, and size-cap/precondition separation twins at the scan and rendering seams. |

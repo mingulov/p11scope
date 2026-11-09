@@ -2292,9 +2292,9 @@ const GAP_GROUPS_SHOWN: usize = 20;
 fn count_explaining_rank(subject: &str) -> Option<u8> {
     const NATIVE_FEED_UNAVAILABLE: &str = "native usage feed unavailable";
     const CAPTURE_FAILED: &str = "inventory capture failed";
-    if subject == crate::inventory::capture::STOPPED_BEFORE_ATTACH_SUBJECT {
+    if subject == crate::inventory_capture::STOPPED_BEFORE_ATTACH_SUBJECT {
         Some(0)
-    } else if subject == crate::inventory::capture::ZERO_PASS_GAP_SUBJECT {
+    } else if subject == crate::inventory_capture::ZERO_PASS_GAP_SUBJECT {
         Some(1)
     } else if subject == NATIVE_FEED_UNAVAILABLE {
         Some(2)

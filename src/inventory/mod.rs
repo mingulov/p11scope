@@ -7165,6 +7165,18 @@ fn open_native_lane_with(
                 .downcast_ref::<crate::attach::MultiHostRefusal>()
                 .is_some() =>
         {
+            // An auto capture on a host without live support (old
+            // kernels) falls back on every scope: counting is
+            // impossible there, but the inventory still answers.
+            if mode == CaptureMode::Auto
+                && error
+                    .downcast_ref::<crate::attach::MultiHostRefusal>()
+                    .is_some_and(|refusal| refusal.scan_fallback_eligible())
+            {
+                let summary = crate::attach::summarize_native_preparation_error(&error);
+                let reason = format!("call counts unavailable on this kernel: {summary}");
+                return unavailable(coordinator, reason);
+            }
             // A host-wide BPF refusal stays fatal, except that an auto PID
             // capture without root falls back to the scan lane with a named
             // gap (never-stop): the scan still answers which providers the
@@ -7191,18 +7203,6 @@ fn open_native_lane_with(
                 } else {
                     format!("live capture refused ({summary})")
                 };
-                return unavailable(coordinator, reason);
-            }
-            // An auto capture on a host without live support (old
-            // kernels) falls back on every scope: counting is
-            // impossible there, but the inventory still answers.
-            if mode == CaptureMode::Auto
-                && error
-                    .downcast_ref::<crate::attach::MultiHostRefusal>()
-                    .is_some_and(|refusal| refusal.scan_fallback_eligible())
-            {
-                let summary = crate::attach::summarize_native_preparation_error(&error);
-                let reason = format!("call counts unavailable on this kernel: {summary}");
                 return unavailable(coordinator, reason);
             }
             return Err(error);
@@ -10792,6 +10792,40 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn pid_auto_uses_counts_gap_on_old_kernel_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        // The old-kernel wording applies on PID scope too (the PID
+        // fallback below it keeps the generic wording for other
+        // causes, covered by the auto_pid tests).
+        let mut coordinator = coordinator();
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(libc::EINVAL));
+        let lane = open_native_lane_with(
+            CaptureMode::Auto,
+            BackendSelection::Auto,
+            Scope::Pid(std::process::id()),
+            &mut coordinator,
+            |_, _, _| Err(refusal.into()),
+        )
+        .expect("pid auto falls back to scan on old-kernel host refusal");
+        assert!(lane.is_none(), "fallback leaves no native lane");
+        coordinator.registry_mut().publish();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        let (_, reason) = gaps
+            .iter()
+            .find(|(subject, _)| subject == "native usage feed unavailable")
+            .expect("fallback records a named gap");
+        assert!(
+            reason.contains("call counts unavailable on this kernel"),
+            "{reason}"
+        );
     }
 
     #[test]

@@ -369,6 +369,151 @@ fn cgroup_runtime_cancelled_worker_keeps_native_service_join_and_finalization() 
     returning_read_control_gate(GateStop::Operator, true);
 }
 
+/// Owner rule 2026-11-09: a timed `--cgroup` run shorter than the
+/// first full pass publishes the members its pass-0 collection saw
+/// instead of discarding into 0 callers. The deadline expires
+/// mid-collection (after the first scanner read returns, like the
+/// busy-host shape); the scanned provider caller must still publish.
+#[test]
+fn cgroup_short_timed_run_publishes_scanned_pass0() {
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(200);
+    let control = CollectionControl::new(Some(deadline));
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    let calls = driver.collections.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let worker_reads = reads.clone();
+    driver.wrapper = Some(Box::new(move |job| {
+        Box::new(move || {
+            let mut first = true;
+            crate::discovery::scan::maps_read_test::observe(
+                move |bytes| {
+                    if bytes > 0 {
+                        worker_reads.fetch_add(1, Ordering::SeqCst);
+                        if first {
+                            first = false;
+                            let bound = Instant::now() + Duration::from_secs(10);
+                            while Instant::now() < deadline {
+                                assert!(
+                                    Instant::now() < bound,
+                                    "the held read must see the deadline pass"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                },
+                job,
+            )
+        })
+    }));
+    let stop_requested = || false;
+    let mut loop_clock = clock(&stop_requested);
+    loop_clock.deadline = Some(deadline);
+    let mut pass_publications = 0;
+    let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+        &mut driver,
+        None,
+        &loop_clock,
+        None,
+        &mut |_, point| {
+            if matches!(point, Publish::Pass { .. }) {
+                pass_publications += 1;
+            }
+            Ok(())
+        },
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(
+        reads.load(Ordering::SeqCst) > 0,
+        "actual scanner I/O reached the held read"
+    );
+    assert_eq!(
+        control.check(),
+        Err(CollectionStop::Deadline),
+        "the deadline latched during the held collection"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no next or recovery collection after the stop"
+    );
+    assert_eq!(pass_publications, 1, "pass 0 still publishes");
+    assert!(
+        result.zero_pass.is_none(),
+        "a publishing pass is not a zero-pass run"
+    );
+    assert_eq!(
+        driver.inner.coordinator.registry().caller_count(),
+        1,
+        "the scanned caller publishes instead of discarding to 0"
+    );
+    assert!(
+        driver.inner.coordinator.registry().edges().next().is_some(),
+        "the scanned caller's module edge publishes"
+    );
+}
+
+/// Twin: a run whose deadline already passed before pass 0 starts
+/// collected nothing, so it stays an honest empty: 0 callers with
+/// the cancelled-before-launch gap and the zero-pass diagnostic.
+#[test]
+fn cgroup_preexpired_deadline_stays_honest_empty() {
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let deadline = Instant::now();
+    let control = CollectionControl::new(Some(deadline));
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    let calls = driver.collections.clone();
+    let stop_requested = || false;
+    let mut loop_clock = clock(&stop_requested);
+    loop_clock.deadline = Some(deadline);
+    let mut pass_publications = 0;
+    let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+        &mut driver,
+        None,
+        &loop_clock,
+        None,
+        &mut |_, point| {
+            if matches!(point, Publish::Pass { .. }) {
+                pass_publications += 1;
+            }
+            Ok(())
+        },
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no collection starts past the deadline"
+    );
+    assert_eq!(pass_publications, 0, "no pass publishes");
+    assert_eq!(
+        driver.inner.coordinator.registry().caller_count(),
+        0,
+        "nothing was seen, so 0 callers is honest"
+    );
+    let zero = result.zero_pass.expect("the honest empty stays zero-pass");
+    assert_eq!(
+        zero.cause,
+        crate::inventory_capture::ZeroPassCause::Deadline
+    );
+    assert_eq!(zero.discarded, 0, "no collection ran to discard");
+    let gaps = driver.inner.coordinator.registry().gaps();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.subject == "cgroup collection cancelled before launch"),
+        "the before-launch stop is named: {:?}",
+        gaps.iter().map(|gap| &gap.subject).collect::<Vec<_>>()
+    );
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.subject == crate::inventory_capture::ZERO_PASS_GAP_SUBJECT),
+        "the zero-pass diagnostic is staged: {:?}",
+        gaps.iter().map(|gap| &gap.subject).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn cgroup_runtime_stopped_native_startup_finalizes_without_fabricating_pass() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

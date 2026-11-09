@@ -55,7 +55,7 @@ sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 
 New here? Work through the [Quickstart](docs/usage.md#quickstart): it sets up a
-throwaway SoftHSM token and runs your first observed workload in about two minutes.
+throwaway SoftHSM token and runs your first observed workload in a few minutes.
 
 `doctor` reports host readiness (real output, v0.7.0 on Ubuntu 26.04):
 

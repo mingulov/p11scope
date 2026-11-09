@@ -8,7 +8,7 @@ release; the entries under Prior releases retain their historical context.
 
 New to p11scope? Start here:
 
-- [Quickstart](usage.md#quickstart) — a throwaway SoftHSM token and your first observed workload, in about two minutes.
+- [Quickstart](usage.md#quickstart) — a throwaway SoftHSM token and your first observed workload, in a few minutes.
 - [Current release limits](#known-limitations-in-060) — the limits in force for this release.
 - [Troubleshooting](troubleshooting.md) — what a refusal or an empty capture means, and the fix.
 

@@ -8,7 +8,7 @@ implementation limits are code contracts, not measurements.
 
 New to p11scope? Start here:
 
-- [Quickstart](#quickstart) — a throwaway SoftHSM token and your first observed workload, in about two minutes.
+- [Quickstart](#quickstart) — a throwaway SoftHSM token and your first observed workload, in a few minutes.
 - [Install](install.md#install) — release bundles, system packages, and building from source.
 - [Troubleshooting](troubleshooting.md) — what a refusal or an empty capture means, and the fix.
 - [Known limitations](known-limitations.md) — what this release does not do, before relying on a capture.
@@ -217,7 +217,7 @@ classification consequences, never the name bytes.
 
 ## Quickstart
 
-Start here (about 2 minutes). First give yourself a token to observe.
+Start here (a few minutes). First give yourself a token to observe.
 Install SoftHSM and `pkcs11-tool` if they are missing (`sudo apt install
 softhsm2 opensc` on Debian/Ubuntu, `sudo dnf install softhsm opensc` on
 Fedora/RHEL), then create a throwaway token and pick the module path for

@@ -3617,10 +3617,11 @@ fn capture_with_host(
             &what,
             engine.plan().modules.is_empty(),
         )?;
-        emit_capture_diagnostic(&empty_plan_hint(&a.scope, engine.plan()));
-        for line in replaced_file_hint_lines(&engine.plan().skipped) {
-            emit_capture_diagnostic(&line);
-        }
+    }
+    let empty_hint = (engine.plan().modules.is_empty() && !named_pid_gone)
+        .then(|| empty_plan_hint(&a.scope, engine.plan()));
+    for line in capture_start_hint_lines(empty_hint, named_pid_gone, &engine.plan().skipped) {
+        emit_capture_diagnostic(&line);
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
@@ -5673,8 +5674,27 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
     }
 }
 
+/// stderr lines for capture startup, in emit order: the empty-plan line
+/// (built by the caller) when nothing attached, then one line per distinct replaced file whenever
+/// the plan's skips carry the replaced-file reason — even when other modules
+/// did attach. Empty when a named pid died (its missing-process line speaks
+/// instead) or when no replaced file was skipped.
+fn capture_start_hint_lines(
+    empty_hint: Option<String>,
+    named_pid_gone: bool,
+    skipped: &[crate::discovery::scan::Skipped],
+) -> Vec<String> {
+    if named_pid_gone {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    lines.extend(empty_hint);
+    lines.extend(replaced_file_hint_lines(skipped));
+    lines
+}
+
 /// stderr lines naming the distinct replaced provider files behind this
-/// capture's discovery gaps, so an empty profile/trace report still names
+/// capture's discovery gaps, so a profile/trace report still names
 /// the file instead of only pointing at inspect/doctor. One line per
 /// distinct file, the first eight in sorted order with any rest counted;
 /// every subject is control-escaped for the terminal. Empty when no plan
@@ -26205,7 +26225,8 @@ int main(int argc, char **argv) {
         let replaced = skip("/opt/r.so (deleted)", REPLACED_PROVIDER_REASON);
         let other = skip("capture discovery", "some other reason");
         let scope = ScopeArg::Pid(42);
-        let empty = capture_start_hint_lines(true, false, &scope, &[replaced.clone()]);
+        let empty =
+            capture_start_hint_lines(Some(no_modules_hint(&scope)), false, &[replaced.clone()]);
         assert_eq!(empty.len(), 2, "{empty:?}");
         assert!(
             empty[0].contains("no PKCS#11 modules discovered in pid 42"),
@@ -26215,7 +26236,7 @@ int main(int argc, char **argv) {
             empty[1].contains("/opt/r.so (deleted)"),
             "the empty capture names the file: {empty:?}"
         );
-        let attached = capture_start_hint_lines(false, false, &scope, &[replaced.clone()]);
+        let attached = capture_start_hint_lines(None, false, &[replaced.clone()]);
         assert_eq!(attached.len(), 1, "{attached:?}");
         assert!(
             attached[0].contains("/opt/r.so (deleted)"),
@@ -26226,15 +26247,16 @@ int main(int argc, char **argv) {
             "an attached capture never prints the no-modules pointer: {attached:?}"
         );
         assert!(
-            capture_start_hint_lines(false, false, &scope, &[other]).is_empty(),
+            capture_start_hint_lines(None, false, &[other]).is_empty(),
             "other skips stay silent when modules attached"
         );
         assert!(
-            capture_start_hint_lines(true, true, &scope, &[replaced.clone()]).is_empty(),
+            capture_start_hint_lines(Some(no_modules_hint(&scope)), true, &[replaced.clone()])
+                .is_empty(),
             "a dead named pid stays silent on the empty path"
         );
         assert!(
-            capture_start_hint_lines(false, true, &scope, &[replaced]).is_empty(),
+            capture_start_hint_lines(None, true, &[replaced]).is_empty(),
             "a dead named pid stays silent on the attached path"
         );
     }

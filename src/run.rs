@@ -6097,12 +6097,18 @@ pub(crate) const TARGET_CALLER_EXE_UNREADABLE: &str = "target exe link unreadabl
 
 /// Resolve the pid-scope target's caller identity from
 /// `/proc/<pid>/exe`: the link text, or the finite reason it could not
-/// be read. Only a `kill(pid, 0)` `ESRCH` names the exit; a `/proc`
-/// miss on a live pid is unreadable, never presumed exited. The pid
-/// itself never enters the report — stderr diagnostics name it beside
-/// this identity. Only the exe link is read: no cwd, cmdline, or
-/// environ.
-pub(crate) fn resolve_pid_caller(pid: u32) -> render::CaptureCaller {
+/// be read. The read is bound to the target's retained pin when one is
+/// held: a generation change under the read discards even a readable
+/// path, so a recycled pid never misattaches an unrelated program's
+/// exe. Without a pin, only a proven exit (`kill(pid, 0)` `ESRCH`, or
+/// a zombie/dead `/proc` stat) names the exit; a `/proc` miss on a
+/// live pid is unreadable, never presumed exited. The pid itself never
+/// enters the report — stderr diagnostics name it beside this identity.
+/// Only the exe link is read: no cwd, cmdline, or environ.
+pub(crate) fn resolve_pid_caller(
+    pid: u32,
+    pin: Option<&crate::process::PidPin>,
+) -> render::CaptureCaller {
     resolve_pid_caller_with(
         pid,
         |path| {
@@ -6110,19 +6116,37 @@ pub(crate) fn resolve_pid_caller(pid: u32) -> render::CaptureCaller {
                 .ok()
                 .map(|link| link.to_string_lossy().into_owned())
         },
-        crate::process::process_proven_exited,
+        // A zombie still answers `kill(pid, 0)`, so the signal proof
+        // alone would mislabel an unreaped exit as hidepid: the stat
+        // verdict covers it (a fallback pin cannot see zombies either).
+        |pid| crate::process::process_proven_exited(pid) || crate::process::generation_dead(pid),
+        || pin.is_none_or(|pin| pin.still_the_same()),
     )
 }
 
 /// [`resolve_pid_caller`] over injected readers, so every outcome is
-/// unit-testable without live `/proc` state.
+/// unit-testable without live `/proc` state. The `still_same` bracket
+/// mirrors `ProcessView::run_while_same`: false before the read, or
+/// after it, discards the path and names the exit.
 fn resolve_pid_caller_with(
     pid: u32,
     read_exe_link: impl Fn(&str) -> Option<String>,
     proven_exited: impl Fn(u32) -> bool,
+    mut still_same: impl FnMut() -> bool,
 ) -> render::CaptureCaller {
+    let exited = || render::CaptureCaller {
+        exe: None,
+        exe_unknown_reason: Some(TARGET_CALLER_EXITED),
+    };
+    if !still_same() {
+        return exited();
+    }
     let path = format!("/proc/{pid}/exe");
-    if let Some(exe) = read_exe_link(&path) {
+    let exe = read_exe_link(&path);
+    if !still_same() {
+        return exited();
+    }
+    if let Some(exe) = exe {
         return render::CaptureCaller {
             exe: Some(exe),
             exe_unknown_reason: None,
@@ -6733,14 +6757,25 @@ fn capture_profile(
     if capture_diagnostics_on() {
         emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
     }
-    // The pid-scope target, resolved once probes are attached (the
-    // target is alive then by construction): stderr names it beside the
-    // readiness line, and the terminal report carries the same
-    // identity. At report time the target may be long gone, so the
-    // terminal block reuses this value and never re-reads.
+    // The pid-scope target, resolved once probes are attached (usually
+    // alive; an exit between attach and the read is named via the exit
+    // reason): stderr names it beside the readiness line, and the
+    // terminal report carries the same identity. The read is bound to
+    // the target's retained pin — the owned child's pin on the degraded
+    // run path, else the named view's — so a recycled pid never
+    // misattaches an unrelated program's exe. At report time the target
+    // may be long gone, so the terminal block reuses this value and
+    // never re-reads.
     let target_caller = match scope {
         Scope::Pid(pid) => {
-            let caller = resolve_pid_caller(*pid);
+            let owned_pin = owned
+                .as_ref()
+                .and_then(|owned| owned.child.as_ref())
+                .filter(|child| child.pid() == *pid)
+                .map(|child| child.pin());
+            let engine_pin = engine.pid_target_pin(*pid);
+            let pin = owned_pin.or(engine_pin.as_deref());
+            let caller = resolve_pid_caller(*pid, pin);
             emit_capture_diagnostic(&target_caller_line(*pid, &caller));
             Some(caller)
         }
@@ -20282,27 +20317,62 @@ mod tests {
             7,
             |_| Some("/bin/app".to_string()),
             |_| panic!("a readable link never consults the exit proof"),
+            || true,
         );
         assert_eq!(named.exe.as_deref(), Some("/bin/app"));
         assert_eq!(named.exe_unknown_reason, None);
         // Unreadable plus proven exit: the exit is named.
-        let exited = resolve_pid_caller_with(7, |_| None, |_| true);
+        let exited = resolve_pid_caller_with(7, |_| None, |_| true, || true);
         assert_eq!(exited.exe, None);
         assert_eq!(exited.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
         // Unreadable but live: unreadable, never presumed exited.
-        let hidden = resolve_pid_caller_with(7, |_| None, |_| false);
+        let hidden = resolve_pid_caller_with(7, |_| None, |_| false, || true);
         assert_eq!(hidden.exe, None);
         assert_eq!(
             hidden.exe_unknown_reason,
             Some(TARGET_CALLER_EXE_UNREADABLE)
         );
+        // Changed generation: a readable link is discarded, never
+        // misattached, and the exit is named without consulting the
+        // proof.
+        let changed = resolve_pid_caller_with(
+            7,
+            |_| Some("/bin/recycled".to_string()),
+            |_| panic!("a changed generation never consults the exit proof"),
+            || false,
+        );
+        assert_eq!(changed.exe, None);
+        assert_eq!(changed.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
+        // Changed under the read: same discard when the bracket fails
+        // after the link was already read.
+        let mut first = true;
+        let raced = resolve_pid_caller_with(
+            7,
+            |_| Some("/bin/recycled".to_string()),
+            |_| panic!("a changed generation never consults the exit proof"),
+            || std::mem::replace(&mut first, false),
+        );
+        assert_eq!(raced.exe, None);
+        assert_eq!(raced.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
     }
 
     #[test]
     fn resolve_pid_caller_names_live_self() {
         // The real reader over a pid that is certainly alive and
         // readable: this test process names its own exe.
-        let caller = resolve_pid_caller(std::process::id());
+        let caller = resolve_pid_caller(std::process::id(), None);
+        let exe = caller.exe.as_deref().unwrap_or_default();
+        assert!(!exe.is_empty(), "{caller:?}");
+        assert_eq!(caller.exe_unknown_reason, None);
+    }
+
+    #[test]
+    fn resolve_pid_caller_with_pin_names_live_self() {
+        // The pin-bound reader over a live pin names the same exe: the
+        // bracket passes through when the generation is unchanged.
+        let pin =
+            crate::process::PidPin::open(std::process::id()).expect("pinning the test process");
+        let caller = resolve_pid_caller(std::process::id(), Some(&pin));
         let exe = caller.exe.as_deref().unwrap_or_default();
         assert!(!exe.is_empty(), "{caller:?}");
         assert_eq!(caller.exe_unknown_reason, None);
@@ -20327,7 +20397,7 @@ mod tests {
             crate::process::process_is_zombie(pid),
             "the killed child is unreaped"
         );
-        let caller = resolve_pid_caller(pid);
+        let caller = resolve_pid_caller(pid, None);
         child.wait().expect("reaping the zombie fixture");
         assert_eq!(caller.exe, None, "{caller:?}");
         assert_eq!(

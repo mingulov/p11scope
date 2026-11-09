@@ -1694,12 +1694,19 @@ pub(crate) fn process_is_kthread(pid: u32) -> bool {
         .is_some_and(|flags| flags & PF_KTHREAD != 0)
 }
 
-/// True when `pid` is provably dead: reaped (`/proc/<pid>/stat` is gone)
-/// or zombie (state `Z`). A single stat read classifies both, so a reap
-/// or exit between two reads cannot strand a dead generation as unknown;
-/// any other read or parse failure answers false (fail-closed: the caller
-/// keeps its unknown). Discovery skip sites use this so an unreaped exit
-/// stays silent like a reaped one.
+/// True when a `/proc/<pid>/stat` state word proves the generation dead:
+/// zombie (`Z`) or dead (`X`, `x`). A live, sleeping, stopped, or parked
+/// task never carries these words, so the verdict is reuse-safe.
+fn stat_state_is_dead(state: &str) -> bool {
+    state == "Z" || state == "X" || state == "x"
+}
+
+/// True when `pid` is provably dead: reaped (`/proc/<pid>/stat` is gone),
+/// zombie (state `Z`), or dead (state `X`). A single stat read classifies
+/// all three, so a reap or exit between two reads cannot strand a dead
+/// generation as unknown; any other read or parse failure answers false
+/// (fail-closed: the caller keeps its unknown). Discovery skip sites use
+/// this so an unreaped exit stays silent like a reaped one.
 pub(crate) fn generation_dead(pid: u32) -> bool {
     let stat = match read_proc_stat(pid) {
         Ok(stat) => stat,
@@ -1711,7 +1718,7 @@ pub(crate) fn generation_dead(pid: u32) -> bool {
     stat[end + 1..]
         .split_whitespace()
         .next()
-        .is_some_and(|state| state == "Z")
+        .is_some_and(stat_state_is_dead)
 }
 
 /// Whether a member whose scan failed is gone for skip purposes. The pin's
@@ -2710,6 +2717,16 @@ int main(int argc, char **argv) {
         assert!(generation_dead(pid), "a zombie reads live");
         child.wait().unwrap();
         assert!(generation_dead(pid), "a reaped child reads live");
+    }
+
+    #[test]
+    fn dead_states_cover_zombie_and_dead_only() {
+        for dead in ["Z", "X", "x"] {
+            assert!(stat_state_is_dead(dead), "{dead} reads live");
+        }
+        for live in ["R", "S", "D", "T", "t", "K", "W", "P", "I", ""] {
+            assert!(!stat_state_is_dead(live), "{live} reads dead");
+        }
     }
 
     #[test]

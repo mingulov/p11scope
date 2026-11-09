@@ -11186,6 +11186,16 @@ impl Engine {
             .any(|view| view.pid() == pid && view.still_the_same())
     }
 
+    /// The pid-scope target's retained pin, when discovery kept the named
+    /// view: the original generation's pin, so a pin-bound read brackets
+    /// the exe link against pid reuse instead of trusting the number.
+    pub(crate) fn pid_target_pin(&self, pid: u32) -> Option<std::sync::Arc<PidPin>> {
+        self.views
+            .iter()
+            .find(|view| view.pid() == pid)
+            .map(|view| view.retained_pin_arc().clone())
+    }
+
     /// Publishes a run-tree coverage gap: the command's descendants a
     /// degraded or ended run did not follow. A measured survivor count
     /// lands beside the skip; degradations and unread memberships

@@ -16475,6 +16475,29 @@ fn engine_retains_pid_reports_live_views_only() {
 }
 
 #[test]
+fn engine_pid_target_pin_returns_the_named_view_pin() {
+    let mut engine = Engine::empty();
+    assert!(
+        engine.pid_target_pin(std::process::id()).is_none(),
+        "an empty engine holds no pin"
+    );
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let pin = engine
+        .pid_target_pin(std::process::id())
+        .expect("the named view keeps its pin");
+    assert_eq!(pin.pid(), std::process::id());
+    assert!(pin.still_the_same(), "the live pin brackets its own view");
+    assert!(
+        std::sync::Arc::ptr_eq(&pin, engine.views[0].retained_pin_arc()),
+        "the accessor shares the view allocation, never a reopen"
+    );
+    assert!(engine.pid_target_pin(u32::MAX).is_none(), "no view, no pin");
+}
+
+#[test]
 fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {

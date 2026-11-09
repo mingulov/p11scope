@@ -1953,6 +1953,10 @@ mod tests {
             GAP_BUDGET_EXHAUSTED,
             GAP_ANCHOR_BINDING_FAILED,
             "opened object identity 1:2 inode 3 does not match mapped object 1:2 inode 4",
+            // Owner rule 2026-11-09 (data-always): a deleted mapping may
+            // still carry executable code, so it fails closed.
+            "deleted mapping",
+            crate::discovery::scan::REPLACED_PROVIDER_REASON,
             "some future unknown omission",
         ] {
             assert!(
@@ -1974,7 +1978,6 @@ mod tests {
             HINT_NOT_MAPPED_REASON,
             NO_ABSOLUTE_PATHNAME_REASON,
             "ambiguous \\012 pathname",
-            "deleted mapping",
             "non-UTF-8 pathname",
         ] {
             assert!(

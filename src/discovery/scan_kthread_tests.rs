@@ -315,11 +315,11 @@ fn deleted_exec_mapping_is_a_named_replaced_file_loss() {
         .map(|skip| skip.reason.as_str())
         .collect();
     assert!(
-        reasons.contains(&"provider file replaced on disk while running; calls not counted"),
+        reasons.contains(&crate::discovery::scan::REPLACED_PROVIDER_REASON),
         "a deleted exec mapping names the replaced-file loss, got {reasons:?}"
     );
     assert!(
-        scan_skip_truncates("provider file replaced on disk while running; calls not counted"),
+        scan_skip_truncates(crate::discovery::scan::REPLACED_PROVIDER_REASON),
         "the replaced-file loss truncates coverage"
     );
 }

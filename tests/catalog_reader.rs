@@ -1006,7 +1006,7 @@ fn catalog_reader_finds_every_fixture_object() {
     );
     assert_eq!(
         a_gap["reason"],
-        "provider file replaced on disk while running; calls not counted"
+        "replaced on disk while running; not examined, calls not counted"
     );
 
     // N: eight interface-linked tables (publication evidence), with 544

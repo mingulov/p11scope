@@ -10247,7 +10247,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             let (expected, truncates) = if name == std::ffi::OsStr::new("deleted.so") {
                 std::fs::remove_file(&path).unwrap();
                 (
-                    "provider file replaced on disk while running; calls not counted",
+                    crate::discovery::scan::REPLACED_PROVIDER_REASON,
                     true,
                 )
             } else if name.as_encoded_bytes().contains(&b'\n') {

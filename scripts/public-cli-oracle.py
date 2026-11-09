@@ -583,8 +583,23 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     for key in LOSS_COUNTERS:
         require(type(evidence.get(key)) is int and evidence[key] == 0, "loss or unknown " + key)
     observation = evidence.get("gap_classes", {}).get("observation", {})
+    ok_exact = observation.get("status") == "exact" and observation.get("causes") == []
+    # Controller ruling 2026-11-09 07:50: every system-scope cell
+    # qualifies the honest ambient-generation gap -- exactly causes
+    # ["skipped", "pid_descendant_gaps"] with every skip the named
+    # redacted discovery pair -- in strict and flagged modes alike.
+    # Owned counts stay exact (checked below), owned loss stays zero
+    # (checked above) and any other class still fails.
+    skip_entries = evidence.get("skipped", [])
+    ok_ambient = (
+        scope == "system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "pid_descendant_gaps"]
+        and isinstance(skip_entries, list)
+        and len(skip_entries) >= 1
+        and all(skip == DISCLOSABLE_DISCOVERY_SKIP for skip in skip_entries)
+        and evidence.get("modules_skipped") == [])
     if relaxed:
-        ok_exact = observation.get("status") == "exact" and observation.get("causes") == []
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
         ok_skip_family = (
@@ -596,17 +611,19 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             and all(skip == DISCLOSABLE_DISCOVERY_SKIP or
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
-        require(ok_exact or ok_noise or ok_skip_family, "lossy or unknown observation gap class")
+        require(ok_exact or ok_noise or ok_skip_family or ok_ambient,
+                "lossy or unknown observation gap class")
     elif gap66:
-        ok_exact = observation.get("status") == "exact" and observation.get("causes") == []
         ok_gap = (observation.get("status") == "lossy" and
                   observation.get("causes") == ["skipped"] and
                   evidence.get("skipped") == [{"name": "discovery subject",
                                                "reason": "discovery unavailable"}])
-        require(ok_exact or ok_gap, "lossy or unknown observation gap class")
-    else:
-        require(observation.get("status") == "exact" and observation.get("causes") == [],
+        require(ok_exact or ok_gap or ok_ambient,
                 "lossy or unknown observation gap class")
+    elif scope == "system":
+        require(ok_exact or ok_ambient, "lossy or unknown observation gap class")
+    else:
+        require(ok_exact, "lossy or unknown observation gap class")
     kernel = evidence.get("kernel_control", {})
     require(kernel.get("capture_halted") is False and kernel.get("owner_poison") == [] and
             kernel.get("root_affiliation_failures") == [], "kernel capture halted or unknown")
@@ -617,7 +634,9 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         evidence.get("attach_mechanisms") if mode == "profile" else None,
         report)
     terminal(evidence, profile=mode == "profile")
-    if relaxed and evidence.get("pid_descendant_gaps", 0) > 0:
+    ambient = (not relaxed and scope == "system" and
+               observation.get("causes") == ["skipped", "pid_descendant_gaps"])
+    if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps
         # or other loss would have failed above, and PARTIAL/concrete_gap
@@ -627,11 +646,13 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         # otherwise it would be stricter than strict. The only added ruling
         # requirement is the provider-subject check below. Hints are never
         # required; when present they must not place a gap subject in the
-        # watched provider set.
+        # watched provider set. The strict ambient gap carries the same
+        # check: a provider-linked subject is not ambient noise.
         hints = evidence.get("gap_exe_hints")
         if hints is not None:
+            subject = "ambient gap subject" if ambient else "runner noise subject"
             require(hints.get("links_provider", 0) == 0,
-                    "runner noise subject links the watched provider")
+                    subject + " links the watched provider")
     if cell in RUN_CELLS:
         run_judge(evidence)
     if cell.startswith("select-endpoint-"):
@@ -714,7 +735,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
                     if skip == DISCLOSABLE_DISCOVERY_SKIP)
-        if cell == "mt-system":
+        if cell == "mt-system" or skips > 0:
             noise = f"pid_descendant_gaps={gaps}; discovery_skips={skips}"
         else:
             noise = f"pid_descendant_gaps={gaps}"
@@ -732,6 +753,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             "owned physical-provider counts match independent successful ledger; "
             "disclosed 6.6 discovery gap: discovery subject/discovery unavailable; "
             "per-caller attribution is not established")
+    if ambient:
+        gaps = evidence.get("pid_descendant_gaps", 0)
+        skips = sum(1 for skip in evidence.get("skipped", [])
+                    if skip == DISCLOSABLE_DISCOVERY_SKIP)
+        return "owned-provider-counts-with-ambient-gap", (
+            "owned physical-provider counts match independent successful ledger; "
+            f"disclosed honest ambient gap: pid_descendant_gaps={gaps}; discovery_skips={skips}; "
+            "per-caller attribution is not established")
     return "owned-provider-counts", ("owned physical-provider counts match independent successful ledger; "
                                      "per-caller attribution is not established")
 
@@ -744,7 +773,9 @@ def main(argv=None):
                         help="CI-GAP-1: on the system cells (`system`, `mt-system`) only, disclose nonzero "
                              "pid_descendant_gaps as runner noise instead of failing; "
                              "ruling U1: on `mt-system` only, also disclose the named "
-                             "{discovery subject, discovery unavailable} skips")
+                             "{discovery subject, discovery unavailable} skips; "
+                             "the 2026-11-09 ambient-gap ruling qualifies exactly that "
+                             "skip family on every system-scope cell with or without this flag")
     parser.add_argument("--allow-66-discovery-gap", action="store_true",
                         help="flake-66: on select-endpoint-system only, disclose exactly one "
                              "redacted discovery skip as a 6.6 transient instead of failing")

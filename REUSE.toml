@@ -66,3 +66,19 @@ path = ["tests/fixtures/**/*.log"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Denis Mingulov <denis@mingulov.com>"
 SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Upstream CycloneDX schemas (controller ruling 2026-11-09 09:45):
+# byte-identical Apache-2.0 files from the CycloneDX specification (see
+# tests/fixtures/cbom/README.md); their $comment fields name no holder,
+# so the ruling's holder text applies. `override` wins over the fixtures
+# glob above, which still matches them; REUSE resolves these three paths
+# to upstream only.
+[[annotations]]
+path = [
+    "tests/fixtures/cbom/bom-1.6.schema.json",
+    "tests/fixtures/cbom/jsf-0.82.schema.json",
+    "tests/fixtures/cbom/spdx.schema.json",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "OWASP Foundation and the CycloneDX contributors"
+SPDX-License-Identifier = "Apache-2.0"

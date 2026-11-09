@@ -15409,6 +15409,198 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     }
 }
 
+// Upstream CycloneDX schemas (controller ruling 2026-11-09 09:45):
+// byte-identical Apache-2.0 files that the project fixtures glob would
+// otherwise attribute to us, so an `override` annotation reattributes
+// exactly these paths to upstream. Their own `$comment` fields name the
+// license but no holder; the upstream LICENSE appendix names
+// "Copyright OWASP Foundation", and the ruling's holder text covers it.
+const LICENSE_CYCLONEDX_SCHEMAS: &[&str] = &[
+    "tests/fixtures/cbom/bom-1.6.schema.json",
+    "tests/fixtures/cbom/jsf-0.82.schema.json",
+    "tests/fixtures/cbom/spdx.schema.json",
+];
+const LICENSE_CYCLONEDX_COPYRIGHT: &str = "OWASP Foundation and the CycloneDX contributors";
+
+struct LicenseReuseAnnotation {
+    paths: Vec<String>,
+    precedence: String,
+    copyright: String,
+    license: String,
+}
+
+// Minimal REUSE.toml reader: splits `[[annotations]]` blocks and pulls the
+// path list plus the precedence/license/copyright fields. The file is
+// machine-regular; anything unexpected fails the contract loudly.
+fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in text.lines() {
+        if line.trim() == "[[annotations]]" {
+            blocks.push(Vec::new());
+        } else if let Some(block) = blocks.last_mut() {
+            block.push(line);
+        }
+    }
+    blocks
+        .iter()
+        .map(|block| {
+            let mut paths = Vec::new();
+            let mut in_paths = false;
+            let mut precedence = String::new();
+            let mut copyright = String::new();
+            let mut license = String::new();
+            for line in block {
+                let line = line.trim();
+                if line.starts_with("path") {
+                    in_paths = true;
+                    continue;
+                }
+                if in_paths {
+                    if line.starts_with(']') {
+                        in_paths = false;
+                    } else if let Some(entry) = line.strip_prefix('"') {
+                        if let Some(entry) = entry.strip_suffix("\",") {
+                            paths.push(entry.to_string());
+                        } else if let Some(entry) = entry.strip_suffix('"') {
+                            paths.push(entry.to_string());
+                        }
+                    }
+                    continue;
+                }
+                for (key, slot) in [
+                    ("precedence", &mut precedence),
+                    ("SPDX-FileCopyrightText", &mut copyright),
+                    ("SPDX-License-Identifier", &mut license),
+                ] {
+                    if let Some(value) = line.strip_prefix(key) {
+                        let value = value.trim().trim_start_matches('=').trim();
+                        *slot = value.trim_matches('"').to_string();
+                    }
+                }
+            }
+            LicenseReuseAnnotation {
+                paths,
+                precedence,
+                copyright,
+                license,
+            }
+        })
+        .collect()
+}
+
+fn license_reuse_segment_matches(pattern: &str, name: &str) -> bool {
+    let mut chunks = pattern.split('*');
+    let first = chunks.next().unwrap_or("");
+    if !name.starts_with(first) {
+        return false;
+    }
+    let mut rest = &name[first.len()..];
+    let mut last = "";
+    for chunk in chunks {
+        last = chunk;
+        if chunk.is_empty() {
+            continue;
+        }
+        match rest.find(chunk) {
+            Some(index) => rest = &rest[index + chunk.len()..],
+            None => return false,
+        }
+    }
+    last.is_empty() || name.ends_with(last)
+}
+
+// REUSE path-pattern matcher for the shapes this file uses: exact paths,
+// `*` inside one segment, and `**` for any depth.
+fn license_reuse_pattern_matches(pattern: &str, path: &str) -> bool {
+    fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((head, rest)) if *head == "**" => {
+                (0..=path.len()).any(|skip| segments_match(rest, &path[skip..]))
+            }
+            Some((head, rest)) => match path.split_first() {
+                None => false,
+                Some((first, tail)) => {
+                    license_reuse_segment_matches(head, first) && segments_match(rest, tail)
+                }
+            },
+        }
+    }
+    segments_match(
+        &pattern.split('/').collect::<Vec<_>>(),
+        &path.split('/').collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn license_reuse_attributes_cyclonedx_schemas_to_upstream() {
+    let text = fs::read_to_string("REUSE.toml").expect("REUSE.toml must be readable");
+    let annotations = license_reuse_annotations(&text);
+    assert!(
+        !annotations.is_empty(),
+        "REUSE.toml must carry [[annotations]] blocks"
+    );
+    for schema in LICENSE_CYCLONEDX_SCHEMAS {
+        // The file must stay byte-identical upstream JSON (an object,
+        // with no stamped SPDX line), ...
+        let content = fs::read_to_string(schema).expect("schema fixture must be readable");
+        assert!(
+            content.starts_with('{'),
+            "{schema} must start with '{{', not a stamped header"
+        );
+        assert!(
+            !content.contains("SPDX-License-Identifier"),
+            "{schema} must not carry a stamped SPDX header"
+        );
+        // ... and resolve through REUSE.toml to the upstream license.
+        let matching: Vec<&LicenseReuseAnnotation> = annotations
+            .iter()
+            .filter(|annotation| {
+                annotation
+                    .paths
+                    .iter()
+                    .any(|pattern| license_reuse_pattern_matches(pattern, schema))
+            })
+            .collect();
+        assert!(
+            matching
+                .iter()
+                .any(|annotation| annotation.precedence == "aggregate"
+                    && annotation.license == "GPL-3.0-or-later"),
+            "{schema} must still match the project fixtures glob (the conflict the override resolves)"
+        );
+        let overrides: Vec<&&LicenseReuseAnnotation> = matching
+            .iter()
+            .filter(|annotation| annotation.precedence == "override")
+            .collect();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "{schema} must match exactly one override annotation"
+        );
+        assert_eq!(
+            overrides[0].license, "Apache-2.0",
+            "{schema} must resolve to Apache-2.0"
+        );
+        assert_eq!(
+            overrides[0].copyright, LICENSE_CYCLONEDX_COPYRIGHT,
+            "{schema} must resolve to the upstream holder"
+        );
+    }
+    // REUSE resolves the license id against LICENSES/.
+    let apache =
+        fs::read_to_string("LICENSES/Apache-2.0.txt").expect("LICENSES/Apache-2.0.txt must exist");
+    assert!(
+        apache.contains("Version 2.0, January 2004"),
+        "LICENSES/Apache-2.0.txt lacks its canonical version marker"
+    );
+    let tracked = license_tracked_files();
+    assert!(
+        tracked.iter().any(|path| path == "LICENSES/Apache-2.0.txt"),
+        "LICENSES/Apache-2.0.txt must be tracked"
+    );
+}
+
 const SEMANTIC_CAPTURE_TESTS: &str = "src/semantic_capture/tests.rs";
 const SEMANTIC_VALIDATION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/semantic_validation.rs";

@@ -4436,11 +4436,34 @@ fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
 /// natural exit, reaped here instead of failing an already-published run.
 fn commit_staged_duration_handoff(
     pending: &mut Option<OwnedChild>,
-    _handoff_note: &mut Option<String>,
-    _exit_code: &mut Option<i32>,
-    _still_running: &mut bool,
+    handoff_note: &mut Option<String>,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
 ) -> Result<()> {
-    commit_handoff(pending)
+    if pending.is_none() {
+        return Ok(());
+    }
+    if commit_handoff(pending).is_ok() {
+        return Ok(());
+    }
+    // The child exited between the stage and the commit: reap the
+    // natural exit instead of failing an already-published run.
+    let child = pending
+        .as_mut()
+        .context("owned child missing during settlement")?;
+    let settled = child
+        .terminate_and_reap()
+        .map(ChildOutcome::Exited)
+        .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
+    let reaped = child.is_reaped();
+    let outcome = record_settlement_result(child, settled, exit_code, still_running);
+    if reaped {
+        // No survivor was handed back, so no handoff note may print;
+        // and the spent owner must not stay staged.
+        *handoff_note = None;
+        drop(pending.take());
+    }
+    outcome
 }
 
 /// Commits a staged observer-side handoff: a live child is handed back

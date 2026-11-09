@@ -14997,7 +14997,10 @@ int main(int argc, char **argv) {
     if (argc != 2) return 2;
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) return 3;
-    sleep(30);
+    /* The test owns this child's lifetime (the fixture guard kills it):
+       never expire on wall time. A sleep here lets a slow instrumented
+       runner outlive its provider and flakes live-process assertions. */
+    for (;;) pause();
     dlclose(handle);
     return 0;
 }

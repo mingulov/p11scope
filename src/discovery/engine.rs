@@ -841,6 +841,9 @@ pub struct Engine {
     held_back: BTreeMap<u32, HeldBack>,
     /// Processes held back over the capture (each counted once).
     held_back_total: u64,
+    /// Forces `inventory_candidate` past the unchanged-tick fast path, so
+    /// the isolation baseline takes the same full rebuild as its trials.
+    force_full_candidate: bool,
     /// Consecutive dropped tick passes since the last tick that completed
     /// without dropping (batch-tail drops do not count). Past `DROPPED_PASS_RETAIN_LIMIT`, a drop
     /// completes serviced requests so a persistently poisoned tick
@@ -944,6 +947,16 @@ const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
 struct HeldBack {
     strikes: u32,
     retry_pass: u64,
+    /// The held generation's `/proc` start time: a reused pid with a
+    /// different start time does not inherit the hold.
+    start_time: Option<u64>,
+}
+
+/// What newcomer isolation decided for one failing pass.
+struct NewcomerIsolation {
+    candidate: LiveCandidate,
+    held: BTreeSet<u32>,
+    deferred: BTreeSet<u32>,
 }
 
 /// Internal dropped-pass aggregate for one error text: how many passes
@@ -11117,6 +11130,7 @@ impl Engine {
             dropped_pass_gap: None,
             held_back: BTreeMap::new(),
             held_back_total: 0,
+            force_full_candidate: false,
             consecutive_dropped_passes: 0,
             exploratory_evictions: 0,
             probationary_completions: 0,
@@ -12933,68 +12947,135 @@ impl Engine {
     }
 
     /// Per-process degradation for a failed first tick candidate: when the
-    /// pass builds without this tick's newcomers, each newcomer is tried
-    /// alone, and every newcomer whose own data breaks the candidate is
-    /// held back (released, counted, one named gap) while the pass
-    /// commits the rest. Returns the rebuilt candidate, or `None` when the
-    /// failure is not attributable to single newcomers (the caller drops
-    /// the pass as before). Runs only on the failure path; its extra
-    /// candidate builds are bounded by the tick's admission window.
+    /// pass builds without this tick's newcomers (as a full rebuild, never
+    /// the unchanged-tick fast path, so the baseline and the trials take
+    /// the same path), each newcomer is tried alone, and every newcomer
+    /// whose own data breaks the candidate is held back (released,
+    /// counted, one named gap) while the pass commits the rest. Trials
+    /// are charged to the pass time budget: at least one runs, then
+    /// untried newcomers are deferred under the pending-newcomer gap.
+    /// `saved_keys` is the pending rejected-key set from before the first
+    /// build, restored so trial builds never leak rejections. Returns
+    /// `None` when the failure is not attributable to single newcomers
+    /// (the caller drops the pass as before). Runs only on the failure
+    /// path.
+    #[allow(clippy::too_many_arguments)]
     fn isolate_broken_newcomers(
         &mut self,
         removed: &BTreeSet<ProcessViewId>,
         refreshed: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
         new_views: &mut Vec<InventoryNewView>,
-        skipped: &[Skipped],
+        skipped: &mut Vec<Skipped>,
         declined: &BTreeSet<ProcessViewId>,
-    ) -> Option<(LiveCandidate, BTreeSet<u32>)> {
-        if new_views.is_empty()
-            || self
-                .inventory_candidate(removed, refreshed, &[], skipped.to_vec(), declined)
-                .is_err()
-        {
+        saved_keys: BTreeSet<ObjectKey>,
+        tick_now: &mut TickClock<'_>,
+    ) -> Option<NewcomerIsolation> {
+        if new_views.is_empty() {
             return None;
         }
-        let broken: Vec<usize> = (0..new_views.len())
-            .filter(|&index| {
-                self.inventory_candidate(
+        self.pending_rejected_keys = saved_keys.clone();
+        self.force_full_candidate = true;
+        let baseline = self.inventory_candidate(removed, refreshed, &[], skipped.clone(), declined);
+        self.force_full_candidate = false;
+        let baseline = baseline.ok()?;
+        let baseline_keys = self.pending_rejected_keys.clone();
+        let mut broken = Vec::new();
+        let mut tried = 0;
+        for index in 0..new_views.len() {
+            if index > 0 && self.isolation_budget_spent(index, &mut *tick_now) {
+                break;
+            }
+            tried += 1;
+            if self
+                .inventory_candidate(
                     removed,
                     refreshed,
                     &new_views[index..=index],
-                    skipped.to_vec(),
+                    skipped.clone(),
                     declined,
                 )
                 .is_err()
-            })
-            .collect();
-        if broken.is_empty() {
+            {
+                broken.push(index);
+            }
+        }
+        if broken.is_empty() && tried == new_views.len() {
+            self.pending_rejected_keys = saved_keys;
             return None;
         }
         let pass = self.inventory_passes;
         let mut held = BTreeSet::new();
-        let mut released = Vec::with_capacity(broken.len());
+        let mut released = Vec::with_capacity(new_views.len() - tried + broken.len());
+        let untried = new_views.split_off(tried);
+        let deferred: BTreeSet<u32> = untried.iter().map(|(view, _, _)| view.pid()).collect();
+        released.extend(untried);
         for index in broken.into_iter().rev() {
             let entry = new_views.remove(index);
             let pid = entry.0.pid();
             held.insert(pid);
+            let start_time = entry.0.start_time();
             let hold = self.held_back.entry(pid).or_insert(HeldBack {
                 strikes: 0,
                 retry_pass: 0,
+                start_time,
             });
             if hold.strikes == 0 {
                 self.held_back_total = self.held_back_total.saturating_add(1);
             }
             hold.strikes = hold.strikes.saturating_add(1);
+            hold.start_time = start_time;
             hold.retry_pass =
                 pass.saturating_add(HELD_BACK_RETRY_BASE_PASSES << (hold.strikes - 1).min(6));
             released.push(entry);
         }
         self.release_unadmitted_views(released);
-        self.mark_partial(HELD_BACK_SUBJECT, HELD_BACK_REASON);
-        let candidate = self
-            .inventory_candidate(removed, refreshed, new_views, skipped.to_vec(), declined)
-            .ok()?;
-        Some((candidate, held))
+        if !held.is_empty() {
+            self.mark_partial(HELD_BACK_SUBJECT, HELD_BACK_REASON);
+        }
+        if !deferred.is_empty() {
+            let pending = tried + deferred.len();
+            let noun = if pending == 1 { "process" } else { "processes" };
+            skipped.push(Skipped {
+                subject: "live discovery tick".into(),
+                reason: format!(
+                    "{pending} new {noun} pending; tick admitted {} for deep scanning (tick limit {})",
+                    new_views.len(),
+                    self.scheduler.max_new_views_per_tick()
+                ),
+            });
+        }
+        let candidate = if new_views.is_empty() && deferred.is_empty() {
+            // Every newcomer was broken: the baseline is the final candidate.
+            self.pending_rejected_keys = baseline_keys;
+            baseline
+        } else {
+            self.pending_rejected_keys = saved_keys;
+            self.inventory_candidate(removed, refreshed, new_views, skipped.clone(), declined)
+                .ok()?
+        };
+        Some(NewcomerIsolation {
+            candidate,
+            held,
+            deferred,
+        })
+    }
+
+    /// Whether newcomer isolation must stop before trial `index`: the
+    /// pass's deep-scan time budget is spent.
+    fn isolation_budget_spent(&self, index: usize, tick_now: &mut TickClock<'_>) -> bool {
+        #[cfg(test)]
+        if let Some(budget) = self.isolation_trial_budget_for_test {
+            return index >= budget;
+        }
+        let _ = index;
+        self.scheduler.tick_expired(tick_now())
+    }
+
+    /// Whether a held-back pid is still waiting for its retry pass.
+    fn held_back_waiting(&self, pid: u32) -> bool {
+        self.held_back
+            .get(&pid)
+            .is_some_and(|hold| self.inventory_passes < hold.retry_pass)
     }
 
     /// Test-only: processes currently held back from admission.
@@ -13007,6 +13088,15 @@ impl Engine {
     #[cfg(test)]
     fn held_back_strikes_for_test(&self, pid: u32) -> Option<u32> {
         self.held_back.get(&pid).map(|hold| hold.strikes)
+    }
+
+    /// Test-only: make a hold's recorded generation differ from the live
+    /// process, as after PID reuse.
+    #[cfg(test)]
+    fn age_held_back_start_for_test(&mut self, pid: u32) {
+        if let Some(hold) = self.held_back.get_mut(&pid) {
+            hold.start_time = Some(hold.start_time.map_or(1, |time| time.wrapping_add(1)));
+        }
     }
 
     /// Test-only: processes held back over the capture.
@@ -22337,6 +22427,8 @@ impl Engine {
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
+            // An exec replaces the image whose data broke the pass.
+            self.held_back.remove(&pid);
             self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             None
         } else {
@@ -23651,9 +23743,9 @@ impl Engine {
             }
         }
         #[cfg(not(test))]
-        let fast_path_disabled = false;
+        let fast_path_disabled = self.force_full_candidate;
         #[cfg(test)]
-        let fast_path_disabled = self.empty_tick_fast_path_disabled();
+        let fast_path_disabled = self.force_full_candidate || self.empty_tick_fast_path_disabled();
         if removed.is_empty()
             && refreshed.is_empty()
             && new_views.is_empty()
@@ -24241,6 +24333,13 @@ impl Engine {
                         pids.iter()
                             .copied()
                             .filter(|pid| self.scheduler.cooling_down(*pid)),
+                    )
+                    // Held-back pids waiting for their retry would only be
+                    // filtered out of admission: keep their rotation slots.
+                    .chain(
+                        pids.iter()
+                            .copied()
+                            .filter(|pid| self.held_back_waiting(*pid)),
                     )
                     .collect();
                 let free_slots = max_scan_pids.saturating_sub(self.views.len());
@@ -24990,17 +25089,20 @@ impl Engine {
         // Held-back processes (their own data broke a candidate) wait for
         // their retry pass instead of blocking every later admission; a
         // hold ends when the pid leaves the scope or gets admitted.
-        self.held_back
-            .retain(|pid, _| live.contains(pid) && !known_pids.contains(pid));
-        let pass = self.inventory_passes;
+        // Only a complete enumeration proves a pid left or was reused; a
+        // partial walk keeps holds (and their backoff) as they are.
+        self.held_back.retain(|pid, hold| {
+            !known_pids.contains(pid)
+                && (!membership_complete
+                    || (live.contains(pid)
+                        && hold.start_time.is_none_or(|time| {
+                            crate::process::process_start_time(*pid).ok() == Some(time)
+                        })))
+        });
         let new_pids: Vec<_> = desired
             .difference(&known_pids)
             .copied()
-            .filter(|pid| {
-                self.held_back
-                    .get(pid)
-                    .is_none_or(|hold| pass >= hold.retry_pass)
-            })
+            .filter(|pid| !self.held_back_waiting(*pid))
             .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Scan,
@@ -25208,6 +25310,9 @@ impl Engine {
         let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
+        // Trial builds in newcomer isolation must not leak rejected keys:
+        // remember the set the first build starts from.
+        let saved_rejected_keys = self.pending_rejected_keys.clone();
         let candidate = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::First,
@@ -25234,12 +25339,17 @@ impl Engine {
                 &removed,
                 &refreshed_scans,
                 new_views,
-                &skipped,
+                &mut skipped,
                 &declined,
+                saved_rejected_keys,
+                &mut *tick_now,
             ) {
-                Some((candidate, held)) => {
-                    new_view_pids.retain(|pid| !held.contains(pid));
-                    candidate
+                Some(isolation) => {
+                    new_view_pids.retain(|pid| {
+                        !isolation.held.contains(pid) && !isolation.deferred.contains(pid)
+                    });
+                    failed_refresh_pids.extend(isolation.deferred.iter().copied());
+                    isolation.candidate
                 }
                 None => {
                     self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);

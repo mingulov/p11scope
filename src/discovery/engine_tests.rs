@@ -68739,6 +68739,34 @@ fn isolation_trials_stop_when_the_pass_budget_is_spent() {
     }
 }
 
+/// A hold belongs to one process generation: a hold whose recorded start
+/// time no longer matches the pid (PID reuse) is dropped on a complete
+/// enumeration.
+#[test]
+fn held_back_pid_reuse_does_not_inherit_the_hold() {
+    let mut kept = sleeping_child();
+    let mut poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    write_procs(&dir, &[kept_pid, poison_pid]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.held_back_strikes_for_test(poison_pid), Some(1));
+    engine.fail_candidate_with_pid_for_test = None;
+    engine.age_held_back_start_for_test(poison_pid);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert!(
+        view_pids(&engine).contains(&poison_pid),
+        "a different generation on the pid is admitted at once: {:?}",
+        engine.plan.skipped
+    );
+    assert_eq!(engine.held_back_count_for_test(), 0);
+    for child in [&mut kept, &mut poison] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// Measurement (reported, not asserted): one full candidate rebuild over
 /// a 256-view system-like scope with real provider mappings, the unit an
 /// isolation trial costs.

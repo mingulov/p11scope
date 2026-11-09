@@ -1517,20 +1517,50 @@ fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
     })
 }
 
+/// Bounded retries across transient kernel refusals of a fail-fast probe
+/// (a pidfd poll, a rooted open, a generation read). `EAGAIN`/`EINTR` are
+/// "try again" signals and `ENOMEM` clears when transient pressure passes;
+/// anything else — including a genuinely missing process — reports at once.
+/// The bound keeps a persistently refusing kernel fail-fast.
+pub(crate) const TRANSIENT_PROBE_RETRIES: u32 = 64;
+
+/// Whether this probe error is worth one more attempt: transient
+/// scheduling or allocation pressure, or signal delivery — never a
+/// verdict about the process or file itself.
+pub(crate) fn is_transient_probe_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::OutOfMemory
+    )
+}
+
 /// Retries an interrupted pidfd readiness poll, preserving the caller's
 /// timeout: a non-blocking probe (0) and an infinite wait (negative)
 /// retry the same timeout, while a finite wait retries against a
 /// deadline, so signals can never stretch it into an infinite one.
-/// Only `Interrupted` retries; any other failure propagates unchanged.
+/// `Interrupted` retries unbounded; transient pressure retries bounded;
+/// any other failure propagates unchanged.
 fn pidfd_poll_retry_with(
     timeout_ms: i32,
     mut now: impl FnMut() -> std::time::Instant,
     mut poll: impl FnMut(i32) -> io::Result<bool>,
 ) -> io::Result<bool> {
+    // Interruption retries unbounded (a signal is always safe to ride
+    // through); allocation pressure retries bounded (spinning forever
+    // during a real outage would hang liveness itself).
+    let mut transient_retries = 0;
     if timeout_ms <= 0 {
         loop {
             match poll(timeout_ms) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if is_transient_probe_error(&error)
+                        && transient_retries < TRANSIENT_PROBE_RETRIES =>
+                {
+                    transient_retries += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
                 result => return result,
             }
         }
@@ -1550,6 +1580,14 @@ fn pidfd_poll_retry_with(
             .min(u128::from(i32::MAX as u32)) as i32;
         match poll(remaining_ms) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if is_transient_probe_error(&error)
+                    && transient_retries < TRANSIENT_PROBE_RETRIES =>
+            {
+                transient_retries += 1;
+                std::thread::yield_now();
+                continue;
+            }
             result => return result,
         }
     }
@@ -2273,6 +2311,70 @@ int main(int argc, char **argv) {
         .expect_err("a non-interrupt failure must propagate");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(calls.get(), 2);
+    }
+
+    /// Only scheduling/allocation pressure and signal delivery retry: a
+    /// missing process, a refusal, or a malformed read never does.
+    #[test]
+    fn transient_probe_errors_cover_pressure_and_signals_only() {
+        for transient in [
+            io::Error::from(io::ErrorKind::WouldBlock),
+            io::Error::from_raw_os_error(libc::EAGAIN),
+            io::Error::from(io::ErrorKind::Interrupted),
+            io::Error::from_raw_os_error(libc::EINTR),
+            io::Error::from(io::ErrorKind::OutOfMemory),
+            io::Error::from_raw_os_error(libc::ENOMEM),
+        ] {
+            assert!(
+                is_transient_probe_error(&transient),
+                "{transient:?} must retry"
+            );
+        }
+        for permanent in [
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::from_raw_os_error(libc::ENOENT),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::from(io::ErrorKind::IsADirectory),
+            io::Error::from(io::ErrorKind::InvalidData),
+        ] {
+            assert!(
+                !is_transient_probe_error(&permanent),
+                "{permanent:?} must report at once"
+            );
+        }
+    }
+
+    /// Scripted twin of the interruption test: allocation pressure retries
+    /// with the same timeout until one probe succeeds.
+    #[test]
+    fn pidfd_poll_retries_out_of_memory_until_one_succeeds() {
+        let scripted = RefCell::new(VecDeque::from([
+            Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+            Err(io::Error::from(io::ErrorKind::OutOfMemory)),
+            Ok(false),
+        ]));
+        let seen = RefCell::new(Vec::new());
+        let ready = pidfd_poll_retry_with(0, Instant::now, |timeout| {
+            seen.borrow_mut().push(timeout);
+            scripted.borrow_mut().pop_front().expect("a scripted poll")
+        })
+        .expect("retries end in the scripted result");
+        assert!(!ready);
+        assert_eq!(*seen.borrow(), vec![0, 0, 0]);
+    }
+
+    /// A persistently pressured kernel stays fail-fast: the bound caps the
+    /// retries and the last pressure error reports unchanged.
+    #[test]
+    fn pidfd_poll_gives_up_out_of_memory_after_the_bound() {
+        let calls = Cell::new(0u32);
+        let error = pidfd_poll_retry_with(0, Instant::now, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        })
+        .expect_err("exhausted retries must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(calls.get(), TRANSIENT_PROBE_RETRIES + 1);
     }
 
     /// Mutation caught: classifying a changed `/proc` start time as an exit

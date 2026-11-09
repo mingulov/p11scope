@@ -350,6 +350,30 @@ impl ColdFilesystem<'_> {
     }
 }
 
+/// Runs one fail-fast open across transient kernel refusals. A refused
+/// `EAGAIN`/`EINTR`/`ENOMEM` is pressure or a signal, not a verdict about
+/// the path, so the identical confined open repeats; the bound keeps a
+/// persistently refusing kernel fail-fast and the final error reports
+/// exactly as a single attempt would.
+fn retry_transient_open<R>(
+    mut open: impl FnMut() -> Result<R, std::io::Error>,
+) -> Result<R, std::io::Error> {
+    let mut retries = 0;
+    loop {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if super::is_transient_probe_error(&error)
+                    && retries < super::TRANSIENT_PROBE_RETRIES =>
+            {
+                retries += 1;
+                std::thread::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl<'a> ViewFilesystem<'a> {
     pub(crate) fn open(pin: &'a PidPin, work: &mut CaptureWorkBudget) -> Result<Self, String> {
         Self::open_required(pin, false, work)
@@ -618,21 +642,25 @@ impl<'a> ViewFilesystem<'a> {
         };
         // SAFETY: live root fd, bounded NUL-terminated relative name, and
         // the kernel's fixed open_how layout. No failure has a loose fallback.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_openat2,
-                root.as_raw_fd(),
-                name.as_ptr(),
-                &how,
-                std::mem::size_of::<OpenHow>(),
-            )
-        };
-        if result < 0 {
-            return Err(format!(
-                "opening object within retained target root: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        // Each attempt re-resolves the same confined path, so a transient
+        // refusal retries identically and only the final error reports.
+        let result = retry_transient_open(|| {
+            let raw = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    root.as_raw_fd(),
+                    name.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            };
+            if raw < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(raw)
+            }
+        })
+        .map_err(|error| format!("opening object within retained target root: {error}"))?;
         // SAFETY: successful openat2 returned a newly owned descriptor.
         let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(result as i32) });
         if !file
@@ -1460,5 +1488,64 @@ mod tests {
         }
         proof.validate(&mut work).unwrap();
         group.call_three();
+    }
+
+    /// A transiently refused open repeats identically until one attempt
+    /// succeeds: pressure, then a signal, then the file.
+    #[test]
+    fn transient_open_retries_pressure_and_signals_then_succeeds() {
+        use std::io::{Error, ErrorKind};
+        let mut scripted = [
+            Err::<(), _>(Error::new(ErrorKind::WouldBlock, "EAGAIN")),
+            Err(Error::from_raw_os_error(libc::EINTR)),
+            Err(Error::from_raw_os_error(libc::ENOMEM)),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let result = retry_transient_open(|| {
+            calls += 1;
+            match scripted.next() {
+                Some(Err(error)) => Err(error),
+                _ => Ok(7),
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 4);
+    }
+
+    /// A persistently pressured kernel stays fail-fast: the bound caps the
+    /// attempts and the last pressure error reports unchanged.
+    #[test]
+    fn transient_open_gives_up_after_the_bound() {
+        use std::io::{Error, ErrorKind};
+        let mut calls = 0u32;
+        let error = retry_transient_open(|| {
+            calls += 1;
+            Err::<(), _>(Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .expect_err("exhausted retries must propagate");
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert_eq!(calls, crate::process::TRANSIENT_PROBE_RETRIES + 1);
+    }
+
+    /// Only pressure and signals retry: a missing path, a refusal, or a
+    /// directory where a file belongs reports on the first attempt.
+    #[test]
+    fn transient_open_fails_fast_on_permanent_errors() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::IsADirectory,
+        ] {
+            let mut calls = 0;
+            let error = retry_transient_open(|| {
+                calls += 1;
+                Err::<(), _>(Error::new(kind, "permanent"))
+            })
+            .expect_err("a permanent failure must propagate");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(calls, 1, "{kind:?} must not retry");
+        }
     }
 }

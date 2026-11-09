@@ -4947,23 +4947,15 @@ fn run_owned_inner_with_host(
             .as_ref()
             .expect("owned child is present after release");
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
-        if let Err(error) = owned.coordinator.revalidate_after_release(&mut io) {
-            if error.lifecycle() {
-                return Err(finish_capture_error(
-                    pause_failure(error),
-                    &mut engine,
-                    &mut session,
-                    Some(&mut owned),
-                    &stop,
-                ));
-            }
-            let always = error.required();
-            retire_pause_policy(error).map_err(|error| {
-                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
-            })?;
-            if always {
-                owned.coordinator.note_unavailable();
-            }
+        let revalidated = post_release_pass(&mut owned.coordinator, &mut io);
+        if let Err(error) = revalidated {
+            return Err(finish_capture_error(
+                error,
+                &mut engine,
+                &mut session,
+                Some(&mut owned),
+                &stop,
+            ));
         }
     }
 
@@ -5775,6 +5767,25 @@ fn pending_stop_pass(
 /// writes the report. Required (`always`) pauses keep refusing.
 fn cancelled_pause_cycle(error: &PauseError, cancelled: bool) -> bool {
     cancelled && error.lifecycle() && !error.required()
+}
+
+/// The post-release revalidation step of an owned run, generic over the
+/// pause I/O so `run_owned` and the held-child tests run the same code. A
+/// lifecycle failure ends the run (the caller finishes the capture with the
+/// error); a nonfatal one is retired as a capture tick retires it (`auto`:
+/// partial; `always`: collected unpaused and counted unavailable).
+fn post_release_pass(
+    coordinator: &mut PauseCoordinator,
+    io: &mut impl PauseIo,
+) -> Result<()> {
+    if let Err(error) = coordinator.revalidate_after_release(io) {
+        let always = error.required() && !error.lifecycle();
+        retire_pause_policy(error)?;
+        if always {
+            coordinator.note_unavailable();
+        }
+    }
+    Ok(())
 }
 
 /// `pending_stop_pass` for the capture loops, through the session adapter.

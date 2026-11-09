@@ -2514,6 +2514,15 @@ fn gap_plain_reason(reason: &str) -> &str {
     {
         return "process exited during scan (file gone before it could be read)";
     }
+    // The stopped-before-attach family (the production reason and its
+    // stem): the stored reason carries the stop cause and elapsed
+    // time, which the 100-char cap would cut before "counts not
+    // attached". Concise folds it to one short clause keeping all
+    // three facts (never attached, rows shown, counts missing);
+    // verbose keeps the stored reason beside it, JSON keeps it verbatim.
+    if reason.contains("the completed collection applied scan-only") {
+        return "probes never attached; modules and callers shown, counts not attached";
+    }
     // The overlay-witness unavailable family (canonical plus every
     // enriched `: <stage>` suffix) folds to one plain clause; verbose
     // keeps the machine token beside it, JSON keeps it verbatim.

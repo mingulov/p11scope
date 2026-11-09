@@ -7905,6 +7905,9 @@ fn capture_profile(
                 flush_stdout(stdout, &mut stdout_open)?;
             }
             scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
+            // The frame freed its pin batch; hand the peak back before the
+            // next frame allocates (see `reclaim_pass_heap`).
+            crate::inventory::reclaim_pass_heap();
             if !stdout_open && !has_output {
                 break Ok(CaptureEnd::Error);
             }

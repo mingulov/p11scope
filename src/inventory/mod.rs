@@ -1337,10 +1337,11 @@ pub(crate) fn reset_reclaim_pass_heap_calls() {
 }
 
 /// Release pass-transient heap pages back to the kernel after a classic
-/// inventory pass publishes. A `--system` pass pins hundreds of module
-/// files and buffers the match; glibc otherwise retains the freed peak
-/// (about 200 MiB here) for the rest of the run, leaving the soak's
-/// 256 MiB bound no margin under load. A hint only: it never frees live
+/// inventory pass or a profile frame publishes. A `--system` pass pins
+/// hundreds of module files and buffers the match; glibc otherwise
+/// retains the freed peak (about 200 MiB here) for the rest of the run,
+/// leaving the soak's 256 MiB bound no margin under load. A hint only:
+/// it never frees live
 /// state, and it costs ~0.4 ms per pass once steady (first call ~45 ms
 /// on a 210 MiB fragmented heap; v060-manifest-soak-bounds round 2),
 /// far under the ~2-4 s pass period.
@@ -1352,7 +1353,7 @@ pub(crate) fn reset_reclaim_pass_heap_calls() {
 /// therefore keeps its allocator's default retention; three Fedora
 /// 1800 s release soaks hold RSS flat at ~80 MB peak (round 2),
 /// bounded without the trim.
-fn reclaim_pass_heap() {
+pub(crate) fn reclaim_pass_heap() {
     #[cfg(test)]
     RECLAIM_PASS_HEAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: malloc_trim takes a pad length and releases free top pages;

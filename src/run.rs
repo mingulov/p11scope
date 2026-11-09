@@ -26098,6 +26098,61 @@ int main(int argc, char **argv) {
         assert_eq!(json["completeness"], "PARTIAL");
     }
 
+    /// An empty capture over a replaced provider names the file on
+    /// stderr: one escaped line per distinct file, bounded with a
+    /// counted tail; other skips stay silent.
+    #[test]
+    fn replaced_files_are_named_on_stderr_lines_bounded_and_escaped() {
+        use crate::discovery::scan::{REPLACED_PROVIDER_REASON, Skipped};
+        let skip = |subject: &str, reason: &str| Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        };
+        let lines = replaced_file_hint_lines(&[
+            skip("/opt/b.so (deleted)", REPLACED_PROVIDER_REASON),
+            skip("/opt/a.so (deleted)", REPLACED_PROVIDER_REASON),
+            skip("/opt/a.so (deleted)", REPLACED_PROVIDER_REASON),
+            skip("capture discovery", "some other reason"),
+        ]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("/opt/a.so (deleted)") && lines[1].contains("/opt/b.so (deleted)"),
+            "distinct files in sorted order, duplicates folded: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| line.contains("calls not counted")),
+            "each line carries the reason: {lines:?}"
+        );
+        let evil = replaced_file_hint_lines(&[skip(
+            "/opt/\x07evil.so (deleted)",
+            REPLACED_PROVIDER_REASON,
+        )]);
+        assert_eq!(evil.len(), 1);
+        assert!(
+            !evil[0].contains('\x07') && evil[0].contains("\\u{7}"),
+            "control bytes are escaped: {:?}",
+            evil[0]
+        );
+        let many: Vec<Skipped> = (0..10)
+            .map(|n| {
+                skip(
+                    &format!("/opt/f{n:02}.so (deleted)"),
+                    REPLACED_PROVIDER_REASON,
+                )
+            })
+            .collect();
+        let bounded = replaced_file_hint_lines(&many);
+        assert_eq!(bounded.len(), 9, "{bounded:?}");
+        assert!(
+            bounded[8].contains("and 2 more replaced files"),
+            "the tail counts the rest: {bounded:?}"
+        );
+        assert!(
+            replaced_file_hint_lines(&[skip("capture discovery", "some other reason")]).is_empty(),
+            "no replaced reason means no lines"
+        );
+    }
+
     /// `inspect` propagates a hard error for a pid that names nothing; it must reach
     /// the operator as one line and exit 1, never as a panic or a backtrace dump.
     #[test]

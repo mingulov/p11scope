@@ -3967,7 +3967,7 @@ fn concise_replaced_providers_read_as_gaps() {
             module: None,
             pid: Some(pid),
             subject: subject.into(),
-            reason: "provider file replaced on disk while running; calls not counted".into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
             budget: None,
             repeats: 1,
         });
@@ -4000,7 +4000,7 @@ fn concise_replaced_providers_read_as_gaps() {
         assert!(
             block.iter().any(|line| line.contains(fragment)
                 && line.ends_with(
-                    " — provider file replaced on disk while running; calls not counted"
+                    " — replaced on disk while running; not examined, calls not counted"
                 )),
             "the gaps block names the {fragment} running copy with its loss: {out}"
         );
@@ -4031,7 +4031,7 @@ fn replaced_only_gaps_force_partial_with_gaps_block() {
         module: None,
         pid: Some(11),
         subject: "/usr/lib/libsoftokn3.so (deleted)".into(),
-        reason: "provider file replaced on disk while running; calls not counted".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
         budget: None,
         repeats: 1,
     });
@@ -4069,7 +4069,7 @@ fn replaced_provider_gap_forces_partial_coverage() {
         module: None,
         pid: Some(11),
         subject: "/usr/lib/libsoftokn3.so (deleted)".into(),
-        reason: "provider file replaced on disk while running; calls not counted".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
         budget: None,
         repeats: 1,
     });
@@ -4083,7 +4083,7 @@ fn replaced_provider_gap_forces_partial_coverage() {
         "the gaps block names the replaced provider: {out}"
     );
     assert!(
-        out.contains("provider file replaced on disk while running; calls not counted"),
+        out.contains("replaced on disk while running; not examined, calls not counted"),
         "the named gap surfaces verbatim: {out}"
     );
     assert!(
@@ -4959,10 +4959,7 @@ fn gap_group_line_keeps_path_tail() {
         !line.contains("/var/tmp"),
         "the line drops the path head: {line}"
     );
-    assert!(
-        line.chars().count() <= 100,
-        "over 100 chars: {line}"
-    );
+    assert!(line.chars().count() <= 100, "over 100 chars: {line}");
 }
 
 /// I1 twin: a prose subject still keeps its START on the concise gap
@@ -4978,5 +4975,248 @@ fn gap_group_line_keeps_prose_head() {
         line,
         "  1 × native usage feed unavai… — live capture refused (missing capabilities); run \
          'p11scope doctor'"
+    );
+}
+/// F1: an empty inventory with replaced-file gaps names the loss:
+/// "No counted associations; N programs run files replaced on disk
+/// (below)" plus one not-counted line per program/file with restart
+/// advice. Text only; JSON unchanged.
+#[test]
+fn empty_inventory_with_replaced_files_names_not_counted() {
+    let harness = varied_harness();
+    let caller = harness.coordinator().adapter().live_id(70_000).unwrap();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
+    presentation.gaps.push(GapView {
+        caller: Some(caller),
+        module: None,
+        pid: Some(70_000),
+        subject: "/var/tmp/p11scope-ws-tmp/replaced-holder/prov/libsofthsm2.so (deleted)".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 1 program runs files replaced on disk (below)."),
+        "the absence line names the replaced-file loss: {out}"
+    );
+    assert!(
+        !out.contains("No application/module associations observed"),
+        "the bare absence line is gone: {out}"
+    );
+    assert!(
+        out.contains(
+            "not counted: driver (PID 70000) runs \
+             /var/tmp/p11scope-ws-tmp/replaced-holder/prov/libsofthsm2.so (deleted), a file \
+             replaced on disk while it runs; restart it to count its calls"
+        ),
+        "the not-counted line names program, pid and file: {out}"
+    );
+    let quiet = render_snapshot_summary(&presentation);
+    assert!(
+        quiet.contains("No counted associations; 1 program"),
+        "{quiet}"
+    );
+    assert!(quiet.contains("not counted: driver (PID 70000)"), "{quiet}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("No counted associations; 1 program"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("not counted: driver (PID 70000)"),
+        "{verbose}"
+    );
+    // JSON unchanged: the gap row keeps caller/pid/subject/reason
+    // verbatim, and no new text leaks in.
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let text = serde_json::to_string(&document).unwrap();
+    assert!(
+        !text.contains("not counted:"),
+        "text-only line leaked to JSON: {text}"
+    );
+    assert!(
+        !text.contains("No counted associations"),
+        "text-only line leaked to JSON: {text}"
+    );
+    assert!(
+        text.contains("replaced on disk while running; not examined, calls not counted"),
+        "the JSON gap keeps the verbatim reason: {text}"
+    );
+}
+
+/// F1 plural: two programs with replaced files count as two.
+#[test]
+fn empty_inventory_with_two_replaced_programs_counts_two() {
+    let harness = varied_harness();
+    let caller = harness.coordinator().adapter().live_id(70_000).unwrap();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for (caller, pid, subject) in [
+        (
+            Some(caller),
+            Some(70_000),
+            "/prov/a/libsofthsm2.so (deleted)",
+        ),
+        (None, Some(70_001), "/prov/b/libpcre2-8.so.0 (deleted)"),
+    ] {
+        presentation.gaps.push(GapView {
+            caller,
+            module: None,
+            pid,
+            subject: subject.into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 2 programs run files replaced on disk (below)."),
+        "the absence line counts both programs: {out}"
+    );
+    assert!(
+        out.contains("not counted: driver (PID 70000) runs /prov/a/libsofthsm2.so (deleted)"),
+        "the known caller is named: {out}"
+    );
+    assert!(
+        out.contains("not counted: PID 70001 runs /prov/b/libpcre2-8.so.0 (deleted)"),
+        "the caller-less gap falls back to its pid: {out}"
+    );
+}
+
+/// F1 twin: the pre-wording spelling triggers the same disclosure,
+/// so the text survives either side of the constant change.
+#[test]
+fn empty_inventory_with_legacy_replaced_reason_names_not_counted() {
+    let harness = varied_harness();
+    let caller = harness.coordinator().adapter().live_id(70_000).unwrap();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: Some(caller),
+        module: None,
+        pid: Some(70_000),
+        subject: "/prov/libsofthsm2.so (deleted)".into(),
+        reason: "provider file replaced on disk while running; calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 1 program runs files replaced on disk (below)."),
+        "the legacy spelling triggers the same line: {out}"
+    );
+    assert!(
+        out.contains("not counted: driver (PID 70000) runs /prov/libsofthsm2.so (deleted)"),
+        "the legacy spelling names the program and file: {out}"
+    );
+}
+
+/// F1 guard: an empty inventory without replaced files keeps the bare
+/// absence line.
+#[test]
+fn empty_inventory_without_replaced_files_keeps_bare_absence_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "fixture scope".into(),
+        reason: "fixture reason".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains(
+            "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
+        ),
+        "the bare absence line stays without replaced files: {out}"
+    );
+    assert!(
+        !out.contains("No counted associations"),
+        "no replaced-file line without replaced files: {out}"
+    );
+}
+
+/// F1 guard: the notices belong to the empty view only; a capture
+/// with edges keeps the gaps block as the replaced-file disclosure.
+#[test]
+fn nonempty_inventory_with_replaced_files_adds_no_not_counted_lines() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert!(!presentation.edges.is_empty(), "the twin needs edges");
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(70_000),
+        subject: "/prov/libsofthsm2.so (deleted)".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.contains("No counted associations"),
+        "no absence line with edges: {out}"
+    );
+    assert!(
+        !out.contains("not counted:"),
+        "no not-counted lines with edges: {out}"
+    );
+}
+
+/// F1: the notices fold past twenty entries; `--json` keeps every item.
+#[test]
+fn replaced_notices_fold_beyond_twenty() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for index in 0..21 {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(80_000 + index),
+            subject: format!("/prov/file{index}.so (deleted)"),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 21 programs run files replaced on disk (below)."),
+        "the absence line counts every program: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("not counted:"))
+            .count(),
+        20,
+        "twenty notices print: {out}"
+    );
+    assert!(
+        out.contains("  and 1 more replaced file (--json has every item)"),
+        "the remainder folds: {out}"
     );
 }

@@ -1975,6 +1975,35 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The production parent-death signal for an owned child: SIGCONT. When
+/// the observer dies — exit, abort, SIGKILL, panic — the kernel delivers
+/// it to the child: a child the pause holds stopped resumes, and a
+/// running child never notices (SIGCONT to an unstopped process is a
+/// no-op). Never a killing signal: the observed program outlives its
+/// observer. No parent-pid check: if the observer were already gone,
+/// nothing could have stopped this child, so a lost resume is
+/// impossible. Applied first thing in the fork child and again after the
+/// identity change, which may clear it. Test builds overwrite this with
+/// the SIGKILL arm below unless they opt out with
+/// [`spawn_with_production_parent_death`].
+unsafe fn arm_parent_death_continue() -> std::result::Result<(), i32> {
+    // SAFETY: raw prctl syscall only; async-signal-safe after fork.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGCONT,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    Ok(())
+}
+
 /// Test builds only: tie an owned fork child's life to the test thread that
 /// forked it. A test binary killed without unwinding (a harness `timeout`,
 /// SIGINT, SIGKILL, an abort) runs no `Drop`, and an owned child leads its
@@ -1983,10 +2012,10 @@ thread_local! {
 /// released command lives on, adopted by init (DR-LEAKED-STOPPED-HOLD).
 /// SIGKILL is the parent-death signal because it also ends a stopped child.
 /// Applied first thing in the fork child and again after the identity
-/// change, which may clear it. A parent that
-/// already died before the prctl is caught by the parent-pid check. The
-/// observer hands a live command back on purpose, so release builds never
-/// set this, and a probe that observes production parent-death behaviour
+/// change, which may clear it, in both cases after the production SIGCONT
+/// arm above so the test arm wins. A parent that
+/// already died before the prctl is caught by the parent-pid check, and a
+/// probe that observes production parent-death behaviour
 /// opts out with [`spawn_with_production_parent_death`].
 #[cfg(test)]
 unsafe fn die_with_test_parent(parent: libc::pid_t) -> std::result::Result<(), i32> {
@@ -2215,9 +2244,15 @@ impl OwnedChild {
         }
         if pid == 0 {
             unsafe {
-                // Test builds: before anything a test can observe (setsid
-                // marks the child as ready to stop), so a child stopped at
-                // any point already dies with its test thread.
+                // Production: arm the resume guarantee before anything a
+                // test or the pause can observe (setsid marks the child as
+                // ready to stop), so a child stopped at any point already
+                // resumes when the observer dies.
+                if let Err(errno) = arm_parent_death_continue() {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
+                }
+                // Test builds: after the production arm, so the SIGKILL
+                // arm wins unless the spawn opted out of it.
                 #[cfg(test)]
                 if test_parent_death && let Err(errno) = die_with_test_parent(test_parent) {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
@@ -2268,7 +2303,10 @@ impl OwnedChild {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
                 // Again after the identity change, which clears it when the
-                // credentials change.
+                // credentials change: production first, then the test arm.
+                if let Err(errno) = arm_parent_death_continue() {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
+                }
                 #[cfg(test)]
                 if test_parent_death && let Err(errno) = die_with_test_parent(test_parent) {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
@@ -2835,10 +2873,20 @@ impl Drop for OwnedChild {
             return;
         }
         // Closing an unreleased barrier makes the child exit 127. If it does
-        // not, kill the owned process group and reap the exact fork child.
+        // not, a pre-exec child is killed where it stands and the exact fork
+        // child is reaped; a released command is detached alive below.
         self.release_writer.take();
         self.exec_reader.take();
         if self.try_reap().ok().flatten().is_some() {
+            return;
+        }
+        if self.exec_confirmed {
+            // A released command outlives its observer: resume a child the
+            // pause holds stopped and detach without killing or reaping.
+            // Structured paths settle or hand off explicitly; this is the
+            // panic path, where the process is exiting and init adopts the
+            // survivor. The pre-exec child below never ran the command.
+            self.resume_if_stopped();
             return;
         }
         self.begin_settlement(FINAL_KILL_GRACE);
@@ -4093,6 +4141,88 @@ impl Owned {
     }
 }
 
+/// The observer-side handoff note: names the surviving PID so a capture
+/// error (or an exhausted event budget) never exits 1 silent about the
+/// command it left running.
+fn format_observer_end_handoff_note(end: CaptureEnd, pid: u32) -> String {
+    let reason = match end {
+        CaptureEnd::Error => "capture failed",
+        CaptureEnd::LimitReached => "event budget exhausted",
+        other => unreachable!("observer-side settlement reached for {other:?}"),
+    };
+    format!(
+        "p11scope: {reason}; handed back live child pid {pid} \
+         (still running outside this capture)"
+    )
+}
+
+/// Settles an observer-side end (`Error`, `LimitReached`) without killing:
+/// a stop the operator requested still settles through the signal path so
+/// the forwarded signal reaches the child as today; anything else reaps a
+/// natural exit and hands a live child back running. A pre-exec child is
+/// still this process's fork, never the command: it is killed where it
+/// stands so nothing can release it late.
+#[allow(clippy::too_many_arguments)]
+fn settle_observer_end_without_kill(
+    retained: &mut Option<OwnedChild>,
+    end: CaptureEnd,
+    signals: &SignalState,
+    pending: &mut Option<OwnedChild>,
+    exit_code: &mut Option<i32>,
+    requested_kill: &mut bool,
+    still_running: &mut bool,
+) -> Result<()> {
+    *requested_kill = false;
+    {
+        let child = retained
+            .as_mut()
+            .context("owned child missing during settlement")?;
+        if signals.interrupted() && child.still_running() {
+            let settled = settle_after_signal(child, signals);
+            return record_settlement_result(child, settled, exit_code, still_running);
+        }
+        // Resume before the liveness check, so a child the pause holds
+        // stopped is handed back running, never left in T.
+        child.resume_if_stopped();
+        if !child.exec_confirmed {
+            let settled = child
+                .terminate_and_reap()
+                .map(ChildOutcome::Exited)
+                .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
+            return record_settlement_result(child, settled, exit_code, still_running);
+        }
+    }
+    match stage_handoff(retained, pending)? {
+        ChildOutcome::Exited(code) => {
+            *exit_code = Some(code);
+            *still_running = false;
+            Ok(())
+        }
+        ChildOutcome::TimedOutRunning => {
+            let pid = pending
+                .as_ref()
+                .map(|child| child.pid())
+                .context("owned child missing during settlement")?;
+            if commit_handoff(pending).is_ok() {
+                *exit_code = None;
+                *still_running = true;
+                emit_capture_diagnostic(&format_observer_end_handoff_note(end, pid));
+                return Ok(());
+            }
+            // The child exited between the stage and the commit: reap the
+            // natural exit instead of failing the settlement.
+            let child = pending
+                .as_mut()
+                .context("owned child missing during settlement")?;
+            let settled = child
+                .terminate_and_reap()
+                .map(ChildOutcome::Exited)
+                .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
+            record_settlement_result(child, settled, exit_code, still_running)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn settle_owned_child(
     retained: &mut Option<OwnedChild>,
@@ -4111,8 +4241,22 @@ fn settle_owned_child(
     } else {
         end
     };
-    // An expired `--duration` is the only end that may hand back a live
-    // child, and only after coordinator cleanup succeeds.
+    // Observer-side ends never kill: a capture error or an exhausted event
+    // budget hands a live child back running (reaping only a natural exit),
+    // so the observed program outlives the failed capture.
+    if matches!(end, CaptureEnd::Error | CaptureEnd::LimitReached) {
+        return settle_observer_end_without_kill(
+            retained,
+            end,
+            signals,
+            pending,
+            exit_code,
+            requested_kill,
+            still_running,
+        );
+    }
+    // An expired `--duration` is the only other end that may hand back a
+    // live child, and only after coordinator cleanup succeeds.
     let can_hand_off = cleanup_ok && end.allows_handoff(kill_on_timeout) && signals.claim_handoff();
     if can_hand_off {
         let outcome = stage_handoff(retained, pending)?;
@@ -4320,9 +4464,18 @@ fn settle_after_signal_with_grace_and(
 }
 
 fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
-    let Some(mut child) = pending.take() else {
+    let Some(child) = pending.as_mut() else {
         return Ok(());
     };
+    // A staged child is the observed program, still owed its life: resume
+    // a pause-held child and hand it back. Only a child that already
+    // exited (or never ran) is reaped here instead.
+    child.resume_if_stopped();
+    if child.hand_off_running().is_ok() {
+        pending.take();
+        return Ok(());
+    }
+    let mut child = pending.take().expect("pending handoff is present");
     child
         .terminate_and_reap()
         .map(|_| ())

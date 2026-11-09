@@ -878,11 +878,16 @@ a dropped ssh session — is handled exactly like SIGTERM, with the same outcome
 and exit status, as long as p11scope itself inherited the default SIGHUP
 disposition. An inherited ignore (`nohup p11scope ...`) is preserved, so the
 capture keeps running after logout. SIGQUIT keeps its default disposition
-(core dump, for debugging). SIGKILL cannot be handled, and p11scope installs
-no `PR_SET_PDEATHSIG`: if the observer is killed that way there is no final
-frame and no `-o` file, and a child the pause holds stopped stays stopped —
-its own session leaves its process group already orphaned, so the kernel
-sends no hangup when the observer dies; resume or kill the orphan by hand.
+(core dump, for debugging). SIGKILL cannot be handled: if the observer is killed that way there is no
+final frame and no `-o` file. The observed program still survives: the child
+arms `PR_SET_PDEATHSIG` to SIGCONT, so a child the pause holds stopped
+resumes when the observer dies, while a running child never notices. Its own
+session leaves its process group already orphaned, so the kernel sends no
+hangup when the observer dies. A capture error likewise hands a live child
+back running — exit 1 names the error and the surviving PID — instead of
+killing it. Only a stop the operator requested, an expired `--duration` with
+`--kill-on-timeout`, or a child still behind its pre-exec barrier is ever
+terminated by the observer.
 The owned command starts with the signal dispositions p11scope itself
 inherited: a SIGINT, SIGTERM, or SIGHUP ignored on entry stays ignored
 across the fork (`nohup` ignores SIGHUP; a background job of a

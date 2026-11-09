@@ -10840,6 +10840,7 @@ mod tests {
         // must not advise running the scan lane.
         for (stage, errno) in [
             (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS)),
             (MultiHostStage::SelfLink, Some(libc::EINVAL)),
         ] {
             let mut coordinator = coordinator();

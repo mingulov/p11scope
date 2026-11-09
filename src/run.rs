@@ -20924,13 +20924,16 @@ mod tests {
     #[test]
     fn resolve_pid_caller_names_unreaped_zombie_exited() {
         // A zombie answers `kill(pid, 0)` but its exe link is gone: the
-        // exit must be named, never misreported as hidepid/unreadable.
+        // exit must be named, never misreported as hidepid/unreadable —
+        // both unpinned (the stat verdict) and through the real pin held
+        // across the kill (the pidfd poll verdict where pidfd applies).
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .die_with_parent()
             .spawn()
             .expect("spawning the zombie fixture");
         let pid = child.id();
+        let pin = crate::process::PidPin::open(pid).expect("pinning the live child");
         child.kill().expect("killing the zombie fixture");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !crate::process::process_is_zombie(pid) && Instant::now() < deadline {
@@ -20941,12 +20944,19 @@ mod tests {
             "the killed child is unreaped"
         );
         let caller = resolve_pid_caller(pid, None);
+        let pinned = resolve_pid_caller(pid, Some(&pin));
         child.wait().expect("reaping the zombie fixture");
         assert_eq!(caller.exe, None, "{caller:?}");
         assert_eq!(
             caller.exe_unknown_reason,
             Some(TARGET_CALLER_EXITED),
             "{caller:?}"
+        );
+        assert_eq!(pinned.exe, None, "{pinned:?}");
+        assert_eq!(
+            pinned.exe_unknown_reason,
+            Some(TARGET_CALLER_EXITED),
+            "{pinned:?}"
         );
     }
 

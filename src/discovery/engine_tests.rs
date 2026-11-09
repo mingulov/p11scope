@@ -3455,7 +3455,16 @@ fn failed_publication_keeps_the_revision_dirty() {
     engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
     let before = publication_operation_counts(&engine);
 
-    assert!(engine.publish_batch_tail(false).is_err());
+    engine
+        .publish_batch_tail(false)
+        .expect("a failing tail drops the pass instead of aborting");
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live inventory pass" && skip.reason.contains("dropped")
+        }),
+        "a counted named gap records the dropped tail: {:?}",
+        engine.counters.object_skips
+    );
 
     assert_eq!(engine.published_facts_revision, public_revision);
     assert_ne!(engine.facts_revision, public_revision);

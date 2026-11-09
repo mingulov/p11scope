@@ -13,18 +13,19 @@ numbers and the commands so the claims stay checkable.
 
 ## Harness condition: observer at `nice -n -5`
 
-Every cell below ran the joint observer one step above best-effort
-(`scripts/ci/joint-throughput.sh`: `nice -n -5`). The keep-up claims
-are conditional on that scheduling; operator runs at default
-priority may differ. The S1 twin cell always runs unniced.
+Every round-2 cell below ran the joint observer one step above
+best-effort (`scripts/ci/joint-throughput.sh`: `nice -n -5`).
+Round-4 re-runs at default priority are tabulated separately below;
+operator runs at other priorities may differ. The S1 twin cell
+always runs unniced.
 `JOINT_NICE` overrides the level; empty now skips nice and runs at
 the caller's priority. Correction: the round-3 control re-ran
 10k/60s with `JOINT_NICE=` (empty), but the round-3 script ran that
 case under a bare `nice`, which adds its default +10 — so the old
 control was really a nice +10 run, not a without-nice one (its
 Gate-2 exactness held even de-prioritised; its latency comparison
-was +10 against −5). Round 4 re-runs the control at true default
-priority.
+was +10 against −5). Round 4 re-ran the control at true default
+priority; its rows are tabulated below.
 
 ## Gate 2 exactness and settlement
 
@@ -53,6 +54,22 @@ stops there, so later gates are unjudged. `total_ring_loss_sum` is
 Cell entry load (`results.jsonl`): ~1.0 for the first four cells;
 10.88/10.09/1.89 for cpu2 (elevated lane entry; CPU% below is the
 observer's own ticks and stands).
+
+## Round 4 (default priority)
+
+One `joint-10k-single` cell per rate at true default priority
+(`JOINT_NICE=` empty, fixed script skips `nice`), observer rev
+`7871895e7`, same fedora 5-CPU VM, exclusive lane.
+
+| cell | result |
+| --- | --- |
+| 6.25k/60s | exact: calls 375,004 = want, lost 0, settlement p50 16 ms as reported |
+| 10k/60s | lost 271 records, counted (matches bpftool 271); key-operation tracking ended; ~65% of calls unattributed; settlement p50 2.4 s as reported |
+
+This throughput is a local 5-CPU test-VM metric only, not a product
+promise: 10k/s with key operations is at this VM's capacity edge — 1
+of 4 runs (the two round-2 nice-−5 cells and the round-3 nice-+10
+cell were exact) lost records, and every lost record was counted.
 
 ## Observer CPU and RSS (cpu2 cell)
 

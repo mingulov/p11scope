@@ -697,8 +697,8 @@ impl<'a> ViewFilesystem<'a> {
 
     /// Open a mapping-rendered path for a scan, pin or loader read: the
     /// target root first, then — only when the target root is foreign but
-    /// shares the observer's mount namespace (a chroot: mappings predate the
-    /// root switch, so their host paths are unopenable under
+    /// shares the observer's mount namespace (a chroot: maps paths render
+    /// host-absolute to this observer, so they miss under
     /// `/proc/<pid>/root`) — the observer root. The retry proves nothing by
     /// itself: every caller still runs its like-for-like identity guard
     /// (mountinfo resolution, the self-mapping probe, `mapped_file_guard`)

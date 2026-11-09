@@ -3499,7 +3499,7 @@ fn gap_reason_words_exited_process_races_calmly() {
     );
 }
 
-/// A chrooted-target failure that attempted the verified host-root
+/// A chrooted-target failure that attempted the gated host-root
 /// fallback names a live process whose object missed (or was refused)
 /// under both roots — never an exit race, even when the target half
 /// reads ENOENT. Concise names the fallback instead of claiming the

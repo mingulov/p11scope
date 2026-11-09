@@ -2620,7 +2620,7 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
-    // A chrooted-target failure that attempted the verified host-root
+    // A chrooted-target failure that attempted the gated host-root
     // fallback names a live process whose object missed (or was refused)
     // under both roots — never an exit race, even when the target half
     // reads ENOENT. Name the fallback; verbose keeps the machine error

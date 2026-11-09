@@ -823,12 +823,18 @@ pub struct Engine {
     /// Inventory ticks started (`refresh_inventory` entries). Names the
     /// dropped pass in the pass-containment gap; healthy ticks never read it.
     inventory_passes: u64,
-    /// Dropped-pass aggregates by error text (`note_dropped_pass`): one
-    /// gap per error with a count and first/last pass numbers. Bounded
-    /// by distinct error texts.
+    /// Dropped-pass aggregates by error text (`note_dropped_pass`): a
+    /// count and first/last pass numbers per error, for diagnostics and
+    /// tests only. Bounded by distinct error texts. Never published:
+    /// the capture carries exactly one fixed gap (`dropped_pass_gap`).
     dropped_pass_gaps: BTreeMap<String, DroppedPassAggregate>,
-    /// Consecutive dropped passes since the last tick that completed
-    /// without dropping. Past `DROPPED_PASS_RETAIN_LIMIT`, a drop
+    /// The one published dropped-pass gap, recorded by the first drop
+    /// and never rewritten. Every publishing layer keys gaps by subject
+    /// plus reason and only adds, so a rewritten reason would publish a
+    /// new entry per drop.
+    dropped_pass_gap: Option<Skipped>,
+    /// Consecutive dropped tick passes since the last tick that completed
+    /// without dropping (batch-tail drops do not count). Past `DROPPED_PASS_RETAIN_LIMIT`, a drop
     /// completes serviced requests so a persistently poisoned tick
     /// stops blocking all later discovery.
     consecutive_dropped_passes: u64,
@@ -907,22 +913,14 @@ pub struct Engine {
 /// faults, then the capture degrades instead of stalling.
 const DROPPED_PASS_RETAIN_LIMIT: u64 = 2;
 
-/// One aggregated dropped-pass gap: how many passes with one error
-/// text dropped, and the first/last pass numbers.
+/// Internal dropped-pass aggregate for one error text: how many passes
+/// dropped with it, and the first/last pass numbers (diagnostics only).
 struct DroppedPassAggregate {
     count: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     first_pass: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     last_pass: u64,
-}
-
-/// Renders one dropped-pass gap reason: the single form for the first
-/// drop, the aggregated form with count and first/last passes after.
-fn dropped_pass_reason(count: u64, first_pass: u64, last_pass: u64, error: &str) -> String {
-    if count <= 1 {
-        format!("pass {first_pass} dropped: {error}")
-    } else {
-        format!("passes {first_pass}-{last_pass} dropped ({count}x): {error}")
-    }
 }
 
 #[cfg(test)]
@@ -11083,6 +11081,7 @@ impl Engine {
             loader_arms: 0,
             inventory_passes: 0,
             dropped_pass_gaps: BTreeMap::new(),
+            dropped_pass_gap: None,
             consecutive_dropped_passes: 0,
             exploratory_evictions: 0,
             probationary_completions: 0,
@@ -12861,48 +12860,51 @@ impl Engine {
     /// failures reach here: `apply_candidate` fails before its first
     /// link mutation (its one `?` is the pre-mutation preflight), and
     /// `inventory_candidate` builds from clones, so the committed state
-    /// is untouched. Repeats with the same error aggregate into one
-    /// gap with a count and first/last pass numbers, updated in place.
+    /// is untouched. The first drop records the capture's one
+    /// `live inventory pass` gap; later drops (any error) only update
+    /// the internal aggregates and the skip-attribution count, so the
+    /// published output keeps exactly one entry however many passes drop.
     #[track_caller]
     fn note_dropped_pass(&mut self, error: &anyhow::Error) {
         const SUBJECT: &str = "live inventory pass";
         let pass = self.inventory_passes;
-        self.consecutive_dropped_passes = self.consecutive_dropped_passes.saturating_add(1);
         let key = format!("{error:#}");
-        let (previous_count, previous_last, first_pass) = {
-            let aggregate =
-                self.dropped_pass_gaps
-                    .entry(key.clone())
-                    .or_insert(DroppedPassAggregate {
-                        count: 0,
-                        first_pass: pass,
-                        last_pass: pass,
-                    });
-            let previous = (aggregate.count, aggregate.last_pass, aggregate.first_pass);
-            aggregate.count = aggregate.count.saturating_add(1);
-            aggregate.last_pass = pass;
-            previous
-        };
-        let reason = dropped_pass_reason(previous_count.saturating_add(1), first_pass, pass, &key);
-        if previous_count == 0 {
-            self.mark_partial(SUBJECT, &reason);
+        let aggregate = self
+            .dropped_pass_gaps
+            .entry(key.clone())
+            .or_insert(DroppedPassAggregate {
+                count: 0,
+                first_pass: pass,
+                last_pass: pass,
+            });
+        aggregate.count = aggregate.count.saturating_add(1);
+        aggregate.last_pass = pass;
+        if let Some(gap) = &self.dropped_pass_gap {
+            // Counted for diagnostics only: the published gap and the
+            // publication inputs stay unchanged.
+            attribution::note(gap);
             return;
         }
-        let old = dropped_pass_reason(previous_count, first_pass, previous_last, &key);
-        if let Some(skip) = self
-            .counters
-            .object_skips
-            .iter_mut()
-            .find(|skip| skip.subject == SUBJECT && skip.reason == old)
-        {
-            skip.reason = reason;
-            attribution::note(skip);
-            self.note_facts_mutated();
-        } else {
-            // Defensive: the aggregated entry is gone (nothing today
-            // removes it), so record the drop instead of losing it.
-            self.mark_partial(SUBJECT, &reason);
-        }
+        let reason = format!("pass {pass} dropped: {key}");
+        self.dropped_pass_gap = Some(Skipped {
+            subject: SUBJECT.into(),
+            reason: reason.clone(),
+        });
+        self.mark_partial(SUBJECT, &reason);
+    }
+
+    /// A dropped tick pass: counts toward the consecutive-drop chain
+    /// (batch-tail drops do not), records the gap, then escalates.
+    #[track_caller]
+    fn note_dropped_tick(
+        &mut self,
+        error: &anyhow::Error,
+        serviced: &BTreeMap<u32, u64>,
+        failed: &BTreeSet<u32>,
+    ) {
+        self.consecutive_dropped_passes = self.consecutive_dropped_passes.saturating_add(1);
+        self.note_dropped_pass(error);
+        self.complete_serviced_after_repeated_drops(serviced, failed);
     }
 
     /// Escalation for a dropped tick: while drops stay rare the
@@ -12926,6 +12928,14 @@ impl Engine {
     #[cfg(test)]
     fn dropped_pass_count_for_test(&self, error: &str) -> u64 {
         self.dropped_pass_gaps.get(error).map_or(0, |gap| gap.count)
+    }
+
+    /// Test-only: first and last dropped pass numbers for one error text.
+    #[cfg(test)]
+    fn dropped_pass_span_for_test(&self, error: &str) -> Option<(u64, u64)> {
+        self.dropped_pass_gaps
+            .get(error)
+            .map(|gap| (gap.first_pass, gap.last_pass))
     }
 
     pub(crate) fn selection_coverage(
@@ -25081,11 +25091,7 @@ impl Engine {
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.note_dropped_pass(&error);
-                self.complete_serviced_after_repeated_drops(
-                    &serviced_requests,
-                    &failed_refresh_pids,
-                );
+                self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
                 *additions_allowed = false;
                 closure.fail();
                 return Ok(false);
@@ -25370,11 +25376,7 @@ impl Engine {
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.note_dropped_pass(&error);
-                self.complete_serviced_after_repeated_drops(
-                    &serviced_requests,
-                    &failed_refresh_pids,
-                );
+                self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
                 *additions_allowed = false;
                 closure.fail();
                 return Ok(changed);
@@ -25520,11 +25522,7 @@ impl Engine {
             match self.apply_candidate(session, candidate, additions_allowed, true, &extra_views) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.note_dropped_pass(&error);
-                    self.complete_serviced_after_repeated_drops(
-                        &serviced_requests,
-                        &failed_refresh_pids,
-                    );
+                    self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
                     *additions_allowed = false;
                     closure.fail();
                     return Ok(changed);

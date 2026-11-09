@@ -68237,7 +68237,11 @@ fn repeated_drops_publish_exactly_one_fixed_gap() {
         .into_iter()
         .cloned()
         .collect();
-    assert_eq!(first.len(), 1, "the first drop publishes its gap: {first:?}");
+    assert_eq!(
+        first.len(),
+        1,
+        "the first drop publishes its gap: {first:?}"
+    );
     assert!(
         first[0].reason.starts_with("pass ")
             && first[0].reason.ends_with(&format!("dropped: {ERROR}")),
@@ -68247,6 +68251,11 @@ fn repeated_drops_publish_exactly_one_fixed_gap() {
         drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
     }
     assert_eq!(engine.dropped_pass_count_for_test(ERROR), 4);
+    let (first_pass, last_pass) = engine.dropped_pass_span_for_test(ERROR).unwrap();
+    assert!(
+        last_pass > first_pass,
+        "later drops are counted internally: passes {first_pass}..{last_pass}"
+    );
     let published = published_inventory_pass_gaps(&engine);
     assert_eq!(
         published.len(),
@@ -68380,7 +68389,11 @@ fn poisoned_newcomer_is_never_admitted_and_publishes_one_gap() {
         drop_one_more_pass(&mut engine, &mut session, kept_pid, ERROR, false);
     }
     let pids: Vec<_> = engine.views.iter().map(ProcessView::pid).collect();
-    assert_eq!(pids, vec![kept_pid], "the poisoned newcomer stays unadmitted");
+    assert_eq!(
+        pids,
+        vec![kept_pid],
+        "the poisoned newcomer stays unadmitted"
+    );
     assert!(
         !engine.refresh_requested.contains_key(&kept_pid),
         "past the retain limit the unrelated request completes unapplied"

@@ -1021,8 +1021,10 @@ fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
     case.engine.views.push(other);
     let first = case.scan_context(case.engine.views[0].id(), None);
     let second = case.scan_context(other_id, None);
-    case.engine.pending_loader_scans.insert(first, (11, 1));
-    case.engine.pending_loader_scans.insert(second, (22, 1));
+    // Service is freshest-first: the handoff-triggering scan carries the
+    // newer hook timestamp so it is served first and parks the other.
+    case.engine.pending_loader_scans.insert(first, (22, 1));
+    case.engine.pending_loader_scans.insert(second, (11, 1));
     let scans = case.engine.deep_scans;
     let outcome = case
         .engine
@@ -1046,7 +1048,7 @@ fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
     );
     assert_eq!(
         case.engine.pending_loader_scans.get(&second),
-        Some(&(22, 1))
+        Some(&(11, 1))
     );
     assert!(case.session.attached_slots.is_empty());
 }

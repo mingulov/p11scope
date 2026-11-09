@@ -14344,6 +14344,29 @@ impl Engine {
             return;
         }
         if self.pending_loader_scans.len() == crate::discovery::loader::MAX_LOADER_CONTEXTS {
+            // Ledger full under churn: the ledger holds the stalest
+            // deferrals — likeliest for processes that already exited —
+            // while this arrival is fresh. Evict the stalest entry for
+            // an arrival strictly newer than it, so the ledger always
+            // holds the freshest bounded window and freshest-first
+            // service spends the frame on live processes. The evicted
+            // scan counts the same bounded-ledger truncation the dropped
+            // arrival would have; only the victim changes. An arrival no
+            // newer than everything held drops as before.
+            let stalest = self
+                .pending_loader_scans
+                .iter()
+                .min_by_key(|(key, (hook_ts, _))| (*hook_ts, **key))
+                .map(|(key, _)| *key);
+            if let Some(victim) = stalest.filter(|victim| {
+                self.pending_loader_scans
+                    .get(victim)
+                    .is_some_and(|(victim_ts, _)| *victim_ts < hook_ts_ns)
+            }) {
+                self.pending_loader_scans.remove(&victim);
+                self.pending_loader_scans
+                    .insert(key, (hook_ts_ns, announced));
+            }
             self.record_pending_loader_scan_loss(
                 "a deferred loader memory scan exceeded the bounded loader-context ledger",
             );
@@ -18297,6 +18320,26 @@ impl Engine {
         Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
+    /// Service order for due loader scans: freshest-first by hook
+    /// timestamp, ties by key. Under churn the ledger holds dead scans
+    /// ahead of live newcomers; key order would spend the frame budget
+    /// on the dead. Freshest-first spends it where the processes are
+    /// likeliest alive — one live scan proves the provider file for
+    /// every later process mapping it. Keys missing from the ledger
+    /// (stale `due` entries) sink below every known one; the service
+    /// loop skips them.
+    fn order_loader_scans_freshest_first(
+        pending: &BTreeMap<PendingLoaderScanKey, (u64, u32)>,
+        due: &BTreeSet<PendingLoaderScanKey>,
+    ) -> Vec<PendingLoaderScanKey> {
+        let mut ordered: Vec<PendingLoaderScanKey> = due.iter().copied().collect();
+        ordered.sort_by_key(|key| {
+            let ts = pending.get(key).map(|(hook_ts_ns, _)| *hook_ts_ns);
+            (std::cmp::Reverse(ts), *key)
+        });
+        ordered
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn service_pending_loader_scans(
         &mut self,
@@ -18307,7 +18350,7 @@ impl Engine {
     ) -> Result<DiscoveryRecordOutcome> {
         let mut changed = false;
         let mut required_complete = true;
-        for key in due {
+        for key in Self::order_loader_scans_freshest_first(&self.pending_loader_scans, &due) {
             // An earlier fallback can hand off native ownership. The remaining
             // keys keep their original timestamps for the fresh scoped frame.
             if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {

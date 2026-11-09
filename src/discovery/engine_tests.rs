@@ -11881,6 +11881,80 @@ fn loader_deferral_bound_drops_with_explicit_loss() {
     );
 }
 
+/// Churn ledger: a full ledger holds the stalest deferrals — likeliest
+/// for processes that already exited — while fresh arrivals carry live
+/// processes. Past the cap, an arrival strictly newer than the stalest
+/// held entry evicts it (the same bounded-ledger truncation, only the
+/// victim changes) so the ledger always holds the freshest bounded
+/// window. Tied and older arrivals still drop as before.
+#[test]
+fn loader_ledger_full_evicts_stalest_for_fresher_arrival() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    for index in 0..crate::discovery::loader::MAX_LOADER_CONTEXTS as u32 {
+        engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(index),
+                context,
+            },
+            100 + u64::from(index),
+            1,
+        );
+    }
+    assert_eq!(
+        engine.pending_loader_scans.len(),
+        crate::discovery::loader::MAX_LOADER_CONTEXTS
+    );
+    engine.defer_loader_memory_scan(
+        PendingLoaderScanKey {
+            view: ProcessViewId(1000),
+            context,
+        },
+        10_000,
+        1,
+    );
+    assert_eq!(
+        engine.pending_loader_scans.len(),
+        crate::discovery::loader::MAX_LOADER_CONTEXTS,
+        "eviction keeps the ledger bounded"
+    );
+    assert!(
+        !engine
+            .pending_loader_scans
+            .keys()
+            .any(|key| key.view == ProcessViewId(0)),
+        "the stalest entry leaves for the fresher arrival"
+    );
+    assert!(
+        engine
+            .pending_loader_scans
+            .keys()
+            .any(|key| key.view == ProcessViewId(1000)),
+        "the fresher arrival is admitted"
+    );
+    assert_eq!(engine.discovery_truncated, 1);
+}
+
+/// Churn service: under overload the ledger holds dead scans ahead of
+/// live newcomers; key order would spend the frame budget on the dead.
+/// Due scans serve freshest-first (hook timestamp, ties by key) so one
+/// live scan proves the provider file for every later process mapping it.
+#[test]
+fn loader_service_orders_freshest_first() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    let key = |view: u32| PendingLoaderScanKey {
+        view: ProcessViewId(view),
+        context,
+    };
+    engine.pending_loader_scans.insert(key(1), (10, 1));
+    engine.pending_loader_scans.insert(key(2), (30, 1));
+    engine.pending_loader_scans.insert(key(3), (20, 1));
+    let due: BTreeSet<PendingLoaderScanKey> = engine.pending_loader_scans.keys().copied().collect();
+    let order = Engine::order_loader_scans_freshest_first(&engine.pending_loader_scans, &due);
+    assert_eq!(order, vec![key(2), key(3), key(1)]);
+}
+
 /// Task 3.1b: ordinary rotation admits unscanned views into free slots and
 /// never displaces a retained view. Five members under a cap of two: the
 /// first ordinary pass fills the free slot (if any) with the lowest

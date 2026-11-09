@@ -54,9 +54,12 @@ def profile_doc(functions, scope="pid", completeness="COMPLETE",
     }
 
 
-def function_row(name, calls):
-    return {"names": [name], "calls": calls,
-            "module": {"dev": [8, 1], "ino": 99, "sha256": "b" * 64}}
+def function_row(name, calls, forwarding_layer=False):
+    row = {"names": [name], "calls": calls,
+           "module": {"dev": [8, 1], "ino": 99, "sha256": "b" * 64}}
+    if forwarding_layer:
+        row["forwarding_layer"] = True
+    return row
 
 
 def exact_functions():
@@ -191,6 +194,21 @@ class OracleCase(unittest.TestCase):
         rc, text = self.judge(
             "profile", "pid", json.dumps(doc),
             stdout_body="functions: 9 rows\n",
+            stderr_body="p11scope: target pid 4242 attached\n",
+            extra=("--exact", "{expected}", "--caller-pid", "4242"))
+        self.assertEqual(rc, 0, text)
+        self.assert_result(text, "PASS")
+
+    # GREEN: a forwarding-layer row duplicates logical calls and must
+    # be skipped when summing (profile schema v3).
+    def test_profile_forwarding_layer_skipped_pass(self):
+        doc = profile_doc(
+            exact_functions()
+            + [function_row("C_GenerateRandom", 100,
+                            forwarding_layer=True)])
+        rc, text = self.judge(
+            "profile", "pid", json.dumps(doc),
+            stdout_body="functions: 10 rows\n",
             stderr_body="p11scope: target pid 4242 attached\n",
             extra=("--exact", "{expected}", "--caller-pid", "4242"))
         self.assertEqual(rc, 0, text)

@@ -68311,7 +68311,7 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
 /// a live tick needs to find the provider again on rescan. The
 /// fixture owns the provider child, so it must stay alive.
 fn provider_engine_with_committed_seed() -> (LoadedSeedProvider, Engine, ScriptedSession, u32) {
-    let (fixture, mut engine, mut session) = initial_export_route();
+    let (fixture, mut engine, session) = initial_export_route();
     let pid = engine.views[0].pid();
     engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
     assert!(
@@ -68340,7 +68340,7 @@ fn dropped_tick_keeps_committed_provider_modules_plan_and_counts() {
             .any(|skip| skip.subject == "live inventory pass"),
         "the healthy tick emits no dropped-pass gap"
     );
-    let modules = serde_json::to_value(&engine.modules).unwrap();
+    let modules = engine.modules.clone();
     let slots = engine.plan.active_slot_count();
     let entries_seen = engine.plan.entries_seen;
     let discovery_modules = serde_json::to_value(&engine.discovery.modules).unwrap();
@@ -68349,8 +68349,7 @@ fn dropped_tick_keeps_committed_provider_modules_plan_and_counts() {
     apply_ordinary_batch(&mut engine, &mut session, vec![])
         .expect("a dropped pass still returns Ok");
     assert_eq!(
-        serde_json::to_value(&engine.modules).unwrap(),
-        modules,
+        engine.modules, modules,
         "committed modules survive the dropped pass"
     );
     assert_eq!(

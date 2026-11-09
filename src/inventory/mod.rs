@@ -14814,6 +14814,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn progress_lines_groups_many_admissions_into_one_counted_line() {
+        // A 210-admission pass renders one counted line, not 210
+        // per-caller lines; the headline stays first.
+        use crate::discovery::caller_registry::CallerId;
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let events: Vec<CallerEvent> = (0..210)
+            .map(|id| CallerEvent::Admitted { id: CallerId(id) })
+            .collect();
+        let report = PassReport {
+            pass: 2,
+            scanned: 210,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 210,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&coordinator, &report);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "p11scope: pass 2: 210 callers admitted"),
+            "one counted admissions line: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("caller c")),
+            "no per-caller admission lines: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("p11scope: pass 2: 210 scanned"),
+            "the headline stays first: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn progress_lines_keeps_few_admissions_individual() {
+        // At most ADMITTED_EVENTS_SHOWN_PER_PASS admissions keep
+        // today's per-caller lines; small passes stay fully detailed.
+        use crate::discovery::caller_registry::CallerId;
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let events: Vec<CallerEvent> = (0..8)
+            .map(|id| CallerEvent::Admitted { id: CallerId(id) })
+            .collect();
+        let report = PassReport {
+            pass: 1,
+            scanned: 8,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 8,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&coordinator, &report);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("caller c"))
+                .count(),
+            8,
+            "eight admissions keep eight lines: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("callers admitted")),
+            "no counted line at the boundary: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn progress_lines_admission_grouping_keeps_other_events() {
+        // Past the grouping threshold the counted line replaces only
+        // the admission lines: every other distinct event keeps its
+        // own line.
+        use crate::discovery::caller_registry::CallerId;
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let mut events: Vec<CallerEvent> = (0..10)
+            .map(|id| CallerEvent::Admitted { id: CallerId(id) })
+            .collect();
+        events.push(CallerEvent::Exited {
+            id: CallerId(11),
+            reason: "process exited".into(),
+        });
+        events.push(CallerEvent::AdmitFailed {
+            pid: 9,
+            reason: "cannot pin pid 9".into(),
+            budget: None,
+        });
+        let report = PassReport {
+            pass: 4,
+            scanned: 12,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 12,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&coordinator, &report);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "p11scope: pass 4: 10 callers admitted"),
+            "one counted admissions line: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("caller c")
+                && !line.contains("exited")),
+            "no per-caller admission lines: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "p11scope: pass 4: caller c11 exited: process exited"),
+            "the exit keeps its line: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line
+                == "p11scope: pass 4: caller admission failed for pid 9: cannot pin pid 9"),
+            "the single failure keeps its line: {lines:?}"
+        );
+    }
+
     /// DR-K8S-4 through the real per-pass emitter: one identical gap over
     /// three passes is one `gap_recorded` plus `gap_repeated` deltas, and
     /// replaying the stream reproduces the snapshot's `repeats` exactly.

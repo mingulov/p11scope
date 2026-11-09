@@ -9990,6 +9990,54 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn deep_scan_progress_keeps_every_line_for_small_selections() {
+        for len in [0, 1, 2, 64, 128] {
+            for index in 0..len {
+                assert!(
+                    super::deep_scan_progress_visible(index, len),
+                    "index {index} of {len}"
+                );
+            }
+            assert_eq!(
+                super::deep_scan_progress_summary(len),
+                None,
+                "no summary for {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_scan_progress_samples_large_selections_with_first_and_last() {
+        let len = 205;
+        let visible: Vec<usize> = (0..len)
+            .filter(|index| super::deep_scan_progress_visible(*index, len))
+            .collect();
+        assert_eq!(visible.first(), Some(&0), "first stays: {visible:?}");
+        assert_eq!(
+            visible.last(),
+            Some(&(len - 1)),
+            "last stays: {visible:?}"
+        );
+        // Stride ceil(205/16) = 13: positions 1, 13, 26, ..., 195, 205.
+        assert_eq!(visible.len(), 17, "{visible:?}");
+        assert!(super::deep_scan_progress_visible(12, len), "13th stays");
+        assert!(!super::deep_scan_progress_visible(1, len), "2nd drops");
+        assert!(!super::deep_scan_progress_visible(13, len), "14th drops");
+        assert_eq!(
+            super::deep_scan_progress_summary(len).as_deref(),
+            Some("p11scope: deep-scanned 205 processes (progress sampled)"),
+        );
+    }
+
+    #[test]
+    fn deep_scan_progress_summary_starts_past_full_detail() {
+        assert_eq!(super::deep_scan_progress_summary(128), None);
+        assert!(super::deep_scan_progress_summary(129).is_some());
+        assert!(!super::deep_scan_progress_visible(1, 129));
+        assert!(super::deep_scan_progress_visible(0, 129));
+    }
 }
 
 #[cfg(test)]

@@ -4048,6 +4048,46 @@ fn deleted_only_gaps_keep_coverage_complete_with_notes() {
     );
 }
 
+/// Audit P0-1: a replaced-provider gap forces PARTIAL coverage — the
+/// gaps block names the running copy, never a "not loss" note.
+#[test]
+fn replaced_provider_gap_forces_partial_coverage() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(11),
+        subject: "/usr/lib/libsoftokn3.so (deleted)".into(),
+        reason: "provider file replaced on disk while running; calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines().any(|line| line == "coverage: partial — 1 gap"),
+        "a replaced-provider gap forces PARTIAL: {out}"
+    );
+    assert!(
+        out.lines().any(|line| line == "gaps: 1"),
+        "the gaps block names the replaced provider: {out}"
+    );
+    assert!(
+        out.contains("provider file replaced on disk while running; calls not counted"),
+        "the named gap surfaces verbatim: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("notes:")),
+        "no not-loss note for a replaced provider: {out}"
+    );
+}
+
 const SCOPE_DOCKER_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const SCOPE_POD_UID: &str = "12345678-1234-abcd-9876-1234567890ab";
 

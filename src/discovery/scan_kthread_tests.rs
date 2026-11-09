@@ -295,6 +295,36 @@ fn inode_match_without_usable_path_still_misses_the_hint() {
 }
 
 #[test]
+fn deleted_exec_mapping_is_a_named_replaced_file_loss() {
+    // Owner rule 2026-11-09 (data-always, audit P0-1): a provider file
+    // replaced on disk while running still has its code mapped — the
+    // scan names the loss, never "not loss".
+    let mut fixture = EmptyMapsFixture {
+        maps: b"7f0000000000-7f0000001000 r-xp 00000000 08:01 4242 /usr/lib/libsoftokn3.so (deleted)\n"
+            .to_vec(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, _) = run_examined(&mut fixture, &mut budget, &[])
+        .expect("the scan must complete, not error");
+    let reasons: Vec<&str> = outcome
+        .skipped()
+        .iter()
+        .map(|skip| skip.reason.as_str())
+        .collect();
+    assert!(
+        reasons.iter().any(|reason| *reason
+            == "provider file replaced on disk while running; calls not counted"),
+        "a deleted exec mapping names the replaced-file loss, got {reasons:?}"
+    );
+    assert!(
+        scan_skip_truncates("provider file replaced on disk while running; calls not counted"),
+        "the replaced-file loss truncates coverage"
+    );
+}
+
+#[test]
 fn inode_match_with_unopenable_object_still_misses_the_hint() {
     // Same, when the aliased path exists in maps but cannot be opened in
     // the target: the gate never runs, so the hint stays unmatched.

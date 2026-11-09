@@ -8542,6 +8542,13 @@ fn dashboard_visible_lines(lines: &[String], verbose: bool) -> Vec<&String> {
         .collect()
 }
 
+/// Per-pass `Admitted` events rendered as individual lines: past
+/// this many, one counted line replaces them, like the admission
+/// failure aggregation. The admitted identities stay in verbose
+/// stdout (per-edge detail) and the complete JSON; stderr keeps the
+/// count. Small passes stay fully detailed.
+const ADMITTED_EVENTS_SHOWN_PER_PASS: usize = 8;
+
 /// Per-pass progress lines (stdout stays parseable): what the pass
 /// scanned, which caller incarnations turned over, and what the pass
 /// cost — gaps, budget refusals, and suppressed gaps are reported, so a
@@ -8612,8 +8619,27 @@ fn progress_lines<Source: ProcessSource>(
             crate::render::escape_controls(reason)
         ));
     }
+    // Admissions aggregate past ADMITTED_EVENTS_SHOWN_PER_PASS per
+    // pass, like failures above: a 200-caller pass renders one
+    // counted line instead of 200 per-caller lines.
+    let admitted = report
+        .events
+        .iter()
+        .filter(|event| matches!(event, CallerEvent::Admitted { .. }))
+        .count();
+    if admitted > ADMITTED_EVENTS_SHOWN_PER_PASS {
+        lines.push(format!(
+            "p11scope: pass {}: {admitted} callers admitted",
+            report.pass
+        ));
+    }
     for event in &report.events {
         if failed.len() > 1 && matches!(event, CallerEvent::AdmitFailed { .. }) {
+            continue;
+        }
+        if admitted > ADMITTED_EVENTS_SHOWN_PER_PASS
+            && matches!(event, CallerEvent::Admitted { .. })
+        {
             continue;
         }
         let line = match event {
@@ -14927,8 +14953,9 @@ mod tests {
             "one counted admissions line: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|line| line.contains("caller c")
-                && !line.contains("exited")),
+            !lines
+                .iter()
+                .any(|line| line.contains("caller c") && !line.contains("exited")),
             "no per-caller admission lines: {lines:?}"
         );
         assert!(

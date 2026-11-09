@@ -171,16 +171,34 @@ pub(crate) fn stage_timings_requested() -> bool {
     std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|value| value == "1")
 }
 
-/// Whether the `index`-th tick of a `len`-process deep scan prints.
-/// Seam for the progress sampling; currently always visible.
-fn deep_scan_progress_visible(_index: usize, _len: usize) -> bool {
-    true
+/// Selections past this size sample their per-PID deep-scan progress
+/// ticks instead of printing one line per process: small scopes keep
+/// every line, production scopes stay readable. The bound covers every
+/// test selection (scan caps at most 128, and selection never exceeds
+/// its cap), so the selected-pid proof keeps full detail.
+const DEEP_SCAN_FULL_DETAIL_MAX: usize = 128;
+
+/// Whether the `index`-th tick of a `len`-process deep scan prints:
+/// every tick for small selections; the first, the last, and every
+/// sixteenth of the scan past [`DEEP_SCAN_FULL_DETAIL_MAX`], so a
+/// large scan renders about seventeen ticks plus its completion line.
+fn deep_scan_progress_visible(index: usize, len: usize) -> bool {
+    if len <= DEEP_SCAN_FULL_DETAIL_MAX {
+        return true;
+    }
+    let position = index + 1;
+    position == 1 || position == len || position.is_multiple_of(len.div_ceil(16))
 }
 
-/// The completion line for a sampled deep scan, if `len` sampled.
-/// Seam for the progress sampling; currently never sampled.
-fn deep_scan_progress_summary(_len: usize) -> Option<String> {
-    None
+/// The completion line for a sampled deep scan: `None` (no extra
+/// line) while every tick prints.
+fn deep_scan_progress_summary(len: usize) -> Option<String> {
+    if len <= DEEP_SCAN_FULL_DETAIL_MAX {
+        return None;
+    }
+    Some(format!(
+        "p11scope: deep-scanned {len} processes (progress sampled)"
+    ))
 }
 
 /// One gap record with optional member attribution. Scope-level gaps
@@ -10015,11 +10033,7 @@ mod tests {
             .filter(|index| super::deep_scan_progress_visible(*index, len))
             .collect();
         assert_eq!(visible.first(), Some(&0), "first stays: {visible:?}");
-        assert_eq!(
-            visible.last(),
-            Some(&(len - 1)),
-            "last stays: {visible:?}"
-        );
+        assert_eq!(visible.last(), Some(&(len - 1)), "last stays: {visible:?}");
         // Stride ceil(205/16) = 13: positions 1, 13, 26, ..., 195, 205.
         assert_eq!(visible.len(), 17, "{visible:?}");
         assert!(super::deep_scan_progress_visible(12, len), "13th stays");

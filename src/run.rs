@@ -4606,6 +4606,32 @@ fn run_tree_survivors_gap(read: std::io::Result<u64>) -> (Option<u64>, Option<St
     }
 }
 
+/// Settles an owned-run pause preflight: success passes the coordinator
+/// through; an `auto` failure degrades to one counted partial attempt (the
+/// child runs free); any other failure propagates to the caller, which
+/// fails the run (and, for `always`, names the refusal).
+fn settle_pause_preflight(
+    policy: cli::PausePolicy,
+    preflight: Result<PauseCoordinator, anyhow::Error>,
+    pid: u32,
+    generation: u64,
+) -> Result<PauseCoordinator, anyhow::Error> {
+    match preflight {
+        Ok(coordinator) => Ok(coordinator),
+        Err(error) if policy == cli::PausePolicy::Auto => {
+            // Best effort: an `auto` preflight that cannot even start
+            // degrades to an unpaused run with one counted partial
+            // attempt, never a dead child. `always` still refuses below.
+            emit_capture_diagnostic(&format!(
+                "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
+                render::escape_controls(&error.to_string())
+            ));
+            Ok(PauseCoordinator::degraded_auto(pid, generation))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn run_owned_inner_with_host(
     args: &RunArgs,
     stop: Arc<SignalState>,
@@ -4820,18 +4846,13 @@ fn run_owned_inner_with_host(
         let mut io = SessionPauseIo::new(&mut engine, &mut session, &child, &marker, &cancelled);
         PauseCoordinator::preflight(args.pause, &child, &mut io).map_err(pause_failure)
     };
-    let coordinator = match preflight {
+    let coordinator = match settle_pause_preflight(
+        args.pause,
+        preflight,
+        child.pid(),
+        child.generation().get(),
+    ) {
         Ok(coordinator) => coordinator,
-        Err(error) if args.pause == cli::PausePolicy::Auto => {
-            // Best effort: an `auto` preflight that cannot even start
-            // degrades to an unpaused run with one counted partial
-            // attempt, never a dead child. `always` still refuses below.
-            emit_capture_diagnostic(&format!(
-                "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
-                render::escape_controls(&error.to_string())
-            ));
-            PauseCoordinator::degraded_auto(child.pid(), child.generation().get())
-        }
         Err(error) => {
             return Err(combine_preflight_failure_with(
                 error,

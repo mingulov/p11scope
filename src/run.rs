@@ -4901,13 +4901,21 @@ fn finish_handoff_error_with<C>(
     context: &mut C,
     note_gap: impl FnOnce(&mut C),
     settle: impl FnOnce(&mut C) -> Result<()>,
-    _publish: impl FnOnce(&mut C) -> Result<()>,
+    publish: impl FnOnce(&mut C) -> Result<()>,
     detach: impl FnOnce(&mut C) -> Result<()>,
 ) -> anyhow::Error {
     note_gap(context);
     let finish = settle(context);
+    // Settlement gates the seal (the child's disposition is a fact the
+    // document reports, never a guess), exactly like the loop-error and
+    // quiesce-error paths. A failed settlement skips publication here;
+    // the settlement-gate lane owns that report.
+    let published = match &finish {
+        Ok(()) => Some(publish(context)),
+        Err(_) => None,
+    };
     let detach = detach(context);
-    combine_handoff_report_failure(error, finish, None, detach)
+    combine_handoff_report_failure(error, finish, published, detach)
 }
 
 /// Drives one owned-handoff step with its report: the fault hook `handoff`
@@ -4915,7 +4923,8 @@ fn finish_handoff_error_with<C>(
 /// report, the failure twin a partial report naming the failed step —
 /// before the outcome returns. Production wires the failure arm to
 /// `finish_handoff_error_with`; the healthy arm proceeds to the capture
-/// loop, which seals the full report there.
+/// loop, which seals the full report there. Test seam only.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_owned_handoff_with<C>(
     context: &mut C,
@@ -4942,6 +4951,719 @@ fn drive_owned_handoff_with<C>(
             detach,
         )),
     }
+}
+
+/// Finite handoff step names for the partial-report gap. The stderr error
+/// carries the step's details; the report names the step.
+const HANDOFF_STEP_PAUSE_ARM: &str = "pause arm";
+const HANDOFF_STEP_EXEC: &str = "exec handoff";
+const HANDOFF_STEP_POST_RELEASE: &str = "post-release pause revalidation";
+
+/// Production context for an owned-handoff failure seal: the attached
+/// session and settled child plus the report inputs the capture loop
+/// would have carried into its terminal.
+struct HandoffReportContext<'a> {
+    engine: &'a mut Engine,
+    session: &'a mut Session,
+    owned: &'a mut Owned,
+    signals: &'a SignalState,
+    out: &'a mut OutputSink,
+    kind: Kind,
+    policy: CapturePolicy,
+    scope: &'a Scope,
+    ring_bytes: Option<u32>,
+    drain: Duration,
+    max_events: Option<u64>,
+    uretprobe_override: Option<render::UretprobeOverride>,
+    owned_command: Option<&'a str>,
+    resource_start: crate::timing::ResourceSample,
+    step: &'static str,
+}
+
+/// Settles an owned-handoff failure and seals its partial report: the
+/// child still gets pause cleanup and policy settlement (kill, reap or
+/// hand-back, exactly as the error path settles today), the report seals
+/// from whatever was captured with the failed step named and quiescence
+/// unproven, producers still detach, and the original handoff error
+/// returns the run nonzero. Mirrors the loop-error and quiesce-error
+/// paths; settlement gates the seal there as here.
+#[allow(clippy::too_many_arguments)]
+fn finish_owned_handoff_error(
+    error: anyhow::Error,
+    step: &'static str,
+    engine: &mut Engine,
+    session: &mut Session,
+    owned: &mut Owned,
+    signals: &SignalState,
+    out: &mut OutputSink,
+    kind: Kind,
+    policy: CapturePolicy,
+    scope: &Scope,
+    ring_bytes: Option<u32>,
+    drain: Duration,
+    max_events: Option<u64>,
+    uretprobe_override: Option<render::UretprobeOverride>,
+    owned_command: Option<&str>,
+    resource_start: crate::timing::ResourceSample,
+) -> anyhow::Error {
+    let mut context = HandoffReportContext {
+        engine,
+        session,
+        owned,
+        signals,
+        out,
+        kind,
+        policy,
+        scope,
+        ring_bytes,
+        drain,
+        max_events,
+        uretprobe_override,
+        owned_command,
+        resource_start,
+        step,
+    };
+    let error = finish_handoff_error_with(
+        error,
+        step,
+        &mut context,
+        |context| context.engine.note_capture_loop_failure(),
+        |context| {
+            let settled = context.owned.finish(
+                &mut *context.engine,
+                &mut *context.session,
+                CaptureEnd::Error,
+                context.signals,
+            );
+            emit_stored_handoff_note(context.owned);
+            settled
+        },
+        seal_owned_handoff_partial,
+        |context| {
+            context.session.detach_producers_driven(
+                || context.signals.sigint_deliveries() >= 2,
+                terminal_diagnostics().as_mut(),
+            )
+        },
+    );
+    // U-19, as in `run_loop`: the handoff never reached a loop, so its
+    // discovery noise flushes here, on the error return.
+    context.engine.report_discovery_noise();
+    error
+}
+
+/// Seals the handoff partial report for the context's kind, from whatever
+/// the failure left behind. Drain and read failures become named gaps,
+/// never an aborted seal: the run's error already names the handoff
+/// failure, and the report names what is missing or unknown.
+fn seal_owned_handoff_partial(context: &mut HandoffReportContext) -> Result<()> {
+    report_attach_failures(context.session);
+    match context.kind {
+        Kind::Profile => seal_owned_handoff_profile(context),
+        Kind::Trace => seal_owned_handoff_trace(context),
+    }
+}
+
+/// Seals a profile-kind handoff report: discovery and (for event
+/// policies) the EVENTS ring drain best-effort into fresh consumers,
+/// counters read best-effort, and the `-o` JSON (or the stdout frame
+/// when no `-o` was given) seals PARTIAL with the failed step named
+/// and quiescence unproven.
+fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> {
+    let mut terminal_gap_due = false;
+    let _plan_changed = seal_terminal_discovery_or_gap(
+        || terminal_gap_due = true,
+        || {
+            context
+                .engine
+                .drain_discovery_terminal(&mut *context.session)
+        },
+    )?;
+    if terminal_gap_due {
+        context.engine.note_terminal_discovery_failure();
+    }
+    let profile = context.policy.uses_events();
+    let mode = if profile { "profile" } else { "metrics" };
+    let domain = context.session.events_domain();
+    let mut state =
+        semantics::State::for_capture(context.engine.plan(), context.policy, domain.clone());
+    let mut tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_resource(crate::timing::ResourcePoint::Start, context.resource_start);
+    scheduling.note_attach(context.session.attach_mono_ns());
+    let mut malformed_records: u64 = 0;
+    let mut handoff_gaps: Vec<render::SkippedOut> = Vec::new();
+    // The pid-scope target, named once here as the loop would have named
+    // it at its start; the terminal reuses the value and never re-reads.
+    let target_caller = match context.scope {
+        Scope::Pid(pid) => {
+            let owned_pin = context.owned.child.as_ref().map(|child| child.pin());
+            let engine_pin = context.engine.pid_target_pin(*pid);
+            let pin = owned_pin.or(engine_pin.as_deref());
+            let caller = resolve_pid_caller(*pid, pin);
+            emit_capture_diagnostic(&target_caller_line(*pid, &caller));
+            Some(caller)
+        }
+        Scope::Cgroup { .. } | Scope::System => None,
+    };
+    // A held-fd fstat failure is a provider-changed gap (fail closed on
+    // identity), never an aborted seal; a changed provider is already an
+    // `Ok(false)` the evidence reports through its latch.
+    if let Err(error) = context.engine.pinned().check_unchanged() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: provider identity recheck failed; sealing the report from partial state: {}",
+            crate::render::escape_controls(&error),
+        ));
+        handoff_gaps.push(render::SkippedOut {
+            name: "provider identity".to_string(),
+            reason: "the terminal identity recheck failed; provider sameness is unproven"
+                .to_string(),
+        });
+    }
+    if profile {
+        let root = drain_original_root_events(
+            &mut *context.session,
+            Some(&mut *context.owned),
+            context.signals,
+            |domain, event| {
+                reduce_profile_event(domain, &mut tracker, &mut state, context.scope, event)
+            },
+        );
+        match root {
+            Ok(OriginalRootDrain::Absent) => {}
+            Ok(OriginalRootDrain::Completed { malformed, tail }) => {
+                malformed_records = malformed_records.saturating_add(malformed);
+                if let Err(error) = apply_original_root_retirement(&mut tracker, &mut state, *tail)
+                {
+                    emit_capture_diagnostic(&format!(
+                        "p11scope: original-root retirement failed; sealing the report from \
+                         partial state: {}",
+                        crate::render::escape_controls(&format!("{error:#}")),
+                    ));
+                    handoff_gaps.push(render::SkippedOut {
+                        name: "original root tail".to_string(),
+                        reason: "the reaped child's tail could not be retired; its events may \
+                                 be missing or double-counted"
+                            .to_string(),
+                    });
+                }
+            }
+            Ok(OriginalRootDrain::Cancelled {
+                malformed,
+                remaining,
+            }) => {
+                malformed_records = malformed_records.saturating_add(malformed);
+                let _ = crate::sink::try_stderr_line(&format!(
+                    "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
+                ));
+                handoff_gaps.push(render::SkippedOut {
+                    name: "original root tail".to_string(),
+                    reason: "the reaped child's tail drain was cancelled; its events are \
+                             unproven"
+                        .to_string(),
+                });
+            }
+            Err(error) => {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: original-root drain failed; sealing the report from partial \
+                     state: {}",
+                    crate::render::escape_controls(&format!("{error:#}")),
+                ));
+                handoff_gaps.push(render::SkippedOut {
+                    name: "original root tail".to_string(),
+                    reason: "the reaped child's tail drain failed; its events are unproven"
+                        .to_string(),
+                });
+            }
+        }
+        match context.session.event_drain() {
+            Ok(drain) => {
+                match drain_profile_events(
+                    drain,
+                    &mut state,
+                    &mut tracker,
+                    context.scope,
+                    Some(crate::events::TERMINAL_DRAIN_BOUND),
+                ) {
+                    Ok((malformed, may_remain)) => {
+                        malformed_records = malformed_records.saturating_add(malformed);
+                        scheduling.note_terminal_drain(may_remain);
+                    }
+                    Err(error) => {
+                        emit_capture_diagnostic(&format!(
+                            "p11scope: terminal event drain failed; sealing the report from \
+                             partial state: {}",
+                            crate::render::escape_controls(&format!("{error:#}")),
+                        ));
+                        handoff_gaps.push(render::SkippedOut {
+                            name: "events drain".to_string(),
+                            reason: "the terminal event drain failed; calls past the failure \
+                                     are unproven"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: terminal event drain failed; sealing the report from partial \
+                     state: {}",
+                    crate::render::escape_controls(&format!("{error:#}")),
+                ));
+                handoff_gaps.push(render::SkippedOut {
+                    name: "events drain".to_string(),
+                    reason: "the EVENTS reader could not be opened; calls are unproven".to_string(),
+                });
+            }
+        }
+    }
+    let mut collection =
+        metrics::CaptureCollection::new(counter_inputs_for_capture(context.policy, context.engine));
+    let mut snapshot_opt = None;
+    let (reports, kernel_evidence) = match collection.terminal(
+        context.session,
+        context.engine.plan(),
+        context.engine.pinned(),
+        profile,
+    ) {
+        Ok(snapshot) => {
+            let kernel = snapshot.kernel_evidence();
+            let reports = snapshot.reports().to_vec();
+            snapshot_opt = Some(snapshot);
+            (reports, kernel)
+        }
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal counter read failed; sealing the report from partial \
+                 state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: "counter collection".to_string(),
+                reason: "the terminal counter read failed; counts are unproven".to_string(),
+            });
+            (Vec::new(), metrics::KernelEvidence::default())
+        }
+    };
+    let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+        owned_prearm_hold(Some(&*context.owned));
+    finish_prearm_terminal(
+        &mut *context.engine,
+        &*context.session,
+        context.session.attach_failures(),
+        CaptureEnd::Error,
+        &reports,
+        &kernel_evidence,
+        malformed_records,
+        None,
+        prearm_hold,
+        prearm_owned_run,
+        prearm_release_ns,
+    );
+    context.engine.settle_terminal_drain();
+    scheduling.note_terminal(
+        kernel_evidence.ring_loss,
+        context.engine.capture_facts().discovery_losses()[0],
+    );
+    scheduling.sync_discovery_deferrals(context.engine);
+    scheduling.sync_engine_stages(context.engine);
+    scheduling.sync_newcomer_stats(context.engine, crate::attach::monotonic_ns());
+    scheduling.sync_tail_stats(context.engine);
+    let capture_tracking_degraded = initial_tracking_evidence(
+        context.scope,
+        context
+            .session
+            .process_creation_tracking_unavailable()
+            .is_some(),
+        context.session.lifecycle_tracking_unavailable().is_some(),
+    );
+    let mut ev = evidence_for(
+        context.engine,
+        context.engine.capture_facts(),
+        context.session.attached_probes(),
+        context.session.dynamic_per_offset_attached(),
+        context.session.static_multi_attached() || context.session.dynamic_multi_attached(),
+        context.session.attach_backend_evidence(),
+        context.session.object_capture_evidence(),
+        context.session.attach_failures(),
+        &reports,
+        kernel_evidence,
+        tracker.evidence(),
+        malformed_records,
+        &state,
+        context.engine.pinned().provider_changed(),
+        profile,
+        context.owned.coordinator.counters(),
+        context.owned.coordinator.engine_incomplete_retirements(),
+        Some(context.owned.still_running),
+        capture_tracking_degraded,
+        scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+        context.uretprobe_override.clone(),
+        context.owned.still_running.then_some(context.owned.pid),
+        None,
+        context.session.unpublished_mechanisms(),
+    );
+    // The failed step, named in the finite vocabulary; the stderr error
+    // carries the step's details. Every drain and read failure above
+    // rides beside it, so the verdict stays a concrete gap.
+    ev.skipped.push(render::SkippedOut {
+        name: context.step.to_string(),
+        reason: "the owned startup step failed before the capture loop; the report holds \
+                 what was captured up to the failure"
+            .to_string(),
+    });
+    ev.skipped.extend(handoff_gaps);
+    // No stop gate ran: quiescence is unproven, never reached.
+    ev.apply_stop_quiescence(render::StopQuiescence {
+        state: render::QuiescenceState::Unproven,
+        post_q_events: false,
+        post_q_discovery: false,
+    });
+    ev.settle_terminal(profile);
+    if let Some(snapshot) = snapshot_opt.as_ref() {
+        render::apply_counter_snapshot(&mut ev, snapshot);
+        render::apply_legacy_gaps(&mut ev, snapshot);
+    }
+    let facts = context.engine.capture_facts();
+    let frame = render::live_scoped(
+        &reports,
+        &ev,
+        Duration::ZERO,
+        &facts.heading(),
+        mode,
+        context.policy,
+        context.scope.kind(),
+        state.mechanisms(),
+    );
+    // The `-o` file is the report when one was given; the stdout frame is
+    // display only then. Without `-o` the frame is the report, so its
+    // write is the seal.
+    let live_display = LiveDisplay::for_capture(true);
+    let mut stdout_open = true;
+    let stdout_result = (|| -> Result<()> {
+        let mut stdout_sink = crate::sink::stdout_sink().map_err(|error| {
+            anyhow::anyhow!("run: opening stdout for the handoff report: {error}")
+        })?;
+        stdout_sink.set_cancel_flag(context.signals.cancel_flag());
+        stdout_sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+            write_stdout(&mut stdout_sink, &mut stdout_open, bytes.as_bytes())?;
+            flush_stdout(&mut stdout_sink, &mut stdout_open)?;
+        }
+        collect_sink_drops(&mut stdout_sink, &mut scheduling, &mut None, Instant::now());
+        Ok(())
+    })();
+    let taken = std::mem::replace(context.out, OutputSink::None);
+    if let OutputSink::Profile(boxed) = taken {
+        let mut out_file: AtomicFile = *boxed;
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let now = fmt_rfc3339(SystemTime::now());
+        let capture = render::CaptureMeta {
+            started: &now,
+            ended: &now,
+            kernel: &kernel,
+            policy: context.policy,
+            scope: context.scope.kind(),
+            caller: target_caller,
+            ring_bytes: resolve_ring_bytes(context.ring_bytes),
+            drain_interval_ms: context.drain.as_millis() as u64,
+        };
+        let j = if profile {
+            render::profile_json(
+                &reports,
+                render::VersionedEvidence::wrap(&ev),
+                &state,
+                &capture,
+            )
+        } else {
+            render::json(&reports, &ev, &capture)
+        };
+        let j = match snapshot_opt.as_ref() {
+            Some(snapshot) => {
+                let j = render::with_counter_snapshot(j, snapshot);
+                render::with_legacy_snapshot(j, snapshot)
+            }
+            None => j,
+        };
+        write_json_report(out_file.file(), &j)?;
+        out_file.commit().map_err(anyhow::Error::msg)?;
+        // The file is the report; a display-only stdout failure never
+        // fails a sealed file.
+        return Ok(());
+    }
+    // Without `-o` the frame is the report.
+    stdout_result
+}
+
+/// Seals a trace-kind handoff report: the `-o` stream begins (or the
+/// report continues stdout-only when the stream cannot begin), the
+/// header emits, the EVENTS ring drains best-effort with each line
+/// streamed as it arrives, and the terminal COUNT and EVIDENCE seal
+/// PARTIAL with the failed step named and quiescence unproven.
+/// Streamed lines are the report; a terminal failure still returns the
+/// lines' error beside the handoff error.
+fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
+    let taken = std::mem::replace(context.out, OutputSink::None);
+    let mut out_file: Option<std::io::BufWriter<std::fs::File>> = match taken {
+        OutputSink::Trace(stream) => match stream.begin() {
+            Ok(file) => Some(buffered_sink(file)),
+            Err(error) => {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: creating trace output failed; continuing the handoff trace on \
+                     stdout: {}",
+                    crate::render::escape_controls(&error),
+                ));
+                None
+            }
+        },
+        OutputSink::None => None,
+        OutputSink::Profile(_) => {
+            return Err(anyhow::anyhow!(
+                "run: handoff report kind mismatch (profile sink for a trace)"
+            ));
+        }
+    };
+    // A dead stdout at creation still routes through the shared emitter
+    // with a fallback null sink held closed, so the file-only path keeps
+    // the byte-exact terminal accounting below.
+    let (mut stdout_sink, mut stdout_open) = match crate::sink::stdout_sink() {
+        Ok(sink) => (sink, true),
+        Err(error) => {
+            if out_file.is_none() {
+                return Err(
+                    anyhow::Error::new(error).context("run: opening stdout for the handoff trace")
+                );
+            }
+            emit_capture_diagnostic(&format!(
+                "p11scope: stdout unavailable for the handoff trace; continuing file-only: {}",
+                crate::render::escape_controls(&error.to_string()),
+            ));
+            let null = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
+            let fallback = crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(null))
+                .map_err(|error| anyhow::anyhow!("run: opening stdout fallback: {error}"))?;
+            (fallback, false)
+        }
+    };
+    stdout_sink.set_cancel_flag(context.signals.cancel_flag());
+    stdout_sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+    let header = trace::header(context.policy, context.engine.plan());
+    if let Err(error) = emit_trace_line(&header, &mut stdout_sink, &mut stdout_open, &mut out_file)
+    {
+        if out_file.is_some() {
+            stdout_open = false;
+            emit_trace_line(&header, &mut stdout_sink, &mut stdout_open, &mut out_file)?;
+        } else {
+            return Err(error);
+        }
+    }
+    let trace_limit = resolve_trace_max_events(context.max_events);
+    let mut remaining = Some(trace_limit);
+    let domain = context.session.events_domain();
+    let mut state =
+        semantics::State::for_capture(context.engine.plan(), context.policy, domain.clone());
+    let mut tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut tracer = trace::Tracer::new(context.engine.plan());
+    if let Some(command) = context.owned_command {
+        tracer.set_owned_command(context.owned.pid, command.to_string());
+    }
+    let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_resource(crate::timing::ResourcePoint::Start, context.resource_start);
+    scheduling.note_attach(context.session.attach_mono_ns());
+    let mut malformed_records: u64 = 0;
+    let mut last_reported_loss: u64 = 0;
+    let mut handoff_gaps: Vec<render::SkippedOut> = Vec::new();
+    if let Err(error) = report_trace_loss(
+        context.session,
+        &mut last_reported_loss,
+        &mut stdout_sink,
+        &mut stdout_open,
+        &mut out_file,
+    ) {
+        emit_capture_diagnostic(&format!(
+            "p11scope: trace loss report failed; continuing the handoff trace: {}",
+            crate::render::escape_controls(&format!("{error:#}")),
+        ));
+        handoff_gaps.push(render::SkippedOut {
+            name: "ring loss report".to_string(),
+            reason: "the ring-loss line could not be emitted; loss is unproven".to_string(),
+        });
+    }
+    match drain_trace_events(
+        &mut *context.session,
+        &mut remaining,
+        &mut state,
+        &mut tracker,
+        context.scope,
+        &mut tracer,
+        None,
+        &mut stdout_sink,
+        &mut stdout_open,
+        &mut out_file,
+        &mut scheduling,
+        &mut || false,
+        EventsDrainBound::Terminal,
+    ) {
+        Ok(malformed) => {
+            malformed_records = malformed_records.saturating_add(malformed);
+        }
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal event drain failed; sealing the handoff trace from \
+                 partial state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: "events drain".to_string(),
+                reason: "the terminal event drain failed; calls past the failure are \
+                         unproven"
+                    .to_string(),
+            });
+        }
+    }
+    collect_sink_drops(&mut stdout_sink, &mut scheduling, &mut None, Instant::now());
+    if let Err(error) = context.engine.pinned().check_unchanged() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: provider identity recheck failed; sealing the handoff trace from \
+             partial state: {}",
+            crate::render::escape_controls(&error),
+        ));
+        handoff_gaps.push(render::SkippedOut {
+            name: "provider identity".to_string(),
+            reason: "the terminal identity recheck failed; provider sameness is unproven"
+                .to_string(),
+        });
+    }
+    let reports = match metrics::read(context.session, context.engine.plan()) {
+        Ok(reports) => reports,
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal counter read failed; sealing the handoff trace from \
+                 partial state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: "counter collection".to_string(),
+                reason: "the terminal counter read failed; counts are unproven".to_string(),
+            });
+            Vec::new()
+        }
+    };
+    let kernel_evidence = match metrics::kernel_evidence(context.session) {
+        Ok(kernel) => kernel,
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal kernel evidence read failed; sealing the handoff trace \
+                 from partial state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: "kernel evidence".to_string(),
+                reason: "the terminal kernel evidence read failed; loss is unproven".to_string(),
+            });
+            metrics::KernelEvidence::default()
+        }
+    };
+    let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+        owned_prearm_hold(Some(&*context.owned));
+    finish_prearm_terminal(
+        &mut *context.engine,
+        &*context.session,
+        context.session.attach_failures(),
+        CaptureEnd::Error,
+        &reports,
+        &kernel_evidence,
+        malformed_records,
+        None,
+        prearm_hold,
+        prearm_owned_run,
+        prearm_release_ns,
+    );
+    context.engine.settle_terminal_drain();
+    scheduling.note_terminal(
+        kernel_evidence.ring_loss,
+        context.engine.capture_facts().discovery_losses()[0],
+    );
+    scheduling.sync_discovery_deferrals(context.engine);
+    scheduling.sync_engine_stages(context.engine);
+    scheduling.sync_newcomer_stats(context.engine, crate::attach::monotonic_ns());
+    scheduling.sync_tail_stats(context.engine);
+    let capture_tracking_degraded = initial_tracking_evidence(
+        context.scope,
+        context
+            .session
+            .process_creation_tracking_unavailable()
+            .is_some(),
+        context.session.lifecycle_tracking_unavailable().is_some(),
+    );
+    let mut ev = evidence_for(
+        context.engine,
+        context.engine.capture_facts(),
+        context.session.attached_probes(),
+        context.session.dynamic_per_offset_attached(),
+        context.session.static_multi_attached() || context.session.dynamic_multi_attached(),
+        context.session.attach_backend_evidence(),
+        context.session.object_capture_evidence(),
+        context.session.attach_failures(),
+        &reports,
+        kernel_evidence,
+        tracker.evidence(),
+        malformed_records,
+        &state,
+        context.engine.pinned().provider_changed(),
+        true,
+        context.owned.coordinator.counters(),
+        context.owned.coordinator.engine_incomplete_retirements(),
+        Some(context.owned.still_running),
+        capture_tracking_degraded,
+        scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+        context.uretprobe_override.clone(),
+        context.owned.still_running.then_some(context.owned.pid),
+        None,
+        context.session.unpublished_mechanisms(),
+    );
+    ev.stdout_data_sink = out_file.is_none();
+    ev.trace_truncated = remaining == Some(0);
+    ev.skipped.push(render::SkippedOut {
+        name: context.step.to_string(),
+        reason: "the owned startup step failed before the capture loop; the trace holds \
+                 what was captured up to the failure"
+            .to_string(),
+    });
+    ev.skipped.extend(handoff_gaps);
+    ev.apply_stop_quiescence(render::StopQuiescence {
+        state: render::QuiescenceState::Unproven,
+        post_q_events: false,
+        post_q_discovery: false,
+    });
+    ev.settle_terminal(true);
+    if malformed_records > 0 {
+        let _ = crate::sink::try_stderr_line(&format!(
+            "p11scope: {malformed_records} malformed ring-buffer records discarded this capture"
+        ));
+    }
+    emit_trace_terminal_accounted(
+        &mut ev,
+        context.policy,
+        trace_limit,
+        context.max_events.is_some(),
+        &reports,
+        &tracer,
+        &mut scheduling,
+        &mut stdout_sink,
+        &mut stdout_open,
+        &mut out_file,
+        crate::cli::text_verbosity(),
+    )?;
+    if let Some(file) = out_file.as_mut() {
+        file.flush()?;
+    }
+    Ok(())
 }
 
 fn finish_capture_loop(
@@ -5451,7 +6173,7 @@ fn run_owned_inner_with_host(
     // signalled `always` failure can be named an interruption, not a refusal.
     // Before the attach, and before the child crosses its barrier: a bad `-o`
     // path must never cost a released child or a loaded session.
-    let out = OutputSink::open(args.kind, args.out.as_deref())
+    let mut out = OutputSink::open(args.kind, args.out.as_deref())
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     // 7.10b: arm extensive mode before the session publishes its
@@ -5542,17 +6264,45 @@ fn run_owned_inner_with_host(
             // collects unpaused with a pause_unavailable gap instead of
             // aborting before the capture. Lifecycle still aborts.
             if error.lifecycle() {
-                return Err(finish_capture_error(
+                return Err(finish_owned_handoff_error(
                     pause_failure(error),
+                    HANDOFF_STEP_PAUSE_ARM,
                     &mut engine,
                     &mut session,
-                    Some(&mut owned),
+                    &mut owned,
                     &stop,
+                    &mut out,
+                    args.kind,
+                    policy,
+                    &scope,
+                    args.ring_bytes,
+                    resolve_drain_cadence(args.kind, args.drain_interval),
+                    args.max_events,
+                    uretprobe_override.clone(),
+                    Some(&owned_command),
+                    resource_start,
                 ));
             }
             let always = error.required();
             retire_pause_policy(error).map_err(|error| {
-                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
+                finish_owned_handoff_error(
+                    error,
+                    HANDOFF_STEP_PAUSE_ARM,
+                    &mut engine,
+                    &mut session,
+                    &mut owned,
+                    &stop,
+                    &mut out,
+                    args.kind,
+                    policy,
+                    &scope,
+                    args.ring_bytes,
+                    resolve_drain_cadence(args.kind, args.drain_interval),
+                    args.max_events,
+                    uretprobe_override.clone(),
+                    Some(&owned_command),
+                    resource_start,
+                )
             })?;
             if always {
                 owned.coordinator.note_unavailable();
@@ -5569,12 +6319,23 @@ fn run_owned_inner_with_host(
         })
         .map_err(|failure| anyhow!("run: {failure}"));
     if let Err(error) = release {
-        return Err(finish_capture_error(
+        return Err(finish_owned_handoff_error(
             error,
+            HANDOFF_STEP_EXEC,
             &mut engine,
             &mut session,
-            Some(&mut owned),
+            &mut owned,
             &stop,
+            &mut out,
+            args.kind,
+            policy,
+            &scope,
+            args.ring_bytes,
+            resolve_drain_cadence(args.kind, args.drain_interval),
+            args.max_events,
+            uretprobe_override.clone(),
+            Some(&owned_command),
+            resource_start,
         ));
     }
     owned.prearm_release_ns = owned.child.as_ref().and_then(|child| child.release_ns());
@@ -5588,12 +6349,23 @@ fn run_owned_inner_with_host(
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         let revalidated = post_release_pass(&mut owned.coordinator, &mut io);
         if let Err(error) = revalidated {
-            return Err(finish_capture_error(
+            return Err(finish_owned_handoff_error(
                 error,
+                HANDOFF_STEP_POST_RELEASE,
                 &mut engine,
                 &mut session,
-                Some(&mut owned),
+                &mut owned,
                 &stop,
+                &mut out,
+                args.kind,
+                policy,
+                &scope,
+                args.ring_bytes,
+                resolve_drain_cadence(args.kind, args.drain_interval),
+                args.max_events,
+                uretprobe_override.clone(),
+                Some(&owned_command),
+                resource_start,
             ));
         }
     }
@@ -25300,14 +26072,15 @@ int main(int argc, char **argv) {
         assert_eq!(piped.frame_bytes(frame, true).as_deref(), Some(frame));
     }
 
-    /// Both profile frame sites go through `LiveDisplay`; nothing else in
-    /// the capture loops writes the clear-screen escape.
+    /// All three profile frame sites (tick, terminal, owned-handoff
+    /// partial) go through `LiveDisplay`; nothing else in the capture
+    /// loops writes the clear-screen escape.
     #[test]
     fn every_profile_frame_goes_through_the_live_display() {
         let source = include_str!("run.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         assert_eq!(production.matches("\\x1b[2J").count(), 1);
-        assert_eq!(production.matches("live_display.frame_bytes(").count(), 2);
+        assert_eq!(production.matches("live_display.frame_bytes(").count(), 3);
     }
 
     /// Sol-full F3: no production capture/discovery diagnostic may use a

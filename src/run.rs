@@ -15975,7 +15975,6 @@ mod tests {
             signals: &signals,
         };
         let handed = pending_stop_pass(&mut coordinator, &mut io);
-        drop(io);
         let (plan_changed, paused) =
             handed.expect("a stop during the hold ends the tick, not the capture");
         assert!(!paused, "the cancelled cycle serviced nothing");

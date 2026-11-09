@@ -247,6 +247,73 @@ class ReleaseNoticesTests(unittest.TestCase):
         config = self.mod.make_config(metadata, self.root, recipe)
         self.assertIn('[example.clarify]\nlicense = "Apache-2.0 OR MIT"\n', config)
 
+    def test_clarification_invalid_versions_are_rejected(self):
+        recipe, metadata, _bodies = self.clarification_fixture()
+        broken = [None, [], "1.0", ["1.0"], [{"version": "1.0"}],
+                  [{"version": "1.0", "files": [], "extra": True}],
+                  [{"version": "1.0", "files": "one.txt"}]]
+        for versions in broken:
+            with self.subTest(versions=versions):
+                recipe["clarifications"]["example"]["versions"] = versions
+                with self.assertRaisesRegex(self.mod.NoticeError, "versions are invalid"):
+                    self.mod.make_config(metadata, self.root, recipe)
+        del recipe["clarifications"]["example"]["versions"]
+        with self.assertRaisesRegex(self.mod.NoticeError, "versions are invalid"):
+            self.mod.make_config(metadata, self.root, recipe)
+
+    def test_clarification_duplicated_versions_are_rejected(self):
+        recipe, metadata, _bodies = self.clarification_fixture()
+        recipe["clarifications"]["example"]["versions"][1]["version"] = "1.0"
+        with self.assertRaisesRegex(self.mod.NoticeError, "versions are duplicated"):
+            self.mod.make_config(metadata, self.root, recipe)
+
+    def test_clarification_file_pinned_twice_is_rejected(self):
+        recipe, metadata, _bodies = self.clarification_fixture()
+        recipe["clarifications"]["example"]["versions"][1]["files"] = [
+            {"license": "MIT", "path": "one.txt"}]
+        with self.assertRaisesRegex(self.mod.NoticeError, "file pinned twice"):
+            self.mod.make_config(metadata, self.root, recipe)
+
+    def test_generate_rejects_invalid_feature_disabled_pins(self):
+        repo = self.root / "repo"
+        (repo / "third-party/licenses").mkdir(parents=True)
+        (repo / ".release-rust-version").write_text("1.99.1\n")
+        private = self.root / "private"
+        private.mkdir(mode=0o700)
+        about = self.root / "cargo-about"
+        real_run = self.mod.run
+
+        def fake_run(argv, cwd, env=None):
+            if argv[0] == str(about):
+                return "cargo-about 0.9.2"
+            return real_run(argv, cwd, env)
+
+        def attempt(recipe):
+            (repo / "third-party/licenses/sources.json").write_text(json.dumps(recipe))
+            with mock.patch.object(self.mod, "run", side_effect=fake_run), \
+                    mock.patch.object(self.mod, "source_identity",
+                                      return_value={"head": "h", "tree": "t"}):
+                self.mod.generate(repo, about, [], private / "out")
+
+        broken = [None, "host", {"host": {}}, {"host": {}, "bpf": {}, "extra": {}},
+                  {"host": [], "bpf": {}}, {"host": {"id": 7}, "bpf": {}},
+                  {"host": {"id": ""}, "bpf": {}}, {"host": {"id": "  "}, "bpf": {}}]
+        for disabled in broken:
+            with self.subTest(disabled=disabled):
+                recipe = {"schema_version": 3, "feature_disabled": disabled}
+                with self.assertRaisesRegex(self.mod.NoticeError, "feature-disabled pins are invalid"):
+                    attempt(recipe)
+        recipe = {"schema_version": 3, "feature_disabled": {"host": {}, "bpf": {}},
+                  "files": {}, "toolchains": []}
+        del recipe["feature_disabled"]
+        with self.assertRaisesRegex(self.mod.NoticeError, "feature-disabled pins are invalid"):
+            attempt(recipe)
+        # A well-shaped pin table passes the gate and fails later at
+        # toolchain inspection, proving the gate let it through.
+        recipe["feature_disabled"] = {"host": {"some-id": "1.0"}, "bpf": {}}
+        with self.assertRaisesRegex(self.mod.NoticeError, "current release compiler"):
+            attempt(recipe)
+
     def test_accepted_licenses_cover_mit_no_attribution(self):
         # MIT-0 (MIT minus attribution, as declared by borrow-or-share in
         # the jsonschema dev-tree) is accepted alongside MIT; dropping it

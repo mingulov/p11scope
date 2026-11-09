@@ -22828,6 +22828,36 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Every rendered profile frame reclaims its transient heap. A
+    /// `--system` frame pins module files and buffers the match, like a
+    /// classic inventory pass; without the release glibc retains the freed
+    /// peak and long profile captures blow the soak RSS bound. Pinned as
+    /// source text like the frame-decision test above: the real loop needs
+    /// attached BPF, which unit tests cannot drive.
+    #[test]
+    fn rendered_profile_frames_reclaim_their_transient_heap() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let render = profile
+            .split_once("if tick_frame.render {")
+            .unwrap()
+            .1
+            .split_once("request_profile_recovery_frame(")
+            .unwrap()
+            .0;
+        assert_eq!(
+            render.matches("reclaim_pass_heap()").count(),
+            1,
+            "capture_profile reclaims the transient heap once per rendered frame"
+        );
+    }
+
     /// Requested-wait margin at the default ring: one full idle timeout
     /// admits 2 ms x 128k/s = 256 records, far under the default ring.
     /// This bounds the REQUESTED wait only — it is not a scheduling

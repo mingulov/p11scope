@@ -1579,6 +1579,21 @@ fn setflags_twins_fall_back_when_the_primary_is_unusable() {
     std::fs::remove_dir_all(&twins).unwrap();
 }
 
+/// Two fallback selections must not share one directory: N2 and the
+/// selection test fall back concurrently on runners without SETFLAGS
+/// support, and a shared dir lets either test wipe the other's twins.
+#[test]
+fn setflags_fallback_dirs_are_unique_per_caller() {
+    let dir = scratch("isolation-setflags-uniqueness");
+    let first = setflags_twin_dir(&dir.join("no-such-first"));
+    let second = setflags_twin_dir(&dir.join("no-such-second"));
+    assert_ne!(
+        first, second,
+        "each caller needs its own fallback dir, or they race"
+    );
+    std::fs::remove_dir_all(&second).unwrap();
+}
+
 /// Whether `dir` lives on btrfs (statfs magic), for the fs-gated cell.
 fn dir_is_btrfs(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;

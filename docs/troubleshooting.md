@@ -105,7 +105,7 @@ attempt fails in the early load branch with the actionable hint
 (`UNSUPPORTED_ENV_HINT` in `src/attach.rs`):
 
 ```
-hint: this usually means the environment cannot load or attach BPF programs at all — missing capabilities from the minimal live-capture set (CAP_BPF, CAP_CHECKPOINT_RESTORE, CAP_DAC_READ_SEARCH, CAP_PERFMON, CAP_SYS_PTRACE), a kernel lockdown mode, an LSM policy or a container seccomp profile, unavailable required BPF features, missing BTF (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See docs/notes/phase5-unsupported.md for what each looks like when observed. Run `p11scope doctor` to see which cause applies on this host.
+hint: this usually means the environment cannot load or attach BPF programs at all — missing capabilities from the minimal live-capture set (CAP_BPF, CAP_CHECKPOINT_RESTORE, CAP_DAC_READ_SEARCH, CAP_PERFMON, CAP_SYS_PTRACE), kernel lockdown, an LSM policy or container seccomp profile, missing BPF features or BTF (/sys/kernel/btf/vmlinux), or a strict kernel.perf_event_paranoid sysctl. See docs/notes/phase5-unsupported.md; `p11scope doctor` names the cause.
 ```
 
 Why: the BPF loader needs kernel BTF (`CONFIG_DEBUG_INFO_BTF` in the

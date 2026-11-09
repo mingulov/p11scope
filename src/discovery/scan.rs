@@ -11451,6 +11451,7 @@ mod tests {
                 error.contains("opening object within retained target root"),
                 "unexpected primitive error: {error}"
             );
+            Ok::<(), String>(())
         })
         .unwrap();
         let hooks = HookRegistry::builtin();
@@ -11546,11 +11547,16 @@ mod tests {
             "unopenable foreign-root objects collapse into one counted gap: {:#?}",
             outcome.skipped()
         );
+        let root = subject
+            .dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(
             retained[0].reason.contains("mapped objects unopenable")
-                && retained[0]
-                    .reason
-                    .contains(&subject.dir.path().canonicalize().unwrap().to_string_lossy().into_owned()),
+                && retained[0].reason.contains(root.as_str()),
             "the collapsed gap names its count and target root: {:#?}",
             retained[0]
         );

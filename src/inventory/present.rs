@@ -2333,8 +2333,11 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     }
     let mut ranked: Vec<((String, String), (usize, bool))> = groups.into_iter().collect();
     ranked.sort_by(|left, right| {
+        // `Option` orders `None` below every `Some`, so a missing
+        // rank maps to last place explicitly.
         count_explaining_rank(&left.0.0)
-            .cmp(&count_explaining_rank(&right.0.0))
+            .unwrap_or(u8::MAX)
+            .cmp(&count_explaining_rank(&right.0.0).unwrap_or(u8::MAX))
             .then_with(|| right.1.1.cmp(&left.1.1))
             .then_with(|| right.1.0.cmp(&left.1.0))
             .then_with(|| left.0.cmp(&right.0))

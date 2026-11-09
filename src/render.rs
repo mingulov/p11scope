@@ -15185,6 +15185,24 @@ pub(crate) mod tests {
         assert_eq!(CaptureFacts::default().heading(), "no modules discovered");
     }
 
+    /// The empty heading must not contradict the refused-provider line:
+    /// zero accepted modules with refused providers reads as none
+    /// attached with the found count, not "no modules discovered".
+    #[test]
+    fn the_empty_heading_names_refused_providers_instead_of_none_found() {
+        let facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules_skipped: vec![SkippedOut {
+                    name: "/opt/p11.so".into(),
+                    reason: "whole refusal: needs 12 slots, 4 free".into(),
+                }],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(facts.heading(), "none attached (1 found, refused)");
+    }
+
     #[test]
     fn headings_and_live_frames_escape_module_path_controls() {
         let mut facts = CaptureFacts {

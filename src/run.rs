@@ -24080,6 +24080,22 @@ mod tests {
         assert!(hint.contains("p11scope inspect --pid 42"), "{hint}");
     }
 
+    /// A discovery stop (ceiling, deadline, unavailable maps) is not a
+    /// mapped file: the empty-plan line names the stop, never a file
+    /// count for it.
+    #[test]
+    fn an_empty_plan_with_a_discovery_stop_names_the_stop_not_files() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.to_string(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(!hint.contains("mapped file"), "{hint}");
+        assert!(hint.contains("capture discovery"), "{hint}");
+    }
+
     /// P1-3 twin: a refused whole module is a confirmed provider by
     /// construction (it was admitted, then refused), so it counts as
     /// found-but-refused too.

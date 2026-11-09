@@ -3652,6 +3652,38 @@ fn concise_limits_line_uses_singular_nouns_for_one() {
     assert!(!limits.contains("edges"), "{limits}");
 }
 
+/// A scan-only inventory (kept first pass, scan fallback) records
+/// endpoints without attaching any: the limits line says recorded
+/// with 0 attached, never "watched".
+#[test]
+fn concise_limits_line_says_recorded_when_no_endpoint_attached() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-limits-scan-only",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 74_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
+    presentation.usage_feed = false;
+    presentation.budgets.endpoints_occupied = 0;
+    presentation.budgets.inventory_endpoints_occupied = 213;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(
+        limits.contains("213 functions recorded, 0 attached"),
+        "{limits}"
+    );
+    assert!(!limits.contains("watched"), "{limits}");
+}
+
 /// CLI-1: the verbose snapshot keeps the full `Details:` tail and no hint.
 #[test]
 fn verbose_snapshot_keeps_details_without_hint() {

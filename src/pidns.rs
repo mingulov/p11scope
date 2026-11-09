@@ -625,6 +625,22 @@ mod tests {
         }
     }
 
+    /// The nested refusal runs before the found-but-refused line, so it
+    /// must not claim nothing was found: refused providers may still be
+    /// named below. It refuses on countable modules, not found ones.
+    #[test]
+    fn nested_empty_refusal_says_countable_not_missing() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+            .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("no countable modules"), "{text}");
+        assert!(!text.contains("found no PKCS#11 modules"), "{text}");
+    }
+
     #[test]
     fn pid_scope_is_allowed_only_in_the_initial_namespace() {
         assert!(require_numbering_agrees(&with(ObserverPidNs::Initial), "--pid 7").is_ok());

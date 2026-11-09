@@ -4369,7 +4369,14 @@ fn commit_staged_observer_handoff(
         .terminate_and_reap()
         .map(ChildOutcome::Exited)
         .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
-    record_settlement_result(child, settled, exit_code, still_running)
+    let reaped = child.is_reaped();
+    let outcome = record_settlement_result(child, settled, exit_code, still_running);
+    if reaped {
+        // The spent owner must not stay staged: the outer commit would
+        // refuse the reaped child and fail an already-published run.
+        drop(pending.take());
+    }
+    outcome
 }
 
 fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<ChildOutcome> {

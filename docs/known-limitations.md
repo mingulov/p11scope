@@ -100,8 +100,10 @@ was available in the test cache, so 6.9.12 was not run and the
 fixed-filter boundary there stays unverified; 6.7, 6.8, 6.10 and 6.11
 were not run either. Each item below names its measured kernel range.
 The `inventory --system/--cgroup/--pid` rows below predate the scan
-fallback: at `79108a1c7` they refused with the live gate; current
-builds fall back to scan (exit 0) there.
+fallback: at `79108a1c7` `--system`/`--cgroup` refused with the live
+gate while `--pid` already exited 0 with the older `live capture
+refused (...)` reason; current builds fall back to scan (exit 0) on
+all three with the `call counts unavailable on this host` reason.
 
 #### 5.15 and 6.1 refuse live capture
 

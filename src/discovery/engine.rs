@@ -13000,7 +13000,10 @@ impl Engine {
             }
         }
         if broken.is_empty() && tried == new_views.len() {
-            self.pending_rejected_keys = saved_keys;
+            // The caller drops the pass: keep the baseline's fail-closed
+            // rejections for refreshed views queued, as the failed first
+            // build had them, without any trial's.
+            self.pending_rejected_keys = baseline_keys;
             return None;
         }
         let pass = self.inventory_passes;
@@ -24952,6 +24955,9 @@ impl Engine {
         }
         let enumerate_start = crate::attach::monotonic_ns();
         let (pids, mut skipped) = scope_pids(&self.scope);
+        // The walk read every scope member (above the view cap too): only
+        // such a walk proves a held pid left or was reused.
+        let walk_complete = skipped.is_empty();
         let enumerate_end = crate::attach::monotonic_ns();
         let max_scan_pids = self.max_scan_pids;
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
@@ -25089,11 +25095,11 @@ impl Engine {
         // Held-back processes (their own data broke a candidate) wait for
         // their retry pass instead of blocking every later admission; a
         // hold ends when the pid leaves the scope or gets admitted.
-        // Only a complete enumeration proves a pid left or was reused; a
-        // partial walk keeps holds (and their backoff) as they are.
+        // Only a complete walk proves a pid left or was reused; a partial
+        // walk keeps holds (and their backoff) as they are.
         self.held_back.retain(|pid, hold| {
             !known_pids.contains(pid)
-                && (!membership_complete
+                && (!walk_complete
                     || (live.contains(pid)
                         && hold.start_time.is_none_or(|time| {
                             crate::process::process_start_time(*pid).ok() == Some(time)

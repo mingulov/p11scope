@@ -2314,6 +2314,18 @@ impl PauseCoordinator {
     /// Only the run loop's cancelled conversion calls this; every other
     /// lifecycle failure still aborts before any report renders.
     #[must_use]
+    /// A lifecycle failure that ends the run (`--pause always` refusal, or
+    /// any fatal cycle not handed back) closes its open attempt as one
+    /// partial, so the sealed report never reads a refused cycle as a
+    /// confirmed `sigstop` and the counters still add up.
+    pub(crate) fn note_failed_cycle(&mut self) {
+        if self.attempt_open {
+            self.attempt_open = false;
+            self.counters.partial = self.counters.partial.saturating_add(1);
+        }
+        debug_assert!(self.counters.valid());
+    }
+
     pub(crate) fn note_cancelled_cycle(&mut self) -> bool {
         if self.policy != PausePolicy::Auto {
             return false;
@@ -10708,6 +10720,32 @@ mod tests {
         );
     }
 
+    /// A fatal (lifecycle) cycle that is not handed back closes its open
+    /// attempt as one partial under either policy: a refused `always`
+    /// cycle must never leave `attempts` ahead of the lattice and read as
+    /// a confirmed `sigstop`. Idempotent once closed.
+    #[test]
+    fn failed_cycle_closes_its_open_attempt_as_partial() {
+        for policy in [PausePolicy::Always, PausePolicy::Auto] {
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            coordinator.begin_attempt();
+            assert_eq!(
+                coordinator.status(),
+                PauseStatus::Sigstop,
+                "open attempt alone"
+            );
+            coordinator.note_failed_cycle();
+            coordinator.note_failed_cycle();
+            let counters = coordinator.counters();
+            assert_eq!(
+                (counters.attempts, counters.confirmed, counters.partial),
+                (1, 0, 1)
+            );
+            assert!(counters.valid());
+            assert_eq!(coordinator.status(), PauseStatus::Partial, "{policy:?}");
+        }
+    }
+
     /// Arms the SIGINT-while-held hook for one run; disarms on drop so a
     /// run that never holds (or errors first) leaves no armed hook behind.
     /// Privileged cells run `--exact --test-threads=1`.
@@ -10831,13 +10869,20 @@ mod tests {
             always["functions"].as_array().is_some(),
             "the refused run's report carries the function table"
         );
+        let evidence = &always["evidence"];
         assert_eq!(
-            always["completeness"], "PARTIAL",
+            evidence["completeness"], "PARTIAL",
             "a refused required pause is never a complete capture"
         );
-        assert_ne!(
-            always["pause"], "sigstop",
+        assert_eq!(
+            evidence["pause"], "partial",
             "a refused required pause never reads as a confirmed pause"
+        );
+        assert_eq!(evidence["pause_attempts"], 1);
+        assert_eq!(evidence["pause_confirmed"], 0);
+        assert_eq!(
+            evidence["pause_partial"], 1,
+            "the refused cycle counts as one partial attempt"
         );
     }
 

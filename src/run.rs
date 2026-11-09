@@ -6352,6 +6352,9 @@ fn drain_discovery_tick(
                 return Ok((engine.drain_discovery(session)?, false));
             }
             let always = error.required() && !error.lifecycle();
+            if error.lifecycle() {
+                owned.coordinator.note_failed_cycle();
+            }
             retire_pause_policy(error)?;
             if always {
                 owned.coordinator.note_unavailable();
@@ -6395,6 +6398,9 @@ fn pending_stop_pass(
                 return Ok((io.plan_changed(), false));
             }
             let always = error.required() && !error.lifecycle();
+            if error.lifecycle() {
+                coordinator.note_failed_cycle();
+            }
             retire_pause_policy(error)?;
             if always {
                 coordinator.note_unavailable();
@@ -6446,6 +6452,9 @@ fn post_release_pass(coordinator: &mut PauseCoordinator, io: &mut impl PauseIo) 
             return Ok(());
         }
         let always = error.required() && !error.lifecycle();
+        if error.lifecycle() {
+            coordinator.note_failed_cycle();
+        }
         retire_pause_policy(error)?;
         if always {
             coordinator.note_unavailable();

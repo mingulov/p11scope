@@ -135,7 +135,7 @@ What the catalog proves:
    reproduced Marionette-only, so no Playwright/Juggler involvement;
    no-login controls navigate fine). A sign-positive Firefox cell
    therefore also needs a SoftHSM build without that crash.
-2. **`p11scope run` + Chromium aborts (SIGABRT, 3/4 launches).** First
+2. **`p11scope run` + Chromium aborted with a deep `TMPDIR` (SIGABRT).** First
    attributed to the loader hooks during Chromium's spawn storm. On
    2026-11-09 the abort was reproduced only with a deep `TMPDIR`: Chromium
    aborts by itself ("Socket path too long") when its SingletonSocket path

@@ -93,7 +93,8 @@ def normalize_report(report, metadata, root, inputs, feature_disabled=frozenset(
             continue
         # Cargo accepts this historical spelling; cargo-about canonicalizes it.
         # This exact alias is not a general SPDX parser or a license selection.
-        canonical = {"MIT/Apache-2.0": "MIT OR Apache-2.0"}.get(package["license"], package["license"])
+        canonical = {"MIT/Apache-2.0": "MIT OR Apache-2.0",
+                     "Apache-2.0/MIT": "Apache-2.0 OR MIT"}.get(package["license"], package["license"])
         if actual[ident]["license"] != canonical:
             raise NoticeError(f"declared license expression changed: {package['name']}")
         normalized[ident] = package_id(package, root)

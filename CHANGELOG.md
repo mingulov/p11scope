@@ -52,6 +52,13 @@ versioned separately and are opaque, exact dispatch keys.
 - A stop that lands inside an active `auto` pause cycle now ends the
   run by signal with its report instead of a `pause coordination
   cancelled` error; the cancelled attempt counts one partial.
+- Empty captures explain themselves instead of showing a bare empty
+  view: the concise gaps block ranks count-explaining gaps first, the
+  limits line says "recorded, 0 attached" for scan-only inventories,
+  and discovery stops read as discovery events, never file counts.
+- A stopped pass-0 collection is kept as scan-only inventory under
+  `--pid`/`--system` (modules and callers shown, counts not attached)
+  instead of being discarded.
 
 ### Fixed
 
@@ -59,6 +66,13 @@ versioned separately and are opaque, exact dispatch keys.
   zero rows with `not_attached`). <!-- lane: invsys-zero -->
 - stdout/stderr keep working under sudo with the tightened kept
   capability set. <!-- lane: caps-fix -->
+- The empty-report heading names refused providers ("none attached (N
+  found, refused)") instead of claiming "no modules discovered" beside
+  the stderr refusal line; a proxy closure still awaiting publication
+  keeps the nothing-discovered heading.
+- The nested-capture refusal says "no countable modules" instead of
+  "found no PKCS#11 modules", and the discovery-stop hint lists stop
+  reasons without repeating the subject.
 
 ## [0.6.0] - 2026-11-06
 

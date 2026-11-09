@@ -64,7 +64,10 @@ modules that owned them — and the ordinary exit is not itself a discovery loss
 a reconciliation, or a reason to drop history. The same rule governs the live
 and terminal on-screen headings: they name the providers this capture accepted,
 never the ones currently mapped, so "no modules discovered" can only mean a
-capture that never accepted one.
+capture that never accepted one. When refused providers were found but none
+attached, the heading reads "none attached (N found, refused)"; a proxy
+closure still awaiting publication reads like nothing mapped yet, so the
+heading stays "no modules discovered" for it.
 
 A consumer that needs to know what is live now must observe now; this document
 answers what was observed, not what remains. `evidence.active_slots` is the one

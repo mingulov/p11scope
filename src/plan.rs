@@ -2117,6 +2117,9 @@ impl AttachPlan {
         }
 
         for slot in &rebuilt.slots {
+            if !rebuilt.is_active(slot.index) {
+                continue;
+            }
             let key = AttachKey::of(slot);
             if let Some(position) = self.slot_by_key.get(&key).copied() {
                 let old = slots[position].clone();
@@ -2227,6 +2230,9 @@ impl AttachPlan {
             }
         }
         for slot in &rebuilt.slots {
+            if !rebuilt.is_active(slot.index) {
+                continue;
+            }
             for module in &slot.module_ids {
                 if !ids.contains(module) {
                     return Err(format!(
@@ -2243,7 +2249,10 @@ impl AttachPlan {
         let additions = rebuilt
             .slots
             .iter()
-            .filter(|slot| !self.slot_by_key.contains_key(&AttachKey::of(slot)))
+            .filter(|slot| {
+                rebuilt.is_active(slot.index)
+                    && !self.slot_by_key.contains_key(&AttachKey::of(slot))
+            })
             .count();
         self.admission_policy
             .checked_required(self.slots.len(), additions)

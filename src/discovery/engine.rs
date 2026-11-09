@@ -1999,7 +1999,6 @@ fn record_selection_in(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SlotBindingLoss {
     slot: u32,
-    unknown: Vec<plan::ModuleId>,
     dropped: bool,
 }
 
@@ -2137,28 +2136,26 @@ impl CaptureFacts {
                 continue;
             }
             let mut remapped = Vec::with_capacity(slot.module_ids.len());
-            let mut unknown = Vec::new();
+            let mut has_unknown = false;
             for id in &slot.module_ids {
                 match remap.get(id).copied() {
                     Some(stable) => remapped.push(stable),
-                    None => unknown.push(*id),
+                    None => has_unknown = true,
                 }
             }
-            if unknown.is_empty() {
+            if !has_unknown {
                 let mut slot = slot.clone();
                 slot.module_ids = remapped;
                 remapped_slots.push(slot);
             } else if remapped.is_empty() {
                 losses.push(SlotBindingLoss {
                     slot: slot.index,
-                    unknown,
                     dropped: true,
                 });
                 remapped_slots.push(slot.clone());
             } else {
                 losses.push(SlotBindingLoss {
                     slot: slot.index,
-                    unknown,
                     dropped: false,
                 });
                 let mut slot = slot.clone();

@@ -12,6 +12,8 @@ use p11scope_ebpf_common::{
     PAUSE_REQUESTED,
 };
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -531,6 +533,39 @@ fn clamp_deadline(slot: &mut Option<u64>, candidate: u64) -> u64 {
     let deadline = slot.map_or(candidate, |existing| existing.min(candidate));
     *slot = Some(deadline);
     deadline
+}
+
+/// Test-only hook for the SIGINT-during-hold cell: when armed, the first
+/// proven hold raises SIGINT to the test process — the real signal through
+/// the production stop flag, like `raise_sigint_on_activation` — so the
+/// next cancellation check observes an operator stop during the hold.
+/// One-shot: the raise disarms it. Inert unless a cell arms it.
+#[cfg(test)]
+static TEST_SIGINT_WHILE_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Arms the one-shot SIGINT-while-held hook (the cell's guard disarms it).
+#[cfg(test)]
+pub(crate) fn arm_test_sigint_while_held() {
+    TEST_SIGINT_WHILE_HELD.store(true, Ordering::SeqCst);
+}
+
+/// Disarms the hook without firing.
+#[cfg(test)]
+pub(crate) fn disarm_test_sigint_while_held() {
+    TEST_SIGINT_WHILE_HELD.store(false, Ordering::SeqCst);
+}
+
+/// Fires the armed hook once: a real SIGINT to this process, caught by the
+/// run under test's own stop-flag handler.
+#[cfg(test)]
+fn raise_test_sigint_while_held() {
+    if TEST_SIGINT_WHILE_HELD.swap(false, Ordering::SeqCst) {
+        // SAFETY: raising SIGINT to self; the cell arms this only around a
+        // `run_owned` that installed its stop-flag handler first.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+    }
 }
 
 impl PauseCoordinator {
@@ -1186,6 +1221,8 @@ impl PauseCoordinator {
         {
             return self.fail_cycle(io, "stopped snapshots were less than 1 ms apart", false);
         }
+        #[cfg(test)]
+        raise_test_sigint_while_held();
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
@@ -10610,6 +10647,82 @@ mod tests {
         assert!(
             wrapper_total_calls(&never_doc) <= oracle,
             "an unpaused run misses calls, never invents them"
+        );
+    }
+
+    /// Arms the SIGINT-while-held hook for one run; disarms on drop so a
+    /// run that never holds (or errors first) leaves no armed hook behind.
+    /// Privileged cells run `--exact --test-threads=1`.
+    struct SigintWhileHeldGuard;
+
+    impl SigintWhileHeldGuard {
+        fn arm() -> Self {
+            super::arm_test_sigint_while_held();
+            Self
+        }
+    }
+
+    impl Drop for SigintWhileHeldGuard {
+        fn drop(&mut self) {
+            super::disarm_test_sigint_while_held();
+        }
+    }
+
+    /// SIGINT during a held `auto` pause ends the run by signal with its
+    /// report, not with a `pause coordination cancelled` error. The
+    /// one-shot hook raises a real SIGINT at the first proven hold (the
+    /// child is stopped then); the cancelled cycle counts one partial,
+    /// the child is resumed and settled, and the `-o` report is written
+    /// with exit 130.
+    #[test]
+    #[ignore = "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_sigint_during_hold_still_writes_report_lp64() {
+        let dir = wrapper_work_dir("sigint-hold");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        // The audit's first-contact shape: list slots and exit fast.
+        let tool: Vec<std::ffi::OsString> = vec![
+            "/usr/bin/pkcs11-tool".into(),
+            "--module".into(),
+            module.into(),
+            "-L".into(),
+        ];
+        // Default flags: parsed exactly as the operator types them, with
+        // no --pause flag, so the CLI default is what the run exercises.
+        let mut argv: Vec<std::ffi::OsString> = vec![
+            "run".into(),
+            "-o".into(),
+            dir.join("sigint-hold.json").into(),
+            "--".into(),
+        ];
+        argv.extend(tool);
+        let parsed = crate::cli::parse(argv).expect("the default run parses");
+        let crate::cli::Command::Run(args) = parsed else {
+            panic!("expected an owned run");
+        };
+        assert_eq!(args.pause, PausePolicy::Auto, "omission is auto");
+        let _hook = SigintWhileHeldGuard::arm();
+        let outcome =
+            crate::run::run_owned(&args).expect("the stopped run still completes with its report");
+        assert_eq!(outcome.child_exit_code, Some(128 + libc::SIGINT));
+        assert_eq!(outcome.evidence.pause, "partial");
+        assert_eq!(outcome.evidence.pause_attempts, 1);
+        assert_eq!(outcome.evidence.pause_partial, 1);
+        assert_eq!(outcome.evidence.pause_confirmed, 0);
+        assert_eq!(
+            outcome.evidence.pause_confirmed + outcome.evidence.pause_partial,
+            outcome.evidence.pause_attempts,
+            "pause counters do not add up"
+        );
+        assert_eq!(outcome.evidence.completeness, "PARTIAL");
+        let document: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("sigint-hold.json")).expect("report exists"),
+        )
+        .expect("valid JSON");
+        assert!(
+            document["functions"].as_array().is_some(),
+            "the report carries the function table"
         );
     }
 

@@ -947,6 +947,12 @@
     },
     {
       "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_sigint_during_hold_still_writes_report_lp64",
+      "reason": "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
       "path": "discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64",
       "reason": "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
       "cell": "privileged"

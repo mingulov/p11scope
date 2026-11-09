@@ -2192,26 +2192,37 @@ The old bounds are measurements, not a product startup SLA.
 
 - What the user sees: one failing inventory pass no longer aborts the
   capture: the pass's delta is dropped, the earlier committed
-  plan/pins/modules stay, and a `live inventory pass` gap names the
-  dropped pass. Repeats with the same error aggregate into one gap
-  (`passes A-B dropped (Nx): <error>`). The first two consecutive
-  drops keep serviced refresh requests queued for retry; from the
-  third consecutive drop on, serviced requests complete so later
-  ticks can serve other processes — a process whose data keeps
-  breaking the candidate goes stale until a loader event or a poll
-  re-queues it.
-- Kernels/conditions: all kernels; any capture whose tick candidate
-  or apply fails. Transient faults recover on the next tick.
-- Disclosure: the `live inventory pass` gap (concise/`-v`/JSON via the
+  plan/pins/modules stay, and one `live inventory pass` gap names the
+  first dropped pass (`pass N dropped: <error>`). The capture carries
+  exactly one such gap however many passes drop; later drops are
+  counted internally for diagnostics and do not change it. The gap
+  stays for the rest of the capture, even after later passes succeed.
+- Retry and escalation: the first two consecutive dropped ticks keep
+  their serviced refresh requests queued for retry. From the third
+  consecutive dropped tick on, every request serviced in that tick
+  completes without being applied, including requests for unrelated
+  processes, so later ticks can serve other work. Those processes
+  refresh again only on their next loader event, poll or reconcile
+  pass. A tick that completes without dropping resets the count;
+  dropped batch-tail publications do not count toward it.
+- Kernels/conditions: all kernels; any capture whose tick candidate,
+  apply or batch-tail merge fails. Transient faults recover on the next
+  tick.
+- Disclosure: the `live inventory pass` gap (concise/`-v` via the
   existing gap rendering; capture JSON projects it as
-  `discovery subject` / `inventory pass unavailable`), `PARTIAL`
-  coverage while drops stand.
-- Workaround: none needed for transient faults. A poison that breaks
-  every candidate regardless of its inputs (committed-state
-  corruption, not one process's data) still stalls tick commits; the
-  capture runs to its report with the aggregated gap and the last
-  committed state.
-- Planned: none; this is the intended degradation policy.
+  `discovery subject` / `discovery unavailable`) and `PARTIAL` coverage
+  for the rest of the capture.
+- Not unblocked: a not-yet-admitted process whose own data breaks the
+  candidate is offered again on every tick, so every later tick drops
+  and no new process is admitted for the rest of the capture; already
+  admitted processes keep their last committed state. The same holds
+  for a poison that breaks every candidate regardless of its inputs
+  (committed-state corruption). The capture still runs to its report
+  with the one gap and the last committed state.
+- Workaround: none needed for transient faults; restart the capture
+  after a persistent failure.
+- Planned: v0.7.x (hold back the breaking newcomer with its own counted
+  gap instead of dropping every later tick).
 
 ### PID-scope coverage after leader exit or exec stays Unknown (DR-C3-2)
 

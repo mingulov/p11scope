@@ -15384,8 +15384,10 @@ impl Engine {
         // the new generation before release. The async worker round-trip
         // would park the tick incomplete and release the pause first,
         // losing the new generation's startup records.
-        let owned_only =
-            !selected.is_empty() && selected.iter().all(|slot| self.slot_owned_by_run(slot));
+        let owned_only = !selected.is_empty()
+            && selected
+                .iter()
+                .all(|slot| self.slot_owned_by_run(slot, &candidate));
         let detach_slots_start = crate::attach::monotonic_ns();
         #[cfg(feature = "h6-reexec-diagnostic")]
         let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
@@ -20496,6 +20498,14 @@ impl Engine {
     /// owned run child's current view. Slots no claimed module maps fail
     /// closed to the ordinary async global path.
     ///
+    /// Both the committed modules and the candidate's modules count: the
+    /// candidate is what this same apply commits, and the first scan after
+    /// pre-arm introduces the owned child's module in the very candidate
+    /// that retires the static pre-arm slots (static -> exact transition).
+    /// Judging only the committed set (still empty then) sent that retire
+    /// to the async worker, parked the pause tick incomplete and released
+    /// the owned child before attach.
+    ///
     /// Lane-A (pre-6.8 overlay) split: the pre-arm pin and the scanned
     /// identity are distinct pins over identical bytes, and only the
     /// scanned identity lands in `entry_objects`. A retiring static slot
@@ -20503,26 +20513,27 @@ impl Engine {
     /// same; matching it by digest keeps the owned-only retire on the
     /// synchronous path so the refresh tick still completes inside the
     /// pause. An empty digest never matches: unhashed pins fail closed.
-    fn slot_owned_by_run(&self, slot: &plan::Slot) -> bool {
-        self.modules.iter().any(|module| {
+    fn slot_owned_by_run(&self, slot: &plan::Slot, candidate: &LiveCandidate) -> bool {
+        // Pin ids are shared between the committed and candidate pin sets
+        // (the candidate extends the committed one), but on the split the
+        // pre-arm pin and the scanned pin may each be known to only one of
+        // them: resolve every digest from either.
+        let digest = |id: PinnedObjectId| {
+            candidate
+                .pinned
+                .summary(id)
+                .or_else(|| self.pinned.summary(id))
+                .map(|summary| summary.sha256)
+                .filter(|sha256| !sha256.is_empty())
+        };
+        let slot_digest = digest(slot.object);
+        self.modules.iter().chain(&candidate.modules).any(|module| {
             self.owned_run_view(module.scanned.view)
-                && module
-                    .entry_objects
-                    .iter()
-                    .flatten()
-                    .any(|id| *id == slot.object || self.same_pinned_bytes(*id, slot.object))
+                && module.entry_objects.iter().flatten().any(|id| {
+                    *id == slot.object
+                        || slot_digest.is_some_and(|slot_digest| digest(*id) == Some(slot_digest))
+                })
         })
-    }
-
-    /// Whether two pins digest identical bytes. Distinct-pin/same-bytes is
-    /// the lane-A pre-arm/scan split (and the copy-up pair shape); the
-    /// digest is the only same-file key that survives it, since devices
-    /// (and on xino-off overlays, inodes) differ across the split.
-    fn same_pinned_bytes(&self, first: PinnedObjectId, second: PinnedObjectId) -> bool {
-        match (self.pinned.summary(first), self.pinned.summary(second)) {
-            (Some(a), Some(b)) => !a.sha256.is_empty() && a.sha256 == b.sha256,
-            _ => false,
-        }
     }
 
     /// Whether the ownership gate in `arm_loader_or_partial` keeps this view

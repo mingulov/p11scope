@@ -239,7 +239,8 @@ sudo --preserve-env=SOFTHSM2_CONF p11scope run --pause auto -- \
 (The `1234` values are throwaway PINs for this demo token; SoftHSM needs
 at least 4 characters. The config and tokens live in a fresh directory
 under `/var/tmp`, so your own SoftHSM setup is untouched; remove that
-directory when you are done. `sudo` resets the environment first, hence
+directory when you are done, then `unset SOFTHSM2_CONF`. `sudo` resets
+the environment first, hence
 `--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
 
 The 4-step command reference follows; read the concepts after it as needed:

@@ -96,9 +96,10 @@ were not run either. Each item below names its measured kernel range.
 
 #### 5.15 and 6.1 refuse live capture
 
-- What the user sees: every live capture — `profile`, `metrics`,
-  `trace`, `run`, `--system`/`--cgroup` scopes, counter modes and
-  `--select-endpoint` — exits 1 with one line and writes no report:
+- What the user sees: every live capture — `profile` (including
+  `--mode metrics`), `trace`, `run`, `--system`/`--cgroup` scopes,
+  counter modes and `--select-endpoint` — exits 1 with one line and
+  writes no report:
 
   ```
   p11scope: live capture did not start: attaching p11scope's probes failed (Invalid argument); run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.

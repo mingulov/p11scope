@@ -37,7 +37,7 @@ unmeasured. Dropping `--pid=host` or `SYS_PTRACE` refuses, as
 ```sh
 docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
   --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-  ghcr.io/mingulov/p11scope:0.7.0 doctor
+  ghcr.io/mingulov/p11scope:latest doctor
 ```
 
 (On AppArmor hosts add `--security-opt apparmor=unconfined`; on

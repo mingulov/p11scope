@@ -15401,10 +15401,14 @@ impl Engine {
             // already counted exactly, and the terminal drain settles the
             // links. Loud in -v, silent in the report. Anything with a
             // live generation — including a pid reused by a new process —
-            // keeps the loud mark, as does a dead view that still owns a
-            // new attach target: a newcomer that mapped a provider must
-            // never vanish silently.
+            // keeps the loud mark, as does any pending attach target: the
+            // abort defers every target in the delta (a live view's as much
+            // as a dead one's) and loses its module from `attach_gap_ms`,
+            // so a newcomer that mapped a provider must never vanish
+            // silently. Only an empty delta drops nothing.
             if stale_views_all_dead(&outcome.stale_views, &self.views, extra_views)
+                && candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
                 && stale_views_own_no_delta_target(&outcome.stale_views, &candidate)
             {
                 // The mark stays silent but the publication inputs still

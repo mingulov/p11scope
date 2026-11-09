@@ -850,6 +850,12 @@ pub struct Engine {
     /// (1-based over the capture), driving the pass-containment path.
     #[cfg(test)]
     fail_inventory_candidate_call_for_test: Option<u64>,
+    /// Test-only persistent poison: every `inventory_candidate` whose
+    /// refreshed or newly admitted inputs include this pid fails,
+    /// modelling one process whose data breaks the whole-tick
+    /// candidate. Stays armed until cleared.
+    #[cfg(test)]
+    fail_candidate_with_pid_for_test: Option<u32>,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Test-only one-shot: force the next record-path loader scan to
@@ -11056,6 +11062,8 @@ impl Engine {
             inventory_candidate_calls_for_test: 0,
             #[cfg(test)]
             fail_inventory_candidate_call_for_test: None,
+            #[cfg(test)]
+            fail_candidate_with_pid_for_test: None,
             #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
@@ -23406,6 +23414,17 @@ impl Engine {
                 == Some(self.inventory_candidate_calls_for_test)
             {
                 bail!("test-forced candidate failure");
+            }
+            if let Some(poison) = self.fail_candidate_with_pid_for_test {
+                let poisoned = refreshed.iter().any(|(view, _, _)| {
+                    self.views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .is_some_and(|candidate| candidate.pid() == poison)
+                }) || new_views.iter().any(|(view, _, _)| view.pid() == poison);
+                if poisoned {
+                    bail!("test-forced poisoned candidate failure");
+                }
             }
         }
         #[cfg(not(test))]

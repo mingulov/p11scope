@@ -3965,6 +3965,9 @@ pub struct OwnedRunOutcome {
     /// The child this run owned. A handed-back child must be nameable or the
     /// operator cannot find what `run` left alive. Not a rendered field.
     pub child_pid: u32,
+    /// The capture failed and the live child was handed back: an observer
+    /// failure, so the run exits 1.
+    pub error_handoff: bool,
     pub evidence: render::Evidence,
 }
 
@@ -3973,7 +3976,9 @@ impl OwnedRunOutcome {
     /// and a handed-back child are observer success (0); otherwise
     /// the child's own status, as a shell would report it.
     pub fn exit_code(&self) -> i32 {
-        if self.requested_timeout_kill {
+        if self.error_handoff {
+            1
+        } else if self.requested_timeout_kill {
             0
         } else {
             self.child_exit_code.unwrap_or(0)
@@ -3998,6 +4003,10 @@ struct Owned {
     /// committed a handoff: the terminal path prints it once, so the
     /// operator reads the true reason, never a reworded guess.
     handoff_note: Option<String>,
+    /// A capture error ended the run and its live child was handed back:
+    /// the observer failed, so the run exits 1 even though the child
+    /// survives.
+    error_handoff: bool,
     /// The run's own pre-spawn scope start: the claim start the terminal
     /// pre-arm hold composes with the coordinator's proven segment.
     prearm_scope_start_ns: Option<u64>,
@@ -4081,6 +4090,31 @@ fn finish_observation_natural_exit(end: CaptureEnd, observation: Result<bool, St
     end == CaptureEnd::TargetExit && matches!(observation, Ok(true))
 }
 
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // An error return that skipped settlement (a settlement step that
+        // failed before its handoff committed) leaves a started command
+        // running: `OwnedChild`'s drop resumes it and lets it live, so the
+        // operator must still learn its PID.
+        if let Some(note) = self.child.as_ref().and_then(unsettled_child_note) {
+            emit_capture_diagnostic(&note);
+        }
+    }
+}
+
+/// The stderr line for a started command that the run neither reaped nor
+/// handed off, or `None` when there is no such child (never released, a
+/// pre-exec fork the drop kills, already reaped or exited).
+fn unsettled_child_note(child: &OwnedChild) -> Option<String> {
+    (child.exec_confirmed && child.still_running()).then(|| {
+        format!(
+            "p11scope: run ended before settling its command; left live child pid {} \
+             running (still running outside this capture)",
+            child.pid()
+        )
+    })
+}
+
 impl Owned {
     /// Closes the pause epoch and settles the child, *before* any terminal
     /// evidence is built: `child_still_running` is a fact the final document
@@ -4131,6 +4165,7 @@ impl Owned {
             &mut self.still_running,
         )
         .map(|note| {
+            self.error_handoff = end == CaptureEnd::Error && note.is_some();
             self.handoff_note = note;
         });
         // A reaped child is an expected target exit: without the mark, a
@@ -4156,6 +4191,7 @@ fn format_observer_end_handoff_note(end: CaptureEnd, pid: u32) -> String {
     let reason = match end {
         CaptureEnd::Error => "capture failed",
         CaptureEnd::LimitReached => "event budget exhausted",
+        CaptureEnd::DurationExpired => "duration expired but pause cleanup failed",
         other => unreachable!("observer-side settlement reached for {other:?}"),
     };
     format!(
@@ -4164,7 +4200,8 @@ fn format_observer_end_handoff_note(end: CaptureEnd, pid: u32) -> String {
     )
 }
 
-/// Settles an observer-side end (`Error`, `LimitReached`) without killing:
+/// Settles an observer-side end (`Error`, `LimitReached`, or an expired
+/// `--duration` whose pause cleanup failed) without killing:
 /// a stop the operator requested still settles through the signal path so
 /// the forwarded signal reaches the child as today; anything else reaps a
 /// natural exit and hands a live child back running. A pre-exec child is
@@ -4239,8 +4276,17 @@ fn settle_owned_child(
     };
     // Observer-side ends never kill: a capture error or an exhausted event
     // budget hands a live child back running (reaping only a natural exit),
-    // so the observed program outlives the failed capture.
-    if matches!(end, CaptureEnd::Error | CaptureEnd::LimitReached) {
+    // so the observed program outlives the failed capture. A failed pause
+    // cleanup is an observer failure too: without --kill-on-timeout, an
+    // expired duration then settles the same way (resumed, handed back
+    // live, never killed); its handoff claim keeps a racing stop signal
+    // on the signal path.
+    let observer_end = matches!(end, CaptureEnd::Error | CaptureEnd::LimitReached)
+        || (end == CaptureEnd::DurationExpired
+            && !cleanup_ok
+            && !kill_on_timeout
+            && signals.claim_handoff());
+    if observer_end {
         return settle_observer_end_without_kill(
             retained,
             end,
@@ -4251,8 +4297,8 @@ fn settle_owned_child(
             still_running,
         );
     }
-    // An expired `--duration` is the only other end that may hand back a
-    // live child, and only after coordinator cleanup succeeds.
+    // An expired `--duration` with a clean pause cleanup stages its
+    // handoff for the outer commit.
     let can_hand_off = cleanup_ok && end.allows_handoff(kill_on_timeout) && signals.claim_handoff();
     if can_hand_off {
         let outcome = stage_handoff(retained, pending)?;
@@ -4504,9 +4550,13 @@ fn settle_after_signal_with_grace_and(
         .map_err(|error| anyhow!("run: settling after signal: {error}"))
 }
 
-fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
+/// Settles a staged handoff the run could not commit. `Ok(true)` when it
+/// handed the live child back (the stored note then names it), `Ok(false)`
+/// when nothing was staged or the staged child had already exited and was
+/// reaped instead.
+fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<bool> {
     let Some(child) = pending.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
     // A staged child is the observed program, still owed its life: resume
     // a pause-held child and hand it back. Only a child that already
@@ -4514,13 +4564,28 @@ fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
     child.resume_if_stopped();
     if child.hand_off_running().is_ok() {
         pending.take();
-        return Ok(());
+        return Ok(true);
     }
     let mut child = pending.take().expect("pending handoff is present");
     child
         .terminate_and_reap()
-        .map(|_| ())
+        .map(|_| false)
         .map_err(|error| anyhow!("run: aborting pending handoff: {error}"))
+}
+
+/// The error-return settlement after the capture loop: aborts a staged
+/// handoff and names whatever child the run handed back, whether the
+/// abort handed it back just now or an observer-side end committed it
+/// at settlement. A staged child the abort reaped (or failed to settle)
+/// is not handed back, so its stored note is dropped, never printed.
+fn abort_pending_and_name(owned: &mut Owned) -> Result<()> {
+    let had_pending = owned.pending_handoff.is_some();
+    let aborted = abort_pending_handoff(&mut owned.pending_handoff);
+    if had_pending && !matches!(aborted, Ok(true)) {
+        owned.handoff_note = None;
+    }
+    emit_stored_handoff_note(owned);
+    aborted.map(|_| ())
 }
 
 /// The exit status `main` reports for a failed command: 130 when a second
@@ -4640,9 +4705,10 @@ fn combine_detach<T>(terminal: Result<T>, detach: Result<()>) -> Result<T> {
 /// stored when it committed the handoff. Takes the note, so each
 /// committed handoff prints at most once whichever path reaches here
 /// first (an error path, a quiesce-error settle, an error-end loop
-/// settlement or the terminal block). A handoff that is only staged
-/// (a duration expiry awaiting its outer commit) prints nothing yet:
-/// its child is not handed back until that commit succeeds.
+/// settlement, the error-return abort or the terminal block). A handoff
+/// that is only staged (a duration expiry awaiting its outer commit)
+/// prints nothing yet: its child is handed back by that commit or by
+/// the error-return abort, and that site prints the note.
 fn emit_stored_handoff_note(owned: &mut Owned) {
     if let Some(note) = take_committed_handoff_note(&owned.pending_handoff, &mut owned.handoff_note)
     {
@@ -5243,6 +5309,7 @@ fn run_owned_inner_with_host(
         requested_kill: false,
         still_running: false,
         handoff_note: None,
+        error_handoff: false,
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
         run_cgroup,
@@ -5339,13 +5406,11 @@ fn run_owned_inner_with_host(
         args.select_endpoint.as_deref(),
         Some(&owned_command),
     )
-    .map_err(|error| {
-        combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
-    })?;
+    .map_err(|error| combine_handoff_failure(error, abort_pending_and_name(&mut owned)))?;
     if let Err(error) = commit_handoff(&mut owned.pending_handoff) {
         return Err(combine_handoff_failure(
             error,
-            abort_pending_handoff(&mut owned.pending_handoff),
+            abort_pending_and_name(&mut owned),
         ));
     }
     // A signalled death is reported as one. `run` owns this child, so its
@@ -5375,6 +5440,7 @@ fn run_owned_inner_with_host(
         requested_timeout_kill: owned.requested_kill,
         child_still_running: owned.still_running,
         child_pid: owned.pid,
+        error_handoff: owned.error_handoff,
         evidence,
     })
 }
@@ -14991,8 +15057,10 @@ mod tests {
     }
 
     /// A duration handoff is only staged at settlement: no note prints
-    /// until its outer commit, so a later abort can never contradict a
-    /// "handed back" line already on stderr.
+    /// until it is handed back (its outer commit, or an error-return
+    /// abort that hands it back), and an abort that reaps it instead
+    /// drops the note, so stderr never claims a handback that did not
+    /// happen.
     #[test]
     fn a_staged_duration_handoff_prints_nothing_until_committed() {
         let mut child = spawn("/bin/sleep", &["30"]);
@@ -15019,8 +15087,70 @@ mod tests {
         assert!(note.is_some(), "the staged note is stored");
         assert_eq!(take_committed_handoff_note(&pending, &mut note), None);
         assert!(note.is_some(), "the note waits for the commit");
-        // Dropping the staged handoff SIGKILLs and reaps the sleeper.
-        drop(pending.take());
+        pending.take().unwrap().terminate_and_reap().unwrap();
+    }
+
+    /// A staged duration handoff the error path aborts is handed back
+    /// live and reported as such; a staged child that already exited is
+    /// reaped and reported as not handed back.
+    #[test]
+    fn aborting_a_staged_handoff_reports_whether_it_handed_back() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut Some(child), &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        assert!(
+            abort_pending_handoff(&mut pending).unwrap(),
+            "a live child is handed back"
+        );
+        assert!(pending.is_none());
+        // SAFETY: signaling and reaping the exact handed-back child only.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+        assert!(
+            !abort_pending_handoff(&mut pending).unwrap(),
+            "nothing staged"
+        );
+    }
+
+    /// A handed-back child after a capture error is an observer failure:
+    /// exit 1, whatever the child's own (absent) status says.
+    #[test]
+    fn an_error_handoff_exits_one() {
+        let outcome = OwnedRunOutcome {
+            child_exit_code: None,
+            requested_timeout_kill: false,
+            child_still_running: true,
+            child_pid: 4242,
+            error_handoff: true,
+            evidence: render::tests::evidence(),
+        };
+        assert_eq!(outcome.exit_code(), 1);
+    }
+
+    /// A started command the run neither reaped nor handed off is named;
+    /// once reaped it is not.
+    #[test]
+    fn an_unsettled_started_child_is_named() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        wait_until(
+            || child.exec_confirmed || !child.still_running(),
+            "exec never confirmed",
+        );
+        let note = unsettled_child_note(&child).expect("a live started child is named");
+        assert!(note.contains(&format!("pid {pid}")), "{note}");
+        child.terminate_and_reap().unwrap();
+        assert_eq!(unsettled_child_note(&child), None);
     }
 
     /// Every error return after the capture loop names a child it hands
@@ -15041,7 +15171,9 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(
-            after_loop.matches("abort_pending_and_name(&mut owned)").count(),
+            after_loop
+                .matches("abort_pending_and_name(&mut owned)")
+                .count(),
             2,
             "both error closures abort through the naming helper"
         );
@@ -15326,7 +15458,7 @@ mod tests {
 
         let error = combine_handoff_failure(
             anyhow!("terminal failed"),
-            abort_pending_handoff(&mut pending),
+            abort_pending_handoff(&mut pending).map(|_| ()),
         );
         let rendered = format!("{error:#}");
         assert!(rendered.contains("terminal failed"), "{rendered}");
@@ -15379,7 +15511,7 @@ mod tests {
 
         let error = combine_handoff_failure(
             anyhow!("terminal failed"),
-            abort_pending_handoff(&mut pending),
+            abort_pending_handoff(&mut pending).map(|_| ()),
         );
         let rendered = format!("{error:#}");
         assert!(rendered.contains("terminal failed"), "{rendered}");
@@ -15957,6 +16089,7 @@ int main(int argc, char **argv) {
                 requested_timeout_kill,
                 child_still_running: child_exit_code.is_none(),
                 child_pid: 4242,
+                error_handoff: false,
                 evidence: render::tests::evidence(),
             };
         assert_eq!(
@@ -17139,8 +17272,9 @@ int main(int argc, char **argv) {
                         "{case}: a handed-back child is never left stopped"
                     );
                     staged.terminate_and_reap().unwrap();
-                } else if end == CaptureEnd::Error {
-                    // A capture error hands the live child back running,
+                } else if end == CaptureEnd::Error || end == CaptureEnd::DurationExpired {
+                    // A capture error, or an expired duration whose pause
+                    // cleanup failed, hands the live child back running,
                     // never stopped and never killed.
                     assert_eq!(exit_code, None, "{case}");
                     assert!(still_running, "{case}");

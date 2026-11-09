@@ -203,13 +203,6 @@ names the source SHA behind each check the release rounds re-measured.
   for deep scans, `overlay_kernel_unavailable` for sweeps). While a
   caller waits for its turn, its edge reads uncertain and its in-flight
   operations end as unknown.
-- Where every provider file sits on an overlay filesystem (a
-  pure-overlay rootfs, as in the vng test guests), `inventory
-  --cgroup` attaches no modules and reports 0 endpoints: the kernel
-  proof cannot run in scoped collection there, and files it cannot
-  prove are never admitted. Each caller is still listed with its
-  named gap. Proving these files is planned overlay-witness work in
-  0.7.x.
 - Strict speed claims apply only on kernels with working uprobe_multi,
   normally 6.6 and newer: the rate and latency numbers above were
   measured there. Older kernels stay correct with a finite stop but are

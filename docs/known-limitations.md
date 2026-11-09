@@ -844,9 +844,8 @@ or below 236 ms; this excludes the time until the next publication.
 With `--key-operations`, the v0.6.0 measurements in
 [Known limitations in 0.6.0](#known-limitations-in-060) supersede the
 older lane numbers: key operations sustain 6,250 calls/s for 60 s with
-exact rows (plain counts stay exact at 10,000 calls/s), and
-key-operation rows lag their calls by about 1.6-1.9 s p99 in quiet
-runs. The older 1,000 calls/s ceiling describes the pre-integration
+exact rows, and key-operation rows lag their calls by about 1.6-1.9 s
+p99 in quiet runs. The older 1,000 calls/s ceiling describes the pre-integration
 lane, not this release. The `authority_lost` reason is still live: it
 latches after a watchdog trip or disposed staged history and renders
 "per-key tracking stopped" even while exact rows continue beside

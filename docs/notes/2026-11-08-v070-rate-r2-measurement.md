@@ -64,7 +64,7 @@ One `joint-10k-single` cell per rate at true default priority
 | cell | result |
 | --- | --- |
 | 6.25k/60s | exact: calls 375,004 = want, lost 0, settlement p50 16 ms as reported |
-| 10k/60s | lost 271 records, counted (matches bpftool 271); key-operation tracking ended; ~65% of calls unattributed; settlement p50 2.4 s as reported |
+| 10k/60s | calls 599,868 (136 short of want, consistent with ~2 records per call over 271 lost records, not exact); loss counted (matches bpftool 271); key-operation tracking ended; ~65% of calls unattributed; settlement p50 2.4 s as reported |
 
 This throughput is a local 5-CPU test-VM metric only, not a product
 promise: 10k/s with key operations is at this VM's capacity edge — 1

@@ -327,7 +327,10 @@ names the source SHA behind each check the release rounds re-measured.
 - Strict speed claims apply only on kernels with working uprobe_multi,
   normally 6.6 and newer: the rate and latency numbers above were
   measured there. Older kernels stay correct with a finite stop but are
-  not speed-qualified; live capture refuses there with a `live capture ...`
+  not speed-qualified; there `inventory --capture auto` falls back to the
+  scan lane (exit 0 with modules and callers, counts unknown under the
+  `native usage feed unavailable` gap), while `profile`, `trace`, `run`
+  and `inventory --capture native` refuse with a `live capture ...`
   refusal (`unavailable` or `did not start`).
 - Per-key rows cover operations that start after the attach.
   Attaching to an already-running process (for example a running

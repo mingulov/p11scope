@@ -78,8 +78,11 @@ What you see (documented shape, from the host gate in
 `src/attach/multi_host.rs` and
 [the unsupported-environments note](notes/phase5-unsupported.md)):
 on a kernel whose self-link probe fails with the known pre-Multi
-shape (observed on Linux 6.1), live capture refuses before loading
-any capture program, and `doctor` skips the capture-object loads:
+shape (observed on Linux 6.1), the live lane cannot start:
+`inventory --capture auto` (the default) falls back to the scan lane
+with the `native usage feed unavailable` gap (exit 0), while `profile`,
+`trace`, `run` and `inventory --capture native` refuse before loading
+any capture program. `doctor` skips the capture-object loads:
 
 ```
 skipped: this check loads capture programs, which need uprobe-multi
@@ -94,8 +97,9 @@ capability, normally Linux 6.6+ or a working backport; capability is
 tested, never admitted by version. Fix: boot a 6.6+ kernel (the
 release is qualified on 6.6 through 7.3;
 [qualification record](../CHANGELOG.md#qualification-of-this-release)),
-or stay with the offline commands (`inspect`, `inventory --capture
-scan`, `inventory diff`), which do not need the live gate.
+or stay on the scan lane: `inventory --capture auto` falls back to it
+by itself there, and `inspect`, `inventory --capture scan` and
+`inventory diff` never need the live gate.
 
 ## Missing BTF
 

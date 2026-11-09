@@ -214,8 +214,9 @@ names the source SHA behind each check the release rounds re-measured.
 - Key operations sustain 6,250 calls/s for 60 s with exact per-key rows
   and no capture loss in every measured run at that rate; plain call
   counts stay exact at 10,000 calls/s for 60 s without
-  `--key-operations`. With key operations on, a lossy run's counts
-  fall short by exactly the counted loss. Above 6,250 calls/s the
+  `--key-operations`. With key operations on, a lossy run's call
+  counts can fall short; every lost record is counted and named
+  (one call writes up to two records). Above 6,250 calls/s the
   16 MiB event ring can overflow between reads and key-operation
   tracking ends with a named gap. Sustained 10,000 calls/s for key
   operations is planned for 0.7.0.

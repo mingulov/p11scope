@@ -2216,11 +2216,26 @@ The old bounds are measurements, not a product startup SLA.
 - One broken process: when a not-yet-admitted process's own data breaks
   the pass, that process alone is held back from admission and the pass
   commits everything else, so other processes keep being admitted and
-  observed. The hold carries one named gap (`live process admission`,
-  projected as `discovery subject` / `discovery unavailable`), keeps
-  `PARTIAL` coverage (never reported complete) and is retried after 8
-  passes, doubling per repeat up to 512; it ends when the process exits.
-  The process's calls stay unobserved while it is held.
+  observed. Each newcomer of the failing pass is tried alone, charged to
+  the pass time budget (at least one try per pass); newcomers not tried
+  in time wait under the usual pending-newcomer gap and are tried on a
+  later pass. The hold carries one named gap (`live process admission`,
+  projected as `discovery subject` / `discovery unavailable`), is counted
+  internally, keeps `PARTIAL` coverage (never reported complete) and is
+  retried after 8 passes, doubling per repeat up to 512. It ends when the
+  process exits, execs, or its pid is reused by another process; exits
+  and reuse are only acted on after a complete process walk, so a
+  partial walk keeps the hold and its delay.
+- Calls while held: the held process's provider modules are not
+  discovered or attached through it, so calls through providers that
+  only it maps are not observed. If it calls into a provider already
+  attached for another process, the kernel filter (by pid or cgroup
+  scope, not by admitted process) may still deliver those calls; how
+  they are attributed was not checked.
+- Evidence checker: the release evidence checker's proxy-capacity check
+  treats `discovery subject` / `discovery unavailable` as an ambient
+  race, so that check alone does not fail a capture with a held
+  process; the capture's coverage is still `PARTIAL`.
 - Not isolated: a failure caused by already-admitted processes, by
   several newcomers only in combination, by the apply step rather than
   the candidate, or by committed-state corruption still drops whole

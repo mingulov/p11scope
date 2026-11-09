@@ -17075,6 +17075,125 @@ exit 0
     }
 
     #[test]
+    fn cgroup_operator_stop_after_scan_publishes_partial_pass0() {
+        // Data-always (owner, binding): an operator stop during pass-0
+        // publishes what was scanned so far with a named incomplete gap,
+        // never discarding to 0. The stop lands after the worker returned
+        // its scanned member but before the final sample (commit-sample
+        // stage): the transaction cannot complete, but the scan is real.
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection.preparation(child.id()).is_some(),
+            "actual provider scan ran before the stop"
+        );
+        control.cancel();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            coordinator.registry.caller_count(),
+            1,
+            "the scanned caller publishes instead of discarding to 0"
+        );
+        assert!(
+            coordinator.registry.edges().next().is_some(),
+            "the scanned caller's module edge publishes"
+        );
+        let gaps: Vec<String> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|subject| subject == "collection incomplete (stopped by operator)"),
+            "the partial scan names the operator stop: {gaps:?}"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|subject| subject == "cgroup scope transaction incomplete"),
+            "scan-only replaces the generic transaction gap: {gaps:?}"
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            completion.outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+        assert_eq!(completion.admitted, 1);
+    }
+
+    #[test]
+    fn cgroup_operator_stop_before_any_scan_stays_honest_empty() {
+        // Healthy twin: the stop landed before traversal saw any member,
+        // so nothing was collected and 0 callers is honest. No partial-scan
+        // gap is claimed; the generic transaction gap names the cancel.
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let control = CollectionControl::new(None);
+        control.cancel();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(
+            collection.member_pids().count(),
+            0,
+            "cancelled traversal saw no members"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            coordinator.registry.caller_count(),
+            0,
+            "nothing was seen, so 0 callers is honest"
+        );
+        let gaps: Vec<String> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|subject| subject == "cgroup scope transaction incomplete"),
+            "the cancelled empty names its transaction gap: {gaps:?}"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|subject| subject == "collection incomplete (stopped by operator)"),
+            "no partial scan is claimed when nothing was seen: {gaps:?}"
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            completion.outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+        assert_eq!(completion.admitted, 0);
+    }
+
+    #[test]
     fn cgroup_tiny_remaining_budget_stops_before_provider_preparation() {
         use crate::discovery::inventory_attach_set::provider_read_test;
         let (_fixture, child, mut coordinator) = cgroup_provider_scene();

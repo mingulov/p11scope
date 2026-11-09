@@ -6264,21 +6264,20 @@ fn scan_view_with_examined(
 
 /// Indices of `--module` hints naming a still-mapped copy of a replaced
 /// file: the kernel renders the group's raw path as "<path> (deleted)",
-/// so the suffix is stripped before the verbatim comparison. Empty when
-/// the raw path carries no parseable hint spelling.
+/// so the suffix is stripped before the verbatim comparison. The stripped
+/// bytes are compared as `OsStr`, never through `str`: a deleted mapping
+/// is classified before the UTF-8 check, so non-UTF-8 hints match here.
+/// Empty when the raw path carries no parseable hint spelling.
 fn stripped_deleted_hint_matches(raw_path: &[u8], hints: &[PathBuf]) -> Vec<usize> {
-    let Some(prefix) = raw_path
-        .strip_suffix(b" (deleted)".as_slice())
-        .and_then(|prefix| std::str::from_utf8(prefix).ok())
-    else {
+    let Some(prefix) = raw_path.strip_suffix(b" (deleted)".as_slice()) else {
         return Vec::new();
     };
-    let stripped = Path::new(prefix);
+    let stripped = std::ffi::OsStr::from_bytes(prefix);
     hints
         .iter()
         .enumerate()
         .filter_map(|(index, hint)| {
-            if hint.as_path() == stripped {
+            if hint.as_os_str() == stripped {
                 Some(index)
             } else {
                 None

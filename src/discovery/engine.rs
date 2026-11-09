@@ -835,6 +835,18 @@ pub struct Engine {
     /// and drives the real branch, predicate and settlement past it.
     #[cfg(test)]
     fail_next_loader_memory_scan: bool,
+    /// Test-only one-shot: the next `apply_candidate` fails before any
+    /// link mutation, driving the pass-containment path past it.
+    #[cfg(test)]
+    fail_next_apply_for_test: bool,
+    /// Test-only count of `inventory_candidate` calls, for the
+    /// pass-containment twins below.
+    #[cfg(test)]
+    inventory_candidate_calls_for_test: u64,
+    /// Test-only one-shot: fail the Nth `inventory_candidate` call
+    /// (1-based over the capture), driving the pass-containment path.
+    #[cfg(test)]
+    fail_inventory_candidate_call_for_test: Option<u64>,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Test-only one-shot: force the next record-path loader scan to
@@ -11035,6 +11047,12 @@ impl Engine {
             #[cfg(test)]
             fail_next_loader_memory_scan: false,
             #[cfg(test)]
+            fail_next_apply_for_test: false,
+            #[cfg(test)]
+            inventory_candidate_calls_for_test: 0,
+            #[cfg(test)]
+            fail_inventory_candidate_call_for_test: None,
+            #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
             loader_force_record_scan_incomplete: false,
@@ -14792,6 +14810,10 @@ impl Engine {
         extra_views: &[&ProcessView],
         ended: Option<&PendingEndedPidRetirement>,
     ) -> Result<ApplyOutcome> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_apply_for_test) {
+            bail!("test-forced apply failure");
+        }
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
             d.begin(
@@ -23346,6 +23368,15 @@ impl Engine {
         mut skipped: Vec<Skipped>,
         declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
+        #[cfg(test)]
+        {
+            self.inventory_candidate_calls_for_test += 1;
+            if self.fail_inventory_candidate_call_for_test
+                == Some(self.inventory_candidate_calls_for_test)
+            {
+                bail!("test-forced candidate failure");
+            }
+        }
         #[cfg(not(test))]
         let fast_path_disabled = false;
         #[cfg(test)]

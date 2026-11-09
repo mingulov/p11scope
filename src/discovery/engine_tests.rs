@@ -67997,3 +67997,177 @@ fn failed_scarce_rotation_attempt_skips_failed_newcomer_sink() {
         "the failed rotation attempt never entered the failed-newcomer list"
     );
 }
+
+/// P1-5: one bad pass must not abort the whole capture. Fault-inject
+/// `apply_candidate` failing in the second pass: the batch still
+/// returns Ok, earlier committed views survive, and a counted named
+/// gap records the dropped pass.
+#[test]
+fn dropped_apply_keeps_earlier_data_and_names_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1, "first pass admits the live member");
+    assert!(engine.request_refresh(pid, None));
+    engine.fail_next_apply_for_test = true;
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a dropped pass still returns Ok");
+    assert!(
+        !outcome.required_complete,
+        "a dropped pass never confirms completeness"
+    );
+    assert_eq!(
+        engine.views.len(),
+        1,
+        "earlier committed view survives the dropped pass"
+    );
+    assert_eq!(engine.views[0].pid(), pid);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("dropped") && skip.reason.contains("test-forced apply")
+        }),
+        "a counted named gap records the dropped pass: {:?}",
+        engine.counters.object_skips
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// P1-5 first-candidate site: the tick's First `inventory_candidate`
+/// failing drops that pass with a gap, keeping earlier state.
+#[test]
+fn dropped_first_candidate_keeps_earlier_data() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    // First tick built candidates 1 (First) and 2 (Final); the second
+    // tick's First is call 3.
+    assert_eq!(engine.inventory_candidate_calls_for_test, 2);
+    assert!(engine.request_refresh(pid, None));
+    engine.fail_inventory_candidate_call_for_test = Some(3);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a dropped pass still returns Ok");
+    assert!(!outcome.required_complete);
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].pid(), pid);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("dropped") && skip.reason.contains("test-forced candidate")
+        }),
+        "a counted named gap records the dropped pass: {:?}",
+        engine.counters.object_skips
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// P1-5 final-candidate site: the tick's Final `inventory_candidate`
+/// failing drops that pass with a gap, keeping earlier state.
+#[test]
+fn dropped_final_candidate_keeps_earlier_data() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.inventory_candidate_calls_for_test, 2);
+    assert!(engine.request_refresh(pid, None));
+    engine.fail_inventory_candidate_call_for_test = Some(4);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a dropped pass still returns Ok");
+    assert!(!outcome.required_complete);
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].pid(), pid);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("dropped") && skip.reason.contains("test-forced candidate")
+        }),
+        "a counted named gap records the dropped pass: {:?}",
+        engine.counters.object_skips
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// P1-5 healthy twin: two healthy passes admit and refresh with no
+/// dropped-pass gap. Must pass both before and after containment.
+#[test]
+fn healthy_twin_has_no_dropped_pass_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    assert!(engine.request_refresh(pid, None));
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].pid(), pid);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("dropped")),
+        "a healthy twin emits no dropped-pass gap: {:?}",
+        engine.counters.object_skips
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// P1-5 real-bail twin: a genuine `resolve_merge_inputs` invariant
+/// (manifest history lost its ordinals) drops the pass with a gap
+/// instead of aborting, keeping earlier data.
+#[test]
+fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    engine.manifest_ordinals.push(999);
+    assert!(engine.request_refresh(pid, None));
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a real invariant still returns Ok");
+    assert!(!outcome.required_complete);
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].pid(), pid);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason.contains("dropped")
+                && (skip.reason.contains("ordinals") || skip.reason.contains("manifest history"))
+        }),
+        "a counted named gap records the real dropped pass: {:?}",
+        engine.counters.object_skips
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

@@ -228,6 +228,15 @@ class ReleaseNoticesTests(unittest.TestCase):
         with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
             self.mod.make_config(metadata, self.root, recipe)
 
+    def test_clarification_stale_pinned_version_is_rejected(self):
+        # Pins must match the locked graph exactly in both directions: a
+        # version that drops out of the metadata is refused rather than
+        # silently emitted into the clarify block. The exact-set positive
+        # twin is test_clarification_accepts_each_pinned_version_once.
+        recipe, _metadata, _bodies = self.clarification_fixture()
+        with self.assertRaisesRegex(self.mod.NoticeError, "stale clarification version pin"):
+            self.mod.make_config(self.metadata, self.root, recipe)
+
     def test_clarify_emission_canonicalizes_slash_spelling(self):
         # cargo-about parses the clarify license as SPDX, so the raw
         # historical slash spelling must be emitted canonicalized.

@@ -218,8 +218,8 @@ names the source SHA behind each check the release rounds re-measured.
   counts can fall short; every lost record is counted and named
   (one call writes up to two records). Above 6,250 calls/s the
   16 MiB event ring can overflow between reads and key-operation
-  tracking ends with a named gap. Sustained 10,000 calls/s for key
-  operations is planned for 0.7.0.
+  tracking ends with a named gap. 10,000 calls/s with key operations
+  is not yet sustained.
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
   qualified 60 s runs), against the 1.5 s target; under host load it

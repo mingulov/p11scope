@@ -68333,6 +68333,7 @@ fn dropped_tail_keeps_committed_provider_modules_plan_and_counts() {
     let discovery_modules = serde_json::to_value(&engine.discovery.modules).unwrap();
     let public_revision = engine.published_facts_revision;
     engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
+    engine.note_facts_mutated(); // Force the merge attempt the drop needs.
     engine
         .publish_batch_tail(false)
         .expect("a dropped tail still returns Ok");
@@ -68379,6 +68380,7 @@ fn report_after_dropped_tail_carries_earlier_data_and_gap() {
         "the fixture must commit a provider module"
     );
     engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
+    engine.note_facts_mutated(); // Force the merge attempt the drop needs.
     engine
         .publish_batch_tail(false)
         .expect("a dropped tail still returns Ok");

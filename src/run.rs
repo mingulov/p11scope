@@ -3953,8 +3953,9 @@ pub(crate) fn run_profile_loop_for_test(
 pub struct OwnedRunOutcome {
     /// The child's status as a shell would report it (128 + signal when
     /// signalled). `None` exactly when the child was handed back still
-    /// running: an expired `--duration` without `--kill-on-timeout`, or
-    /// an exhausted event budget.
+    /// running: an expired `--duration` without `--kill-on-timeout`
+    /// (also when its pause cleanup failed), an exhausted event budget,
+    /// or a capture error.
     pub child_exit_code: Option<i32>,
     /// True when `--kill-on-timeout` was requested and the timeout kill
     /// reaped a live child by signal: a normal end, reported as
@@ -3972,9 +3973,12 @@ pub struct OwnedRunOutcome {
 }
 
 impl OwnedRunOutcome {
-    /// The process exit code for this run: a requested timeout kill
-    /// and a handed-back child are observer success (0); otherwise
-    /// the child's own status, as a shell would report it.
+    /// The process exit code for this run: a capture error that handed
+    /// the child back is an observer failure (1); a requested timeout
+    /// kill and any other handed-back child are observer success (0);
+    /// otherwise the child's own status, as a shell would report it. A
+    /// failed pause cleanup never reaches here: it returns an error, so
+    /// that run exits 1 whatever was handed back.
     pub fn exit_code(&self) -> i32 {
         if self.error_handoff {
             1

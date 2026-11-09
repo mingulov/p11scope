@@ -1872,14 +1872,17 @@ changing capture behavior, it joins the table above and the `--help` list.
 
 - `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
   when a still-running child is handed back (an expired `--duration`
-  without `--kill-on-timeout`, or an exhausted `--max-events` budget),
+  without `--kill-on-timeout` whose pause cleanup succeeded, or an
+  exhausted `--max-events` budget),
   or when a requested `--kill-on-timeout` kill reaped a live child by the
   observer's signal at timeout. A voluntary exit keeps its own status,
   however high its code, as does a death before the observer's signal.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead, except when the capture itself
   failed and the live child was handed back (for example a closed stdout
-  with no `-o`): that run exits 1 and stderr names the surviving PID. `doctor` exits 1 when any requested
+  with no `-o`), or an expired `--duration` whose pause cleanup failed:
+  that run exits 1 and stderr names the error and the surviving PID.
+  `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure
   in any assessed lane instead); `inspect --pid` exits 1 when the target
   cannot be read, while `inspect --system` renders a partial catalog

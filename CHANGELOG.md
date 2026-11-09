@@ -68,6 +68,10 @@ versioned separately and are opaque, exact dispatch keys.
   143); the report carries the truncation marker. A capture error
   likewise hands a live child back running instead of killing it, still
   exiting 1 with the error and the surviving PID on stderr.
+- Under `run`, an expired `--duration` whose pause cleanup failed now
+  resumes and hands the live child back instead of killing it (unless
+  `--kill-on-timeout` was given), exiting 1 with the cleanup error and the
+  surviving PID on stderr.
 
 ### Fixed
 

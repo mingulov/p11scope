@@ -4506,6 +4506,7 @@ fn finish_quiesce_error<C>(
     error: anyhow::Error,
     loop_result: Result<CaptureEnd>,
     context: &mut C,
+    loop_gap: impl FnOnce(&mut C),
     settle: impl FnOnce(&mut C, CaptureEnd) -> Result<()>,
     publish: impl FnOnce(&mut C) -> Result<()>,
     detach: impl FnOnce(&mut C) -> Result<()>,
@@ -4527,6 +4528,10 @@ fn finish_quiesce_error<C>(
         }
         Err(loop_error) => {
             let combined = also_failed(loop_error, error, "terminal quiescence");
+            // The failed loop is a named gap in the sealed report, exactly
+            // as on the `finish_capture_with` path: an unproven quiescence
+            // alone would let the verdict read clean-but-unproven.
+            loop_gap(context);
             let finish = settle(context, CaptureEnd::Error);
             // Every stop seals from partial state even behind a failed
             // loop, signalled or not: calls happened, so the report shows
@@ -7632,6 +7637,7 @@ fn capture_profile(
                 error,
                 loop_result,
                 &mut settle_context,
+                |context| context.0.note_capture_loop_failure(),
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
                     None => Ok(()),
@@ -8734,6 +8740,7 @@ fn capture_trace(
                 error,
                 loop_result,
                 &mut settle_context,
+                |context| context.0.note_capture_loop_failure(),
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
                     None => Ok(()),
@@ -15097,6 +15104,7 @@ mod tests {
                 anyhow::anyhow!("quiesce failure"),
                 loop_result,
                 &mut (),
+                |_| {},
                 |_, end| {
                     settle_owned_child(
                         &mut retained,
@@ -15156,6 +15164,7 @@ mod tests {
             anyhow::anyhow!("terminal quiescence failed"),
             Err(anyhow::anyhow!("loop failure")),
             &mut (),
+            |_| {},
             |_, _| Ok(()),
             |_| {
                 published.set(true);
@@ -15185,6 +15194,7 @@ mod tests {
             anyhow::anyhow!("terminal quiescence failed"),
             Err(anyhow::anyhow!("loop failure")),
             &mut (),
+            |_| {},
             |_, _| Ok(()),
             |_| {
                 published.set(true);
@@ -16814,6 +16824,7 @@ mod tests {
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
             &mut (),
+            |_| {},
             |_, _| Ok(()),
             |_| Ok(()),
             |_| Err(interrupted()),
@@ -16822,6 +16833,7 @@ mod tests {
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
             &mut (),
+            |_| {},
             |_, _| Ok(()),
             |_| Err(anyhow!("seal failed")),
             |_| Err(interrupted()),

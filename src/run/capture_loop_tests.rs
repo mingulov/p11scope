@@ -498,6 +498,7 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
             anyhow::anyhow!("quiesce failure"),
             Ok(CaptureEnd::DurationExpired),
             &mut phases,
+            |phases| phases.push("gap"),
             |phases, end| {
                 phases.push("settle");
                 settled_end = Some(end);
@@ -567,6 +568,7 @@ fn quiesce_error_with_publish_failure_labels_publication_and_still_detaches() {
         anyhow::anyhow!("quiesce failure"),
         Ok(CaptureEnd::Signal),
         &mut phases,
+        |phases| phases.push("gap"),
         |phases, _| {
             phases.push("settle");
             Ok(())
@@ -601,6 +603,7 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
         anyhow::anyhow!("quiesce failure"),
         Err(anyhow::anyhow!("loop failure")),
         &mut phases,
+        |phases| phases.push("gap"),
         |phases, end| {
             phases.push("settle");
             settled_end = Some(end);
@@ -616,8 +619,9 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
         },
     );
     assert_eq!(settled_end, Some(CaptureEnd::Error));
-    // A failed loop still seals what was captured, unsignalled too.
-    assert_eq!(phases, ["settle", "publish", "detach"]);
+    // A failed loop still seals what was captured, unsignalled too,
+    // and files its named gap before the seal.
+    assert_eq!(phases, ["gap", "settle", "publish", "detach"]);
     let message = format!("{error:#}");
     assert!(
         message.contains("loop failure"),

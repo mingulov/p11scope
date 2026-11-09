@@ -10920,11 +10920,14 @@ fn stale_process_views(
         .collect()
 }
 
-/// True when every stale view names a pid with no live generation right
-/// now (reaped, zombie, or dead): the ordinary end of those processes.
+/// True when every stale view names an original generation that is
+/// provably gone two ways: the retained pin answers exited (no live
+/// generation, no poll error) and the pid has no live generation right
+/// now (reaped, zombie, or dead) — the ordinary end of those processes.
 /// Reuse-safe: a pid reused by a live process reads live, and an
-/// unreadable pid or an unknown view reads unproven — both fail closed
-/// (loud). The caller holds a non-empty stale set.
+/// unreadable pid, an unanswerable pin, or an unknown view reads
+/// unproven — all fail closed (loud). The caller holds a non-empty
+/// stale set.
 fn stale_views_all_dead(
     stale: &BTreeSet<ProcessViewId>,
     views: &[ProcessView],
@@ -10935,8 +10938,59 @@ fn stale_views_all_dead(
             .iter()
             .chain(extra_views.iter().copied())
             .find(|view| view.id() == *id)
-            .is_some_and(|view| process::generation_dead(view.pid()))
+            .is_some_and(|view| {
+                view.original_exited() == Ok(true) && process::generation_dead(view.pid())
+            })
     })
+}
+
+/// True when no stale view owns a module with a pending attach target
+/// in this candidate: a newcomer that mapped a provider must never
+/// vanish silently — its calls were never observed. Ownership runs from
+/// the delta slots through the plan summaries to the reconciled scan
+/// owner (`ScannedModule.view`). An unmapped slot fails closed (loud).
+fn stale_views_own_no_delta_target(
+    stale: &BTreeSet<ProcessViewId>,
+    candidate: &LiveCandidate,
+) -> bool {
+    candidate
+        .delta
+        .new
+        .iter()
+        .chain(&candidate.delta.replace)
+        .flat_map(|slot| slot.module_ids.iter())
+        .all(|module| !delta_module_owned_by_stale_view(*module, stale, candidate))
+}
+
+/// True when the plan module names a stale view among its reconciled
+/// scan owners — or when no scan claims it (fail-closed: an unknown
+/// owner keeps the mark).
+fn delta_module_owned_by_stale_view(
+    module: plan::ModuleId,
+    stale: &BTreeSet<ProcessViewId>,
+    candidate: &LiveCandidate,
+) -> bool {
+    let Some(summary) = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.id == module)
+    else {
+        return true;
+    };
+    let mut known = false;
+    for owner in candidate
+        .modules
+        .iter()
+        .filter(|reconciled| reconciled.object == summary.object)
+        .map(|reconciled| reconciled.scanned.view)
+    {
+        known = true;
+        if stale.contains(&owner) {
+            return true;
+        }
+    }
+    !known
 }
 
 fn validate_loader_record_context<'a>(
@@ -15347,8 +15401,16 @@ impl Engine {
             // already counted exactly, and the terminal drain settles the
             // links. Loud in -v, silent in the report. Anything with a
             // live generation — including a pid reused by a new process —
-            // keeps the loud mark.
-            if stale_views_all_dead(&outcome.stale_views, &self.views, extra_views) {
+            // keeps the loud mark, as does a dead view that still owns a
+            // new attach target: a newcomer that mapped a provider must
+            // never vanish silently.
+            if stale_views_all_dead(&outcome.stale_views, &self.views, extra_views)
+                && stale_views_own_no_delta_target(&outcome.stale_views, &candidate)
+            {
+                // The mark stays silent but the publication inputs still
+                // changed (the abort drops this candidate's mutations), so
+                // the loader-plan cache goes, exactly as on the loud path.
+                self.loader_plan_cache = None;
                 self.counters.noise.note_skip(
                     "live discovery generation",
                     "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",

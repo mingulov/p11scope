@@ -129,6 +129,11 @@ def check_profile(verdict, doc, text_blobs, args):
     for row in functions:
         if not isinstance(row, dict):
             continue
+        # Forwarding-layer rows duplicate the logical calls of the
+        # provider row they contain (profile schema v3): consumers
+        # summing calls must skip them to count each call once.
+        if row.get("forwarding_layer"):
+            continue
         names = row.get("names") or []
         calls = row.get("calls", 0) or 0
         total += calls

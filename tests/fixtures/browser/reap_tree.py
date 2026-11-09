@@ -125,6 +125,38 @@ def _tree_members(pgid):
     return [pid for pid in _group_members(pgid) if _descends_from(pid, me)]
 
 
+def _descendant_pids():
+    """Live PIDs descending from us besides ourselves (a /proc scan).
+
+    Group-independent: the browser is always our descendant, even
+    before its session group is published to the termination state.
+    """
+    me = os.getpid()
+    descendants = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return descendants
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        if _descends_from(pid, me):
+            descendants.append(pid)
+    return descendants
+
+
+def _kill_pids(pids):
+    """SIGKILL each pid, ignoring races (exited or reparented away)."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
 def _killer_main(pipe_r, pgid):
     """Forked helper: every requested byte SIGKILLs the group at once.
 
@@ -208,11 +240,7 @@ def _close_killer(killer):
 
 def _kill_tree(pgid):
     """SIGKILL every tree member besides ourselves (shutdown is over)."""
-    for pid in _tree_members(pgid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            continue
+    _kill_pids(_tree_members(pgid))
 
 
 def _reap_children():
@@ -249,12 +277,18 @@ def _reap_tree(pgid, killer=None, budget=REAP_BUDGET_SECONDS):
 def _install_termination_handler(state):
     """Termination kills the tree at once and exits 128+signum.
 
-    ``state`` carries the browser group and helper once spawned; before
-    that there is no tree to kill.
+    ``state`` carries the browser group and helper once spawned. A
+    signal can also land inside the spawn window (after the browser
+    fork, before the group is published), so the handler additionally
+    kills every descendant directly: the browser is always ours by
+    descent, whatever the published state. The killpg helper is spared
+    so its strike still covers anything the scans missed.
     """
 
     def terminate(signum, _frame):
         _poke_killer(state["killer"])
+        helper = state["killer"][0] if state["killer"] is not None else None
+        _kill_pids(pid for pid in _descendant_pids() if pid != helper)
         if state["pgid"] is not None:
             _kill_tree(state["pgid"])
         _reap_children()

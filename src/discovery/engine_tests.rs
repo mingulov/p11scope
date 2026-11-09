@@ -5290,6 +5290,117 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
 }
 
 #[test]
+fn terminal_drain_withdraws_a_counted_loss_whose_group_exited() {
+    // A leader-exit assessment sampled while the group was still tearing
+    // down counts eagerly at the batch; when the group provably fully
+    // exited by capture end, no member survived to escape observation, so
+    // the terminal re-poll withdraws the transient instead of publishing
+    // a gap that never happened.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(60), child.id()).unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(60), None);
+    let polled = engine.views[0].original_exited();
+    assert_eq!(polled, Ok(false));
+    let assessment = settle_leader_exit_view(
+        &mut engine.pending_leader_exit_views,
+        &mut engine.counted_leader_exit_views,
+        &mut engine.task_uprobe_link_losses,
+        ProcessViewId(60),
+        polled,
+    );
+    assert_eq!(assessment, LeaderExitAssessment::LinkLoss);
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(
+        engine.task_uprobe_link_losses, 0,
+        "a group that provably exited by capture end left no surviving member"
+    );
+    assert!(
+        engine.counted_leader_exit_views.is_empty(),
+        "withdrawal releases the counted view"
+    );
+}
+
+#[test]
+fn terminal_drain_prunes_a_pending_assessment_whose_group_exited() {
+    // The sibling path: an assessment that never became answerable
+    // mid-capture must not be terminalized as a loss when the terminal
+    // re-poll proves the whole group exited.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(61), child.id()).unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(61), None);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+
+    engine.settle_terminal_drain();
+
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert_eq!(
+        engine.task_uprobe_link_losses, 0,
+        "a proven whole-group exit at capture end is ordinary retirement"
+    );
+}
+
+#[test]
+fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
+    // The other direction, so the withdrawal cannot become "stop
+    // counting": a counted loss whose group is still live at capture end
+    // keeps its gap.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(62), child.id()).unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(62), None);
+    let polled = engine.views[0].original_exited();
+    assert_eq!(polled, Ok(false));
+    let assessment = settle_leader_exit_view(
+        &mut engine.pending_leader_exit_views,
+        &mut engine.counted_leader_exit_views,
+        &mut engine.task_uprobe_link_losses,
+        ProcessViewId(62),
+        polled,
+    );
+    assert_eq!(assessment, LeaderExitAssessment::LinkLoss);
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(
+        engine.task_uprobe_link_losses, 1,
+        "a group still live at capture end keeps its counted loss"
+    );
+    assert!(
+        engine
+            .counted_leader_exit_views
+            .contains(&ProcessViewId(62)),
+        "a surviving group keeps its counted view"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 fn cgroup_exec_rejects_a_stale_retained_generation() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")

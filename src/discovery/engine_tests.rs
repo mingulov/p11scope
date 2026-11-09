@@ -68295,7 +68295,11 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     assert!(
         engine.views.iter().any(|view| view.pid() == newcomer_pid),
         "the newcomer is admitted: {:?}",
-        engine.views.iter().map(ProcessView::pid).collect::<Vec<_>>()
+        engine
+            .views
+            .iter()
+            .map(ProcessView::pid)
+            .collect::<Vec<_>>()
     );
     let _ = poison.kill();
     let _ = poison.wait();

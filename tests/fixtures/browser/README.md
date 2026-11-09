@@ -16,8 +16,8 @@ end to end beside independent TLS-layer ground truth.
 - `tls_server.py` — threaded loopback flow servers (plain HTTP, HTTPS, and
   `CERT_REQUIRED`), recording connections, requests, and presented client
   certificates as oracle ground truth.
-- `cells.py` — cell runners: `run_direct` (`p11scope run` owns the browser
-  child) and `attach_drive` (Playwright drives, `p11scope profile --pid`
+- `cells.py` — cell runners: `run_direct` (`p11scope run` owns the tree
+  supervisor) and `attach_drive` (Playwright drives, `p11scope profile --pid`
   observes the main browser process).
 - `flows.py` — Playwright flows (page visit, client-cert attempt) with wait
   strategies and bounded timeouts.

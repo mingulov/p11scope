@@ -2113,7 +2113,7 @@ class BrowserReapTree(unittest.TestCase):
     leader-exit assessment sampled a live group
     (``task_uprobe_link_losses``), and the never-mapped oracle fails
     closed on both (the v0.7.0 browser-cells flake: FF-NOMOD failed 2 of
-    13 hosted runs on ``task_uprobe_link_losses``, once with survivors).
+    16 hosted runs on ``task_uprobe_link_losses``, once with survivors).
     The supervisor (``tests/fixtures/browser/reap_tree.py``) is the owned
     child instead: a private process group plus the child-subreaper bit,
     then wait for the browser's exit, SIGKILL the stragglers, and reap to

@@ -135,7 +135,7 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
                browser_env: dict | None = None,
                extra_browser_args: tuple[str, ...] = (),
                duration_seconds: int = 120) -> CellResult:
-    """Run one ``p11scope run`` cell with the browser as the owned child.
+    """Run one ``p11scope run`` cell with the tree supervisor as the owned child.
 
     ``observe_module`` is the ``--module`` target (always the controlled
     SoftHSM provider). ``register_module`` is the module registered in the
@@ -190,6 +190,10 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         "--", "/usr/bin/env",
         f"HOME={child_env['HOME']}", f"TMPDIR={tmpdir}",
         sys.executable, str(supervisor),
+        # Assumption: the run's remaining work past its screenshot is
+        # pure teardown, so ending the run at flow completion truncates
+        # nothing a cell needs. A future registered-module run_direct
+        # cell must re-check this before inheriting --flow-done.
         "--flow-done", str(screenshot),
         *browser_argv, *extra_browser_args,
     ]

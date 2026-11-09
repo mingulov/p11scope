@@ -26,7 +26,8 @@ so it beats even a fast shutdown wave; a post-spawn scan proves the
 fresh group has no recycled-pgid stale members first, else
 descent-checked scan-kill covers the run. Capture therefore always
 ends on a quiesced tree. The browser's argv is passed through opaquely
-and never inspected; only the supervisor's own --flow-done path is read.
+and never inspected; only the flow-done trailer and /proc ppid/pgrp
+identity are read.
 
 The readiness signal is ECHILD (no descendants remain), not a timeout:
 REAP_BUDGET_SECONDS only fails loud on a wedged tree, where the
@@ -301,7 +302,7 @@ def _install_termination_handler(state):
 def _flow_complete(shot):
     """True when the screenshot file carries a complete PNG trailer.
 
-    Only the last eight bytes are ever read; a missing, short, or
+    Only the last twelve bytes are ever read; a missing, short, or
     unreadable file is simply incomplete.
     """
     if shot is None:

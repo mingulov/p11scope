@@ -3324,6 +3324,47 @@ mod c1b {
         );
     }
 
+    /// An exited member is not retained: a no-bind pass whose members
+    /// exited after the sweep still marks their edges uncertain and still
+    /// forwards its capped loss. A `Mapped` edge claims neither endpoint
+    /// has ended, so it would be live-looking for a dead caller; exits
+    /// retire through the adapter's reconcile, not the scan status.
+    #[test]
+    fn a_no_bind_pass_with_exited_members_still_marks_edges_uncertain() {
+        let mut harness = spawned();
+        let first = with_digests(catalog(&[], &[]));
+        let digests = first.sweep_digests.clone();
+        harness.apply_catalog(first);
+        harness.advance(1);
+        let mut second = transient_pass(&digests);
+        for process in &mut second.processes {
+            if process.pid < 20_000 {
+                process.status = MemberStatus::Exited;
+            }
+        }
+        harness.apply_catalog(second);
+        let document = harness.render();
+        assert_eq!(
+            edge_states(&document, "uncertain"),
+            CALLERS as usize,
+            "exited members are not retained"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter().any(|gap| gap["subject"] == "discovery capped"
+                && !gap["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("attribution complete")),
+            "a real loss still forwards its capped gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .all(|gap| gap["subject"] != "transient pass retained established edges"),
+            "nothing was retained, so no retention gap: {gaps:?}"
+        );
+    }
+
     /// A real provider change still updates: a pass binding a new
     /// provider key moves established edges onto the new module.
     #[test]
@@ -3352,7 +3393,22 @@ mod c1b {
             .iter()
             .map(|edge| edge["module"].as_str().unwrap())
             .collect();
-        assert_eq!(targets.len(), 1, "every mapped edge moved to one module");
+        let module_id = |sha256: &str| {
+            modules
+                .iter()
+                .find(|module| module["identity"]["sha256"] == sha256)
+                .unwrap_or_else(|| panic!("the {sha256} key renders its own module"))["id"]
+                .as_str()
+                .unwrap()
+        };
+        let old_id = module_id("sha-softhsm2");
+        let new_id = module_id("sha-softhsm2-new");
+        assert_ne!(old_id, new_id, "the new key is a distinct module");
+        assert_eq!(
+            targets,
+            std::collections::BTreeSet::from([new_id]),
+            "every mapped edge moved to the NEW module"
+        );
     }
 
     #[test]

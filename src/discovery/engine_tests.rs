@@ -68302,3 +68302,106 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     let _ = newcomer.kill();
     let _ = newcomer.wait();
 }
+
+/// A seed-provider engine with committed modules plus the module hint
+/// a live tick needs to find the provider again on rescan. The
+/// fixture owns the provider child, so it must stay alive.
+fn provider_engine_with_committed_seed() -> (LoadedSeedProvider, Engine, ScriptedSession, u32) {
+    let (fixture, mut engine, mut session) = initial_export_route();
+    let pid = engine.views[0].pid();
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    assert!(
+        !engine.modules.is_empty(),
+        "the route must commit the seed provider"
+    );
+    (fixture, engine, session, pid)
+}
+
+/// A dropped tick keeps committed provider modules, plan slots and
+/// discovery modules (with their counts), not just the process view.
+#[test]
+fn dropped_tick_keeps_committed_provider_modules_plan_and_counts() {
+    let (_fixture, mut engine, mut session, pid) = provider_engine_with_committed_seed();
+    assert!(engine.request_refresh(pid, None));
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert!(
+        !engine.modules.is_empty(),
+        "the healthy tick keeps the seed provider"
+    );
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live inventory pass"),
+        "the healthy tick emits no dropped-pass gap"
+    );
+    let modules = serde_json::to_value(&engine.modules).unwrap();
+    let slots = engine.plan.active_slot_count();
+    let entries_seen = engine.plan.entries_seen;
+    let discovery_modules = serde_json::to_value(&engine.discovery.modules).unwrap();
+    assert!(engine.request_refresh(pid, None));
+    engine.fail_next_apply_for_test = true;
+    apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a dropped pass still returns Ok");
+    assert_eq!(
+        serde_json::to_value(&engine.modules).unwrap(),
+        modules,
+        "committed modules survive the dropped pass"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        slots,
+        "committed plan slots survive the dropped pass"
+    );
+    assert_eq!(
+        engine.plan.entries_seen, entries_seen,
+        "committed plan entries survive the dropped pass"
+    );
+    assert_eq!(
+        serde_json::to_value(&engine.discovery.modules).unwrap(),
+        discovery_modules,
+        "discovery modules and their counts survive the dropped pass"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live inventory pass" && skip.reason.contains("dropped")
+        }),
+        "a counted named gap records the dropped pass: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// End to end at the engine seam: after a dropped pass the batch tail
+/// still publishes, and the serialized report carries the earlier
+/// provider data plus the dropped-pass gap.
+#[test]
+fn report_after_dropped_pass_carries_earlier_data_and_gap() {
+    let (_fixture, mut engine, mut session, pid) = provider_engine_with_committed_seed();
+    assert!(engine.request_refresh(pid, None));
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert!(
+        !engine.modules.is_empty(),
+        "the healthy tick keeps the seed provider"
+    );
+    assert!(engine.request_refresh(pid, None));
+    engine.fail_next_apply_for_test = true;
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
+        .expect("a dropped pass still returns Ok");
+    assert!(!outcome.required_complete);
+    engine
+        .publish_batch_tail(outcome.changed)
+        .expect("the tail still publishes after a dropped pass");
+    assert!(
+        !engine.discovery.modules.is_empty(),
+        "the published report keeps the earlier provider"
+    );
+    serde_json::to_string(&engine.discovery).expect("the report still serializes");
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == "live inventory pass" && skip.reason.contains("dropped")
+        }),
+        "the published plan carries the dropped-pass gap: {:?}",
+        engine.plan.skipped
+    );
+}

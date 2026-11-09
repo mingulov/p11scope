@@ -3499,6 +3499,51 @@ fn gap_reason_words_exited_process_races_calmly() {
     );
 }
 
+/// A chrooted-target failure that attempted the verified host-root
+/// fallback names a live process whose object missed (or was refused)
+/// under both roots — never an exit race, even when the target half
+/// reads ENOENT. Concise names the fallback instead of claiming the
+/// process exited; verbose keeps the machine reason beside the words.
+#[test]
+fn gap_reason_names_the_host_root_fallback_when_attempted() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for reason in [
+        "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2))",
+        "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: object is 278755480 bytes; limit is 268435456)",
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "/usr/lib64/libc.so.6".into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.contains("process exited during scan"),
+        "a fallback-attempted failure is not an exit race: {concise}"
+    );
+    assert!(
+        concise.contains("object unavailable from the process's root or the host-root fallback"),
+        "concise names the attempted fallback: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("object unavailable from the process's root or the host-root fallback"),
+        "verbose leads with the fallback wording: {verbose}"
+    );
+    assert!(
+        verbose.contains("opening object within retained target root"),
+        "verbose keeps the machine error beside it: {verbose}"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

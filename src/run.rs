@@ -15023,6 +15023,52 @@ mod tests {
         drop(pending.take());
     }
 
+    /// Every error return after the capture loop names a child it hands
+    /// back: the abort of a staged duration handoff and an already
+    /// committed observer-end handoff both print through one helper on
+    /// both error closures; a handed-back child after a capture error
+    /// exits 1; and a released child the run neither reaped nor handed
+    /// off is named when the run's state is dropped on an error return.
+    #[test]
+    fn error_returns_name_every_handed_back_child() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let after_loop = production
+            .split_once("let evidence = run_loop(")
+            .expect("run_owned's capture loop")
+            .1
+            .split_once("// A signalled death is reported as one.")
+            .unwrap()
+            .0;
+        assert_eq!(
+            after_loop.matches("abort_pending_and_name(&mut owned)").count(),
+            2,
+            "both error closures abort through the naming helper"
+        );
+        assert!(
+            production.contains(
+                "fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<bool> {"
+            ),
+            "the abort says whether it handed the child back"
+        );
+        let exit = production
+            .split_once("pub fn exit_code(&self) -> i32 {")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            exit.contains("self.error_handoff"),
+            "a handed-back child after a capture error exits 1"
+        );
+        let drop_owned = production
+            .split_once("impl Drop for Owned {")
+            .expect("dropping the run state names an unsettled child")
+            .1;
+        assert!(drop_owned.contains("unsettled_child_note("));
+    }
+
     /// Every settlement that can commit a handoff names the survivor on
     /// stderr exactly once: the stored note is taken by one helper, which
     /// the error paths, both quiesce-error settle closures, an error-end
@@ -15658,13 +15704,16 @@ int main(int argc, char **argv) {
                 None,
                 None,
             ),
+            // A failed pause cleanup is an observer failure: without
+            // --kill-on-timeout an expired duration hands the live child
+            // back like any observer-side end, never kills it.
             (
                 "/bin/sleep",
                 CaptureEnd::DurationExpired,
                 false,
                 false,
                 None,
-                Some(128 + libc::SIGTERM),
+                None,
             ),
             (
                 "/bin/sleep",

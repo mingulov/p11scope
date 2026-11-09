@@ -876,9 +876,13 @@ named gap (the retirement count is
 the run fails instead: no profile
 report is published (a trace `-o` stream keeps only the lines already
 written), and a `--duration` child is terminated rather than handed back. A
-signal that lands inside an active pause cycle (which has a 500 ms deadline)
-can also end the run with a `pause coordination cancelled` error, after the
-same resume and settlement and with the same `-o` outcome.
+signal that lands inside an active `auto` pause cycle (which has a 500 ms
+deadline) cancels that cycle instead: the child is resumed, the cancelled
+attempt counts one partial, and the run ends by signal with its report
+rather than an error. Under `--pause always` the same stop still ends the
+run with a `pause coordination cancelled` error and no report: required
+pause protection that cannot complete refuses rather than capturing
+unpaused.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 256 members per pass, rarest providers first; past the cap the capture

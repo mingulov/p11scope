@@ -5689,6 +5689,10 @@ fn drain_discovery_tick(
         Ok(Some(changed)) => Ok((changed, true)),
         Ok(None) => Ok((engine.drain_discovery(session)?, false)),
         Err(error) => {
+            if cancelled_pause_cycle(&error, interrupted.interrupted()) {
+                owned.coordinator.note_cancelled_cycle();
+                return Ok((engine.drain_discovery(session)?, false));
+            }
             let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
             if always {
@@ -5718,7 +5722,9 @@ impl TickPauseIo for SessionPauseIo<'_> {
 /// `service_pause`, without the frame's ordinary discovery, so a disabled or
 /// retired policy leaves discovery to the next frame. An error is retired
 /// exactly as a frame retires it (`retire_pause_policy`: lifecycle ends the
-/// capture, `always` degrades to unpaused with a gap). The tick's
+/// capture, `always` degrades to unpaused with a gap), except a
+/// stop-cancelled `auto` cycle, which hands the tick back so the loop
+/// observes the stop and still writes the report. The tick's
 /// `(plan_changed, paused)` reports whatever the call applied either way.
 fn pending_stop_pass(
     coordinator: &mut PauseCoordinator,
@@ -5727,6 +5733,10 @@ fn pending_stop_pass(
     let paused = match service_pause(coordinator, io) {
         Ok(serviced) => serviced,
         Err(error) => {
+            if cancelled_pause_cycle(&error, io.cancelled().unwrap_or(false)) {
+                coordinator.note_cancelled_cycle();
+                return Ok((io.plan_changed(), false));
+            }
             let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
             if always {
@@ -5736,6 +5746,14 @@ fn pending_stop_pass(
         }
     };
     Ok((io.plan_changed(), paused))
+}
+
+/// An operator stop that lands inside a best-effort (`auto`) pause cycle
+/// cancels it with a lifecycle error; that is a signal end, not a capture
+/// failure: the tick hands back so the loop observes the stop and still
+/// writes the report. Required (`always`) pauses keep refusing.
+fn cancelled_pause_cycle(error: &PauseError, cancelled: bool) -> bool {
+    cancelled && error.lifecycle() && !error.required()
 }
 
 /// `pending_stop_pass` for the capture loops, through the session adapter.

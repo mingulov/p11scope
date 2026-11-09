@@ -15962,6 +15962,16 @@ int main(int argc, char **argv) {
                 None,
                 None,
             ),
+            // With --kill-on-timeout the requested kill still lands,
+            // whether or not the pause cleanup succeeded.
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                false,
+                true,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
             (
                 "/bin/sleep",
                 CaptureEnd::DurationExpired,

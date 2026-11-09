@@ -467,9 +467,13 @@ capture can refuse its fixed 384 MiB graph pool: the stop ends as a
 finite incomplete stop, with retired objects still reported attached
 and the measured peak disclosed (full entry below).
 
-A timed run shorter than the first full pass (5–10 s on a busy host)
-discards the collection and reports 0 callers with a `no complete
-collection pass` gap and one informational stderr line. The first
+A timed `--cgroup` run shorter than the first full pass (5–10 s on
+a busy host) still discards the collection and reports 0 callers
+with a `no complete collection pass` gap and one informational
+stderr line (the retained-pass path; follow-up planned below).
+Under `--pid` and `--system`, v0.7.0 instead publishes the completed
+first collection scan-only — modules and callers shown, counts
+`not attached` — with a `stopped before attach` scope gap. The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or
@@ -955,6 +959,10 @@ detail during a counter capture (`--select-endpoint`).
   further cut the short-run void rate.
 - Tracking short-lived processes that exit before their first binding
   (exit-time mapping verdicts shipped; full call attribution still planned).
+- Publishing a stopped `--cgroup` first pass scan-only: v0.7.0 keeps
+  the completed first collection under `--pid`/`--system` instead of
+  discarding it, but the `--cgroup` retained-pass path still reports
+  0 callers with the `no complete collection pass` gap.
 - Following the started command's process tree under `run`
   (descendant admission and per-descendant probes, scoped to that tree
   only).
@@ -1029,7 +1037,9 @@ and the measured peak disclosed (full entry below).
 
 A timed run shorter than the first full pass (5–10 s on a busy host)
 discards the collection and reports 0 callers with a `no complete
-collection pass` gap and one informational stderr line. The first
+collection pass` gap and one informational stderr line (v0.7.0 keeps
+this only on the `--cgroup` retained-pass path; `--pid` and `--system`
+now publish the kept first collection scan-only). The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or

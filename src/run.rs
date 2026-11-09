@@ -15076,10 +15076,10 @@ mod tests {
     fn sigkill_probe_cleans_up_its_orphan_on_every_exit_path() {
         let source = include_str!("run.rs");
         let probe = source
-            .split_once("fn sigkill_of_the_observer_resumes_a_stopped_owned_child() {")
+            .split_once("fn sigkill_of_the_observer_resumes_a_stopped_owned_child() {\n")
             .unwrap()
             .1
-            .split_once("fn capture_end_only_allows_handoff_for_clean_duration_expiry")
+            .split_once("fn capture_end_only_allows_handoff_for_clean_duration_expiry() {\n")
             .unwrap()
             .0;
         let read = probe.find("let orphan = u32::from_ne_bytes(pid);").unwrap();
@@ -16274,13 +16274,29 @@ int main(int argc, char **argv) {
     /// elsewhere survives. Duration/settle tests need a child that simply
     /// lives until signalled, independent of host coreutils.
     fn build_sleeper(dir: &std::path::Path) -> std::path::PathBuf {
-        let source = dir.join("sleeper.c");
-        let binary = dir.join("sleeper");
-        std::fs::write(
-            &source,
+        build_sleeper_source(
+            dir,
             "#include <unistd.h>\nint main(void) { for (;;) sleep(60); return 0; }\n",
         )
-        .unwrap();
+    }
+
+    /// The same sleeper with a self-imposed lifetime: `alarm` ends it
+    /// after `seconds` even if every test-side cleanup was skipped (the
+    /// test binary itself SIGKILLed), so a probe that deliberately runs
+    /// without the test-death backstop leaves minutes, not days, of residue.
+    fn build_bounded_sleeper(dir: &std::path::Path, seconds: u32) -> std::path::PathBuf {
+        build_sleeper_source(
+            dir,
+            &format!(
+                "#include <unistd.h>\nint main(void) {{ alarm({seconds}); for (;;) sleep(60); return 0; }}\n"
+            ),
+        )
+    }
+
+    fn build_sleeper_source(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
+        let source = dir.join("sleeper.c");
+        let binary = dir.join("sleeper");
+        std::fs::write(&source, text).unwrap();
         assert!(
             std::process::Command::new("gcc")
                 .args(["-O0", "-o"])
@@ -24591,6 +24607,93 @@ int main(int argc, char **argv) {
     /// probe below sets it, and only while holding the signal-test mutex.
     struct SubreaperGuard;
 
+    /// Kills and reaps one test-owned process on drop unless disarmed,
+    /// so a failing assertion (a panic) can never leave a fixture behind.
+    /// The reap is bounded: a pid that is not (or no longer) this
+    /// process's child is still killed, then left to its own parent.
+    struct ChildKillGuard {
+        pid: Option<libc::pid_t>,
+    }
+
+    impl ChildKillGuard {
+        fn new(pid: libc::pid_t) -> Self {
+            Self { pid: Some(pid) }
+        }
+
+        fn disarm(&mut self) {
+            self.pid = None;
+        }
+    }
+
+    impl Drop for ChildKillGuard {
+        fn drop(&mut self) {
+            let Some(pid) = self.pid.take() else {
+                return;
+            };
+            // SAFETY: signals and waits on the exact guarded pid only.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut status = 0;
+                // SAFETY: status is a live out-param.
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid
+                    || (waited < 0
+                        && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+                {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn child_kill_guard_kills_and_reaps_on_panic() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ChildKillGuard::new(pid);
+            panic!("a failing probe assertion");
+        }));
+        assert!(unwound.is_err());
+        let mut status = 0;
+        // SAFETY: status is a live out-param.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1, "the guard must have reaped the child");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        drop(child);
+    }
+
+    #[test]
+    fn child_kill_guard_leaves_a_disarmed_child_alone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut guard = ChildKillGuard::new(pid);
+        guard.disarm();
+        drop(guard);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a disarmed guard kills nothing"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     impl Drop for SubreaperGuard {
         fn drop(&mut self) {
             // SAFETY: prctl with only integer arguments.
@@ -24688,7 +24791,7 @@ int main(int argc, char **argv) {
         );
         let _subreaper = SubreaperGuard;
         let fixture_dir = tempfile::tempdir().unwrap();
-        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = build_bounded_sleeper(fixture_dir.path(), 120);
         let (reader, writer) = pipe_pair();
         // SAFETY: fork in a test thread; the child never touches a lock
         // (spawn takes none) and exits via _exit on every failure path.
@@ -24699,6 +24802,9 @@ int main(int argc, char **argv) {
             close_inherited_in_test_fork(&writer);
             sigkill_probe_intermediate(writer, &sleeper);
         }
+        // Every failure below unwinds through these guards: the paused
+        // intermediate and the orphan are killed and reaped, never left.
+        let mut parent_guard = ChildKillGuard::new(parent);
         drop(writer);
         let mut pid = [0u8; 4];
         let mut reader = reader;
@@ -24706,9 +24812,11 @@ int main(int argc, char **argv) {
             .read_exact(&mut pid)
             .expect("the probe intermediate died before reporting its stopped child");
         let orphan = u32::from_ne_bytes(pid);
+        let mut orphan_guard = ChildKillGuard::new(orphan as libc::pid_t);
         // SAFETY: signaling the exact intermediate only, then reaping it.
         assert_eq!(unsafe { libc::kill(parent, libc::SIGKILL) }, 0);
         let parent_status = reap_blocking(parent);
+        parent_guard.disarm();
         assert!(
             libc::WIFSIGNALED(parent_status) && libc::WTERMSIG(parent_status) == libc::SIGKILL,
             "the probe intermediate was not SIGKILLed: status {parent_status:#x}"
@@ -24751,6 +24859,7 @@ int main(int argc, char **argv) {
             "the resumed orphan died before cleanup"
         );
         let orphan_status = reap_blocking(orphan as libc::pid_t);
+        orphan_guard.disarm();
         assert!(
             libc::WIFSIGNALED(orphan_status) && libc::WTERMSIG(orphan_status) == libc::SIGKILL,
             "the resumed orphan did not die by the cleanup SIGKILL: status {orphan_status:#x}"

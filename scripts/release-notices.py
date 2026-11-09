@@ -69,14 +69,28 @@ def package_id(package, root):
     return package["id"]
 
 
-def normalize_report(report, metadata, root, inputs):
-    """Validate coverage and text provenance without interpreting SPDX ourselves."""
+def normalize_report(report, metadata, root, inputs, feature_disabled=frozenset()):
+    """Validate coverage and text provenance without interpreting SPDX ourselves.
+
+    `feature_disabled` holds the exact package IDs the notice recipe justifies
+    as resolved-but-feature-disabled (absent from cargo-about's
+    feature-unified graph). Anything else missing, anything extra, and any
+    pin that no longer matches an absence all refuse.
+    """
     expected = {p["id"]: p for p in metadata["packages"]}
     actual = {p["package"]["id"]: p for p in report["crates"]}
-    if set(actual) != set(expected) or len(actual) != len(report["crates"]):
+    missing = set(expected) - set(actual)
+    extra = set(actual) - set(expected)
+    if extra or len(actual) != len(report["crates"]) or missing - set(feature_disabled):
         raise NoticeError("cargo-about package coverage differs from locked metadata")
+    stale = set(feature_disabled) - missing
+    if stale:
+        raise NoticeError(f"stale feature-disabled pin: {sorted(stale)[0]}")
     normalized = {}
     for ident, package in expected.items():
+        if ident in feature_disabled:
+            normalized[ident] = package_id(package, root)
+            continue
         # Cargo accepts this historical spelling; cargo-about canonicalizes it.
         # This exact alias is not a general SPDX parser or a license selection.
         canonical = {"MIT/Apache-2.0": "MIT OR Apache-2.0"}.get(package["license"], package["license"])
@@ -104,7 +118,7 @@ def normalize_report(report, metadata, root, inputs):
         notices.append({"license": entry["id"], "text": text,
                         "text_sha256": digest(text.encode()), "source_sha256": digest(raw),
                         "packages": sorted(normalized[p] for p in owners)})
-    if covered != expected.keys():
+    if covered != set(expected) - set(feature_disabled):
         raise NoticeError("notice coverage omits resolved packages")
     packages = [{"id": normalized[p["id"]], "name": p["name"], "version": p["version"],
                  "source": p["source"], "declared_license": p["license"]}
@@ -309,8 +323,13 @@ def generate(root, cargo_about, musl_archives, output):
     recipe_path = root / "third-party/licenses/sources.json"
     recipe_bytes = checked_bytes(recipe_path)
     recipe = json.loads(recipe_bytes)
-    if recipe.get("schema_version") != 2:
+    if recipe.get("schema_version") != 3:
         raise NoticeError("unsupported notice recipe schema")
+    disabled = recipe.get("feature_disabled")
+    if not isinstance(disabled, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) or not value.strip()
+            for key, value in disabled.items()):
+        raise NoticeError("notice recipe feature-disabled pins are invalid")
     verified = load_inputs(root, recipe)
     payload, toolchains = toolchain_payload(root, recipe)
     payload.update(musl_payload(musl_archives, recipe["musl"]))
@@ -331,7 +350,8 @@ def generate(root, cargo_about, musl_archives, output):
             config = temporary / f"{graph}.toml"
             config.write_text(make_config(metadata, root, recipe))
             raw = json.loads(run([str(cargo_about), "generate", "--locked", "--offline", "--workspace", "--no-default-features", "--fail", "--format", "json", "--config", str(config), "--manifest-path", str(manifest)], root, environment))
-            graphs[graph] = normalize_report(raw, metadata, root, root / "third-party/licenses")
+            graphs[graph] = normalize_report(raw, metadata, root, root / "third-party/licenses",
+                                               frozenset(disabled))
             originals, additional_payload = collect_license_files(metadata, root)
             graphs[graph]["original_license_files"] = originals
             payload.update(additional_payload)

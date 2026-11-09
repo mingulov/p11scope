@@ -196,6 +196,9 @@
       ]
     }
   },
+  "feature_disabled": {
+    "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63": "optional zerocopy/derive feature; nothing in the locked graph enables it (ahash 0.8.12 uses zerocopy with simd only, default-features off), so cargo-about/krates filters it from the feature-unified graph while cargo metadata still resolves it"
+  },
   "files": {
     "aya-302985c-apache.txt": {
       "bytes": 10852,
@@ -666,7 +669,7 @@
     "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.99.1/src/llvm-project",
     "scope": "Notices for the native libraries and startup objects supplied by the pinned Rust target; actual linked members depend on the final artifact."
   },
-  "schema_version": 2,
+  "schema_version": 3,
   "toolchains": [
     {
       "files": [

@@ -2851,12 +2851,30 @@ mod tests {
         // Ring [call, discard, call] staged with no stop, then read up
         // to 16: the stop sits below the staged span, so the queue
         // refuses loudly instead of stopping early at 8 like before.
-        let mut script = ScriptedRecords::records([numbered_call(0)], 3);
-        script.push_discard();
-        script.push_record(numbered_call(1));
-        let mut queued = EventDrain::over(StagedEvents::with_caps(script, 1024, 1024 * 1024));
+        let make_script = || {
+            let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+            script.push_discard();
+            script.push_record(numbered_call(1));
+            script
+        };
+        let mut queued =
+            EventDrain::over(StagedEvents::with_caps(make_script(), 1024, 1024 * 1024));
         queued.source_mut().stage(100, None);
+        let consumer = queued.source.consumer();
+        let staged = queued.source_mut().staged_len();
+        let discarded = queued.discarded();
         assert!(queued.source_mut().bounded_record(16).is_err());
+        // The refusal changed nothing: the queue still holds the
+        // staged span and the loss count is untouched.
+        assert_eq!(queued.source.consumer(), consumer);
+        assert_eq!(queued.source_mut().staged_len(), staged);
+        assert_eq!(queued.discarded(), discarded);
+        // A stop at the staged span reads exactly like the bare ring.
+        let mut bare = EventDrain::over(make_script());
+        assert_eq!(
+            bounded_to_stop(&mut queued, 24),
+            bounded_to_stop(&mut bare, 24)
+        );
     }
 
     #[test]
@@ -2864,12 +2882,30 @@ mod tests {
         // Ring [call, discard, discard] staged with no stop, then read
         // up to 16: the stop sits below the staged span, so the queue
         // refuses loudly instead of overshooting to 24 like before.
-        let mut script = ScriptedRecords::records([numbered_call(0)], 3);
-        script.push_discard();
-        script.push_discard();
-        let mut queued = EventDrain::over(StagedEvents::with_caps(script, 1024, 1024 * 1024));
+        let make_script = || {
+            let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+            script.push_discard();
+            script.push_discard();
+            script
+        };
+        let mut queued =
+            EventDrain::over(StagedEvents::with_caps(make_script(), 1024, 1024 * 1024));
         queued.source_mut().stage(100, None);
+        let consumer = queued.source.consumer();
+        let staged = queued.source_mut().staged_len();
+        let discarded = queued.discarded();
         assert!(queued.source_mut().bounded_record(16).is_err());
+        // The refusal changed nothing: the queue still holds the
+        // staged span and the loss count is untouched.
+        assert_eq!(queued.source.consumer(), consumer);
+        assert_eq!(queued.source_mut().staged_len(), staged);
+        assert_eq!(queued.discarded(), discarded);
+        // A stop at the staged span reads exactly like the bare ring.
+        let mut bare = EventDrain::over(make_script());
+        assert_eq!(
+            bounded_to_stop(&mut queued, 24),
+            bounded_to_stop(&mut bare, 24)
+        );
     }
 
     #[test]

@@ -158,7 +158,9 @@ were not run either. Each item below names its measured kernel range.
   retained in the saved reports. In one of the two runs a 25 s
   `--system` capture reported PARTIAL with exact counts and `1
   discovery step unavailable` (observation `lossy`/`skipped`); the
-  rerun was exact.
+  rerun showed no discovery gap (observation exact, counts still
+  3000; still PARTIAL for withheld attribution, same as the 7.3.1
+  control).
 - Kernels/conditions: 6.6.157 measured twice; 7.3.1 control clean.
   Kernel-specificity of the single transient is not established.
 - Why: live capture is supported where uprobe-multi links. The

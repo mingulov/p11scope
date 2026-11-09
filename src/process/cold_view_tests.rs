@@ -292,7 +292,11 @@ fn cold_target_object_and_cached_mountinfo_use_the_same_retained_filesystem() {
         for _ in 0..2 {
             let (file, mountinfo) = view
                 .open_then_cached_mountinfo(
-                    |filesystem| filesystem.open_rooted(&group.program),
+                    |filesystem| {
+                        filesystem
+                            .open_rooted_detailed(&group.program)
+                            .map_err(|failure| failure.reason)
+                    },
                     &mut cache,
                     &mut work,
                 )

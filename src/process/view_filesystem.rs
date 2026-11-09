@@ -296,6 +296,43 @@ fn host_fallback_allowed(
     target_root != observer_root && target_mount_ns == observer_mount_ns
 }
 
+/// A target-root open failure with its resolution errno when the
+/// failure came from the `openat2` resolution itself. Only a
+/// resolution errno can authorize the host fallback; a precondition,
+/// size, type or reopen refusal carries `None` and never retries.
+#[derive(Debug, Clone)]
+pub(crate) struct RootedOpenFailure {
+    pub reason: String,
+    pub resolution_errno: Option<i32>,
+}
+
+/// Whether an `openat2` errno from the target-root open may retry on
+/// the host: only resolution failures (a path missing under a chroot,
+/// including symlink and magic-link loops) qualify. Any other errno —
+/// permission, memory, busy — fails where it happened.
+fn is_resolution_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        x if x == libc::ENOENT || x == libc::ENOTDIR || x == libc::EXDEV || x == libc::ELOOP
+    )
+}
+
+/// True when `path` cannot be opened under either root: relative or
+/// carrying parent traversal. Both roots enforce the same shape.
+fn path_needs_absolute_no_traversal(path: &Path) -> bool {
+    !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
 fn observer_root_identity() -> Option<(u64, u64)> {
     std::fs::metadata("/")
         .ok()
@@ -625,17 +662,35 @@ impl<'a> ViewFilesystem<'a> {
         metadata
     }
 
-    pub(crate) fn open_rooted(&self, path: &Path) -> Result<std::fs::File, String> {
-        let pinned = self.pin_rooted_regular(path)?;
-        Self::open_pinned_regular(&pinned)
+    pub(crate) fn open_rooted_detailed(
+        &self,
+        path: &Path,
+    ) -> Result<std::fs::File, RootedOpenFailure> {
+        let pinned = self.pin_rooted_regular_detailed(path)?;
+        Self::open_pinned_regular(&pinned).map_err(|reason| RootedOpenFailure {
+            reason,
+            resolution_errno: None,
+        })
     }
 
-    pub(crate) fn open_rooted_object(&self, path: &Path) -> Result<std::fs::File, String> {
-        let file = self.open_rooted(path)?;
-        let size = file.metadata().map_err(|error| error.to_string())?.len();
+    pub(crate) fn open_rooted_object_detailed(
+        &self,
+        path: &Path,
+    ) -> Result<std::fs::File, RootedOpenFailure> {
+        let file = self.open_rooted_detailed(path)?;
+        let size = file
+            .metadata()
+            .map_err(|error| RootedOpenFailure {
+                reason: error.to_string(),
+                resolution_errno: None,
+            })?
+            .len();
         let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
         if size > limit {
-            return Err(format!("object is {size} bytes; limit is {limit}"));
+            return Err(RootedOpenFailure {
+                reason: format!("object is {size} bytes; limit is {limit}"),
+                resolution_errno: None,
+            });
         }
         Ok(file)
     }
@@ -652,24 +707,24 @@ impl<'a> ViewFilesystem<'a> {
     /// name another filesystem entirely, and only the target root can open
     /// it. On total failure the original target-root reason is preserved.
     pub(crate) fn open_mapped(&self, path: &Path) -> Result<std::fs::File, MappedOpenError> {
-        match self.open_rooted(path) {
+        match self.open_rooted_detailed(path) {
             Ok(file) => Ok(file),
-            Err(reason) => self.open_mapped_fallback(path, reason, false),
+            Err(failure) => self.open_mapped_fallback(path, failure, false),
         }
     }
 
     /// [`open_mapped`](Self::open_mapped) with the shared object size cap.
     pub(crate) fn open_mapped_object(&self, path: &Path) -> Result<std::fs::File, MappedOpenError> {
-        match self.open_rooted_object(path) {
+        match self.open_rooted_object_detailed(path) {
             Ok(file) => Ok(file),
-            Err(reason) => self.open_mapped_fallback(path, reason, true),
+            Err(failure) => self.open_mapped_fallback(path, failure, true),
         }
     }
 
     fn open_mapped_fallback(
         &self,
         path: &Path,
-        reason: String,
+        failure: RootedOpenFailure,
         with_size_cap: bool,
     ) -> Result<std::fs::File, MappedOpenError> {
         let target = self.target_root_identity();
@@ -681,30 +736,94 @@ impl<'a> ViewFilesystem<'a> {
             }
             _ => None,
         };
-        let allowed = match (target, observer, observer_ns) {
-            (Some(target), Some(observer), Some(namespace)) => {
-                host_fallback_allowed(target, observer, self.namespace, namespace)
-            }
-            _ => false,
-        };
+        let retryable = failure.resolution_errno.is_some_and(is_resolution_errno);
+        let allowed = retryable
+            && match (target, observer, observer_ns) {
+                (Some(target), Some(observer), Some(namespace)) => {
+                    host_fallback_allowed(target, observer, self.namespace, namespace)
+                }
+                _ => false,
+            };
         if !allowed {
             return Err(MappedOpenError {
-                reason,
+                reason: failure.reason,
                 foreign_target_root: foreign,
             });
         }
         let fallback = if with_size_cap {
-            p11scope_manifest::identity::open_object(path)
+            Self::open_host_object(path)
         } else {
-            p11scope_manifest::identity::open_regular(path)
+            Self::open_host_regular(path)
         };
         match fallback {
             Ok(file) => Ok(file),
             Err(fallback_reason) => Err(MappedOpenError {
-                reason: format!("{reason} (host-root fallback: {fallback_reason})"),
+                reason: format!("{} (host-root fallback: {fallback_reason})", failure.reason),
                 foreign_target_root: foreign,
             }),
         }
+    }
+
+    /// The host side of the mapping fallback: the same absolute/no-`..`
+    /// precondition as the target open, then an `openat2` pin from the
+    /// observer's own root with `RESOLVE_NO_MAGICLINKS`, so a
+    /// `/proc/self/fd`-style magic link is refused instead of followed.
+    /// The pinned inode is verified regular before the readable reopen.
+    pub(crate) fn open_host_regular(path: &Path) -> Result<std::fs::File, String> {
+        if path_needs_absolute_no_traversal(path) {
+            return Err(
+                "host-root object requires an absolute path without parent traversal".into(),
+            );
+        }
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|error| error.to_string())?;
+        let how = OpenHow {
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            // No root scope here (the observer's own `/` is the frame),
+            // but magic links still cannot redirect this open elsewhere.
+            resolve: 0x02, // RESOLVE_NO_MAGICLINKS
+        };
+        // SAFETY: `AT_FDCWD` with a bounded NUL-terminated absolute name
+        // and the kernel's fixed open_how layout.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if result < 0 {
+            return Err(format!("open failed: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: successful openat2 returned a newly owned descriptor.
+        let pinned = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(result as i32) });
+        if !pinned
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err("not a regular file".into());
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+            .map_err(|error| format!("opening pinned regular file failed: {error}"))
+    }
+
+    /// [`open_host_regular`](Self::open_host_regular) with the shared
+    /// object size cap.
+    pub(crate) fn open_host_object(path: &Path) -> Result<std::fs::File, String> {
+        let file = Self::open_host_regular(path)?;
+        let size = file.metadata().map_err(|error| error.to_string())?.len();
+        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+        if size > limit {
+            return Err(format!("object is {size} bytes; limit is {limit}"));
+        }
+        Ok(file)
     }
 
     /// The target root's `(device, inode)` identity: the retained root for a
@@ -731,17 +850,18 @@ impl<'a> ViewFilesystem<'a> {
         )
     }
 
-    fn pin_rooted_regular(&self, path: &Path) -> Result<std::fs::File, String> {
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
-        {
-            return Err(
-                "target-root object requires an absolute path without parent traversal".into(),
-            );
+    fn pin_rooted_regular_detailed(&self, path: &Path) -> Result<std::fs::File, RootedOpenFailure> {
+        if path_needs_absolute_no_traversal(path) {
+            return Err(RootedOpenFailure {
+                reason: "target-root object requires an absolute path without parent traversal"
+                    .into(),
+                resolution_errno: None,
+            });
         }
-        let relative = path.strip_prefix("/").map_err(|error| error.to_string())?;
+        let relative = path.strip_prefix("/").map_err(|error| RootedOpenFailure {
+            reason: error.to_string(),
+            resolution_errno: None,
+        })?;
         let ordinary_root;
         let root = match &self.cold {
             Some(cold) => &cold.filesystem.root,
@@ -750,18 +870,20 @@ impl<'a> ViewFilesystem<'a> {
                     .read(true)
                     .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
                     .open(self.owned_path("root"))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| RootedOpenFailure {
+                        reason: error.to_string(),
+                        resolution_errno: None,
+                    })?;
                 &ordinary_root
             }
         };
-        let name = std::ffi::CString::new(relative.as_os_str().as_encoded_bytes())
-            .map_err(|error| error.to_string())?;
-        #[repr(C)]
-        struct OpenHow {
-            flags: u64,
-            mode: u64,
-            resolve: u64,
-        }
+        let name =
+            std::ffi::CString::new(relative.as_os_str().as_encoded_bytes()).map_err(|error| {
+                RootedOpenFailure {
+                    reason: error.to_string(),
+                    resolution_errno: None,
+                }
+            })?;
         let how = OpenHow {
             flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -789,15 +911,24 @@ impl<'a> ViewFilesystem<'a> {
                 Ok(raw)
             }
         })
-        .map_err(|error| format!("opening object within retained target root: {error}"))?;
+        .map_err(|error| RootedOpenFailure {
+            reason: format!("opening object within retained target root: {error}"),
+            resolution_errno: error.raw_os_error(),
+        })?;
         // SAFETY: successful openat2 returned a newly owned descriptor.
         let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(result as i32) });
         if !file
             .metadata()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| RootedOpenFailure {
+                reason: error.to_string(),
+                resolution_errno: None,
+            })?
             .is_file()
         {
-            return Err("target-root object is not a regular file".into());
+            return Err(RootedOpenFailure {
+                reason: "target-root object is not a regular file".into(),
+                resolution_errno: None,
+            });
         }
         Ok(file)
     }
@@ -1376,8 +1507,9 @@ mod tests {
             );
             assert!(
                 proof
-                    .open_rooted(&fifo)
+                    .open_rooted_detailed(&fifo)
                     .unwrap_err()
+                    .reason
                     .contains("not a regular file")
             );
             let mut events = [0u8; 512];
@@ -1409,13 +1541,13 @@ mod tests {
             std::fs::write(&regular, b"original regular inode").unwrap();
             std::os::unix::fs::symlink(&regular, &alias).unwrap();
             for path in [&regular, &alias] {
-                let mut file = proof.open_rooted(path).unwrap();
+                let mut file = proof.open_rooted_detailed(path).unwrap();
                 let mut body = String::new();
                 file.read_to_string(&mut body).unwrap();
                 assert_eq!(body, "original regular inode");
             }
 
-            let pinned = proof.pin_rooted_regular(&alias).unwrap();
+            let pinned = proof.pin_rooted_regular_detailed(&alias).unwrap();
             let held = pinned.metadata().unwrap();
             std::fs::rename(&regular, regular.with_extension("held")).unwrap();
             let replacement =
@@ -1430,8 +1562,9 @@ mod tests {
             assert_eq!(body, "original regular inode");
             assert!(
                 proof
-                    .open_rooted(&alias)
+                    .open_rooted_detailed(&alias)
                     .unwrap_err()
+                    .reason
                     .contains("not a regular file")
             );
             proof.validate(&mut work).unwrap();
@@ -1454,19 +1587,25 @@ mod tests {
         let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
         file.set_len(limit + 1).unwrap();
         assert_eq!(
-            proof.open_rooted(&large).unwrap().metadata().unwrap().len(),
+            proof
+                .open_rooted_detailed(&large)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
             limit + 1
         );
         assert!(
             proof
-                .open_rooted_object(&large)
+                .open_rooted_object_detailed(&large)
                 .unwrap_err()
+                .reason
                 .contains("limit is")
         );
         file.set_len(limit).unwrap();
         assert_eq!(
             proof
-                .open_rooted_object(&large)
+                .open_rooted_object_detailed(&large)
                 .unwrap()
                 .metadata()
                 .unwrap()
@@ -1528,7 +1667,7 @@ mod tests {
             assert_ne!(u64::from_le_bytes(body[8..16].try_into().unwrap()), 0);
             assert!(body[16..].iter().all(|byte| *byte == 0));
             let object = proof
-                .open_rooted(&group.program)
+                .open_rooted_detailed(&group.program)
                 .expect("the held target root opens its actual provider");
             let actual = object.metadata().unwrap();
             let expected = group.program.metadata().unwrap();
@@ -1635,7 +1774,10 @@ mod tests {
         let mut work = CaptureWorkBudget::default();
         let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
         for path in ["relative", "/../outside", "/owned/../../outside"] {
-            let error = proof.open_rooted(Path::new(path)).unwrap_err();
+            let error = proof
+                .open_rooted_detailed(Path::new(path))
+                .unwrap_err()
+                .reason;
             assert!(error.contains("without parent traversal"), "{error}");
         }
         proof.validate(&mut work).unwrap();
@@ -1745,7 +1887,10 @@ mod tests {
         }
         let exe = std::env::current_exe().unwrap();
         ViewFilesystem::open_host_regular(&exe).expect("an ordinary host file opens");
-        ViewFilesystem::open_host_object(&exe).expect("an ordinary host object opens");
+        // The test binary itself exceeds the shared object cap, so the
+        // capped positive control uses a small system file instead.
+        ViewFilesystem::open_host_object(Path::new("/bin/sh"))
+            .expect("a small host object opens under the cap");
     }
 
     /// A precondition refusal and a size refusal carry no resolution

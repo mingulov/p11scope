@@ -11636,8 +11636,9 @@ mod tests {
         // mapping predates the chroot.
         view.with_filesystem(&mut budget, |filesystem, _| {
             let error = filesystem
-                .open_rooted(&exe)
-                .expect_err("target-root open must fail inside the chroot");
+                .open_rooted_detailed(&exe)
+                .expect_err("target-root open must fail inside the chroot")
+                .reason;
             assert!(
                 error.contains("opening object within retained target root"),
                 "unexpected primitive error: {error}"

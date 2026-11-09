@@ -971,6 +971,12 @@
     },
     {
       "file": "src/discovery/pressure_native_tests.rs",
+      "path": "discovery::engine::pressure_native_tests::cgroup_scope_probe_flags_in_scope_ambient_only",
+      "reason": "privileged: live BPF cgroup-scope sensitivity probe; run as root with --ignored --test-threads=1 under the privileged lane",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pressure_native_tests.rs",
       "path": "discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control_admits",
       "reason": "privileged: live BPF unparked-head control; run as root with --ignored --test-threads=1 under the privileged lane",
       "cell": "privileged"

@@ -15,7 +15,7 @@
 #   run_lifecycle::a_signalled_child_reports_the_signal_status_the_shell_would
 #   run_lifecycle::duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for
 #   run_lifecycle::the_run_only_evidence_field_reaches_the_written_document
-#   pause::omitted_pause_is_never_and_publishes_the_neutral_lattice
+#   pause::explicit_never_publishes_the_neutral_lattice
 #   pause::explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing
 #   pause::explicit_always_refuses_rather_than_completing_unpaused
 #   t2_cold_start::cold_start_profile_lane_is_honest_without_ambient_state
@@ -232,7 +232,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     LOG_BODY='P11SCOPE_TEST_BRANCH=unavailable
 test one ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'
-    check 'pause::omitted_pause_is_never_and_publishes_the_neutral_lattice' 0 1 False failed 'branch=unavailable rc=0'
+    check 'pause::explicit_never_publishes_the_neutral_lattice' 0 1 False failed 'branch=unavailable rc=0'
     # A passing run that printed no branch line fails instead of passing
     # as branch=unknown.
     LOG_BODY='test one ... ok
@@ -357,7 +357,7 @@ CELLS=(
     run_lifecycle:a_signalled_child_reports_the_signal_status_the_shell_would
     run_lifecycle:duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for
     run_lifecycle:the_run_only_evidence_field_reaches_the_written_document
-    pause:omitted_pause_is_never_and_publishes_the_neutral_lattice
+    pause:explicit_never_publishes_the_neutral_lattice
     pause:explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing
     pause:explicit_always_refuses_rather_than_completing_unpaused
     t2_cold_start:cold_start_profile_lane_is_honest_without_ambient_state

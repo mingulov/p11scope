@@ -724,10 +724,9 @@ fn spawn_run_observer(
         out.to_str().context("out path")?,
     ]);
     // The gate-less probe overrides the pause policy through the
-    // environment; every other shape runs the default (`never`).
-    if let Some(mode) = pause {
-        command.args(["--pause", mode]);
-    }
+    // environment; every other shape runs explicit `never` (the
+    // pre-0.7.0 default the cells were qualified under).
+    command.args(["--pause", pause.unwrap_or("never")]);
     command.args([
         "--",
         ledger.to_str().context("ledger path")?,
@@ -1014,7 +1013,7 @@ fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
     let workload = K0Workload::build_owned(&module)?;
     // P11SCOPE_K0_PAUSE=always probes the pause hypothesis (the child
     // pauses at its load until the observer processes it); the
-    // default campaign leaves it unset, which is `--pause never`.
+    // default campaign leaves it unset, which runs explicit `--pause never`.
     let pause = std::env::var("P11SCOPE_K0_PAUSE").ok();
     let outcome = k0_owned_run(
         &workload,

@@ -152,12 +152,13 @@ pub struct CaptureArgs {
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
-/// racing an unobserved `dlopen`. `Never` is the omission default: nothing this
-/// observer starts is stopped unless the operator asked for it.
+/// racing an unobserved `dlopen`. `Auto` is the omission default: a first run
+/// holds the child at loader hits until its probes attach, so early calls are
+/// counted. `Never` stays available for runs that must not delay the child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PausePolicy {
-    #[default]
     Never,
+    #[default]
     Auto,
     Always,
 }
@@ -716,7 +717,7 @@ start (a provider loaded after start needs --prearm-module <provider.so>; with r
 required). The detail is the function's own counter values between selection and close; an exec of the owned child in between withholds it with a named reason
 while a leader exit that is the last lifecycle record ends the window cleanly.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
---pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load. The default becomes auto in a later release, so spelling out --pause auto keeps the command working either way.
+--pause auto (default) pauses only when the child would load unobserved; never does not pause the child (for runs that must not delay it); always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
 executable identity and the child's own execs are grouped by linkage.
@@ -2352,7 +2353,7 @@ pub fn parse_capture(
 /// taken verbatim so an argument meant for the child is never consumed here.
 fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliError> {
     let mut common = Common::default();
-    let mut pause = PausePolicy::Never;
+    let mut pause = PausePolicy::Auto;
     let mut pause_seen = false;
     let mut kill_on_timeout = false;
     let mut trace = false;
@@ -4734,7 +4735,7 @@ mod tests {
                 assert_eq!(run.kind, Kind::Profile);
                 assert!(run.metrics && !run.unsafe_requested);
                 assert_eq!(run.counter_mode, Some(expected));
-                assert_eq!(run.pause, PausePolicy::Never);
+                assert_eq!(run.pause, PausePolicy::Auto);
                 assert_eq!(run.attach_backend, BackendSelection::Auto);
                 assert_eq!(run.command, child, "child flags and bytes belong after --");
             }
@@ -4783,7 +4784,7 @@ mod tests {
             assert_eq!(run.metrics, metrics);
             assert_eq!(run.counter_mode, None);
             assert!(!run.unsafe_requested);
-            assert_eq!(run.pause, PausePolicy::Never);
+            assert_eq!(run.pause, PausePolicy::Auto);
             assert_eq!(run.command, ["/bin/echo", "--counter-mode", "counts"]);
         }
 

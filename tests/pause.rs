@@ -105,13 +105,17 @@ fn assert_pause_lattice(evidence: &p11scope::render::Evidence) {
 }
 
 #[test]
-fn omitted_pause_is_never_and_publishes_the_neutral_lattice() {
+fn explicit_never_publishes_the_neutral_lattice() {
     let dir = work_dir("never");
     let marker = dir.join("ran");
-    let omitted = paused_run(PausePolicy::Never, &marker);
-    assert_eq!(omitted.pause, PausePolicy::Never, "omission is never");
+    let explicit = paused_run(PausePolicy::Never, &marker);
+    assert_eq!(
+        explicit.pause,
+        PausePolicy::Never,
+        "explicit never stays never"
+    );
 
-    match (capture_available(), run_owned(&omitted)) {
+    match (capture_available(), run_owned(&explicit)) {
         (true, Ok(outcome)) => {
             eprintln!("P11SCOPE_TEST_BRANCH=positive");
             // Nothing this observer started was stopped, and no pause
@@ -123,7 +127,7 @@ fn omitted_pause_is_never_and_publishes_the_neutral_lattice() {
         }
         (false, Err(_)) => {
             eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
-            require_capture_positive("omitted_pause_is_never_and_publishes_the_neutral_lattice");
+            require_capture_positive("explicit_never_publishes_the_neutral_lattice");
             assert!(!marker.exists(), "a refused run released the child");
         }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),

@@ -602,11 +602,11 @@ stock non-Multi hosts are outside current live support, and none of these
 numbers is a product cold-start SLA. The kernel verifies BPF loads; plan the
 hold phase accordingly. Keep the workload alive past attach (a sleep/hold phase,
 `LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived
-daemons via `profile --pid`). Without `run --pause auto`, expect the
-earliest post-load calls to be absent from the counts; with it, the child
-is held at each loader hit until the new provider's probes are attached,
-and the release qualification captured every call of a child that
-`dlopen`s SoftHSM2.
+daemons via `profile --pid`). `run` holds the child at each loader hit
+by default (`--pause auto`), and the release qualification captured
+every call of a child that `dlopen`s SoftHSM2. With `run --pause never`,
+expect the earliest post-load calls to be absent from the counts; pass
+it only for runs that must not delay the child.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
@@ -994,7 +994,9 @@ verdict (`"clean_but_unproven"`): the stop gate did not prove the final drain
 (see `evidence.stop_quiescence`). An owned run whose command ran ahead of
 probe attachment without pausing says
 `coverage: partial — the command loaded its provider before probes attached;
-rerun with --pause auto`. With `-v`, each plain reason is paired with its
+rerun with --pause auto`. Since 0.7.0 the default is `--pause auto`, so
+this line appears only when the run did not pause (explicit `--pause
+never`). With `-v`, each plain reason is paired with its
 machine cause name, and the `Evidence:` line repeats the same verdict
 reasons after the probe and slot counts. A `COMPLETE` verdict reads
 `coverage: complete`.

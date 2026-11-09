@@ -585,6 +585,21 @@ impl PauseCoordinator {
         Ok(coordinator)
     }
 
+    /// An `auto` preflight that could not even start degrades to this
+    /// instead of failing the child: one counted partial attempt, arming
+    /// disabled, no hold. The lattice reads `partial`, so the run reports
+    /// `PARTIAL` with the named pause cause while the child runs free.
+    /// `always` never takes this path: it refuses.
+    pub(crate) fn degraded_auto(pid: u32, generation: u64) -> Self {
+        let mut degraded = Self::new(PausePolicy::Auto, pid, generation, BTreeMap::new());
+        degraded.rearming_enabled = false;
+        degraded.counters.attempts = 1;
+        degraded.counters.partial = 1;
+        degraded.hold_void = true;
+        debug_assert!(degraded.counters.valid());
+        degraded
+    }
+
     fn new(
         policy: PausePolicy,
         pid: u32,
@@ -4025,6 +4040,43 @@ mod tests {
                 .contains("start time during pause preflight"),
             "{error}"
         );
+    }
+
+    /// An `auto` preflight that cannot start degrades instead of failing
+    /// the child: one counted partial attempt, arming disabled, no hold,
+    /// cleanup a no-op. (`always` still refuses: see the preflight tests.)
+    #[test]
+    fn degraded_auto_counts_one_partial_and_never_arms() {
+        let mut coordinator = PauseCoordinator::degraded_auto(41, 9);
+        let mut io = FakeIo::default();
+
+        assert_eq!(coordinator.policy, PausePolicy::Auto);
+        assert_eq!(coordinator.pid, 41);
+        assert_eq!(coordinator.generation(), 9);
+        assert!(!coordinator.is_armed());
+        assert!(!coordinator.rearming_enabled());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            }
+        );
+        assert!(coordinator.counters().valid());
+        assert_eq!(coordinator.status(), PauseStatus::Partial);
+        assert!(coordinator.pause_hold().is_none());
+
+        assert_eq!(
+            coordinator
+                .arm(&mut io)
+                .expect("a disabled arm cannot fail"),
+            ArmResult::Disabled
+        );
+        assert!(!coordinator.stop_pending(&mut io));
+        coordinator.cleanup(&mut io).expect("nothing to clean");
+        assert_eq!(coordinator.counters().partial, 1);
     }
 
     /// The owned child ends; its last records are already in the ring. Nothing
@@ -10531,11 +10583,8 @@ mod tests {
             panic!("expected an owned run");
         };
         assert_eq!(default_args.pause, PausePolicy::Auto, "omission is auto");
-        let (oracle_outcome, oracle_doc) = wrapper_profile(
-            PausePolicy::Auto,
-            tool.clone(),
-            &dir.join("oracle.json"),
-        );
+        let (oracle_outcome, oracle_doc) =
+            wrapper_profile(PausePolicy::Auto, tool.clone(), &dir.join("oracle.json"));
         assert_eq!(oracle_outcome.child_exit_code, Some(0));
         let oracle = wrapper_total_calls(&oracle_doc);
         assert!(oracle > 0, "the oracle workload must observe calls");

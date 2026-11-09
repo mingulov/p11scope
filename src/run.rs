@@ -4822,6 +4822,16 @@ fn run_owned_inner_with_host(
     };
     let coordinator = match preflight {
         Ok(coordinator) => coordinator,
+        Err(error) if args.pause == cli::PausePolicy::Auto => {
+            // Best effort: an `auto` preflight that cannot even start
+            // degrades to an unpaused run with one counted partial
+            // attempt, never a dead child. `always` still refuses below.
+            emit_capture_diagnostic(&format!(
+                "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
+                render::escape_controls(&error.to_string())
+            ));
+            PauseCoordinator::degraded_auto(child.pid(), child.generation().get())
+        }
         Err(error) => {
             return Err(combine_preflight_failure_with(
                 error,

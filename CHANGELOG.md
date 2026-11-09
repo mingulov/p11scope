@@ -39,6 +39,13 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Changed
 
+- `p11scope run` now pauses by default (`--pause auto`): a first run
+  holds the child at loader hits until its probes attach, so early
+  calls are counted instead of missed. `--pause never` stays available
+  for runs that must not delay the child, and an `auto` pause that
+  cannot start degrades to an unpaused run with a named gap instead of
+  failing the child.
+
 ### Fixed
 
 - `inventory --system` binds usage on hosts with many endpoints (was:

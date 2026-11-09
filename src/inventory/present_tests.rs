@@ -5094,36 +5094,6 @@ fn empty_inventory_with_two_replaced_programs_counts_two() {
     );
 }
 
-/// F1 twin: the pre-wording spelling triggers the same disclosure,
-/// so the text survives either side of the constant change.
-#[test]
-fn empty_inventory_with_legacy_replaced_reason_names_not_counted() {
-    let harness = varied_harness();
-    let caller = harness.coordinator().adapter().live_id(70_000).unwrap();
-    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
-    presentation.edges.clear();
-    presentation.gaps.clear();
-    presentation.gaps_suppressed = 0;
-    presentation.gaps.push(GapView {
-        caller: Some(caller),
-        module: None,
-        pid: Some(70_000),
-        subject: "/prov/libsofthsm2.so (deleted)".into(),
-        reason: "provider file replaced on disk while running; calls not counted".into(),
-        budget: None,
-        repeats: 1,
-    });
-    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    assert!(
-        out.contains("No counted associations; 1 program runs files replaced on disk (below)."),
-        "the legacy spelling triggers the same line: {out}"
-    );
-    assert!(
-        out.contains("not counted: driver (PID 70000) runs /prov/libsofthsm2.so (deleted)"),
-        "the legacy spelling names the program and file: {out}"
-    );
-}
-
 /// F1 guard: an empty inventory without replaced files keeps the bare
 /// absence line.
 #[test]

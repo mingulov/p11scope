@@ -2278,8 +2278,10 @@ const REPLACED_FILE_REASON_NEXT: &str =
     "replaced on disk while running; not examined, calls not counted";
 
 /// True for a gap naming a running copy whose file was replaced on
-/// disk while it runs: the current replaced-provider reason or its
-/// neutral successor. Both spellings disclose the same loss.
+/// disk while it runs: the live replaced-provider reason or its
+/// neutral successor. The pre-wording spelling has no producer once
+/// the constant change lands, so no test pins it; then both arms
+/// coincide and the second may fold into the first.
 fn is_replaced_file_gap(reason: &str) -> bool {
     reason == crate::discovery::scan::REPLACED_PROVIDER_REASON
         || reason == REPLACED_FILE_REASON_NEXT

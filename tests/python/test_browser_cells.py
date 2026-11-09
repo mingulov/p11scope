@@ -682,6 +682,29 @@ class BrowserCells(unittest.TestCase):
         context.close()
         return captured["env"]
 
+    def test_run_direct_chromium_tmpdir_fits_the_singleton_socket(self):
+        """Twin: a deep cell must not hand Chromium a TMPDIR whose
+        SingletonSocket path overflows ``sun_path`` (FATAL, SIGABRT on
+        every launch); a shallow cell and Firefox keep ``workdir/tmp``."""
+        deep = self.work / ("d" * 80) / "cell"
+        deep.mkdir(parents=True)
+        short = cells.child_tmpdir("chromium", deep)
+        try:
+            self.assertNotIn(deep, short.parents)
+            self.assertTrue(short.is_dir())
+            self.assertEqual(short.stat().st_mode & 0o777, 0o700)
+            self.assertLessEqual(
+                len(os.fsencode(short)) + len(cells.CHROMIUM_SOCKET_SUFFIX),
+                cells.SUN_PATH_MAX)
+        finally:
+            shutil.rmtree(short, ignore_errors=True)
+        self.assertEqual(cells.child_tmpdir("firefox", deep), deep / "tmp")
+        shallow = self.work / "c"
+        shallow.mkdir()
+        if len(os.fsencode(shallow / "tmp")) + len(cells.CHROMIUM_SOCKET_SUFFIX) \
+                <= cells.SUN_PATH_MAX:
+            self.assertEqual(cells.child_tmpdir("chromium", shallow), shallow / "tmp")
+
     def test_launch_without_registered_module_scrubs_store_env(self):
         """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
 

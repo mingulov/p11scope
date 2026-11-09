@@ -820,6 +820,9 @@ pub struct Engine {
     /// Loader-arm attempts driven by inventory (`arm_loader_or_partial`
     /// calls) — the hook half of the same oracle.
     loader_arms: u64,
+    /// Inventory ticks started (`refresh_inventory` entries). Names the
+    /// dropped pass in the pass-containment gap; healthy ticks never read it.
+    inventory_passes: u64,
     /// Cumulative exploratory views evicted by rotation.
     exploratory_evictions: u64,
     /// Cumulative pending newcomers completed without a view by the
@@ -11040,6 +11043,7 @@ impl Engine {
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
             loader_arms: 0,
+            inventory_passes: 0,
             exploratory_evictions: 0,
             probationary_completions: 0,
             #[cfg(test)]
@@ -12809,6 +12813,22 @@ impl Engine {
         self.note_facts_mutated();
     }
 
+    /// Pass containment (P1-5): one tick's candidate or apply failing
+    /// drops that pass's delta with a counted named gap, keeping the
+    /// previous committed plan, pins and modules. Only pre-commit
+    /// failures reach here: `apply_candidate` fails before its first
+    /// link mutation (its one `?` is the pre-mutation preflight), and
+    /// `inventory_candidate` builds from clones, so the committed state
+    /// is untouched and the next tick retries the retained requests.
+    #[track_caller]
+    fn note_dropped_pass(&mut self, error: &anyhow::Error) {
+        let pass = self.inventory_passes;
+        self.mark_partial(
+            "live inventory pass",
+            &format!("pass {pass} dropped: {error:#}"),
+        );
+    }
+
     pub(crate) fn selection_coverage(
         &self,
         provider: plan::ModuleId,
@@ -14033,8 +14053,19 @@ impl Engine {
         if self.facts_revision != self.published_facts_revision
             || self.capture_facts.staged.is_some()
         {
-            self.publish_current_capture_facts()?;
-            self.tail_publishes = self.tail_publishes.saturating_add(1);
+            match self.publish_current_capture_facts() {
+                Ok(()) => {
+                    self.tail_publishes = self.tail_publishes.saturating_add(1);
+                }
+                Err(error) => {
+                    // Pass containment (P1-5): a tail merge failing drops
+                    // with a gap like a tick candidate, keeping the previous
+                    // published history. `merge_current` fails before cloning
+                    // it, so nothing partial commits. Always Ok: callers keep
+                    // their `?` (now infallible) to stay minimal.
+                    self.note_dropped_pass(&error);
+                }
+            }
         } else {
             self.tail_skips = self.tail_skips.saturating_add(1);
         }
@@ -24424,6 +24455,7 @@ impl Engine {
             )
         });
         let mut new_views = Vec::new();
+        self.inventory_passes = self.inventory_passes.saturating_add(1);
         self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(
             session,
@@ -24913,7 +24945,7 @@ impl Engine {
         let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
-        let candidate = inventory_candidate_observed(
+        let candidate = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::First,
             || {
@@ -24933,7 +24965,15 @@ impl Engine {
                     &declined,
                 )
             },
-        )?;
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.note_dropped_pass(&error);
+                *additions_allowed = false;
+                closure.fail();
+                return Ok(false);
+            }
+        };
         let admission_start = crate::attach::monotonic_ns();
         let admission = inventory_admission_observed(
             session,
@@ -25198,7 +25238,7 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let mut candidate = inventory_candidate_observed(
+        let mut candidate = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::Final,
             || {
@@ -25210,7 +25250,15 @@ impl Engine {
                 ]
             },
             || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped, &declined),
-        )?;
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.note_dropped_pass(&error);
+                *additions_allowed = false;
+                closure.fail();
+                return Ok(changed);
+            }
+        };
         // Declined views stay in the candidate's pins and modules (the
         // apply carries them over unchanged) but leave its currency set:
         // the apply reads `candidate.views` raw for its admission,
@@ -25348,7 +25396,15 @@ impl Engine {
             .map(|prepared| (prepared.view, prepared.serial))
             .collect();
         let outcome =
-            self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
+            match self.apply_candidate(session, candidate, additions_allowed, true, &extra_views) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.note_dropped_pass(&error);
+                    *additions_allowed = false;
+                    closure.fail();
+                    return Ok(changed);
+                }
+            };
         self.record_apply_timing(&outcome);
         if outcome.disposition == ApplyDisposition::Deferred {
             // Retain exact original request serials, ages, newcomers and exec

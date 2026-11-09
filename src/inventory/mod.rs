@@ -6352,6 +6352,17 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 
     fn collector(&mut self) -> crate::inventory_capture::CollectJob {
         if let Some(cgroup) = &mut self.cgroup {
+            // Owner rule 2026-11-09: pass 0 completes like a sync
+            // collection even past the run deadline, so a short timed
+            // run still publishes what it saw. The run control keeps
+            // the deadline and still gates later passes; operator
+            // stops still reach this same worker control through the
+            // shared source and the loop's direct latch.
+            let control = if self.coordinator.passes() == 0 {
+                cgroup.control.without_deadline()
+            } else {
+                cgroup.control.clone()
+            };
             let task = cgroup
                 .continuation
                 .take()
@@ -6361,17 +6372,14 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                         .cgroup_collector_observed(
                             state,
                             cgroup.limits.clone(),
-                            cgroup.control.clone(),
+                            control.clone(),
                             self.max_scan_pids,
                             cgroup.observer.clone(),
                         )
                         .map(|job| Box::new(job) as crate::inventory_capture::CgroupCollectJob)
                         .map_err(|_| CgroupJobFailure::Preparation)
                 });
-            return CollectJob::Cgroup {
-                control: cgroup.control.clone(),
-                task,
-            };
+            return CollectJob::Cgroup { control, task };
         }
         match self.inventory_scope {
             Some(scope) => {

@@ -3298,6 +3298,15 @@ where
                 }
                 let now = now_ns();
                 let job = driver.collector();
+                // The job's worker control can differ from the run
+                // control (a deadline-decoupled pass-0 fork): an
+                // operator stop must latch both, so the worker still
+                // cancels promptly while the run deadline only ends
+                // the run past this pass.
+                let worker_control = match &job {
+                    CollectJob::Cgroup { control, .. } => Some(control.clone()),
+                    CollectJob::Legacy(_) => None,
+                };
                 // The ring first, then the display (C5.3): on a fixed-rate schedule,
                 // so the draw never delays the next ring service.
                 let collected = collect_job_off_thread(
@@ -3314,6 +3323,9 @@ where
                         driver.on_tick_with_acquisition(lane_acquisition(&mut lane));
                         if let Some(control) = &control {
                             latch_collection_stop(control, clock);
+                        }
+                        if let Some(worker) = &worker_control {
+                            latch_collection_stop(worker, clock);
                         }
                     },
                     clock.deadline,
@@ -3389,6 +3401,40 @@ where
                         driver.host().stop_coordinator();
                         stop_latched = true;
                         break;
+                    }
+                }
+                // The cgroup twin of P1-2 (owner rule 2026-11-09): the
+                // stop landed during (deadline, decoupled for pass 0) or
+                // just after (any stop) pass 0's collection, which
+                // completed. The completed collection still applies
+                // below instead of discarding into an empty view, with
+                // the same stopped-before-attach marker on a live lane.
+                // Attaching after the stop stays blocked: the cgroup
+                // commit hooks already refuse extension past a latched
+                // stop, and the run breaks after this pass publishes.
+                // A cancelled collection keeps today's path (no marker
+                // here; the transaction gap names it at commit).
+                if control.is_some()
+                    && passes == 0
+                    && let Some(cause) = clock.stop_cause()
+                    && matches!(
+                        &collected,
+                        CollectedPass::Cgroup(Ok(collection))
+                            if collection.outcome()
+                                == crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete
+                    )
+                {
+                    stop_cause.get_or_insert(cause);
+                    if lane.is_some() {
+                        driver.host().note_scope_gap(
+                            STOPPED_BEFORE_ATTACH_SUBJECT.into(),
+                            format!(
+                                "{} ({} elapsed); the completed collection applied scan-only: \
+                                 modules and callers shown, counts not attached",
+                                ZeroPassStop::cause_event(cause, true),
+                                elapsed_secs_2dp(loop_start.elapsed()),
+                            ),
+                        );
                     }
                 }
                 let mut report = if let Some(cause) = stopped_before_apply {

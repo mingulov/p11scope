@@ -53,6 +53,20 @@ impl CollectionControl {
         self.operator_stop_source = Some(source);
         self
     }
+    /// A worker control for a pass that must complete like a sync
+    /// collection (owner rule 2026-11-09): no run deadline, its own
+    /// stop latch, the same operator-stop source and clock. The run
+    /// control keeps the deadline and still gates later passes; an
+    /// operator stop reaches the worker through the shared source,
+    /// and the loop latches this same control directly.
+    pub(crate) fn without_deadline(&self) -> Self {
+        Self {
+            deadline: None,
+            stop: Arc::new(AtomicU8::new(0)),
+            operator_stop_source: self.operator_stop_source.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
     pub(crate) fn cancel(&self) {
         let _ = self
             .stop
@@ -1431,6 +1445,32 @@ mod tests {
                 &CollectionControl::new(None)
             ),
             MembershipOutcome::Unknown(CgroupIncomplete::ReplacedDirectory)
+        );
+    }
+    #[test]
+    fn deadline_fork_ignores_the_deadline_but_shares_operator_stop() {
+        let start = Instant::now();
+        let source = Arc::new(AtomicUsize::new(0));
+        let run =
+            CollectionControl::new(Some(start)).with_operator_stop_source(Arc::clone(&source));
+        let worker = run.without_deadline();
+        assert_eq!(run.check(), Err(CollectionStop::Deadline));
+        assert_eq!(
+            worker.check(),
+            Ok(()),
+            "the forked worker control carries no deadline"
+        );
+        run.cancel();
+        assert_eq!(
+            worker.check(),
+            Ok(()),
+            "the run latch does not reach the forked atomic"
+        );
+        source.store(1, Ordering::SeqCst);
+        assert_eq!(
+            worker.check(),
+            Err(CollectionStop::OperatorStop),
+            "the shared stop source still cancels the worker"
         );
     }
     #[test]

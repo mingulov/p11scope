@@ -314,16 +314,35 @@ fn returning_read_control_gate(reason: GateStop, native: bool) {
         1,
         "no next or recovery collection after stop"
     );
-    if reason != GateStop::Healthy {
-        assert_eq!(
-            control.check(),
-            Err(if reason == GateStop::Operator {
-                CollectionStop::OperatorStop
-            } else {
-                CollectionStop::Deadline
-            })
+    if reason == GateStop::Healthy {
+        assert_eq!(control.check(), Ok(()));
+        assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+        assert!(driver.inner.coordinator.registry().edges().next().is_some());
+    } else if reason == GateStop::Deadline {
+        // Owner rule 2026-11-09: pass 0 completes past the deadline,
+        // so the run publishes the scanned caller like the healthy
+        // twin instead of discarding into 0 callers. The run control
+        // still latches, and the staged delta is never taken past
+        // the stop.
+        assert_eq!(control.check(), Err(CollectionStop::Deadline));
+        assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+        assert!(driver.inner.coordinator.registry().edges().next().is_some());
+        assert!(
+            !driver
+                .inner
+                .coordinator
+                .take_target_delta()
+                .endpoints
+                .is_empty(),
+            "the completed commit stages its delta; the stopped run takes nothing"
         );
-        assert_eq!(driver.inner.coordinator.registry().caller_count(), 0);
+    } else {
+        assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
+        assert_eq!(
+            driver.inner.coordinator.registry().caller_count(),
+            0,
+            "an operator stop still cancels the worker promptly"
+        );
         assert!(
             driver
                 .inner
@@ -332,10 +351,6 @@ fn returning_read_control_gate(reason: GateStop, native: bool) {
                 .endpoints
                 .is_empty()
         );
-    } else {
-        assert_eq!(control.check(), Ok(()));
-        assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
-        assert!(driver.inner.coordinator.registry().edges().next().is_some());
     }
     if native {
         assert!(
@@ -452,6 +467,87 @@ fn cgroup_short_timed_run_publishes_scanned_pass0() {
     assert!(
         driver.inner.coordinator.registry().edges().next().is_some(),
         "the scanned caller's module edge publishes"
+    );
+}
+
+/// Live twin of the kept pass: with a native lane the completed
+/// pass-0 collection publishes its caller beside the
+/// `stopped before attach` scope gap (counts never attached; no
+/// attach starts after the stop), and the owned stop still drains.
+#[test]
+fn cgroup_short_timed_run_keeps_live_pass_with_attach_gap() {
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let (capture, _native_log) = crate::inventory_capture::tests::cgroup_runtime_lane();
+    let lane = NativeLane::start(capture, &mut coordinator, LaneWindows::PROVISIONAL, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let base = Instant::now();
+    let deadline = base + Duration::from_millis(200);
+    let control = CollectionControl::new(Some(deadline));
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let worker_reads = reads.clone();
+    driver.wrapper = Some(Box::new(move |job| {
+        Box::new(move || {
+            let mut first = true;
+            crate::discovery::scan::maps_read_test::observe(
+                move |bytes| {
+                    if bytes > 0 {
+                        worker_reads.fetch_add(1, Ordering::SeqCst);
+                        if first {
+                            first = false;
+                            let bound = Instant::now() + Duration::from_secs(10);
+                            while Instant::now() < deadline {
+                                assert!(
+                                    Instant::now() < bound,
+                                    "the held read must see the deadline pass"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                },
+                job,
+            )
+        })
+    }));
+    let stop_requested = || false;
+    let mut loop_clock = clock(&stop_requested);
+    loop_clock.deadline = Some(deadline);
+    let result = run_classic_finalizing(&mut driver, Some(lane), &loop_clock, None, &mut |_, _| {
+        Ok(())
+    });
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(
+        reads.load(Ordering::SeqCst) > 0,
+        "actual scanner I/O reached the held read"
+    );
+    assert_eq!(
+        control.check(),
+        Err(CollectionStop::Deadline),
+        "the deadline latched during the held collection"
+    );
+    let stopped = result.stopped.as_ref().expect("the owned stop drains");
+    assert_eq!(stopped.summary.passes, 1, "the kept pass is the run");
+    assert!(
+        result.zero_pass.is_none(),
+        "a kept pass is not a zero-pass run"
+    );
+    assert_eq!(
+        driver.inner.coordinator.registry().caller_count(),
+        1,
+        "the scanned caller publishes instead of discarding to 0"
+    );
+    assert!(
+        driver.inner.coordinator.registry().edges().next().is_some(),
+        "the scanned caller's module edge publishes"
+    );
+    let gaps = driver.inner.coordinator.registry().gaps();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.subject == crate::inventory_capture::STOPPED_BEFORE_ATTACH_SUBJECT),
+        "the live kept pass names stopped-before-attach: {:?}",
+        gaps.iter().map(|gap| &gap.subject).collect::<Vec<_>>()
     );
 }
 
@@ -601,14 +697,20 @@ fn cgroup_runtime_fast_result_stop_is_checked_before_apply_commit() {
     assert!(result.error.is_none());
     assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
     assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
-    assert_eq!(driver.inner.coordinator.registry().caller_count(), 0);
+    // Owner rule 2026-11-09: the stop landed after the collection
+    // completed, so the completed collection still applies instead
+    // of discarding into 0 callers (the cgroup twin of the kept
+    // pass-0). The run control still latches, and no second
+    // collection starts.
+    assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
     assert!(
-        driver
+        !driver
             .inner
             .coordinator
             .take_target_delta()
             .endpoints
-            .is_empty()
+            .is_empty(),
+        "the completed commit stages its delta; the stopped run takes nothing"
     );
 }
 

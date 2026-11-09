@@ -1663,6 +1663,7 @@ const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was
 const MANIFEST_OBJECT_UNAVAILABLE: &str = "manifest object unavailable";
 const PREARM_OBJECT_UNAVAILABLE: &str = "prearm object unavailable";
 const DISCOVERY_TRANSPORT_UNAVAILABLE: &str = "discovery transport unavailable";
+const INVENTORY_PASS_UNAVAILABLE: &str = "inventory pass unavailable";
 
 /// The engine's view-capacity sentence with its configured limit value
 /// still in place: exact prefix, ASCII digits, exact suffix, whole string
@@ -1779,6 +1780,11 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         || (s.subject == "live discovery transport" && s.reason.contains("transport failure"))
     {
         DISCOVERY_TRANSPORT_UNAVAILABLE
+    } else if s.subject == "live inventory pass" {
+        // Dropped inventory passes (single and aggregated forms alike)
+        // keep their own finite reason; the internal error chain stays
+        // in diagnostics. The subject has a single producer.
+        INVENTORY_PASS_UNAVAILABLE
     } else {
         DISCOVERY_UNAVAILABLE
     };

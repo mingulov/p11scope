@@ -252,19 +252,21 @@ def check_trace(verdict, body, text_blobs, args):
         verdict.info("caller '%s' named on %d/%d events"
                      % (args.caller, len(named), total))
         return
+    gap_classes = evidence.get("gap_classes", {})
+    if not isinstance(gap_classes, dict):
+        gap_classes = {}
     causes = []
-    try:
-        causes = (evidence.get("gap_classes", {}).get("observation", {})
-                  .get("causes", []))
-    except AttributeError:
-        causes = []
+    for lane in ("observation", "attribution"):
+        lane_info = gap_classes.get(lane, {})
+        if isinstance(lane_info, dict):
+            causes.extend(lane_info.get("causes", []) or [])
     if causes:
         verdict.caller = "unknown-named"
-        verdict.info("caller unknown with named observation causes: %s"
-                     % (causes,))
+        verdict.info("caller unknown with named gap causes: %s" % (causes,))
     else:
         verdict.bad("caller '%s' unnamed on all %d events and no "
-                    "observation cause names why" % (args.caller, total))
+                    "observation/attribution cause names why"
+                    % (args.caller, total))
 
 
 def check_inventory(verdict, doc, args):

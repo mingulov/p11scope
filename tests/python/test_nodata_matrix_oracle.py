@@ -64,7 +64,8 @@ def exact_functions():
             for name, count in sorted(EXPECTED_COUNTS.items())]
 
 
-def trace_text(per_fn, caller='"harness"', raw_calls=None, extra=""):
+def trace_text(per_fn, caller='"harness"', raw_calls=None, extra="",
+               attribution_causes=()):
     lines = ["CAPTURE privacy=allowlisted", "identity: exact"]
     n = 0
     for index, (name, count) in enumerate(sorted(per_fn.items())):
@@ -79,7 +80,10 @@ def trace_text(per_fn, caller='"harness"', raw_calls=None, extra=""):
                  % (total, total, total))
     lines.append("EVIDENCE {\"event_loss\":0,"
                  "\"gap_classes\":{\"observation\":{\"causes\":[],"
-                 "\"status\":\"exact\"}}}")
+                 "\"status\":\"exact\"},\"attribution\":{\"causes\":[%s],"
+                 "\"status\":\"withheld\"}}}"
+                 % ",".join(json.dumps(cause)
+                            for cause in attribution_causes))
     if extra:
         lines.append(extra)
     return "\n".join(lines) + "\n"
@@ -316,6 +320,19 @@ class OracleCase(unittest.TestCase):
         rc, text = self.judge("profile", "pid", json.dumps({"hello": 1}))
         self.assertEqual(rc, 1, text)
         self.assert_result(text, "FAIL")
+
+    # GREEN: trace with unknown-only exe but a named attribution cause
+    # (manifest-less runs withhold exe labels as semantic_unverified_slots).
+    def test_trace_caller_attribution_withheld_pass(self):
+        body = trace_text(
+            EXPECTED_COUNTS, caller="Unknown executable",
+            attribution_causes=["semantic_unverified_slots"]).replace(
+            'exe="/work/harness" ', "")
+        rc, text = self.judge(
+            "trace", "pid", body,
+            stderr_body="note: /work/cells/x/libnodata.so attached\n")
+        self.assertEqual(rc, 0, text)
+        self.assert_result(text, "PASS")
 
     # RED: trace with unknown-only callers and no named cause.
     def test_trace_caller_unknown_unnamed_fail(self):

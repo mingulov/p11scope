@@ -3618,6 +3618,9 @@ fn capture_with_host(
             engine.plan().modules.is_empty(),
         )?;
         emit_capture_diagnostic(&empty_plan_hint(&a.scope, engine.plan()));
+        for line in replaced_file_hint_lines(&engine.plan().skipped) {
+            emit_capture_diagnostic(&line);
+        }
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
@@ -5668,6 +5671,41 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
              `p11scope inspect --pid <n>` for one process, or `p11scope doctor` to see why"
             .to_string(),
     }
+}
+
+/// stderr lines naming the distinct replaced provider files behind this
+/// capture's discovery gaps, so an empty profile/trace report still names
+/// the file instead of only pointing at inspect/doctor. One line per
+/// distinct file, the first eight in sorted order with any rest counted;
+/// every subject is control-escaped for the terminal. Empty when no plan
+/// skip carries the replaced-file reason.
+fn replaced_file_hint_lines(skipped: &[crate::discovery::scan::Skipped]) -> Vec<String> {
+    const SHOWN: usize = 8;
+    let mut files: Vec<&str> = skipped
+        .iter()
+        .filter(|skip| skip.reason == crate::discovery::scan::REPLACED_PROVIDER_REASON)
+        .map(|skip| skip.subject.as_str())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    let mut lines: Vec<String> = files
+        .iter()
+        .take(SHOWN)
+        .map(|file| {
+            format!(
+                "p11scope: {}: {}; restart the process to count its calls",
+                render::escape_controls(file),
+                crate::discovery::scan::REPLACED_PROVIDER_REASON
+            )
+        })
+        .collect();
+    if files.len() > SHOWN {
+        lines.push(format!(
+            "p11scope: ... and {} more replaced files not shown",
+            files.len() - SHOWN
+        ));
+    }
+    lines
 }
 
 /// Best-effort capture diagnostic on stderr through the bounded

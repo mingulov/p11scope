@@ -2911,10 +2911,11 @@ mod c1b {
     use super::*;
     use crate::inspect_system::{
         AdmissionRecord, AdmissionSummary, Catalog, CatalogObject, MemberGeneration, MemberStatus,
-        Observation, ObservationEvidence, ProcessRecord,
+        Observation, ObservationEvidence, PidGap, ProcessRecord,
     };
     use crate::process::ProcessViewId;
     use p11scope_manifest::maps::{Device, ObjectKey};
+    use std::collections::BTreeMap;
 
     const REP: u32 = 10_000;
     const CALLERS: u32 = 300;
@@ -3141,6 +3142,217 @@ mod c1b {
             edge_of(&document, REP + 6).unwrap()["mapping"]["state"],
             "mapped"
         );
+    }
+
+    /// Sweep digests for every process row: the scripted stand-in for
+    /// the per-pid digests a collection pairs with each swept pid.
+    fn with_digests(mut catalog: Catalog) -> Catalog {
+        catalog.sweep_digests = catalog
+            .processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid,
+                    (
+                        Some(start(process.pid)),
+                        0x9E37_79B9_7F4A_7C15u64.wrapping_add(u64::from(process.pid)),
+                    ),
+                )
+            })
+            .collect();
+        catalog
+    }
+
+    /// The transient empty pass: the provider representative's rescan
+    /// failed, so the pass bound no provider key — no objects, every
+    /// caller unselected — while no member's maps changed (the first
+    /// pass's digests carried over). Carries the production capped-loss
+    /// and per-pid maps gaps for that shape.
+    fn transient_pass(digests: &BTreeMap<u32, (Option<u64>, u64)>) -> Catalog {
+        let mut pass = catalog(&[], &[]);
+        pass.objects.clear();
+        pass.admission.admitted = 0;
+        pass.maps_matched = 0;
+        pass.unexamined = CALLERS as usize;
+        pass.unexamined_objects = 6;
+        for process in &mut pass.processes {
+            if process.pid < 20_000 {
+                process.status = MemberStatus::NotSelected { loss: None };
+                process.objects.clear();
+                process.generation = None;
+                process.hints_examined = false;
+            }
+        }
+        pass.sweep_digests = digests.clone();
+        pass.skipped = vec![PidGap {
+            pid: None,
+            subject: "discovery capped".into(),
+            reason: "448 processes in scope; 2 deep-scanned by provider rarity (limit 64); 0 \
+                 attributed to pinned provider objects by exact maps identity; 300 processes map 6 \
+                 shared objects no deep scan examined and may use undiscovered providers"
+                .into(),
+            generic: false,
+        }];
+        for pid in REP..REP + CALLERS {
+            pass.skipped.push(PidGap {
+                pid: Some(pid),
+                subject: "maps attribution".into(),
+                reason: "maps 1 shared object no deep scan examined this pass; it may be an \
+                     undiscovered provider"
+                    .into(),
+                generic: false,
+            });
+        }
+        pass
+    }
+
+    fn edge_states(document: &serde_json::Value, state: &str) -> usize {
+        document["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["mapping"]["state"] == state)
+            .count()
+    }
+
+    /// One transient pass that binds no provider key must not discard
+    /// established edges: members whose maps are byte-identical to the
+    /// prior applied pass keep their mappings.
+    #[test]
+    fn a_transient_pass_binding_no_provider_key_keeps_established_edges() {
+        let mut harness = spawned();
+        let first = with_digests(catalog(&[], &[]));
+        let digests = first.sweep_digests.clone();
+        harness.apply_catalog(first);
+        harness.advance(1);
+        let report = harness.apply_catalog(transient_pass(&digests));
+        assert_eq!(report.maps_matched, 0);
+        let document = harness.render();
+        assert_eq!(
+            document["edges"].as_array().unwrap().len(),
+            CALLERS as usize
+        );
+        assert_eq!(
+            edge_states(&document, "mapped"),
+            CALLERS as usize,
+            "established edges survive a transient no-bind pass"
+        );
+        let edges = document["edges"].as_array().unwrap();
+        let evidence = |label: &str| {
+            edges
+                .iter()
+                .filter(|edge| edge["mapping"]["evidence"] == label)
+                .count()
+        };
+        assert_eq!(evidence("deep_scan"), 1);
+        assert_eq!(evidence("maps_match"), (CALLERS - 1) as usize);
+    }
+
+    /// The transient pass is one named gap: its vacuous capped loss and
+    /// per-pid unexamined gaps (every member was examined last pass and
+    /// has not changed) are not forwarded as new unknowns.
+    #[test]
+    fn a_transient_pass_binding_no_provider_key_is_one_named_gap() {
+        let mut harness = spawned();
+        let first = with_digests(catalog(&[], &[]));
+        let digests = first.sweep_digests.clone();
+        harness.apply_catalog(first);
+        harness.advance(1);
+        harness.apply_catalog(transient_pass(&digests));
+        let document = harness.render();
+        let gaps = document["gaps"].as_array().unwrap();
+        let kept = gaps
+            .iter()
+            .find(|gap| gap["subject"] == "transient pass retained established edges")
+            .expect("one named gap for the transient pass");
+        let reason = kept["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("300"),
+            "the gap counts the retained callers: {reason}"
+        );
+        assert!(
+            gaps.iter().all(|gap| gap["subject"] != "discovery capped"
+                || gap["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("attribution complete")),
+            "the vacuous capped loss is not forwarded: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|gap| !(gap["subject"] == "maps attribution"
+                && gap["pid"].as_u64().is_some_and(|pid| {
+                    pid >= u64::from(REP) && pid < u64::from(REP + CALLERS)
+                }))),
+            "vacuous per-pid unexamined gaps are not forwarded: {gaps:?}"
+        );
+    }
+
+    /// The retention is keyed on unchanged identity: a no-bind pass with
+    /// remapped members still marks their edges uncertain and still
+    /// forwards its capped loss.
+    #[test]
+    fn a_no_bind_pass_with_changed_maps_still_marks_edges_uncertain() {
+        let mut harness = spawned();
+        let first = with_digests(catalog(&[], &[]));
+        let digests = first.sweep_digests.clone();
+        harness.apply_catalog(first);
+        harness.advance(1);
+        let mut second = transient_pass(&digests);
+        for prior in second.sweep_digests.values_mut() {
+            prior.1 ^= 0xFFFF_FFFF_FFFF_FFFF;
+        }
+        harness.apply_catalog(second);
+        let document = harness.render();
+        assert_eq!(
+            edge_states(&document, "uncertain"),
+            CALLERS as usize,
+            "remapped members are not retained"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter().any(|gap| gap["subject"] == "discovery capped"
+                && !gap["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("attribution complete")),
+            "a real loss still forwards its capped gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .all(|gap| gap["subject"] != "transient pass retained established edges"),
+            "nothing was retained, so no retention gap: {gaps:?}"
+        );
+    }
+
+    /// A real provider change still updates: a pass binding a new
+    /// provider key moves established edges onto the new module.
+    #[test]
+    fn a_new_provider_key_still_moves_established_edges() {
+        let mut harness = spawned();
+        let first = with_digests(catalog(&[], &[]));
+        harness.apply_catalog(first);
+        harness.advance(1);
+        let mut second = with_digests(catalog(&[], &[]));
+        second.objects[0].key.inode = 9_090;
+        second.objects[0].sha256 = Some("sha-softhsm2-new".into());
+        for prior in second.sweep_digests.values_mut() {
+            prior.1 ^= 0xFFFF_FFFF_FFFF_FFFF;
+        }
+        harness.apply_catalog(second);
+        let document = harness.render();
+        let modules = document["modules"].as_array().unwrap();
+        assert_eq!(modules.len(), 2);
+        let edges = document["edges"].as_array().unwrap();
+        let mapped: Vec<&serde_json::Value> = edges
+            .iter()
+            .filter(|edge| edge["mapping"]["state"] == "mapped")
+            .collect();
+        assert_eq!(mapped.len(), CALLERS as usize);
+        let targets: std::collections::BTreeSet<&str> = mapped
+            .iter()
+            .map(|edge| edge["module"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets.len(), 1, "every mapped edge moved to one module");
     }
 
     #[test]

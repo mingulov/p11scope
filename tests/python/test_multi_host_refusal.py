@@ -31,6 +31,17 @@ if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='scan':
         print('x'*10000+'scan-stdout-marker')
         print('y'*10000+'scan-stderr-marker',file=sys.stderr);sys.exit(7)
     pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps({'schema':'p11scope/inventory/v1'}));sys.exit(0)
+if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='auto' and mode!='refuses-auto':
+    if mode=='bad-fallback-doc':
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False},'gaps':[]}
+    elif mode=='fallback-counts-claim':
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':True},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test'}]}
+    else:
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test refuses at link'}]}
+    pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps(doc))
+    print('p11scope: native usage feed unavailable, continuing with the scan lane',file=sys.stderr);sys.exit(0)
+if mode=='native-exits-zero' and a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='native':
+    pathlib.Path(a[a.index('-o')+1]).write_text('{}');sys.exit(0)
 if mode=='accepts-singles' and 'singles' in a:sys.exit(0)
 if mode=='writes-sink' and '-o' in a:pathlib.Path(a[a.index('-o')+1]).write_text('TRUNCATED')
 if mode=='runs-child' and a[0]=='run':
@@ -67,6 +78,36 @@ class CombinedRefusalTests(unittest.TestCase):
         self.assertEqual({r["case"] for r in rows if r["outcome"] == "offline-ok"},
                          {"help", "version", "inventory-scan", "inventory-diff"})
         self.assertFalse((self.work / "workload-ran").exists())
+
+    def test_auto_inventory_fallback_partition_is_exact(self):
+        rows = self.check(self.observer, self.work)
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(sum(r["outcome"] == "refused" for r in rows), 13)
+        self.assertEqual(sorted(r["case"] for r in rows if r["outcome"] == "fallback"),
+                         ["inventory-auto-auto", "inventory-auto-multi",
+                          "inventory-auto-singles"])
+        self.assertEqual({r["case"] for r in rows if r["outcome"] == "offline-ok"},
+                         {"help", "version", "inventory-scan", "inventory-diff"})
+
+    def test_old_auto_refusal_is_rejected(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "refuses-auto"}):
+            with self.assertRaisesRegex(RuntimeError, "fallback"):
+                self.check(self.observer, self.work)
+
+    def test_native_inventory_must_still_refuse(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "native-exits-zero"}):
+            with self.assertRaisesRegex(RuntimeError, "refusal"):
+                self.check(self.observer, self.work)
+
+    def test_fallback_document_must_name_the_gap(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "bad-fallback-doc"}):
+            with self.assertRaisesRegex(RuntimeError, "fallback"):
+                self.check(self.observer, self.work)
+
+    def test_fallback_must_not_claim_counts(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "fallback-counts-claim"}):
+            with self.assertRaisesRegex(RuntimeError, "fallback"):
+                self.check(self.observer, self.work)
 
     def test_guest_uses_private_disk_stage_and_caller_trust(self):
         namespace = runpy.run_path(str(SCRIPT))
@@ -211,7 +252,8 @@ class CombinedRefusalTests(unittest.TestCase):
         self.assertTrue(progress.is_file(), "failed19th case erased preceding receipts")
         rows = json.loads(progress.read_text())["cases"]
         self.assertEqual(len(rows), 19)
-        self.assertEqual(sum(row["outcome"] == "refused" for row in rows), 16)
+        self.assertEqual(sum(row["outcome"] == "refused" for row in rows), 13)
+        self.assertEqual(sum(row["outcome"] == "fallback" for row in rows), 3)
         self.assertEqual(sum(row["outcome"] == "offline-ok" for row in rows), 2)
         failed = rows[-1]
         self.assertEqual((failed["case"], failed["outcome"], failed["rc"]),

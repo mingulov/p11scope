@@ -121,7 +121,7 @@ static int provider_path(char *out,size_t size,const char *dir,char side,unsigne
 }
 int main(int argc,char **argv) {
     unsigned long milliseconds,counted,shared;
-    if((argc!=8&&argc!=9)||!nonce_valid(argv[4])||number(argv[5],900000,&milliseconds)||
+    if((argc!=8&&argc!=9)||!nonce_valid(argv[4])||number(argv[5],1200000,&milliseconds)||
        number(argv[6],400,&counted)||number(argv[7],258,&shared))return 2;
     int probe=argc==9;
     if(probe&&(strcmp(argv[8],"probe")||counted!=3||shared!=1))return 2;

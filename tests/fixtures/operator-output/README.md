@@ -252,7 +252,7 @@ to the declared accelerated engine cadence; it does not establish default CLI
 cadence or disabled/enabled cost. The scoped override restores on normal return,
 nested calls and panic and cannot alter another thread's test. Run this short
 pilot before choosing any longer one-pair schedule; no guessed per-call record
-multiplier or arbitrary900s expectation is an acceptance fact.
+multiplier or arbitrary1200s expectation is an acceptance fact.
 
 The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
 32 indexed A/B2.40 table pairs and32common ELFs with one distinct real entry
@@ -357,7 +357,7 @@ Run the same independent schedule with diagnostics disabled/enabled and compare
 primary count, entry observation, saturation/inflight, capture, presence,
 coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
 Both legs must validate the same startup disposition; counts compare exactly
-with no replacement. Each run has an explicit900s bound; the pair runs at its
+with no replacement. Each run has an explicit1200s bound; the pair runs at its
 declared accelerated cadence (R-17):250ms for the pid cell,50ms for the
 system cell (whole-machine scan load), about12minutes per pid cell (two
 ~6-minute legs) and about27minutes per system cell on the reference host.
@@ -366,12 +366,12 @@ cadence, not default CLI cadence, performance or cost. Report actual
 runtime/output bytes. Controlled RSS/CPU/performance cost is a separate T10 gate.
 
 The 400/258 default-cadence schedule (KI-1/KI-2: ~1326 passes/leg exceeding
-900s at1s cadence on any host) is retired; the shortened264-round schedule
+1200s at1s cadence on any host) is retired; the shortened264-round schedule
 (264 = 260 counted + 4 shared without fence/proof; 266 with fence/proof per
 leg, 532 per two-leg cell) above replaces it with identical wrap and parity
 assertions, parameterized to the live schedule. Both default-ring capacities
 stay24576/8192. Ordinary margin is 224 records (<1%); longer counted runs
-exceed the 900 s system bound live.
+exceeded the former 900 s system bound live.
 
 Readable stderr accepts either complete once-only main-control-thread marker:
 `p11scope: cancel: loop exited on signal N after T ticks` or the truthful late

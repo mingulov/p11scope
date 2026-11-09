@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 const TARGETS: u64 = 32;
 const COUNTED: u64 = 400;
 const SHARED: u64 = 258;
-const RUN_SECONDS: u64 = 900;
+const RUN_SECONDS: u64 = 1200;
 const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Parameterized wrap schedule: `counted` A rounds, `shared` shared rounds,
@@ -42,30 +42,30 @@ const PILOT_SCHEDULE: WrapSchedule = WrapSchedule {
 /// 3232 (96/A-round, 32/S-round), exceptional 3897 (101/A-round,
 /// 69/S-round); C=260/S=4 yields ordinary 24800 and exceptional ~15-23k,
 /// both over the 24576/8192 capacities with a thin 224-record ordinary
-/// margin. Longer counted runs (C=286: 1056 margin) exceed the 900 s
-/// system bound live (enabled leg reached 249/286); 10% margin needs
-/// C~=330 at 32/round, infeasible on available hosts. The 900 s per-leg
-/// bound is unchanged.
+/// margin. Longer counted runs (C=286: 1056 margin) exceeded the former
+/// 900 s system bound live (enabled leg reached 249/286); 10% margin needs
+/// C~=330 at 32/round, infeasible on available hosts. The per-leg bound is
+/// 1200 s (owner 2026-11-09; hang guard only, proof unchanged).
 const WRAP_COUNTED: u64 = 260;
 const WRAP_SHARED: u64 = 4;
 const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
     counted: WRAP_COUNTED,
     shared: WRAP_SHARED,
     run_seconds: RUN_SECONDS,
-    deadline_ms: 900_000,
+    deadline_ms: 1_200_000,
 };
 
 /// Declared accelerated inter-pass cadences for the live wrap legs (R-17),
 /// applied through the existing test-only scoped override. Production builds
 /// and all unselected tests retain the 1 s cadence. The system leg scans the
-/// whole machine per pass, so it uses a faster cadence to fit the same 900 s
+/// whole machine per pass, so it uses a faster cadence to fit the same 1200 s
 /// per-leg bound; both cadences are declared up front per run.
 const WRAP_PID_POLL_INTERVAL_MS: u64 = 250;
 const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 50;
 
 /// Workload trailing CLI arguments `[NONCE, DEADLINE_MS, COUNTED, SHARED]`
 /// for a schedule, with the fixture binary's own bounds enforced first
-/// (deadline 1..=900_000, counted 1..=400, shared 1..=258) plus the
+/// (deadline 1..=1_200_000, counted 1..=400, shared 1..=258) plus the
 /// harness/fixture lifetime coordination: the workload's own deadline
 /// must cover the harness run budget, or the fixture would self-cancel
 /// mid-leg. Pure so unit tests pin the coordination without a fixture.
@@ -77,8 +77,8 @@ fn schedule_args(schedule: &WrapSchedule) -> Result<Vec<String>> {
         schedule.run_seconds
     );
     ensure!(
-        (1..=900_000).contains(&schedule.deadline_ms),
-        "workload deadline out of range 1..=900000: {}",
+        (1..=1_200_000).contains(&schedule.deadline_ms),
+        "workload deadline out of range 1..=1200000: {}",
         schedule.deadline_ms
     );
     ensure!(
@@ -7510,11 +7510,11 @@ fn operator_diagnostics_wrap_twin_schedule_args_pilot() -> Result<()> {
         counted: COUNTED,
         shared: SHARED,
         run_seconds: RUN_SECONDS,
-        deadline_ms: 900_000,
+        deadline_ms: 1_200_000,
     };
     let args = schedule_args(&full)?;
     ensure!(
-        args[1..] == ["900000", "400", "258"],
+        args[1..] == ["1200000", "400", "258"],
         "full workload arguments drifted: {args:?}"
     );
     for schedule in [
@@ -7552,7 +7552,7 @@ fn operator_diagnostics_wrap_twin_schedule_args_pilot() -> Result<()> {
             counted: 32,
             shared: 4,
             run_seconds: 540,
-            deadline_ms: 900_001,
+            deadline_ms: 1_200_001,
         },
         WrapSchedule {
             counted: 32,

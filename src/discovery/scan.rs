@@ -6262,6 +6262,31 @@ fn scan_view_with_examined(
     scan_view_examined_mode(request, view, budget, io, scan_memory, None)
 }
 
+/// Indices of `--module` hints naming a still-mapped copy of a replaced
+/// file: the kernel renders the group's raw path as "<path> (deleted)",
+/// so the suffix is stripped before the verbatim comparison. Empty when
+/// the raw path carries no parseable hint spelling.
+fn stripped_deleted_hint_matches(raw_path: &[u8], hints: &[PathBuf]) -> Vec<usize> {
+    let Some(prefix) = raw_path
+        .strip_suffix(b" (deleted)".as_slice())
+        .and_then(|prefix| std::str::from_utf8(prefix).ok())
+    else {
+        return Vec::new();
+    };
+    let stripped = Path::new(prefix);
+    hints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, hint)| {
+            if hint.as_path() == stripped {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn scan_view_examined_mode(
     request: &ScanRequest<'_>,
     view: &ProcessView,
@@ -6430,6 +6455,17 @@ fn scan_view_examined_mode(
             })
             .collect();
         let hinted = !matched.is_empty();
+        // A file replaced on disk still renders its old mappings as
+        // "<path> (deleted)". A `--module` hint naming that path matches
+        // the group, so the scan names the replaced-file gap below
+        // instead of reporting the hint as not mapped. The group still
+        // has no usable path, so it is never opened or attached.
+        let deleted_hint_matched: Vec<usize> = match &named {
+            Some((MappedPath::Unusable { reason }, raw_path)) if reason == "deleted mapping" => {
+                stripped_deleted_hint_matches(raw_path, request.hints)
+            }
+            _ => Vec::new(),
+        };
         // F5: the exclusion match is evaluated before the `--module` hint
         // filter, so a disjoint `--exclude-module` is recorded as excluded —
         // never misreported as "matched no mapped file" — even for mappings
@@ -6437,7 +6473,7 @@ fn scan_view_examined_mode(
         // pre-exclusion failure (it was never examined) and skips the scan
         // body once exclusion has been evaluated; with no excludes the old
         // fast path skips it before any open.
-        let narrowed_out = !request.hints.is_empty() && !hinted;
+        let narrowed_out = !request.hints.is_empty() && !hinted && deleted_hint_matched.is_empty();
         let excludes_present = !exclude_paths.is_empty() || !exclude_names.is_empty();
         if narrowed_out && !excludes_present {
             continue;
@@ -6450,6 +6486,11 @@ fn scan_view_examined_mode(
             if *kind == HintMatch::Path {
                 hint_matched[*index] = true;
             }
+        }
+        // The stripped-path match above is the same verbatim evidence as
+        // a Path match: the hint named this mapping.
+        for index in &deleted_hint_matched {
+            hint_matched[*index] = true;
         }
         let subject = match &named {
             Some((_, raw_path)) => String::from_utf8_lossy(raw_path).into_owned(),

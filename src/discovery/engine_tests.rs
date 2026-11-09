@@ -68307,94 +68307,77 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     let _ = newcomer.wait();
 }
 
-/// A seed-provider engine with committed modules plus the module hint
-/// a live tick needs to find the provider again on rescan. The
-/// fixture owns the provider child, so it must stay alive.
-fn provider_engine_with_committed_seed() -> (LoadedSeedProvider, Engine, ScriptedSession, u32) {
-    let (fixture, mut engine, session) = initial_export_route();
-    let pid = engine.views[0].pid();
-    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
-    assert!(
-        !engine.modules.is_empty(),
-        "the route must commit the seed provider"
-    );
-    (fixture, engine, session, pid)
-}
-
-/// A dropped tick keeps committed provider modules, plan slots and
-/// discovery modules (with their counts), not just the process view.
+/// A dropped batch tail keeps committed provider modules, plan
+/// slots and discovery modules (with their counts): the earlier-data
+/// proof for modules, plan and counts, over the publication fixture.
 #[test]
-fn dropped_tick_keeps_committed_provider_modules_plan_and_counts() {
-    let (_fixture, mut engine, mut session, pid) = provider_engine_with_committed_seed();
-    assert!(engine.request_refresh(pid, None));
-    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+fn dropped_tail_keeps_committed_provider_modules_plan_and_counts() {
+    let (mut engine, _raw) = retained_publication_engine(213, 1);
+    engine.publish_batch_tail(false).unwrap();
     assert!(
         !engine.modules.is_empty(),
-        "the healthy tick keeps the seed provider"
-    );
-    assert!(
-        !engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.subject == "live inventory pass"),
-        "the healthy tick emits no dropped-pass gap"
+        "the fixture must commit a provider module"
     );
     let modules = engine.modules.clone();
     let slots = engine.plan.active_slot_count();
     let entries_seen = engine.plan.entries_seen;
     let discovery_modules = serde_json::to_value(&engine.discovery.modules).unwrap();
-    assert!(engine.request_refresh(pid, None));
-    engine.fail_next_apply_for_test = true;
-    apply_ordinary_batch(&mut engine, &mut session, vec![])
-        .expect("a dropped pass still returns Ok");
+    let public_revision = engine.published_facts_revision;
+    engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
+    engine
+        .publish_batch_tail(false)
+        .expect("a dropped tail still returns Ok");
     assert_eq!(
         engine.modules, modules,
-        "committed modules survive the dropped pass"
+        "committed modules survive the dropped tail"
     );
     assert_eq!(
         engine.plan.active_slot_count(),
         slots,
-        "committed plan slots survive the dropped pass"
+        "committed plan slots survive the dropped tail"
     );
     assert_eq!(
         engine.plan.entries_seen, entries_seen,
-        "committed plan entries survive the dropped pass"
+        "committed plan entries survive the dropped tail"
     );
     assert_eq!(
         serde_json::to_value(&engine.discovery.modules).unwrap(),
         discovery_modules,
-        "discovery modules and their counts survive the dropped pass"
+        "discovery modules and their counts survive the dropped tail"
+    );
+    assert_eq!(
+        engine.published_facts_revision, public_revision,
+        "the dropped tail publishes nothing partial"
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live inventory pass" && skip.reason.contains("dropped")
         }),
-        "a counted named gap records the dropped pass: {:?}",
+        "a counted named gap records the dropped tail: {:?}",
         engine.counters.object_skips
     );
 }
 
-/// End to end at the engine seam: after a dropped pass the batch tail
-/// still publishes, and the serialized report carries the earlier
+/// End to end at the publication seam: after a dropped tail the next
+/// tail still publishes, and the serialized report carries the earlier
 /// provider data plus the dropped-pass gap.
 #[test]
-fn report_after_dropped_pass_carries_earlier_data_and_gap() {
-    let (_fixture, mut engine, mut session, pid) = provider_engine_with_committed_seed();
-    assert!(engine.request_refresh(pid, None));
-    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+fn report_after_dropped_tail_carries_earlier_data_and_gap() {
+    let (mut engine, _raw) = retained_publication_engine(213, 1);
+    engine.publish_batch_tail(false).unwrap();
     assert!(
         !engine.modules.is_empty(),
-        "the healthy tick keeps the seed provider"
+        "the fixture must commit a provider module"
     );
-    assert!(engine.request_refresh(pid, None));
-    engine.fail_next_apply_for_test = true;
-    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![])
-        .expect("a dropped pass still returns Ok");
-    assert!(!outcome.required_complete);
+    engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
     engine
-        .publish_batch_tail(outcome.changed)
-        .expect("the tail still publishes after a dropped pass");
+        .publish_batch_tail(false)
+        .expect("a dropped tail still returns Ok");
+    engine.manifest_ordinals.clear();
+    engine.note_facts_mutated();
+    engine
+        .publish_batch_tail(false)
+        .expect("the tail still publishes after a dropped tail");
     assert!(
         !engine.discovery.modules.is_empty(),
         "the published report keeps the earlier provider"

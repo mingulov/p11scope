@@ -4486,3 +4486,173 @@ fn joint_machine_sealed_finalize_stays_populated_across_later_quantum() {
         "the finalized era stays populated: gaps {reasons:?}"
     );
 }
+
+use crate::discovery::caller_registry::CallerId;
+use crate::semantics_key_use::FeedMode;
+
+/// Every Joint-birth refusal disclosed so far, committed (expanded by
+/// repeats) and still staged, as (caller, reason).
+fn birth_refusals(scene: &MachineScene) -> Vec<(Option<CallerId>, String)> {
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let subject = crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
+    let mut reasons = Vec::new();
+    for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats()) {
+        if gap.subject == subject {
+            for _ in 0..*repeats {
+                reasons.push((gap.caller, gap.reason.clone()));
+            }
+        }
+    }
+    reasons.extend(
+        registry
+            .staged_gaps_for_test()
+            .into_iter()
+            .filter(|gap| gap.subject == subject)
+            .map(|gap| (gap.caller, gap.reason)),
+    );
+    reasons
+}
+
+/// (feed mode, pre-birth direct reductions) of one caller's instances.
+fn caller_feeds(scene: &MachineScene, caller: CallerId) -> Vec<(FeedMode, u64)> {
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|record| record.caller == caller)
+        .map(|record| (record.feed.mode(), record.feed.pre_attach_direct()))
+        .collect()
+}
+
+/// Late browser beside a busy background caller (FF-FIRST-BG): the
+/// background caller's calls drive the passes while the newly mapped
+/// browser makes none, so the browser's `New` sighting has no
+/// admission. Its first call lands in a later pass. The observation in
+/// that pass must still carry a birth: the browser's first
+/// registration then selects Joint from an exec-marker birth whose cut
+/// precedes every record of its image. Without it the browser
+/// registers S1Only, the admitted-mark retry arrives a pass later
+/// (when novelty is already broken) and per-key tracking never starts
+/// for the run, which is the `bootstrap_unavailable` cell failure.
+#[test]
+fn joint_machine_first_call_after_unadmitted_sighting_still_births_joint() {
+    use crate::semantics_objects::journal::BirthKind;
+    let mut scene = MachineScene::with_initial_files(1, &[0], false);
+    let browser_pid = std::process::id();
+    let bg = OwnedStoppedChild::new();
+    add_initial_machine_image(
+        &mut scene,
+        bg.id(),
+        ImageIdentity {
+            task_cookie: 72,
+            exec_id: 0,
+        },
+    );
+    let browser = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(browser_pid)
+        .unwrap();
+    let bg_caller = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(bg.id())
+        .unwrap();
+    // Quiet browser passes: only the background caller calls.
+    for (pass, sequence) in [(0, 1), (1, 2), (2, 3)] {
+        scene.scene.push(bg.id(), 0, "C_SignInit", sequence);
+        scene.published_labeled(&format!("bg-pass-{pass}"), None);
+    }
+    let quiet = birth_refusals(&scene);
+    assert!(
+        quiet
+            .iter()
+            .any(|(caller, reason)| *caller == Some(browser)
+                && reason == "joint_birth_no_admission"),
+        "precondition: the browser's sighting birth had no admission: refusals={quiet:?} births={:?}",
+        scene.native.birth_outcomes
+    );
+    // The sighting's coverage registers the browser's instance with no
+    // birth: S1Only, with no call of any kind yet.
+    assert_eq!(
+        caller_feeds(&scene, browser),
+        vec![(FeedMode::S1Only, 0)],
+        "precondition: the browser registered at its sighting, S1Only"
+    );
+    assert_eq!(
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter(|record| record.caller == browser)
+            .map(|record| (record.api_returns, record.feed.reduced()))
+            .collect::<Vec<_>>(),
+        vec![(None, 0)],
+        "precondition: no browser call has been reduced"
+    );
+    assert_eq!(
+        caller_feeds(&scene, bg_caller)
+            .iter()
+            .map(|(mode, _)| *mode)
+            .collect::<Vec<_>>(),
+        vec![FeedMode::Joint],
+        "control: the background caller called in its sighting pass and is Joint"
+    );
+    let births_before = scene.native.birth_outcomes.len();
+
+    // The browser's first call (a modelled, affecting one) arrives in
+    // a later pass, beside the background caller's next call.
+    scene.scene.push(bg.id(), 0, "C_SignInit", 4);
+    scene.scene.push(browser_pid, 0, "C_CreateObject", 1);
+    scene.published_labeled("browser-first-call", None);
+    let refusals = birth_refusals(&scene);
+    assert_eq!(
+        scene.native.birth_outcomes[births_before..]
+            .iter()
+            .filter(|(file, result)| *file == 0 && *result == Ok(BirthKind::ExecMarker))
+            .count(),
+        1,
+        "the first-call pass births the browser from its exec marker: births={:?} refusals={refusals:?}",
+        scene.native.birth_outcomes
+    );
+    assert_eq!(
+        caller_feeds(&scene, browser),
+        vec![(FeedMode::Joint, 0)],
+        "the browser's first registration selects Joint, with no pre-birth call: refusals={refusals:?}"
+    );
+    assert_eq!(
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        2
+    );
+    // Quiet retries add no repeated no-admission disclosure, and the
+    // birth adds no refusal of its own for the browser.
+    let browser_refusals = |list: &[(Option<CallerId>, String)]| {
+        list.iter()
+            .filter(|(caller, _)| *caller == Some(browser))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        browser_refusals(&refusals),
+        browser_refusals(&quiet),
+        "refusals={refusals:?}"
+    );
+}

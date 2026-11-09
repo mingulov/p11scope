@@ -4554,7 +4554,11 @@ fn seal_terminal_discovery_or_gap(
                  from partial state: {}",
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
-            Ok(false)
+            // Earlier quanta in the same drain may already have committed
+            // plan changes before this quantum failed: report changed so
+            // the seal syncs to the engine's committed plan. Syncing an
+            // unchanged plan is a harmless refresh.
+            Ok(true)
         }
         Err(error) => Err(error),
     }

@@ -1488,14 +1488,23 @@ mod tests {
                 "{name}"
             );
             assert!(
-                !name.contains(&pid),
-                "the name must not leak the PID: {name}"
-            );
-            assert!(
                 names.insert(name.clone()),
                 "duplicate run cgroup name: {name}"
             );
         }
+        // Random hex can contain the PID's digits by chance (about 5% of
+        // 256-name runs for a 4-digit PID), so count instead of failing on
+        // one hit: a PID-derived name would contain it in every call. A
+        // one-digit PID (a container init) appears in most random names.
+        if pid.len() < 2 {
+            return;
+        }
+        let pid_hits = names.iter().filter(|name| name.contains(&pid)).count();
+        assert!(
+            pid_hits < names.len() / 4,
+            "the name must not leak the PID {pid}: {pid_hits} of {} names contain it",
+            names.len()
+        );
     }
 
     #[test]

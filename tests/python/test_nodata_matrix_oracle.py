@@ -4,7 +4,8 @@
 GREEN fixtures (a healthy cell per mode) must PASS; RED fixtures (empty
 views, zero endpoints/calls, unnamed refusals, exact-count mismatches,
 unrecognized shapes) must FAIL. The oracle never passes a shape it does
-not understand.
+not understand. A final case locks the matrix copy-up cells to the
+same-bytes scenario.
 """
 
 import contextlib
@@ -412,6 +413,21 @@ class OracleCase(unittest.TestCase):
         self.assert_result(text, "FAIL")
         self.assertIn("FAIL: caller 'harness' unnamed on all", text)
         self.assertNotIn("FAIL: provider", text)
+
+
+class MatrixScriptCase(unittest.TestCase):
+    # The copy-up cells must model the R-41 same-bytes scenario: only
+    # metadata changes on the merged path, with bytes proven unchanged.
+    # Appending bytes would probe the file-changed path instead under
+    # the copy-up label.
+    def test_copyup_preserves_provider_bytes(self):
+        script = (ROOT / "scripts/matrix/nodata-matrix.sh").read_text(
+            encoding="utf-8")
+        for var in ("lc_mod", "ic_mod"):
+            self.assertNotIn('>> "$%s"' % var, script)
+        for var in ("lc_sha_before", "lc_sha_after",
+                    "ic_sha_before", "ic_sha_after"):
+            self.assertIn(var, script)
 
 
 if __name__ == "__main__":

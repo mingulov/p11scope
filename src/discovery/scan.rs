@@ -14363,10 +14363,9 @@ mod tests {
         // export-facts debit path. Floor only: the window may be raised,
         // never lowered below the measured need.
         const MEASURED_NEED_BYTES: u64 = 18 * 1024 * 1024;
-        assert!(
-            INVENTORY_WINDOW_IO_BYTES >= MEASURED_NEED_BYTES,
-            "production window {INVENTORY_WINDOW_IO_BYTES} must fit the measured {MEASURED_NEED_BYTES}-byte closure"
-        );
+        const {
+            assert!(INVENTORY_WINDOW_IO_BYTES >= 18 * 1024 * 1024);
+        }
         let per_file = File::open("/bin/sh").unwrap().metadata().unwrap().len();
         assert!(per_file > 0 && per_file < 8 * 1024 * 1024);
         let dir = tempfile::tempdir().unwrap();

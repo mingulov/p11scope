@@ -172,7 +172,8 @@ def validate_notice_contents(root: Path, manifest, payload):
     graphs = manifest.get("graphs")
     if not isinstance(graphs, dict) or set(graphs) != {"host", "bpf"}:
         raise ValueError("notice graphs must include host and BPF workspaces")
-    for graph in graphs.values():
+    disabled = recipe.get("feature_disabled", {})
+    for name, graph in graphs.items():
         packages = graph.get("packages", [])
         identifiers = {package["id"] for package in packages}
         if not identifiers or len(identifiers) != len(packages):
@@ -185,7 +186,11 @@ def validate_notice_contents(root: Path, manifest, payload):
             covered.update(owners)
             if record["file"] not in payload or digest(payload[record["file"]]) != record["text_sha256"]:
                 raise ValueError("notice graph text is missing or changed")
-        if covered != identifiers:
+        pins = set(disabled.get(name, {}) or {})
+        textless = identifiers - covered
+        if pins - textless:
+            raise ValueError(f"stale feature-disabled pin: {sorted(pins - textless)[0]}")
+        if textless - pins:
             raise ValueError("notice graph coverage is incomplete")
         originals = graph.get("original_license_files", [])
         if not originals:

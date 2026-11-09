@@ -13278,10 +13278,62 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
     );
 }
 
+/// Post-load mapping observation for the lifecycle fixture: the child has
+/// already acknowledged its `dlopen`, so every refresh re-observes stable
+/// target state — but one tick is not guaranteed to serve the retained
+/// refresh request. When the tick's deep-scan quantum expires first (wall
+/// time under parallel-suite load), the rescan defers to the next tick
+/// with the request retained, by design
+/// (`expired_tick_quantum_defers_refreshed_scans_with_requests_retained`).
+/// Wait for the real observation — the provider's 68-entry scanned table
+/// in `engine.modules` — bounded, and fail naming what was not observed.
+fn refresh_until_provider_mapped(engine: &mut Engine, pid: u32) {
+    const MAX_REFRESHES: u32 = 10;
+    for _ in 1..=MAX_REFRESHES {
+        engine.request_refresh(pid, None);
+        refresh_inventory_once(engine);
+        if engine.modules.iter().any(|module| {
+            module
+                .scanned
+                .tables
+                .iter()
+                .any(|table| table.entries.len() == 68)
+        }) {
+            return;
+        }
+    }
+    let tables: Vec<Vec<usize>> = engine
+        .modules
+        .iter()
+        .map(|module| {
+            module
+                .scanned
+                .tables
+                .iter()
+                .map(|table| table.entries.len())
+                .collect()
+        })
+        .collect();
+    let quantum_exhausted = engine
+        .counters
+        .object_skips
+        .iter()
+        .any(|skipped| skipped.reason.contains("tick deep-scan quantum exhausted"));
+    panic!(
+        "post-load refresh never observed the provider mapping for pid {pid}: \
+         engine.modules holds no 68-entry scanned table after {MAX_REFRESHES} refreshes \
+         (modules={}, tables={tables:?}, refresh_pending={}, quantum_exhausted={quantum_exhausted})",
+        engine.modules.len(),
+        engine.refresh_requested.contains_key(&pid),
+    );
+}
+
 /// Mapped pre-arm engine with scripted declared-set stamps: the fixture
 /// provider loads for real (sources gain `scan`, so the base window
 /// applies), the scope start pins to 50, and every declared slot links and
-/// stamps at `stamp`. Keeps the fixture alive for the engine's views.
+/// stamps at `stamp`. Keeps the fixture alive for the engine's views. The
+/// post-load refresh waits for the mapping observation (see
+/// `refresh_until_provider_mapped`): a single tick may defer under load.
 pub(crate) fn prearm_mapped_engine_with_declared_stamps(
     stamp: u64,
 ) -> (DiscoveryLifecycleFixture, Engine, ScriptedSession, Vec<u32>) {
@@ -13289,8 +13341,7 @@ pub(crate) fn prearm_mapped_engine_with_declared_stamps(
     let mut engine = fixture.discover_prearm_before_load();
     assert!(engine.has_prearm_watches());
     fixture.load();
-    engine.request_refresh(fixture.pid(), None);
-    refresh_inventory_once(&mut engine);
+    refresh_until_provider_mapped(&mut engine, fixture.pid());
     engine.publish_current_capture_facts().unwrap();
     engine.set_scope_start_ns(Some(50));
     let keys: Vec<_> = engine
@@ -13317,6 +13368,23 @@ pub(crate) fn prearm_mapped_engine_with_declared_stamps(
         session.scripted_stamps.insert(*slot, stamp);
     }
     (fixture, engine, session, declared)
+}
+
+/// The mapping wait fails loud and bounded when the observation never
+/// arrives: a zero tick quantum defers every rescan deterministically (any
+/// clock poll is past a zero deadline, no wall-clock dependence), so the
+/// helper must exhaust its bound and name the unobserved provider
+/// mapping. The healthy twin is every
+/// `prearm_mapped_engine_with_declared_stamps` user, which returns through
+/// the same helper without panicking.
+#[test]
+#[should_panic(expected = "never observed the provider mapping")]
+fn refresh_until_provider_mapped_fails_naming_the_unobserved_mapping() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    fixture.load();
+    engine.scheduler.set_tick_quantum_ns_for_test(0);
+    refresh_until_provider_mapped(&mut engine, fixture.pid());
 }
 
 /// The one watched pre-arm record after the terminal finish.

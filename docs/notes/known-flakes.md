@@ -40,6 +40,34 @@ check job (`lint`, `audit`, `tests`, a `contracts-N` shard or `scripts`).
 It is supporting evidence only: a green quarantine result
 never makes the failed workflow pass.
 
+## Fixed unit-test flakes
+
+### `witness_every` post-load mapping miss (fixed 2026-11-09)
+
+- Selector: `discovery::engine::prearm_witness_tests::witness_every_keep_reason_keeps_todays_window_when_mapped`
+  (library), with sibling trips in other
+  `prearm_mapped_engine_with_declared_stamps` users.
+- Signature: `assertion 'left == right' failed ... left: None,
+  right: Some([UnobservedWindow { start_ns: 50, end_ns: 900,
+  reason: PreAttach }])` — the record read never-mapped. Failed in
+  full-suite runs (1 of 2 same-binary runs, 2026-11-08) while passing
+  in isolation.
+- Mechanism: the shared fixture ran exactly one post-load
+  `refresh_inventory` tick and assumed the mapping admitted. One tick
+  is not guaranteed to serve the retained refresh request: when the
+  200 ms tick deep-scan quantum (`TICK_DEEP_SCAN_QUANTUM_NS`) expires
+  first under load, the retained-view rescan defers to the next tick
+  with the request retained, by design
+  (`expired_tick_quantum_defers_refreshed_scans_with_requests_retained`).
+  The deferred tick admits nothing, so the record's sources stay
+  `["prearm"]` and the terminal assembly reports no window.
+- Disposition: fixed — the fixture now waits for the real mapping
+  observation (the provider's 68-entry scanned table in
+  `engine.modules`), bounded at 10 refreshes, and fails naming the
+  unobserved mapping. No timeout was raised and no retry was added:
+  each iteration is a real observation tick over already-stable
+  target state (the child acknowledged its `dlopen`).
+
 ## Live-cell signatures
 
 These failures come from Docker live cells

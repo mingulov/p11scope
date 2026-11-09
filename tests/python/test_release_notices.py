@@ -38,8 +38,8 @@ class ReleaseNoticesTests(unittest.TestCase):
                        "licenses": [{"id": "MIT", "text": self.license.read_text(),
                                      "source_path": str(self.license), "used_by": [{"crate": self.package}]}]}
 
-    def normalize(self):
-        return self.mod.normalize_report(self.report, self.metadata, self.root, self.root)
+    def normalize(self, disabled=frozenset()):
+        return self.mod.normalize_report(self.report, self.metadata, self.root, self.root, disabled)
 
     def toolchain_fixture(self, stable):
         (self.root / ".release-rust-version").write_text("1.99.1\n")
@@ -94,6 +94,26 @@ class ReleaseNoticesTests(unittest.TestCase):
         self.report["licenses"][0]["source_path"] = None
         with self.assertRaisesRegex(self.mod.NoticeError, "synthesized"):
             self.normalize()
+
+    def test_pinned_feature_disabled_absence_is_accepted(self):
+        # A resolved-but-feature-disabled package (e.g. an optional derive
+        # macro nothing enables) is absent from cargo-about's
+        # feature-unified graph; an exact version-pinned justification
+        # accepts that absence while its declaration and original files
+        # still ship from metadata.
+        report = {"crates": [], "licenses": []}
+        pinned = frozenset([self.package["id"]])
+        data = self.mod.normalize_report(report, self.metadata, self.root, self.root, pinned)
+        self.assertEqual([p["id"] for p in data["packages"]], [self.package["id"]])
+        self.assertEqual(data["notices"], [])
+
+    def test_stale_feature_disabled_pin_is_rejected(self):
+        pinned = frozenset([self.package["id"]])
+        with self.assertRaisesRegex(self.mod.NoticeError, "stale feature-disabled pin"):
+            self.mod.normalize_report(self.report, self.metadata, self.root, self.root, pinned)
+        with self.assertRaisesRegex(self.mod.NoticeError, "stale feature-disabled pin"):
+            self.mod.normalize_report(self.report, self.metadata, self.root, self.root,
+                                      frozenset(["registry+https://example.test#other@2.0"]))
 
     def test_missing_package_is_rejected(self):
         self.report["crates"] = []

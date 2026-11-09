@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Shared base image for the Docker rows of the Phase 4 environment matrix
 # (verify-docker.sh, verify-shared-layer.sh). Host-built (dynamic)
 # p11scope-discover and the harness binary need at most GLIBC_2.34 (measured

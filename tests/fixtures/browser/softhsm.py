@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Controlled SoftHSM provider for the G33 browser cells.
 
 Every browser cell observes a real SoftHSM token through the browser's own

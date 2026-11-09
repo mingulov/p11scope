@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned deterministic workload + oracle writer (system-scale plan Tasks
  * 1.4/1.5/1.6). Drives the multi-wrapper provider through one scenario,
  * records every call the provider must emit, and writes the exact oracle.

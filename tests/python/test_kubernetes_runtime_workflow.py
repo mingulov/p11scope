@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Exercise Kubernetes workflow preparation, ownership and result gates offline.
 
 Docker/kind/kubectl are subprocess stubs. No daemon, cluster, Cargo or capture

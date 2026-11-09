@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use p11scope::discovery::identity::pin_manifest_objects;
 use p11scope::manifest_input::validate_structure;
 use p11scope::plan::build_from_sources;

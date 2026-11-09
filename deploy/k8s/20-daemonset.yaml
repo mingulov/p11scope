@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # p11scope node observer: one agent pod per node. It idles (`sleep infinity`,
 # after making the /tmp scratch mount sticky)
 # and runs one-shot captures on operator request through `kubectl exec`

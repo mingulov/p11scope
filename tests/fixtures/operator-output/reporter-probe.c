@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned task-bound reporter witness. Decoder fixtures never claim attachment. */
 #define _GNU_SOURCE
 #include <errno.h>

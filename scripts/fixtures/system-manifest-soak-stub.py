@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Dry-run stand-in for the installed observer in manifest-soak trials.
 
 Speaks the observer's inventory argv shape (`inventory --system

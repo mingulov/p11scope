@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Exercise the registered dispatcher and exact local reusable-call surface.
 
 The dedupe body is the actual workflow shell, using an owned API transport

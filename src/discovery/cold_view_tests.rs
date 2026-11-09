@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Future R56: cold snapshots are hints; deep scans retain actual group custody.
 
 use super::*;

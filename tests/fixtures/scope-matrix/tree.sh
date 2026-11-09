@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Scope-matrix process tree: a root with a descendant plus an outside
 # sibling, then a leave/re-enter cycle once the GO file appears.
 #

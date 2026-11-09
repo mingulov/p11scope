@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell K3: Knative scale-from-zero pod using a PKCS#11 provider (dev host).
 #
 # A private kind cluster gets the smallest real Knative install (Serving

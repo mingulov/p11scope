@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Soak gates for the system-scope soak vehicle (soak.1800s and kin).
 
 Evaluates one soak evidence directory produced by

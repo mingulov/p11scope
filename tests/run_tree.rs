@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Run-tree CLI cells: `p11scope run` follows the command's process
 //! tree (v0.7.0). Each cell runs a shell wrapper or a fork/daemonize
 //! fixture under `run` against SoftHSM and asserts the descendants'

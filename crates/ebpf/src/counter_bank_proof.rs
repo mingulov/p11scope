@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-only
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Unselected format2 Counts roots. Current Session preparation refuses them.
 
 use super::*;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Own a birth-blocked raw child through two checked initial exec events.
 
 Call before starting any Reader or other OS thread. The caller supplies the

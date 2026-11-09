@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 3 Stage A privileged gates: real fentry hooks, calibration, stamps
 //! and routing against owned workloads with independent ledgers. Explicitly
 //! selected ignored tests; they fail (never skip) on unavailable support.

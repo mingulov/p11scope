@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* mt_mixed: deterministic multi-threaded mixed-function SoftHSM2 workload.
  *
  * usage: mt_mixed MODULE THREADS ITERS GATE MODE ERRORS

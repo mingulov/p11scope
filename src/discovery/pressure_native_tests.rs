@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! T8/G18 live256 native pressure suite (cgroup-scoped episodes;
 //! ticket-spend and quota controls stay System scope).
 //!

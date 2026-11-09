@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Least-privilege capability profiles for the observer.
 //!
 //! p11scope runs as an ordinary user with file capabilities (`setcap` on

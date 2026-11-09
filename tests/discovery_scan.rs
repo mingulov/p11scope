@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The scan's oracle is the offline helper: for the same provider loaded in this
 //! process, every table entry the scan finds must have the offset
 //! `p11scope-discover` computes. Both run in-process here; the helper dlopens the

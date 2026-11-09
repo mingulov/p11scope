@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Slice 1b-1 spikes — measured /proc access (spec §6.4 unprivileged half, §6.6)
 
 Host: 7.0.0-28-generic, glibc 2.39 (Ubuntu GLIBC 2.39-0ubuntu8.8), ptrace_scope=1,

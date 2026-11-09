@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* subreaper-parent: adopting launcher for the parent-chain subreaper cell.
  * Usage: subreaper-parent PROG ARGS...
  * Marks itself PR_SET_CHILD_SUBREAPER, forks an intermediate that forks

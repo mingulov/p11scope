@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-container-image.sh -- permanent container-image cell.
 #
 # The observer image (built here from a musl binary, or prebuilt and loaded)

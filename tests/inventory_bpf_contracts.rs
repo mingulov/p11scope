@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use std::process::Command;
 
 /// Whether BPF rustflags carry an opt-level override. Flags arrive

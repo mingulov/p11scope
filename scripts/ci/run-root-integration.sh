@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # run-root-integration.sh P11SCOPE OUTDIR [TEST_BIN_DIR]
 # run-root-integration.sh --self-test
 #

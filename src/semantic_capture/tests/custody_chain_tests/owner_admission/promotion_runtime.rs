@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Original process custody at the real Inventory-to-Detailed admission seam.
 //! Native I/O uses the existing parent fixture; no receipt is constructed here.
 

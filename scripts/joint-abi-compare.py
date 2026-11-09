@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Validate a 104-entry ABI ledger and its observer-side counts.
 
 The ledger is E17-pattern JSONL emitted by

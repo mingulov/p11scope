@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 dlopen driver: loads one provider and calls one resolved endpoint.
  *
  * Usage (protocol and exit codes: e16_protocol.h):

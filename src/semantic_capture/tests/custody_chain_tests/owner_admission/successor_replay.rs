@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual ClassicDriver admission composed with the coordinator's H6 handoff.
 //! The child, mapped provider, held files and receipt validation are real.
 //! Inventory map reads and Detailed records/clocks are deterministic inputs:

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private caller preparation, exact map contract, immutable endpoint
 //! publication and retained health for the dedicated caller object.
 

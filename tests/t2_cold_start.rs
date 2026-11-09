@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! T2 first-use cold-start pins: the product boots with no ambient
 //! credentials and refuses honestly where it cannot run.
 //!

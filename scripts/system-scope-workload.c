@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* system-scope-workload.c — deterministic counting workload for the
  * system-scope measurement harness (scripts/system-scope-measure.sh).
  *

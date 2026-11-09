@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Independent lifetime workload and oracle controls for G16/G17.
 
 Synthetic rows exercise the parser/judge boundaries (including full 300

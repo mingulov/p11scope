@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # System acceptance manifest v1
 
 `tests/fixtures/system-qualification/system-test-manifest.json` is the

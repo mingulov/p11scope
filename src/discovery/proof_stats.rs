@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! DR-C1b-3 (owner ruling, C5.6): the per-range `map_files` proof stats of
 //! one collection, run on a small bounded pool.
 //!

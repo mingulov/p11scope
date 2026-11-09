@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Fresh installed Cgroup admission after an owned original process group dies.
 
 Run only in the owner's granted live lane. Each backend creates its own cgroup

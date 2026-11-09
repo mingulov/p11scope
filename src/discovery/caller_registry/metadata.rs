@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Display-only access to already-admitted original process custody.
 
 use super::{CallerAdapter, CallerId, CallerLifecycle, ProcessSource};

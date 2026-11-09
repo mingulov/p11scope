@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Explicit privileged checks over real maps and the production self-probe.
 //!
 //! Build with ordinary Cargo, then run the resulting test executable with

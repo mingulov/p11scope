@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Process-wide cache of the original and parsed host vmlinux BTF plus the
 //! pidfd-iterator selector probe derived from it.
 //!

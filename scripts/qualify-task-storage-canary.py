@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Isolated seeded task-storage byte controls for the closed canary oracle.
 
 A fresh fixture process and fresh maps per control case, each inside its own

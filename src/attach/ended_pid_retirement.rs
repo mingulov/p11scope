@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Eager retirement after the retained original named process group ended.
 
 use super::pid_continuity::{PairBook, RegistrationId, current_pair};

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Verdict gates for the system--manifest soak vehicle (M13, cell 5.5).
 
 Evaluates one evidence directory produced by

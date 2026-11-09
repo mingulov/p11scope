@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::*;
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};

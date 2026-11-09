@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Judge stop-race sweep trials and newcomer-burst runs against ledgers.
 
 A sweep trial stops one capture with SIGINT at a seeded offset and judges:

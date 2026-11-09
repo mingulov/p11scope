@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Judge real-provider `run` evidence against an independent pkcs11-spy ledger.
 
 Each WP-3 cell runs a real distro tool under `p11scope run --pause auto`

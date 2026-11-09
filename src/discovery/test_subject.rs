@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned, stopped subjects for tests that need a stable process mapping lifetime.
 
 use crate::fixture_guard::DieWithParent as _;

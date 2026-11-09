@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded identity re-projection from one immutable publication revision.
 
 use crate::discovery::caller_registry::{CallerId, ModuleId};

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """System disclosures cannot weaken the independently ledgered H6 population.
 
 The existing unprivileged controller seam supplies real owned-child ledgers.

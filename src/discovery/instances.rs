@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 3 Stage A: load-instance continuity and per-call instance routing.
 //!
 //! A provider file can be loaded more than once in one process (`dlmopen`)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """H4a matched pre/post userspace identity regression gate (RUN suite).
 
 RUN registration runs ``--self-test`` in CI; the live gate runs via the

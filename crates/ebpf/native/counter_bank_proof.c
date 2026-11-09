@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Unselected format2 Counts bridge:16x512 cells, START16384/RV65536.
  * Legacy STATS512 remains separate and unused by these roots. Real Session
  * preparation/reader support and useful population are separately gated. */

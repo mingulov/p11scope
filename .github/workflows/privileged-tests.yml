@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 name: privileged-tests
 # The default privileged lib-test campaign on hosted runners (root, real
 # runner kernel, BTF). Ordinary CI runs only the unprivileged default

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Which exported symbols hand out a PKCS#11 function table, and with what ABI.
 //! Built-ins cover the standard three plus NSS's `NSC_`/`FC_` pair; `--hook-symbol`
 //! adds vendor names (spec §2, §4.3).

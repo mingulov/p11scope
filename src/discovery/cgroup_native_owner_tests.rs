@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Native-owner admission through the real retained-root cgroup transaction.
 //! The owned child, provider mappings, process custody and membership samples
 //! are real. Only native record transport is scripted; the temporary directory

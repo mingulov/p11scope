@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! A test-only allocation counter for reuse microbenchmarks (C7 wave A).
 //!
 //! The counters are per thread and arm around one closure only, so a

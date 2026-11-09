@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Userspace side of the Detailed STOP_GATE map: metadata validation plus
 //! the `Session`-owned mmap of its single cell.
 

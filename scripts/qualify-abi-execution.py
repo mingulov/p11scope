@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed 104-slot ABI execution qualification, LP64 and ia32 (stage-3
 cell 3.8, missing piece M9).
 

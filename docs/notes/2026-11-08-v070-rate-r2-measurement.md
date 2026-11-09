@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v070 rate round-2 measurement (2026-11-08)
 
 Lane `task/v070-rate`, observer rev `47136fc68` (EVENTS staging

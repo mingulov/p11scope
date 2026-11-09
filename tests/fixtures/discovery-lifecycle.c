@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Private discovery test: a file-backed 2.40 table and an acknowledged loader.
  * The observer never executes provider code; only this owned test driver and
  * the test's offline manifest helper do. No ordinary PKCS#11 call is made. */

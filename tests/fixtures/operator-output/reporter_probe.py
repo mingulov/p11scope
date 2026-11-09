@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Candidate-bound reporter witness primitives; no automatic live attachment.
 
 The parent retains the observer pidfd/unreaped child and FilePin throughout.

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Future cold leader view admission (R56)
 
 Branch `task/v051-cold-leader-survivor` starts at

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Public-command dashboard + event-stream tests (U0/U1 behaviors).
 //!
 //! Dashboard mode over owned fixtures (multi-provider, multi-caller),

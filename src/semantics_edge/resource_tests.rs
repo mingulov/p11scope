@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Resource controls and an isolated host probe over the production reducer.
 //! Allocation requests, glibc heap occupancy and process RSS are different
 //! measurements. No result below declares an aggregate admission limit.

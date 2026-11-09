@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned, ignored live gates for the native inventory lane (Task 6 C5.1),
 //! plus the D3d forced-kernel sweep cells (production identity proof over
 //! owned btrfs fixtures through the production classic path).

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned, ignored end-to-end gate for the v0.5.0 headline command:
 //! `inventory --system --manifest` over a live SoftHSM2 ledger workload
 //! through the real CLI surface (`cli::parse` + `inventory::run`).

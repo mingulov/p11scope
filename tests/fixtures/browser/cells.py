@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Cell runners for the G33 browser harness.
 
 Two observation modes, both against a controlled SoftHSM provider:

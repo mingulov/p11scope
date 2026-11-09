@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # In-cluster twin of scripts/attach-pod.sh: run INSIDE the p11scope-observer
 # DaemonSet pod (via `kubectl exec`) to capture one target pod's cgroup.
 #

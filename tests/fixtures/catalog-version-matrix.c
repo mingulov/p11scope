@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Catalog-only three-table surface. Full mode gives each retained 3.0 target
  * its actual standard export; partial mode keeps only the three getters.
  * The shared ABI matrix remains unchanged for its oversized/sparse tests. */

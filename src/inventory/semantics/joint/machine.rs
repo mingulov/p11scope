@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Inactive, single-owner service of the actual collected Joint pipeline.
 //! This module retains originals and scheduling positions; all authority stays
 //! in Capture, prepared admissions, the canonical ledger and the real frame.

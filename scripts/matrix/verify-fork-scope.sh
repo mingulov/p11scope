@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Phase 4 Task 8, part 1: fork scoping. A prefork-server-shape workload
 # (scripts/matrix/fork-harness.c) forks N children BEFORE any PKCS#11 call
 # is made by anyone -- the whole point is that the children do not exist as

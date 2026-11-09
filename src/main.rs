@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes). CLI entry
 //! point only: argument dispatch and the process exit code. Every capture
 //! loop lives in the `p11scope` library crate (`src/run.rs`) so that

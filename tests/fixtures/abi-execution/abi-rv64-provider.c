@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* High-bit stub provider for the abi-104 rv64 installed cell.
  *
  * Build (LP64):  gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared

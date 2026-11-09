@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* alias_workload.c — calls the two aliased entries in
  * crates/discover/tests/fixture/provider.c (C_CancelFunction and
  * C_WaitForSlotEvent, legacy table indices 66/67, which that fixture

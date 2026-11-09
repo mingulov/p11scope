@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Registered mechanism id → `CKM_*` display name.
 //!
 //! The table below is generated from the `// CKM_*` comments on

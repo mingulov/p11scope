@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-only
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Positive exact image/physical-object witnesses for the caller flavor,
 //! each with a saturating entry count. Rows and endpoint bindings are
 //! retained for the entire owned map domain.

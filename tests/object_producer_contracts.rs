@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7 object producer contracts: alias agreement across S1/object protocols,
 //! canary/Rust marker parity, catalog pins and ordinary-path compatibility.
 

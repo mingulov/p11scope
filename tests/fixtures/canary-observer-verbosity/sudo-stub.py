@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """sudo tripwire for the canary observer-verbosity probe.
 
 Records every privileged invocation and succeeds without privilege. For

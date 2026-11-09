@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! WP-7 stop-after-last-waiter cell: request the Joint finish 0, 1, 5 and
 //! 20 ms after the refresh that resolves the last waiter, and pin
 //! Published-then-WoundDown, the at-Q stash publication, and the abandon

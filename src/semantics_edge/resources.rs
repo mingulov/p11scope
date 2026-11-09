@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture-wide S1 allocation charges. This is a requested-allocation
 //! envelope on the pinned Rust x86-64 implementation, never an RSS limit.
 //! One registry owns the pool; reducers retain move-only leases from it.

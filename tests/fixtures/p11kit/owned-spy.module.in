@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned spy-wrapped provider for the transparency cells.
 # Installed by scripts/ci/p11kit-transparency.sh as
 # $XDG_CONFIG_HOME/pkcs11/modules/owned-spy.module with the placeholder

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Unit tests for scripts/matched-cost-run.py (no root, no binaries).
 
 Covers the parsers (stage timings, readiness lines, GNU time RSS),

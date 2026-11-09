@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pass-local scanner custody and anchor installation. Runtime proof selection
 //! is a later slice; these owners never change default userspace collection.
 

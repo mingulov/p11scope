@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile ELF regression tests: truncated, extreme-valued and mutated object
 //! bytes must be refused with a bounded error or yield only in-range facts.
 //! Untrusted header/table lengths, counts and offsets never drive unbounded

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Per-slot call counts of a clean SoftHSM2 capture, as a multiset.
 
 A scan-only table whose slots are named `unknown` can only be counted exactly

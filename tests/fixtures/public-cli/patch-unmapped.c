@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* patch-unmapped: flip one byte in an unmapped ELF section, in place.
  * usage: patch-unmapped FILE
  * Test-only fixture for the kind copy-up negative cell: the workload stages

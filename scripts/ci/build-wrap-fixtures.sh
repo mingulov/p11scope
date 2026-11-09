@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Build the diagnostics-wrap prebuilt32-object fixture for the privileged runner.
 #
 # Usage: scripts/ci/build-wrap-fixtures.sh OUTDIR

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Matched v0.5.0-vs-v0.6.0 cost run: same inputs, interleaved trials.
 
 Runs a fixed workload matrix against two observer binaries (an old

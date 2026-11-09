@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! DR37 promotion request/state core: the pure-std UI-side control.
 //!
 //! No crate dependencies: the request/state seam iterates standalone

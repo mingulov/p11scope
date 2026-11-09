@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Birth-marker cost verdict math for scripts/bench-marker-cost.sh.
 
 Reads a campaign log plus its pre-declared manifest, verifies the

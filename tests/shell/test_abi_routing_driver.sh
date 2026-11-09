@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -eu
 cd "$(dirname "$0")/../.."
 ABI_ROUTING_DRIVER_LIBRARY_ONLY=1 . scripts/matrix/verify-abi-routing.sh

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile output/path regression tests: symlinked, special-file and
 //! unusable destinations are refused before any capture bytes exist, a
 //! failed or abandoned publish keeps the existing destination byte-exact,

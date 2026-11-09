@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Run existing K1/K2 oracles with a prebuilt observer and owned resources.
 
 The artifact consumer validates the package before invoking this coordinator.

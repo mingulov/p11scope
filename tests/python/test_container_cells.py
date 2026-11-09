@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Container cells entry point (S8): harness errors, exit mapping, disclosure.
 
 Runs scripts/ci/container-cells.sh against stub tools and stub cell scripts

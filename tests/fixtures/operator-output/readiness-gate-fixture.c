@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Unprivileged interposer controls only, never product/cancellation evidence. */
 #define _GNU_SOURCE
 #include <errno.h>

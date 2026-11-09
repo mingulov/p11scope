@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pure S2/S3 reference model: instance/session/object observation lifetimes.
 //!
 //! One capture-owned [`ObjectSemantics`] owns capture-local IDs, budgets,

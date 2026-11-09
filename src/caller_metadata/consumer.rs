@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pure consumers of the one immutable metadata frame. No acquisition here.
 
 use super::presentation::CallerMetadata;

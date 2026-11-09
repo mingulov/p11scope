@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """U6 installed journey cells: all-modes-vs-ledger and named-trace/false-name twins.
 
 Two full journeys, three modes each:

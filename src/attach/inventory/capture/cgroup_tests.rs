@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Cgroup capture facade controls; filesystem and scripted IO only.
 
 use super::super::activation::validate_capture_activation;

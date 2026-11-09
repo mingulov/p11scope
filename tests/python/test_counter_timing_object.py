@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Real-object guard for the timing bank producer, its timestamps R4 build,
 and the counts/timing route-copy pin.
 

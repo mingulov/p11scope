@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned32-pair indexed physical entry-count gate. No semantic/API/104-slot claim.
 //! Prebuilt-only, paired normal/default diagnostics; no recorder injection.
 use super::*;

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Deployment artifacts
 
 - [`k8s/`](k8s/README.md) — the Kubernetes node observer: namespace,

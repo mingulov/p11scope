@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #define P11SCOPE_SELECTED_HOST_TEST
 #include "../../../crates/ebpf/native/selected_detailed.c"
 #include <assert.h>

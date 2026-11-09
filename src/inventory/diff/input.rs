@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded, exact-v1 input. Local references are resolved inside each snapshot.
 
 use anyhow::{Context, Result, ensure};

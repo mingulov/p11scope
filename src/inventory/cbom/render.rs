@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! CycloneDX 1.6 document and text views for a CBOM projection.
 //!
 //! The JSON document is complete; text views cap their named lists and

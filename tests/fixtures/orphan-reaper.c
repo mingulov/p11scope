@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Isolated orphan reaper for the fixture orphan-policy twins.
  *
  *   orphan-reaper <pidfile> <reaped-file> -- <observer argv...>

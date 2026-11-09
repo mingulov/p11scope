@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Nine concurrent PKCS #11 2.40/3.0/3.2 calls covering allowlisted argument
  * words 0..6. Arguments 7..9 and every pointed-to secret carry canaries. */
 #define _GNU_SOURCE

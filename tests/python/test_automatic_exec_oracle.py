@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Adversarial controls for the H6 installed-acceptance oracle.
 
 Loads scripts/qualify-automatic-exec.py (the oracle under test) via runpy

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile `/proc/<pid>/maps` regression tests: malformed lines, extreme
 //! addresses/offsets/devices/inodes and mutated snapshots must be refused
 //! with a named error or yield only consistent entries. Untrusted hex and

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """One combined stock pre-Multi refusal guest, not an old positive/load lane.
 
 The caller reserves the guest lane. Image checksums belong to the workflow;

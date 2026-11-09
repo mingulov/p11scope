@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! dlopen + table-walk glue: raw provider facts become bounded manifest evidence.
 //! The helper never calls C_Initialize and performs only the fixed v5
 //! C_GetInterface compatibility matrix.

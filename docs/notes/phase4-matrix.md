@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Phase 4 environment matrix — historical results
 
 This records the August 2026 experiment and its follow-up at those revisions.

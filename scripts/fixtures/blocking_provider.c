@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* blocking_provider.c — minimal legacy (v2.40, 68-entry) PKCS#11 function
  * table for the "in-flight at end" gap in scripts/verify-induced-gaps.sh.
  * Identification of table entries is by POSITION (see spike/discover.c for

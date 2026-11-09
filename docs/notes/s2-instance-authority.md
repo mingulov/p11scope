@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # S2 carry: module load-instance authority (from S1/F7b)
 
 Carried from S1 fix round 3 (finding F7b, path (2): fail-closed

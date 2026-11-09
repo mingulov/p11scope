@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! sem-4: post-attach first-burst retention at the production H0 seam.
 //!
 //! Live shape (system run, process started after the observer): mapped by

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Package G capacity contract: P11SCOPE_OWNER_SLOT_BOUND is
  * NATIVE_OWNER_SLOT_BOUND == MAX_SLOTS in the selected Detailed object. The lookup checks
  * (p11_owner_start_get/remove), the start-count bound (valid_owner,

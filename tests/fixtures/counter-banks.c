@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned LP64 barrier fixture: an old call returns only after explicit release.
  * Build the provider with -DCOUNTER_BANK_PROVIDER; build its small dlopen driver
  * without that define. No timeout, timing-based release or PKCS#11 payload. */

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! B17 leg-2 installed cell: one `p11scope inventory --manifest` capture
 //! over a two-provider fixture must publish `instance_reload_not_excluded`
 //! for the sharer-churned provider and not for the clean control.

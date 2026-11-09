@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Stage A deviations from `task3-mechanism-decision.md`
 
 Recorded 2026-10-06 by Task 1b-fix (branch `v030-stage-a`, base `e421f9a`).

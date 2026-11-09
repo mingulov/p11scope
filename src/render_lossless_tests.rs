@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Lossless large-value + unknown parity pins across the text, JSON,
 //! JSONL and dashboard lanes (V5-28a).
 //!

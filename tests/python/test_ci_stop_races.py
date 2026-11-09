@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """CI entry mapping for the stop-race cells (synthetic, no root).
 
 Exercises `scripts/ci/stop-races.sh` without privileged runs: the

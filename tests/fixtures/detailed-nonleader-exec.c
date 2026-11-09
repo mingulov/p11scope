@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Private LP64 x86-64 exec fixture: DSO, before driver, and distinct after driver.
  * The raw clone worker makes no libc/TLS calls. Only that worker reads stdin
  * after THREAD; the leader waits outside the provider until killed by exec or

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Focused CBOM twins: classifier mapping, mechanism union, key
 //! filtering, profile input and degraded-row handling.
 

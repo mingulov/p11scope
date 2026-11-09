@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-only
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Image-bank proof roots (Choice B feasibility): thin dispatcher, slot,
 //! return and reference uprobe roots over the native bank cores in
 //! `native/image_bank_proof.c`. Feature `image-bank-proof` only; the

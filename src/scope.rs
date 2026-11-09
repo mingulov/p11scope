@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture scope. The BPF side observes nothing until a filter is
 //! installed — scope is always explicit, and system-wide capture requires
 //! the explicit system scope, never a missing filter.

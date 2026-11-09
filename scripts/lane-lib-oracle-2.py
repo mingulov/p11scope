@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Shared lib recorded-process launcher oracle: record the launcher identity to an exclusive 0600 pidfile, then exec the user command. Oracle extracted from scripts/lib.sh (lines 466-509)."""
 import argparse
 import sys

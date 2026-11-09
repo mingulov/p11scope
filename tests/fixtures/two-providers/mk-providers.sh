@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Build the late-b cell inputs: two distinct-file SoftHSM providers plus one
 # token store holding the P11SCOPE-A and P11SCOPE-B tokens.
 #

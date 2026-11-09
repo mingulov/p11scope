@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell D1: Docker shared layers / storage driver / copy-up (dev host AND fedora).
 #
 # Two containers A and B start from one holder image (deploy/Dockerfile.holder,

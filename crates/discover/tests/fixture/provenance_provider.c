@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Each fixture runs in a separate helper process; none executes mapped scratch bytes. */
 #define _GNU_SOURCE
 #include <dlfcn.h>

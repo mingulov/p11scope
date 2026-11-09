@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* lat_probe: per-call latency of a SoftHSM2 client (Task 6 C5 measurement M6, DR-39).
  *
  * usage: lat_probe MODULE SECONDS MMAP_EVERY OUT

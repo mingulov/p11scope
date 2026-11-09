@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Native home of the Joint state×event cells for the owned-detach
 //! states J14–J16 (§8.7): J14 `OwnedProducerDetach::Pending`, J15
 //! detach Unproved, J16 detach Complete with completion minted, each

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Object-journal proof qualification oracle (H8 slice E, unprivileged part).
 
 Compares observer output against the READY/GO controlled provider ledger:

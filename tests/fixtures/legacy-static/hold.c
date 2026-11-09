@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned legacy-static holder (system-scale plan Task 1.5 case 9). Loads
  * the legacy-static provider, publishes its table through the real
  * C_GetFunctionList, prints the table exactly as the observer's probe

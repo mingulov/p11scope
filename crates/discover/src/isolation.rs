@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Optional isolated profile for the discover helper.
 //!
 //! Contract: `docs/superpowers/specs/2026-11-06-v070-helper-isolation-contract.md`

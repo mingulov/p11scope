@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed E17 ordinary-EVENTS matrix, using only supplied prebuilt inputs.
 
 Root and an independently held host lane are required. No compilation, cgroup,

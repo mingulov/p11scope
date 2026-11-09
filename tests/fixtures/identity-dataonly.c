@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned identity-dataonly fixture: map a provider file data-only, then sleep.
  *
  *   identity-dataonly --ready <file> [--sleep <secs>] <provider.so>

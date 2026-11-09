@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private collect/audit/route/scan orchestration. This does not activate a
 //! semantic reducer or alter physical counts (the later activation tasks).
 #![cfg_attr(not(test), allow(dead_code))]

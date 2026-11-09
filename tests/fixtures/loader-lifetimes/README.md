@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Loader/image lifetime fixtures (G16/G17 workload)
 
 `provider.c` and `lifetime-driver.c` are the smallest bounded source that

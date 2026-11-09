@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Gate G2 induced-gaps gap-3b oracle: disclose ring_bytes 4096 and drain_interval_ms 1000. Oracle extracted from scripts/verify-induced-gaps.sh (lines 1166-1171)."""
 import argparse
 import sys

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! p11scope-discover — unprivileged short-lived discovery helper.
 //! Design: v1 behavior when discovery fails is report-and-exit-nonzero;
 //! never silently proceed (design spec, Architecture).

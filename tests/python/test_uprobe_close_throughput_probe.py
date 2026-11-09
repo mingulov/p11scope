@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Unit tests for scripts/uprobe-close-throughput-probe.py (A2.0).
 
 Only the pure logic (argument parsing, offset planning, spec building,

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual collected H0, current validation and original prepared admissions.
 //! No object bootstrap or ordinary Joint activation is supplied by this seam.
 

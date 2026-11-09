@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Loss-share measurement oracle (Task 3.1): trace-stream, burst-timing,
 event-path arithmetic, window-validity, and loadavg helpers imported from
 scripts/system-scope-measure.py, never copied.

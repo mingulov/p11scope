@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # System-scope measurement harness
 
 `scripts/system-scope-measure.sh` runs controlled PID and system captures

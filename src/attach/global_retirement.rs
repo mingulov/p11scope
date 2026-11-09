@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Physical retirement and reselection of global static points.
 
 use super::pid_continuity::{AttachRound, PhysicalGapSummary, RegistrationId, current_pair};

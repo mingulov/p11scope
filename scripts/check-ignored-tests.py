@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Every ignored Rust test is a tracked obligation (v0.5 closure).
 
 Scans the workspace Rust sources under src/, tests/ and crates/ for real

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Kernel-side image-bank proof prototype (Choice B feasibility).
 //!
 //! This module exists only in `#[cfg(test)]` proof builds

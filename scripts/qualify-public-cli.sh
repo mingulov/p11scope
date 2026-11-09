@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-public-cli.sh P11SCOPE OUTDIR: independently ledgered public cells.
 # Requires root for live cells. --control-gated OBSERVER OUTDIR FIXTURE [CELL]
 # executes one bounded profile-pid, mt-exact or system lifecycle unprivileged.

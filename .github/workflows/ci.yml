@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 name: ci
 on:
   # Release tags ride the commit a branch push already ran (RELEASING.md
@@ -534,6 +536,13 @@ jobs:
       # builds (plain Inventory stays code-identical), and the Callers
       # flavor accepts the exe-identity bit (Callers .text +64 B). No
       # other BPF input changed since v0.6.0.
+      # A third recorded transition covers the v0.7.0 copyright-header
+      # pass: every BPF input gains only SPDX/copyright comment lines
+      # (68 added across 65 files, none removed), so code-section sizes
+      # stay exactly the transition-2 values (.text +504/+64 B, uprobe
+      # +40 B) and only .BTF.ext line info and .debug_* move with the
+      # added lines. No section is added or removed, and the shape is
+      # verified run-independent across two snapshot builds.
       # Allowed-change process: when kernel code changes on purpose, run
       # scripts/check-bpf-noninterference.py locally for the baseline tag
       # versus the candidate, take the per-section size deltas of the two

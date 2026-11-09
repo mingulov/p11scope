@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # run-cell-script.sh NAME P11SCOPE OUTDIR [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 # Generic cell-script template: runs scripts/ci/<NAME>.sh P11SCOPE OUTDIR,
 # then validates OUTDIR/results.jsonl with check-cell-results.py.

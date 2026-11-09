@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-real-providers.sh P11SCOPE OUTDIR: real distro tools under `run`.
 #
 # Each cell runs a real PKCS#11 tool under `p11scope run --pause auto` with

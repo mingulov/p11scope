@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! D4 overlay cells: xino on/off/same-fs backend parity and divergence.
 //!
 //! Lane A (pre-6.8) renders the backing inode in maps; lane B (6.8+)

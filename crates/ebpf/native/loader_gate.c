@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* T-L2c token-keyed loader gate (see loader_gate.h). The probe path is
  * serialized in-kernel: concurrent same-token and successor-generation
  * hits meet on the per-slot claim (generation CAS, then state CAS), so

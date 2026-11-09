@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The outer owned controller supplies frozen inputs and all shared leases.
 //! This body only observes; it neither starts nor stops a workload process.
 use super::*;

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # System resource and latency measurement protocol
 
 This protocol freezes the pilot axes, denominators and failure rules. It

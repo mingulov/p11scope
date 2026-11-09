@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /*
  * Host driver for the image dispatcher/bank rollover model: compiles the
  * REAL image_bank.c for host with stub map storage and runs one scripted

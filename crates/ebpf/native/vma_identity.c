@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #include "vma_identity.h"
 
 /* Kernel-only anchor maps: observer fds are `BPF_F_WRONLY`, so syscall reads

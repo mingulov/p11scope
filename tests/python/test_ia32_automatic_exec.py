@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """ia32 H6 controls: ordinary owned ELF32 workloads, never native capture."""
 import copy
 import contextlib

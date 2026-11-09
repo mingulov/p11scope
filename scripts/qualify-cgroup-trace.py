@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Bounded installed trace cells; run only with the separately granted live lane.
 
 No controllers, existing cgroups, namespaces, sysctls or containers are changed.

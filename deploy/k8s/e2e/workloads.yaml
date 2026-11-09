@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Test-only workloads for scripts/kind-e2e.sh. NOT for production.
 # A separate namespace from the observer on purpose: the observer has no API
 # access and needs none to capture a pod in any namespace on its node.

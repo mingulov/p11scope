@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! `p11scope run` owned-child lifecycle, through the one public production
 //! facade the binary uses (`p11scope::run_owned`). The coordinator clocks,
 //! maps, drains, guards and injected actions behind it stay crate-private and

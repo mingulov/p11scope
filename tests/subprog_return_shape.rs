@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Kernels since 7.4 treat a static subprogram whose BTF return type is
 //! 9..=16 bytes as returning a register pair (R0, R2) and refuse the load
 //! when either register holds a stack pointer at subprogram exit

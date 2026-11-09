@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Deterministic SoftHSM workload for counter-mode parity checks.
  * Usage: counter-softhsm-workload MODULE [ITERATIONS [SETTLE_SECONDS]]
  *

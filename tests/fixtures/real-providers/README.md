@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Real-provider fixtures (WP-3)
 
 The WP-3 cells run real distro tools under `p11scope run --pause auto`

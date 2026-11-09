@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Process-session snapshot races: python3 -I tests/python/test_process_session_snapshot.py."""
 
 import contextlib

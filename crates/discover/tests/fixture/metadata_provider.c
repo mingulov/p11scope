@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Metadata faults must not erase readable function words. */
 #define _GNU_SOURCE
 #include <errno.h>

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* sign_hammer.c — fires C_SignInit+C_Sign (HMAC-SHA256 session key) at
  * SoftHSM2 back to back: the "heavier call" arm of the overhead bench.
  * Same dlopen/table convention and two-phase go-file protocol as

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Per-module `C_Initialize` roll-up: observed init returns since the
 //! semantic lane sealed, from joined (converted) and shed (unrouted)
 //! Events. Counts are exact observations, never claims: a zero says

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # G34 runbook — carry, selector, measurement-oracle, claim-policy reconciliation
 
 Account for 433 source-qualified occurrences, 147 public ledger rows and

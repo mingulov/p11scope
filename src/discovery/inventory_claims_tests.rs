@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 
 //! I4b Slice 1 regressions through the existing owner and candidate paths.
 //! Scan results and native-image replies are scripted at those dependency

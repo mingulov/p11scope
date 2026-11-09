@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Kubernetes e2e for the DaemonSet node observer (deploy/k8s) on a private,
 # uniquely named kind cluster that this script creates and always deletes.
 #

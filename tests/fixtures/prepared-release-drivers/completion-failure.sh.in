@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 case @FAILURE@:$* in
     final-sync:*/status|final-sync:*/status.pending)
         echo 'injected final status sync failure' >&2

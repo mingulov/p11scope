@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Gate G2 induced-gaps lane oracle policy_map_ids: publish the expected policy-map id set to a 0600 file. Oracle extracted from scripts/verify-induced-gaps.sh (lines 297-329)."""
 import argparse
 import sys

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Optional bounded copies of inventory decisions. This module never decides attribution.
 
 use crate::attach::capture::DomainCookie;

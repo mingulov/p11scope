@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pins objects — manifest-recorded or scan-discovered — to their current identity
 //! without holding read leases. `check_unchanged` gives cheap, best-effort change
 //! detection via `(ino, size, ctime)`; it is not a security boundary — the leased,

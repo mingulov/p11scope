@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile function-table decode regressions (observer-side memory decode):
 //! truncated, extreme-valued and mutated table snapshots must decode to
 //! `None` or to tables whose every entry survived validation — a null or a

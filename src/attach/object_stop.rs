@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Retire private object pointers only after the native STOP gate proves Q.
 
 use super::stop_gate::StopGate;

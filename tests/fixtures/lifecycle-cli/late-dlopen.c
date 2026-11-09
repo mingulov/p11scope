@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* late-dlopen: ledgered SoftHSM2 client that maps the provider only after
  * the gate opens, then calls immediately. usage: late-dlopen MODULE N GATEFILE
  * Prints READY before any dlopen, waits for GATEFILE, dlopens MODULE, sets

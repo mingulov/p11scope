@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Test-only parent-death guard for fixture processes.
 //!
 //! A fixture child spawned without a guard outlives a test process that

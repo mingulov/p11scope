@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bridges pkcs11-types' shared mechanism registry to the BPF `MECH_SHAPE`
 //! map. *Which* mechanisms have decodable parameters comes from the
 //! registry (config), not a hardcoded mechanism-id list (code) — so

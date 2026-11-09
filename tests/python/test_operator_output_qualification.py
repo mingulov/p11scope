@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Oracle mutations and genuine fd controls, never installed acceptance."""
 import copy
 import fcntl

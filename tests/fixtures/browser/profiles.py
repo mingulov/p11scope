@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Fresh browser profiles for the G33 browser cells.
 
 Firefox reads ``pkcs11.txt`` from its profile directory at NSS startup;

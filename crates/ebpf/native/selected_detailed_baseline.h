@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #ifndef P11SCOPE_SELECTED_BASELINE_H
 #define P11SCOPE_SELECTED_BASELINE_H
 #include "image_identity.h"

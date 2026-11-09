@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # demo4-run.sh — DEMO-4 late-attach browser cell (runs ON fedora).
 #
 # The user already has the browser running: the browser launches

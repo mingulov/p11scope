@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-p11kit-pid-startup.sh: privileged cell for a named capture starting
 # beside an unpublished p11-kit closure array.
 #

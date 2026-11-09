@@ -1,18 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# DRAFT for the end-of-integration per-file pass (lane v070-copyright).
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Covers first-party files that cannot carry a comment header (strict JSON
-# and byte-exact golden/log fixtures). Rename to REUSE.toml and re-verify
-# with `reuse lint` once scripts/add-copyright-headers.py has been applied
-# to this checkout. No tracked binary files exist today; if one lands it
-# needs an entry here.
+# and byte-exact golden/log fixtures). No tracked binary files exist today;
+# if one lands it needs an entry here.
 #
-# Deliberately NOT covered here (open items for the final pass):
-# - Files that CAN carry comments but have no SPDX header yet: Cargo
-#   manifests, .github/workflows/*.yml, deploy/k8s/*.yaml, Dockerfiles,
-#   tests/fixtures p11kit .conf, *.in templates, scripts/fixtures/*.jq and
-#   the extensionless fixture shims. These want real headers, not REUSE
-#   entries; the headerless .c fixtures are contract-exempt
-#   (LICENSE_C_FIXTURES) and need a per-file license decision first.
+# Deliberately NOT covered here (comment-capable first-party files carry
+# real headers instead, including the test-input .c fixtures, which the
+# 2026-09-27 license decision places in the app domain, GPL-3.0-or-later):
 # - LICENSE and LICENSES/*.txt: upstream FSF texts with their own notices.
 # - third-party/**: vendored sources, pinned notice originals and patches.
 # - Upstream fixture data: tests/fixtures/lane13-evidence/releases/*.yaml
@@ -22,6 +16,14 @@ version = 1
 SPDX-PackageName = "p11scope"
 SPDX-PackageSupplier = "Denis Mingulov <denis@mingulov.com>"
 SPDX-PackageDownloadLocation = "https://github.com/mingulov/p11scope"
+
+[[annotations]]
+path = [
+    "scripts/bpf-noninterference-allowed.json",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Denis Mingulov <denis@mingulov.com>"
+SPDX-License-Identifier = "GPL-3.0-or-later"
 
 [[annotations]]
 path = [

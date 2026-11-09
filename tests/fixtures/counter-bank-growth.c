@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* LP64-only owned fixture, built twice: -DCOUNTER_BANK_GROWTH_PROVIDER gives
  * the provider; otherwise build the dlopen/pthread driver with -ldl -pthread.
  * Symbols counter_bank_growth_e0000..e1fff are 8192 separate function bodies.

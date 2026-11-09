@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile manifest regression tests: oversize, truncated, extreme-valued
 //! and mutated `p11scope-manifest/5` documents must be refused before or
 //! during parsing, or validate only when structurally sound. Untrusted

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! S2/S3 Task 2: independent reference histories for the pure object model.
 //!
 //! Every expectation below is handwritten from the contract notes (model,

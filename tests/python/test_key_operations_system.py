@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Churn cells: full-script self-test through fakes, plus check units.
 
 Runs scripts/ci/key-operations-system.sh end to end with a self-stopping

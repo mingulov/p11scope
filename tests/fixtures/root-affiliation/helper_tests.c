@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Reuse the actual owner implementation and its helper injection, not a model. */
 #define main owner_fixture_main
 /* A renamed C main loses main's implicit return0 rule; its unchanged test

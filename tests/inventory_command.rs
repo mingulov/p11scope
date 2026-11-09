@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Public-command inventory tests (module/caller inventory behaviors).
 //!
 //! Every behavior is asserted through the public `p11scope inventory`

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-pidns.sh P11SCOPE OUTDIR — nested PID namespace honesty cells (DR-K8S-1/2).
 #
 # BPF numbers every task by its initial-namespace tgid (`bpf_get_current_pid_tgid`);

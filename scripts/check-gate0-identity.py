@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Section-level gate-0 identity check (ruling P2F-2, hardened by P2F-5 F3,
 I1 program sections and the P2F-9 structural .BTF fallback).
 

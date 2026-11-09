@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Consume one completed same-source FULL package producer; never build.
 
 Print only the absolute staged observer path on stdout. The caller owns the

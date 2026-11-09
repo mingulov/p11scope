@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! W3-1 (Stage 3 Wave D, D2a+b) standalone harness for the task_vma identity
 //! object and its loader/parser.
 //!

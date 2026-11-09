@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture-owned registries and settlement for the pure object model.
 //!
 //! Settlement replays each domain's admitted history in reference-cut order

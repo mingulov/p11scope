@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """The vng qualify wrappers propagate guest failures to their exit code.
 
 Drives scripts/qualify-public-cli-vng.sh,

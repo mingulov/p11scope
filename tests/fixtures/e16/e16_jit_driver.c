@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 surface: PKCS#11-shaped calls into anonymous executable memory.
  *
  * Usage: e16_jit_driver N

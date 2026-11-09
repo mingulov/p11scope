@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* H8 journal custody fixture: executes the actual production
  * lifetime-mint, side-map and ring-leaf implementation from
  * crates/ebpf/native/object_journal.{c,h} plus the owner lease/cleanup

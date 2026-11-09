@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The I3/I4b inventory coordinator: owns the I4a scan window, drives
 //! scan→reconcile→publish, revalidates every prepared candidate at its
 //! publication boundary, and commits through the explicit seam.

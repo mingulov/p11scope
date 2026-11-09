@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """The P2-8 witness CLI executor scripts: exact cells, judging, exits.
 
 tests/prearm_witness_cli.rs holds the 6 P2-8 cells; scripts/ci/run-witness-cli.sh

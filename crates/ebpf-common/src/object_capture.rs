@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded object read protocols: shared production core (H7 slice C).
 //!
 //! Pure `core`-only implementations of the entry/return protocols from the

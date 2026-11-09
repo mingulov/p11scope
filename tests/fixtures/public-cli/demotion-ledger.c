@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned LP64 demotion fixture; build this source four times:
  * cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -DDEMOTION_COMMON \
  *    demotion-ledger.c -o libdemotion-common.so

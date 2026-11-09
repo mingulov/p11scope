@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Frozen H9 v5 object_observations contract agrees with its golden fixture.
 
 docs/schema/inventory-v1-object-observations-v5.schema.json is the frozen

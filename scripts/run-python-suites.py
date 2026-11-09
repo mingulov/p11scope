@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """One entry point for every tests/python suite (audit F-62).
 
 Every `tests/python/test_*.py` file is registered here exactly once, in one

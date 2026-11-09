@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* exit-mapping holder: maps the watched provider in a slow dlopen/dlclose
  * loop until killed, so discovery and the loader flow observe the mapping
  * after admission. Prints one READY line before the first dlopen, so the

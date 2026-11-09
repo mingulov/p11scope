@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! First observed semantic registration after physical use, through the real Cgroup
 //! driver/H0 and registry publication. Only native transport is substituted;
 //! these controls do not qualify kernel attachment or count missing API calls.

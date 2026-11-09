@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 7 (finish plan): adaptive capacity, sustained identity, bounded history.
 //!
 //! RED suite: every test names one Task 7 box. The `capacity` items under

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! S1 validation: reference-model sequences (D1), the false-join
 //! matrix (D2), Phase-4 workload replay with four-way agreement (D3),
 //! and the matched overhead runs (D5) — all through the real reducer

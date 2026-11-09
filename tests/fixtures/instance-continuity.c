@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* instance-continuity: owned Task 3 Stage A continuity workloads.
  *
  * Built with -DINSTANCE_PROVIDER -shared -fPIC this file is a tiny provider

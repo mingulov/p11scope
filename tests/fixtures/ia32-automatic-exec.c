@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* H6 ia32 leader exec only. Build -m32, optionally -DH6_IA32_PROVIDER
  * -shared -fPIC, or -DIA32_IMAGE=1 for the distinct successor executable.
  * Every real API call is ledgered. Initial readiness precedes calls; old

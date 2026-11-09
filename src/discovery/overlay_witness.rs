@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The original-file witness for overlay deep scans: after an overlayfs
 //! copy-up, a process still running the old lower-layer file keeps a
 //! mapping whose `(dev, ino)` equals the fresh upper file, so the

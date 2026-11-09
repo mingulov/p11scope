@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! A stop signal after the `-o` temp file exists but before attachment
 //! must leave no temp file and name the interruption. Inotify alone does
 //! not synchronize the sender: startup may finish before it is scheduled.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Small entry module for the JSON signal-lifetime probe.
 
 `test_canary_evidence.py` used to run this probe via `runpy` on the whole

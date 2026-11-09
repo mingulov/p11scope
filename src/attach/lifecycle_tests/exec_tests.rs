@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned nonleader exec: old-key cleanup before explicit same-Session rebinding.
 //! This does not qualify automatic Engine recovery across exec.
 

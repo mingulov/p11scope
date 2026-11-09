@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # One saturating joint cell (U6 loss honesty): a 100k/s joint cell
 # through scripts/ci/joint-throughput.sh, then three assertions on
 # the finished cell:

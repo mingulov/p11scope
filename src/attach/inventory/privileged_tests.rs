@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Root-owned gates; run explicitly with --ignored --test-threads=1.
 use super::*;
 use crate::capacity::CallerBudget;

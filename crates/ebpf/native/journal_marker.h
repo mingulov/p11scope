@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* H8-D atomic birth marker: one READY/DIRTY word appended to PROC_EPOCH
  * (152 B total) plus a 16 B admission control row {spent, failed}
  * in the Detailed marker and journal objects. Live since slice D: the

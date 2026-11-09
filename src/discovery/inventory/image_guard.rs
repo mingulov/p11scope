@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Production caller: scoped owner preparation and refresh in the
 //! inventory coordinator, fed per commit by the capture lane's
 //! threaded acquisition handle.

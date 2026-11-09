@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /*
  * Host model of the image dispatcher/bank rollover protocol. See
  * image_bank.h for the mechanism. Storage below stands in for the kernel

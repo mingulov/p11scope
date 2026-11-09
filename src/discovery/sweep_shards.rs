@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! C7 A4: the phase-1 maps sweep, sharded by contiguous pid ranges across
 //! the observer's CPUs.
 //!

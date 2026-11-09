@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private same-Session executable proof custody; disabled until trace wiring.
 
 use super::{CapturePolicy, Scope, Session};

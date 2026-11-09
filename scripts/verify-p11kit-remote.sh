@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-p11kit-remote.sh: Part 0 no-regression cell for p11-kit remote access.
 #
 # A p11-kit remote client (p11-kit-client.so in the application, p11-kit

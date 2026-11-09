@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* gated: ledgered SoftHSM2 client. usage: gated MODULE ITERS SLEEP_US GATEFILE
  * Sets up (Initialize/GetSlotList/OpenSession/Login), prints READY, waits for GATEFILE to exist,
  * runs ITERS x {GenerateRandom, DigestInit, Digest, FindObjectsInit, FindObjects, FindObjectsFinal},

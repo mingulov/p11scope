@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual private observation/decoder controls. These do not claim live native
 //! iterator acquisition or turn an observation into caller admission.
 use super::*;

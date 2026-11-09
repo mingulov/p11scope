@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Minimal SoftHSM first-use workload for the run-prearm public cell
  * (scripts/qualify-public-cli.sh): dlopen the provider given on argv,
  * publish its function list, then run N C_Initialize/C_Finalize pairs at

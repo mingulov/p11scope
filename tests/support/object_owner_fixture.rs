@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7-E shared native-fixture driver: compile the real task-owner C
 //! fixture and run one subcommand under default and small-state maps.
 

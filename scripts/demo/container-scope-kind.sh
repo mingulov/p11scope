@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Container-scope demo for kind (v0.7.0 F10; Task 9 reuses this script): two
 # SoftHSM signing pods run in a kind cluster on this host while the host
 # inventory names each pod in concise text.

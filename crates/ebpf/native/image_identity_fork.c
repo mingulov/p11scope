@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Detailed-only typed birth wrapper; the core owns the identity domain. */
 #include "image_identity.h"
 #include "stop_gate.h"

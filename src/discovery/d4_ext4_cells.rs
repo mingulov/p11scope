@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! D4 ext4 cells: a recycled inode number never joins a stale holder to
 //! the new file. The recycled row exits the original holder, deletes and
 //! re-creates the path (different bytes, same number), maps the new file

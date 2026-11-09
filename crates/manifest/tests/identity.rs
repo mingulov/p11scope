@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use object::elf;
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{

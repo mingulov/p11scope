@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual private journal roots and their emitted native call graph.
 
 use std::{fs, path::Path, process::Command};

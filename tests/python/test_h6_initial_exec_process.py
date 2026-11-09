@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Ordinary-uid raw-fork/ptrace controls; no p11scope or privileged lane."""
 
 from contextlib import contextmanager

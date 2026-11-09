@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* S1/Joint throughput driver: paced SoftHSM digest or keyed HMAC-sign
  * calls with per-call ledgers.
  *

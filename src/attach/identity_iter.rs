@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Stage 3 Wave D kernel-side identity (D2a+b): the aya loader, record
 //! parser, run reader, and raw iterator syscalls for the `vma_identity` BPF
 //! object (`crates/ebpf/native/vma_identity.c`).

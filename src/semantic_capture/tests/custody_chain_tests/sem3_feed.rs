@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! sem-3: refused-admission disclosure at the production H0 seam.
 //!
 //! Live shape (system run, pre-existing caller): mapped and

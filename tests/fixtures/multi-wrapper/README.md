@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Owned multi-wrapper fixture provider + workload oracle
 
 This fixture supplies independent ground truth for published-wrapper

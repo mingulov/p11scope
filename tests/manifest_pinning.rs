@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use p11scope::discovery::scan::{CaptureWorkBudget, ScanLimits};
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};

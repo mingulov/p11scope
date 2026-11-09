@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Install
 
 p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)

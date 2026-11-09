@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pass-local custody controls. Scripted verdicts do not claim live BPF proof.
 
 use super::super::identity::FileIdentity;

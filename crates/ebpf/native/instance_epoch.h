@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Task 3 Stage A: per-(process, provider file) load-instance continuity
  * witness. The hooks read kernel VMA/file/mm metadata only: no syscall
  * argument, user address, path or memory content is read or emitted. Shared

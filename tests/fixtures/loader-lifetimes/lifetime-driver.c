@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* One provider-bearing lifetime for G16/G17 qualification.
  *
  *   lifetime-driver PROVIDER LABEL

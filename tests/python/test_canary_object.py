@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """H7 slice D object-cell oracle tests: 608-byte records, stopped offsets,
 ledger replay and live-surface honesty, all hermetic."""
 

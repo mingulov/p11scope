@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # witness-cli-vng.sh TESTBIN OUTDIR KERNEL — run the P2-8 witness CLI
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
 # tag such as v6.6.157, or a release candidate such as v7.4-rc1) via

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* H8-D atomic birth marker leaves. Live since slice D: the exec-birth
  * and scope-gap roots wire these (pinned by test). BPF-compatible: at
  * most 3 arguments per leaf, no static initializers, 64-bit atomics

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Native identity isolation and compiled ABI; never loads BPF."""
 from pathlib import Path
 import subprocess

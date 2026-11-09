@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture facade contracts. Only kernel link/map IO is replaced: the
 //! attach set, its retained pins, and the entry validators are production.
 

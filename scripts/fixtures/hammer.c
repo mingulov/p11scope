@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* hammer.c — fires C_GenerateRandom at SoftHSM2 as fast as possible, with
  * no per-call delay, so a tiny ring buffer (scripts/verify-induced-gaps.sh's
  * event-loss gap, small-ring build) overflows before the next drain.

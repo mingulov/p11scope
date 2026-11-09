@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-only
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Ordinary endpoint-use entries. The optional caller flavor additionally
 //! records exact image/object witnesses. No ordinary arguments or returns.
 use super::*;

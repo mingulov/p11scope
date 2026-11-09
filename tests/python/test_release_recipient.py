@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed recipient journeys must execute the selected candidate binary.
 
 G25/C8: the journey resolves its observer through the explicit selected

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! BPF load feasibility measurements (parallel loading, resident service).
 //!
 //! Ignored privileged cells, run by hand as root under the privileged lock:

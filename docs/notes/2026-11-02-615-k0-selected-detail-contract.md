@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Packet 6.15 K0 contract — selected-endpoint detail from the broad counter
 
 **Status:** current contract for `--select-endpoint` (K0), implemented in

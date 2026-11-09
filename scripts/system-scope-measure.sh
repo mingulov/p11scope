@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # system-scope-measure.sh — controlled per-PID and --system captures for the
 # measurement protocol (docs/testing/system-scope-measurement.md):
 # identical deterministic workload, exact binary identity,

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::*;
 use crate::attach::{OwnedLink, ProducerProgram, RetirementFixture};
 use crate::discovery::scheduler::{MAX_NEW_VIEWS_PER_TICK, MAX_NEWCOMER_ADMISSIONS_PER_TICK};

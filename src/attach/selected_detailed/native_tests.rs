@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Can run directly with rustc --test; no Cargo/BPF build or kernel loading.
 use std::path::PathBuf;
 use std::process::Command;

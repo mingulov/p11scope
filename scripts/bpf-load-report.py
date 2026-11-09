@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """One-kernel BPF load report from raw verifier-stats probe JSONL.
 
 Reads the probe's own output (``record:"load"`` rows plus one

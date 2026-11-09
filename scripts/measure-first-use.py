@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Measure one first-use sweep cell from fixture ledger plus observer record.
 
 The fixture ledger comes from tests/fixtures/system-first-use.c delay/mode

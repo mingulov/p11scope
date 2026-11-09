@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Shared vng guest-release match for the BPF load drivers.
 #
 # Sourced by scripts/check-bpf-load-kernels.sh,

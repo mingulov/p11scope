@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::*;
 use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
 use p11scope_ebpf_common::{Event, capture, event_type};

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """System-scope exact-equality regressions (WP-10, gap §3 item 4).
 
 The harness always runs the workload against a private provider inode

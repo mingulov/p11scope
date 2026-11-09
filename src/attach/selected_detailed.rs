@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Closed selected Detailed preparation. Native integration is deliberately
 //! unavailable until the real coordinator activation proof is connected.
 

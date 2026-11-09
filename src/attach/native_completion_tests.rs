@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The native completion adjudicator mints only joined evidence: joined
 //! detach, proven Q, a backlog-free terminal drain with no
 //! reserved-but-uncommitted head, and the minting Session's retained

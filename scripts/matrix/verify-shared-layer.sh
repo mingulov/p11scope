@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Task 6: shared image-layer attach/count oracle, broad and leaf cgroup scope.
 #
 # Manifest-free: nothing is copied out of either container. This is the measured

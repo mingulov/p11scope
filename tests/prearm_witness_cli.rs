@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! P2-8 CLI cells: `--prearm-module` exactness through the real command
 //! line against SoftHSM. A GO-gated workload maps SoftHSM and issues a
 //! scripted call sequence only after the capture prints its ready line;

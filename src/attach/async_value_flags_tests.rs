@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Privileged live gates for the async control value flags: an OK
 //! `C_AsyncGetID` with a NULL output pointer must set
 //! `ASYNC_VALUE_UNREADABLE`, while a GetID/Join with a readable id must

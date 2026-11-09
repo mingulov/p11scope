@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* inventory-ledger: the ledgered PKCS#11 workload for the installed
  * `p11scope inventory` acceptance (Task 6 C8). Driven by
  * scripts/qualify-inventory-native.sh, checked by scripts/inventory-native-oracle.py.

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Caller object ABI and bounded execution of actual ordinary-entry bytecode.
 
 The concrete runner implements only the instruction subset reached by these

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! DR37 promotion requests: immutable actual-view requests over the real
 //! presentation, the one-slot UI mailbox and the display snapshot.
 //!

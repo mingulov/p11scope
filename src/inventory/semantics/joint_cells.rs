@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Joint state/event cell table (§8.7 "Homes"): every constructible
 //! (state, event) pair exactly once, with the home that proves it.
 //! `Unconstructible` pairs (retire_own before any completion exists)

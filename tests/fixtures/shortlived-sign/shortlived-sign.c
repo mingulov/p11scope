@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Short-lived SoftHSM caller: init, login, RSA signs, exit.
  *
  * Usage: shortlived-sign PROVIDER PIN SLEEP_MS [ITERS INTERVAL_MS]

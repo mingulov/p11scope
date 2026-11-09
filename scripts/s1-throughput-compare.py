@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Compare an S1 throughput run's driver ledger with observer output.
 
 Inputs: one driver ledger per worker thread (the T0 per-call shape:

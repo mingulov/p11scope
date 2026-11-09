@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! 6.15 driver packet: CLI endpoint selection plus live
 //! counter→detail promotion/demotion orchestration over the
 //! handoff→gate adapter (WF §D2.3 ordering as amended R2-D2-A…E).

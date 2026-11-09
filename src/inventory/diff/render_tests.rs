@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Human conclusions and publication ordering from real admitted snapshots.
 
 use super::{compare::compare, input, model, render::render_text};

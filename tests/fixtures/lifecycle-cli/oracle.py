@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Lifecycle CLI oracle (WP-10, S9/S10): judge one cell from its report, ledger(s) and receipt.
 
 Usage: oracle.py --cell NAME --report REPORT --ledger LEDGER --receipt RECEIPT [--stderr STDERR]

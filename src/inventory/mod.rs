@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! `p11scope inventory`: which module is used by whom.
 //!
 //! One snapshot pass, or a `--duration` observation window of passes,

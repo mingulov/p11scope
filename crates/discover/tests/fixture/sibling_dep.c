@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Sibling dependency fixture for the provider-directory fallback: the
  * provider under test links against this library (DT_NEEDED) and the
  * library lives beside the provider, outside the loader search path. */

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #define P11SCOPE_IMAGE_QUERY_HOST_TEST
 #include "../../../crates/ebpf/native/image_identity_query.c"
 static u64 fixture_pid_tgid(void) { return 400ULL << 32; }

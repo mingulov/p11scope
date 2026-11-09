@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Package recipient checklist (G25 installed artifact acceptance)
 
 Clean-context verification of the official release assets. Run against the

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Native leaves enter Session custody before bisect can encounter another error.
 pub(in crate::attach) fn retain_success<T, E>(
     result: Result<T, E>,

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Independent, atomic delivery of the completed inventory diagnostics.
 
 use crate::inventory_diagnostics::{DiagnosticSummary, FinishedDiagnostics, RetainedIdentityView};

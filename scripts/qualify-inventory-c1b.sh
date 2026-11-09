@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-inventory-c1b.sh — privileged cells and stage timings for C1b
 # (inventory --system attributes callers past --max-scan-pids by maps identity).
 #

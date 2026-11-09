@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* through-proxy: ledgered PKCS#11 client for the p11-kit transparency cells.
  * usage: through-proxy MODULE ITERS SLEEP_US SETTLE_MS GATEFILE
  * Prints READY before the first PKCS#11 call (and before dlopen), waits for

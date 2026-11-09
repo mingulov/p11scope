@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Validity checks and statistics for scripts/bench-inventory-native.sh (Task 6 C5.5).
 
 A run directory written by the bench holds:

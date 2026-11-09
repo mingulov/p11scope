@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private scan-local executable receipts; no event naming authority.
 
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};

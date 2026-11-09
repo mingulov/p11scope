@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Joint key-operations throughput cells (WU-7a): live keyed HMAC at
 # 10,000 calls/s over a linked capture, judged by the --joint oracle.
 #

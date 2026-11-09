@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 surface: a SYNTHETIC client-side HSM proxy with a standard shape.
  *
  * This provider keeps the fully standard file-backed surface (exported

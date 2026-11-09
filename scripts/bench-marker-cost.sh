@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # bench-marker-cost.sh — birth-marker cost: per-exec and per-call.
 #
 # Method: two self-measured workloads run beside a live observer under

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # joint-stall-live.sh P11SCOPE OUTDIR: live Joint finish stall/wedge campaign.
 #
 # Runs the observer (p11scope inventory --system with a SoftHSM manifest)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Measure successful verifier work through the actual native loader on Linux.
 
 Build the bounded x86-64 probe elsewhere with `build OUTDIR`. `run` NEVER builds:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Drive `p11scope inventory --dashboard` under a pty and verify it.
 
 All modes exercise the scan dashboard explicitly; they do not need live BPF

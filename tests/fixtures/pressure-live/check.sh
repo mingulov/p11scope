@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # check.sh: isolated self-check for the pressure-live fixtures.
 # Unprivileged. Builds driver/static-head plus a tiny provider, runs a small
 # retain+late+head population through the gate protocol, validates every

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """S1 throughput harness twins: compare script and gen-calls driver.
 
 The harness (R2 T1 narrowed to the S1 path by R-53/N3) lets the

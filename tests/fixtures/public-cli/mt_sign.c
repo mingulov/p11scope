@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* mt_sign: deterministic multi-threaded shared-key signing workload.
  *
  * usage: mt_sign MODULE THREADS SIGNS GATE PIN LABEL

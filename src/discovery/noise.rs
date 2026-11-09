@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Discovery-noise aggregation (Task 3.2, S1).
 //!
 //! Live `--system` discovery emits one stderr line per skipped object view

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* 104-entry ABI execution ledger emitter (E17 pattern).
  *
  * Usage: abi-104 PROVIDER LEDGER_PATH [GO_FILE] [MODE] [ARG]

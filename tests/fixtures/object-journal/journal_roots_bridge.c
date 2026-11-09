@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Test adapter only. Native custody and BEGIN/return/settlement are the
  * production implementation included by the unchanged historical fixture.
  * Rust drives the same in-place return writers used by the private roots. */

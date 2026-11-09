@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Real attested held files and H0 decisions through substituted map I/O.
 //! These tests establish source behavior, not native attachment qualification.
 

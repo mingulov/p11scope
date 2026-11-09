@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Container-cells oracle for scripts/docker-shared-layer-e2e.sh (D1), scripts/docker-copyup-changed-e2e.sh (D1-changed) and scripts/late-provider-negative.sh (N4).
 
 Subcommands: copy-up (D1 shared-layer / copy-up), copy-up-changed

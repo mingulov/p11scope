@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The release compiler is single-sourced from `.release-rust-version`.
 //!
 //! Live release toolchain selectors (shell, Python, CI) read that file instead

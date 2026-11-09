@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture resource reservations backed by the registry's existing pool.
 
 use super::MAX_UNSETTLED_STAGED;

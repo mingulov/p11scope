@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """E16 qualification runner: reducers, lifecycle and the eight H1 regressions.
 
 Run as a script, never through pytest collection:

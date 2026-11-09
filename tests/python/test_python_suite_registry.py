@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Meta-test for scripts/run-python-suites.py (audit F-62).
 
 The registry must account for every tests/python suite, both ways, and a

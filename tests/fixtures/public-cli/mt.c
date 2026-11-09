@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* mt: N threads hammer C_GenerateRandom on SoftHSM2 for SECS seconds; prints exact total. */
 #define _GNU_SOURCE
 #include <dlfcn.h>

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* null_provider.c — minimal PKCS#11 provider that returns CKR_OK immediately.
  *
  * Purpose: measure p11scope's own per-call ceiling, not the provider's.

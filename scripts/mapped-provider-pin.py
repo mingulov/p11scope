@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Hash a held provider FD and independently anchor its /proc/maps identity.
 
 As in discovery::identity and manifest::KernelSelfMappingProbe, fstat identity

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Two-provider ledger/oracle twins.
 
 The oracle (scripts/joint-two-provider-compare.py) compares the

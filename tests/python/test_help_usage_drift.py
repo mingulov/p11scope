@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Help/usage/parser flag agreement (SYSPLAN residual F-30).
 
 Three artifacts name the CLI surface: the parser in src/cli.rs, the USAGE

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! FU-3 (Package E): fixture groundwork for the E20 same-domain /
 //! distinct-cookie trigger pair.
 //!

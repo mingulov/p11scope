@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """One retained, stopped acquisition for the closed canary lanes.
 
 The shell owns external workload waits. Owned runs retain their child through

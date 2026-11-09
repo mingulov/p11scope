@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* cgroup-fork: ledgered SoftHSM2 client that forks a child after the gate.
  * usage: cgroup-fork MODULE ITERS SLEEP_US GATEFILE
  * Prints TARGET/READY, waits for GATEFILE, forks; parent and child each run

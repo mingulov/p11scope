@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! U1 dashboard: bounded views over unbounded captures, plus DR37 promotion keys.
 //!
 //! The renderer consumes IMMUTABLE [`Presentation`] snapshots through

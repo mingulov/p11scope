@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Slice 1b-2 production live-discovery driver fixture.
  *
  * One source, three frozen builds; the provider byte identities it drives are

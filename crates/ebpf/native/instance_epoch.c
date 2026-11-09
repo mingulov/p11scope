@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Task 3 Stage A load-instance continuity witness (Detailed and journal).
  *
  * Every file-VMA lifecycle transition passes through the kernel's uprobe

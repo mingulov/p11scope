@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Same-caller provider admission through genuine H0 receipts. Only the existing
 //! native/Session I/O seam is substituted; no current receipt is constructed here.
 

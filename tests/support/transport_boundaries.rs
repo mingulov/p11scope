@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Source sentinels shared with a standalone, dependency-free regression seam.
 
 const JOURNAL: &str = "src/semantics_objects/journal.rs";

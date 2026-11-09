@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Native real-helper tests with authenticated pidfd custody and bounded teardown."""
 
 import ctypes

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Task 4 lane 02 validate_root oracle: refuse when the evidence-root identity changed. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 60-65)."""
 import argparse
 import sys

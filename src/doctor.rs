@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! `p11scope doctor`: host and target capability probes with a verdict (spec §4.6).
 //! Tells an operator *before* a capture attempt which lanes this host and this
 //! target support, and what to change when one does not. `probe` runs the real

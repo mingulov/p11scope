@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Build one system-scope measurement record from a controlled capture.
 
 Inputs: the observer's JSON report, the /proc sampler trace, the

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Calls the production entry, pre-mm invalidator and iterator. Helpers are
  * scripted; shared cells use real atomic accesses, including host writers. */
 #ifdef P11SCOPE_LOADER_GATE

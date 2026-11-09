@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Physical entry-count fixture, not semantic/API or full ABI qualification.
  * 32 indexed A_i/B_i 2.40 table pairs share32 real CK_RV(void) bodies, one
  * body per distinct physical object (libdemotion-common-00..31.so): 32 offsets

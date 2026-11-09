@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* async-32 driver: scripted caller for the async-32 stub provider (link
  * -ldl). Binds through C_GetFunctionList like a real application and
  * cross-checks the table entries against dlsym.

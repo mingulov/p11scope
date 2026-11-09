@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Attach the `pin` uprobe at a caller-supplied offset, run the target once,
 //! print the hit count. Exit 0 iff hits == expected. Exit 3 on attach error.
 

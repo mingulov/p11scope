@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Function-table ABI fixture. Names come from the shared Rust field arrays;
  * this file supplies only the published slot counts and pointer mechanics. */
 #include <stddef.h>

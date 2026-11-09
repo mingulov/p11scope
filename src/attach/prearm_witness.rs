@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pre-arm mapping-instant witness (WU-13 P-C phase 2): short-lived startup
 //! object proving no scope member had the pinned provider mapped between
 //! scope start and attach-complete.

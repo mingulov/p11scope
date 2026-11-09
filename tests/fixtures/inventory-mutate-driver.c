@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned provider-mutation fixture driver: map a provider, then dlclose and
  * dlopen the same path on signal so the observer watches one path resolve
  * to two distinct physical module instances across passes.

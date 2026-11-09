@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 \
     && rm -rf /var/lib/apt/lists/*

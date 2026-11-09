@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Real C protocol controls for leader exit with an already entered frame.
 
 These controls compile and drive the owned LP64 fixture without BPF. They

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Kernel-side image-bank proof prototype (Choice B feasibility).
  * Dispatcher + two bank slots behind owner-shaped program arrays; the
  * route word rides the START row (R0, no new map). Bank A reuses the

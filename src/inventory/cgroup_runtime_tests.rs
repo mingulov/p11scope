@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Runtime controls use real scoped collection/commit over an owned provider.
 //! Scripted capture service does not qualify a kernel capture or public cgroupfs.
 

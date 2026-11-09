@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Scripted binder tests: rows, pins, cookie answers and exec records are
 //! programmed, never read from the host.
 

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! C7 A4: the sharded maps sweep is the serial sweep, result for result and
 //! charge for charge, at every ceiling.
 

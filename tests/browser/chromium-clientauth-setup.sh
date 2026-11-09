@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 #
 # README -- Chromium client-certificate demo workload that actually signs
 # ----------------------------------------------------------------------

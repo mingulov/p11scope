@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """E16 execution-surface qualification: owned live runner and verifier.
 
 E16 asks whether discovery finds, or honestly refuses, PKCS#11 code in

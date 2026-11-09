@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 surface: direct PKCS#11 exports without any discoverable table.
  *
  * This provider exports a handful of PKCS#11 entry points directly as

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H5 C7 durable late-real-provider cell (unprivileged, always runs).
 //!
 //! A sustained retained population (eight children on one early provider)

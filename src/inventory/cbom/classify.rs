@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Conservative `CKM_*` name → CycloneDX `algorithmProperties` mapping.
 //!
 //! Every property here is determined by the mechanism's own registered

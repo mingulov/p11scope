@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded current ownership, separate from retained historical membership.
 use crate::discovery::caller_registry::{
     AdmissionState, CallerId, CallerRegistry, MappingState, ModuleKey, RegistryLimits,

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Forwarding/sparse two-provider ledger stub: a provider-free emitter.
  *
  * Usage: forward-sparse-stub LEDGER COUNT [--sparse N] [--forward SPEC]

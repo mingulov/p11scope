@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #include "../../../crates/ebpf/native/image_identity.c"
 void selected_fixture_identity_setup(void *lookup, void *storage, void *current)
 {

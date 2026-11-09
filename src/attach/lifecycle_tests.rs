@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned Detailed lifecycle gates and their unprivileged fixture protocols.
 //! Explicitly selected ignored gates fail on unavailable kernel support.
 

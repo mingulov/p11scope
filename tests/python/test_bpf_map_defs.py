@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Compiled ELF fixtures exercise the production map inventory decoder."""
 import argparse
 import contextlib

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! U1 dashboard tests: deterministic rendering + REAL PTY coverage
 //! (scrolling, resize, small terminals, Unicode/control, exit/
 //! restoration, large inventories), JSON-vs-dashboard replay

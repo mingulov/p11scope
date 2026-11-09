@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Original call and effect positions from one actual conversion/settlement.
 
 use super::{ConsumptionOrdinal, JournalAdapter, SealSuccess, SealedCall, SealedObjectPrefix};

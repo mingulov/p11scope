@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Statistics for scripts/bench-discovery.sh (Phase 2, D2).
 
 Reads BENCH_DISCOVERY JSON sample lines (one per line, `cold`/`warm` runs

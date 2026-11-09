@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Conservation checks for the short-lived key-operations cell.
 
 scripts/ci/key-operations-shortlived.sh runs N short-lived SoftHSM

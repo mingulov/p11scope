@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private authority carried from retained Inventory inputs to a Detailed lane.
 
 #[path = "semantics/joint.rs"]

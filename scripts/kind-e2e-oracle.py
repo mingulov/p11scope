@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Kubernetes (kind) e2e oracle for scripts/kind-e2e.sh: validate DaemonSet capture evidence against the workload ledgers and refuse mutations."""
 import argparse
 import sys

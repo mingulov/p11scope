@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Executes the actual production transaction and classifier implementation.
  * Only kernel helper operations and atomic interference are injected; there is
  * no second owner-accounting algorithm. */

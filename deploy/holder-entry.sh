@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Test-only entry for the p11scope-holder image (deploy/Dockerfile.holder).
 #
 #   holder-entry ledger ITERS   init a private SoftHSM2 token, then exec the

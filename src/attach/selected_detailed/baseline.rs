@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Inventory-domain kernel image acquisition. Results are private identity
 //! facts; the view/request binder must qualify them before Detailed preparation.
 use super::super::capture::{NativeDomainId, ReadWindow};

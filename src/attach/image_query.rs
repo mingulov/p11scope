@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Same-object fresh image queries and the only full-image scan seal.
 
 use super::capture::{NativeDomainId, ReadWindow};

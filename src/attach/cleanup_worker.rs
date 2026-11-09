@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Background link retirement and terminal cleanup (stop-gate Task 5).
 //!
 //! The session moves owned links out of Aya and submits tagged live batches

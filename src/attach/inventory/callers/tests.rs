@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Caller preparation contracts. Only kernel allocation/IO is replaced;
 //! validators and the preparation transaction are the production seams.
 

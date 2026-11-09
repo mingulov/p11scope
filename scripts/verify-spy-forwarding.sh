@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-spy-forwarding.sh: privileged cell for an interposing PKCS#11
 # module (OpenSC pkcs11-spy) in front of SoftHSM2.
 #

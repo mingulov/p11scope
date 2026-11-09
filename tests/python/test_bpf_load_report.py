@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Per-kernel BPF load report: every root loaded, stats present, headroom kept.
 
 Drives scripts/bpf-load-report.py through its real CLI on small owned JSONL

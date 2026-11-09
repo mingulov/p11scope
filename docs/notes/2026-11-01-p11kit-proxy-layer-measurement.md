@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # p11-kit proxy-layer coverage measurement (2026-11-01)
 
 Lane task/v060-p11kit-admission, task 3. Measurement only; the 512 / 8192 /

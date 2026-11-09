@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Lifecycle CLI oracle unit tests (WP-10, S9/S10).
 
 Exercises tests/fixtures/lifecycle-cli/oracle.py on synthetic reports,

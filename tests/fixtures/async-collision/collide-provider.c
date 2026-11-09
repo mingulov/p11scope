@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Stub-family async-collision provider fixture (new file; the shared
  * live-discovery-provider.c is never modified).
  *

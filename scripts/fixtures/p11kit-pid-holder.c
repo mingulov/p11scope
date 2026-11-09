@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* p11kit-pid-holder: lazy p11-kit holder for
  * scripts/verify-p11kit-pid-startup.sh. libp11-kit is mapped before the
  * observer attaches, its managed modules load only after the observer

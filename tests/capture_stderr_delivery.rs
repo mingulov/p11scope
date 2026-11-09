@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture diagnostics must not park the observer on a stalled stderr,
 //! nor let diagnostic delivery change the exit status (Sol-full F3).
 //!

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-public-cli-vng.sh KERNEL P11SCOPE OUTDIR — run scripts/qualify-public-cli.sh as root
 # inside a virtme-ng guest booted on KERNEL (a mainline tag such as v6.1.188, or a vmlinuz path),
 # then the least-privilege cell (scripts/ci/minimal-setcap.sh: the observer as the unprivileged

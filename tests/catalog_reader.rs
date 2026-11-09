@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Independent catalog reader (module/caller inventory Phase 1 gate).
 //!
 //! Reads ONLY the `inspect --system` output document (via CLI invocation

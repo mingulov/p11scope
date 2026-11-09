@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Phase 4 Task 8 — fork scoping and measured privileges
 
 > Addendum 2026-09-27: the capability rows below were measured on the

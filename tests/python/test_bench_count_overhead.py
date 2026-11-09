@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """M2 counting-overhead analyzer: strict shape and exactness gates (G34).
 
 A reduced log, a None==None count re-check, scrambled ABBA order or a

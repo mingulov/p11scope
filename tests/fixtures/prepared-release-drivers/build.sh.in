@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -eu
 ROOT=@ROOT@
 P11SCOPE_PREPARED_STABLE_CARGO=@CARGO@

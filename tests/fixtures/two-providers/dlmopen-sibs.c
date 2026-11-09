@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Same-process dlmopen sibling fixture: one provider file, two namespaces.
  *
  * One source, two builds (the s1-dlmopen-double-load.c pattern):

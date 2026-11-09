@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # G25 runbook — candidate CI, package recipient and documentation contracts
 
 Exact source freshness and usability; no independent reproducible-build

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Native Linux x86-64 LP64 caller. Real SoftHSM calls; no simulated provider.
  * Every provider call, including setup/teardown, has an independent ledger
  * (call rows carry the session handle, or 0 where no session exists; target

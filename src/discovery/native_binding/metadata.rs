@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Display-only expected images from already-proven native caller bindings.
 //! These facts never upgrade caller, Engine, provider or scope authority.
 use super::*;

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 
 P11SCOPE_VM_BASES=${P11SCOPE_VM_BASES:-$HOME/src/m/p11scope-ws/vm-bases}
 

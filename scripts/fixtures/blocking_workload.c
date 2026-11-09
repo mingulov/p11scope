@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* blocking_workload.c — calls the one blocking entry point in
  * blocking_provider.c (C_WaitForSlotEvent, legacy index 67) and hangs
  * there. scripts/verify-induced-gaps.sh starts this under attach, lets

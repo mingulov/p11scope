@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # G33 runbook — real providers, browsers, deployment, concrete kernel lanes
 
 No browser dependency is added to mandatory hosted CI. Base `fabbb0a4`.

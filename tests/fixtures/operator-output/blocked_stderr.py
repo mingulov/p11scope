@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Blocked-stderr E17 acceptance: dependency binding plus ACK/pressure/cleanup verdict.
 
 The blocked stderr channel cannot prove its own prompt acknowledgement, so a

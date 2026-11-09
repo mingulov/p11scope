@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Pre-arm mapping-instant witness (WU-13 P-C phase 2, addendum §4). Standalone
  * startup object: an unmap latch, departure accounting, a cgroup
  * out-migration latch and one iter/task_vma presence walk. Every sensor

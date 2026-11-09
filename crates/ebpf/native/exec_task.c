@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #include "exec_task.h"
 
 #ifndef P11SCOPE_EXEC_HOST_TEST

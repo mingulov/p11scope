@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Short-lived cell key setup: generate the RSA key the signer finds.
  *
  * Usage: shortlived-keygen PROVIDER PIN

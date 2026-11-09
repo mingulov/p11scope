@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Z2 retained thread-member custody twins: mint/validate/selector plus every
 //! refusal (foreign group, independent Arc, changed birth, exits, permission,
 //! missing pidfd, deadline, headroom, FD exhaustion, exec, mid-proof).

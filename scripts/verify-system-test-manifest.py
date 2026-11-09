@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Verify acceptance records without executing their declared commands.
 
 The checked-in ledger and mandatory gate catalog are acceptance authority;

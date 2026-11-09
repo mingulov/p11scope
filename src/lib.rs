@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
 
 /// Crate-wide, non-panicking `eprintln!`/`eprint!` (HIGH-4). The Rust

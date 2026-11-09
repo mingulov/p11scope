@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Extensive-mode executable dependency hints (6.14 Option B, D-transitive).
 //!
 //! A process that exits before its first caller binding leaves a

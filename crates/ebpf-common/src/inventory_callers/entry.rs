@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Shared ordinary-entry decision seam and its map/helper boundary.
 
 use super::{

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! sem-5: instance continuity across passes (E) and once-only call accounting (F).
 //!
 //! Live shape (system run, two providers callers, 17 passes): one still-mapped

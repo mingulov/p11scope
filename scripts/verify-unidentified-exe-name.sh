@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # verify-unidentified-exe-name.sh: privileged cell for the user question
 # "which program called?" over short-lived callers.
 #

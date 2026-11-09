@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* refresh-churn: long-lived SoftHSM digest caller with exec/reload churn,
  * plus a short-lived single-operation mode for the joint-stall live cell.
  *

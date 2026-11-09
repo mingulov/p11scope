@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Complete inventory documents with exact local accepted-byte accounting.
 //!
 //! Positive writes reset the inactivity budget; there is no total deadline.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Dry-run stand-in for the installed observer in soak trials.
 
 Speaks the observer's profile argv shape (`profile --pid PID --manifest

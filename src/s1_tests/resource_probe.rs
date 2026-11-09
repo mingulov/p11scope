@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Retained H2 metadata and output costs, separately from reducer costs.
 //! H3's final unpublished-batch and instance-emitter types do not exist yet;
 //! measuring H2 envelopes here does not stand in for those future types.

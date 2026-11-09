@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::fixture_guard::DieWithParent as _;

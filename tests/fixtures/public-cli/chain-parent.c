@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* chain-parent: named launcher for the parent-chain public-CLI cell.
  * Usage: chain-parent PROG ARGS...
  * Forks and execs PROG, waits for it, and exits with its status, so the

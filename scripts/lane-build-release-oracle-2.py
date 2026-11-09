@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Release tree-digest transcript oracle: join the sorted tree listing with sha256 records into a validated transcript. Oracle extracted from scripts/build-release.sh (lines 359-406)."""
 import argparse
 import sys

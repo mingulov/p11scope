@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Standalone diagnosis: NSS-level token login, then TLS, no Playwright.
 
 Reproduces the blocker behind the missing Firefox sign-positive cell

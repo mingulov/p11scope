@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned churn observation helper (inventory breadth matrix).
 #
 # Spawns one anchor driver (killed INV_ANCHOR_KILL_SECS seconds after the

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Actual native root helper tests and narrow production hook contracts."""
 from pathlib import Path
 import argparse

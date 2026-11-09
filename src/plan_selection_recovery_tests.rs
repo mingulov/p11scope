@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::*;
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionTable};
 use std::path::{Path, PathBuf};

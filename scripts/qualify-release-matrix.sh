@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-release-matrix.sh — exact selected release-matrix assertions.
 # Full Stage5 remains owner-manual; valid smoke exits 2, never full coverage PASS.
 #

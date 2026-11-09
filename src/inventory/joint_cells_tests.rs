@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 // Driver home of the Joint state×event cells (§8.7): J0–J11 ×
 // {cancel, promote, held_install, replace_foreign, sigint2}, J9/J11 ×
 // {stop, deadline, capture_error, sink_failure}, J16 × retire_own,

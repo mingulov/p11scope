@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Test-only Knative Service for cell K3 (scripts/knative-e2e.sh). NOT for production.
 # One revision, scale-to-zero, one request per pod: the image serves $PORT and
 # runs exactly one ledgered SoftHSM2 run per pod (see

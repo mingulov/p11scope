@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! `p11scope inspect --system`: the whole-machine discovered catalog.
 //!
 //! Every process enumerated from `/proc` is deep-scanned with the same

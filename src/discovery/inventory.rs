@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 
 //! Inventory-only ownership and reconciliation preparation. This component does
 //! not attach probes, publish capture output, or schedule work; the I3/I4b

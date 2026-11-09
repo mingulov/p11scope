@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #include "../../../crates/ebpf/native/selected_detailed_baseline.c"
 #include <assert.h>
 #include <stdio.h>

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Observer-side RSA oracle: observed units must match the independent ledger.
 
 The application ledger (built by test_key_operation_ledger's workload

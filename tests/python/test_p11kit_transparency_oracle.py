@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """p11-kit transparency oracle: parser and judge controls.
 
 The spy parser is fed a real captured log,

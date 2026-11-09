@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Independent oracle for the installed `p11scope inventory` acceptance (Task 6 C8).
 
 Ground truth is the per-process ledger printed by

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Shared wire records for positive caller/object Inventory evidence.
 //!
 //! Caller-use rows retain historical physical-use evidence and a saturating

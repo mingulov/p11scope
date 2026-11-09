@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Shared lib user process-group identity oracle: validate the recorded pid, starttime, pgid, sid, and argv identity. Oracle extracted from scripts/lib.sh (lines 535-553)."""
 import argparse
 import sys

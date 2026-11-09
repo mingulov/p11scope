@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* The one E16 fixture hold protocol, shared by every E16 driver.
  *
  * Every protocol record is one whole stderr line written by e16_write_all,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Wait until every workload edge is native-matched in the event stream.
 
 Inventory usage counting only observes calls made after a caller's edge is

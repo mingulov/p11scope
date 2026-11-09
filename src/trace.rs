@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! `trace` renderer: one line per completed call, in arrival order — the
 //! per-investigation counterpart to `profile`'s aggregate report
 //! (see `docs/usage.md` and `docs/privacy/allowlist-v1.md`).

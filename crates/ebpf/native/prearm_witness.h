@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Pre-arm mapping-instant witness (WU-13 P-C phase 2). The hooks read kernel
  * VMA/file/mm/task/cgroup metadata only: no syscall argument, user address,
  * path, payload or memory content is read or emitted. Shared by the BPF build

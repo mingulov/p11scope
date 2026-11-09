@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Which PID namespace this observer numbers processes in (DR-30, DR-K8S-1/2).
 //!
 //! BPF names every task by `bpf_get_current_pid_tgid()`: the task's tgid in

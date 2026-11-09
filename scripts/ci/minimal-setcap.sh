@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # minimal-setcap.sh P11SCOPE OUTDIR: the v0.7.0 least-privilege cell.
 # Runs the observer as the unprivileged `nobody` user with exactly the
 # minimal file-capability set (no sudo, no CAP_SYS_ADMIN) at the current

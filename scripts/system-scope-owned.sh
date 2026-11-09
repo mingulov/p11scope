@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # shellcheck shell=sh
 # Launch-time supervisor custody for system-scope-measure.sh.
 

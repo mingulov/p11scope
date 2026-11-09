@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Offline CycloneDX CBOM export from saved inventory or profile evidence.
 
 pub(crate) mod classify;

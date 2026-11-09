@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # v0.7.0 "calls happened => data present" live regression matrix.
 #
 # Owner rule (2026-11-09): if a program makes PKCS#11 calls, p11scope must

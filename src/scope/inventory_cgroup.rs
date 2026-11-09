@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded, retained-root cgroup candidate discovery and fresh leaf sampling.
 //! Candidates never authorize admission. Samples are endpoints, not continuous
 //! residency, process/image identity, scope absence, or call-time authority.

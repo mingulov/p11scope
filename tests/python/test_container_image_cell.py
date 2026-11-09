@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Permanent container-image cell: argument contract and preflight exits.
 
 Runs scripts/matrix/verify-container-image.sh against stub tools in a fake

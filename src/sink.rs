@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The bounded-wait-drop stdout sink: a stalled flush waits at most the
 //! per-tick budget, then its pending bytes are dropped with counters,
 //! never held unboundedly. The capture continues; the evidence says what

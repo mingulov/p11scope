@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # fedora-softhsm-cell.sh P11SCOPE OUTDIR: real SoftHSM 2.7 exact cell.
 #
 # Cell (b) of the S2 package: the gated workload runs against the real

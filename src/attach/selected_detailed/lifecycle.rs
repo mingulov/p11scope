@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Retain each actual producer before attempting the next acquisition.
 pub(super) fn attach_retained_with<T, E>(
     owners: &mut Vec<T>,

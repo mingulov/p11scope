@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! C1b: attribute callers independently of the deep-scan cap.
 //!
 //! Over `--max-scan-pids`, discovery deep-scans one representative per

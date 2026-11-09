@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Family-28 key-operation text summary: the `key operations:` block
 //! `render_snapshot` prints directly after the `coverage:` line — one
 //! header line plus one indented line per provider and category. Counts

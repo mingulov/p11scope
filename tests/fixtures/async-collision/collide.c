@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Async-collision two-process ledger emitter (E17 pattern).
  *
  * Usage: collide PROVIDER MODE OPS LEDGER_A LEDGER_B [GO_FILE]

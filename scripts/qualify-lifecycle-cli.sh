@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-lifecycle-cli.sh P11SCOPE OUTDIR: lifecycle cells through the public commands (S9/S10).
 #
 # Cells:

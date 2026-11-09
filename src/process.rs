@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded Linux process identity tracking for node-wide captures.
 
 use crate::discovery::scan::{CaptureWorkBudget, read_mountinfo};

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Bench-overhead coverage oracle: prove each observed sample counted the workload.
 
 Exit 0 means the sample is VALID (exact equal coverage). Exit 10 means the

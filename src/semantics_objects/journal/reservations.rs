@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Fixed resource bookkeeping. IDs and roles grant no semantic authority.
 //!
 //! The caller prepays this table's one allocation before construction. Each

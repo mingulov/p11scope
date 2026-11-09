@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 typedef unsigned char CK_BYTE;
 typedef unsigned long CK_RV;
 typedef struct { CK_BYTE major; CK_BYTE minor; } CK_VERSION;

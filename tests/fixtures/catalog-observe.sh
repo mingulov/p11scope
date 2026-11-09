@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned catalog observation helper (module/caller inventory Phase 1).
 #
 # Spawns the eight owned fixture processes, waits for their readiness

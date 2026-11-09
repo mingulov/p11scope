@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Owned EXT-01 filtered-worker qualification; live use needs its host lane.
 
 First require the observer's functional doctor Clean verdict. Only then launch

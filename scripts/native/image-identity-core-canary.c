@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Compile-only root consuming the real identity core; no copied allocator. */
 #include "../../crates/ebpf/native/image_identity.c"
 

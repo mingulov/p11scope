@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Compare all bytes of the three default BPF objects from fresh snapshots.
 
 Run an explicit --repeat-baseline diagnostic first, then compare distinct

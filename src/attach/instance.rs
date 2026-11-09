@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
 //! - Loads the four native continuity hooks (`uprobe_mmap`, `uprobe_munmap`,

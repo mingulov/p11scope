@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Socket-needy fixture: C_GetFunctionList needs an AF_INET socket and fails
  * with CKR_DEVICE_ERROR when creation fails. Under the trusted profile the
  * table is walked; under the isolated profile the failure must be recorded

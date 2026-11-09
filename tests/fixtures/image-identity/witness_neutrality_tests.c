@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Witness counter neutrality: quota, zero-cell, create, retry and config
  * failures through p11_link_current_cookie must leave the shared health
  * counters (unavailable, create_failures, retry_exhausted) unchanged.

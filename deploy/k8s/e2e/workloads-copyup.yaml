@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Test-only workload for the kind copy-up negative cell (scripts/kind-e2e.sh
 # only: the shared workloads.yaml stays exactly the set every kind cell
 # applies). Side S maps the staged provider and ledgers 400, one unmapped

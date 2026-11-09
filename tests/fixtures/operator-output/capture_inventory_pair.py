@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Capture two real independent Inventory CLI windows with prebuilt fixtures.
 
 Each window captures only the original control's first five physical entries.

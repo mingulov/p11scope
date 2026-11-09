@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 [package]
 name = "p11scope-ebpf"
 version = "0.0.0"

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 // These charges depend on the pinned alloc implementation. A stable compiler
 // bump requires semantic-budget remeasurement and source-proof revalidation.
 // Rust1.99.1 alloc/core and std's hashbrown0.17.1 retain the geometry used here;

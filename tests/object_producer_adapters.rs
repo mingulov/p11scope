@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7 adapters tail: wire the read-protocol core to object storage.
 //!
 //! Entry-fill runs after the ABI record (dispatch on the frozen descriptor

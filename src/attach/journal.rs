@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Reachable under `inventory --key-operations`: the opt-in lane threads a
 //! real `JournalSpec` through the attested Session start; all other factories
 //! pass `None` and stay ordinary. Remaining staged row: R4 deferred custody in

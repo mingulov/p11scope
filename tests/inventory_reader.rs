@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Independent inventory reader (module/caller inventory contract).
 //!
 //! Reads ONLY the `inventory` output document (via CLI invocation on

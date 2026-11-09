@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! sem-1: shed-call disclosure at the production H0 seam.
 //!
 //! Live-shaped records (manifest-A function set, P1/P7 mechanism workload)

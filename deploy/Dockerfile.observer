@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # p11scope observer image for development: a static musl binary plus the
 # in-cluster entry script, on scratch with a pinned static busybox for the
 # entry script. The image runs the observer by

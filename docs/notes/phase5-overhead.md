@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Phase 5 Task 3 — measured overhead across capture modes
 
 `scripts/bench-overhead.sh` measures p11scope's real cost against

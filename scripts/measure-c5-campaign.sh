@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # measure-c5-campaign.sh — the Task 6 C5 measurement campaign (M0–M7), end to end.
 #
 #   measure-c5-campaign.sh --candidate BIN --baseline BIN [--r4-base BIN] [--loss-candidate BIN]

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Build/check only owned demotion fixtures on a build host, never on Fedora.
 
 Print temporary arrival-check metadata to stdout. Outputs are active test inputs,

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual collector custody and negative disposal, with substituted ring I/O.
 
 use super::tests::{SteadyFault, producers};

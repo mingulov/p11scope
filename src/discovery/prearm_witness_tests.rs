@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pre-arm witness engine twins (WU-13 P-C phase 2, P2-6): the binding §11
 //! list through the real `finish_prearm_capture` with `ScriptedSession` and
 //! planted verdicts. Every test asserts exact window lists, never `is_some`.

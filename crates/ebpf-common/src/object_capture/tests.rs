@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7 slice-C protocol tests: host executions of the production core with
 //! injected read spies. Every test asserts exact read sets (addresses and
 //! sizes) and proves forbidden fields unread via the read log.

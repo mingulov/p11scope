@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Release-asset container publish at the extracted workflow seams.
 
 container-publish.yml downloads the published release tarball, SHA256SUMS

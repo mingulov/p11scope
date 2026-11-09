@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # legacy32-shape.sh P11SCOPE OUTDIR: SoftHSM 2.7 table-shape exact cells.
 #
 # Cell (a) of the S2 package: a synthetic 68-slot provider labelled {3,2}

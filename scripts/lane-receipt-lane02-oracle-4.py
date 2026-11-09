@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Task 4 lane 02 count_byte_token oracle: count token occurrences in a file. Oracle extracted from scripts/verify-receipt-lane02.sh (lines 137-141)."""
 import argparse
 import sys

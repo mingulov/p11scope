@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The owned Inventory capture facade (Task 6 C3): one caller-flavor
 //! Inventory object behind `Prepared → Active → Retiring → Retired` (plus
 //! `Failed`, which always keeps its retirement capability). Callers never

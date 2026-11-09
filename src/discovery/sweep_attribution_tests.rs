@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! C1b pure-core tests: more processes than the deep-scan cap, many
 //! identical callers, and every confirmation and identity hazard.
 

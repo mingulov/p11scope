@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Unprivileged qualification-oracle tests: argument handling, READY/GO and
 deadline behavior, ledger comparison and rejection/mutation cells.
 

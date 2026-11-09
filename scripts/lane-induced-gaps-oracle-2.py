@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Gate G2 induced-gaps lane oracle assert_gap2: validate the stranded in-flight call gap with no completed count and no latency. Oracle extracted from scripts/verify-induced-gaps.sh (lines 222-286)."""
 import argparse
 import sys

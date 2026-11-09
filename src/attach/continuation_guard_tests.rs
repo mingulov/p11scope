@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! SG-T7B guard (owner ruling B, 2026-09-25): the two tail-call
 //! continuations release the stop-gate admission their caller took, so
 //! they must never be attached directly. A direct attach would release

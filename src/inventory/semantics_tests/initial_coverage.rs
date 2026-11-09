@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Registry publication ordering, using the existing converted-registration
 //! seam. These timestamps disclose observation order, never call authority.
 

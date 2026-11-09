@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Container-cells oracle (D1 copy-up, D1-changed, N4 late-reported): healthy twins pass, every check refuses its mutation.
 
 D1 follows the live D1-extended shape (binding): pre collapses B-pre onto

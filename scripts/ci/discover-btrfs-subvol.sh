@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # discover-btrfs-subvol.sh DISCOVER SCRATCH OUTDIR: the discover helper's
 # btrfs-subvolume twin as a CI cell.
 #

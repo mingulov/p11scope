@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H8 journal wire contracts: exact BEGIN/END/ABANDON layouts, finite
 //! validators, compact/full equivalence and rejection of every malformed
 //! combination. Drives only the public shared wire API; the producer that

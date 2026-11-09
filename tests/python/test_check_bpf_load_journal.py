@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Journal load gate: the linked inventory loads the journal pair in guests.
 
 Drives scripts/check-bpf-load-journal.sh through owned fake guests (a fake

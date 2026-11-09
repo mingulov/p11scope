@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Acceptance seams of the soak vehicle (scripts/system-scope-soak.sh).
 
 The oracle's own --self-test battery proves every gate red-green on

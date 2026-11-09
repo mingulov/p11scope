@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Reading the aggregate maps. PerCpu values are summed in userspace;
 //! percentiles come from log2 buckets and are therefore approximations
 //! (the lower bound of the containing bucket), which every renderer must

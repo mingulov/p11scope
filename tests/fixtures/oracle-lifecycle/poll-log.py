@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Recorded-process helper interposer that logs every liveness poll.
 
 The hung-clients scenario points RECORDED_PROCESS_EXEC here, so each

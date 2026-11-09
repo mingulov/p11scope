@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-only
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Distinct journal roots. This module is absent from every non-journal BPF
 //! object; proof and production journal selections link the same roots.
 //! The host proof includes its scalar policy and in-place wire writers only.

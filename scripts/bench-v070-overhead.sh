@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # bench-v070-overhead.sh — today's real per-call overhead and maximum rates.
 #
 # Owner questions (2026-11-08): "what's the overall overhead?" and "do some

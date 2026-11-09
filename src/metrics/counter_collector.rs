@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private preparation for independent cumulative counter collection.
 //!
 //! Acquisition supplies actual Session identity and complete native health.

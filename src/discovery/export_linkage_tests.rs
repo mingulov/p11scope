@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Export linkage (GT-2): a provider loaded before attach has no interface,
 //! live-return or manifest evidence, so its scan-decoded table used to be
 //! named `unknown` throughout. Its own `.dynsym` is a second, independent

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Per-call ledger fixture/oracle foundation twins.
 
 The oracle (scripts/joint-ledger-oracle.py) validates the independent

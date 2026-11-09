@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned single-target inventory observation helper.
 #
 # Spawns one fixture driver, waits for its readiness marker, then EXECS

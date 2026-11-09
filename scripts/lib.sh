@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Shared helpers for the gate scripts: non-root caller check, cleanup traps,
 # container tar cap, root process pinning/signalling, capture-ready wait.
 

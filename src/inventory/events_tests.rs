@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! U0/D event-stream tests: versioned schema, rotation that never
 //! loses silently, retention accounting, stream gaps identical in
 //! meaning to snapshot gaps, and privacy bounds equal to snapshots.

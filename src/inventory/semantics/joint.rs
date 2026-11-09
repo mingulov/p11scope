@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Scope-bound borrows of one live Joint lane; no additional retained owner.
 #![cfg_attr(not(test), allow(dead_code))] // The following machine slice supplies these borrows.
 

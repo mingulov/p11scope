@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Judge inventory MT-exact evidence against the threaded fixture ledger.
 
 Cells `inventory-mt-pid` (one N-thread process) and `inventory-mt-system`

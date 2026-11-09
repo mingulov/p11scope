@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-inventory-c1b-vng.sh KERNEL P11SCOPE OUTDIR [CELLS] — run
 # scripts/qualify-inventory-c1b.sh as root inside a virtme-ng guest booted on
 # KERNEL (a mainline tag such as v6.1.188, or a vmlinuz path). CELLS defaults

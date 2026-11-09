@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* S1/F7b owned double-load fixture: one provider object, loaded twice.
  * Built twice from this file: `-DS1_DLMOPEN_PROVIDER -shared -fPIC`
  * yields the provider; without it, the driver, which takes the

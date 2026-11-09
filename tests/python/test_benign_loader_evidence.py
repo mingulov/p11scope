@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Benign loader-hit evidence: closed-set, invariant, and complete rule.
 
 Direct checker tests (no subprocess): `benign_hits` exonerates fully

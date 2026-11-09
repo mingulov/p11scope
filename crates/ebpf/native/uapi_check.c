@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Reproducible UAPI assertion check for the identity raw syscalls (F6).
  * Compiled with `-fsyntax-only` against the HOST <linux/bpf.h> at build
  * time: every `_Static_assert` below must hold or the build fails. This

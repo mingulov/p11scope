@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Probe-manifest schema v5 — the contract between `p11scope-discover`
 //! (writer) and `p11scope` (reader). Offsets are ELF object-file byte
 //! offsets; see docs/notes/aya-offset-semantics.md.

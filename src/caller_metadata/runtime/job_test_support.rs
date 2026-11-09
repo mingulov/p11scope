@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Test-only blocking fault at the actual production work owner and budget.
 //! It cannot fabricate a completion, expected image or publishable sample.
 

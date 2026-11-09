@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Native setup for the actual release seal CLI, ending at a harmless probe."""
 
 from dataclasses import dataclass

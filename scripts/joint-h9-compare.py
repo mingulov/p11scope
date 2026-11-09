@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Compare two interleaved feed ledgers against H9 joint output.
 
 Inputs: two per-feed ledgers from tests/fixtures/joint-populations/two-feed.c

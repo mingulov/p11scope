@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed 104-slot ABI execution driver twins (fake outputs, owned inputs).
 
 Twins for scripts/qualify-abi-execution.py: the profile-to-counts

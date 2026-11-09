@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! U0 presentation tests: ONE model for JSON and snapshots (A1/A2),
 //! exact dashboard vocabulary with its distinctions (B2), and the
 //! withheld semantic column (B3). JSON-vs-snapshot agreement is pinned

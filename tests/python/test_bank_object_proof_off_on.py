@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Proof-off/proof-on ordinary-object comparison + shared artifact preflight.
 
 Section 3(c): the ordinary Detailed object must be identical across the

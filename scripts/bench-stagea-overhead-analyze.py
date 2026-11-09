@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Stage A overhead ABBA analysis (Task 1d; completeness-hardened, P2-4).
 
 Reads a scripts/bench-stagea-overhead.sh campaign log: MACHINE/BINARY header

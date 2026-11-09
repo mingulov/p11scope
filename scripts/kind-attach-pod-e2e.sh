@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell K2: attach-pod.sh against a kind pod, from the kind node container.
 #
 # A private kind cluster runs the test-only workloads (deploy/k8s/e2e/

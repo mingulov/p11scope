@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -I
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Apply one fixed post-admission mutation for lane-13 native tests."""
 
 import json

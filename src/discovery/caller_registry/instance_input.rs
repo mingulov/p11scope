@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Sealed H2 consumer inputs. H3 must consume runtime proofs here; these
 //! reference builders never exist in a production build.
 #![cfg_attr(not(test), allow(dead_code))]

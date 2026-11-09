@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private first-use evidence. Never compiled into the public executable.
 
 use p11scope_ebpf_common::Event;

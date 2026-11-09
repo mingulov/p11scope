@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Machine-readable v3 schema agrees with the release oracle (F-50, F-12).
 
 docs/schema/observed-profile-v3.schema.json is a consumer aid, not the

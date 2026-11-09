@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # release-gate.sh — checked-in ordinary release gate runner.
 #
 # Runs the ordinary (unprivileged, host) release gates in order — a fmt

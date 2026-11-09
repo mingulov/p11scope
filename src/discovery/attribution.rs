@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Internal-only attribution for published discovery skips.
 //!
 //! `render::capture_skipped_out` deliberately flattens every internal loss to

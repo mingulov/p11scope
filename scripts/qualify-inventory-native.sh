@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-inventory-native.sh — installed `p11scope inventory` acceptance (Task 6 C8).
 #
 #   qualify-inventory-native.sh P11SCOPE [--lane scan|native] [--base DIR] [--no-dashboard] [--max-endpoints N]

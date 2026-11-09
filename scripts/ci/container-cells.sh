@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # scripts/ci/container-cells.sh P11SCOPE OUTDIR — S8 container cells on hosted runners.
 #
 # Apt prerequisites (ubuntu-26.04): docker.io gcc python3 softhsm2 libsofthsm2

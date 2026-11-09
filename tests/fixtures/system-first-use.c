@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Private T2 workload. Observer transition times are deliberately absent. */
 #define _GNU_SOURCE
 #include <stddef.h>

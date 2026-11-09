@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Executable resolution for the identity-object clang invocation, shared
 //! by `build.rs` and the qualification harness (both include this file by
 //! path; it takes no crate dependencies so it compiles in either).

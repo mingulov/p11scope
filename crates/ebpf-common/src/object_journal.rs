@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Finite object-journal wire contracts (H8). Exact kernel/userspace layouts
 //! for BEGIN/END/ABANDON journal records plus their pure validators.
 //!

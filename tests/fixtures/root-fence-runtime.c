@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Native x86-64 PKCS#11 3.2 provider and post-exec two-call driver.
  * Compile with ROOT_RUNTIME_DRIVER for the driver. Neither program is a
  * retirement witness: the Rust owner must genuinely reap before dequeue. */

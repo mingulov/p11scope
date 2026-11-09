@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Host regression harness for the real birth wrapper and instance epoch hooks.
  * Every external helper is scripted; every assertion is on production code.
  * Include the wrapper before the scripted epoch CAS: stop-gate atomics stay real. */

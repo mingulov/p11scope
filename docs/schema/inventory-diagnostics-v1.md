@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Inventory diagnostics JSONL v1
 
 Inventory diagnostics explain decisions made by a native inventory capture.

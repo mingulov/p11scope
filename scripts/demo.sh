@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # r/PKI demo: which program called my token? Make a SoftHSM token, run three
 # callers (pkcs11-tool sign, a python3 sign script, openssl via
 # pkcs11-provider), then show `inventory --system` naming each program and

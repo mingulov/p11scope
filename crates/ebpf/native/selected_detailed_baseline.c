@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Caller Inventory identity only. This unit has no Detailed/START/continuity
  * dependency and never emits EVENTS/DISCOVERY or reads target user memory. */
 #include "selected_detailed_baseline.h"

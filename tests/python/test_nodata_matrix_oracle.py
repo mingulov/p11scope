@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Self-test for the v0.7.0 no-data matrix oracle.
 
 GREEN fixtures (a healthy cell per mode) must PASS; RED fixtures (empty

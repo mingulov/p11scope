@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned EXT-01 fixture, built twice: -DRETURN_PROBE_PROVIDER for the SO,
  * otherwise a pthread caller. No observer is attached by this program.
  * Caller argv: PROVIDER worker-pre-filter|worker-late-filter CALLS LEDGER.

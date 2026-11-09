@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned identity observation helper (D3d sweep cells).
 #
 # Spawns the owned fixture processes, waits for their readiness markers,

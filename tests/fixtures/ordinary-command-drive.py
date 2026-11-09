@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Ordinary unprivileged operator journey with explicit observer/helper paths.
 
 Owns a same-uid target and checks inspect identity against /proc independently.

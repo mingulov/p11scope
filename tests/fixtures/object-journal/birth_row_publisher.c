@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* H8-D birth-row publisher: runs the REAL marker leaves over real
  * instance_record rows and dumps the resulting NATIVE bytes for the
  * Rust birth-observation tests, so happy paths traverse genuinely

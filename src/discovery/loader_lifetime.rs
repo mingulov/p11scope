@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! STAGED: no production caller; activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Staged L1 loader-lifetime token/generation model (G16).
 //!

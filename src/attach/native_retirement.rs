@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Session-owned live retirement and bounded collected-Finish ownership.
 
 use super::cleanup_worker::{BatchStatus, BatchTicket};

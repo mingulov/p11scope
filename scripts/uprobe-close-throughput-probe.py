@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Uprobe perf-event close-throughput probe (A2.0 pre-measurement).
 
 Question: does closing uprobe perf-event FDs scale with closer threads, or

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* One selected native domain. Identity/negative lifecycle only until the
  * runtime consumes its genuine final activation proof. No target user reads. */
 #include "selected_detailed.h"

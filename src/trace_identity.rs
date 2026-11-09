@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture-local retained executable receipts and event-time lookup.
 
 use crate::attach::detailed_identity::{ProofSession, TraceProofUnknown, VerifiedTraceSeed};

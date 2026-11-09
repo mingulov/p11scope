@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Teach-preload for verify-unidentified-exe-name.sh --teach: sleep in a
  * constructor so a preloaded tool instance stays alive (with its exe
  * path intact) while the observer admits it. Admission records the

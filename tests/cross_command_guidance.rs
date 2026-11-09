@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Guidance must agree with real doctor verdicts and helper output channels.
 
 use p11scope::doctor::{self, Check, Status};

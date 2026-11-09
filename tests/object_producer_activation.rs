@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7 slice D: reviewed finite object capture activation gates.
 //!
 //! Production publication lifts ONLY on the reviewed allowlisted attested

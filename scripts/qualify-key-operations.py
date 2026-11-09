@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Compare observed key operations with the independent RSA ledger.
 
 Inputs are the controlled application's JSONL ledger (validated by

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Manual qualified runner for the H4a pre/post userspace gate.
 
 The gate needs root, both prebuilt release binaries, the Btrfs holder

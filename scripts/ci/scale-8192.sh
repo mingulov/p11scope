@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # scale-8192.sh P11SCOPE OUTDIR — weekly 8192-endpoint system-scale entry (S7).
 #
 # Runs scripts/qualify-inventory-native.sh --capacity boundary

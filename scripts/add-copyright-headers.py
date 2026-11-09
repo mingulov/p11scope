@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Insert the project copyright line beside first-party SPDX headers.
 
 Prepared for the end-of-integration per-file pass; not yet applied to
@@ -52,6 +53,11 @@ UPSTREAM_FIXTURE_PREFIXES = (
 )
 # Generated manifests carry no header by convention.
 GENERATED_SUFFIXES = (".lock", ".sums")
+# Byte-exact policy files: the v1 allowlist is a frozen decoder-inventory
+# contract and must stay byte-identical; the pass leaves it unstamped.
+BYTE_EXACT_FILES = (
+    "docs/privacy/allowlist-v1.md",
+)
 
 # Comment openers that may carry a copyright notice line, including the
 # continuation line of a block comment.
@@ -99,6 +105,8 @@ def plan_for(path, content):
     for suffix in GENERATED_SUFFIXES:
         if path.endswith(suffix):
             return ("skip", None, "generated file")
+    if path in BYTE_EXACT_FILES:
+        return ("skip", None, "byte-exact policy file")
     if b"\x00" in content:
         return ("skip", None, "binary file")
     state = comment_notice(content)

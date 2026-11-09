@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* reload-workload: ledgered SoftHSM2 client with a mid-capture provider reload.
  * usage: reload-workload MODULE N1 N2 GATEFILE
  * Sets up, prints READY, waits for GATEFILE, runs N1 x {6 functions},

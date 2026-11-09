@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Independent target BTF. Padding makes an unrelocated fixed offset fail. */
 #ifndef EXEC_SHAPE
 #error EXEC_SHAPE must select a target representation

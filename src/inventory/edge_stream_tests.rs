@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! DR-C5-EDGE: production `edge_observed` records through the real
 //! per-pass emitter and the terminal sweep in `finish_output` — only on
 //! class changes, capped per pass with a counted deferred carry, a digest

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Multi-uprobe link creation plus bounded poison-offset isolation.
 //!
 //! Provenance: `link_create` UAPI layout is borrowed from `ossl-bpf-sys`

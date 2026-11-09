@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # tsprobe.sh — manual LOST-timeline probe (Task 3.1 G4m method): pid/trace
 # duration-expired run with externally timestamped stdout, splitting
 # capture-tick loss from detach-window loss across the detach silence gap.

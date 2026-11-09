@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Conservative compiled birth/name wiring contracts, without loading BPF.
 
 Reuse the frozen ELF/LLVM decoder and finite CFG helpers. Small instruction
@@ -22,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 from _loader import load_sibling
 
-DECODER_SHA256 = '3a9034c4e928c954ef0aa494438cda6cb04df02e2d3fe2dda03ac94265a98d65'
+DECODER_SHA256 = '20f67ea065ef30c60e6b64e3663c9886d010e0b23725d3fb20fa4acee4fbc2bc'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')

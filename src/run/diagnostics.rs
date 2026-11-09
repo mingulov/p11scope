@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Cleanup progress is optional diagnostics, never a blocking dependency.
 
 use std::io::{self, Write};

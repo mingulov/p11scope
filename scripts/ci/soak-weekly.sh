@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # soak-weekly.sh P11SCOPE OUTDIR — weekly 1800 s soak entries (S14).
 #
 # Runs the two long soaks sequentially:

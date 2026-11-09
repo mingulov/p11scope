@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell N4: node-wide never-seen late provider stays UNSUPPORTED (dev host
 # primary, fedora optional repeat; no kind, host observer, initial PID namespace).
 #

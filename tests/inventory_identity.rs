@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! D3d identity-backend integration: bounded real-CLI sweep cells.
 //!
 //! Every behavior is asserted through the public `p11scope inventory`

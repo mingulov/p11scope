@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # The observer's namespace. Pod Security Admission must allow the
 # `privileged` level here: hostPID and the added capabilities are outside the
 # `baseline` profile. Keep target workloads in their own namespaces; nothing

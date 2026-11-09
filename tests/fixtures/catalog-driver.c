@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned catalog fixture driver: map providers, then sleep for the observer.
  *
  *   catalog-driver --ready <file> [--call] [--sleep <secs>] <provider.so>...

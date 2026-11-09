@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #define _POSIX_C_SOURCE 200809L
 #include <fcntl.h>
 #include <signal.h>

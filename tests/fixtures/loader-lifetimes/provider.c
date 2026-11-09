@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Minimal synthetic provider for loader/image lifetime qualification (G16/G17).
  *
  * One source, one byte identity:

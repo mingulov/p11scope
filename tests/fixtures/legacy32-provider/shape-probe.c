@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* shape-probe: read a provider's published table shape without judging it.
  * usage: shape-probe PROVIDER.so
  * Prints fact lines; the cell script judges them against expectations:

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The Inventory attach set: the append-only, budgeted table of physical
 //! endpoints the inventory command would instrument, retained across scan
 //! passes.

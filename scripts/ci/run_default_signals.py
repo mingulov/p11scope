@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Exec a child with default SIGINT/SIGQUIT dispositions.
 
 A POSIX shell without job control starts every `&` background job with

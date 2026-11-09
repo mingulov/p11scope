@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Incremental-discovery responsiveness telemetry (Phase 2).
 //!
 //! Per-stage timers, the inter-drain gap distribution, newcomer queue ages,

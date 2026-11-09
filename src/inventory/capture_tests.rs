@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The native lane over a scripted facade and a real coordinator (scripted
 //! process source, scripted catalogs): the exact call order of startup,
 //! passes and stop, and what each ordering rule buys end to end.

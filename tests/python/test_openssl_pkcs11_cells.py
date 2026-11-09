@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """OpenSSL through PKCS#11 cells: real openssl/pkcs11-tool/p11tool traffic.
 
 Each test drives a real client (openssl 3 pkcs11-provider, legacy engine,

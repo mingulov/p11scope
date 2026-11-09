@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded preparation, ordered accounting, shared proof and live finish.
 //!
 //! Speculative maps reads use private work budgets, but every real pin uses

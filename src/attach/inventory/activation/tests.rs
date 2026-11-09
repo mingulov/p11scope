@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Behavioral contracts for the production Inventory activation helpers.
 //! Only kernel link/map operations are replaced; target pinning uses real files.
 

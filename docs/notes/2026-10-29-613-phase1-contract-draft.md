@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Packet 6.13 phase-1 contract draft — pre-armed named providers + watch intervals
 
 **Status:** DRAFT for root decision (phase 1 of packet 6.13). No code beyond

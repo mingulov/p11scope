@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Finite object wire contracts (H7). Exact kernel/userspace layouts for
 //! object-call facts plus their pure validators. These types pin the frozen
 //! wire; they activate no capture and authorize no read by themselves.

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The native usage lane of `p11scope inventory` (Task 6 C5.1): the loop
 //! adapter that owns the Inventory capture facade, services it between
 //! scan passes, stages every native batch through the coordinator, and

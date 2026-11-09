@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # G32 runbook — policy, safety, privileges, live stop/sink boundaries
 
 No new capture policy, no universal hard deadline. Base `fabbb0a4`;

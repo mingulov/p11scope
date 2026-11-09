@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded cgroup transactions. Candidates schedule work; only borrowed
 //! transaction permits can authorize admission. Custody survives publication.
 

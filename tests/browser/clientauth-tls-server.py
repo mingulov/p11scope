@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Tiny loopback TLS server that requires a client certificate.
 
 Demo ground truth for the Chromium client-auth workload: it counts TCP

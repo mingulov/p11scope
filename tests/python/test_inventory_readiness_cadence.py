@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Replay delayed Inventory publication through the real readiness controller.
 
 Only the clock, fixture command and held-image queries are substituted. The

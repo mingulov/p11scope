@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Public CLI breadth oracles: exact run, cgroup, counter, select, ia32, trace loss.
 
 Covers WP-4 new cells and strengthened oracles. All expectations are

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* exec_storm: self-timed fork+exec churn for the birth-marker cost bench.
  * usage: exec_storm PROG OPS
  * Runs OPS x {fork, exec PROG, wait for exit} sequentially. PROG must exit

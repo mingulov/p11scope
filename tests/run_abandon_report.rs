@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! A second SIGINT while teardown is still settling must publish the `-o`
 //! report before exiting 130: the public contract promises the report is
 //! written at the quiescence point, before any probe link closes, and stays

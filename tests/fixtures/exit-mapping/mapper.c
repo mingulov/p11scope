@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* exit-mapping mapper: single-threaded dlopen/dlclose cycles over the watched
  * provider, then exits. Each cycle is an independent mapping event and slots
  * are sticky, so any localized cycle names the slot at exit. usage: mapper

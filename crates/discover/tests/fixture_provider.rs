@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use p11scope_discover::discover::discover;
 use p11scope_discover::manifest::*;
 use std::path::{Path, PathBuf};

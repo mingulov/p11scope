@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Local TLS/HTTP flow servers for the G33 browser cells.
 
 The servers are the cells' independent ground truth: they record what the

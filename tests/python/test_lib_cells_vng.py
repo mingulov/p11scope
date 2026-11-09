@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """The kernel-sensitive lib-cell subset guest script: exact cells, judging, exits.
 
 Drives scripts/ci/lib-cells-vng.sh with a stubbed `vng` that writes canned

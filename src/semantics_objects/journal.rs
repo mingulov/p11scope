@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Sealed object-journal authority (H8): the private consumer that turns the
 //! inactive journal wire into proven model inputs.
 //!

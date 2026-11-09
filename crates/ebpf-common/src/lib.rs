@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Wire types and pure policies shared between the BPF programs and userspace.
 //! Map wire types use `#[repr(C)]` so both sides read the same bytes. Pure
 //! policy types, including `object_policy`, are not map or event layouts.

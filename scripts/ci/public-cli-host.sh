@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # public-cli-host.sh P11SCOPE OUTDIR: proof wrapper for the cell-script template.
 # Runs the existing public-cli host cells (scripts/qualify-public-cli.sh) and
 # leaves OUTDIR/results.jsonl for check-cell-results.py.

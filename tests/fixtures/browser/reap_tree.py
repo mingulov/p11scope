@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Owned-child supervisor for run-mode browser cells.
 
 ``p11scope run`` ends capture when its owned child exits and honestly

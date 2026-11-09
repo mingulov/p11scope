@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Host substitution is limited to BPF map/task helpers. The selector and
  * irreversible state transition bodies below are the production C source. */
 #define P11SCOPE_SELECTED_HOST_TEST

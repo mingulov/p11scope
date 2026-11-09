@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Production diagnostic hooks over the same real-identity retirement schedules.
 use super::demotion_retirement_tests::Scene;
 use super::*;

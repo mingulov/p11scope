@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Late-provider-B fixture with a physical cut: two distinct provider files,
  * real PKCS#11 v2.40 calls, one feed-labeled ledger.
  *

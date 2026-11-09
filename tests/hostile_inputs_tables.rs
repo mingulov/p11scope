@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile provider-table regression tests: modules whose `C_GetFunctionList`
 //! or `C_GetInterfaceList` return null pointers, garbage addresses or lying
 //! counts must be recorded as evidence. Version labels remain metadata;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Owned actual-reporter controls; never a complete blocked-stderr acceptance.
 
 The delayed control queues a signal while the process is stopped. It does not

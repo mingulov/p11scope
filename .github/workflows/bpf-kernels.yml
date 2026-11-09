@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 name: bpf-kernels
 # Trial (early-BPF-load-checks plan, Task 5 step 1): load every BPF program
 # on the LTS kernels inside KVM guests on hosted runners, and once more on

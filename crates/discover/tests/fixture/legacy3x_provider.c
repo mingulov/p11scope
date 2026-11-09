@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Legacy-only provider stamped with a 3.x version, the Fedora SoftHSM 2.7
  * shape: the frozen 68-slot CK_FUNCTION_LIST carries the library version
  * (STAMP_MAJOR.STAMP_MINOR), every slot is a distinct exported C_ function,

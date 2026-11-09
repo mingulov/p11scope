@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Oracles for the G33 browser cells.
 
 Each ``check_*`` takes a ``cells.CellResult``, the parsed report, the

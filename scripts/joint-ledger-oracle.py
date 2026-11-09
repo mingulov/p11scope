@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Validate an independent per-call ledger and its settlement join.
 
 The ledger is E17-pattern JSONL: one `ready` row, N `call` rows with

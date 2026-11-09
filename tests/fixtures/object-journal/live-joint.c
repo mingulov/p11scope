@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* live-joint: the READY/GO owned provider workload for the R1.6 live Joint
  * root cells (inventory::privileged_tests::privileged_joint_*_lp64).
  *

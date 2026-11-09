@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! ELF facts the observer needs about an object's *bytes*: which registry symbols it
 //! exports and where they live as file offsets. Offsets are ELF object-file byte
 //! offsets (docs/notes/aya-offset-semantics.md) — the same domain manifest records use,

@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Load the journal object in throwaway vng guests and score its verifier cost.
 #
 # Usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1]

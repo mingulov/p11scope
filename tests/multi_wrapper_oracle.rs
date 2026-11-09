@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned multi-wrapper fixture provider + workload oracle: self-tests.
 //!
 //! The C fixture under `tests/fixtures/multi-wrapper/` models the p11-kit

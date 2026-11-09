@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Phase 2 Task D2: cold/warm discovery benchmark over the owned lifecycle
 # fixture (the D1 harness,
 # `cold_and_warm_discovery_agree_on_catalog_attach_sets_and_call_counts`).

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Retained, bounded wire custody for one production Joint quantum.
 //!
 //! Raw custody is not admission, bootstrap or drain-binding authority.

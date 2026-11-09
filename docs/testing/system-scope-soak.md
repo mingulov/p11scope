@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Soak vehicle: system-scope-soak.sh
 
 `scripts/system-scope-soak.sh` runs the acceptance manifest's `soak.*`

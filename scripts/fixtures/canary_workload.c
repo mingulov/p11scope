@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* The deterministic fixture matrix plants ordinary pointer sentinels plus
  * every diagnostic scalar decoder, readable/faulting controls, and v3.2-only
  * functions. Provider success is not capture evidence; the verification

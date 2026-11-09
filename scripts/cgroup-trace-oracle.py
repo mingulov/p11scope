@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Check real-provider trace cells against independent caller and held-FD evidence.
 
 Event wall times are unused: rendering anchors them on receipt. The first package

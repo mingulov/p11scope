@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # R57 exit-receipt boundary (investigation, 2026-10-29)
 
 Packet 6.10-R57, v0.6.0. Investigation BEFORE any repair estimate: test-only

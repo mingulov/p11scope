@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # p11scope on Kubernetes
 
 Live capture requires usable host `uprobe_multi` load/self-link capability

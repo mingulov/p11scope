@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Load the gate-1 observer's Detailed BPF programs inside throwaway vng
 # guests and report every program's verifier cost per kernel.
 #

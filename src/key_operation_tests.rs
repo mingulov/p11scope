@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H9 key-operation acceptance tests: operation effects, the single S1
 //! feed, positional key roles, metadata timing, bounded projection and
 //! output-schema agreement. Reducer/feed/projection behavior is tested

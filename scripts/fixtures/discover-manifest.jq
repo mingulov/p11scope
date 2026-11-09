@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # The deterministic version-matrix oracle for p11scope-discover, in one place:
 # both container lanes and the unprivileged --self-test run this exact filter.
 def full($major; $minor; $count):

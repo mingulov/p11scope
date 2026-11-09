@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Task 1.6 Lane B: bounded non-evicting sparse-map storage model.
 
 Lane A decided the coverage question (broad attaches every validated

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Native caller binding (Task 6 C4, plan §3.3): conservative, exact or
 //! nothing.
 //!

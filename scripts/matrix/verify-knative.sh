@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Task 6: attach before a Knative scale-from-zero pod exists.
 #
 # P11SCOPE_LANE_EVIDENCE_DIR=/absent/path names the retained evidence root.

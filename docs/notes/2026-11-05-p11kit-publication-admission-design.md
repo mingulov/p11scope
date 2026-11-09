@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Publication-driven admission for forwarding layers (design, 2026-11-05)
 
 Status: design for 0.6.1 (Phase 2 of the p11-kit line). Phase 1 (route B:

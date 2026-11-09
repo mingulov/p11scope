@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Host harness for the image dispatcher/bank rollover protocol (E1 logic
 //! stage): the real `crates/ebpf/native/image_bank.c` is compiled for host
 //! with stub map storage and driven through scripted interleavings covering

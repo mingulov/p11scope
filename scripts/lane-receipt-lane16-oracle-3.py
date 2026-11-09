@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Task 4 lane 16 structural oracle: assert the observed evidence row counts, losses, and pause shape for the mode. Oracle extracted from scripts/verify-receipt-lane16.sh (lines 429-442)."""
 import argparse
 import sys

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Run one command with a pseudo-terminal as its stdin/stdout/stderr.
 
 `p11scope profile` draws its live frame only when stdout is a terminal

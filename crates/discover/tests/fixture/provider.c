@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Controlled PKCS#11 provider fixture. Exercises what SoftHSM2 (2.40-only)
  * cannot: a 3.0 interface, a vendor interface, a "PKCS 11" interface with a
  * NULL function list, a NULL table entry, a cross-surface alias, and a

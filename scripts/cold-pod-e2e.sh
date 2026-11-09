@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell C3: a pre-attached-provider cold pod is captured exactly.
 #
 # A private kind cluster runs the DaemonSet node observer (deploy/k8s,

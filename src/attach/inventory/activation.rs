@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private static Inventory activation: entry-only Singles with retained pins,
 //! discovery transport and monotonic positive evidence. No caller/count claim.
 //! The capture facade additionally attaches entries as immutable uprobe-multi

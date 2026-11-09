@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Gate G2 induced-gaps Task 4 receipt finalizer oracle: enforce the exact evidence-root tree shape with 0700 dirs and 0600 files. Oracle extracted from scripts/verify-induced-gaps.sh (lines 497-506)."""
 import argparse
 import sys

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # run-tree-vng.sh TESTBIN OUTDIR KERNEL — run the v0.7.0 run-tree CLI
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
 # tag such as v6.6.157) via scripts/ci/run-run-tree.sh, and judge the

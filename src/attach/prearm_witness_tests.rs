@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pre-arm witness privileged behavior cells (WU-13 P-C phase 2, P2-7):
 //! the binding §11 matrix through the live driver on real kernels.
 //! Fixture children re-exec this test binary into

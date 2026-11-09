@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Detailed stop-gate admission for native BPF programs. Shared by the BPF
  * build and the host unit-test builds; the map symbol below is the real
  * Rust-exported STOP_GATE cell and only its address enters map helpers. */

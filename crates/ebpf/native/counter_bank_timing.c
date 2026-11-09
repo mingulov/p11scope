@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Format2 timing bank bridge: 16x512 cells, START16384/RV65536, one mode per
  * build selected by -DP11SCOPE_BANK_MODE_TIMESTAMPS or
  * -DP11SCOPE_BANK_MODE_LATENCY. Frozen twin of counter_bank_proof.c: that

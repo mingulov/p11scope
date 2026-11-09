@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Task 1.6 Lane A: broad vs publication-selected attach-cost isolation.
 
 Drives the owned multi-wrapper fixture through a pre-capture-publish /

@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -u
 . scripts/prepared-dependency-snapshot.sh
 receipt_digest() { sha256sum "$1" | awk '{print $1}'; }

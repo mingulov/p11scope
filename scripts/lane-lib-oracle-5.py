@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Shared lib process-session snapshot oracle snapshot_user_process_session: list session members with exe digests and argv. Oracle extracted from scripts/lib.sh (lines 599-669)."""
 import argparse
 import sys

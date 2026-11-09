@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Executable object-adapter sequencing: the production adapter bodies shared
 //! by the BPF programs and host regression tests.
 //!

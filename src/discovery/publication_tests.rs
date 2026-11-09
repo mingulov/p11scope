@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 1.5: publication-driven admission — heap wrappers + backend
 //! forwarding (option A). Nine cases asserting exact target sets +
 //! workload counts against the owned multi-wrapper fixture (plus the

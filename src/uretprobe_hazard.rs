@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Whether attaching a uretprobe would kill the process being observed.
 //!
 //! Linux 6.11 moved uretprobes to a syscall trampoline: when a probed function

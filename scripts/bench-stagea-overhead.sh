@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # bench-stagea-overhead.sh — Task 1d ABBA: Stage A continuity-hook overhead.
 #
 # Method: a self-timed file-mapping churn workload (scripts/fixtures/map_churn.c:

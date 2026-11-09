@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned single-target inventory observation helper for app-hint cells.
 #
 # Like inventory-observe-pid.sh, but the driver is an interpreter script

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* async-32: shared shape for the PKCS#11 3.2 async stub provider and its
  * driver. Minimal CK_* types (LP64/ILP32-portable: CK_ULONG is unsigned
  * long), the CKR codes the stub returns, the real 3.2 async signatures

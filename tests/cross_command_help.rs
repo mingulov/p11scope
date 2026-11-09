@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Public help and refusal contracts: no provider or target is opened.
 
 use p11scope::cli::{self, Command as ParsedCommand};

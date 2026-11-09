@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """SYSPLAN residual CI/doc gates (F-04, F-28, F-27, F-63, F-40, F-30, F-29).
 
 Each test pins one residual finding's recurring gate: a privileged E2E job,

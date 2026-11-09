@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned blocking retirement work. Discovery stays with the main owner.
 
 use super::{InventoryCleanupReceipt, InventoryDetachFailure, InventoryLinkIdentity};

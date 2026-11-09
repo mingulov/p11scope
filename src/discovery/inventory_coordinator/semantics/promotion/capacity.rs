@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! std HashMap requests on pinned Rust x86-64 Linux.
 //! A requested entry is not one allocated bucket: the table keeps a load-factor
 //! reserve, a control byte per bucket and one 16-byte control group. Round the

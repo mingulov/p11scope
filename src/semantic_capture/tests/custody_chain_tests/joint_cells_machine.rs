@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Machine-home joint cells (§8.7): J0–J8, J10 × {stop, deadline,
 //! capture_error, sink_failure}. Each cell builds its state through
 //! `scene_for`, applies its event, and proves the table's codes: R

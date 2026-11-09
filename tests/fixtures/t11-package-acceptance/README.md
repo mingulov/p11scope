@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # T11 package/claims/carries acceptance preparation (lane D)
 
 PREPARATION ONLY. New disjoint files, no production behavior changes, no

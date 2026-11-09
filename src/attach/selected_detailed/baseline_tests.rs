@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private binder fixtures exercise the actual decoder and charged original
 //! process custody. They do not claim live kernel acquisition or activation.
 use super::*;

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # p11kit-transparency.sh P11SCOPE OUTDIR [CELL...]: prove that calls through
 # p11-kit are never silently hidden.
 #

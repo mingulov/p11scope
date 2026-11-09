@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7-E shared adapter core: instrumented target memory plus the exact
 //! read-log assertions shared by the object-producer adapter regressions.
 //! Suite-local mirrors (continuity stamps, argument spies, root sequencing)

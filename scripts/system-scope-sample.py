@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Sample a privileged observer's CPU/RSS/fds from /proc at a fixed cadence.
 
 The observer runs under sudo, so this sampler runs under sudo too (reading

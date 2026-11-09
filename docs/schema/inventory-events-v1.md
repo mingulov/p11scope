@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # `p11scope/inventory-events/v1`: observation-event stream
 
 Appendable JSONL companions to the [`p11scope/inventory/v1` snapshot](inventory-v1.md):

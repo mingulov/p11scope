@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Display-only app hints for interpreter-run callers.
 //!
 //! The caller label stays the exe basename; beside it the observer may show

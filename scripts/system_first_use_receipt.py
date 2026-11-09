@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Private trusted-fixture post-call custody, not observer entry evidence.
 
 Only the pinned single-thread fixture establishes that the first FD was opened

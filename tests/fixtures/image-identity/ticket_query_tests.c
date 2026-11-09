@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #include "image_identity.h"
 /* Weak declarations make the pre-implementation test fail at the actual
  * missing helper assertion, without a link-error masquerading as runtime

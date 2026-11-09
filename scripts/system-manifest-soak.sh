@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # system-manifest-soak.sh — the M13 soak vehicle (cell 5.5): one long
 # `inventory --system --manifest` capture over owned SoftHSM workloads
 # on a private provider copy, with workload-ledger, loss and RSS/FD

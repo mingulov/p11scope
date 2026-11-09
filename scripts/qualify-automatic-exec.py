@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed automatic exec/scope recovery acceptance (H6 slice 4).
 
 Runs the required --cells against an explicitly staged observer binary plus

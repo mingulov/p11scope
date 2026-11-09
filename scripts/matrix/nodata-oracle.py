@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """v0.7.0 no-data matrix oracle: judge one live cell.
 
 Owner rule: if a program makes PKCS#11 calls, p11scope must produce data

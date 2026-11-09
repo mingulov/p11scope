@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Preparation-only capability for the dedicated compact Inventory object.
 use super::{
     AttachBackend, BPF_F_RDONLY_PROG, ExactMapMetadata, Scope, compare_map_metadata, freeze_map,

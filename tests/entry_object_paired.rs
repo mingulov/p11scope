@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Paired default/unsafe driver for tests/python/test_entry_object.py.
 //!
 //! Lane procedure: build the workspace twice in separate target dirs,

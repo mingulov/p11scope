@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Explicit privileged receipt prerequisite, never an ordinary-suite skip.
 
 The outer owner must already hold the shared live leases and supervisor

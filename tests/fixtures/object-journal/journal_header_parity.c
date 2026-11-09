@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* G2 header-parity fixture: executes the actual native
  * `journal_header_valid` from crates/ebpf/native/object_journal.h over
  * the (length x kind x flags x identity) union and prints one verdict

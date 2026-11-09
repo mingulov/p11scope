@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* pressure-live driver: ledgered provider-bearing child for the T8/G18 live256
  * pressure workload preparation (lane D). This file is preparation only: it
  * builds and runs unprivileged without any capture, and no runner consumes it

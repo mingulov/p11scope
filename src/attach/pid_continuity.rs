@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Session-private physical pair facts. These facts cannot spare an Engine
 //! replacement without an exact request-bound preservation receipt.
 

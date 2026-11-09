@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Independent per-call ledger emitter (E17 pattern).
  *
  * Usage: per-call-ledger PROVIDER TABLE_INDEX COUNT LEDGER_PATH [GO_FILE]

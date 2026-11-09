@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # lib-cells-vng.sh LIBTEST OUTDIR [KERNEL...] — run the kernel-sensitive
 # privileged lib-cell subset as root inside virtme-ng guests, one guest per
 # kernel, and judge every cell exactly like run-privileged-lib-tests.sh

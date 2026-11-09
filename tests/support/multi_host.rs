@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Use the observer's required Multi probe, not the aggregate doctor verdict.
 
 use p11scope::doctor::{Check, Status};

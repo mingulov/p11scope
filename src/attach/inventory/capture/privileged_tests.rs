@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned, ignored live gates for the capture facade. Root BPF lane, run
 //! serially through `scripts/run-privileged-lib-tests.sh`. Every caller is
 //! an owned fixture process with an independent stdout ledger; every

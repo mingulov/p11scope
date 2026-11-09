@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Measure finite doctor capability tiers against the documented fixed host
 # baseline (kernel.yama.ptrace_scope=1 and kernel.perf_event_paranoid=4).
 set -eu

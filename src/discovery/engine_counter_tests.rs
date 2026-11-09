@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Engine wiring for counter captures: preflight, pool and growth staging.
 
 use super::session_fixture::ScriptedSession;

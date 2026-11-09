@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded discovery scheduling (Task 3.1b).
 //!
 //! Ordinary inventory ticks serve event-driven work (lifecycle/loader refresh

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # CBOM export design note (v0.7.0, V1)
 
 `p11scope inventory cbom INPUT.json [-o out.cdx.json] [--json] [-v] [--quiet]`

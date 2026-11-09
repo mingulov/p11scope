@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Cell D1-changed: Docker different-bytes copy-up (dev host, lane B only).
 #
 # One container B starts from the holder image (deploy/Dockerfile.holder,

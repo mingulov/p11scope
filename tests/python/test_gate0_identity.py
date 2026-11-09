@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Unit tests for scripts/check-gate0-identity.py (P2F-5 F3, r6 I1/I6, r7 R1).
 
 Drives the checker's real code on tiny owned BPF objects built with

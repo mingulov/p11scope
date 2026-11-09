@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # qualify-stop-races.sh P11SCOPE OUTDIR [--trials N] [--burst-trials M] [--seed S] [--cell sweep|burst|all]
 # S3 stop-path races: a seeded SIGINT sweep over four commands plus the
 # system newcomer burst. Requires root for live trials; --self-test needs

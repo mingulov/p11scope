@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile `/proc` regression tests: malformed statm/stat/io text must be
 //! refused or yield only values the input supports. Untrusted counters
 //! never overflow a conversion. (Cgroup membership is `pub(crate)`; its

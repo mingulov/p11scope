@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Privacy allowlist v3 — PROPOSED object and attribute extension
 
 **Status: PROPOSED; pending independent privacy and implementation review,

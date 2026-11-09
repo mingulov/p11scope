@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Contract for the hosted privileged lib-test workflow.
 
 privileged-tests.yml copies its toolchain setup from ci.yml, and the

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Privacy allowlist v2 — interface-selection evidence
 
 This version extends [`allowlist-v1.md`](allowlist-v1.md); every v1 decoder,

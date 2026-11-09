@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Test-only PKCS#11 auto-login shim for the Chromium client-cert demo.
  *
  * Headless Chromium cannot enter a token PIN, so a stock SoftHSM token never

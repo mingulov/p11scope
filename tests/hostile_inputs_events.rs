@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile event-record regression tests: ring-buffer bytes of the wrong
 //! length or with an invalid root affiliation must decode to `None`, and
 //! every decoded event must carry an affiliation the gate allowed. Length

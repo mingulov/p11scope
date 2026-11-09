@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Opus B4 static-sleeper fallback: raw-syscall sleeper, no libc.
  *
  * Built with `gcc -static -nostdlib -fno-stack-protector` for hosts

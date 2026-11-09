@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! U0/D JSONL observation-event stream (amendment A1).
 //!
 //! Alongside the versioned snapshot JSON, an appendable JSONL stream

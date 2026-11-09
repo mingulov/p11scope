@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Sum EVIDENCE[0] (ring loss) over CPUs and maps from bpftool JSON.
 
 Pure JSON parsing (no bpftool calls here; the caller runs bpftool with

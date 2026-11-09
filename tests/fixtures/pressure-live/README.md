@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # T8 live256 pressure workload preparation (lane D)
 
 Preparation only. These fixtures build and run unprivileged without any

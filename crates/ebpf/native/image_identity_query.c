@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Detailed-only negative continuity and a lookup-only same-object query.
  * No task/mm pointer is retained or emitted. Nodes never leave either hash. */
 #include "image_identity_query.h"

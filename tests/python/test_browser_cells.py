@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 
 Installed-gate suite (proposed RUN entry, self-skipping): each test drives

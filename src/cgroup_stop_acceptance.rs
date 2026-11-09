@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private installed-acceptance rendezvous. Absent an explicit inherited
 //! controller socket, this module performs no descriptor operations.
 //! It observes real transactions; only the existing collection control stops

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # bench-inventory-native.sh — native inventory scale cells (Task 6 C5.5: M1, M3–M7).
 #
 #   bench-inventory-native.sh P11SCOPE --capture native|scan|auto --total N --callers C

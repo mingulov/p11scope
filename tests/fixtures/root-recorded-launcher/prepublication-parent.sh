@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -eu
 if [ "$1" = chain ]; then
     "$REAL_PYTHON" -I "$FIXTURE_DIR/owned-exec.py" middle sh "$0" single &

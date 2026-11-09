@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Actual public-binary usage/refusal controls. Positive executable population
 //! belongs to root's separately owned installed capture lane, never a fake feed.
 

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture-owned, display-only scheduling and charged immutable publication.
 //!
 //! No admission, provider, scope, or semantic code consumes this table. The

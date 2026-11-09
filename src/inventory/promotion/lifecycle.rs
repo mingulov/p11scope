@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! DR37 selected-lane lifecycle: the activation proof, the preparation
 //! worker service and the native-authority boundaries.
 //!

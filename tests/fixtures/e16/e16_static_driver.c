@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 static-surface driver: the provider object is linked into this
  * executable, so there is no provider .so and no dlopen.
  *

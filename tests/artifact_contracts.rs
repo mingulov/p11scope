@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 #[allow(dead_code)]
 mod support;
 
@@ -14699,45 +14700,13 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 //   `GPL-3.0-or-later` elsewhere.
 //
 // Documented exemptions (each pinned below so it cannot silently rot):
-// test-input C fixtures remain headerless, `include!`d Rust files carry
-// the `//` form with their include site pinned (E0753 rejects `//!`
-// across `include!`), and generated third-party source trees remain
-// untracked. Internal plans and agent guides live outside the
-// public repository and need no source-tree license exemptions.
-
-// Test-input C fixtures: each is consumed by the test named
-// in the comment (location rule: tests/fixtures, scripts/fixtures,
-// crates/discover/tests/fixture stay exempt).
-const LICENSE_C_FIXTURES: &[&str] = &[
-    // crates/discover/tests/fixture/* (compiled/linked by the discover tests)
-    "crates/discover/tests/fixture/fd_env_canary.c", // crates/discover/tests/cli.rs
-    "crates/discover/tests/fixture/helper.c",        // crates/discover/tests/fixture_provider.rs
-    "crates/discover/tests/fixture/lazy_backend.c",  // crates/discover/tests/lazy_dependency.rs
-    "crates/discover/tests/fixture/lazy_wrapper.c",  // crates/discover/tests/lazy_dependency.rs
-    "crates/discover/tests/fixture/provider.c",      // crates/discover/tests/fixture_provider.rs
-    "crates/discover/tests/fixture/version_matrix.c", // crates/discover/tests/version_matrix.rs
-    // scripts/fixtures/* (compiled/run by canary and gap suites)
-    "scripts/fixtures/alias_workload.c", // scripts/verify-induced-gaps.sh
-    "scripts/fixtures/blocking_provider.c", // scripts/verify-induced-gaps.sh
-    "scripts/fixtures/blocking_workload.c", // scripts/verify-induced-gaps.sh
-    "scripts/fixtures/canary_workload.c", // tests/python/test_canary_workload.py
-    "scripts/fixtures/hammer.c", // scripts/verify-receipt-lane16.sh (+verify-induced-gaps.sh:727, bench-overhead.sh:52)
-    "scripts/fixtures/privacy-stack-workload.c", // scripts/check-canary-evidence.py
-    "scripts/fixtures/receipt-fcntl-trace.c", // tests/receipt_build_subjects.rs
-    // tests/fixtures/* (copied/compiled/parsed per test at runtime)
-    "tests/fixtures/bpf-map-defs/mixed.c", // tests/python/test_bpf_map_defs.py (read as text)
-    "tests/fixtures/ia32-lifecycle/capability-xattr.c", // tests/python/test_ia32_lifecycle.py
-    "tests/fixtures/ia32-lifecycle/guard-target.c", // tests/python/test_ia32_lifecycle.py
-    "tests/fixtures/image-identity/helper_tests.c", // tests/artifact_contracts.rs (image_identity_native_control_*)
-    "tests/fixtures/instance-epoch/helper_tests.c", // tests/artifact_contracts.rs (instance_epoch_native_hooks_*)
-    "tests/fixtures/lane13-evidence/port-forward.c", // tests/python/test_lane13_evidence.py
-    "tests/fixtures/live-discovery-driver.c",       // tests/discovery_scan.rs
-    "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
-    "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
-    "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
-    "tests/fixtures/root-fence-runtime.c",      // orphan fixture (no consumer); exempt by location
-    "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
-];
+// `include!`d Rust files carry the `//` form with their include site
+// pinned (E0753 rejects `//!` across `include!`), and generated
+// third-party source trees remain untracked. Internal plans and agent
+// guides live outside the public repository and need no source-tree
+// license exemptions. The test-input C fixtures used to be exempt while
+// headerless; they now carry the app-domain header like any other `.c`
+// source (2026-09-27 license decision) and are checked in scope below.
 
 // Rust files joined through `include!` cannot carry the `//!`
 // inner-doc header: rustc E0753 rejects it across the macro
@@ -14774,9 +14743,6 @@ const LICENSE_MANIFESTS: &[(&str, &str)] = &[
 
 fn license_expected_header(path: &str) -> Option<&'static str> {
     if path.ends_with(".c") || path.ends_with(".h") {
-        if LICENSE_C_FIXTURES.contains(&path) {
-            return None;
-        }
         if path.starts_with("crates/ebpf/native/")
             || path == "scripts/native/dump-task-storage.bpf.c"
             || path == "scripts/native/image-identity-core-canary.c"
@@ -15129,20 +15095,6 @@ fn license_headers_cover_every_tracked_source_file() {
         symlinks.is_empty(),
         "in-scope source symlinks: {symlinks:?}"
     );
-
-    // Every exempt C fixture is still tracked (stale entries
-    // fail) and still headerless (a headed fixture moves in scope).
-    for fixture in LICENSE_C_FIXTURES {
-        assert!(
-            tracked.iter().any(|path| path == fixture),
-            "exempt fixture {fixture} is no longer tracked; drop its exemption"
-        );
-        let first = read(fixture).lines().next().unwrap_or("").to_string();
-        assert!(
-            !first.contains("SPDX-License-Identifier"),
-            "exempt fixture {fixture} gained a header; move it in scope"
-        );
-    }
 
     // Every exempt `include!`d Rust file is still tracked (a stale
     // entry fails), still `//`-headed (a real module file moves back

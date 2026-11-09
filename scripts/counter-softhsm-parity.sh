@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Counter-mode parity against real SoftHSM: run one deterministic
 # PKCS#11 workload twice under `run --mode metrics` (once plain, once
 # per counter mode) and compare the `-o` JSON documents.

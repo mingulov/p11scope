@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Capture-local, optional metadata. Never consulted for capture authority.
 
 #[cfg(not(feature = "h6-reexec-diagnostic"))]

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Public-command breadth matrix: scale and churn workloads through the
 //! real `p11scope inventory` binary over owned fixtures, asserting
 //! ledger agreement at command level with the harness's public API,

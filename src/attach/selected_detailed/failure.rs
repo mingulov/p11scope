@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Failed preparation retains its original native cleanup owner.
 use super::super::{ProducerDetachProgress, Session};
 use crate::inventory_semantics::SemanticRefusal;

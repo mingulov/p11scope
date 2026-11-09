@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Per-edge semantic reducer (S1): mechanism/operation context.
 //!
 //! One [`EdgeSemantics`] per inventory edge turns that edge's completed

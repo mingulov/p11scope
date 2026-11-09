@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Negative-only fixture. Gate facts are location/delivery witnesses, never ACKs. */
 #define _GNU_SOURCE
 #include <errno.h>

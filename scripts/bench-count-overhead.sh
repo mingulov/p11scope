@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # bench-count-overhead.sh — Stage 2 M2 cost gate: per-edge counting overhead.
 #
 # Method: a self-timed PKCS#11 call-churn workload (scripts/fixtures/mt_count.c:

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # E16 execution surfaces
 
 E16 asks whether discovery finds, or honestly refuses, PKCS#11 code in

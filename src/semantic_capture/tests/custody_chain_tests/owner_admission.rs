@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Driver-to-H0 admission regressions. Native map/query I/O is substituted;
 //! catalog collection, process custody, held files, H0 and publication are real.
 //! The fixture's attested offsets do not qualify native probes or cryptography.

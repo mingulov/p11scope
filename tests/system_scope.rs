@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Whole-machine (`--system`) scope: select-all semantics with no cgroup
 //! path, per-process/module attribution, and cap-driven PARTIAL. All
 //! discovery here is unprivileged userspace (`Engine::discover`); no BPF

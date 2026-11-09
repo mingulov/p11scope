@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Task 3.3 (F-Scale-6): the output sink is trust-validated before the
 //! discovery scan, so a bad `-o` path fails fast instead of after a scan.
 

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Command-line parsing for every subcommand: one parser body for profile and
 //! trace, durations with suffixes, hints for removed flags.
 

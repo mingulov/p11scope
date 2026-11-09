@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Controlled application ledger only: this is no observer/bootstrap proof.
  * Use one disposable, initialized token with P11SCOPE_KEY_FIXTURE_PIN set.
  * stdin G starts calls; F after DONE releases the retained provider mapping.

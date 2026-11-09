@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """M13 system--manifest soak oracle twins: healthy and failing evidence.
 
 The M13 vehicle (scripts/system-manifest-soak.sh) runs one long

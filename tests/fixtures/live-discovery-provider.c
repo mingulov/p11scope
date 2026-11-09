@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Slice 1b-2 production live-discovery provider fixture.
  *
  * Written for this campaign; it adapts the reviewed research behaviour of

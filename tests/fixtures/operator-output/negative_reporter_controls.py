@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Actual owned negative adapters; no blocked-stderr positive is implied."""
 import ctypes
 import json

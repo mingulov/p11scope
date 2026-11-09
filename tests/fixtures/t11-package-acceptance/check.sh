@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # T11 prep isolated self-check: every path/name this directory references
 # must exist (or be absent, where a gap is claimed) at the pinned base.
 # Read-only: no builds, no privilege, no network, no writes outside a

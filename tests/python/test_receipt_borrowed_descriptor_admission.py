@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Native borrowed-descriptor admission contracts for ``run_reconciled_build``."""
 
 import contextlib

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Stage 3 Wave D (W3-2): the kernel-identity probe CLI for privileged
 //! host cells and vng guest cells (which cannot run cargo).
 //!

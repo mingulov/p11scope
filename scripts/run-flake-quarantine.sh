@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # run-flake-quarantine.sh — serial, isolated re-runs of the seven ledgered
 # flakes (docs/notes/known-flakes.md, mapping in
 # docs/notes/test-quarantine.md). Triage evidence only: a green quarantine

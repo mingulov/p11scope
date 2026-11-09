@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """One-call-per-second PIN-less SoftHSM slot-listing caller.
 
 Test fixture (v0.6.0 F1 / v0.7.0 demo-bootstrap): keeps a

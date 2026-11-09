@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded numeric-offset lookups within one immutable presentation.
 
 use super::{InstanceSemanticView, InstanceView};

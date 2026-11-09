@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """E03 measurement-contract regressions (audit F-74, Package A).
 
 The system-scope harness must derive phases from actual monotonic

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned non-p11-kit legacy provider fixture (system-scale plan Task 1.5
  * case 9). A plain PKCS#11-shaped provider with exactly one static,
  * initialized {2,40} function table: 68 distinct entry points, every

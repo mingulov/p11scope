@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Build/check owned32-pair indexed physical-count fixtures on a dev host, not Fedora."""
 import argparse
 from collections import Counter

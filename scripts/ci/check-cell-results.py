@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Validate a cell-script results.jsonl file.
 
 Each line must be one JSON object with exactly the keys cell, pass,

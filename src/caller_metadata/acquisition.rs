@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded two-read acquisition of cgroup membership for caller metadata.
 //!
 //! This engine performs no process I/O itself: a narrow [`MembershipSource`]

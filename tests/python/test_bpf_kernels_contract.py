@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Contract for the bpf-kernels trial workflow.
 
 The trial copies its toolchain setup from ci.yml's tests job, and the

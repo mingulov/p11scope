@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Judge public-command evidence against independent fixture targets/counts.
 
 TARGET records bind actual mapped device/inode and function file offsets.

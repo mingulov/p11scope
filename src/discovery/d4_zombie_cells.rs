@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! D4 zombie cells: leader-zombie groups with live survivors. Ordinary
 //! twins pin the sweep-seam classification (a group without a live member
 //! stays exited; a live survivor prepares through retained-member custody

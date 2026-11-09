@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private endpoint image facts for bounded caller-context sampling. Ordinary
 //! metadata observations still cannot upgrade admission, scope, provider
 //! permission or Detailed readiness; the specifically approved

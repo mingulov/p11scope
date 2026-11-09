@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """First-use sweep oracle twins.
 
 The oracle (scripts/measure-first-use.py) measures one sweep cell from the

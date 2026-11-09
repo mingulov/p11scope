@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Genuine prior sealed history, retained by the canonical owner and pool.
 
 use super::audit_handoff::{acquire, attachment, claim_and_finish};

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Gated fixture driver: protocol, barriers, reaping (self-test).
 
 Drives scripts/ci/key_operations_fixture.py against a fake fixture

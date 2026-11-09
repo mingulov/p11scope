@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! B17 minimum same-address reload witness (6.12b, D4 R2-D4-1..7):
 //! router-seam twins for the named continuation marker.
 //!

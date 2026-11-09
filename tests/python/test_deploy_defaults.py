@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Deploy defaults: the DaemonSet image and the documented minimal run.
 
 Pins two honesties: the DaemonSet default is runnable from the checkout

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Loading and attaching. One selected entry uprobe + one uretprobe serve
 //! each slot; the attach cookie carries the slot index.
 

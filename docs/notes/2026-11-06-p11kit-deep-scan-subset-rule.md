@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Step 3: bounded deep-scan subset rule (design, 2026-11-06)
 
 Status: design. No behavior change ships with this note: every held

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Public CLI qualifier harness: expected-failure, summary, startup, ia32, cgroup.
 
 Tests the shell qualifier's handling of known product gaps (expected-failure

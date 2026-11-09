@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Inspect the image-bank proof object (Choice B feasibility, R0 route).
 
 This is a compiled-object contract, not a kernel behavior claim. It pins

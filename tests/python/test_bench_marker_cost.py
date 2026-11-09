@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Marker-cost bench: harness self-tests and analyzer checks.
 
 Runs scripts/bench-marker-cost.sh --self-test and --dry-run (both

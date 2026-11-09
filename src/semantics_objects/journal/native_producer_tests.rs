@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! P1 native BEGIN against the real shared return writers and P0a predicate.
 //! Root wires this private child after the concurrent parent writer closes.
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* short-lived-caller: minimal-lifetime SoftHSM2 client for --track-short-lived.
  * usage: short-lived-caller MODULE N GATEFILE
  * Sets up, prints READY, waits for GATEFILE, runs N x {GenerateRandom} with

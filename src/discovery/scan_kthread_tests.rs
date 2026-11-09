@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Empty-maps classification: a kernel thread's `/proc/<pid>/maps` reads 0
 //! bytes successfully (no user address space), which must scan as verified
 //! absence — not as a refusal that forces every `--system` capture PARTIAL.

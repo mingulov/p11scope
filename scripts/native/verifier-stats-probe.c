@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Qualification-only x86-64 preload probe. The product's actual loader owns
  * relocations, maps, flags, program types and lifetime. Only verifier logging
  * changes: one bounded STATS buffer on its original BPF_PROG_LOAD call.

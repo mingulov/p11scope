@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Finite object policy from the reviewed proposed privacy allowlist v3.
 //!
 //! These pure definitions perform no reads and activate no capture. A caller

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #define SEC(s) __attribute__((section(s), used))
 #define UINT(n, v) int (*n)[v]
 #define TYPE(n, t) t *n

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! E16 execution surfaces: unprivileged userspace discovery characterization.
 //!
 //! One owned fixture per E16 shape, each run under the single hold protocol

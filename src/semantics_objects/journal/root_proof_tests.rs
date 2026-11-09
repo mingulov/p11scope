@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Private host proof of native custody plus the actual root wire writers.
 //! No Session/loader path imports this child or its fixture library.
 

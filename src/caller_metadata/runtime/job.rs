@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Original-custody jobs and the only native-qualified metadata commit path.
 
 use super::work_lane::{WorkFailure, WorkOwner, WorkSlot};

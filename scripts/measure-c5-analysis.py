@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Classifiers and per-measurement analysis for the C5 campaign (M0-M7).
 
 scripts/measure-c5-campaign.sh runs the cells; this script judges them. It

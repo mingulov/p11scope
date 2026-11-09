@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Producer-to-validator skip-reason vocabulary (audit F-13, Package A).
 
 The observer's public skip reasons are string constants in

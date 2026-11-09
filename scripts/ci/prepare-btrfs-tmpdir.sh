@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Loop-mounted btrfs TMPDIR for the privileged runner's btrfs group.
 #
 # Usage: scripts/ci/prepare-btrfs-tmpdir.sh IMG MNT

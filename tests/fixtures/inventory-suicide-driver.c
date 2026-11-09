@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Owned inventory fixture: map a provider, then SIGKILL itself.
  *
  *   inventory-suicide-driver --ready <file> <provider.so>

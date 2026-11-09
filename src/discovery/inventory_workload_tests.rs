@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Phase 4 breadth tests: scale, budgets, failure injection, churn,
 //! shutdown, and honest history — every workload through the ONE harness
 //! (`super`), every expectation an exact ledger over the real JSON path.

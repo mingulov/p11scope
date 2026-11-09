@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Owned scale observation helper (inventory breadth matrix).
 #
 # Spawns INV_COUNT fixture drivers (each mapping every provider in

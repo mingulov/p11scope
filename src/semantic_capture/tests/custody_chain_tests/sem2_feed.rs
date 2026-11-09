@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! sem-2: disclosure collateral for the system-scale semantic feed.
 //!
 //! Pins the finite scan-refusal vocabulary, the per-reason counting,

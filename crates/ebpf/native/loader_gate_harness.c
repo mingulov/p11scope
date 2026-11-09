@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* T-L2/T-L2c host harness: executes the real loader_gate.c with stub map
  * storage and drives producer-shaped admit/lookup/retire/cutover scenarios.
  * Only the map helpers are stubbed; there is no second gate algorithm. */

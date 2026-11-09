@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Audit-oracle regressions (system-scale audit 2026-09-20: F2, F9).
 
 F2 pins owned-attribution for system-scope coverage at the artifact level:

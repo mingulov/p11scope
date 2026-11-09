@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -eu
 if [ "${FAIL_PIDFD:-0}" = 1 ] && [ "${2-}" = scripts/lane-lib-oracle-1.py ]; then
     program=$2

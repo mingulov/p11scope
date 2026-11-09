@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """104-entry ABI execution fixture/oracle twins.
 
 The oracle (scripts/joint-abi-compare.py) validates the ABI ledger emitted

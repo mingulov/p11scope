@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """CI tests the dependencies it ships (audit F-03, Package A).
 
 The root Cargo.toml patches aya/aya-obj to recipe-selected vendored

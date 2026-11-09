@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! T-L2/T-L2c native seam: the real `crates/ebpf/native/loader_gate.c` is
 //! compiled for host through `loader_gate_harness.c` with stub map storage
 //! and driven through admit/lookup/retire/cutover scenarios, and the real

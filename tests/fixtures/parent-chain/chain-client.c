@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* chain-client: short-lived SoftHSM client for launcher-chain tests.
  * Usage: chain-client MODULE READY GATE
  * dlopens MODULE, writes "READY <pid>" to READY, waits for GATE to appear

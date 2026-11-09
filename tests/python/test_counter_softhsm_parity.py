@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Counter-mode parity against real SoftHSM: comparator and twins.
 
 The harness (scripts/counter-softhsm-parity.sh) runs one real SoftHSM

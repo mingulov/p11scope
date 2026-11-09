@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""The end-of-integration copyright pass stays a prepared, unapplied script.
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+"""The end-of-integration copyright pass is applied to this checkout.
 
 `scripts/add-copyright-headers.py` inserts one
 `SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>` line
 beside each first-party SPDX header, in the header's own comment style.
 These tests pin the per-style insertion, the skip rules (vendored,
-upstream, generated, already-noticed) and the dry-run report; the script
-itself never runs against this checkout outside a scratch copy.
+upstream, generated, already-noticed, byte-exact policy files) and the
+applied-tree report; the script itself never writes to this checkout
+outside a scratch copy.
 """
 
 import importlib.util
@@ -128,6 +130,13 @@ class AddCopyrightHeadersTests(unittest.TestCase):
                 self.assertEqual(action, "skip")
                 self.assertIsNone(after)
 
+    def test_byte_exact_policy_file_is_skipped(self):
+        header = b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n# Title\n"
+        action, after, reason = ADD.plan_for("docs/privacy/allowlist-v1.md", header)
+        self.assertEqual(action, "skip")
+        self.assertIsNone(after)
+        self.assertIn("byte-exact", reason)
+
     def test_binary_and_headerless_files_are_not_touched(self):
         action, after, _ = ADD.plan_for("blob.o", b"\x7fELF\x00binary")
         self.assertEqual(action, "skip")
@@ -163,7 +172,7 @@ class AddCopyrightHeadersTests(unittest.TestCase):
             self.assertEqual(again.returncode, 0, again.stderr)
             self.assertIn("summary: change=0 already=2 skipped=0 unhandled=0", again.stdout)
 
-    def test_dry_run_on_the_tree_reports_the_known_unhandled_files(self):
+    def test_applied_tree_reports_no_remaining_changes(self):
         probe = subprocess.run(
             [sys.executable, "-I", str(SCRIPT), "--root", str(ROOT)],
             capture_output=True, text=True, timeout=120)
@@ -176,7 +185,8 @@ class AddCopyrightHeadersTests(unittest.TestCase):
         summary = [line for line in probe.stdout.splitlines() if line.startswith("summary: ")]
         self.assertEqual(len(summary), 1)
         fields = dict(part.split("=") for part in summary[0].removeprefix("summary: ").split())
-        self.assertGreaterEqual(int(fields["change"]), 1000)
+        self.assertEqual(int(fields["change"]), 0)
+        self.assertGreaterEqual(int(fields["already"]), 1000)
         self.assertEqual(int(fields["unhandled"]), len(unhandled))
 
 

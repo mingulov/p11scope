@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Drive one headless Chromium client-cert page load (demo workload).
 
 Reads the environment file written by chromium-clientauth-setup.sh, launches

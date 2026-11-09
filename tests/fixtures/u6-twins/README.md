@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # U6 installed journey cells (G22)
 
 Driver: `tests/fixtures/u6-installed-drive.py`, selected by

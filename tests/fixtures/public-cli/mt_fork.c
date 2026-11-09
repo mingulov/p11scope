@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* mt_fork: multi-process deterministic mixed-function SoftHSM2 workload.
  *
  * usage: mt_fork MODULE PROCS THREADS ITERS GATE ERRORS

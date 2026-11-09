@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Hostile saved-snapshot regression tests: malformed, truncated, oversize
 //! and mutated `p11scope/inventory/v1` documents fed to the offline diff
 //! must be refused with a side-naming error, never compared as valid

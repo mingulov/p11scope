@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Host probe: runs the actual bank_bucket() from the timing bank producer
  * over argv-supplied hex inputs, printing one bucket index per line. The
  * Rust boundary test compares each line against

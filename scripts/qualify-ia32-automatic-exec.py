@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Installed H6 ia32 leader/failed-exec gate: eight required public-command legs.
 
 Singles and Multi each run leader trace/profile/metrics and continuing failed

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Deterministic partition of the workspace test gate across hosted CI jobs.
 
 The workspace gate is one command:

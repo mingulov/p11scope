@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Inspect fixed-capacity, unselected counter artifacts and causal mutants.
 
 This is a compiled-object contract, not an installed count-conservation or

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Pre-activation visibility at the genuine owner-consumption boundary.
 //! Ordinary and private consumers share the same real evidence validator;
 //! only the destination of its history/binding effects differs.

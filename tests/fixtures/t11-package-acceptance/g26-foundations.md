@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # G26 runbook — preserve accepted H0/H1/H2 foundations through integration
 
 Rerun existing tests at affected integration boundaries; do NOT reimplement

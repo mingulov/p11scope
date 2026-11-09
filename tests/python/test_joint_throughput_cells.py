@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Twins for scripts/ci/joint-throughput.sh (the WU-7a cells).
 
 The privileged capture core cannot run here; this suite covers what it

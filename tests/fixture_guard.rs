@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Mirror cell for the integration-side parent-death guard
 //! (`tests/support/mod.rs::DieWithParent`): a victim helper spawns one
 //! guarded sleeper, dies by SIGKILL, and the sleeper must be gone within

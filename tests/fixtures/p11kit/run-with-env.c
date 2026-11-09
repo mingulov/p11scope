@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* run-with-env: minimal exec wrapper for the p11-kit `run` cell.
  * usage: run-with-env NAME=VALUE... -- prog args...
  * A root observer starts `run` children with an allowlisted environment

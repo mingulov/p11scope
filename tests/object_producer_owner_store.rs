@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H7 slice B: bounded object-call custody in the native owner.
 //!
 //! The native owner allocates, binds, scrubs and deletes one 432-byte

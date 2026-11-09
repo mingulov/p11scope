@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! One original ingested collection, immutable audit and bounded all-domain delivery.
 #![cfg_attr(not(test), allow(dead_code))] // Ordinary Joint activation remains gated.
 

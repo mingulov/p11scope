@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # ci/real-providers.sh P11SCOPE OUTDIR: WP-1 entry point for WP-3 cells.
 #
 # Wires scripts/qualify-real-providers.sh into the privileged-tests job

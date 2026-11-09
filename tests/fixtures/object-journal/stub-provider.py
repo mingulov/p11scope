@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """READY/GO stub provider for the object-journal qualification oracle.
 
 Replays the frozen provider ledger's TRACE (the raw request stream:

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Packet 6.13 — pre-armed named providers (B19) and explicit watch intervals
 //! (B18): causal REDs on the merged D1 contract, plus healthy twins.
 //!

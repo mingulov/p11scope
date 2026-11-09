@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 #ifndef P11SCOPE_LOADER_GATE_H
 #define P11SCOPE_LOADER_GATE_H
 /* T-L2c token-keyed loader gate: the BPF/native side of the cookie contract

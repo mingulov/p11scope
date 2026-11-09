@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use p11scope::attach::{BackendSelection, Scope};
 use p11scope::cli::{CaptureArgs, Kind, ScopeArg};
 use p11scope::discovery::engine::Engine;

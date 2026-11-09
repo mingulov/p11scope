@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Deterministic public renderer/trace consumers; these fixtures are not live captures.
 use p11scope::attach::CapturePolicy;
 use p11scope::metrics::SlotReport;

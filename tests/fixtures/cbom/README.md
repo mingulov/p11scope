@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # CBOM fixtures
 
 `bom-1.6.schema.json` is the official CycloneDX 1.6 JSON schema,

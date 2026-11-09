@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Stop-gate object contract for the Detailed programs.
 
 For each static entry/return program (plan 2026-09-23 Task 2) and each

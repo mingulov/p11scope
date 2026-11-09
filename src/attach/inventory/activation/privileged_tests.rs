@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Owned, ignored live gates. The parent runs these serially with its BPF lane.
 use super::*;
 use crate::attach::inventory::capture::{

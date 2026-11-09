@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Deep-freeze long-run detector (T2, G-14): notices long-runtime failure
 //! modes the per-capture verdict cannot see.
 //!

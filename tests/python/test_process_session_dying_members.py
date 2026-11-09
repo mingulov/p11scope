@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Dying session members never fail the snapshot: python3 -I tests/python/test_process_session_dying_members.py."""
 
 import contextlib

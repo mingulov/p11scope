@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Contract for the generic cell-script template.
 
 scripts/ci/run-cell-script.sh runs one scripts/ci/<name>.sh cell script and

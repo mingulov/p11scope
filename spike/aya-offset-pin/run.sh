@@ -1,5 +1,6 @@
 #!/bin/sh -eu
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Regression pin for aya's uprobe offset semantics (Gate G0 carry-over).
 set -eu
 cd "$(dirname "$0")"

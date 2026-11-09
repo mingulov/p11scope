@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* E16 surface: statically linked provider (object linked into the driver
  * executable, no .so, no dynamic factory export).
  *

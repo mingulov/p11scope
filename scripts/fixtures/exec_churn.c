@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* exec_churn: fork and exec at a fixed rate (Task 6 C5.5, measurements M3/M4).
  *
  * usage: exec_churn RATE SECONDS SHARE_PCT LEDGER [-- CALLER ARGV...]

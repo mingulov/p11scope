@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Launcher-chain tests: who launched the caller.
 //!
 //! A named parent (`chain-parent`) launches a short-lived SoftHSM client

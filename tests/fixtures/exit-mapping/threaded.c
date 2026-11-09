@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* exit-mapping threaded mapper: a live second thread spans the dlopen cycles,
  * so every mapping event sees mm_users > 1, globalizes, and the exit summary
  * stays empty (reads unknown). A pipe proves the thread is alive before the

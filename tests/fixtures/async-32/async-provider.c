@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* async-32 stub provider: a PKCS#11 3.2 function table (version 3.2,
  * 104 entries in canonical order) with real exported symbols and real
  * signatures at ordinals 99-101 (C_AsyncComplete, C_AsyncGetID,

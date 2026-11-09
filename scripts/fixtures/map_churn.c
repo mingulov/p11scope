@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* map_churn: self-timed file-mapping churn for the Stage A overhead gate.
  * usage: map_churn FILE OPS MODE
  * MODE mmap: OPS x {mmap 4096 PROT_READ MAP_PRIVATE, munmap} of FILE.

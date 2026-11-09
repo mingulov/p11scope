@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # key-operations-system.sh — 60 s linked churn: no discovery-ring loss.
 #
 # Runs `inventory --system --capture native --key-operations --manifest`

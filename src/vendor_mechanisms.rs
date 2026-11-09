@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! p11scope-owned vendor mechanism overlay.
 //!
 //! The BPF return path publishes a mechanism id only on exact membership

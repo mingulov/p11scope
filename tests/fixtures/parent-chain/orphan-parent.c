@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* orphan-parent: double-fork launcher for the parent-chain orphan cell.
  * Usage: orphan-parent PROG ARGS...
  * Forks twice so PROG is reparented to init (pid 1), then reaps the

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 use super::*;
 use crate::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use crate::inventory_mark_used_with;

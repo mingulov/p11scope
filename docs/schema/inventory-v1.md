@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # `p11scope/inventory/v1`: module/caller inventory
 
 Answers "which module is used by whom" for one scope (`--pid`, `--cgroup`, or

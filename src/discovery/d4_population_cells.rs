@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! D4 population cells: the kernel-positive identity population never
 //! counts a provider the capture itself watches. One mixed Btrfs
 //! population (a watched and an unwatched provider, each with a live

@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 #[allow(dead_code)]
 #[path = "../build_support/bpf_tools.rs"]
 mod bpf_tools;

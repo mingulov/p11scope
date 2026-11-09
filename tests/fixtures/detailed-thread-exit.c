@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Private x86-64 fixture. Build once as a DSO and once as its owned driver.
  * The raw clone worker never calls libc or accesses shared glibc TLS. The
  * probed C_Initialize frame uses SYS_exit, never pthread_exit/unwinding.

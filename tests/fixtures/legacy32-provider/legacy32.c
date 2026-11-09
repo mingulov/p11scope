@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* legacy32: a SoftHSM 2.7-shaped synthetic PKCS#11 provider.
  *
  * Shape (matches Fedora 44 softhsm-2.7.0-0.1.rc1 as read from the

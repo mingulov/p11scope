@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! H9 operation/key delivery: the single S1 feed, joint replay and
 //! key-use aggregation.
 //!

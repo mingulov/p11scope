@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # Helpers shared by the container/Kubernetes matrix lanes. Source after
 # scripts/lib.sh, from the repository root.
 

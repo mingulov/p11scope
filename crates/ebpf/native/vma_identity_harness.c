@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /*
  * Host behavioral harness for `p11_anchor_vma` (W3-1 fix round 3, items
  * 3W1F3-01/02) plus the member-run target gate of `p11_identity_vma`.

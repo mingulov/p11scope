@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # system-scope-soak.sh — the soak vehicle for the acceptance manifest's
 # soak.* cells (soak.1800s is required for the bounded release claim).
 #

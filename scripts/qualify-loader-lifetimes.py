@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Independent workload and public-output oracle for loader/image lifetimes.
 
 G16 needs one capture over 300 sequential provider-bearing lifetimes (at

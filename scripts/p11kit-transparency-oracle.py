@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Judge p11-kit transparency: no layer's calls are silently hidden.
 
 Ground truth (independent of p11scope):

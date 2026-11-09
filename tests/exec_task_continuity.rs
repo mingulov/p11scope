@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Finite native/CO-RE controls. No verifier, kernel load or link-health claim.
 
 use p11scope_ebpf_common::{FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_TRACK_SHORT_LIVED};

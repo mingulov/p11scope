@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """The coverage packer and its test-binary self-pin guard.
 
 `scripts/ci-test-partition.py coverage-pack` archives a shard's

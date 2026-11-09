@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Bounded CBOM input: one saved inventory or profile document.
 //!
 //! The byte, depth, string and node bounds are exactly the offline

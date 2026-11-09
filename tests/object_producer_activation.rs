@@ -3228,6 +3228,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// flag compares, plus their comment lines): 149085 B, measured
 /// with this same lexer on the integrated source; the previous pin
 /// matches its parent.
+/// Re-baselined for the v0.7.0 copyright-header pass (the only BPF
+/// source change: one `//! SPDX-FileCopyrightText` line after the
+/// SPDX license line; the lexer drops the comment and keeps its
+/// newline, so the dump is the previous dump with one more `\n` in
+/// its leading run of newlines): 149086 B, measured with this same lexer on the integrated
+/// source; the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3237,8 +3243,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            149085,
-            "f7ac1270807f27d74982ed9ccee864209c951a5b6529047b7aa33d8213e76ff5"
+            149086,
+            "10f9a1bb5d15dbd3d97c1d99c6d862eb3987e37219ece52545715326d4649e1c"
         ),
         "stripped BPF dump must stay byte-identical"
     );

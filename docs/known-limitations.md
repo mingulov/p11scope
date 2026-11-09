@@ -260,7 +260,11 @@ names the source SHA behind each check the release rounds re-measured.
   placed in a dedicated cgroup under the observer's own cgroup before
   release, so fork/exec children, `sh -c` and `env` wrappers and
   double forks are born in the cgroup. Only the direct child is
-  paused; descendants are never paused. A descendant that loads an
+  paused; descendants are never paused. Killing the observer with
+  SIGKILL while the child is held stopped strands it stopped: no
+  handler can run, so there is no final report, and the orphaned
+  process group sends no hangup; resume or kill the orphan by hand.
+  A descendant that loads an
   already-attached provider file is observed from its first call, but
   a short-lived descendant that cold-loads the provider can retire
   before admission: its calls are then missing and the run reports
@@ -748,7 +752,7 @@ A process that loads a provider, makes one call within about a
 millisecond, and unloads is not observed without `run --pause auto`.
 On Linux 7.0.14, for the four provider shapes measured under `p11scope
 run --trace` (32 runs at 0/10/100/1000 us load-to-call delays) with
-the default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
+the pre-0.7.0 default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
 each reporting PARTIAL with a proven drain and zero event loss: the
 transient exits before discovery attaches anything (0 slots, no
 modules). With `run --pause auto`, which holds the child at each
@@ -1080,7 +1084,7 @@ A process that loads a provider, makes one call within about a
 millisecond, and unloads is not observed without `run --pause auto`.
 On Linux 7.0.14, for the four provider shapes measured under `p11scope
 run --trace` (32 runs at 0/10/100/1000 us load-to-call delays) with
-the default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
+the pre-0.7.0 default `--pause never`, all 32 runs missed the single call (1 of 1 missed, 0 caller-attributed),
 each reporting PARTIAL with a proven drain and zero event loss: the
 transient exits before discovery attaches anything (0 slots, no
 modules). With `run --pause auto`, which holds the child at each

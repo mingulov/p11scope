@@ -45,6 +45,10 @@ versioned separately and are opaque, exact dispatch keys.
   for runs that must not delay the child, and an `auto` pause that
   cannot start degrades to an unpaused run with a named gap instead of
   failing the child.
+- Killing the observer with SIGKILL during a paused `run` strands a
+  held child stopped: no handler can run, so no report is written and
+  the orphaned process group sends no hangup. Resume or kill the
+  orphan by hand (see `docs/usage.md` and `docs/known-limitations.md`).
 
 ### Fixed
 

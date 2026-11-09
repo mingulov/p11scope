@@ -2820,6 +2820,32 @@ mod tests {
     }
 
     #[test]
+    fn staged_stop_below_staged_span_refuses_split_record() {
+        // Ring [call, discard, call] staged with no stop, then read up
+        // to 16: the stop sits below the staged span, so the queue
+        // refuses loudly instead of stopping early at 8 like before.
+        let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+        script.push_discard();
+        script.push_record(numbered_call(1));
+        let mut queued = EventDrain::over(StagedEvents::with_caps(script, 1024, 1024 * 1024));
+        queued.source_mut().stage(100, None);
+        assert!(queued.source_mut().bounded_record(16).is_err());
+    }
+
+    #[test]
+    fn staged_stop_below_staged_span_refuses_trailing_discards() {
+        // Ring [call, discard, discard] staged with no stop, then read
+        // up to 16: the stop sits below the staged span, so the queue
+        // refuses loudly instead of overshooting to 24 like before.
+        let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+        script.push_discard();
+        script.push_discard();
+        let mut queued = EventDrain::over(StagedEvents::with_caps(script, 1024, 1024 * 1024));
+        queued.source_mut().stage(100, None);
+        assert!(queued.source_mut().bounded_record(16).is_err());
+    }
+
+    #[test]
     fn staged_events_count_malformed_at_decode() {
         let pushed = vec![vec![0u8; 10], numbered_call(7)];
         let mut drain = staged_script(pushed, 2, 1024, 1024 * 1024);

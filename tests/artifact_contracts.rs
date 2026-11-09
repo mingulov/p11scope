@@ -9959,7 +9959,7 @@ fn release_docs_describe_the_built_version() {
     let manifest = read("Cargo.toml");
     let version = manifest
         .split("\n[")
-        .next()
+        .find(|section| section.starts_with("[package]") || section.starts_with("package]"))
         .expect("root [package] section")
         .lines()
         .find_map(|line| {

@@ -141,7 +141,7 @@ pub(crate) const NO_ABSOLUTE_PATHNAME_REASON: &str = "no absolute pathname in /p
 /// omission is loss — never "not loss" (owner rule 2026-11-09,
 /// data-always).
 pub(crate) const REPLACED_PROVIDER_REASON: &str =
-    "provider file replaced on disk while running; calls not counted";
+    "replaced on disk while running; not examined, calls not counted";
 pub(crate) const MAPS_CEILING_REASON: &str =
     "capture /proc maps byte ceiling reached; remaining mappings were not read";
 pub(crate) const MAPS_ENTRY_CEILING_REASON: &str =

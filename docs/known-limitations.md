@@ -280,9 +280,11 @@ names the source SHA behind each check the release rounds re-measured.
   release, so fork/exec children, `sh -c` and `env` wrappers and
   double forks are born in the cgroup. Only the direct child is
   paused; descendants are never paused. Killing the observer with
-  SIGKILL while the child is held stopped strands it stopped: no
-  handler can run, so there is no final report, and the orphaned
-  process group sends no hangup; resume or kill the orphan by hand.
+  SIGKILL while the child is held stopped writes no final report (no
+  handler can run); the child resumes when the observer dies, through
+  its SIGCONT parent-death signal. A pause stop a probe queued in the
+  instant the observer dies is not ruled out; check the child with
+  `ps` after such a kill.
   A descendant that loads an
   already-attached provider file is observed from its first call, but
   a short-lived descendant that cold-loads the provider can retire

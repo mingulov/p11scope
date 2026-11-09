@@ -45,10 +45,10 @@ versioned separately and are opaque, exact dispatch keys.
   for runs that must not delay the child, and an `auto` pause that
   cannot start degrades to an unpaused run with a named gap instead of
   failing the child.
-- Killing the observer with SIGKILL during a paused `run` strands a
-  held child stopped: no handler can run, so no report is written and
-  the orphaned process group sends no hangup. Resume or kill the
-  orphan by hand (see `docs/usage.md` and `docs/known-limitations.md`).
+- Killing the observer with SIGKILL during a paused `run` writes no
+  report (no handler can run); a child the pause held stopped resumes
+  when the observer dies, through its SIGCONT parent-death signal (see
+  `docs/usage.md` and `docs/known-limitations.md`).
 - A stop that lands inside an active `auto` pause cycle now ends the
   run by signal with its report instead of a `pause coordination
   cancelled` error; the cancelled attempt counts one partial.

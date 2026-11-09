@@ -885,7 +885,8 @@ resumes when the observer dies, while a running child never notices. Its own
 session leaves its process group already orphaned, so the kernel sends no
 hangup when the observer dies. A capture error likewise hands a live child
 back running — exit 1 names the error and the surviving PID — instead of
-killing it. Only a stop the operator requested, an expired `--duration` with
+killing it, and so does an expired `--duration` whose pause cleanup failed.
+Only a stop the operator requested, an expired `--duration` with
 `--kill-on-timeout`, or a child still behind its pre-exec barrier is ever
 terminated by the observer.
 The owned command starts with the signal dispositions p11scope itself
@@ -1876,7 +1877,9 @@ changing capture behavior, it joins the table above and the `--help` list.
   observer's signal at timeout. A voluntary exit keeps its own status,
   however high its code, as does a death before the observer's signal.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
-  the child's nonzero exit code instead. `doctor` exits 1 when any requested
+  the child's nonzero exit code instead, except when the capture itself
+  failed and the live child was handed back (for example a closed stdout
+  with no `-o`): that run exits 1 and stderr names the surviving PID. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure
   in any assessed lane instead); `inspect --pid` exits 1 when the target
   cannot be read, while `inspect --system` renders a partial catalog

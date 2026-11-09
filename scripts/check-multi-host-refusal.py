@@ -50,9 +50,10 @@ def fallback_document(sink):
 
     A pre-Multi `inventory --capture auto` run exits 0 with modules and
     callers but no counts: the schema must be inventory/v1, the
-    observation must not claim a usage feed, and one gap must name the
-    unavailable counts. No refusal-lead check applies here: the stderr
-    fallback notice embeds the host summary, which carries a lead.
+    observation must not claim a usage feed, must keep at least one
+    pass, and one gap must name the unavailable counts. No
+    refusal-lead check applies here: the stderr fallback notice embeds
+    the host summary, which carries a lead.
     """
     try:
         document = json.loads(sink.read_bytes())
@@ -64,6 +65,8 @@ def fallback_document(sink):
         return None
     observation = document.get("observation")
     if not isinstance(observation, dict) or observation.get("usage_feed") is not False:
+        return None
+    if type(observation.get("passes")) is not int or observation["passes"] < 1:
         return None
     gaps = document.get("gaps")
     if not isinstance(gaps, list):

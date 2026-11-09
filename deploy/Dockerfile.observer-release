@@ -41,7 +41,8 @@
 # as the extraction stage (its tar, sha256sum, find, grep and cp unpack and
 # verify the tarball), so one pin serves the whole build. The BUSYBOX.md
 # notice names the same version; bump the pin, the notice check and APPLETS
-# together with Dockerfile.observer and scripts/cold-pod-e2e.sh.
+# together with Dockerfile.observer, scripts/cold-pod-e2e.sh and
+# tests/artifact_contracts.rs (busybox_pin).
 # No curl/jq: the observer never talks to the Kubernetes API.
 # The base is pinned by digest (multi-arch index of busybox:1.37.0-musl as
 # published 2026-10-27); bump tag and digest together. Layer timestamps

@@ -422,6 +422,7 @@ other privileged work on the host. Evidence lands in a 0700 directory under
   ledgered client, the final stage carries only SoftHSM2 and the client.
 - **Maintenance note**: bump `busybox:1.37.0-musl` and its pinned digest
   together in `Dockerfile.observer` and `Dockerfile.observer-release`
-  (one line per file, plus the BUSYBOX.md version check in the same files
-  and `OBSERVER_BASE` in `scripts/cold-pod-e2e.sh`, then an e2e re-run);
+  (one line per file, plus the BUSYBOX.md version check in the same files,
+  `OBSERVER_BASE` in `scripts/cold-pod-e2e.sh` and `busybox_pin` in
+  `tests/artifact_contracts.rs`, then an e2e re-run);
   the holder pins `ubuntu:26.04` the same way.

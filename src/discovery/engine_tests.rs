@@ -1131,6 +1131,38 @@ fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
 }
 
 #[test]
+fn fresh_build_bind_loss_extends_without_aborting_and_keeps_the_gap() {
+    let mut facts = CaptureFacts::default();
+    let mut rebuilt = plan_with(1, 0);
+    rebuilt.modules.clear();
+    let losses = facts
+        .bind_plan_module_ids(&mut rebuilt, &[], &[], &PinnedObjects::empty())
+        .unwrap();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].slot, 0);
+    assert!(losses[0].dropped);
+    let skip = slot_binding_loss_skip(&losses[0]);
+    assert_eq!(skip.subject, "discovery plan binding");
+    assert!(
+        skip.reason.contains("slot 0 dropped"),
+        "the gap names the dropped slot: {:?}",
+        skip.reason
+    );
+    let mut committed = plan::AttachPlan::from_slots(vec![]);
+    let result = committed.extend_exact_with_stable_module_ids(rebuilt);
+    assert!(
+        result.is_ok(),
+        "a bind loss on the fresh-build path must degrade with a gap, not abort: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        committed.active_slot_count(),
+        0,
+        "the dropped slot stays retired, not resurrected as active"
+    );
+}
+
+#[test]
 fn retire_prunes_vanished_owners_and_retires_orphaned_dependency_slots() {
     let key_a = overlay_key(80);
     let key_b = overlay_key(81);

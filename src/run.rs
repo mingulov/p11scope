@@ -26191,6 +26191,54 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Capture startup names each distinct replaced file whenever the plan's
+    /// skips carry the replaced-file reason — even when other modules did
+    /// attach — while the no-modules pointer stays empty-only and a dead
+    /// named pid stays silent (its missing-process line speaks instead).
+    #[test]
+    fn capture_start_lines_name_replaced_files_whenever_skipped() {
+        use crate::discovery::scan::{REPLACED_PROVIDER_REASON, Skipped};
+        let skip = |subject: &str, reason: &str| Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        };
+        let replaced = skip("/opt/r.so (deleted)", REPLACED_PROVIDER_REASON);
+        let other = skip("capture discovery", "some other reason");
+        let scope = ScopeArg::Pid(42);
+        let empty = capture_start_hint_lines(true, false, &scope, &[replaced.clone()]);
+        assert_eq!(empty.len(), 2, "{empty:?}");
+        assert!(
+            empty[0].contains("no PKCS#11 modules discovered in pid 42"),
+            "the empty capture keeps its pointer first: {empty:?}"
+        );
+        assert!(
+            empty[1].contains("/opt/r.so (deleted)"),
+            "the empty capture names the file: {empty:?}"
+        );
+        let attached = capture_start_hint_lines(false, false, &scope, &[replaced.clone()]);
+        assert_eq!(attached.len(), 1, "{attached:?}");
+        assert!(
+            attached[0].contains("/opt/r.so (deleted)"),
+            "an attached capture still names the replaced file: {attached:?}"
+        );
+        assert!(
+            !attached[0].contains("no PKCS#11 modules"),
+            "an attached capture never prints the no-modules pointer: {attached:?}"
+        );
+        assert!(
+            capture_start_hint_lines(false, false, &scope, &[other]).is_empty(),
+            "other skips stay silent when modules attached"
+        );
+        assert!(
+            capture_start_hint_lines(true, true, &scope, &[replaced.clone()]).is_empty(),
+            "a dead named pid stays silent on the empty path"
+        );
+        assert!(
+            capture_start_hint_lines(false, true, &scope, &[replaced]).is_empty(),
+            "a dead named pid stays silent on the attached path"
+        );
+    }
+
     /// `inspect` propagates a hard error for a pid that names nothing; it must reach
     /// the operator as one line and exit 1, never as a panic or a backtrace dump.
     #[test]

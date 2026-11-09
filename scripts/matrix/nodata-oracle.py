@@ -168,7 +168,7 @@ def check_profile(verdict, doc, text_blobs, args):
     # bare aggregate with no target reference leaves the caller unnamed.
     pid = args.caller_pid
     blob = "\n".join(text_blobs) + json.dumps(doc)
-    if pid is not None and (str(pid) in blob):
+    if pid is not None and re.search(r"\b%d\b" % pid, blob):
         verdict.caller = "named"
         verdict.info("caller pid %d named" % pid)
     elif args.caller and args.caller in blob:

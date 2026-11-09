@@ -1466,7 +1466,11 @@ Limits that matter in pods:
   dashboard owns the screen (the per-process scan progress lines are
   off) and are replayed on stderr after it, with the pass warnings and
   caller events (`p11scope: stderr while the dashboard ran (N lines,
-  D older dropped):`, the newest 256 kept). When stderr is a file or a
+  D older dropped):`, the newest 256 kept). A pass that admits more
+  than 8 callers logs one counted `p11scope: pass N: M callers
+  admitted` line instead of one line per caller, in the dashboard log
+  tail and on `-v` stderr alike; the identities stay in `-v` stdout and
+  the JSON. When stderr is a file or a
   pipe (`2>run.log`) it is left alone and also gets the log lines as
   they come, like the classic path (shed, counted, if it stops
   reading). The log tail notes `the terminal did not keep up: N frames

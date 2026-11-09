@@ -20870,11 +20870,20 @@ impl Engine {
             &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
         );
         let pending_views = self.pending_leader_exit_views.clone();
+        // Terminal re-poll: mid-capture settlement samples the retained
+        // pidfd once, so a group torn down across the sample counts
+        // eagerly as a link loss. At capture end the same pidfd answers
+        // definitively: a group that provably fully exited left no
+        // surviving member, so its assessment resolves as an ordinary
+        // whole-group exit. Still-live, unanswerable, and already-removed
+        // views keep the fail-closed count. Bounded: one poll per view.
+        self.prune_exited_pending_leader_exit_views();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
             &mut self.counted_leader_exit_views,
             &mut self.task_uprobe_link_losses,
         );
+        self.withdraw_exited_counted_leader_exit_losses();
         self.pending_leader_exit_order.clear();
         for view in pending_views {
             self.close_owned_selection_for_view(view);
@@ -20888,6 +20897,52 @@ impl Engine {
         };
         self.counters.object_skips.retain(|skip| *skip != announced);
         self.plan.skipped.retain(|skip| *skip != announced);
+    }
+
+    /// Drops terminal pending assessments whose retained generation
+    /// provably fully exited: an ordinary whole-group exit discovered at
+    /// capture end, not a lost link. The fail-closed terminalizer then
+    /// counts only what is still live or unanswerable.
+    fn prune_exited_pending_leader_exit_views(&mut self) {
+        let exited: Vec<ProcessViewId> = self
+            .pending_leader_exit_views
+            .iter()
+            .copied()
+            .filter(|view| self.retained_view_exited(*view))
+            .collect();
+        for view in exited {
+            self.pending_leader_exit_views.remove(&view);
+            self.pending_leader_exit_order.remove(&view);
+        }
+    }
+
+    /// Withdraws eagerly counted link losses whose retained generation
+    /// provably fully exited by capture end: no member survived to escape
+    /// observation, so the teardown sample was a transient. The counted
+    /// set and the counter move together, so a withdrawn view frees
+    /// exactly one count and can never double-withdraw.
+    fn withdraw_exited_counted_leader_exit_losses(&mut self) {
+        let exited: Vec<ProcessViewId> = self
+            .counted_leader_exit_views
+            .iter()
+            .copied()
+            .filter(|view| self.retained_view_exited(*view))
+            .collect();
+        for view in exited {
+            if self.counted_leader_exit_views.remove(&view) {
+                self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_sub(1);
+            }
+        }
+    }
+
+    /// True only when the view is still retained and its original
+    /// generation provably exited (retained pidfd poll). Missing views
+    /// and poll errors stay fail-closed.
+    fn retained_view_exited(&self, view: ProcessViewId) -> bool {
+        self.views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .is_some_and(|retained| retained.original_exited() == Ok(true))
     }
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {

@@ -823,6 +823,15 @@ pub struct Engine {
     /// Inventory ticks started (`refresh_inventory` entries). Names the
     /// dropped pass in the pass-containment gap; healthy ticks never read it.
     inventory_passes: u64,
+    /// Dropped-pass aggregates by error text (`note_dropped_pass`): one
+    /// gap per error with a count and first/last pass numbers. Bounded
+    /// by distinct error texts.
+    dropped_pass_gaps: BTreeMap<String, DroppedPassAggregate>,
+    /// Consecutive dropped passes since the last tick that completed
+    /// without dropping. Past `DROPPED_PASS_RETAIN_LIMIT`, a drop
+    /// completes serviced requests so a persistently poisoned tick
+    /// stops blocking all later discovery.
+    consecutive_dropped_passes: u64,
     /// Cumulative exploratory views evicted by rotation.
     exploratory_evictions: u64,
     /// Cumulative pending newcomers completed without a view by the
@@ -891,6 +900,29 @@ pub struct Engine {
     /// without a matching allocation.
     #[cfg(test)]
     view_log: Vec<ViewLogEntry>,
+}
+
+/// Consecutive drops that keep serviced requests queued for retry
+/// before a further drop completes them: two retries cover transient
+/// faults, then the capture degrades instead of stalling.
+const DROPPED_PASS_RETAIN_LIMIT: u64 = 2;
+
+/// One aggregated dropped-pass gap: how many passes with one error
+/// text dropped, and the first/last pass numbers.
+struct DroppedPassAggregate {
+    count: u64,
+    first_pass: u64,
+    last_pass: u64,
+}
+
+/// Renders one dropped-pass gap reason: the single form for the first
+/// drop, the aggregated form with count and first/last passes after.
+fn dropped_pass_reason(count: u64, first_pass: u64, last_pass: u64, error: &str) -> String {
+    if count <= 1 {
+        format!("pass {first_pass} dropped: {error}")
+    } else {
+        format!("passes {first_pass}-{last_pass} dropped ({count}x): {error}")
+    }
 }
 
 #[cfg(test)]
@@ -11050,6 +11082,8 @@ impl Engine {
             deep_scans: 0,
             loader_arms: 0,
             inventory_passes: 0,
+            dropped_pass_gaps: BTreeMap::new(),
+            consecutive_dropped_passes: 0,
             exploratory_evictions: 0,
             probationary_completions: 0,
             #[cfg(test)]
@@ -12827,14 +12861,65 @@ impl Engine {
     /// failures reach here: `apply_candidate` fails before its first
     /// link mutation (its one `?` is the pre-mutation preflight), and
     /// `inventory_candidate` builds from clones, so the committed state
-    /// is untouched and the next tick retries the retained requests.
+    /// is untouched. Repeats with the same error aggregate into one
+    /// gap with a count and first/last pass numbers, updated in place.
     #[track_caller]
     fn note_dropped_pass(&mut self, error: &anyhow::Error) {
+        const SUBJECT: &str = "live inventory pass";
         let pass = self.inventory_passes;
-        self.mark_partial(
-            "live inventory pass",
-            &format!("pass {pass} dropped: {error:#}"),
-        );
+        self.consecutive_dropped_passes = self.consecutive_dropped_passes.saturating_add(1);
+        let key = format!("{error:#}");
+        let (previous_count, previous_last, first_pass) = {
+            let aggregate = self
+                .dropped_pass_gaps
+                .entry(key.clone())
+                .or_insert(DroppedPassAggregate {
+                    count: 0,
+                    first_pass: pass,
+                    last_pass: pass,
+                });
+            let previous = (aggregate.count, aggregate.last_pass, aggregate.first_pass);
+            aggregate.count = aggregate.count.saturating_add(1);
+            aggregate.last_pass = pass;
+            previous
+        };
+        let reason = dropped_pass_reason(previous_count.saturating_add(1), first_pass, pass, &key);
+        if previous_count == 0 {
+            self.mark_partial(SUBJECT, &reason);
+            return;
+        }
+        let old = dropped_pass_reason(previous_count, first_pass, previous_last, &key);
+        if let Some(skip) = self
+            .counters
+            .object_skips
+            .iter_mut()
+            .find(|skip| skip.subject == SUBJECT && skip.reason == old)
+        {
+            skip.reason = reason;
+            attribution::note(skip);
+            self.note_facts_mutated();
+        } else {
+            // Defensive: the aggregated entry is gone (nothing today
+            // removes it), so record the drop instead of losing it.
+            self.mark_partial(SUBJECT, &reason);
+        }
+    }
+
+    /// Escalation for a dropped tick: while drops stay rare the
+    /// serviced requests stay queued for retry (transient recovery);
+    /// once drops run consecutively past `DROPPED_PASS_RETAIN_LIMIT`,
+    /// complete the serviced-but-unfailed requests through the normal
+    /// failed-refresh path so later ticks serve other work instead of
+    /// re-feeding the same poisoned inputs. Already-failed pids stay
+    /// queued for retry either way.
+    fn complete_serviced_after_repeated_drops(
+        &mut self,
+        serviced: &BTreeMap<u32, u64>,
+        failed: &BTreeSet<u32>,
+    ) {
+        if self.consecutive_dropped_passes > DROPPED_PASS_RETAIN_LIMIT {
+            self.complete_refresh_requests(serviced, failed);
+        }
     }
 
     pub(crate) fn selection_coverage(
@@ -24778,6 +24863,9 @@ impl Engine {
         self.scheduler.note_enumeration(&live);
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
             self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+            // A tick that completed without dropping breaks the
+            // consecutive-drop chain.
+            self.consecutive_dropped_passes = 0;
             crate::attach::reexec_diagnostic::observe!(session, |diag| {
                 diag.note(
                     DiagnosticPhase::SettleRequest,
@@ -24988,6 +25076,10 @@ impl Engine {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.note_dropped_pass(&error);
+                self.complete_serviced_after_repeated_drops(
+                    &serviced_requests,
+                    &failed_refresh_pids,
+                );
                 *additions_allowed = false;
                 closure.fail();
                 return Ok(false);
@@ -25273,6 +25365,10 @@ impl Engine {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.note_dropped_pass(&error);
+                self.complete_serviced_after_repeated_drops(
+                    &serviced_requests,
+                    &failed_refresh_pids,
+                );
                 *additions_allowed = false;
                 closure.fail();
                 return Ok(changed);
@@ -25419,6 +25515,10 @@ impl Engine {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.note_dropped_pass(&error);
+                    self.complete_serviced_after_repeated_drops(
+                        &serviced_requests,
+                        &failed_refresh_pids,
+                    );
                     *additions_allowed = false;
                     closure.fail();
                     return Ok(changed);
@@ -25682,6 +25782,9 @@ impl Engine {
             span.finish(DiagnosticOutcome::Ok);
         }
         self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+        // A tick that completed without dropping breaks the
+        // consecutive-drop chain.
+        self.consecutive_dropped_passes = 0;
         crate::attach::reexec_diagnostic::observe!(session, |diag| {
             diag.note(
                 DiagnosticPhase::SettleRequest,

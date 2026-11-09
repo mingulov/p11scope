@@ -377,6 +377,82 @@ fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
 }
 
 #[test]
+fn async_global_owned_only_retire_covers_module_first_seen_in_candidate() {
+    // Pre-arm on a split-identity (pre-6.8 overlay) file: the static
+    // pre-arm slots are live before any module is committed, and the
+    // first scan's candidate both introduces the owned child's module and
+    // retires those static slots (static -> exact transition). Ownership
+    // must be judged against the candidate's modules too; otherwise the
+    // retire parks an async global ticket, the pause tick stays
+    // incomplete and the owned child is released before attach.
+    let mut case = Case::new();
+    case.engine.owned_run_pid = Some(case.child.id());
+    let candidate = case.candidate();
+    assert!(
+        candidate.modules.iter().any(|module| {
+            module
+                .entry_objects
+                .iter()
+                .flatten()
+                .any(|id| *id == candidate.delta.retire[0].object)
+        }),
+        "the candidate's module names the retiring slot's object"
+    );
+    case.engine.modules.clear();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "a module first seen in the candidate still owns the retire"
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0
+    );
+    assert!(
+        case.session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| !slots.is_empty()),
+        "the retire detaches synchronously inside the tick"
+    );
+}
+
+#[test]
+fn async_global_candidate_module_of_unowned_view_keeps_async_ticket() {
+    // Guard twin: the candidate's module belongs to a view that is not
+    // the owned run child, so the same module-first-seen retire keeps
+    // the ordinary async global path.
+    let mut case = Case::new();
+    case.engine.owned_run_pid = Some(case.child.id().wrapping_add(1_000_000));
+    let candidate = case.candidate();
+    case.engine.modules.clear();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+    assert!(case.engine.pending_global_retirement.is_some());
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+}
+
+#[test]
 fn async_global_unowned_retire_keeps_async_ticket() {
     // Guard twin: without an owned run child, the same candidate keeps
     // the ordinary async global path.

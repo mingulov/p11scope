@@ -12,6 +12,7 @@ import pwd
 from pathlib import Path
 import re
 import runpy
+import shlex
 import shutil
 import stat
 import struct
@@ -1569,15 +1570,15 @@ class MatrixContract(unittest.TestCase):
                 self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertFalse(bound.exists(), "host judgment reopened or created the guest base")
 
-    def retained_object_inputs(self, cells=(("full", 64),), native_inputs=None):
-        repo = self.base / "original object source"
+    def retained_object_inputs(self, cells=(("full", 64),), native_inputs=None, tag=""):
+        repo = self.base / ("original object source" + tag)
         names = set().union(*(set(CHECKER_MOD[key]) for key in
             ("SOURCE_FILES", "RUNTIME_SOURCES", "CANARY_SOURCE_FILES", "CANARY_RUNTIME_SOURCES", "CANARY_PRODUCER_SOURCES")))
         for name in names:
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
-        candidate = candidate_receipt(self.bins, self.base / "object-source-build.json", repo)
+        candidate = candidate_receipt(self.bins, self.base / ("object-source-build" + tag + ".json"), repo)
         arguments = []
         for mode, bits in cells:
             bundle, facts = self.canary_inputs(mode, bits)
@@ -1592,7 +1593,7 @@ class MatrixContract(unittest.TestCase):
                     item["sha256"] = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
             (bundle / "canary-build.json").write_text(json.dumps(facts))
             arguments.extend(("--object-input", mode, str(bits), str(bundle)))
-        stage = self.base / "retained object stage"
+        stage = self.base / ("retained object stage" + tag)
         result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--prepare", str(stage),
             "--lane", "host", "--kernel", "host", "--bin-dir", str(self.bins), "--binary-list", str(self.listing),
             "--guest-work-root", str(self.base),
@@ -2758,6 +2759,43 @@ receipt_path.write_text(json.dumps(receipt))
 '''
 
 
+# Fast owned runuser stub for the object-matrix readability/identity probes.
+# OBJECT_EXTERNALS stays the oracle for every other external; this stub
+# handles only the exact runuser shapes run_objects emits, records the same
+# event rows, and answers the same exit codes. Every fork costs ~13 ms on a
+# loaded host, so a Python stub burns 9-17 s on the per-binding readability
+# probes alone; this hot path is one bash fork with a baked identity and the
+# builtin test, and no other subprocess. Unknown shapes are refused like
+# the sudo stub refuses unknown operations.
+OBJECT_RUNUSER = r'''#!/bin/bash
+set -eu
+EVENTS=@RUNUSER_EVENTS@
+MYUID=@RUNUSER_UID@
+MYUSER=@RUNUSER_USER@
+[ "$MYUID" -ne 0 ] || { echo 'runuser stub refuses root' >&2; exit 1; }
+[ $# -ge 4 ] && [ "$1" = -u ] && [ "$2" = "$MYUSER" ] && [ "$3" = -- ] || { echo 'runuser stub refuses foreign identity' >&2; exit 1; }
+shift 3
+case "$*" in
+  'id -u'|'id -g'|'sudo -n true'|'test -r '*|'env P11SCOPE_CANARY_TARGET_BITS='*verify-canaries.sh' --capture-mode '*' --prebuilt-dir '*' --object-pilot'*) ;;
+  *) echo "unknown runuser operation: $*" >&2; exit 94 ;;
+esac
+if [[ "$*" =~ [[:cntrl:]] ]]; then echo 'runuser stub refuses control characters' >&2; exit 1; fi
+[ -n "$EVENTS" ] || { echo 'runuser stub has no events sink' >&2; exit 1; }
+user_esc=${MYUSER//\\/\\\\}; user_esc=${user_esc//\"/\\\"}
+row="{\"kind\": \"runuser\", \"argv\": [\"-u\", \"$user_esc\", \"--\""
+for arg in "$@"; do
+  esc=${arg//\\/\\\\}; esc=${esc//\"/\\\"}
+  row="$row, \"$esc\""
+done
+printf '%s, "real_uid": %s}\n' "$row]" "$MYUID" >>"$EVENTS"
+cmd=$1; shift
+# The readability probe is the hot shape: answer it with the builtin test
+# (same -r semantics, no fork) instead of execing /usr/bin/test.
+if [ "$cmd" = test ]; then test "$@"; exit "$?"; fi
+exec "$cmd" "$@"
+'''
+
+
 class NativeObjectMatrix(unittest.TestCase):
     """Eight tiny C builds once; actual runner/oracles, controlled acquisition.
 
@@ -2802,7 +2840,7 @@ int main(int argc, char **argv) {
         self.addCleanup(self.scene.temp.cleanup)
         self.base = self.scene.base
 
-    def acquisition_templates(self, controls):
+    def acquisition_templates(self, controls, cells=None):
         fixtures = runpy.run_path(str(ROOT / "tests/python/test_canary_evidence.py"))
         objects = runpy.run_path(str(ROOT / "tests/python/test_canary_object.py"))
         capture = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
@@ -2811,6 +2849,8 @@ int main(int argc, char **argv) {
         ordinals = {name: ordinal for ordinal, name in objects["evidence"]["OBJECT_LEDGER"]}
         for mode in ("full", "p0"):
             for bits in (32, 64):
+                if cells is not None and (mode, bits) not in cells:
+                    continue
                 root = controls / f"{mode}-{bits}"; root.mkdir()
                 pilot = fixtures["FinalScannerSurfaceTests"]()
                 pilot.object_pilot_fixture.__func__.__globals__["TARGET_BITS"] = bits
@@ -2856,17 +2896,17 @@ int main(int argc, char **argv) {
                 capture["validate_canary"](lane, report, bits)
                 (root / (lane + ".output")).write_text(json.dumps(report))
 
-    def object_stage(self, cells, *, native_inputs):
-        repo, stage = self.scene.retained_object_inputs(cells, native_inputs)
+    def object_stage(self, cells, *, native_inputs, tag=""):
+        repo, stage = self.scene.retained_object_inputs(cells, native_inputs, tag=tag)
         result = command(str(RUNNER), "--write-inner-stage", str(stage), "--contract", str(stage / "contract.json"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        controls = self.base / "external controls"; controls.mkdir()
-        self.acquisition_templates(controls)
+        controls = self.base / ("external controls" + tag); controls.mkdir()
+        self.acquisition_templates(controls, cells)
         events = controls / "events.jsonl"
         config = controls / "control.json"
         bindings = json.loads((stage / "contract.json").read_text())["bindings"]
         config.write_text(json.dumps({"events": str(events), "templates": str(controls), "stage": str(stage),
-            "source_root": str(stage / "artifacts/source"), "work_root": str(self.base / "caller object work"),
+            "source_root": str(stage / "artifacts/source"), "work_root": str(self.base / ("caller object work" + tag)),
             "inventory_inputs": [{"mode": mode, "target_bits": bits,
                 "path": str(stage / f"artifacts/canary/{mode}-{bits}/default-ebpf"),
                 "sha256": bindings[f"artifacts/canary/{mode}-{bits}/default-ebpf"]} for mode, bits in cells], "failure": ""}))
@@ -2875,10 +2915,16 @@ int main(int argc, char **argv) {
         dispatch = controls / "dispatch.py"
         dispatch.write_text("#!" + sys.executable + "\n" + OBJECT_EXTERNALS)
         dispatch.chmod(0o755)
-        for name in ("python3", "sudo", "runuser", "findmnt", "bpftool", "gcc", "clang", "clang-18", "cargo", "rustc", "cc"):
+        runuser = controls / "runuser"
+        runuser.write_text(OBJECT_RUNUSER
+            .replace("@RUNUSER_EVENTS@", shlex.quote(str(events)))
+            .replace("@RUNUSER_UID@", str(os.getuid()))
+            .replace("@RUNUSER_USER@", shlex.quote(pwd.getpwuid(os.getuid()).pw_name)))
+        runuser.chmod(0o755)
+        for name in ("python3", "sudo", "findmnt", "bpftool", "gcc", "clang", "clang-18", "cargo", "rustc", "cc"):
             (controls / name).symlink_to(dispatch.name)
-        work = self.base / "caller object work"; work.mkdir(mode=0o700)
-        unrelated = self.base / "unrelated object cwd"; unrelated.mkdir()
+        work = self.base / ("caller object work" + tag); work.mkdir(mode=0o700)
+        unrelated = self.base / ("unrelated object cwd" + tag); unrelated.mkdir()
         env = os.environ.copy()
         env.update(PATH=str(controls) + ":" + env["PATH"], P11SCOPE_OBJECT_CONTROL=str(config))
         return repo, stage, work, unrelated, env, config
@@ -2892,35 +2938,44 @@ int main(int argc, char **argv) {
         return result
 
     def test_generated_inner_runs_selected_prebuilt_object_pairs(self):
-        cells = [(mode, bits) for mode in ("full", "p0") for bits in (32, 64)]
-        _, stage, work, cwd, env, config_path = self.object_stage(cells, native_inputs=self.native)
-        bindings = json.loads((stage / "contract.json").read_text())["bindings"]
-        before = {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings}
-        result = self.dispatch(stage, work, cwd, env)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        rows = CHECKER_MOD["object_rows"](stage, json.loads((stage / "contract.json").read_text()))
-        self.assertEqual([row["id"] for row in rows],
-                         [f"object:{mode}:{bits}:{role}" for mode, bits in cells for role in ("complete", "blocked")])
-        events = [json.loads(line) for line in Path(json.loads(config_path.read_text())["events"]).read_text().splitlines()]
-        captures = [row for row in events if row["kind"] == "capture"]
-        pilots = [row["argv"] for row in events if row["kind"] == "runuser" and "--object-pilot" in row["argv"]]
-        self.assertEqual(len(pilots), 4)
-        for (mode, bits), argv in zip(cells, pilots):
-            self.assertEqual(argv[argv.index("--capture-mode") + 1], mode)
-            self.assertEqual(argv[argv.index("--prebuilt-dir") + 1], str(stage / f"artifacts/canary/{mode}-{bits}"))
-            self.assertIn(f"P11SCOPE_CANARY_TARGET_BITS={bits}", argv)
-        self.assertEqual([(row["attributes"], row["bits"], row["lane"]) for row in captures],
-            [("present" if mode == "full" else "absent", bits,
-              ("object-ia32" if bits == 32 else "object-lp64") + suffix)
-             for mode, bits in cells for suffix in ("", "-blocked")])
-        terms = [row for row in events if row["kind"] == "signal"]
-        self.assertEqual(len(terms), 4)
-        self.assertTrue(all(row["signal"] == "TERM" and row["real_uid"] == os.getuid() for row in terms))
-        self.assertTrue(all(Path(row["helper"]).resolve() == stage / "artifacts/source/scripts/lane-lib-oracle-1.py"
-                            if Path(row["helper"]).is_absolute() else row["helper"] == "scripts/lane-lib-oracle-1.py" for row in terms))
-        self.assertTrue(all(not Path(f'/proc/{row["pid"]}').exists() for row in terms), "blocked workload was not reaped")
-        self.assertFalse(any(row["kind"] == "compiler" for row in events))
-        self.assertEqual(before, {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings})
+        # One dispatch per selected pair, each with the full per-cell
+        # assertions. A dispatch costs ~5 s quiet and ~15 s loaded per cell
+        # (two real C workloads plus six real oracles), so even two cells
+        # reach 29 s at load 22 and the 30 s deadlock guard cannot bound a
+        # wider dispatch robustly on shared hosts. Every pair stays covered;
+        # multi-cell dispatch itself is also exercised by live qualification.
+        selections = [[("full", 32)], [("full", 64)], [("p0", 32)], [("p0", 64)]]
+        for index, cells in enumerate(selections):
+            with self.subTest(cells=cells):
+                _, stage, work, cwd, env, config_path = self.object_stage(
+                    cells, native_inputs=self.native, tag=f" pair {index}")
+                bindings = json.loads((stage / "contract.json").read_text())["bindings"]
+                before = {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings}
+                result = self.dispatch(stage, work, cwd, env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rows = CHECKER_MOD["object_rows"](stage, json.loads((stage / "contract.json").read_text()))
+                self.assertEqual([row["id"] for row in rows],
+                                 [f"object:{mode}:{bits}:{role}" for mode, bits in cells for role in ("complete", "blocked")])
+                events = [json.loads(line) for line in Path(json.loads(config_path.read_text())["events"]).read_text().splitlines()]
+                captures = [row for row in events if row["kind"] == "capture"]
+                pilots = [row["argv"] for row in events if row["kind"] == "runuser" and "--object-pilot" in row["argv"]]
+                self.assertEqual(len(pilots), 1)
+                for (mode, bits), argv in zip(cells, pilots):
+                    self.assertEqual(argv[argv.index("--capture-mode") + 1], mode)
+                    self.assertEqual(argv[argv.index("--prebuilt-dir") + 1], str(stage / f"artifacts/canary/{mode}-{bits}"))
+                    self.assertIn(f"P11SCOPE_CANARY_TARGET_BITS={bits}", argv)
+                self.assertEqual([(row["attributes"], row["bits"], row["lane"]) for row in captures],
+                    [("present" if mode == "full" else "absent", bits,
+                      ("object-ia32" if bits == 32 else "object-lp64") + suffix)
+                     for mode, bits in cells for suffix in ("", "-blocked")])
+                terms = [row for row in events if row["kind"] == "signal"]
+                self.assertEqual(len(terms), 1)
+                self.assertTrue(all(row["signal"] == "TERM" and row["real_uid"] == os.getuid() for row in terms))
+                self.assertTrue(all(Path(row["helper"]).resolve() == stage / "artifacts/source/scripts/lane-lib-oracle-1.py"
+                                    if Path(row["helper"]).is_absolute() else row["helper"] == "scripts/lane-lib-oracle-1.py" for row in terms))
+                self.assertTrue(all(not Path(f'/proc/{row["pid"]}').exists() for row in terms), "blocked workload was not reaped")
+                self.assertFalse(any(row["kind"] == "compiler" for row in events))
+                self.assertEqual(before, {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in bindings})
 
     def test_generated_inner_object_pair_uses_only_staged_sources(self):
         repo, stage, work, cwd, env, config_path = self.object_stage((("full", 64),), native_inputs=self.native)

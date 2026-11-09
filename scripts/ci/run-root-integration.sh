@@ -371,7 +371,10 @@ CELLS=(
 )
 
 PRIVTMP=$(mktemp -d) || exit 2
-chmod 700 "$PRIVTMP" || exit 2
+# 0711: unlistable and not writable by others, but searchable, so a
+# cell's sudo-dropped child can reach a script the cell placed below it
+# (a script runs by its path, unlike an ELF run by descriptor).
+chmod 711 "$PRIVTMP" || exit 2
 cleanup() {
     if command -v pkill >/dev/null 2>&1; then
         # Best effort: only our own strays can name the fresh private

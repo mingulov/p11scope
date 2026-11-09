@@ -767,11 +767,16 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             ensure!(rows.is_none(), "ordinary S1 has no attested semantic rows");
             ensure!(drain.malformed() == 0);
         }
-        let before = crate::events::event_drain_positions(harness.session.event_drain()?);
+        // The staged EVENTS drain reports a widened positions capacity
+        // (ring plus staging margin), so the ring size comes from the map.
+        let Some(Map::RingBuf(events_ring)) = harness.session.ebpf.map("EVENTS") else {
+            bail!("expected native EVENTS ring buffer");
+        };
         ensure!(
-            before.capacity == 4 * 1024 * 1024,
+            events_ring.info()?.max_entries() == 4 * 1024 * 1024,
             "requires the default FULL ring"
         );
+        let before = crate::events::event_drain_positions(harness.session.event_drain()?);
         ensure!(
             before.consumer == before.producer,
             "startup ring must be empty"

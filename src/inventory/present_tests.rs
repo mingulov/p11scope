@@ -5220,3 +5220,134 @@ fn replaced_notices_fold_beyond_twenty() {
         "the remainder folds: {out}"
     );
 }
+
+/// F2: twenty-two notices fold with the plural remainder line.
+#[test]
+fn replaced_notices_fold_uses_plural_beyond_twenty_one() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for index in 0..22 {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(80_000 + index),
+            subject: format!("/prov/file{index}.so (deleted)"),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 22 programs run files replaced on disk (below)."),
+        "the absence line counts every program: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("not counted:"))
+            .count(),
+        20,
+        "twenty notices print: {out}"
+    );
+    assert!(
+        out.contains("  and 2 more replaced files (--json has every item)"),
+        "the remainder folds with the plural line: {out}"
+    );
+    assert!(
+        !out.contains("1 more replaced file ("),
+        "the singular line stays away from a plural remainder: {out}"
+    );
+}
+
+/// F2: two gaps with the same (program, file) pair print one notice.
+#[test]
+fn replaced_notices_deduplicate_same_program_and_file() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for _ in 0..2 {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(80_000),
+            subject: "/prov/dup.so (deleted)".into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(80_001),
+        subject: "/prov/other.so (deleted)".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 2 programs run files replaced on disk (below)."),
+        "the absence line counts both programs: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("not counted:"))
+            .count(),
+        2,
+        "the duplicated pair prints once, the distinct pair prints too: {out}"
+    );
+    assert_eq!(
+        out.lines().filter(|line| line.contains("/prov/dup.so")).count(),
+        1,
+        "the duplicated pair names one notice line: {out}"
+    );
+}
+
+/// F2: a replaced gap without caller or pid names an unknown program,
+/// while a caller without a pid keeps its retained pid.
+#[test]
+fn replaced_notices_name_unknown_program_and_retained_pid() {
+    let harness = varied_harness();
+    let caller = harness.coordinator().adapter().live_id(70_000).unwrap();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "/prov/ghost.so (deleted)".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: Some(caller),
+        module: None,
+        pid: None,
+        subject: "/prov/retained.so (deleted)".into(),
+        reason: "replaced on disk while running; not examined, calls not counted".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("No counted associations; 2 programs run files replaced on disk (below)."),
+        "the absence line counts both programs: {out}"
+    );
+    assert!(
+        out.contains("not counted: an unknown program runs /prov/ghost.so (deleted)"),
+        "the caller-less pid-less gap names an unknown program: {out}"
+    );
+    assert!(
+        out.contains("not counted: driver (PID 70000) runs /prov/retained.so (deleted)"),
+        "the caller without a pid keeps its retained pid: {out}"
+    );
+}

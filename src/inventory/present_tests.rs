@@ -3544,6 +3544,79 @@ fn gap_reason_names_the_host_root_fallback_when_attempted() {
     );
 }
 
+/// Foreign-root failures fold in concise only: three identical
+/// retained-root reasons with their target-root suffix become one
+/// counted line naming the root — never an exit race — while a
+/// size-cap refusal and a precondition refusal keep their own lines.
+/// Verbose lists every gap with its machine reason; JSON keeps every
+/// record verbatim.
+#[test]
+fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let foreign = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)";
+    for subject in ["/lib/a.so", "/lib/b.so", "/bin/daemon"] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: (*subject).into(),
+            reason: (*foreign).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    for (subject, reason) in [
+        (
+            "/lib/big.so",
+            "object is 278755480 bytes; limit is 268435456",
+        ),
+        (
+            "relative/path.so",
+            "target-root object requires an absolute path without parent traversal",
+        ),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: (*subject).into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.contains("process exited during scan"),
+        "a foreign-root failure is not an exit race: {concise}"
+    );
+    assert!(
+        concise.contains("3 ×")
+            && concise.contains("/etc/avahi")
+            && concise.contains("--json lists each"),
+        "concise folds the three identical foreign reasons into one counted line: {concise}"
+    );
+    assert!(
+        concise.contains("/lib/big.so") && concise.contains("relative/path.so"),
+        "size-cap and precondition refusals keep their own lines: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for subject in ["/lib/a.so", "/lib/b.so", "/bin/daemon"] {
+        assert!(
+            verbose.contains(subject),
+            "verbose keeps every object: {verbose}"
+        );
+    }
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = document["gaps"]
+        .as_array()
+        .expect("JSON keeps a gaps array");
+    assert_eq!(gaps.len(), 5, "JSON keeps every record: {document}");
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

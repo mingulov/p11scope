@@ -9621,6 +9621,54 @@ mod tests {
         );
     }
 
+    /// A too-large object in a foreign-root view keeps its `too_large`
+    /// concise record: the size-cap reason folds by cap beside — never
+    /// inside — the foreign-root fold, and JSON keeps every object.
+    #[test]
+    fn foreign_view_too_large_gap_keeps_its_too_large_fold() {
+        let mut catalog = catalog_with(Vec::new());
+        let foreign = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)";
+        for (pid, subject) in [(31u32, "/lib/a.so"), (31, "/lib/b.so")] {
+            catalog.skipped.push(PidGap::member(
+                pid,
+                Skipped {
+                    subject: subject.into(),
+                    reason: foreign.into(),
+                },
+            ));
+        }
+        catalog.skipped.push(PidGap::member(
+            31,
+            Skipped {
+                subject: "/lib/big.so".into(),
+                reason: "object is 278755480 bytes; limit is 268435456".into(),
+            },
+        ));
+        assert_eq!(
+            too_large_cap("object is 278755480 bytes; limit is 268435456"),
+            Some(268435456)
+        );
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("1 file over 256 MiB not read"),
+            "the size-cap refusal keeps its too_large fold: {concise}"
+        );
+        assert!(
+            concise.contains("/etc/avahi"),
+            "the foreign reasons fold with their root beside it: {concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("/lib/a.so"), "{verbose}");
+        assert!(verbose.contains("/lib/b.so"), "{verbose}");
+        assert!(verbose.contains("/lib/big.so"), "{verbose}");
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["skipped"].as_array().map(Vec::len),
+            Some(3),
+            "{document}"
+        );
+    }
+
     /// Twenty identical pin-loss skips across two processes fold to one
     /// counted line in text; JSON still lists every record.
     #[test]

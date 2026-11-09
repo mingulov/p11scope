@@ -11370,6 +11370,55 @@ mod tests {
         );
     }
 
+    /// Foreign-root open failures stay per-object (JSON and `-v` keep
+    /// every object; concise folds): only the retained-root prefix
+    /// gains the target-root suffix, grouped per distinct reason by the
+    /// renderers. A size-cap refusal keeps its exact producer wording
+    /// so the `too_large` concise fold still recognizes it, and a
+    /// precondition refusal keeps its own record too.
+    #[test]
+    fn foreign_root_skips_keep_every_object_with_its_root() {
+        let enoent =
+            "opening object within retained target root: No such file or directory (os error 2)";
+        let skips = foreign_root_skips(vec![
+            foreign_failure("/lib/a.so", enoent, "/etc/avahi"),
+            foreign_failure("/lib/b.so", enoent, "/etc/avahi"),
+            foreign_failure(
+                "/lib/big.so",
+                "object is 278755480 bytes; limit is 268435456",
+                "/etc/avahi",
+            ),
+            foreign_failure(
+                "relative/path.so",
+                "target-root object requires an absolute path without parent traversal",
+                "/etc/avahi",
+            ),
+        ]);
+        assert_eq!(skips.len(), 4, "no per-object record is merged: {skips:#?}");
+        for skip in &skips[0..2] {
+            assert!(
+                skip.reason.starts_with(enoent)
+                    && skip
+                        .reason
+                        .contains("(target root /etc/avahi differs from the observer root)"),
+                "a retained-root failure names its target root: {skip:#?}"
+            );
+        }
+        assert_eq!(skips[0].subject, "/lib/a.so");
+        assert_eq!(skips[1].subject, "/lib/b.so");
+        assert_eq!(
+            skips[2].reason, "object is 278755480 bytes; limit is 268435456",
+            "a size-cap refusal keeps its exact wording for the too_large fold: {:#?}",
+            skips[2]
+        );
+        assert_eq!(
+            skips[3].reason,
+            "target-root object requires an absolute path without parent traversal",
+            "a precondition refusal keeps its own record: {:#?}",
+            skips[3]
+        );
+    }
+
     #[test]
     fn foreign_root_collapse_counts_and_names_its_first_failure() {
         let single = collapse_foreign_root_skips(&[

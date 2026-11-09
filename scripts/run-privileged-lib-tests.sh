@@ -347,8 +347,8 @@ discovery::inventory_workload::tests::privileged_inventory_attach_projection_n81
 # workload (root, BPF, SoftHSM, pkcs11-tool); each wrapper run compares
 # against the direct run's exact call count or neutral lattice. The
 # default-flags cell pins the omitted --pause default end to end on a
-# fast child, with a never twin. The SIGINT-during-hold cell stops that
-# default run mid-hold: the run still writes its report.
+# fast child, with a never twin. The SIGINT-during-hold cell stops a
+# default preload-and-sleep run mid-hold: the run still writes its report.
 discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64

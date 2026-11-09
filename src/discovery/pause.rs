@@ -10686,24 +10686,30 @@ mod tests {
     }
 
     /// SIGINT during a held `auto` pause ends the run by signal with its
-    /// report, not with a `pause coordination cancelled` error. The
-    /// one-shot hook raises a real SIGINT at the first proven hold (the
-    /// child is stopped then); the cancelled cycle counts one partial,
-    /// the child is resumed and settled, and the `-o` report is written
-    /// with exit 130.
+    /// report, not with a `pause coordination cancelled` error. The child
+    /// preloads the provider and then sleeps, so its startup loader hit
+    /// holds deterministically; the one-shot hook raises a real SIGINT at
+    /// that first proven hold (the child is stopped then). The cancelled
+    /// cycle counts one partial, the child is resumed and settled by the
+    /// forwarded signal, and the `-o` report is written with exit 130.
+    /// (A fast `-L` child can finish between the resume and the forward
+    /// and exit 0 instead; the sleep keeps the settlement exact.)
     #[test]
-    #[ignore = "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM, pkcs11-tool)"]
+    #[ignore = "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM)"]
     fn privileged_pause_sigint_during_hold_still_writes_report_lp64() {
         let dir = wrapper_work_dir("sigint-hold");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
         let module = wrapper_softhsm_lib();
-        // The audit's first-contact shape: list slots and exit fast.
+        // The direct child preloads the provider (its startup load holds)
+        // and then sleeps past any forwarding race, so the forwarded
+        // SIGINT deterministically settles it.
         let tool: Vec<std::ffi::OsString> = vec![
-            "/usr/bin/pkcs11-tool".into(),
-            "--module".into(),
-            module.into(),
-            "-L".into(),
+            "/usr/bin/env".into(),
+            format!("SOFTHSM2_CONF={}", conf.display()).into(),
+            format!("LD_PRELOAD={module}").into(),
+            "/usr/bin/sleep".into(),
+            "30".into(),
         ];
         // Default flags: parsed exactly as the operator types them, with
         // no --pause flag, so the CLI default is what the run exercises.

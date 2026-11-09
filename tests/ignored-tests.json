@@ -948,7 +948,7 @@
     {
       "file": "src/discovery/pause.rs",
       "path": "discovery::pause::tests::privileged_pause_sigint_during_hold_still_writes_report_lp64",
-      "reason": "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM, pkcs11-tool)",
+      "reason": "privileged: SIGINT during a held auto pause still writes the run report (root, BPF, SoftHSM)",
       "cell": "privileged"
     },
     {

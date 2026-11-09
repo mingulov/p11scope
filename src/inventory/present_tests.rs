@@ -4964,12 +4964,14 @@ fn gap_group_line_keeps_path_tail() {
 }
 
 /// I1 twin: a prose subject still keeps its START on the concise gap
-/// line; only paths keep the tail.
+/// line; only paths keep the tail. The subject is longer than the
+/// short-subject keep (short machine names stay whole and the reason
+/// gives way instead, pinned in the key-ops twin).
 #[test]
 fn gap_group_line_keeps_prose_head() {
     let line = gap_group_line(
         1,
-        "native usage feed unavailable",
+        "native usage feed unavailable for this capture window",
         "live capture refused (missing capabilities); run 'p11scope doctor'",
     );
     assert_eq!(

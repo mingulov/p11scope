@@ -2383,12 +2383,21 @@ fn concise_short_lived_pointer(gaps: &[GapView]) -> Option<String> {
 /// Watched functions count against the real inventory endpoint budget
 /// (the attach set's `--max-endpoints` limit), never the registry's
 /// internal endpoint ceiling. A scan-only inventory (kept first pass,
-/// scan fallback) records endpoints without attaching any: with no
-/// usage feed the line says recorded with 0 attached, never watched.
-fn render_limits_line(out: &mut String, budgets: &BudgetView, usage_feed: bool) {
+/// scan fallback) records endpoints without attaching any: only when
+/// every edge is unknown for a scan reason does the line say recorded
+/// with 0 attached, never watched. Any other coverage — a watch, a
+/// count, a witness, or an unknown with a non-scan reason — means a
+/// producer ran, so "watched" stays.
+fn render_limits_line(out: &mut String, budgets: &BudgetView, edges: &[EdgeView]) {
     use std::fmt::Write as _;
     let plural = |count: usize| if count == 1 { "" } else { "s" };
-    let scan_only = !usage_feed && budgets.inventory_endpoints_occupied > 0;
+    let scan_only = budgets.inventory_endpoints_occupied > 0
+        && edges.iter().all(|edge| {
+            matches!(
+                edge.coverage,
+                UseCoverage::Unknown(UnknownReason::ScanOnly | UnknownReason::NotAttached)
+            )
+        });
     let _ = writeln!(
         out,
         "limits: {} caller{}, {} provider file{}, {} edge{} ({} refused); {} function{} {} of {} ({} refused). Full budget detail: -v or --json.",
@@ -3416,7 +3425,7 @@ fn render_snapshot_inner(
         return out;
     }
     if verbosity == crate::cli::TextVerbosity::Concise {
-        render_limits_line(&mut out, budgets, presentation.usage_feed);
+        render_limits_line(&mut out, budgets, &presentation.edges);
         for line in concise_gap_summary_block(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }

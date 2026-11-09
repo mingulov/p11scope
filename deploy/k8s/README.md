@@ -407,13 +407,13 @@ other privileged work on the host. Evidence lands in a 0700 directory under
   The observer's deps are pure Rust + `libc` (BPF via aya, no libbpf C
   library), so a static-pie build works: `file` says `static-pie linked`.
   The runtime holds only the observer, the entry script, `/bin/busybox`
-  (static, from digest-pinned `busybox:1.37.0-musl`) installed as `/bin/sh`
-  plus the 16 applet symlinks the pod needs, and the license texts: no
-  package manager, no TLS or crypto libraries, no CA bundle, no shell
-  beyond busybox. The former Alpine runtime carried ~8 MB of packages the
-  static binary never uses (apk, libcrypto/libssl, ssl_client, zlib, the CA
-  bundle, scanelf, musl-utils); the busybox binary is ~1.2 MB. No curl/jq
-  since the observer stopped using the API.
+  (static, from digest-pinned `busybox:1.37.0-musl`) installed as 16 applet
+  symlinks (`/bin/sh` plus the 15 others the pod needs), and the license
+  texts: no package manager, no TLS or crypto libraries, no CA bundle, no
+  shell beyond busybox. The former Alpine runtime carried ~8 MB of packages
+  the static binary never uses (apk, libcrypto/libssl, ssl_client, zlib,
+  the CA bundle, scanelf, musl-utils); the busybox binary is ~1.2 MB. No
+  curl/jq since the observer stopped using the API.
 - **Not pure distroless**: the entry script needs a shell, and the DaemonSet
   idle command, the posture probes and `kubectl cp` need their applets, so
   the image carries busybox with a pinned applet allowlist (APPLETS in

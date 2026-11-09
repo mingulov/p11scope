@@ -14366,10 +14366,18 @@ impl Engine {
                 self.pending_loader_scans.remove(&victim);
                 self.pending_loader_scans
                     .insert(key, (hook_ts_ns, announced));
+                // Same bounded-ledger truncation as the dropped arrival
+                // below, but its own reason: churn-eviction growth and
+                // overload-drop growth stay distinguishable in diagnostics.
+                self.record_pending_loader_scan_loss(
+                    "a deferred loader memory scan exceeded the bounded loader-context ledger; \
+                     the stalest entry was evicted for a fresher arrival",
+                );
+            } else {
+                self.record_pending_loader_scan_loss(
+                    "a deferred loader memory scan exceeded the bounded loader-context ledger",
+                );
             }
-            self.record_pending_loader_scan_loss(
-                "a deferred loader memory scan exceeded the bounded loader-context ledger",
-            );
             return;
         }
         self.pending_loader_scans

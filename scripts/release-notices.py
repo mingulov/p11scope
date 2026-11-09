@@ -241,6 +241,7 @@ def make_config(metadata, root, recipe):
     text += 'ignore-build-dependencies = false\nignore-dev-dependencies = false\nignore-transitive-dependencies = false\nmax-depth = 10\n'
     project = {"p11scope", "p11scope-discover", "p11scope-bpf-multi", "p11scope-manifest", "p11scope-ebpf", "p11scope-ebpf-common"}
     clarified = set()
+    matched = {}
     for package in metadata["packages"]:
         name, expression = package["name"], package["license"]
         files = []
@@ -262,6 +263,7 @@ def make_config(metadata, root, recipe):
                 raise NoticeError(f"clarification versions are duplicated: {name}")
             if sum(pinned["version"] == package["version"] for pinned in versions) != 1:
                 raise NoticeError(f"clarification package identity changed: {name}")
+            matched.setdefault(name, set()).add(package["version"])
             if name in clarified:
                 continue
             clarified.add(name)
@@ -280,6 +282,16 @@ def make_config(metadata, root, recipe):
             text += f'\n[{name}.clarify]\nlicense = {json.dumps(clarified_expression)}\n'
             for path, license_id, sha in files:
                 text += f'[[{name}.clarify.files]]\npath = {json.dumps(str(path))}\nlicense = {json.dumps(license_id)}\nchecksum = "{sha}"\n'
+    # A pinned version that no locked package carries is stale text the
+    # recipe would otherwise emit silently. A clarification whose crate is
+    # absent from this graph entirely stays accepted: the recipe is shared
+    # across the host and BPF graphs, and a clarified crate may resolve in
+    # only one of them.
+    for name, seen in matched.items():
+        pinned = {entry["version"] for entry in recipe["clarifications"][name]["versions"]}
+        stale = sorted(pinned - seen)
+        if stale:
+            raise NoticeError(f"stale clarification version pin: {name}@{stale[0]}")
     return text
 
 

@@ -11290,6 +11290,272 @@ mod tests {
         );
     }
 
+    /// Re-exec channel for the self-chrooting scan fixture below. The parent
+    /// half respawns this same test binary with both variables set; the child
+    /// half enters the new root and sleeps until the parent kills it. Its
+    /// mappings keep their pre-chroot host paths, exactly like avahi-daemon
+    /// after it chroots to `/etc/avahi`.
+    const CHROOT_SCAN_MODE_ENV: &str = "P11SCOPE_CHROOT_SCAN_MODE";
+    const CHROOT_SCAN_DIR_ENV: &str = "P11SCOPE_CHROOT_SCAN_DIR";
+
+    fn chroot_scan_child_main() {
+        let mode = std::env::var(CHROOT_SCAN_MODE_ENV).unwrap();
+        let dir = std::env::var(CHROOT_SCAN_DIR_ENV).unwrap();
+        if mode == "nschroot" {
+            // SAFETY: unsharing the mount namespace affects only this child.
+            let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EPERM) {
+                    // Mount namespaces are unavailable here; the parent maps
+                    // this exit code to a skip with a reason.
+                    std::process::exit(42);
+                }
+                panic!("chroot scan child cannot unshare its mount namespace: {error}");
+            }
+        }
+        let dir_c = std::ffi::CString::new(dir).unwrap();
+        // SAFETY: a NUL-terminated path; chroot affects only this child.
+        assert_eq!(
+            unsafe { libc::chroot(dir_c.as_ptr()) },
+            0,
+            "chroot scan child cannot chroot"
+        );
+        let slash = std::ffi::CString::new("/").unwrap();
+        // SAFETY: a NUL-terminated path; chdir affects only this child.
+        assert_eq!(
+            unsafe { libc::chdir(slash.as_ptr()) },
+            0,
+            "chroot scan child cannot chdir after chroot"
+        );
+        // Bounded sleep: the parent kills this child once scanned; the bound
+        // only reaps orphans if the parent dies first.
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// A live child held inside an empty root directory. Killed and reaped on
+    /// drop, on every exit path.
+    struct ChrootScanChild {
+        child: std::process::Child,
+        dir: tempfile::TempDir,
+    }
+
+    impl ChrootScanChild {
+        /// Spawn the child half of `test` (`"chroot"` keeps the observer's
+        /// mount namespace, `"nschroot"` unshares one first). Returns `None`
+        /// only when the kernel refuses the mount namespace itself.
+        fn spawn(mode: &str, test: &str) -> Option<Self> {
+            // SAFETY: geteuid takes no arguments and has no side effects.
+            assert_eq!(
+                unsafe { libc::geteuid() },
+                0,
+                "this cell needs root (chroot)"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = dir.path().canonicalize().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    test,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHROOT_SCAN_MODE_ENV, mode)
+                .env(CHROOT_SCAN_DIR_ENV, dir.path());
+            let mut child = command.spawn().expect("spawn chroot scan child");
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if std::fs::read_link(format!("/proc/{pid}/root")).is_ok_and(|link| link == canonical)
+                {
+                    break;
+                }
+                match child.try_wait().unwrap() {
+                    Some(status) if status.code() == Some(42) => return None,
+                    Some(status) => panic!("chroot scan child exited early: {status:?}"),
+                    None => {}
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "chroot scan child never entered {}",
+                    dir.path().display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Some(Self { child, dir })
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for ChrootScanChild {
+        fn drop(&mut self) {
+            // SAFETY: signal a known child pid; failure means it already exited.
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The chrooted-daemon observability bug: a process that mapped its
+    /// objects before chroot (avahi-daemon, named, sshd privsep) keeps
+    /// host-absolute paths in `/proc/<pid>/maps`, but every mapped object
+    /// was opened inside the retained target root (`/proc/<pid>/root`), so
+    /// every object failed with ENOENT on every pass and `--system` never
+    /// converged. Mappings that verify against the host root must resolve.
+    #[test]
+    #[ignore = "root: self-chrooting scan child (chroot, process scan)"]
+    fn privileged_chrooted_process_scan_resolves_host_mappings() {
+        if std::env::var_os(CHROOT_SCAN_MODE_ENV).is_some() {
+            chroot_scan_child_main();
+            return;
+        }
+        let subject =
+            ChrootScanChild::spawn("chroot", "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings")
+                .expect("plain chroot needs no mount namespace");
+        let pid = subject.pid();
+        // Fixture proof: the child really is chrooted, its maps still name
+        // host paths, and those paths exist on the host but not under the
+        // child's root.
+        let exe = std::env::current_exe().unwrap();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        assert!(
+            maps.lines().any(|line| line.ends_with(exe.to_str().unwrap())),
+            "the chrooted child must map its host executable: {exe:?}"
+        );
+        let relative = exe.strip_prefix("/").unwrap();
+        assert!(
+            exe.exists(),
+            "the mapped executable must exist on the host: {exe:?}"
+        );
+        assert!(
+            !subject.dir.path().join(relative).exists(),
+            "the mapped executable must not exist under the chroot"
+        );
+        let view = ProcessView::open(ProcessViewId(71), pid).expect("retain chrooted child");
+        assert!(view.still_the_same());
+        let mut budget = CaptureWorkBudget::default();
+        // Primitive-level precondition, unchanged by the fix: opening a
+        // mapped path inside the retained target root fails, because the
+        // mapping predates the chroot.
+        view.with_filesystem(&mut budget, |filesystem, _| {
+            let error = filesystem
+                .open_rooted(&exe)
+                .expect_err("target-root open must fail inside the chroot");
+            assert!(
+                error.contains("opening object within retained target root"),
+                "unexpected primitive error: {error}"
+            );
+        })
+        .unwrap();
+        let hooks = HookRegistry::builtin();
+        let request = ScanRequest {
+            pid,
+            hints: &[],
+            hooks: &hooks,
+        };
+        let (outcome, examined, _) =
+            scan_process_view_examined(&request, &view, &mut budget).expect("scan chrooted child");
+        assert!(view.still_the_same());
+        assert!(
+            outcome.mapping_scan_completed(),
+            "the chrooted scan must complete its mapping bracket: {:#?}",
+            outcome.skipped()
+        );
+        let retained: Vec<_> = outcome
+            .skipped()
+            .iter()
+            .filter(|skip| {
+                skip.reason
+                    .contains("opening object within retained target root")
+            })
+            .collect();
+        assert!(
+            retained.is_empty(),
+            "chrooted mappings must resolve via the verified host root: {retained:#?}"
+        );
+        assert!(
+            !examined.is_empty(),
+            "the chrooted child's libraries must be examined: {:#?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Twin: when the target root is foreign AND the mount namespace differs
+    /// (a container-like view), the host root must not be trusted at all, and
+    /// the unopenable objects must collapse into one counted process gap
+    /// instead of one gap per object per pass.
+    #[test]
+    #[ignore = "root: self-chrooting scan child in a fresh mount namespace"]
+    fn privileged_foreign_mount_namespace_scan_collapses_unopenable_objects() {
+        if std::env::var_os(CHROOT_SCAN_MODE_ENV).is_some() {
+            chroot_scan_child_main();
+            return;
+        }
+        let Some(subject) = ChrootScanChild::spawn(
+            "nschroot",
+            "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
+        ) else {
+            println!("SKIP: the kernel refused the fixture mount namespace (EPERM)");
+            return;
+        };
+        let pid = subject.pid();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        assert!(
+            !maps.is_empty(),
+            "the foreign-root child must have mappings to fail on"
+        );
+        let view = ProcessView::open(ProcessViewId(72), pid).expect("retain foreign-root child");
+        let hooks = HookRegistry::builtin();
+        let request = ScanRequest {
+            pid,
+            hints: &[],
+            hooks: &hooks,
+        };
+        let mut budget = CaptureWorkBudget::default();
+        let outcome = scan_process_view_without_memory(&request, &view, &mut budget)
+            .expect("scan foreign-root child");
+        assert!(view.still_the_same());
+        assert!(
+            outcome.mapping_scan_completed(),
+            "the foreign-root scan must complete its mapping bracket: {:#?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "no provider can be proven from unopenable objects: {:#?}",
+            outcome.modules()
+        );
+        let retained: Vec<_> = outcome
+            .skipped()
+            .iter()
+            .filter(|skip| {
+                skip.reason
+                    .contains("opening object within retained target root")
+                    || skip.subject == "mapped objects unopenable in foreign target root"
+            })
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "unopenable foreign-root objects collapse into one counted gap: {:#?}",
+            outcome.skipped()
+        );
+        assert!(
+            retained[0].reason.contains("mapped objects unopenable")
+                && retained[0]
+                    .reason
+                    .contains(&subject.dir.path().canonicalize().unwrap().to_string_lossy().into_owned()),
+            "the collapsed gap names its count and target root: {:#?}",
+            retained[0]
+        );
+    }
+
     /// H-3 regression: one scan read its view's `/proc/<pid>/mountinfo` once
     /// per mapped executable object — a full kernel render and parse of the
     /// mount table each time, charged to the capture's non-renewable I/O

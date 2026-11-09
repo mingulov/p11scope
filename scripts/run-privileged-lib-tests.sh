@@ -587,6 +587,12 @@ scope::tests::privileged_run_cgroup_place_moves_a_real_child
 # Run-owned cgroup nesting: the subgroup is created under the observer's
 # own cgroup, never at the filesystem root (same prerequisites, no BPF).
 scope::tests::privileged_run_cgroup_create_under_observer_stays_nested
+# Chrooted-target scans: a self-chrooting child keeps host-absolute maps
+# paths (the avahi-daemon shape); same-namespace mappings resolve via the
+# verified host root, while a foreign mount namespace collapses the
+# unopenable objects into one counted gap (needs only root, no BPF).
+discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings
+discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -2181,6 +2182,23 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     capture.validate_inventory(maps, 'default', 'allowlisted', 'owned')
                 self.assertIn('map definition mismatch name=DISCOVERY', str(refused.exception))
                 self.assertNotIn('degradation', str(refused.exception))
+
+    def test_owned_discovery_size_tracks_rust_shared_scope_constant(self):
+        """OWNED_DISCOVERY_MAX_ENTRIES tracks SHARED_SCOPE_DISCOVERY_BYTES.
+
+        The canary's owned-lane expectation must equal the
+        discovery_ring_bytes size in src/attach.rs; the constant is parsed
+        from the Rust source so a one-sided change fails here instead of
+        breaking live owned lanes while this suite stays green.
+        """
+        attach = (ROOT / "src/attach.rs").read_text()
+        matches = re.findall(
+            r"pub\(crate\) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = ([^;]+);", attach)
+        self.assertEqual(len(matches), 1)
+        rust_value = 1
+        for factor in matches[0].split("*"):
+            rust_value *= int(factor.strip())
+        self.assertEqual(capture.OWNED_DISCOVERY_MAX_ENTRIES, rust_value)
 
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.

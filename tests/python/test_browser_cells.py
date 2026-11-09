@@ -209,14 +209,17 @@ class BrowserCells(unittest.TestCase):
 
     def check_report(self, result, store, floors=None, zero=False, attached=None,
                      allowed_gaps=(), allowed_verdicts=_VERDICTS_ATTACHED, absent=None,
-                     s1=None):
+                     s1=None, qualify_nomod_link_loss=False):
         """Common oracle: schema, identity, counts, loss, gaps, earned verdict.
 
         ``attached`` pins the probe state: True (hooked the mapped module),
         False (never hooked — the module stayed unmapped), None (either).
         ``allowed_gaps`` names the observation gap causes that provably do
         not affect this cell's asserted property (per-cell table above);
-        every other cause fails. ``allowed_verdicts`` pins the verdict
+        every other cause fails. ``qualify_nomod_link_loss`` routes the
+        gap check through the FF-NOMOD qualification (sole named link
+        loss with zero probes and zero rows); only the FF-NOMOD cell
+        sets it. ``allowed_verdicts`` pins the verdict
         details the cell earned. ``absent`` names functions that must never
         have been called (returns, open entries, and unattributed rows).
         ``s1`` opts into the v0.5.0 S1 proof over the report's S1
@@ -236,7 +239,10 @@ class BrowserCells(unittest.TestCase):
         failures = []
         failures += oracle.check_no_event_loss(report)
         failures += oracle.check_capture_intact(report)
-        failures += oracle.check_observation_gaps(report, allowed_gaps)
+        if qualify_nomod_link_loss:
+            failures += oracle.check_observation_gaps_nomod_qualified(report, allowed_gaps)
+        else:
+            failures += oracle.check_observation_gaps(report, allowed_gaps)
         failures += oracle.check_skipped_structural(report)
         if s1 is not None:
             failures += oracle.check_no_joint_content(report)
@@ -411,7 +417,8 @@ class BrowserCells(unittest.TestCase):
         self.check_report(result, store, zero=True, attached=False,
                           allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
                           allowed_verdicts=_VERDICTS_NEVER_MAPPED,
-                          s1={"sessions_zero": True})
+                          s1={"sessions_zero": True},
+                          qualify_nomod_link_loss=True)
 
     @gate("firefox")
     def test_ff_pinbound_never_logs_in_or_signs(self):

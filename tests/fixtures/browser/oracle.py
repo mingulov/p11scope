@@ -192,6 +192,46 @@ def check_observation_gaps(report: dict[str, Any], allowed) -> list[str]:
     return failures
 
 
+#: The one gap cause the never-mapped-run cell (FF-NOMOD) qualifies
+#: through the gate below (controller ruling 2026-11-09): task-level
+#: exit tracking for run-tree members lives in the shared link registry
+#: beside zero module probes, so a mid-flow teardown race can count a
+#: link loss while the asserted property (no module ever mapped — zero
+#: rows, zero probes) still holds.
+NOMOD_QUALIFIED_LINK_LOSS = "task_uprobe_link_losses"
+
+
+def check_observation_gaps_nomod_qualified(report: dict[str, Any], allowed) -> list[str]:
+    """FF-NOMOD gap check: the named link loss is qualified, all else fails.
+
+    Behaves exactly like check_observation_gaps except that a sole
+    ``task_uprobe_link_losses`` cause beyond ``allowed`` passes when the
+    asserted never-mapped property is intact: zero attached probes AND
+    zero function rows. Any other gap cause, any attached probe, or any
+    row falls back to the fail-closed verdict, as does a missing
+    ``gap_classes.observation`` block. Only the FF-NOMOD cell takes this
+    path; every other cell keeps calling check_observation_gaps.
+    """
+    failures = []
+    classes = evidence(report).get("gap_classes")
+    if not isinstance(classes, dict) or "observation" not in classes:
+        return ["gap_classes.observation missing: cannot verify observation coverage"]
+    observation = classes["observation"] or {}
+    causes = observation.get("causes") or []
+    allowed_set = set(allowed)
+    extra = [cause for cause in causes if cause not in allowed_set]
+    if (len(extra) == 1 and extra[0] == NOMOD_QUALIFIED_LINK_LOSS
+            and (evidence(report).get("attached_probes", 0) or 0) == 0
+            and len(report.get("functions") or []) == 0):
+        return []
+    for cause in causes:
+        if cause not in allowed_set:
+            failures.append(
+                f"observation gap cause {cause!r} not allowed for this cell "
+                f"(allowed: {sorted(allowed_set)})")
+    return failures
+
+
 def check_capture_intact(report: dict[str, Any]) -> list[str]:
     """No kernel capture failure truncated or refused the observation.
 

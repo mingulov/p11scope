@@ -95,6 +95,38 @@ fn inventory_test_poll_interval() -> Duration {
     TEST_INVENTORY_POLL_INTERVAL.with(|value| value.get().unwrap_or(POLL_INTERVAL))
 }
 
+// Classic pass publications through the runner closure below, counted
+// on this thread only (parallel tests keep their own count, like the
+// cadence above). A multi-pass test stops after N publications instead
+// of racing a deadline against the cadence: the count is then exact
+// whatever the host load, and the run duration stays a pure backstop
+// over single-pass latency. Reset before each run; libtest reuses
+// threads across tests.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLASSIC_PASS_PUBLICATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// One more classic pass reached publication on this thread.
+#[cfg(test)]
+fn note_classic_pass_publication_for_test() {
+    TEST_CLASSIC_PASS_PUBLICATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// How many classic passes reached publication on this thread since
+/// the last [`reset_classic_pass_publications_for_test`].
+#[cfg(test)]
+fn classic_pass_publications_for_test() -> u64 {
+    TEST_CLASSIC_PASS_PUBLICATIONS.with(|count| count.get())
+}
+
+/// Forget this thread's classic pass publications before a run.
+#[cfg(test)]
+fn reset_classic_pass_publications_for_test() {
+    TEST_CLASSIC_PASS_PUBLICATIONS.with(|count| count.set(0));
+}
+
 #[cfg(test)]
 fn with_inventory_test_poll_interval<T>(interval: Duration, action: impl FnOnce() -> T) -> T {
     assert!(
@@ -1821,6 +1853,11 @@ fn run_with_terminal_budget(
         let coordinator = &*driver.coordinator;
         match point {
             Publish::Pass { report, now_ns } => {
+                // Every loop pass publishes exactly once through this
+                // arm, so tests can stop after N publications and pin
+                // an exact pass count without racing the deadline.
+                #[cfg(test)]
+                note_classic_pass_publication_for_test();
                 let Some(presentation) = stream_view_guarded(
                     driver,
                     &mut stream_state,
@@ -11470,58 +11507,68 @@ mod tests {
 
     #[test]
     fn pass_event_failure_reaches_ordinary_finalization_with_and_without_report() {
-        for with_report in [true, false] {
-            let dir = private_tempdir();
-            let events = dir.path().join("events.jsonl");
-            let report = dir.path().join("report.json");
-            let fault = event_fault("pass_committed", false);
-            let attempts = fault.attempts.clone();
-            let finalized = std::cell::Cell::new(false);
-            let mut stdout = Vec::new();
-            let result = run_with_terminal_inner(
-                InspectScope::Pid(std::process::id()),
-                &[],
-                &HookRegistry::builtin(),
-                true,
-                None,
-                None,
-                Some(Duration::from_millis(1100)),
-                with_report.then_some(report.as_path()),
-                false,
-                Some(&events),
-                None,
-                None,
-                None,
-                CaptureMode::Scan,
-                crate::attach::BackendSelection::Auto,
-                &|| false,
-                &|| finalized.set(true),
-                false,
-                &mut WriterStdout(&mut stdout),
-                &DashboardIo::stdio(),
-                Some(fault),
-            );
-            assert!(
-                finalized.get(),
-                "a returned event error skipped the finalizer: {result:?}"
-            );
-            assert_eq!(result.unwrap(), 1);
-            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-            assert_eq!(document["observation"]["passes"], 2);
-            if with_report {
-                assert_eq!(std::fs::read(&report).unwrap(), stdout);
+        // Deterministic two-pass drive: the run stops after the second
+        // pass publication (counted on this thread), so the pinned
+        // count never races the run deadline against the cadence — a
+        // loaded host can take seconds for one PID scan, and the old
+        // 1 s cadence against an 1100 ms deadline then skipped the
+        // second pass. The duration below is a pure backstop over
+        // single-pass latency; the stop selects the count.
+        with_inventory_test_poll_interval(Duration::from_millis(10), || {
+            for with_report in [true, false] {
+                reset_classic_pass_publications_for_test();
+                let dir = private_tempdir();
+                let events = dir.path().join("events.jsonl");
+                let report = dir.path().join("report.json");
+                let fault = event_fault("pass_committed", false);
+                let attempts = fault.attempts.clone();
+                let finalized = std::cell::Cell::new(false);
+                let mut stdout = Vec::new();
+                let result = run_with_terminal_inner(
+                    InspectScope::Pid(std::process::id()),
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    None,
+                    None,
+                    Some(Duration::from_secs(30)),
+                    with_report.then_some(report.as_path()),
+                    false,
+                    Some(&events),
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Scan,
+                    crate::attach::BackendSelection::Auto,
+                    &|| classic_pass_publications_for_test() >= 2,
+                    &|| finalized.set(true),
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    Some(fault),
+                );
+                assert!(
+                    finalized.get(),
+                    "a returned event error skipped the finalizer: {result:?}"
+                );
+                assert_eq!(result.unwrap(), 1);
+                let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(document["observation"]["passes"], 2);
+                if with_report {
+                    assert_eq!(std::fs::read(&report).unwrap(), stdout);
+                }
+                assert_eq!(
+                    attempts
+                        .borrow()
+                        .iter()
+                        .filter(|kind| *kind == "pass_committed")
+                        .count(),
+                    1
+                );
+                assert!(!attempts.borrow().iter().any(|kind| kind == "ended"));
+                assert_eq!(event_records(&events).first().unwrap()["kind"], "started");
             }
-            assert_eq!(
-                attempts
-                    .borrow()
-                    .iter()
-                    .filter(|kind| *kind == "pass_committed")
-                    .count(),
-                1
-            );
-            assert!(!attempts.borrow().iter().any(|kind| kind == "ended"));
-            assert_eq!(event_records(&events).first().unwrap()["kind"], "started");
-        }
+        })
     }
 
     #[test]

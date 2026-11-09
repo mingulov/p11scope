@@ -2908,6 +2908,64 @@ mod tests {
         );
     }
 
+    /// Aya's skip-then-refuse shape: the reader skips one kernel
+    /// discard (cursor and loss count move) and then refuses the
+    /// record (`RecordCrossesBoundary`).
+    struct SkipThenRefuseRecords {
+        consumer: usize,
+        discarded: u64,
+    }
+
+    impl RecordSource for SkipThenRefuseRecords {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            None::<Vec<u8>>
+        }
+        fn discarded(&self) -> u64 {
+            self.discarded
+        }
+    }
+
+    impl BoundedRecordSource for SkipThenRefuseRecords {
+        fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            aya::maps::ring_buf::RingBufPositions {
+                consumer: self.consumer,
+                producer: self.consumer,
+                capacity: 4096,
+            }
+        }
+        fn consumer(&self) -> usize {
+            self.consumer
+        }
+        fn bounded_record(
+            &mut self,
+            _stop: usize,
+        ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+            self.consumer += 8;
+            self.discarded += 1;
+            Err::<BoundedRecord<Vec<u8>>, _>(anyhow::anyhow!("record crosses the stop boundary"))
+        }
+    }
+
+    #[test]
+    fn staged_inner_refusal_resyncs_cursor_and_loss() {
+        // The queue is empty, so the read goes straight to the inner
+        // source; it skips one discard and then refuses. The refusal
+        // propagates, and the cursor and the loss count resync exactly
+        // as a served read does.
+        let mut drain = EventDrain::over(StagedEvents::with_caps(
+            SkipThenRefuseRecords {
+                consumer: 0,
+                discarded: 0,
+            },
+            1024,
+            1024 * 1024,
+        ));
+        assert!(drain.source_mut().bounded_record(16).is_err());
+        assert_eq!(drain.source.consumer(), 8);
+        assert_eq!(drain.source.positions().consumer, 8);
+        assert_eq!(drain.discarded(), 1);
+    }
+
     #[test]
     fn staged_events_count_malformed_at_decode() {
         let pushed = vec![vec![0u8; 10], numbered_call(7)];

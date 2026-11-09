@@ -19,7 +19,9 @@ use crate::discovery::overlay_witness::{
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
-use crate::process::{MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId};
+use crate::process::{
+    MappedOpenError, MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId,
+};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
 use p11scope_manifest::identity::{InspectedObject, mapping_file_key, open_object};
 use p11scope_manifest::maps::{
@@ -3992,13 +3994,55 @@ pub(crate) fn duplicate_exec_load_count(group: &[&MapEntry]) -> u32 {
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
 /// `map_files` is never required, and a container's own file is never copied out).
+/// A chroot-like view (foreign root, shared mount namespace) additionally retries
+/// the observer root; the opened-file identity guard below still verifies the
+/// mapping like-for-like, so a same-path different file is refused.
 fn open_in_target(
     view: &ProcessView,
     path: &str,
     budget: &mut CaptureWorkBudget,
-) -> Result<File, String> {
-    view.with_filesystem(budget, |filesystem, _| {
-        filesystem.open_rooted_object(Path::new(path))
+) -> Result<File, MappedOpenError> {
+    match view.with_filesystem(budget, |filesystem, _| {
+        Ok(filesystem.open_mapped_object(Path::new(path)))
+    }) {
+        Ok(opened) => opened,
+        Err(reason) => Err(MappedOpenError {
+            reason,
+            foreign_target_root: None,
+        }),
+    }
+}
+
+/// One foreign-root open failure held back for the end-of-scan collapse.
+struct ForeignOpenFailure {
+    subject: String,
+    reason: String,
+    root: String,
+}
+
+/// Subject of the single gap a foreign-root scan files when two or more
+/// mapped objects are unopenable (see [`collapse_foreign_root_skips`]).
+const FOREIGN_ROOT_COLLAPSED_SUBJECT: &str = "mapped objects unopenable in foreign target root";
+
+/// Collapse two or more foreign-root open failures into one counted process
+/// gap: an unresolvable foreign view (a container-like mount namespace, or a
+/// chroot whose host fallback failed) must not file one gap per object on
+/// every pass. Zero or one failure keeps the per-object rows (a single
+/// failure is already a single gap, with its object detail intact).
+fn collapse_foreign_root_skips(failures: &[ForeignOpenFailure]) -> Option<Skipped> {
+    if failures.len() < 2 {
+        return None;
+    }
+    let first = &failures[0];
+    Some(Skipped {
+        subject: FOREIGN_ROOT_COLLAPSED_SUBJECT.into(),
+        reason: format!(
+            "{} mapped objects unopenable: target root {} differs from the observer root (first: {}: {})",
+            failures.len(),
+            first.root,
+            first.subject,
+            first.reason,
+        ),
     })
 }
 
@@ -6355,6 +6399,7 @@ fn scan_view_examined_mode(
     let mut examined: Vec<ExaminedObject> = Vec::new();
     let mut dependencies = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut foreign_failures: Vec<ForeignOpenFailure> = Vec::new();
     // Group construction also consumes the capture's existing work allowance.
     if let Err(reason) = budget.spend(maps.len() as u64) {
         return Ok(refused_initial(reason.into()));
@@ -6523,9 +6568,19 @@ fn scan_view_examined_mode(
 
         let file = match open_in_target(view, &path, budget) {
             Ok(file) => file,
-            Err(reason) => {
+            Err(failure) => {
                 if !narrowed_out {
-                    skipped.push(Skipped { subject, reason });
+                    match failure.foreign_target_root {
+                        Some(root) => foreign_failures.push(ForeignOpenFailure {
+                            subject,
+                            reason: failure.reason,
+                            root,
+                        }),
+                        None => skipped.push(Skipped {
+                            subject,
+                            reason: failure.reason,
+                        }),
+                    }
                 }
                 continue;
             }
@@ -6888,6 +6943,14 @@ fn scan_view_examined_mode(
             && stop_before_module.is_none()
             && budget.stopped_reason().is_none();
         modules.push(module);
+    }
+
+    match collapse_foreign_root_skips(&foreign_failures) {
+        Some(single) => skipped.push(single),
+        None => skipped.extend(foreign_failures.into_iter().map(|failure| Skipped {
+            subject: failure.subject,
+            reason: failure.reason,
+        })),
     }
 
     for (hint, matched) in request.hints.iter().zip(hint_matched) {
@@ -11290,29 +11353,77 @@ mod tests {
         );
     }
 
+    fn foreign_failure(subject: &str, reason: &str, root: &str) -> ForeignOpenFailure {
+        ForeignOpenFailure {
+            subject: subject.into(),
+            reason: reason.into(),
+            root: root.into(),
+        }
+    }
+
+    #[test]
+    fn foreign_root_collapse_needs_two_failures() {
+        assert!(collapse_foreign_root_skips(&[]).is_none());
+        assert!(
+            collapse_foreign_root_skips(&[foreign_failure("/lib/a.so", "enoent", "/etc/avahi")])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn foreign_root_collapse_counts_and_names_its_first_failure() {
+        let single = collapse_foreign_root_skips(&[
+            foreign_failure("/lib/a.so", "enoent a", "/etc/avahi"),
+            foreign_failure("/lib/b.so", "enoent b", "/etc/avahi"),
+            foreign_failure("/bin/daemon", "enoent c", "/etc/avahi"),
+        ])
+        .expect("three failures collapse");
+        assert_eq!(single.subject, FOREIGN_ROOT_COLLAPSED_SUBJECT);
+        assert!(
+            single.reason.contains("3 mapped objects unopenable")
+                && single.reason.contains("/etc/avahi")
+                && single.reason.contains("/lib/a.so")
+                && single.reason.contains("enoent a"),
+            "unexpected collapse text: {}",
+            single.reason
+        );
+        let two = collapse_foreign_root_skips(&[
+            foreign_failure("/lib/a.so", "enoent a", "/root-a"),
+            foreign_failure("/lib/b.so", "enoent b", "/root-b"),
+        ])
+        .expect("two failures collapse even across roots");
+        assert!(
+            two.reason.contains("2 mapped objects unopenable") && two.reason.contains("/root-a"),
+            "unexpected collapse text: {}",
+            two.reason
+        );
+    }
+
     /// Re-exec channel for the self-chrooting scan fixture below. The parent
-    /// half respawns this same test binary with both variables set; the child
+    /// half respawns this same test binary with these variables set; the child
     /// half enters the new root and sleeps until the parent kills it. Its
     /// mappings keep their pre-chroot host paths, exactly like avahi-daemon
-    /// after it chroots to `/etc/avahi`.
+    /// after it chroots to `/etc/avahi`. The fresh mount namespace for
+    /// `nschroot` comes from the `unshare(1)` launch: an in-process unshare on
+    /// a libtest worker thread would diverge only that thread, leaving the
+    /// process view (what the scan reads) behind.
     const CHROOT_SCAN_MODE_ENV: &str = "P11SCOPE_CHROOT_SCAN_MODE";
     const CHROOT_SCAN_DIR_ENV: &str = "P11SCOPE_CHROOT_SCAN_DIR";
+    const CHROOT_SCAN_PARENT_NS_ENV: &str = "P11SCOPE_CHROOT_SCAN_PARENT_NS";
 
     fn chroot_scan_child_main() {
         let mode = std::env::var(CHROOT_SCAN_MODE_ENV).unwrap();
         let dir = std::env::var(CHROOT_SCAN_DIR_ENV).unwrap();
         if mode == "nschroot" {
-            // SAFETY: unsharing the mount namespace affects only this child.
-            let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
-            if rc != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EPERM) {
-                    // Mount namespaces are unavailable here; the parent maps
-                    // this exit code to a skip with a reason.
-                    std::process::exit(42);
-                }
-                panic!("chroot scan child cannot unshare its mount namespace: {error}");
-            }
+            let parent = std::env::var(CHROOT_SCAN_PARENT_NS_ENV).unwrap();
+            let own = std::fs::read_link("/proc/self/ns/mnt")
+                .unwrap()
+                .display()
+                .to_string();
+            assert_ne!(
+                own, parent,
+                "the nschroot child must run in a fresh mount namespace"
+            );
         }
         let dir_c = std::ffi::CString::new(dir).unwrap();
         // SAFETY: a NUL-terminated path; chroot affects only this child.
@@ -11340,10 +11451,38 @@ mod tests {
         dir: tempfile::TempDir,
     }
 
+    /// Whether `unshare -m` can mint a mount namespace here. A missing
+    /// `unshare(1)` or a kernel EPERM skips with a reason; anything else
+    /// proceeds so a real failure surfaces loudly at the launch below.
+    fn unshare_mount_probe() -> bool {
+        match std::process::Command::new("unshare")
+            .args(["-m", "true"])
+            .output()
+        {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("Operation not permitted") {
+                    println!("SKIP: the kernel refused the fixture mount namespace (EPERM)");
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!("SKIP: unshare(1) is unavailable: {error}");
+                false
+            }
+            Err(error) => panic!("cannot probe mount namespaces: {error}"),
+        }
+    }
+
     impl ChrootScanChild {
-        /// Spawn the child half of `test` (`"chroot"` keeps the observer's
-        /// mount namespace, `"nschroot"` unshares one first). Returns `None`
-        /// only when the kernel refuses the mount namespace itself.
+        /// Spawn the child half of `test`: `"chroot"` re-runs this binary
+        /// directly (shared mount namespace), `"nschroot"` launches it via
+        /// `unshare -m` so the whole child process starts in a fresh mount
+        /// namespace. Returns `None` only when mount namespaces are
+        /// unavailable here (missing `unshare(1)` or a kernel EPERM).
         fn spawn(mode: &str, test: &str) -> Option<Self> {
             // SAFETY: geteuid takes no arguments and has no side effects.
             assert_eq!(
@@ -11351,29 +11490,51 @@ mod tests {
                 0,
                 "this cell needs root (chroot)"
             );
+            if mode == "nschroot" && !unshare_mount_probe() {
+                return None;
+            }
             let dir = tempfile::tempdir().unwrap();
             let canonical = dir.path().canonicalize().unwrap();
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
+            let parent_ns = std::fs::read_link("/proc/self/ns/mnt")
+                .unwrap()
+                .display()
+                .to_string();
+            let exe = std::env::current_exe().unwrap();
+            let mut command = if mode == "nschroot" {
+                let mut command = std::process::Command::new("unshare");
+                command.arg("-m").arg(&exe).args([
                     "--exact",
                     test,
                     "--ignored",
                     "--nocapture",
                     "--test-threads=1",
-                ])
+                ]);
+                command
+            } else {
+                let mut command = std::process::Command::new(exe);
+                command.args([
+                    "--exact",
+                    test,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ]);
+                command
+            };
+            command
                 .env(CHROOT_SCAN_MODE_ENV, mode)
-                .env(CHROOT_SCAN_DIR_ENV, dir.path());
+                .env(CHROOT_SCAN_DIR_ENV, dir.path())
+                .env(CHROOT_SCAN_PARENT_NS_ENV, &parent_ns);
             let mut child = command.spawn().expect("spawn chroot scan child");
             let pid = child.id();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
-                if std::fs::read_link(format!("/proc/{pid}/root")).is_ok_and(|link| link == canonical)
+                if std::fs::read_link(format!("/proc/{pid}/root"))
+                    .is_ok_and(|link| link == canonical)
                 {
                     break;
                 }
                 match child.try_wait().unwrap() {
-                    Some(status) if status.code() == Some(42) => return None,
                     Some(status) => panic!("chroot scan child exited early: {status:?}"),
                     None => {}
                 }
@@ -11415,9 +11576,11 @@ mod tests {
             chroot_scan_child_main();
             return;
         }
-        let subject =
-            ChrootScanChild::spawn("chroot", "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings")
-                .expect("plain chroot needs no mount namespace");
+        let subject = ChrootScanChild::spawn(
+            "chroot",
+            "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings",
+        )
+        .expect("plain chroot needs no mount namespace");
         let pid = subject.pid();
         // Fixture proof: the child really is chrooted, its maps still name
         // host paths, and those paths exist on the host but not under the
@@ -11425,7 +11588,8 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(
-            maps.lines().any(|line| line.ends_with(exe.to_str().unwrap())),
+            maps.lines()
+                .any(|line| line.ends_with(exe.to_str().unwrap())),
             "the chrooted child must map its host executable: {exe:?}"
         );
         let relative = exe.strip_prefix("/").unwrap();
@@ -11468,17 +11632,22 @@ mod tests {
             "the chrooted scan must complete its mapping bracket: {:#?}",
             outcome.skipped()
         );
-        let retained: Vec<_> = outcome
+        // Every retained-root failure must at least attempt the verified host
+        // fallback (this test binary itself exceeds the shared object size
+        // cap, so its own mapping keeps a fallback-attempted row while the
+        // libraries resolve).
+        let unattempted: Vec<_> = outcome
             .skipped()
             .iter()
             .filter(|skip| {
                 skip.reason
                     .contains("opening object within retained target root")
+                    && !skip.reason.contains("(host-root fallback:")
             })
             .collect();
         assert!(
-            retained.is_empty(),
-            "chrooted mappings must resolve via the verified host root: {retained:#?}"
+            unattempted.is_empty(),
+            "chrooted mappings must resolve via the verified host root: {unattempted:#?}"
         );
         assert!(
             !examined.is_empty(),
@@ -11502,7 +11671,7 @@ mod tests {
             "nschroot",
             "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
         ) else {
-            println!("SKIP: the kernel refused the fixture mount namespace (EPERM)");
+            // The probe above printed the reason.
             return;
         };
         let pid = subject.pid();

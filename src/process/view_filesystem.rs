@@ -272,6 +272,44 @@ fn same_filesystem(left: &Filesystem, right: &Filesystem) -> bool {
     left.namespace_id == right.namespace_id && left.root_id == right.root_id
 }
 
+/// A mapping-driven open failure: the user-facing reason, plus the target
+/// root's display when that root is foreign (differs from the observer's).
+/// Same-root failures keep today's per-object reasons byte-identical.
+#[derive(Debug, Clone)]
+pub(crate) struct MappedOpenError {
+    pub reason: String,
+    pub foreign_target_root: Option<String>,
+}
+
+/// Whether the observer may retry a mapping open in its own root: only a
+/// chroot-like view qualifies — the target root differs from the observer's,
+/// but both share one mount namespace, so the target's mount table resolves
+/// a host fd and maps renders host identities. A foreign mount namespace
+/// (containers) never falls back: the host path may name another filesystem
+/// entirely.
+fn host_fallback_allowed(
+    target_root: (u64, u64),
+    observer_root: (u64, u64),
+    target_mount_ns: MountNamespaceId,
+    observer_mount_ns: MountNamespaceId,
+) -> bool {
+    target_root != observer_root && target_mount_ns == observer_mount_ns
+}
+
+fn observer_root_identity() -> Option<(u64, u64)> {
+    std::fs::metadata("/")
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+fn observer_mount_namespace() -> io::Result<MountNamespaceId> {
+    let metadata = std::fs::metadata("/proc/self/ns/mnt")?;
+    Ok(MountNamespaceId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 impl ColdFilesystem<'_> {
     fn validate(&self, work: &mut CaptureWorkBudget) -> Result<(), String> {
         self.validate_with(work, &mut filesystem_at)
@@ -602,6 +640,97 @@ impl<'a> ViewFilesystem<'a> {
         Ok(file)
     }
 
+    /// Open a mapping-rendered path for a scan, pin or loader read: the
+    /// target root first, then — only when the target root is foreign but
+    /// shares the observer's mount namespace (a chroot: mappings predate the
+    /// root switch, so their host paths are unopenable under
+    /// `/proc/<pid>/root`) — the observer root. The retry proves nothing by
+    /// itself: every caller still runs its like-for-like identity guard
+    /// (mountinfo resolution, the self-mapping probe, `mapped_file_guard`)
+    /// over the opened file, which refuses a same-path different file. A
+    /// foreign mount namespace (containers) never retries: the host path may
+    /// name another filesystem entirely, and only the target root can open
+    /// it. On total failure the original target-root reason is preserved.
+    pub(crate) fn open_mapped(&self, path: &Path) -> Result<std::fs::File, MappedOpenError> {
+        match self.open_rooted(path) {
+            Ok(file) => Ok(file),
+            Err(reason) => self.open_mapped_fallback(path, reason, false),
+        }
+    }
+
+    /// [`open_mapped`](Self::open_mapped) with the shared object size cap.
+    pub(crate) fn open_mapped_object(&self, path: &Path) -> Result<std::fs::File, MappedOpenError> {
+        match self.open_rooted_object(path) {
+            Ok(file) => Ok(file),
+            Err(reason) => self.open_mapped_fallback(path, reason, true),
+        }
+    }
+
+    fn open_mapped_fallback(
+        &self,
+        path: &Path,
+        reason: String,
+        with_size_cap: bool,
+    ) -> Result<std::fs::File, MappedOpenError> {
+        let target = self.target_root_identity();
+        let observer = observer_root_identity();
+        let observer_ns = observer_mount_namespace().ok();
+        let foreign = match (target, observer) {
+            (Some(target), Some(observer)) if target != observer => {
+                Some(self.target_root_display())
+            }
+            _ => None,
+        };
+        let allowed = match (target, observer, observer_ns) {
+            (Some(target), Some(observer), Some(namespace)) => {
+                host_fallback_allowed(target, observer, self.namespace, namespace)
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(MappedOpenError {
+                reason,
+                foreign_target_root: foreign,
+            });
+        }
+        let fallback = if with_size_cap {
+            p11scope_manifest::identity::open_object(path)
+        } else {
+            p11scope_manifest::identity::open_regular(path)
+        };
+        match fallback {
+            Ok(file) => Ok(file),
+            Err(fallback_reason) => Err(MappedOpenError {
+                reason: format!("{reason} (host-root fallback: {fallback_reason})"),
+                foreign_target_root: foreign,
+            }),
+        }
+    }
+
+    /// The target root's `(device, inode)` identity: the retained root for a
+    /// cold view, a fresh stat of `/proc/<pid>/root` for a warm one. `None`
+    /// when it cannot be stated (fail closed: no fallback).
+    fn target_root_identity(&self) -> Option<(u64, u64)> {
+        match &self.cold {
+            Some(cold) => Some((
+                cold.filesystem.root_id.device,
+                cold.filesystem.root_id.inode,
+            )),
+            None => std::fs::metadata(self.owned_path("root"))
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino())),
+        }
+    }
+
+    /// Best-effort display of the target root for gap reasons. Read at most
+    /// once per failed open, only when the root is already known foreign.
+    fn target_root_display(&self) -> String {
+        std::fs::read_link(self.owned_path("root")).map_or_else(
+            |error| format!("(target root unreadable: {error})"),
+            |link| link.display().to_string(),
+        )
+    }
+
     fn pin_rooted_regular(&self, path: &Path) -> Result<std::fs::File, String> {
         if !path.is_absolute()
             || path
@@ -689,6 +818,29 @@ impl<'a> ViewFilesystem<'a> {
 mod tests {
     use super::*;
     use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    #[test]
+    fn host_fallback_gate_needs_a_foreign_root_in_a_shared_namespace() {
+        let home = (1u64, 2u64);
+        let away = (3u64, 4u64);
+        let ns_a = MountNamespaceId {
+            device: 5,
+            inode: 6,
+        };
+        let ns_b = MountNamespaceId {
+            device: 7,
+            inode: 8,
+        };
+        assert!(host_fallback_allowed(away, home, ns_a, ns_a));
+        assert!(!host_fallback_allowed(home, home, ns_a, ns_a));
+        assert!(!host_fallback_allowed(away, home, ns_a, ns_b));
+        assert!(!host_fallback_allowed(home, home, ns_a, ns_b));
+        // Live negative control: this test's own root and namespace never
+        // qualify, however the host numbers them.
+        let root = observer_root_identity().unwrap();
+        let namespace = observer_mount_namespace().unwrap();
+        assert!(!host_fallback_allowed(root, root, namespace, namespace));
+    }
 
     #[test]
     fn capture_stop_precedes_the_local_filesystem_cutoff() {

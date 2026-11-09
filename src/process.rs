@@ -19,7 +19,7 @@ pub(crate) mod leader_exit;
 mod view_filesystem;
 use std::sync::{Arc, Weak};
 pub(crate) use view_filesystem::{
-    ViewFilesystem, cold_filesystem_deadline, snapshot_leader_is_zombie,
+    MappedOpenError, ViewFilesystem, cold_filesystem_deadline, snapshot_leader_is_zombie,
     with_cold_snapshot_filesystem,
 };
 

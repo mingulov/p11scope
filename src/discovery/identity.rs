@@ -6736,7 +6736,11 @@ pub(crate) fn open_view_rooted_object_cached(
 ) -> Result<(std::fs::File, ObjectKey), String> {
     open_view_object_with(
         view,
-        |filesystem| filesystem.open_rooted(path),
+        |filesystem| {
+            filesystem
+                .open_mapped(path)
+                .map_err(|failure| failure.reason)
+        },
         mounts,
         budget,
     )
@@ -8372,7 +8376,11 @@ fn pin_scanned_object(
         }
         None => {
             let (file, mountinfo) = view.open_then_cached_mountinfo(
-                |filesystem| filesystem.open_rooted_object(Path::new(&raw.path)),
+                |filesystem| {
+                    filesystem
+                        .open_mapped_object(Path::new(&raw.path))
+                        .map_err(|failure| failure.reason)
+                },
                 mounts,
                 budget,
             )?;

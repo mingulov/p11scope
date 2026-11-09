@@ -49592,7 +49592,7 @@ fn quiesced_discovery_overflow_publishes_unfinished_terminal_work() {
     );
 }
 
-/// A terminal discovery drain that fails on a signalled stop files
+/// A terminal discovery drain that fails at any stop files
 /// the same unfinished-work shape: the seal proceeds from partial
 /// state with a named gap instead of suppressing the report.
 #[test]
@@ -49612,7 +49612,7 @@ fn terminal_discovery_failure_publishes_unfinished_terminal_work() {
             .any(|skip| skip.subject == "terminal discovery drain"
                 && skip
                     .reason
-                    .contains("could not be published on a signalled stop")),
+                    .contains("terminal discovery batch could not be published")),
         "the failure publishes explicit unfinished evidence: {:?}",
         engine.counters.object_skips
     );

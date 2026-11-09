@@ -30330,7 +30330,7 @@ impl Engine {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.mark_live_loss(
             "terminal discovery drain",
-            "the terminal discovery batch could not be published on a signalled stop; terminal work is unfinished",
+            "the terminal discovery batch could not be published; terminal work is unfinished",
         );
     }
 

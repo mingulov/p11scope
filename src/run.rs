@@ -4500,7 +4500,6 @@ fn combine_quiesce_failure(
 fn finish_quiesce_error<C>(
     error: anyhow::Error,
     loop_result: Result<CaptureEnd>,
-    signalled: bool,
     context: &mut C,
     settle: impl FnOnce(&mut C, CaptureEnd) -> Result<()>,
     publish: impl FnOnce(&mut C) -> Result<()>,
@@ -4513,8 +4512,7 @@ fn finish_quiesce_error<C>(
             // report seals from partial state (drain unproven) so a second
             // signal during teardown keeps the "report already written"
             // contract. Settlement must succeed first: the child's
-            // disposition is a fact the document reports, never a guess. A
-            // failed loop keeps today's settle-and-detach without a report.
+            // disposition is a fact the document reports, never a guess.
             let published = match &finish {
                 Ok(()) => Some(publish(context)),
                 Err(_) => None,
@@ -4525,14 +4523,11 @@ fn finish_quiesce_error<C>(
         Err(loop_error) => {
             let combined = also_failed(loop_error, error, "terminal quiescence");
             let finish = settle(context, CaptureEnd::Error);
-            if !signalled {
-                let detach = detach(context);
-                return combine_capture_failure(combined, finish, detach);
-            }
-            // A signalled stop seals from partial state even behind a
-            // failed loop: the signal asked for whatever was captured,
-            // not for silence. Settlement still gates the seal, exactly
-            // as above; both errors stay in the returned chain.
+            // Every stop seals from partial state even behind a failed
+            // loop, signalled or not: calls happened, so the report shows
+            // what was captured and the error names what failed.
+            // Settlement still gates the seal, exactly as above; both
+            // errors stay in the returned chain.
             let published = match &finish {
                 Ok(()) => Some(publish(context)),
                 Err(_) => None,
@@ -4543,23 +4538,22 @@ fn finish_quiesce_error<C>(
     }
 }
 
-/// A terminal discovery batch that degrades to a named gap on a
-/// signalled stop: a poisoned terminal batch must not suppress the
-/// report the signal asked for. The caller files the gap through
-/// `note_gap` (the engine keeps the committed plan) and the terminal
-/// seal proceeds. Without a signal the failure propagates unchanged.
+/// A terminal discovery batch that degrades to a named gap: a poisoned
+/// terminal batch must not suppress the report, whether the stop was a
+/// signal, the child's own exit or the duration. The caller files the
+/// gap through `note_gap` (the engine keeps the committed plan, and the
+/// gap's truncation fails a strict lossless verdict) and the terminal
+/// seal proceeds.
 fn seal_terminal_discovery_or_gap(
-    signalled: bool,
     mut note_gap: impl FnMut(),
     apply: impl FnOnce() -> Result<bool>,
 ) -> Result<bool> {
     match apply() {
         Ok(changed) => Ok(changed),
-        Err(error) if signalled => {
+        Err(error) => {
             note_gap();
             emit_capture_diagnostic(&format!(
-                "p11scope: terminal discovery failed on a signalled stop; sealing the report \
-                 from partial state: {}",
+                "p11scope: terminal discovery failed; sealing the report from partial state: {}",
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
             // Earlier quanta in the same drain may already have committed
@@ -4568,7 +4562,6 @@ fn seal_terminal_discovery_or_gap(
             // unchanged plan is a harmless refresh.
             Ok(true)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -7633,7 +7626,6 @@ fn capture_profile(
             return Err(finish_quiesce_error(
                 error,
                 loop_result,
-                interrupted.interrupted(),
                 &mut settle_context,
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
@@ -7775,11 +7767,9 @@ fn capture_profile(
                     poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
-                    let signalled_stop = interrupted.interrupted();
                     let mut terminal_gap_due = false;
                     let plan_changed = match quiesced {
                         Some(q) if k0_terminal_active => seal_terminal_discovery_or_gap(
-                            signalled_stop,
                             || terminal_gap_due = true,
                             || {
                                 context.0.drain_discovery_terminal_to_position_observed(
@@ -7797,7 +7787,6 @@ fn capture_profile(
                             },
                         )?,
                         Some(q) => seal_terminal_discovery_or_gap(
-                            signalled_stop,
                             || terminal_gap_due = true,
                             || {
                                 context.0.drain_discovery_terminal_to_position(
@@ -7808,7 +7797,6 @@ fn capture_profile(
                             },
                         )?,
                         None => seal_terminal_discovery_or_gap(
-                            signalled_stop,
                             || terminal_gap_due = true,
                             || context.0.drain_discovery_terminal(context.1),
                         )?,
@@ -8740,7 +8728,6 @@ fn capture_trace(
             return Err(finish_quiesce_error(
                 error,
                 loop_result,
-                interrupted.interrupted(),
                 &mut settle_context,
                 |context, end| match context.2.as_deref_mut() {
                     Some(owned) => owned.finish(context.0, context.1, end, interrupted),
@@ -8824,11 +8811,9 @@ fn capture_trace(
                     poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
-                    let signalled_stop = interrupted.interrupted();
                     let mut terminal_gap_due = false;
                     let plan_changed = match quiesced {
                         Some(q) => seal_terminal_discovery_or_gap(
-                            signalled_stop,
                             || terminal_gap_due = true,
                             || {
                                 context.0.drain_discovery_terminal_to_position(
@@ -8839,7 +8824,6 @@ fn capture_trace(
                             },
                         )?,
                         None => seal_terminal_discovery_or_gap(
-                            signalled_stop,
                             || terminal_gap_due = true,
                             || context.0.drain_discovery_terminal(context.1),
                         )?,
@@ -15099,7 +15083,6 @@ mod tests {
             let error = finish_quiesce_error(
                 anyhow::anyhow!("quiesce failure"),
                 loop_result,
-                false,
                 &mut (),
                 |_, end| {
                     settle_owned_child(
@@ -15159,7 +15142,6 @@ mod tests {
         let error = finish_quiesce_error(
             anyhow::anyhow!("terminal quiescence failed"),
             Err(anyhow::anyhow!("loop failure")),
-            true,
             &mut (),
             |_, _| Ok(()),
             |_| {
@@ -15189,7 +15171,6 @@ mod tests {
         let error = finish_quiesce_error(
             anyhow::anyhow!("terminal quiescence failed"),
             Err(anyhow::anyhow!("loop failure")),
-            false,
             &mut (),
             |_, _| Ok(()),
             |_| {
@@ -15216,7 +15197,6 @@ mod tests {
     fn terminal_discovery_failure_on_a_signalled_stop_degrades_to_a_gap() {
         let gap = std::cell::Cell::new(false);
         let changed = seal_terminal_discovery_or_gap(
-            true,
             || gap.set(true),
             || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
         );
@@ -15232,7 +15212,6 @@ mod tests {
     fn terminal_discovery_failure_without_a_signal_degrades_to_a_gap() {
         let gap = std::cell::Cell::new(false);
         let changed = seal_terminal_discovery_or_gap(
-            false,
             || gap.set(true),
             || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
         );
@@ -16807,7 +16786,6 @@ mod tests {
         let quiesce = finish_quiesce_error(
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
-            false,
             &mut (),
             |_, _| Ok(()),
             |_| Ok(()),
@@ -16816,7 +16794,6 @@ mod tests {
         let quiesce_publish_failed = finish_quiesce_error(
             anyhow!("terminal quiescence failed"),
             Ok(CaptureEnd::Signal),
-            false,
             &mut (),
             |_, _| Ok(()),
             |_| Err(anyhow!("seal failed")),
@@ -22255,31 +22232,22 @@ mod tests {
                 if function == "capture_profile" { 3 } else { 2 },
                 "{function}: every terminal discovery arm degrades on a signalled stop"
             );
-            // The degradation only fires on an observed stop: every arm
-            // passes the live stop flag, bound once from the stop state,
-            // and the quiesce-error combiner reads the stop state too. A
-            // constant at any of these sites must fail this test.
-            assert_eq!(
-                discovery.matches("signalled_stop,").count(),
-                if function == "capture_profile" { 3 } else { 2 },
-                "{function}: every degraded arm passes the live stop flag"
-            );
-            assert_eq!(
-                body.matches("let signalled_stop = interrupted.interrupted();")
-                    .count(),
-                1,
-                "{function}: the stop flag binds once from the live stop state"
-            );
-            let quiesce_head: String = body
-                .split_once("finish_quiesce_error(")
-                .unwrap()
-                .1
-                .chars()
-                .take(400)
-                .collect();
+            // The degradation is unconditional (a signal, the child's own
+            // exit and the duration all seal): no arm reads the stop flag,
+            // and every arm files the gap through the shared flag. A
+            // dropped `|| terminal_gap_due = true` would silently lose it.
             assert!(
-                quiesce_head.contains("interrupted.interrupted(),"),
-                "{function}: the quiesce-error combiner reads the live stop state"
+                !discovery.contains("signalled_stop"),
+                "{function}: the terminal degradation must not depend on a signal"
+            );
+            assert_eq!(
+                discovery.matches("|| terminal_gap_due = true,").count(),
+                if function == "capture_profile" { 3 } else { 2 },
+                "{function}: every degraded arm files the named gap"
+            );
+            assert!(
+                discovery.contains("if terminal_gap_due {"),
+                "{function}: the gap flag reaches the engine"
             );
             assert!(
                 discovery.contains("note_terminal_discovery_failure()"),

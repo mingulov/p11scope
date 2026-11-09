@@ -497,7 +497,6 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
         let error = finish_quiesce_error(
             anyhow::anyhow!("quiesce failure"),
             Ok(CaptureEnd::DurationExpired),
-            false,
             &mut phases,
             |phases, end| {
                 phases.push("settle");
@@ -567,7 +566,6 @@ fn quiesce_error_with_publish_failure_labels_publication_and_still_detaches() {
     let error = finish_quiesce_error(
         anyhow::anyhow!("quiesce failure"),
         Ok(CaptureEnd::Signal),
-        false,
         &mut phases,
         |phases, _| {
             phases.push("settle");
@@ -602,7 +600,6 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
     let error = finish_quiesce_error(
         anyhow::anyhow!("quiesce failure"),
         Err(anyhow::anyhow!("loop failure")),
-        false,
         &mut phases,
         |phases, end| {
             phases.push("settle");

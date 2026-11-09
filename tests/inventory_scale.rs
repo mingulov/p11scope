@@ -1306,3 +1306,116 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     assert_settled_consistent(&doc);
     fd_scope.assert_delta(0);
 }
+
+/// The dashboard twin of [`assert_final_gap_line`]: the typescript holds
+/// dashboard frames (ANSI) plus the post-restore closing lines, so the
+/// search tolerates a line prefix and parses from the `p11scope: final: `
+/// marker. Pins the same three counts against the caller's exact values.
+fn assert_dashboard_final_gap_line(output: &str, gaps: usize, refusals: usize, suppressed: u64) {
+    let marker = "p11scope: final: ";
+    let line = output
+        .lines()
+        .find(|line| line.contains(marker) && line.contains("budget refusal"))
+        .unwrap_or_else(|| panic!("final gap/refusal/suppressed line present: {output:?}"));
+    let rest = line.split_once(marker).unwrap().1;
+    let (seen_gaps, rest) = rest.split_once(' ').unwrap();
+    let seen_gaps: usize = seen_gaps.parse().unwrap();
+    let inner = rest.split('(').nth(1).unwrap().strip_suffix(')').unwrap();
+    let mut parts = inner.split(", ");
+    let seen_refusals: usize = parts
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let seen_suppressed: u64 = parts
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        (seen_gaps, seen_refusals, seen_suppressed),
+        (gaps, refusals, suppressed),
+        "dashboard gap line agrees with the document: {line:?}"
+    );
+}
+
+/// Dashboard honesty at default verbosity: the interactive tail shows
+/// per-pass gap progress always, so its terminal correction must also
+/// appear there — from the same snapshot as the JSON document — or the
+/// user sees only the stale number. Runs the real dashboard on a pty
+/// (`script`) with an overflowed scan cap, no `-v`, the JSON in `-o`.
+#[test]
+fn dashboard_final_gap_line_at_default_verbosity_agrees_with_document() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-dashboard-gapline-e2");
+    // `-o` needs a trusted directory; the target dir does not qualify.
+    let out_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = out_dir.path().join("dashboard-partial.json");
+    let typescript = dir.join("typescript");
+    // One small budget, overflowed on purpose (as in the scan-cap cell):
+    // a scan cap of 1 always truncates, so the run is always partial.
+    // No `-v`, no `--json`: default-verbosity dashboard frames on the pty,
+    // the JSON document in `-o`, closing lines replayed after the restore.
+    let command = format!(
+        "{} inventory --system --capture scan --identity-backend userspace --max-scan-pids 1 --dashboard --duration 4s -o {}",
+        env!("CARGO_BIN_EXE_p11scope"),
+        report.display(),
+    );
+    let status = Command::new("timeout")
+        .args(["60", "script", "-qec", &command])
+        .arg(&typescript)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("timeout runs the script dashboard session");
+    assert!(
+        status.success(),
+        "the script dashboard session exits 0: {status}"
+    );
+    let output = std::fs::read(&typescript).expect("script wrote the typescript");
+    // The interactive path ran, not the degraded classic fallback.
+    assert!(
+        output
+            .windows(b"\x1b[?1049h".len())
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "the dashboard took the alternate screen"
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        !text.contains("degraded to"),
+        "dashboard did not degrade to the classic path"
+    );
+    let body = std::fs::read_to_string(&report).unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    let gaps = doc["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter().any(|gap| gap["subject"] == "discovery capped"
+            && gap["reason"]
+                .as_str()
+                .unwrap()
+                .contains("deep-scanned by provider rarity (limit 1)")),
+        "the truncation gap names the overflowed budget: {}",
+        doc["gaps"]
+    );
+    // Default verbosity still shows the per-pass gap progress (stale
+    // number): the replay after the restore carries it.
+    assert!(
+        text.lines()
+            .any(|line| line.contains("p11scope: pass") && line.contains("budget refusal")),
+        "per-pass gap line visible at default verbosity"
+    );
+    // ... so the terminal correction must also appear there, agreeing
+    // with the document it was rendered from.
+    let refusals = gaps.iter().filter(|gap| !gap["budget"].is_null()).count();
+    let suppressed = doc["gaps_suppressed"].as_u64().unwrap();
+    assert_dashboard_final_gap_line(&text, gaps.len(), refusals, suppressed);
+}

@@ -3262,50 +3262,50 @@ fn instance_continuity_tail_never_reaches_any_renderer() {
     }
 }
 
-/// Data always: a pause cancellation that fails the capture loop, under
-/// `--pause always` or `auto`, still seals the report (settle as an error
-/// end, publish, then detach); the error stays the outer error, and the
-/// `always` wrap names the interruption rather than claiming success.
+/// Data always, generic seal order: a capture loop failure still seals
+/// the report (gap, settle as an error end, publish, then detach) and the
+/// error stays the outer error. `finish_capture_with` takes no pause
+/// policy, so this pins the order once; the real pause paths behind the
+/// loop error — the `auto` hand-back and the `always` refusal — are pinned
+/// by the held-child tests in `run.rs`, and both `always_wrap` texts by
+/// its wrap unit tests. The signalled wrap is asserted here once to pin
+/// the seal-plus-wrap composition: the interruption is named rather than
+/// claimed as a success.
 #[test]
-fn pause_cancellation_loop_failure_still_seals_the_report() {
-    for policy in [
-        crate::cli::PausePolicy::Always,
-        crate::cli::PausePolicy::Auto,
-    ] {
-        let mut phases = Vec::new();
-        let result = finish_capture_with(
-            &mut phases,
-            Err(anyhow::anyhow!("pause: pause coordination cancelled")),
-            |phases| phases.push("gap"),
-            |phases, result| {
-                phases.push("finish");
-                assert_eq!(result.as_ref().ok(), Some(&CaptureEnd::Error));
-                result
-            },
-            |phases| {
-                phases.push("detach");
-                Ok(())
-            },
-            |phases, end, _detached| {
-                assert_eq!(end, CaptureEnd::Error);
-                phases.push("terminal");
-                Ok(())
-            },
-        );
-        assert_eq!(
-            phases,
-            ["gap", "finish", "terminal", "detach"],
-            "{policy:?}"
-        );
-        let error = result.expect_err("the refused run still fails");
-        let signals = SignalState::new();
-        signals.observe(libc::SIGINT);
-        let text = match policy {
-            crate::cli::PausePolicy::Always => format!("{:#}", always_wrap(&signals, error)),
-            _ => format!("{error:#}"),
-        };
-        assert!(text.contains("pause coordination cancelled"), "{text}");
-    }
+fn failed_capture_loop_still_seals_the_report_in_order() {
+    let mut phases = Vec::new();
+    let result = finish_capture_with(
+        &mut phases,
+        Err(anyhow::anyhow!("pause: pause coordination cancelled")),
+        |phases| phases.push("gap"),
+        |phases, result| {
+            phases.push("finish");
+            assert_eq!(result.as_ref().ok(), Some(&CaptureEnd::Error));
+            result
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+        |phases, end, _detached| {
+            assert_eq!(end, CaptureEnd::Error);
+            phases.push("terminal");
+            Ok(())
+        },
+    );
+    assert_eq!(phases, ["gap", "finish", "terminal", "detach"]);
+    let error = result.expect_err("the failed run still fails");
+    let signals = SignalState::new();
+    signals.observe(libc::SIGINT);
+    let text = format!("{:#}", always_wrap(&signals, error));
+    assert!(
+        text.contains("pause coordination cancelled"),
+        "the sealed error still names the cancellation: {text}"
+    );
+    assert!(
+        text.contains("interrupted by SIGINT"),
+        "a signalled run names the interruption, never a refusal: {text}"
+    );
 }
 
 /// v070: a settled finish still seals (healthy twin for the settlement-

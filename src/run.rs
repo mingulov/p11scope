@@ -20180,10 +20180,12 @@ int main(int argc, char **argv) {
 
     /// The `always` twin of the held-cycle stop: a required pause keeps
     /// refusing. The between-frames step fails the capture with the
-    /// cancellation (no report under `always`), and the child is resumed,
-    /// never stranded stopped.
+    /// cancellation (production still seals the report: data always), the
+    /// refused attempt counts one partial, and the child is resumed, never
+    /// stranded stopped.
     #[test]
     fn a_stop_during_a_held_always_cycle_still_refuses_with_the_cancellation() {
+        use crate::discovery::pause::PauseCounters;
         let fixture_dir = tempfile::tempdir().unwrap();
         let sleeper = build_sleeper(fixture_dir.path());
         let mut child = spawn(sleeper.to_str().unwrap(), &[]);
@@ -20205,6 +20207,16 @@ int main(int argc, char **argv) {
         assert!(
             format!("{error:#}").contains("pause coordination cancelled"),
             "the refusal names the cancellation: {error:#}"
+        );
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            },
+            "the refused attempt counts one partial"
         );
         assert!(
             !original_child_is_stopped(child.pin().pidfd().unwrap()),

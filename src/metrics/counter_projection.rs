@@ -2084,6 +2084,23 @@ pub(super) mod tests {
         }
     }
 
+    /// Data always: a profile run that ends with zero snapshots still
+    /// seals its report. A terminal read failure with no prior snapshot
+    /// publishes a degraded snapshot — no aggregate rows — instead of
+    /// failing the publication; the report names the read failure.
+    #[test]
+    fn terminal_without_any_snapshot_still_seals_a_degraded_report() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fresh = ConsumerFixture::new();
+        let degraded = fresh
+            .terminal(CounterMode::Counts, 1, 5, Some(ConsumerFault::ReadRvs))
+            .expect("a terminal without any prior snapshot seals a degraded report");
+        assert!(
+            degraded.reports().is_empty(),
+            "a degraded snapshot carries no aggregate rows"
+        );
+    }
+
     #[test]
     fn terminal_failure_publishes_last_good_stale_with_gap() {
         use p11scope_ebpf_common::CounterMode;

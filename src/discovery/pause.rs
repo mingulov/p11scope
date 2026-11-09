@@ -10916,6 +10916,21 @@ mod tests {
             evidence["pause_partial"], 1,
             "the refused cycle counts as one partial attempt"
         );
+        assert_eq!(
+            evidence["pause_unavailable"], 0,
+            "a refused cycle counts partial, never unavailable"
+        );
+        assert_eq!(
+            evidence["pause_confirmed"]
+                .as_u64()
+                .expect("confirmed count")
+                + evidence["pause_partial"].as_u64().expect("partial count")
+                + evidence["pause_unavailable"]
+                    .as_u64()
+                    .expect("unavailable count"),
+            evidence["pause_attempts"].as_u64().expect("attempt count"),
+            "pause counters do not add up"
+        );
     }
 
     /// A second exec after the provider already loads: the owned task maps

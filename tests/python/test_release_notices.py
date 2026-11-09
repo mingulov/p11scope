@@ -203,6 +203,16 @@ class ReleaseNoticesTests(unittest.TestCase):
         with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
             self.mod.make_config(metadata, self.root, recipe)
 
+    def test_accepted_licenses_cover_mit_no_attribution(self):
+        # MIT-0 (MIT minus attribution, as declared by borrow-or-share in
+        # the jsonschema dev-tree) is accepted alongside MIT; dropping it
+        # refuses the release notices again.
+        recipe, metadata, _bodies = self.clarification_fixture()
+        config = self.mod.make_config(metadata, self.root, recipe)
+        accepted = config.splitlines()[0]
+        self.assertTrue(accepted.startswith("accepted = ["), accepted)
+        self.assertIn('"MIT-0"', accepted)
+
     def test_recipe_input_hash_is_checked(self):
         (self.root / "third-party/licenses").mkdir(parents=True)
         notice = self.root / "third-party/licenses/upstream.txt"

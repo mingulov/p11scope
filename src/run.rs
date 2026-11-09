@@ -14966,6 +14966,41 @@ mod tests {
         assert!(!requested_kill);
     }
 
+    /// An observer-side end over a child still behind its pre-exec
+    /// barrier kills it where it stands: the command never ran, so there
+    /// is nothing to hand back and nothing is ever staged.
+    #[test]
+    fn capture_error_kills_an_unreleased_child_where_it_stands() {
+        let child = spawn("/bin/sleep", &["30"]);
+        wait_for_session_leader(&child);
+        // NOTE: deliberately unreleased.
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = true;
+        let note = settle_owned_child(
+            &mut retained,
+            CaptureEnd::Error,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(note, None);
+        assert_eq!(exit_code, Some(128 + libc::SIGKILL));
+        assert!(!still_running);
+        assert!(!requested_kill);
+        assert!(pending.is_none());
+        let child = retained.as_ref().expect("the settled child");
+        assert!(child.is_reaped(), "a pre-exec kill must be reaped");
+    }
+
     /// Dropping a released child detaches it without killing: the panic path
     /// leaves the observed program running for init to adopt.
     #[test]

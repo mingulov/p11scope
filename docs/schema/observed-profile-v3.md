@@ -782,14 +782,23 @@ and `pid` when it degraded to its exact child. The evidence object keeps
 its closed exact key set; this addition touches the `capture` section only.
 
 `capture.caller` names the pid-scope target: `{exe, exe_unknown_reason}`
-with exactly one non-null — the `/proc/<pid>/exe` link text read when
-probes attached, or the finite reason it could not be read. It is present
-if and only if the scope is `pid` with resolved caller identity; cgroup
-and system scopes emit no key (absent, never null), since their counts
-are aggregate, not per-application. No PID number is carried: profile and
-metrics reports do not publish raw PID/TID, so the operator's own target
-pid is named on stderr diagnostics only. This is a v3-additive disclosure
-that introduces no new schema revision.
+with exactly one non-null — the `/proc/<pid>/exe` link text (lossy
+UTF-8; non-UTF-8 bytes become U+FFFD) read when probes attached, or the
+finite reason it could not be read. The read is bound to the target's
+retained pin, so a recycled pid never misattaches an unrelated
+program's exe. Known limitation: if the target execs mid-capture,
+the report keeps the attach-time name and says nothing changed. It
+is present if and only if the scope is `pid` with resolved caller
+identity (a pid scope that resolved nothing emits no key; that arm is
+test-only — production always resolves exactly one of the two for pid
+scope); cgroup and system scopes emit no key (absent, never null),
+since their counts are aggregate, not per-application. For a target in a container, the path is as the
+container's mount namespace names it (for example `/usr/bin/python3`),
+not the host's file; a deleted binary reads `<path> (deleted)`. No
+PID number is carried: profile and metrics reports do not publish raw
+PID/TID, so the operator's own target pid is named on stderr
+diagnostics only. This is a v3-additive disclosure that introduces no
+new schema revision.
 
 ## Completeness and terminal trace
 

@@ -66,7 +66,9 @@ and [copy-up layer publication](#copy-up-layer-publication-f11-2026-11-07),
 which attributes a witness-proven pre-copy-up lower file as its own
 module row with the finite `pre_copy_up` marker,
 and [caller launcher chain](#caller-launcher-chain-v070),
-which publishes the implemented per-caller parentage below.**
+which publishes the implemented per-caller parentage below,
+and [pid-scope caller executable](#pid-scope-caller-executable-v070),
+which names the pid-scope target exe in profile/metrics below.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -2029,3 +2031,22 @@ parentage at admission, not operator attestation and not that the
 parent invoked PKCS#11. An `init_parent` unit names the caller's
 systemd scope, never a launcher process. Counts and caller identity
 never change.
+
+## Pid-scope caller executable (v0.7.0)
+
+**Status: IMPLEMENTED in v0.7.0: a pid-scope profile/metrics capture
+names its target's executable in `capture.caller` and on the stderr
+target line, so the report never shows a pid-scope capture without its
+caller. Allowlist-v1 bytes are unchanged; this section authorizes the
+one new profile/metrics disclosure below, and no other surface gains a
+name or path.** It adds no target-memory, argument, command-line,
+environment, payload, key, or PIN capture: the only read is the
+`/proc/<pid>/exe` link, the same read kind as caller exe identity.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Pid-scope caller executable (`capture.caller`, stderr target line) | The `/proc/<pid>/exe` link text (readlink, lossy UTF-8) of the pid-scope target, read once probes are attached and bound to the target's retained pin: the owned child's pin on the degraded run path, else the named view's. The pin's `still_the_same` must hold before and after the readlink, else even a readable path is discarded and the exit named, so a recycled pid never misattaches an unrelated program's exe. No cwd, cmdline, environ, `comm`, argument, payload, key, or PIN read. | Public in profile/metrics JSON `capture.caller` (`{exe, exe_unknown_reason}` with exactly one non-null) for pid scope only; cgroup and system scopes emit no key (absent, never null), since their counts are aggregate. The stderr `p11scope: target: pid <N> exe <path>` line names the operator's own target pid beside the exe; the JSON report carries no PID number. A container target's path is as its mount namespace names it; a deleted binary reads `<path> (deleted)`. | An unreadable link on a live pin reads `target exe link unreadable`; a proven exit (`kill(pid, 0)` `ESRCH`, or a zombie/dead stat) or a changed generation reads `target exited before its exe link was read`. Known limitation: a mid-capture exec keeps the attach-time name. Required evidence: pin-change discard, zombie-exit, and aggregate-omission twins at the resolver seam. |
+
+The exe names the observed image, not a desktop application, script,
+package, service, or trust identity, and proves no operator
+attestation. Counts, joins, admissions, and completeness never change.

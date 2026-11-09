@@ -19,7 +19,15 @@
         "scope": {"enum": ["pid", "cgroup", "system"]},
         "ring_bytes": {"type": "integer", "minimum": 0},
         "drain_interval_ms": {"type": "integer", "minimum": 0},
-        "modules": {"type": "array"}
+        "modules": {"type": "array"},
+        "caller": {
+          "type": "object",
+          "description": "Pid-scope target identity, present only for pid scope with resolved caller identity: exactly one of exe/exe_unknown_reason is non-null.",
+          "properties": {
+            "exe": {"type": ["string", "null"]},
+            "exe_unknown_reason": {"type": ["string", "null"]}
+          }
+        }
       }
     },
     "evidence": {

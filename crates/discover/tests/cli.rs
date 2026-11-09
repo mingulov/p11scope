@@ -1363,6 +1363,134 @@ fn inode_flags(path: &Path) -> i32 {
     flags
 }
 
+/// Probe whether `dir` can host the N2 twins: a fresh file there must
+/// take FS_NODUMP_FL via FS_IOC_SETFLAGS and show it back via
+/// FS_IOC_GETFLAGS. Returns the reason (write/open/ioctl errno) when it
+/// cannot, so the caller can try the next candidate instead of failing.
+fn setflags_probe(dir: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    // `libc::Ioctl` is the request parameter's own type (c_int on musl,
+    // c_ulong on glibc); the `as` cast keeps the identical bit pattern.
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601_u32 as libc::Ioctl;
+    const FS_IOC_SETFLAGS: libc::Ioctl = 0x4008_6602_u32 as libc::Ioctl;
+    const FS_NODUMP_FL: i32 = 0x40;
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+    let probe = dir.join(format!("setflags-probe-{}.tmp", std::process::id()));
+    if let Err(error) = std::fs::write(&probe, b"setflags probe") {
+        return Err(format!("cannot write the probe file: {error}"));
+    }
+    let raw = CString::new(probe.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the fd is open from here until the close below; both ioctls
+    // take a pointer to an int-sized flag word.
+    let outcome = unsafe {
+        let fd = libc::open(raw.as_ptr(), libc::O_RDONLY);
+        if fd < 0 {
+            Err(format!("probe open failed with errno={}", errno()))
+        } else {
+            let mut flags: i32 = 0;
+            let result = if libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) != 0 {
+                Err(format!("GETFLAGS failed with errno={}", errno()))
+            } else if flags & FS_NODUMP_FL != 0 {
+                Err("a fresh probe file already has NODUMP".to_string())
+            } else {
+                let set: i32 = FS_NODUMP_FL;
+                if libc::ioctl(fd, FS_IOC_SETFLAGS, &set) != 0 {
+                    Err(format!("SETFLAGS failed with errno={}", errno()))
+                } else {
+                    let mut back: i32 = 0;
+                    if libc::ioctl(fd, FS_IOC_GETFLAGS, &mut back) != 0 {
+                        Err(format!("flag reread failed with errno={}", errno()))
+                    } else if back & FS_NODUMP_FL == 0 {
+                        Err("SETFLAGS succeeded but NODUMP is missing".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            libc::close(fd);
+            result
+        }
+    };
+    let _ = std::fs::remove_file(&probe);
+    outcome
+}
+
+/// Filesystem identity of `dir` for the loud N2 precondition failure: a
+/// short name for the known scratch filesystems, else the statfs magic
+/// in hex (unambiguous, with no table to keep complete).
+fn dir_fstype_name(dir: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: statfs writes the whole struct on success.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return format!(
+            "statfs errno={}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
+    }
+    // SAFETY: success above initialized it.
+    let stat = unsafe { stat.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = stat.f_type as u64;
+    let name = match magic {
+        0xef53 => "ext2/3/4",
+        0x0102_1994 => "tmpfs",
+        0x9123_683e => "btrfs",
+        0x794c_7630 => "overlayfs",
+        0x5846_5342 => "xfs",
+        _ => return format!("statfs magic 0x{magic:x}"),
+    };
+    name.to_string()
+}
+
+/// Directory that holds the N2 twin files: the test's own scratch
+/// directory when its filesystem applies FS_IOC_SETFLAGS, else a fresh
+/// pid-tagged directory on a tmpfs fallback (`/dev/shm`, then the
+/// process temp directory). Some hosted runners return EOPNOTSUPP for
+/// SETFLAGS on the cargo scratch disk; the fence assertions do not
+/// depend on the directory (the isolated run carries no `-o` at all),
+/// so the twins move while the positive stays a positive. Panics with
+/// the named reason SETFLAGS_TWIN_PRECONDITION_FAILED, listing every
+/// candidate with its filesystem and probe error, when no candidate
+/// applies the flag.
+fn setflags_twin_dir(scratch: &Path) -> std::path::PathBuf {
+    if let Err(reason) = setflags_probe(scratch) {
+        let mut attempts = vec![format!(
+            "{} [{}]: {reason}",
+            scratch.display(),
+            dir_fstype_name(scratch)
+        )];
+        for root in [Path::new("/dev/shm"), &std::env::temp_dir()] {
+            if !root.is_dir() {
+                attempts.push(format!("{}: not a usable directory", root.display()));
+                continue;
+            }
+            let dir = scratch_in(root, "setflags-fallback");
+            match setflags_probe(&dir) {
+                Ok(()) => return dir,
+                Err(reason) => {
+                    attempts.push(format!(
+                        "{} [{}]: {reason}",
+                        dir.display(),
+                        dir_fstype_name(&dir)
+                    ));
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        }
+        panic!(
+            "SETFLAGS_TWIN_PRECONDITION_FAILED: no twin directory applies FS_IOC_SETFLAGS: {}",
+            attempts.join("; ")
+        );
+    }
+    scratch.to_path_buf()
+}
+
 /// N2: inode-attribute change outside -o is denied. The constructor's
 /// FS_IOC_SETFLAGS from an O_RDONLY fd sets FS_NODUMP_FL when trusted
 /// (twin proves the probe applies) and fails with EACCES under the fence
@@ -1420,6 +1548,29 @@ fn isolation_setflags_outside_the_output_is_denied() {
         b"setflags probe",
         "the fenced probe must not modify the scratch file"
     );
+}
+
+/// The N2 twins run where the flag applies: an unusable primary (a path
+/// that cannot hold files) selects a working fallback instead of
+/// failing, and the fallback really takes the flag.
+#[test]
+fn setflags_twins_fall_back_when_the_primary_is_unusable() {
+    let dir = scratch("isolation-setflags-fallback");
+    let missing = dir.join("no-such-dir");
+    // Negative control: the setup must genuinely present an unusable
+    // primary, or a pass below would be vacuous.
+    assert!(
+        setflags_probe(&missing).is_err(),
+        "the missing primary must fail the probe"
+    );
+    let twins = setflags_twin_dir(&missing);
+    assert_ne!(twins, missing, "an unusable primary must select a fallback");
+    assert!(
+        setflags_probe(&twins).is_ok(),
+        "the fallback must take the flag: {}",
+        twins.display()
+    );
+    std::fs::remove_dir_all(&twins).unwrap();
 }
 
 /// Whether `dir` lives on btrfs (statfs magic), for the fs-gated cell.

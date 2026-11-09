@@ -1295,7 +1295,7 @@ jobs:
           retention-days: 7
   # Dual-outcome integration tests as root with the positive branch
   # required: run_lifecycle, pause, t2_cold_start and ux_journeys cells
-  # plus the second-SIGINT report cell (13 rows, all qualified; the
+  # plus the second-SIGINT report cell (14 rows, all qualified; the
   # script judges the branch of each cell, not just its exit code).
   # Root-required, consistent with the cell template.
   root-integration:
@@ -1372,7 +1372,7 @@ jobs:
           sudo -n scripts/ci/run-root-integration.sh "$in/p11scope" "$out" "$GITHUB_WORKSPACE/root-test-bins"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           # Inline exact-set check (the WP-1 checker takes this over
-          # with --require when that lane ports; same 13 cells).
+          # with --require when that lane ports; same 14 cells).
           python3 -I - "$out/results.jsonl" <<'PY'
           import json
           import sys
@@ -1392,6 +1392,7 @@ jobs:
                   "ux_journeys::b6_doctor_reports_rows_and_verdict",
                   "ux_journeys::b7_run_refuses_without_capture_lane",
                   "ux_journeys::t3_f3_doctor_verdict_ends_with_newline",
+                  "ux_journeys::j3_script_target_runs_like_any_program",
                   "run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130"}
           problems = sorted("missing cell " + name for name in need - set(cells))
           problems += sorted("extra cell " + name for name in set(cells) - need)

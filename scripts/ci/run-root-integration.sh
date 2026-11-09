@@ -23,6 +23,7 @@
 #   ux_journeys::b6_doctor_reports_rows_and_verdict
 #   ux_journeys::b7_run_refuses_without_capture_lane
 #   ux_journeys::t3_f3_doctor_verdict_ends_with_newline
+#   ux_journeys::j3_script_target_runs_like_any_program
 #   run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130
 #
 # Each results.jsonl row carries exactly cell/pass/qualification/detail (the
@@ -365,6 +366,7 @@ CELLS=(
     ux_journeys:b6_doctor_reports_rows_and_verdict
     ux_journeys:b7_run_refuses_without_capture_lane
     ux_journeys:t3_f3_doctor_verdict_ends_with_newline
+    ux_journeys:j3_script_target_runs_like_any_program
     run_abandon_report:second_sigint_during_teardown_publishes_truthful_report_and_exits_130:ignored
 )
 

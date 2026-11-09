@@ -625,9 +625,9 @@ mod tests {
         }
     }
 
-    /// The nested refusal runs before the found-but-refused line, so it
-    /// must not claim nothing was found: refused providers may still be
-    /// named below. It refuses on countable modules, not found ones.
+    /// The nested refusal returns before the found-but-refused line
+    /// runs, so nothing is named below it; it still must not claim
+    /// nothing was found. It refuses on countable modules, not found ones.
     #[test]
     fn nested_empty_refusal_says_countable_not_missing() {
         let nested_own = PidNumbering {

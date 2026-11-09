@@ -1700,4 +1700,79 @@ mod tests {
             assert_eq!(calls, 1, "{kind:?} must not retry");
         }
     }
+    /// The host fallback retries only resolution failures from the
+    /// target-root open (a missing path under a chroot); any other
+    /// errno never reaches the host.
+    #[test]
+    fn host_fallback_opens_only_on_resolution_errnos() {
+        for errno in [libc::ENOENT, libc::ENOTDIR, libc::EXDEV, libc::ELOOP] {
+            assert!(
+                is_resolution_errno(errno),
+                "errno {errno} must allow the fallback"
+            );
+        }
+        for errno in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EINVAL,
+            libc::ENOMEM,
+            libc::EBUSY,
+        ] {
+            assert!(
+                !is_resolution_errno(errno),
+                "errno {errno} must never reach the host"
+            );
+        }
+    }
+
+    /// The host fallback opens with `RESOLVE_NO_MAGICLINKS`, so a
+    /// `/proc/self/fd`-style magic link is refused instead of followed;
+    /// ordinary host files still open, and the absolute/no-`..`
+    /// precondition applies again.
+    #[test]
+    fn host_fallback_open_refuses_magic_links() {
+        use std::os::unix::io::AsRawFd as _;
+        let held = std::fs::File::open("/dev/null").unwrap();
+        let magic = format!("/proc/self/fd/{}", held.as_raw_fd());
+        let error = ViewFilesystem::open_host_regular(Path::new(&magic)).unwrap_err();
+        assert!(
+            error.contains("Too many levels of symbolic links") || error.contains("os error 40"),
+            "a magic link must be refused, not followed: {error}"
+        );
+        for path in ["relative", "/../outside", "/owned/../../outside"] {
+            let error = ViewFilesystem::open_host_regular(Path::new(path)).unwrap_err();
+            assert!(error.contains("without parent traversal"), "{error}");
+        }
+        let exe = std::env::current_exe().unwrap();
+        ViewFilesystem::open_host_regular(&exe).expect("an ordinary host file opens");
+        ViewFilesystem::open_host_object(&exe).expect("an ordinary host object opens");
+    }
+
+    /// A precondition refusal and a size refusal carry no resolution
+    /// errno, so the host fallback never runs after them.
+    #[test]
+    fn target_precondition_and_size_failures_carry_no_resolution_errno() {
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
+        let precondition = proof
+            .open_rooted_detailed(Path::new("/../outside"))
+            .unwrap_err();
+        assert!(
+            precondition.reason.contains("without parent traversal"),
+            "{precondition:?}"
+        );
+        assert_eq!(precondition.resolution_errno, None);
+        let large = group.program.with_file_name("large-sparse-no-fallback");
+        let file = std::fs::File::create(&large).unwrap();
+        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+        file.set_len(limit + 1).unwrap();
+        let oversized = proof.open_rooted_object_detailed(&large).unwrap_err();
+        assert!(oversized.reason.contains("limit is"), "{oversized:?}");
+        assert_eq!(oversized.resolution_errno, None);
+        proof.validate(&mut work).unwrap();
+        group.call_three();
+    }
 }

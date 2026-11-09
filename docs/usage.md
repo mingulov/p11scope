@@ -455,13 +455,15 @@ the rendered lines name that gap instead of printing an empty section.
 > (root under sudo) before any drop. An ELF runs by descriptor; a script runs
 > by its path so the kernel resolves its `#!` exactly as a direct launch
 > would, after the child re-verifies the path still names the opened file.
-> Owned launch requires procfs mounted at `/proc`: the opened executable is
+> Owned launch requires procfs mounted at `/proc`. An ELF executable is
 > invoked through `/proc/self/fd`, so the target account needs no directory
 > search permission on its path and a later path replacement cannot change the
 > selected inode. If that descriptor path is unavailable, `run` reports the exec
-> failure and refuses to retry the command's original path. A script whose path
-> no longer names the opened file is refused at the barrier instead of running
-> unchecked. The sudo path runs
+> failure and refuses to retry the command's original path. A script runs by
+> its path instead, so the target account needs search permission on it, and
+> the path is re-verified at the barrier rather than pinned: a script whose
+> path no longer names the opened file is refused at the barrier instead of
+> running unchecked. The sudo path runs
 > the child as the invoker with the invoker's supplementary groups from the
 > account database (glibc may return only the primary group) and home
 > environment, as if the user had run the command directly:

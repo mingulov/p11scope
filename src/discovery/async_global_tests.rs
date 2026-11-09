@@ -443,9 +443,8 @@ fn async_global_owned_only_retire_covers_candidate_module_without_entry_objects(
         "the retiring slot sits on a candidate module's own file"
     );
     for module in &mut candidate.modules {
-        for ids in &mut module.entry_objects {
-            ids.clear();
-        }
+        module.scanned.tables.clear();
+        module.entry_objects.clear();
     }
     case.engine.modules.clear();
     let outcome = case

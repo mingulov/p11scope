@@ -314,10 +314,7 @@ fn deleted_exec_mapping_is_a_named_replaced_file_loss() {
         .map(|skip| skip.reason.as_str())
         .collect();
     assert!(
-        reasons
-            .iter()
-            .any(|reason| *reason
-                == "provider file replaced on disk while running; calls not counted"),
+        reasons.contains(&"provider file replaced on disk while running; calls not counted"),
         "a deleted exec mapping names the replaced-file loss, got {reasons:?}"
     );
     assert!(

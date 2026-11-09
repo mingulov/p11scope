@@ -10873,6 +10873,72 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_auto_falls_back_to_scan_on_old_kernel_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        use std::sync::Arc;
+        // The old-kernel fallback covers every scope: a cgroup auto
+        // capture on a host without live support scans with the named
+        // counts gap instead of refusing.
+        let root = tempfile::tempdir().unwrap();
+        let dir = Arc::new(std::fs::File::open(root.path()).unwrap());
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL)),
+        ] {
+            let mut coordinator = coordinator();
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let scope = Scope::Cgroup {
+                id: 0,
+                path: root.path().to_path_buf(),
+                dir: dir.clone(),
+            };
+            let lane = open_native_lane_with(
+                CaptureMode::Auto,
+                BackendSelection::Auto,
+                scope,
+                &mut coordinator,
+                |_, _, _| Err(refusal.into()),
+            )
+            .expect("cgroup auto falls back to scan on old-kernel host refusal");
+            assert!(lane.is_none(), "fallback leaves no native lane");
+            coordinator.registry_mut().publish();
+            let reason = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == "native usage feed unavailable")
+                .map(|gap| gap.reason.clone())
+                .expect("fallback records a named gap");
+            assert!(
+                reason.contains("call counts unavailable on this host:"),
+                "{reason}"
+            );
+        }
+        // A denied cgroup auto capture stays fatal: a capable but
+        // confined host must refuse rather than silently degrade.
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(libc::EPERM));
+        let scope = Scope::Cgroup {
+            id: 0,
+            path: root.path().to_path_buf(),
+            dir: dir.clone(),
+        };
+        let error = open_native_lane_with(
+            CaptureMode::Auto,
+            BackendSelection::Auto,
+            scope,
+            &mut coordinator(),
+            |_, _, _| Err(refusal.into()),
+        )
+        .err()
+        .expect("denied cgroup auto refusal stays fatal");
+        assert_eq!(
+            error.downcast_ref::<MultiHostRefusal>(),
+            Some(&refusal),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn system_auto_run_falls_back_to_scan_on_unavailable_host() {
         use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
         let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP));

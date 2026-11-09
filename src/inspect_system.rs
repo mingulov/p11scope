@@ -2310,6 +2310,17 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
     )
 }
 
+/// Whether a gap is one pid's "shared objects no deep scan examined this
+/// pass" record (as opposed to the no-snapshot or scope-loss shapes): the
+/// coordinator drops these for members whose unchanged maps make the
+/// claim vacuous, and keeps every other maps gap.
+pub(crate) fn is_unexamined_maps_gap(gap: &PidGap) -> bool {
+    gap.pid.is_some()
+        && gap.subject == "maps attribution"
+        && gap.reason.starts_with("maps ")
+        && gap.reason.contains("no deep scan examined this pass")
+}
+
 /// The sweep-refusal gap reason for an object sweep matching cannot use:
 /// names where the object lives and why. A tmpfs mount whose options
 /// could not be read is unproven, not non-unique, so it gets its own

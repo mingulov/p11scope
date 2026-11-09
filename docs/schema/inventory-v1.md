@@ -487,7 +487,14 @@ and never proves an app identity. See the app identity rows of
   ` (deleted)` mapping, an overlay-collapsed or aliased key, a rejected
   key, or a filesystem whose inode numbers are not unique (FUSE,
   network filesystems, tmpfs mounted `inode32` or whose mount cannot be
-  resolved). `entries` is usage
+  resolved). One transient proof failure never discards established
+  edges: a pass that binds no provider key while a member's maps are
+  byte-identical to the prior applied pass keeps that member's edges and
+  records one `transient pass retained established edges` gap with its
+  counts, instead of marking the edges `uncertain` and forwarding the
+  pass's vacuous unexamined gaps. Members whose maps changed, and
+  passes that bind a provider key, follow the ordinary rules above.
+  `entries` is usage
   evidence from observed entries only: cumulative `count` plus
   first/last seen, an in-flight flag, and `observation` —
   `observed`, `unknown (not admitted)`, `unknown (usage observation

@@ -6028,11 +6028,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         let mut join_losses: BTreeMap<AttributionLoss, usize> = BTreeMap::new();
+        // A pass that bound no provider key while member maps are unchanged
+        // proves nothing new: established edges are retained below (one
+        // transient proof failure never discards them) and the pass's
+        // vacuous unexamined gaps are not forwarded as new unknowns.
+        let bound_provider_key = catalog
+            .objects
+            .iter()
+            .any(|object| object.admission.feeds_watch());
+        let mut retained: BTreeSet<u32> = BTreeSet::new();
+        let mut retained_edges: usize = 0;
         for process in &catalog.processes {
             let Some(caller) = self.adapter.live_id(process.pid) else {
                 continue;
             };
             if !process.status.attributable() {
+                if !bound_provider_key
+                    && self.maps_identity_unchanged(process.pid, catalog)
+                    && self.registry.edges_of(caller).next().is_some()
+                {
+                    retained.insert(process.pid);
+                    retained_edges += self
+                        .registry
+                        .edges_of(caller)
+                        .filter(|edge| edge.mapping == MappingState::Mapped)
+                        .count();
+                    self.tail_uncertain.insert(caller);
+                    self.count_ownership
+                        .queue_observation(caller, Vec::new(), None);
+                    continue;
+                }
                 self.registry.note_member_unscanned(caller);
                 self.tail_uncertain.insert(caller);
                 self.count_ownership
@@ -6189,8 +6214,57 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .iter()
             .map(|object| object.path.as_str())
             .collect();
+        if !retained.is_empty() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "transient pass retained established edges".into(),
+                reason: format!(
+                    "pass {} bound no provider key while {} members' maps were unchanged since \
+                     the prior applied pass; their established edges were kept ({} mapped) and \
+                     this pass proved nothing new",
+                    self.passes,
+                    retained.len(),
+                    retained_edges,
+                ),
+                budget: None,
+            });
+        }
         let notes = collapse_hint_misses(&examining, &object_paths, &catalog.notes);
+        // Vacuous unexamined gaps of a retained transient pass: every named
+        // member was examined by the prior applied pass and has not changed,
+        // so per-pid gaps for retained members drop, and the scope capped
+        // loss drops only when every unexamined pid it summarizes was
+        // retained and the pass carries no other maps loss.
+        let unexamined_pids: BTreeSet<u32> = catalog
+            .skipped
+            .iter()
+            .filter(|gap| crate::inspect_system::is_unexamined_maps_gap(gap))
+            .filter_map(|gap| gap.pid)
+            .collect();
+        let other_maps_loss = catalog.skipped.iter().any(|gap| {
+            gap.subject == "maps attribution" && !crate::inspect_system::is_unexamined_maps_gap(gap)
+        });
+        let capped_vacuous = !retained.is_empty()
+            && !unexamined_pids.is_empty()
+            && unexamined_pids.iter().all(|pid| retained.contains(pid))
+            && !other_maps_loss;
         for gap in catalog.skipped.iter().chain(notes.iter()) {
+            if gap.subject == "maps attribution"
+                && let Some(pid) = gap.pid
+                && crate::inspect_system::is_unexamined_maps_gap(gap)
+                && retained.contains(&pid)
+            {
+                continue;
+            }
+            if capped_vacuous
+                && gap.pid.is_none()
+                && gap.subject == "discovery capped"
+                && !gap.reason.starts_with("attribution complete")
+            {
+                continue;
+            }
             self.registry.record_gap(RegistryGap {
                 caller: gap.pid.and_then(|pid| self.adapter.live_id(pid)),
                 module: None,
@@ -6231,6 +6305,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             (Some(_), Some(_)) => Ok(()),
             _ if matched => Err(AttributionLoss::ConfirmUnreadable),
             _ => Ok(()),
+        }
+    }
+
+    /// Whether this pass re-proved a member's mappings byte-identical to
+    /// the prior applied pass: the sweep digest and its beside-read
+    /// generation both match. Both sides must be present — the same proof
+    /// the deep-scan skip set trusts — so a first pass retains nothing.
+    fn maps_identity_unchanged(&self, pid: u32, catalog: &crate::inspect_system::Catalog) -> bool {
+        match (self.maps_prior.get(&pid), catalog.sweep_digests.get(&pid)) {
+            (Some(prior), Some(current)) => prior == current,
+            _ => false,
         }
     }
 

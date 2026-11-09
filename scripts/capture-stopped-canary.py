@@ -673,9 +673,17 @@ def validate_inventory(maps, variant, privacy='allowlisted', workload_origin='ex
                     else wanted['max_entries'])
         if workload_origin == 'owned' and item['name'] == 'DISCOVERY':
             live_max = OWNED_DISCOVERY_MAX_ENTRIES
-        require((item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
-                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags),
-                f'map definition mismatch name={item["name"]}')
+        live = (item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
+        want = (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags)
+        detail = f'map definition mismatch name={item["name"]}'
+        if (live != want and workload_origin == 'owned' and item['name'] == 'DISCOVERY'
+                and item['max_entries'] == wanted['max_entries']):
+            # `run` falls back to Scope::Pid when the run cgroup is not a
+            # usable scope; the loader then reports the pinned Pid size on
+            # an owned lane. Still refused, but the suspect is named.
+            detail += ('; suspected run-tree degradation to Pid scope'
+                       ' (only the started command is observed)')
+        require(live == want, detail)
 
 
 def continuity_map_category(maps, ordinary, *, variant, privacy, workload_origin='external'):

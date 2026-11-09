@@ -10097,7 +10097,9 @@ mod tests {
     /// failures return before the coordinator exists). Observer-side ends
     /// settle through `settle_observer_end_without_kill`, which is called
     /// only from `settle_owned_child`, so its reaps stay inside the same
-    /// post-cleanup funnel.
+    /// post-cleanup funnel. The staged commit it delegates to,
+    /// `commit_staged_observer_handoff`, is likewise called only from
+    /// there, so the race reap stays in the funnel too.
     /// The capture loops route every end (exit, error, signal, timeout,
     /// kill-on-timeout, second SIGINT) through that same finish; that
     /// routing is an audited property of `run.rs`, documented here:
@@ -10154,6 +10156,14 @@ mod tests {
             2,
             "settle_observer_end_without_kill must keep its definition plus the one settle call"
         );
+        // The staged observer-side commit is defined once and called from
+        // the observer-side settlement only, so its race reap stays in
+        // the funnel.
+        assert_eq!(
+            offsets_of(production, "commit_staged_observer_handoff(").len(),
+            2,
+            "commit_staged_observer_handoff must keep its definition plus the one settle call"
+        );
         // No new direct reaps: every production terminate_and_reap call
         // stays in its audited function.
         let mut reapers = std::collections::BTreeSet::new();
@@ -10180,6 +10190,7 @@ mod tests {
             std::collections::BTreeSet::from([
                 "abort_pending_handoff".to_string(),
                 "combine_setup_failure".to_string(),
+                "commit_staged_observer_handoff".to_string(),
                 "run_owned_inner_with_host".to_string(),
                 "settle_observer_end_without_kill".to_string(),
                 "settle_owned_child".to_string(),

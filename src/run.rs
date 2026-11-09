@@ -4199,26 +4199,7 @@ fn settle_observer_end_without_kill(
             Ok(())
         }
         ChildOutcome::TimedOutRunning => {
-            let pid = pending
-                .as_ref()
-                .map(|child| child.pid())
-                .context("owned child missing during settlement")?;
-            if commit_handoff(pending).is_ok() {
-                *exit_code = None;
-                *still_running = true;
-                emit_capture_diagnostic(&format_observer_end_handoff_note(end, pid));
-                return Ok(());
-            }
-            // The child exited between the stage and the commit: reap the
-            // natural exit instead of failing the settlement.
-            let child = pending
-                .as_mut()
-                .context("owned child missing during settlement")?;
-            let settled = child
-                .terminate_and_reap()
-                .map(ChildOutcome::Exited)
-                .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
-            record_settlement_result(child, settled, exit_code, still_running)
+            commit_staged_observer_handoff(pending, end, exit_code, still_running)
         }
     }
 }
@@ -4357,6 +4338,38 @@ fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
         .map_err(|error| anyhow!("run: handing back the owned child: {error}"))?;
     pending.take();
     Ok(())
+}
+
+/// Commits a staged observer-side handoff: a live child is handed back
+/// running with this end's terminal note, while a child that exited
+/// between the stage and the commit keeps its natural exit, reaped here
+/// instead of failing the settlement.
+fn commit_staged_observer_handoff(
+    pending: &mut Option<OwnedChild>,
+    end: CaptureEnd,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
+) -> Result<()> {
+    let pid = pending
+        .as_ref()
+        .map(|child| child.pid())
+        .context("owned child missing during settlement")?;
+    if commit_handoff(pending).is_ok() {
+        *exit_code = None;
+        *still_running = true;
+        emit_capture_diagnostic(&format_observer_end_handoff_note(end, pid));
+        return Ok(());
+    }
+    // The child exited between the stage and the commit: reap the
+    // natural exit instead of failing the settlement.
+    let child = pending
+        .as_mut()
+        .context("owned child missing during settlement")?;
+    let settled = child
+        .terminate_and_reap()
+        .map(ChildOutcome::Exited)
+        .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
+    record_settlement_result(child, settled, exit_code, still_running)
 }
 
 fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<ChildOutcome> {
@@ -14638,6 +14651,91 @@ mod tests {
     #[test]
     fn limit_reached_hands_off_the_live_child_instead_of_killing_it() {
         assert_observer_end_hands_off_live_child(CaptureEnd::LimitReached);
+    }
+
+    /// A staged child that is still live at commit is handed back running:
+    /// nothing stays staged and the run reports no status.
+    #[test]
+    fn staged_handoff_commit_hands_back_the_live_child() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        let mut exit_code = Some(999);
+        let mut still_running = false;
+        commit_staged_observer_handoff(
+            &mut pending,
+            CaptureEnd::LimitReached,
+            &mut exit_code,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, None);
+        assert!(still_running);
+        assert!(retained.is_none());
+        assert!(pending.is_none());
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "the staged commit killed the observed program"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
+    /// A staged child that exits before the commit keeps its natural exit:
+    /// the commit reaps it and clears the staging, so the outer commit
+    /// sees no spent owner to refuse.
+    #[test]
+    fn staged_handoff_commit_race_reaps_the_exit_and_clears_pending() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        wait_until(
+            || !pending.as_ref().unwrap().still_running(),
+            "the staged child never reached its exit state",
+        );
+        let mut exit_code = None;
+        let mut still_running = true;
+        commit_staged_observer_handoff(
+            &mut pending,
+            CaptureEnd::LimitReached,
+            &mut exit_code,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(128 + libc::SIGKILL));
+        assert!(!still_running);
+        assert!(retained.is_none());
+        assert!(
+            pending.is_none(),
+            "a reaped child left staged fails the outer handoff commit"
+        );
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the raced exit was not reaped"
+        );
     }
 
     /// A stop the operator requested still settles through the signal path

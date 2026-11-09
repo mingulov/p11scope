@@ -8714,10 +8714,15 @@ fn capture_profile(
                 ),
             );
         }
-        if let Some(bytes) = live_display.frame_bytes(&frame, true) {
-            write_stdout(context.3, context.4, bytes.as_bytes())?;
-            flush_stdout(context.3, context.4)?;
-        }
+        // The frame result is saved, not `?`-returned: a hard stdout error
+        // here must not skip the `-o` write below; both combine at the end.
+        let frame_error = if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+            write_stdout(context.3, context.4, bytes.as_bytes())
+                .and_then(|()| flush_stdout(context.3, context.4))
+                .err()
+        } else {
+            None
+        };
         consumers
             .scheduling
             .add_phase(SchedulingPhase::Render, render_start.elapsed());
@@ -8772,10 +8777,24 @@ fn capture_profile(
                 None => j,
             };
             poll_terminal_cancellation();
-            write_json_report(out_file.file(), &j)?;
-            poll_terminal_cancellation();
-            out_file.commit().map_err(anyhow::Error::msg)?;
-            poll_terminal_cancellation();
+            let out_path = out_file.path().to_path_buf();
+            publish_profile_report_with_fallback(
+                context.3,
+                context.4,
+                &j,
+                Some(&out_path),
+                || {
+                    write_json_report(out_file.file(), &j)?;
+                    poll_terminal_cancellation();
+                    out_file.commit().map_err(anyhow::Error::msg)?;
+                    poll_terminal_cancellation();
+                    Ok(())
+                },
+                frame_error,
+            )?;
+            collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
+        } else if let Some(error) = frame_error {
+            return Err(error);
         }
         if let Some(error) = snapshot_error {
             // The report above sealed from the last good snapshot; the run
@@ -8802,14 +8821,19 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
     file.sync_all().context("syncing profile output")
 }
 
-/// Factored terminal profile publication (pre-fix scaffold): mirrors
-/// today's sequential `?` publication — a frame error returns before the
-/// `-o` write runs, and a failed `-o` write loses the rendered document.
-/// The twins below pin the target behavior.
+/// Terminal profile publication across its two sinks: the `-o` write runs
+/// even when the live frame already hard-failed, and a failed `-o` write
+/// rescues the rendered document to stdout — which carries display frames
+/// only, never the JSON report, so the rescue is a new delivery, not a
+/// duplicate. `frame_error` is the saved live-frame result (`None` when no
+/// frame was due or it wrote); `write_out` performs the real `-o` write
+/// plus atomic commit. A rescued report still returns the `-o` error, so
+/// the run exits nonzero; drops under stdout backpressure stay the
+/// caller's `collect_sink_drops` accounting.
 fn publish_profile_report_with_fallback<W>(
-    _stdout: &mut dyn Write,
-    _stdout_open: &mut bool,
-    _json: &serde_json::Value,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    json: &serde_json::Value,
     out: Option<&Path>,
     write_out: W,
     frame_error: Option<anyhow::Error>,
@@ -8817,13 +8841,69 @@ fn publish_profile_report_with_fallback<W>(
 where
     W: FnOnce() -> Result<()>,
 {
-    if let Some(error) = frame_error {
-        return Err(error);
-    }
-    let Some(_) = out else {
-        return Ok(());
+    let Some(out_path) = out else {
+        return match frame_error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        };
     };
-    write_out()
+    match write_out() {
+        Ok(()) => match frame_error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        },
+        Err(out_error) => Err(match frame_error {
+            Some(frame) => {
+                // stdout just hard-failed on this tick's frame; a rescue
+                // to the same fd would fail identically, so both surface.
+                also_failed(out_error, frame, "terminal stdout frame")
+            }
+            None => {
+                fallback_profile_report_to_stdout(stdout, stdout_open, json, out_path, out_error)
+            }
+        }),
+    }
+}
+
+/// The `-o` write or commit failed, so the already-rendered JSON document
+/// goes to stdout instead of being lost, after a stderr line naming the
+/// failed path. Always returns the `-o` error (plus any rescue failure),
+/// so the run still exits nonzero. Skipped when stdout already closed
+/// (EPIPE): there is no second sink left to try.
+fn fallback_profile_report_to_stdout(
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    json: &serde_json::Value,
+    failed_path: &Path,
+    out_error: anyhow::Error,
+) -> anyhow::Error {
+    if !*stdout_open {
+        return out_error.context("stdout fallback unavailable: stdout is closed");
+    }
+    emit_capture_diagnostic(&format!(
+        "p11scope: output {} failed: {out_error:#}; the JSON report follows on stdout",
+        failed_path.display()
+    ));
+    let mut bytes = vec![b'\n'];
+    if let Err(error) = serde_json::to_writer_pretty(&mut bytes, json) {
+        return also_failed(
+            out_error,
+            anyhow::Error::msg(error),
+            "stdout fallback serialization",
+        );
+    }
+    bytes.push(b'\n');
+    match write_stdout(stdout, stdout_open, &bytes).and_then(|()| flush_stdout(stdout, stdout_open))
+    {
+        Ok(()) => {
+            if *stdout_open {
+                out_error
+            } else {
+                out_error.context("stdout fallback unavailable: stdout closed while writing")
+            }
+        }
+        Err(rescue_error) => also_failed(out_error, rescue_error, "stdout fallback write"),
+    }
 }
 
 /// `p11scope trace`: one line per completed call, printed as it arrives,

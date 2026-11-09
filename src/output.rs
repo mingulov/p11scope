@@ -152,6 +152,11 @@ impl AtomicFile {
         &mut self.temp_file
     }
 
+    /// The final report path, for error and fallback lines naming it.
+    pub fn path(&self) -> &Path {
+        &self.final_path
+    }
+
     /// Identity of the existing final name in the retained directory. This
     /// remains the actual publication target if its parent pathname moves.
     pub(crate) fn destination_identity(&self) -> Result<Option<(u64, u64)>, String> {
@@ -2038,6 +2043,14 @@ mod tests {
         }
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn atomic_file_names_its_report_path() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let a = AtomicFile::create(&path).unwrap();
+        assert_eq!(a.path(), path.as_path());
     }
 
     #[test]

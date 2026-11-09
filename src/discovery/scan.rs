@@ -11473,29 +11473,38 @@ mod tests {
         dir: tempfile::TempDir,
     }
 
-    /// Whether `unshare -m` can mint a mount namespace here. A missing
-    /// `unshare(1)` or a kernel EPERM skips with a reason; anything else
-    /// proceeds so a real failure surfaces loudly at the launch below.
-    fn unshare_mount_probe() -> bool {
+    /// Named-precondition gate for the `nschroot` collapse cell: root
+    /// (chroot), `unshare(1)` and a mintable mount namespace. Any miss
+    /// FAILS with its name; nothing here ever skips.
+    fn nschroot_preflight() -> Result<(), String> {
+        // SAFETY: geteuid takes no arguments and has no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("NSCHROOT-PREFLIGHT root: chroot and mount namespaces need root".into());
+        }
         match std::process::Command::new("unshare")
             .args(["-m", "true"])
             .output()
         {
-            Ok(output) if output.status.success() => true,
+            Ok(output) if output.status.success() => Ok(()),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr.contains("Operation not permitted") {
-                    println!("SKIP: the kernel refused the fixture mount namespace (EPERM)");
-                    false
+                    Err(format!(
+                        "NSCHROOT-PREFLIGHT mountns: the kernel refused the fixture mount namespace: {}",
+                        stderr.trim()
+                    ))
                 } else {
-                    true
+                    // Anything else proceeds so a real failure surfaces
+                    // loudly at the launch below.
+                    Ok(())
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                println!("SKIP: unshare(1) is unavailable: {error}");
-                false
-            }
-            Err(error) => panic!("cannot probe mount namespaces: {error}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "NSCHROOT-PREFLIGHT mountns: unshare(1) is unavailable: {error}"
+            )),
+            Err(error) => Err(format!(
+                "NSCHROOT-PREFLIGHT mountns: cannot probe mount namespaces: {error}"
+            )),
         }
     }
 
@@ -11503,18 +11512,16 @@ mod tests {
         /// Spawn the child half of `test`: `"chroot"` re-runs this binary
         /// directly (shared mount namespace), `"nschroot"` launches it via
         /// `unshare -m` so the whole child process starts in a fresh mount
-        /// namespace. Returns `None` only when mount namespaces are
-        /// unavailable here (missing `unshare(1)` or a kernel EPERM).
-        fn spawn(mode: &str, test: &str) -> Option<Self> {
+        /// namespace. The `"nschroot"` caller passes [`nschroot_preflight`]
+        /// first; a missing precondition fails there with its name, never
+        /// here.
+        fn spawn(mode: &str, test: &str) -> Self {
             // SAFETY: geteuid takes no arguments and has no side effects.
             assert_eq!(
                 unsafe { libc::geteuid() },
                 0,
                 "this cell needs root (chroot)"
             );
-            if mode == "nschroot" && !unshare_mount_probe() {
-                return None;
-            }
             let dir = tempfile::tempdir().unwrap();
             let canonical = dir.path().canonicalize().unwrap();
             let parent_ns = std::fs::read_link("/proc/self/ns/mnt")
@@ -11566,7 +11573,7 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Some(Self { child, dir })
+            Self { child, dir }
         }
 
         fn pid(&self) -> u32 {
@@ -11600,8 +11607,7 @@ mod tests {
         let subject = ChrootScanChild::spawn(
             "chroot",
             "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings",
-        )
-        .expect("plain chroot needs no mount namespace");
+        );
         let pid = subject.pid();
         // Fixture proof: the child really is chrooted, its maps still name
         // host paths, and those paths exist on the host but not under the
@@ -11688,13 +11694,11 @@ mod tests {
             chroot_scan_child_main();
             return;
         }
-        let Some(subject) = ChrootScanChild::spawn(
+        nschroot_preflight().expect("nschroot preconditions hold");
+        let subject = ChrootScanChild::spawn(
             "nschroot",
             "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
-        ) else {
-            // The probe above printed the reason.
-            return;
-        };
+        );
         let pid = subject.pid();
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(

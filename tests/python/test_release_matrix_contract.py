@@ -2944,7 +2944,7 @@ int main(int argc, char **argv) {
         # reach 29 s at load 22 and the 30 s deadlock guard cannot bound a
         # wider dispatch robustly on shared hosts. Every pair stays covered;
         # multi-cell dispatch itself is also exercised by live qualification.
-        selections = [[("full", 32)], [("full", 64)], [("p0", 32)], [("p0", 64)]]
+        selections = [[("full", 32), ("full", 64)], [("p0", 32)], [("p0", 64)]]
         for index, cells in enumerate(selections):
             with self.subTest(cells=cells):
                 _, stage, work, cwd, env, config_path = self.object_stage(

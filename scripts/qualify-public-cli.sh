@@ -538,20 +538,21 @@ assert report["observation"]["passes"] == stream[-1]["event"]["passes"], "passes
 final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
 for key in ["callers", "modules", "edges"]:
     assert len(report[key]) == final["totals"][key], (key, len(report[key]), final["totals"])
-# Totals kept their cadence: a couple of snapshots, never none.
+# Totals kept their cadence: a couple of snapshots, never none. The
+# cadence is anchored at `started`, not at a pass number: on a slow
+# attach the first pass commits after the interval is already due, so
+# the first totals legitimately trails pass 0.
 totals = [row for row in stream if row["kind"] == "totals"]
 assert 1 <= len(totals) <= 4, "totals count %d" % len(totals)
-last_at = 0
+last_at = stream[0]["at_ns"]
 for row in totals:
-    assert row["event"]["pass"] >= 1, row
     position = stream.index(row)
     marker = [r for r in stream[:position] if r["kind"] == "pass_committed"][-1]["event"]
     assert marker["pass"] == row["event"]["pass"], (marker["pass"], row["event"])
     assert row["event"]["passes"] == row["event"]["pass"] + 1, row["event"]
     for key in ["callers", "modules", "edges"]:
         assert row["event"][key] == marker["totals"][key], (key, row["event"], marker["totals"])
-    if last_at:
-        assert row["at_ns"] - last_at >= 2_000_000_000, row
+    assert row["at_ns"] - last_at >= 2_000_000_000, row
     last_at = row["at_ns"]
 # Early close: the observer sheds, reports, keeps its report, exits 1.
 assert os.environ["rc2"] == "1", "early-close rc=%s" % os.environ["rc2"]

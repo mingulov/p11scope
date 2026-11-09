@@ -670,18 +670,21 @@ fn assert_stderr_honest(stderr: &str) {
     );
 }
 
-/// The per-pass gap/refusal/suppressed line (`report_progress`) is the
-/// actual honesty mechanism on refused and partial runs: it must name
+/// The terminal gap/refusal/suppressed line is the actual honesty
+/// mechanism on refused and partial runs: computed from the same snapshot
+/// as the JSON document, after the terminal disclosures commit, it must name
 /// exactly the gap, budget-refusal, and suppressed counts the document
-/// carries. Parses `p11scope: pass N: G gap(s) (R budget refusal(s), S
+/// carries. Per-pass lines are progress — cumulative when their pass
+/// published — so churn after the last pass can leave them below the final
+/// counts. Parses `p11scope: final: G gap(s) (R budget refusal(s), S
 /// suppressed)` and pins all three against the caller's exact values.
-fn assert_pass_gap_line(stderr: &str, pass: u64, gaps: usize, refusals: usize, suppressed: u64) {
-    let prefix = format!("p11scope: pass {pass}: ");
+fn assert_final_gap_line(stderr: &str, gaps: usize, refusals: usize, suppressed: u64) {
+    let prefix = "p11scope: final: ";
     let line = stderr
         .lines()
-        .find(|line| line.starts_with(&prefix) && line.contains("budget refusal"))
-        .unwrap_or_else(|| panic!("pass {pass} gap/refusal/suppressed line present: {stderr:?}"));
-    let rest = line.strip_prefix(&prefix).unwrap();
+        .find(|line| line.starts_with(prefix) && line.contains("budget refusal"))
+        .unwrap_or_else(|| panic!("final gap/refusal/suppressed line present: {stderr:?}"));
+    let rest = line.strip_prefix(prefix).unwrap();
     let (seen_gaps, rest) = rest.split_once(' ').unwrap();
     let seen_gaps: usize = seen_gaps.parse().unwrap();
     let inner = rest.split('(').nth(1).unwrap().strip_suffix(')').unwrap();
@@ -1288,11 +1291,18 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
         "the truncation gap names the overflowed budget: {}",
         doc["gaps"]
     );
-    // The stderr gap line names exactly what the document carries —
-    // the honesty mechanism on a partial run.
+    // The stderr honesty line names exactly what the document carries.
+    // The per-pass line is progress (it predates the terminal disclosures),
+    // so only its presence is pinned; the final line carries the exact pin.
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("p11scope: pass 0: ") && line.contains("budget refusal")),
+        "pass 0 progress gap line present: {stderr:?}"
+    );
     let refusals = gaps.iter().filter(|gap| !gap["budget"].is_null()).count();
     let suppressed = doc["gaps_suppressed"].as_u64().unwrap();
-    assert_pass_gap_line(&stderr, 0, gaps.len(), refusals, suppressed);
+    assert_final_gap_line(&stderr, gaps.len(), refusals, suppressed);
     assert_settled_consistent(&doc);
     fd_scope.assert_delta(0);
 }

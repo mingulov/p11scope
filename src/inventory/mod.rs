@@ -1973,6 +1973,14 @@ fn run_with_terminal_budget(
     if let Some(zero) = &zero_pass {
         inventory_diagnostic(&zero.stderr_line());
     }
+    // The terminal honesty line, from the same snapshot as the sinks below:
+    // the per-pass lines predate the terminal disclosures. Verbose-only,
+    // like the per-pass gap line.
+    if crate::cli::text_is_verbose()
+        && let Some(line) = final_gap_line(&presentation)
+    {
+        inventory_diagnostic(&line);
+    }
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
@@ -8524,6 +8532,13 @@ fn run_dashboard(
     if let Some(zero) = &zero_pass {
         display.notice(&zero.stderr_line());
     }
+    // The terminal honesty line, from the same snapshot as the sinks below;
+    // verbose-only, like the per-pass gap line on the classic path.
+    if crate::cli::text_is_verbose()
+        && let Some(line) = final_gap_line(&presentation)
+    {
+        display.notice(&line);
+    }
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
     let diagnostic_outcome = diagnostic_outcome(
@@ -8892,6 +8907,35 @@ fn progress_lines<Source: ProcessSource>(
         ));
     }
     lines
+}
+
+/// The terminal honesty line: gap, budget-refusal, and suppressed counts
+/// from the SAME immutable [`Presentation`] the JSON document renders,
+/// emitted after the terminal disclosures commit (post-pass newcomers,
+/// short-lived processes, the pre-arm close). Per-pass lines are progress
+/// — cumulative when their pass published — so churn between the last pass
+/// and the stop gate can leave them below the final counts; this line can
+/// never disagree with the document. `None` when there is nothing to
+/// disclose, like the per-pass line.
+fn final_gap_line(presentation: &Presentation) -> Option<String> {
+    let gaps = presentation.gaps.len();
+    let suppressed = presentation.gaps_suppressed;
+    if gaps == 0 && suppressed == 0 {
+        return None;
+    }
+    let refusals = presentation
+        .gaps
+        .iter()
+        .filter(|gap| gap.budget.is_some())
+        .count();
+    Some(format!(
+        "p11scope: final: {} gap{} ({} budget refusal{}, {} suppressed)",
+        gaps,
+        if gaps == 1 { "" } else { "s" },
+        refusals,
+        if refusals == 1 { "" } else { "s" },
+        suppressed,
+    ))
 }
 
 fn caller_json(
@@ -15461,6 +15505,83 @@ mod tests {
             lines.iter().any(|line| line
                 == "p11scope: pass 4: caller admission failed for pid 9: cannot pin pid 9"),
             "the single failure keeps its line: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn final_gap_line_agrees_with_document_when_a_terminal_gap_lands_late() {
+        // The scan-cap race, deterministically: the pass-0 stderr line is
+        // computed at pass publication, then one terminal gap stages (post-pass
+        // churn disclosed after the last pass, like
+        // `disclose_scan_terminal_newcomers`) before the final document. The
+        // pass line stays at its pass-time count while the document carries
+        // one more; the final line, computed from the same snapshot as the
+        // document, agrees with it.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("pass-time gap".into(), "visible at pass publication".into());
+        coordinator.commit_batch(false).unwrap();
+        let report = stream_identity_report(Vec::new());
+        let pass_lines = progress_lines(&coordinator, &report);
+        let pass_gap = pass_lines
+            .iter()
+            .find(|line| line.contains("budget refusal"))
+            .expect("the pass carries its gap line");
+        assert_eq!(
+            pass_gap,
+            "p11scope: pass 0: 1 gap (0 budget refusals, 0 suppressed)"
+        );
+        // Deterministic hook for the late terminal disclosure.
+        coordinator.enter_terminal_phase();
+        coordinator.note_scope_gap(
+            "late terminal gap".into(),
+            "staged after the pass line".into(),
+        );
+        coordinator.commit_batch(false).unwrap();
+        let final_presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let document = render_json_from_presentation(&final_presentation);
+        let gaps = document["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2, "the late gap reached the document");
+        let refusals = gaps.iter().filter(|gap| !gap["budget"].is_null()).count();
+        let suppressed = document["gaps_suppressed"].as_u64().unwrap();
+        let final_line =
+            final_gap_line(&final_presentation).expect("a final gap line when gaps exist");
+        assert_eq!(
+            final_line,
+            format!(
+                "p11scope: final: {} gaps ({} budget refusals, {} suppressed)",
+                gaps.len(),
+                refusals,
+                suppressed
+            )
+        );
+    }
+
+    #[test]
+    fn final_gap_line_agrees_with_document_without_a_late_gap() {
+        // Healthy twin: nothing stages after the pass line, so the pass
+        // line, the final line, and the document all agree.
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("pass-time gap".into(), "visible at pass publication".into());
+        coordinator.commit_batch(false).unwrap();
+        let report = stream_identity_report(Vec::new());
+        let pass_lines = progress_lines(&coordinator, &report);
+        let pass_gap = pass_lines
+            .iter()
+            .find(|line| line.contains("budget refusal"))
+            .expect("the pass carries its gap line");
+        assert_eq!(
+            pass_gap,
+            "p11scope: pass 0: 1 gap (0 budget refusals, 0 suppressed)"
+        );
+        let final_presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let document = render_json_from_presentation(&final_presentation);
+        let gaps = document["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "no late gap, one documented gap");
+        let final_line =
+            final_gap_line(&final_presentation).expect("a final gap line when gaps exist");
+        assert_eq!(
+            final_line,
+            "p11scope: final: 1 gap (0 budget refusals, 0 suppressed)"
         );
     }
 

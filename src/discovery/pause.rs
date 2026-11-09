@@ -10727,7 +10727,8 @@ mod tests {
     }
 
     /// SIGINT during a held `auto` pause ends the run by signal with its
-    /// report, not with a `pause coordination cancelled` error. The child
+    /// report, not with a `pause coordination cancelled` error; under
+    /// `always` the run fails with that error and still writes the report. The child
     /// preloads the provider and then sleeps, so its startup loader hit
     /// holds deterministically; the one-shot hook raises a real SIGINT at
     /// that first proven hold (the child is stopped then). The cancelled
@@ -10790,8 +10791,9 @@ mod tests {
         );
 
         // The `always` twin: a required pause keeps refusing. The same stop
-        // during the same hold fails the run with the cancellation and
-        // publishes no report.
+        // during the same hold fails the run with the cancellation, but the
+        // calls already captured still publish (data always): the report is
+        // written and never reads as a complete paused capture.
         let mut argv: Vec<std::ffi::OsString> = vec![
             "run".into(),
             "--pause".into(),
@@ -10820,9 +10822,22 @@ mod tests {
             format!("{error:#}").contains("pause coordination cancelled"),
             "the refusal names the cancellation: {error:#}"
         );
+        let always: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("sigint-hold-always.json"))
+                .expect("a refused required pause still publishes its report"),
+        )
+        .expect("valid JSON");
         assert!(
-            !dir.join("sigint-hold-always.json").exists(),
-            "a refused required pause publishes no report"
+            always["functions"].as_array().is_some(),
+            "the refused run's report carries the function table"
+        );
+        assert_eq!(
+            always["completeness"], "PARTIAL",
+            "a refused required pause is never a complete capture"
+        );
+        assert_ne!(
+            always["pause"], "sigstop",
+            "a refused required pause never reads as a confirmed pause"
         );
     }
 

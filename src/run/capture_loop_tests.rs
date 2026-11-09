@@ -3258,3 +3258,49 @@ fn instance_continuity_tail_never_reaches_any_renderer() {
         canary.assert_clean(output, surface);
     }
 }
+
+/// Data always: a pause cancellation that fails the capture loop, under
+/// `--pause always` or `auto`, still seals the report (settle as an error
+/// end, publish, then detach); the error stays the outer error, and the
+/// `always` wrap names the interruption rather than claiming success.
+#[test]
+fn pause_cancellation_loop_failure_still_seals_the_report() {
+    for policy in [
+        crate::cli::PausePolicy::Always,
+        crate::cli::PausePolicy::Auto,
+    ] {
+        let mut phases = Vec::new();
+        let result = finish_capture_with(
+            &mut phases,
+            Err(anyhow::anyhow!("pause: pause coordination cancelled")),
+            |phases| phases.push("gap"),
+            |phases, result| {
+                phases.push("finish");
+                assert_eq!(result.as_ref().ok(), Some(&CaptureEnd::Error));
+                result
+            },
+            |phases| {
+                phases.push("detach");
+                Ok(())
+            },
+            |phases, end, _detached| {
+                assert_eq!(end, CaptureEnd::Error);
+                phases.push("terminal");
+                Ok(())
+            },
+        );
+        assert_eq!(
+            phases,
+            ["gap", "finish", "terminal", "detach"],
+            "{policy:?}"
+        );
+        let error = result.expect_err("the refused run still fails");
+        let signals = SignalState::new();
+        signals.observe(libc::SIGINT);
+        let text = match policy {
+            crate::cli::PausePolicy::Always => format!("{:#}", always_wrap(&signals, error)),
+            _ => format!("{error:#}"),
+        };
+        assert!(text.contains("pause coordination cancelled"), "{text}");
+    }
+}

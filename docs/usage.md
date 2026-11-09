@@ -908,16 +908,18 @@ each incomplete cycle stays a counted partial attempt while the chain
 continues, and four straight incompletes retire the chain with a counted
 named gap (the retirement count is
 `evidence.pause_engine_incomplete_retirements`). Under `--pause always`
-the run fails instead: no profile
-report is published (a trace `-o` stream keeps only the lines already
-written), and a `--duration` child is terminated rather than handed back. A
+the run fails instead (exit nonzero with the pause error), but the calls
+already captured are still written to the `-o` report, which reads
+`PARTIAL` and never `pause: sigstop`; a `--duration` child is terminated
+rather than handed back. A
 signal that lands inside an active `auto` pause cycle (which has a 500 ms
 deadline) cancels that cycle instead: the child is resumed, the cancelled
 attempt counts one partial, and the run ends by signal with its report
 rather than an error. Under `--pause always` the same stop still ends the
-run with a `pause coordination cancelled` error and no report: required
-pause protection that cannot complete refuses rather than capturing
-unpaused.
+run with a `pause coordination cancelled` error (exit nonzero): required
+pause protection that cannot complete refuses rather than passing as a
+paused capture. The report of what was captured is still written, reads
+`PARTIAL`, and does not claim a confirmed pause.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 256 members per pass, rarest providers first; past the cap the capture

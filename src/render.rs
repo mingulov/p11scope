@@ -1737,12 +1737,12 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
     // slot to `unknown`, and the nullness itself is still evidence worth
     // keeping — without claiming which function was null.
     let gated_null = s.subject == crate::plan::UNKNOWN_FUNCTION_NAME && s.reason == "null pointer";
-    let reason = if s.subject == "live inventory pass" {
-        // Dropped inventory passes (one producer) publish the generic
-        // discovery reason the schema and the evidence checker accept,
-        // decided by subject before any reason-text match: the error
-        // chain may quote another category's text. The chain itself
-        // stays in diagnostics.
+    let reason = if s.subject == "live inventory pass" || s.subject == "live process admission" {
+        // Dropped inventory passes and held-back processes (one producer
+        // each) publish the generic discovery reason the schema and the
+        // evidence checker accept, decided by subject before any
+        // reason-text match: the error chain may quote another
+        // category's text. The chain itself stays in diagnostics.
         DISCOVERY_UNAVAILABLE
     } else if function {
         if s.reason == "null pointer" {
@@ -1959,9 +1959,16 @@ fn dropped_pass_gaps_project_to_a_schema_reason() {
         "pass 7 dropped: provider object 3 has no exact opened identity",
         "pass 4 dropped: physical identity is ambiguous for object 9",
         "pass 5 dropped: no function table was found in its file-backed data",
-    ] {
+    ]
+    .into_iter()
+    .map(|reason| ("live inventory pass", reason))
+    .chain([(
+        "live process admission",
+        "a process whose data broke the inventory pass is held back from admission and retried later",
+    )]) {
+        let (subject, reason) = reason;
         let projected = capture_skipped_out(&Skipped {
-            subject: "live inventory pass".into(),
+            subject: subject.into(),
             reason: reason.into(),
         });
         assert_eq!(projected.name, "discovery subject", "{reason}");

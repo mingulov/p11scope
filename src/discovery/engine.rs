@@ -833,6 +833,14 @@ pub struct Engine {
     /// plus reason and only adds, so a rewritten reason would publish a
     /// new entry per drop.
     dropped_pass_gap: Option<Skipped>,
+    /// Not-yet-admitted processes held back because their own data broke
+    /// the tick candidate on its own (`isolate_broken_newcomers`): each is
+    /// left out of admission until its retry pass, so it cannot block
+    /// other processes. Pruned when the pid leaves the scope or is
+    /// admitted; bounded by the live scope.
+    held_back: BTreeMap<u32, HeldBack>,
+    /// Processes held back over the capture (each counted once).
+    held_back_total: u64,
     /// Consecutive dropped tick passes since the last tick that completed
     /// without dropping (batch-tail drops do not count). Past `DROPPED_PASS_RETAIN_LIMIT`, a drop
     /// completes serviced requests so a persistently poisoned tick
@@ -912,6 +920,22 @@ pub struct Engine {
 /// before a further drop completes them: two retries cover transient
 /// faults, then the capture degrades instead of stalling.
 const DROPPED_PASS_RETAIN_LIMIT: u64 = 2;
+
+/// Named gap for processes held back from admission: fixed text, so the
+/// published output keeps one entry however many processes are held.
+const HELD_BACK_SUBJECT: &str = "live process admission";
+const HELD_BACK_REASON: &str =
+    "a process whose data broke the inventory pass is held back from admission and retried later";
+/// Retry delay for a held-back process, in inventory passes; doubles per
+/// repeated isolation up to `HELD_BACK_RETRY_BASE_PASSES << 6`.
+const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
+
+/// One held-back process: how often it was isolated and the inventory
+/// pass from which admission retries it.
+struct HeldBack {
+    strikes: u32,
+    retry_pass: u64,
+}
 
 /// Internal dropped-pass aggregate for one error text: how many passes
 /// dropped with it, and the first/last pass numbers (diagnostics only).
@@ -11082,6 +11106,8 @@ impl Engine {
             inventory_passes: 0,
             dropped_pass_gaps: BTreeMap::new(),
             dropped_pass_gap: None,
+            held_back: BTreeMap::new(),
+            held_back_total: 0,
             consecutive_dropped_passes: 0,
             exploratory_evictions: 0,
             probationary_completions: 0,
@@ -12891,6 +12917,77 @@ impl Engine {
             reason: reason.clone(),
         });
         self.mark_partial(SUBJECT, &reason);
+    }
+
+    /// Per-process degradation for a failed first tick candidate: when the
+    /// pass builds without this tick's newcomers, each newcomer is tried
+    /// alone, and every newcomer whose own data breaks the candidate is
+    /// held back (released, counted, one named gap) while the pass
+    /// commits the rest. Returns the rebuilt candidate, or `None` when the
+    /// failure is not attributable to single newcomers (the caller drops
+    /// the pass as before). Runs only on the failure path; its extra
+    /// candidate builds are bounded by the tick's admission window.
+    fn isolate_broken_newcomers(
+        &mut self,
+        removed: &BTreeSet<ProcessViewId>,
+        refreshed: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
+        new_views: &mut Vec<InventoryNewView>,
+        skipped: &[Skipped],
+        declined: &BTreeSet<ProcessViewId>,
+    ) -> Option<(LiveCandidate, BTreeSet<u32>)> {
+        if new_views.is_empty()
+            || self
+                .inventory_candidate(removed, refreshed, &[], skipped.to_vec(), declined)
+                .is_err()
+        {
+            return None;
+        }
+        let broken: Vec<usize> = (0..new_views.len())
+            .filter(|&index| {
+                self.inventory_candidate(
+                    removed,
+                    refreshed,
+                    &new_views[index..=index],
+                    skipped.to_vec(),
+                    declined,
+                )
+                .is_err()
+            })
+            .collect();
+        if broken.is_empty() {
+            return None;
+        }
+        let pass = self.inventory_passes;
+        let mut held = BTreeSet::new();
+        let mut released = Vec::with_capacity(broken.len());
+        for index in broken.into_iter().rev() {
+            let entry = new_views.remove(index);
+            let pid = entry.0.pid();
+            held.insert(pid);
+            let hold = self.held_back.entry(pid).or_insert(HeldBack {
+                strikes: 0,
+                retry_pass: 0,
+            });
+            if hold.strikes == 0 {
+                self.held_back_total = self.held_back_total.saturating_add(1);
+            }
+            hold.strikes = hold.strikes.saturating_add(1);
+            hold.retry_pass =
+                pass.saturating_add(HELD_BACK_RETRY_BASE_PASSES << (hold.strikes - 1).min(6));
+            released.push(entry);
+        }
+        self.release_unadmitted_views(released);
+        self.mark_partial(HELD_BACK_SUBJECT, HELD_BACK_REASON);
+        let candidate = self
+            .inventory_candidate(removed, refreshed, new_views, skipped.to_vec(), declined)
+            .ok()?;
+        Some((candidate, held))
+    }
+
+    /// Test-only: processes currently held back from admission.
+    #[cfg(test)]
+    fn held_back_count_for_test(&self) -> usize {
+        self.held_back.len()
     }
 
     /// A dropped tick pass: counts toward the consecutive-drop chain
@@ -24861,7 +24958,21 @@ impl Engine {
             .filter(|view| !removed.contains(&view.id()))
             .map(ProcessView::pid)
             .collect();
-        let new_pids: Vec<_> = desired.difference(&known_pids).copied().collect();
+        // Held-back processes (their own data broke a candidate) wait for
+        // their retry pass instead of blocking every later admission; a
+        // hold ends when the pid leaves the scope or gets admitted.
+        self.held_back
+            .retain(|pid, _| live.contains(pid) && !known_pids.contains(pid));
+        let pass = self.inventory_passes;
+        let new_pids: Vec<_> = desired
+            .difference(&known_pids)
+            .copied()
+            .filter(|pid| {
+                self.held_back
+                    .get(pid)
+                    .is_none_or(|hold| pass >= hold.retry_pass)
+            })
+            .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Scan,
             "inventory_enumerate",
@@ -25090,12 +25201,24 @@ impl Engine {
             },
         ) {
             Ok(candidate) => candidate,
-            Err(error) => {
-                self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
-                *additions_allowed = false;
-                closure.fail();
-                return Ok(false);
-            }
+            Err(error) => match self.isolate_broken_newcomers(
+                &removed,
+                &refreshed_scans,
+                new_views,
+                &skipped,
+                &declined,
+            ) {
+                Some((candidate, held)) => {
+                    new_view_pids.retain(|pid| !held.contains(pid));
+                    candidate
+                }
+                None => {
+                    self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
+                    *additions_allowed = false;
+                    closure.fail();
+                    return Ok(false);
+                }
+            },
         };
         let admission_start = crate::attach::monotonic_ns();
         let admission = inventory_admission_observed(

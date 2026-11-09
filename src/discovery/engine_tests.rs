@@ -68274,16 +68274,84 @@ fn repeated_drops_publish_exactly_one_fixed_gap() {
         .filter(|skip| skip.subject == "live inventory pass")
         .collect();
     assert_eq!(internal, vec![&first[0]], "one internal gap as well");
-    let projected: Vec<_> = engine
-        .plan
-        .skipped
-        .iter()
-        .map(crate::render::capture_skipped_out)
-        .filter(|skip| skip.reason == "discovery unavailable")
+    let projected = crate::render::capture_skipped_out(published[0]);
+    assert_eq!(
+        (projected.name.as_str(), projected.reason.as_str()),
+        ("discovery subject", "discovery unavailable"),
+        "the dropped-pass gap itself projects to a schema reason"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Drops with different error texts share the one fixed gap: the first
+/// drop's text is published and never replaced; each error keeps its own
+/// internal count.
+#[test]
+fn drops_with_different_errors_share_the_one_fixed_gap() {
+    const APPLY: &str = "test-forced apply failure";
+    const POISON: &str = "test-forced poisoned candidate failure";
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    drop_one_more_pass(&mut engine, &mut session, pid, APPLY, true);
+    let first: Vec<Skipped> = published_inventory_pass_gaps(&engine)
+        .into_iter()
+        .cloned()
         .collect();
+    assert_eq!(first.len(), 1, "{first:?}");
+    drop_one_more_pass(&mut engine, &mut session, pid, APPLY, true);
+    engine.fail_candidate_with_pid_for_test = Some(pid);
+    drop_one_more_pass(&mut engine, &mut session, pid, POISON, false);
+    drop_one_more_pass(&mut engine, &mut session, pid, POISON, false);
+    assert_eq!(engine.dropped_pass_count_for_test(APPLY), 2);
+    assert_eq!(engine.dropped_pass_count_for_test(POISON), 2);
+    let published = published_inventory_pass_gaps(&engine);
+    assert_eq!(
+        published.len(),
+        1,
+        "one published gap across error texts: {:?}",
+        engine.plan.skipped
+    );
+    assert_eq!(*published[0], first[0], "the first drop's text stays");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// An idle tick (nothing requested, nothing changed) also resets the
+/// consecutive-drop chain.
+#[test]
+fn idle_tick_resets_the_consecutive_drop_chain() {
+    const ERROR: &str = "test-forced apply failure";
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    assert_eq!(engine.consecutive_dropped_passes, 1);
     assert!(
-        !projected.is_empty(),
-        "the gap projects to a schema reason in the capture JSON"
+        engine.refresh_requested.is_empty() || engine.refresh_requested.contains_key(&pid),
+        "only the dropped request may wait"
+    );
+    engine.refresh_requested.clear();
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(
+        engine.consecutive_dropped_passes, 0,
+        "an idle tick breaks the chain"
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -68355,13 +68423,22 @@ fn dropped_tail_does_not_count_toward_the_tick_drop_chain() {
     assert_eq!(engine.consecutive_dropped_passes, 0);
 }
 
-/// Disclosed limit pin: a not-yet-admitted process whose inputs break
-/// every tick candidate is offered again on every tick, so it is never
-/// admitted; escalation completes the other serviced requests without
-/// applying them, and the capture keeps going with one published gap.
+fn admission_gaps(engine: &Engine) -> Vec<&Skipped> {
+    engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live process admission")
+        .collect()
+}
+
+/// A not-yet-admitted process whose own data breaks the tick candidate
+/// is held back alone, with one named gap, while the pass commits the
+/// rest: a healthy process that appears later is still admitted, and no
+/// dropped-pass gap is recorded for the isolated failure. The gap keeps
+/// the capture from claiming complete coverage.
 #[test]
-fn poisoned_newcomer_is_never_admitted_and_publishes_one_gap() {
-    const ERROR: &str = "test-forced poisoned candidate failure";
+fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
     let mut kept = std::process::Command::new("sleep")
         .arg("30")
         .die_with_parent()
@@ -68385,29 +68462,122 @@ fn poisoned_newcomer_is_never_admitted_and_publishes_one_gap() {
     )
     .unwrap();
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
-    for _ in 0..4 {
-        drop_one_more_pass(&mut engine, &mut session, kept_pid, ERROR, false);
+    for _round in 0..3 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![])
+            .expect("a broken newcomer never aborts the capture");
+    }
+    let mut healthy = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let healthy_pid = healthy.id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{kept_pid}\n{poison_pid}\n{healthy_pid}\n"),
+    )
+    .unwrap();
+    let mut admitted = false;
+    for _round in 0..12 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![])
+            .expect("a broken newcomer never aborts the capture");
+        if engine.views.iter().any(|view| view.pid() == healthy_pid) {
+            admitted = true;
+            break;
+        }
     }
     let pids: Vec<_> = engine.views.iter().map(ProcessView::pid).collect();
-    assert_eq!(
-        pids,
-        vec![kept_pid],
-        "the poisoned newcomer stays unadmitted"
-    );
     assert!(
-        !engine.refresh_requested.contains_key(&kept_pid),
-        "past the retain limit the unrelated request completes unapplied"
-    );
-    assert_eq!(
-        published_inventory_pass_gaps(&engine).len(),
-        1,
-        "{:?}",
+        admitted,
+        "the healthy late process is admitted despite the broken one: {pids:?} {:?}",
         engine.plan.skipped
     );
+    assert!(pids.contains(&kept_pid), "{pids:?}");
+    assert!(
+        !pids.contains(&poison_pid),
+        "the broken process stays held back: {pids:?}"
+    );
+    for _round in 0..3 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    }
+    assert!(!engine.views.iter().any(|view| view.pid() == poison_pid));
+    assert_eq!(
+        admission_gaps(&engine).len(),
+        1,
+        "one named gap for held-back processes: {:?}",
+        engine.plan.skipped
+    );
+    assert!(
+        engine.held_back_count_for_test() >= 1,
+        "the hold is counted"
+    );
+    assert!(
+        published_inventory_pass_gaps(&engine).is_empty(),
+        "an isolated failure commits the pass instead of dropping it: {:?}",
+        engine.plan.skipped
+    );
+    let projected: Vec<_> = admission_gaps(&engine)
+        .into_iter()
+        .map(crate::render::capture_skipped_out)
+        .collect();
+    assert_eq!(projected[0].reason, "discovery unavailable");
     let _ = kept.kill();
     let _ = kept.wait();
     let _ = poison.kill();
     let _ = poison.wait();
+    let _ = healthy.kill();
+    let _ = healthy.wait();
+}
+
+/// When the broken process leaves, its hold is released and the gap
+/// stays as history.
+#[test]
+fn held_back_process_is_forgotten_when_it_exits() {
+    let mut kept = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let kept_pid = kept.id();
+    let (mut engine, dir) = engine_over_cgroup_naming(&[kept_pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut poison = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let poison_pid = poison.id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{kept_pid}\n{poison_pid}\n"),
+    )
+    .unwrap();
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    let mut held = false;
+    for _round in 0..12 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        if engine.held_back_count_for_test() > 0 {
+            held = true;
+            break;
+        }
+    }
+    assert!(held, "the broken newcomer is held back");
+    poison.kill().unwrap();
+    poison.wait().unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{kept_pid}\n")).unwrap();
+    for _round in 0..3 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    }
+    assert_eq!(
+        engine.held_back_count_for_test(),
+        0,
+        "the exited hold is released"
+    );
+    assert_eq!(admission_gaps(&engine).len(), 1, "the gap stays as history");
+    let _ = kept.kill();
+    let _ = kept.wait();
 }
 
 /// The first two consecutive drops retain serviced requests for retry

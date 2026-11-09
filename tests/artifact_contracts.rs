@@ -15466,10 +15466,7 @@ fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
                     // annotation uses it), so entries on this line are
                     // parsed too instead of silently dropping the block.
                     let rest = rest.trim().trim_start_matches('=').trim();
-                    assert!(
-                        rest.starts_with('['),
-                        "unexpected REUSE path line: {line}"
-                    );
+                    assert!(rest.starts_with('['), "unexpected REUSE path line: {line}");
                     let rest = rest.strip_prefix('[').unwrap_or("").trim();
                     in_paths = true;
                     for chunk in rest.split(',') {

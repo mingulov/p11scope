@@ -767,6 +767,16 @@ fn script_snap_refusal_error(
     )
 }
 
+/// The invoker identity the runnable pre-check reads files as,
+/// fail-closed: an unresolvable `--user` leaves no invoker, so
+/// interpreter tokens hide instead of leaking through the observer's
+/// own readability.
+fn invoker_for_runnable_check(user: Option<&OsStr>) -> Option<(u32, u32)> {
+    ChildIdentity::for_run_selection(user)
+        .ok()
+        .map(|identity| (identity.uid, identity.gid))
+}
+
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: what cannot
 /// run is refused before any kernel verdict is consulted.
@@ -785,9 +795,7 @@ fn check_owned_target_runnable(
         args,
         std::env::var_os("PATH").as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-        ChildIdentity::for_run_selection(user)
-            .ok()
-            .map(|identity| (identity.uid, identity.gid)),
+        invoker_for_runnable_check(user),
         &probes,
     )
 }

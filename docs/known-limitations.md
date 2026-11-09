@@ -365,10 +365,10 @@ names the source SHA behind each check the release rounds re-measured.
   `native usage feed unavailable` gap), while `profile`, `trace`, `run`
   and `inventory --capture native` refuse with a `live capture ...`
   refusal (`unavailable` or `did not start`). A short `--cgroup` fallback
-  there can still report an empty view: when the run ends before the
-  first pass completes, the collection is discarded with the `no complete
-  collection pass` gap (0 callers), because the kept first pass covers
-  `--pid`/`--system` only.
+  there publishes its completed first pass like `--pid`/`--system`
+  (modules and callers shown, counts unknown); only a run whose
+  deadline already passed before the first collection starts still
+  reports the empty view with the `no complete collection pass` gap.
 - Per-key rows cover operations that start after the attach.
   Attaching to an already-running process (for example a running
   Firefox or Chromium) works: operations that start after the attach
@@ -507,13 +507,19 @@ capture can refuse its fixed 384 MiB graph pool: the stop ends as a
 finite incomplete stop, with retired objects still reported attached
 and the measured peak disclosed (full entry below).
 
-A timed `--cgroup` run shorter than the first full pass (5–10 s on
-a busy host) still discards the collection and reports 0 callers
-with a `no complete collection pass` gap and one informational
-stderr line (the retained-pass path; follow-up planned below).
-Under `--pid` and `--system`, v0.7.0 instead publishes the completed
-first collection scan-only — modules and callers shown, counts
-`not attached` — with a `stopped before attach` scope gap. The first
+A timed run shorter than the first full pass (5–10 s on a busy
+host) still publishes that first collection on every scope: pass 0
+runs to completion past the deadline, then the run ends. Modules
+and callers are shown; on a live lane counts read `not attached`
+with a `stopped before attach` scope gap, since no attach starts
+after the stop. Only a run whose deadline already passed before
+the first collection starts reports 0 callers with the `no complete
+collection pass` gap and one informational stderr line. An operator
+stop during a `--cgroup` pass-0 collection still cancels it
+promptly, so Ctrl-C stays responsive: that run reports 0 callers
+with the `cgroup scope transaction incomplete` gap, while
+`--pid`/`--system` finish the in-flight collection and keep it
+scan-only. The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or
@@ -1017,10 +1023,6 @@ detail during a counter capture (`--select-endpoint`).
   further cut the short-run void rate.
 - Tracking short-lived processes that exit before their first binding
   (exit-time mapping verdicts shipped; full call attribution still planned).
-- Publishing a stopped `--cgroup` first pass scan-only: v0.7.0 keeps
-  the completed first collection under `--pid`/`--system` instead of
-  discarding it, but the `--cgroup` retained-pass path still reports
-  0 callers with the `no complete collection pass` gap.
 - Following the started command's process tree under `run`
   (descendant admission and per-descendant probes, scoped to that tree
   only).
@@ -1095,9 +1097,8 @@ and the measured peak disclosed (full entry below).
 
 A timed run shorter than the first full pass (5–10 s on a busy host)
 discards the collection and reports 0 callers with a `no complete
-collection pass` gap and one informational stderr line (v0.7.0 keeps
-this only on the `--cgroup` retained-pass path; `--pid` and `--system`
-now publish the kept first collection scan-only). The first
+collection pass` gap and one informational stderr line (v0.7.0
+publishes the kept first collection on every scope instead). The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or

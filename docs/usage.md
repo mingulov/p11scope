@@ -463,7 +463,9 @@ the rendered lines name that gap instead of printing an empty section.
 > its path instead, so the target account needs search permission on it, and
 > the path is re-verified at the barrier rather than pinned: a script whose
 > path no longer names the opened file is refused at the barrier instead of
-> running unchecked. The sudo path runs
+> running unchecked. A path replacement landing between that check and
+> `execve` is not covered; only ELF execution stays descriptor-pinned.
+> The sudo path runs
 > the child as the invoker with the invoker's supplementary groups from the
 > account database (glibc may return only the primary group) and home
 > environment, as if the user had run the command directly:

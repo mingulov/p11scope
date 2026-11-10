@@ -707,18 +707,34 @@ assert not outside_ids, 'outside workload leaked into cgroup inventory'
 edges=report.get('edges',[])
 assert any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module'
 owned_gaps=[g for g in report.get('gaps',[]) if g.get('module')==owned]
-if modfs=='overlayfs':
+# The decided no-witness shape (PARTIAL): with no kernel witness the
+# observer keeps the admitted module and its data, plus exactly the
+# named gaps — per-caller unproven, the scan-pinned fallback, and the
+# module-level unidentified-caller positive below. The unbound reason
+# frames one diagnosed binder first-cause, so the oracle matches its
+# fixed framing (same precedent as the unproven prefix).
+def named_unbound(g):
+    if g.get('module')!=owned: return False
+    if g.get('subject')!='used by an unidentified caller image': return False
+    if g.get('caller') is not None or g.get('pid') is not None: return False
+    reason=g.get('reason') or ''
+    return reason.startswith(modpath+': native witness rows of this module were not bound to a caller incarnation (first: ') and reason.endswith('); module-level positive use only, never attributed by pid')
+no_witness=any((g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') for g in report.get('gaps',[]))
+degraded=modfs=='overlayfs' or no_witness
+if degraded:
     # An admission rise across passes is an informative note, not
-    # loss; anything else about the owned module still fails.
-    owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed']
+    # loss, and the decided no-witness shape carries the named
+    # module-level positive; anything else about the owned module
+    # still fails.
+    owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
     assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
 else:
     assert owned_gaps==[], 'inventory gaps about owned module: %r' % owned_gaps
 unproven=[]
-if modfs=='overlayfs':
-    # The published overlay shape keeps the named unproven gap per
-    # inside caller (PARTIAL coverage via the gaps): the witness
-    # never ran, so no proof is claimed.
+if degraded:
+    # The published degraded (overlay or no-witness) shape keeps the
+    # named unproven gap per inside caller (PARTIAL coverage via the
+    # gaps): the witness never ran, so no proof is claimed.
     want=sorted(set(inside_ids+child_ids))
     unproven=[g for g in report.get('gaps',[]) if (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
     assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
@@ -726,10 +742,11 @@ if modfs=='overlayfs':
     for g in unproven:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
-    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed']
+    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
     # The per-caller activation refusal plus, when a pass straddles
     # the run deadline, the designed collection bound (ruling CI-GAP-2,
-    # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md).
+    # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
+    # plus the named module-level positive (excluded above).
     # The unproven member gaps degrade per caller without incompleting
     # the shared transaction, so 'cgroup member scan was incomplete'
     # is deliberately NOT known here: its reappearance fails loudly

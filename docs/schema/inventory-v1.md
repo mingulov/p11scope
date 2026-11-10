@@ -1115,9 +1115,11 @@ never imply S1 loss.
   (73, 74 or 75, requested or established), a non-blank
   `parameter_set` field, or a `parameter_set` query other than
   `not_queried` — else 4 iff a key row carries the
-  `unknown` metadata label (a first-observed key — first seen before
-  attach — whose type/size were never established in the observed
-  window; its identity and counts are proved, no label is guessed),
+  `unknown` metadata label (a proved key with valid attribution and
+  no metadata conflict that has no usable label: a first-observed key
+  — first seen before attach — or a key created in the window whose
+  type/size were never established, such as a generic-secret HMAC
+  key; its identity and counts are proved, no label is guessed),
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
@@ -1185,7 +1187,9 @@ never imply S1 loss.
   private size is never read directly). Such a label is recognizable:
   the view's own `established.modulus_bits` stays `unknown` while the
   label names the inherited size. Unpaired keys and failed generations
-  stay unlabeled (`metadata_unknown` at use).
+  stay unlabeled: a valid, unconflicted use rows under `unknown`;
+  invalid attribution counts `metadata_unknown` and a conflict
+  `metadata_conflicting` in `unknown_key_operations[]`.
 - `key_operations[]` (sorted by instance, object, category, role and
   metadata label) holds proved-key aggregate rows
   `{instance, object, category, role, metadata_at_use, unit,

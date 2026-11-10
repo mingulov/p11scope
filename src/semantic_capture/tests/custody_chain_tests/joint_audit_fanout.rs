@@ -21165,8 +21165,12 @@ fn key_operation_joint_batch_receipts_keep_observation_time() {
                 if !saw_init && feed.reduced - before == init_rank {
                     saw_init = true;
                     if late_metadata {
-                        assert!(
-                            buckets.is_empty(),
+                        // The proved key rows under the honest
+                        // `unknown` label; later metadata never
+                        // backfills the Init's snapshot.
+                        assert_eq!(buckets.len(), 1);
+                        assert_eq!(
+                            buckets[0].0.metadata, "unknown",
                             "metadata learned later never backfills Init"
                         );
                     } else {
@@ -21205,7 +21209,9 @@ fn key_operation_joint_batch_receipts_keep_observation_time() {
                 }
             }
             assert!(done && saw_init);
-            assert_eq!(saw_retirement, !late_metadata);
+            // Both twins hold a proved bucket (rsa_2048, or `unknown`
+            // when metadata arrives later), so both see the retirement.
+            assert!(saw_retirement);
             // The oracle above already checked the actual object is now
             // RSA4096; replay must retain the earlier frozen label instead.
             true

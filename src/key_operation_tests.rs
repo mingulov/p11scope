@@ -4365,17 +4365,25 @@ fn key_operation_unknown_key_and_requested_only() {
         0,
         "no value ever arrived"
     );
-    assert!(
-        keyuse.aggregates().is_empty(),
-        "requested-only proves no bucket"
-    );
+    // Requested-only metadata never labels, but the proved key keeps
+    // its per-key row under the honest `unknown` metadata label: the
+    // call happened on a proved key, so its row shows (data always).
+    assert_eq!(keyuse.aggregates().len(), 1, "the proved key rows");
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     let row = committed
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
-        .expect("requested-only rows metadata-unknown");
+        .find(|row| row.category == "sign")
+        .expect("requested-only key keeps its row");
+    assert_eq!(row.metadata_at_use, "unknown", "no guessed label");
     assert_eq!((row.completed, row.active), (1, 0));
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .all(|row| !(row.category == "sign" && row.reason == "metadata_unknown")),
+        "the row is not counted twice"
+    );
 }
 
 /// DEMO-4 late attach: a key first observed through FIND (its lookup
@@ -4649,7 +4657,10 @@ fn key_operation_later_metadata_never_rewrites_rows() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let before = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(before.unknown_key_operations.len(), 1);
+    // The proved, label-less key rows under `unknown` metadata.
+    assert_eq!(before.key_operations.len(), 1);
+    assert_eq!(before.key_operations[0].metadata_at_use, "unknown");
+    assert!(before.unknown_key_operations.is_empty());
     // The GET establishes Class=3 after the operation completed.
     let get = ShapedS1 {
         getattr_cells: vec![(1u8, 1u8, 3u16)],
@@ -4719,7 +4730,10 @@ fn key_operation_conflicting_metadata_keeps_earlier_value() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let before = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(before.unknown_key_operations.len(), 1);
+    // The proved, label-less key rows under `unknown` metadata.
+    assert_eq!(before.key_operations.len(), 1);
+    assert_eq!(before.key_operations[0].metadata_at_use, "unknown");
+    assert!(before.unknown_key_operations.is_empty());
     // Two GETs disagree on Class: 3 first, then 4.
     for value in [3u16, 4u16] {
         let get = ShapedS1 {
@@ -6192,7 +6206,7 @@ fn key_operation_refused_row_terminal_replaces_in_stream() {
 
 /// N9 remainder (fix round 2): a lost join before the terminal keeps
 /// the old unknown row's zero-active replacement. The
-/// metadata_unknown summary drains to all zeros (its outcome routes
+/// metadata_conflicting summary drains to all zeros (its outcome routes
 /// to key_join_lost) but must still emit — else the cumulative
 /// consumer keeps stale activity the JSON section no longer shows.
 #[test]
@@ -6203,8 +6217,9 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
     let mut joint = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     let mut sink = Vec::new();
-    // Known object, unknown metadata (no getattr): the use aggregates
-    // metadata_unknown.
+    // Known object with conflicting metadata (two GETs disagree on
+    // Class): the use has no row and aggregates metadata_conflicting.
+    // (A valid unconflicted label-less key rows under `unknown`.)
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -6213,6 +6228,20 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
         &mut sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
+    for value in [3u16, 4u16] {
+        let get = ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, value)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &get,
+        );
+    }
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -6233,7 +6262,7 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
     let live = before
         .unknown_key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.reason == "metadata_conflicting")
         .expect("live unknown row");
     assert_eq!(live.active, 1, "precondition: the use is live");
     // Lost join before the terminal, then the S1 terminal routes to
@@ -6251,7 +6280,7 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
     let zero = after
         .unknown_key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.reason == "metadata_conflicting")
         .expect("zero-active replacement");
     assert_eq!(
         (
@@ -6287,7 +6316,7 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
     );
     let replaced = rebuilt
         .unknown
-        .get("u:sign:metadata_unknown")
+        .get("u:sign:metadata_conflicting")
         .expect("the replacement reaches the stream");
     assert_eq!(replaced.0, 2, "the terminal replacement carries revision 2");
     assert_eq!(replaced.1["active"], 0, "never the stale active row");
@@ -6517,12 +6546,19 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
         );
         assert_eq!(own.edge_calls(id), 3);
         let observations = own.registry.joint_observations(10);
+        // The proved label-less key rows under `unknown` metadata;
+        // either bucket counts the one completed operation exactly once.
         assert_eq!(
             observations
                 .unknown_key_operations
                 .iter()
                 .map(|row| row.completed)
-                .sum::<u64>(),
+                .sum::<u64>()
+                + observations
+                    .key_operations
+                    .iter()
+                    .map(|row| row.completed)
+                    .sum::<u64>(),
             1
         );
     }
@@ -8876,9 +8912,11 @@ fn key_operation_schema_contract() {
 
     // ---- Receipt metadata shapes aggregate exactly. ----
     // Hand-built receipts over a REAL object id through the real
-    // edge reducer: usable labels prove rows; conflicting, unknown
-    // and requested-only metadata partition unknown with exact
-    // reasons (requested-only RSA2048 stays untyped).
+    // edge reducer: usable labels prove rows; unknown and
+    // requested-only metadata on a valid key row under the honest
+    // `unknown` label (requested-only RSA2048 stays untyped); a
+    // conflicting or invalid-attribution key partitions unknown with
+    // exact reasons and never rows.
     let mut tiny = JointScene::new();
     let tiny_bootstrap = tiny.bootstrap();
     let mut tiny_staging = JointStaging::select_joint(Some(&tiny_bootstrap));
@@ -8902,6 +8940,7 @@ fn key_operation_schema_contract() {
         (Some(rsa), true, 0x1F, 0x1F, 1u8 << 4),
         (None, true, 0u8, 0u8, 0u8),
         (None, true, 0x13u8, 0u8, 0u8),
+        (None, false, 0u8, 0u8, 0u8),
     ];
     let mut shape_edge = EdgeSemantics::default();
     let mut shape_keyuse = KeyUseReducer::new();
@@ -8949,10 +8988,20 @@ fn key_operation_schema_contract() {
         .find(|row| row.metadata_at_use == "rsa_2048")
         .expect("the usable label proves its row");
     assert_eq!((proved.started, proved.completed), (1, 1));
+    let untyped = shaped_commit
+        .key_operations
+        .iter()
+        .find(|row| row.metadata_at_use == "unknown")
+        .expect("a valid label-less key keeps its row");
+    assert_eq!(
+        (untyped.started, untyped.completed),
+        (2, 2),
+        "unknown and requested-only RSA2048 row untyped, never guessed"
+    );
     assert_eq!(
         shaped_commit.key_operations.len(),
-        1,
-        "only the usable label proves"
+        2,
+        "the usable label and the honest unknown label only"
     );
     let conflicting = shaped_commit
         .unknown_key_operations
@@ -8964,8 +9013,8 @@ fn key_operation_schema_contract() {
         .unknown_key_operations
         .iter()
         .find(|row| row.reason == "metadata_unknown")
-        .expect("unknown and requested-only partition unknown");
-    assert_eq!(unknown.completed, 2, "requested-only RSA2048 stays untyped");
+        .expect("invalid attribution partitions unknown");
+    assert_eq!(unknown.completed, 1, "an invalid key never rows");
     assert!(
         !shaped_commit
             .gaps
@@ -8984,8 +9033,8 @@ fn key_operation_schema_contract() {
     let pruned_commit = commit(10, &[&tiny_staging], &pruned_model, &shape_keyuse);
     assert_eq!(
         pruned_commit.key_operations.len(),
-        1,
-        "the proved row stays"
+        2,
+        "the proved rows stay"
     );
     let tripwire = pruned_commit
         .gaps
@@ -8994,7 +9043,7 @@ fn key_operation_schema_contract() {
         .expect("the inconsistent embedding trips the wire");
     assert_eq!(tripwire.subject, "key_operation");
     assert_eq!(
-        tripwire.repeats, 1,
+        tripwire.repeats, 3,
         "only proved buckets retain object references; unknown summaries count outcomes"
     );
 
@@ -9494,6 +9543,21 @@ fn kem_mlkem_get(word: u64) -> ShapedS1 {
     }
 }
 
+/// The per-key rows a commit carries under the honest `unknown`
+/// metadata label: (category, completed). A valid, unconflicted,
+/// proved key with no usable label rows here (data always); its
+/// type/size is never guessed.
+fn unknown_metadata_rows(
+    committed: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<(&'static str, u64)> {
+    committed
+        .key_operations
+        .iter()
+        .filter(|row| row.metadata_at_use == "unknown")
+        .map(|row| (row.category, row.completed))
+        .collect()
+}
+
 /// Item 1: encapsulation binds its input role. One qualified
 /// Referenced effect (key_use, ordinal 0); the receipt carries the
 /// encapsulation role; the genuine ML-KEM input partitions
@@ -9569,19 +9633,12 @@ fn key_operation_kem_encapsulate_binds_input_role() {
     assert_eq!(receipts[0].role, KeyRole::EncapsulationKey);
     assert_eq!(receipts[0].input, 0);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(
-        committed
-            .key_operations
-            .iter()
-            .all(|row| row.category != "encapsulate"),
-        "no proved row for the genuine ML-KEM input"
+    assert_eq!(
+        unknown_metadata_rows(&committed),
+        vec![("encapsulate", 1)],
+        "the genuine ML-KEM input rows under unknown metadata, no label"
     );
-    let unknown: Vec<_> = committed
-        .unknown_key_operations
-        .iter()
-        .map(|row| (row.category, row.reason, row.completed))
-        .collect();
-    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
+    assert!(committed.unknown_key_operations.is_empty());
     assert!(
         !committed
             .unknown_key_operations
@@ -10018,12 +10075,12 @@ fn key_operation_kem_decapsulate_binds_input_role() {
     assert_eq!(receipts[0].role, KeyRole::DecapsulationKey);
     assert_eq!(receipts[0].input, 0);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    let unknown: Vec<_> = committed
-        .unknown_key_operations
-        .iter()
-        .map(|row| (row.category, row.reason, row.completed))
-        .collect();
-    assert_eq!(unknown, vec![("decapsulate", "metadata_unknown", 1)]);
+    assert_eq!(
+        unknown_metadata_rows(&committed),
+        vec![("decapsulate", 1)],
+        "the input rows under unknown metadata, no label"
+    );
+    assert!(committed.unknown_key_operations.is_empty());
     assert!(
         !committed
             .unknown_key_operations
@@ -10416,13 +10473,16 @@ fn key_operation_kem_proved_row_needs_m1a() {
         );
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(
-            committed.key_operations.is_empty(),
-            "{name}: no label, so no proved ML-KEM row"
+            committed
+                .key_operations
+                .iter()
+                .all(|row| row.metadata_at_use == "unknown"),
+            "{name}: no label, so no labelled ML-KEM row"
         );
         assert_eq!(
-            committed.unknown_key_operations.len(),
+            committed.key_operations.len() + committed.unknown_key_operations.len(),
             1,
-            "{name}: the terminal partitions unknown exactly once"
+            "{name}: the terminal counts exactly once"
         );
         // Unknown metadata is not a proved row by another name: the
         // frozen pre-PQC vocabulary stays at 12 labels (the eighteen
@@ -10475,23 +10535,25 @@ fn key_operation_kem_metadata_unknown_terminal() {
             &ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture),
         );
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-        assert!(
-            committed.key_operations.is_empty(),
-            "{name}: no proved KEM row"
+        assert_eq!(
+            unknown_metadata_rows(&committed),
+            vec![(category, 1)],
+            "{name}: one per-key row under unknown metadata, no label"
         );
-        let unknown: Vec<_> = committed
-            .unknown_key_operations
-            .iter()
-            .map(|row| (row.category, row.reason, row.completed))
-            .collect();
-        assert_eq!(unknown, vec![(category, "metadata_unknown", 1)], "{name}");
+        assert!(committed.unknown_key_operations.is_empty(), "{name}");
         // Parsed keys and counters, not JSON byte order: the row
         // equation holds on the typed row.
-        let row = &committed.unknown_key_operations[0];
+        let row = &committed.key_operations[0];
         assert_eq!(row.unit, "operations");
         assert_eq!(
-            (row.failed, row.cancelled, row.unknown, row.active),
-            (0, 0, 0, 0)
+            (
+                row.started,
+                row.failed,
+                row.cancelled,
+                row.unknown,
+                row.active
+            ),
+            (1, 0, 0, 0, 0)
         );
     }
 }
@@ -11571,8 +11633,8 @@ fn key_operation_kem_later_use_qualifies_forward_only() {
         &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(committed.key_operations.is_empty());
-    assert_eq!(committed.unknown_key_operations.len(), 1);
+    assert_eq!(unknown_metadata_rows(&committed), vec![("encapsulate", 1)]);
+    assert!(committed.unknown_key_operations.is_empty());
     // Establish AES metadata on the KEM *input* (the created key):
     // the next KEM use of that input proves its row.
     let aes = ShapedS1 {
@@ -11596,16 +11658,16 @@ fn key_operation_kem_later_use_qualifies_forward_only() {
         &ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture()),
     );
     let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
-    // The earlier unknown summary stands untouched (no backfill);
-    // the later qualified use proves exactly one row.
-    let unknown: Vec<_> = committed
-        .unknown_key_operations
+    // The earlier unknown-metadata row stands untouched (no
+    // backfill); the later qualified use proves its own labelled row.
+    assert_eq!(unknown_metadata_rows(&committed), vec![("encapsulate", 1)]);
+    assert!(committed.unknown_key_operations.is_empty());
+    assert_eq!(committed.key_operations.len(), 2);
+    let row = committed
+        .key_operations
         .iter()
-        .map(|row| (row.category, row.reason, row.completed))
-        .collect();
-    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
-    assert_eq!(committed.key_operations.len(), 1);
-    let row = &committed.key_operations[0];
+        .find(|row| row.metadata_at_use != "unknown")
+        .expect("the qualified later use");
     assert_eq!(row.category, "decapsulate");
     assert_eq!(row.role, "decapsulation_key");
     assert_eq!(row.metadata_at_use, "aes_256");
@@ -11733,16 +11795,18 @@ fn key_operation_kem_created_output_later_use_m2_twins() {
                 other => panic!("expected a Referenced effect, got {other:?}"),
             }
             let snap1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
-            let unknown1: Vec<_> = snap1
-                .unknown_key_operations
-                .iter()
-                .map(|row| (row.category, row.reason, row.completed))
-                .collect();
+            let unknown1 = unknown_metadata_rows(&snap1);
             assert!(
-                unknown1.contains(&(category, "metadata_unknown", 1)),
-                "first use of the output stays unknown: {unknown1:?}"
+                unknown1.contains(&(category, 1)),
+                "first use of the output rows under unknown metadata: {unknown1:?}"
             );
-            assert!(snap1.key_operations.is_empty(), "nothing proves yet");
+            assert!(
+                snap1
+                    .key_operations
+                    .iter()
+                    .all(|row| row.metadata_at_use == "unknown"),
+                "nothing is labelled yet"
+            );
             let receipts1 = direct_receipts(&sink);
             // GET on the output, then a second use of that same
             // output: generic-secret stays unknown under M2; AES
@@ -11785,35 +11849,31 @@ fn key_operation_kem_created_output_later_use_m2_twins() {
                 other => panic!("expected a Referenced effect, got {other:?}"),
             }
             let snap2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
-            let unknown2: Vec<_> = snap2
-                .unknown_key_operations
+            let unknown2 = unknown_metadata_rows(&snap2);
+            let labelled: Vec<_> = snap2
+                .key_operations
                 .iter()
-                .map(|row| (row.category, row.reason, row.completed))
+                .filter(|row| row.metadata_at_use != "unknown")
                 .collect();
             if proves {
                 assert!(
-                    unknown2.contains(&(category, "metadata_unknown", 1)),
-                    "the earlier unknown summary stands untouched: {unknown2:?}"
+                    unknown2.contains(&(category, 1)),
+                    "the earlier unknown-metadata row stands untouched: {unknown2:?}"
                 );
-                assert_eq!(
-                    snap2.key_operations.len(),
-                    1,
-                    "exactly the qualified use proves"
-                );
-                let row = &snap2.key_operations[0];
+                assert_eq!(labelled.len(), 1, "exactly the qualified use labels");
+                let row = labelled[0];
                 assert_eq!(row.category, category);
                 assert_eq!(row.role, role);
                 assert_eq!(row.metadata_at_use, "aes_256");
                 assert_eq!(row.completed, 1);
             } else {
+                // Generic secret has no label family: both uses row
+                // under unknown metadata on the one output object.
                 assert!(
-                    unknown2.contains(&(category, "metadata_unknown", 2)),
+                    unknown2.contains(&(category, 2)),
                     "generic-secret GET keeps the output unknown: {unknown2:?}"
                 );
-                assert!(
-                    snap2.key_operations.is_empty(),
-                    "generic-secret proves nothing"
-                );
+                assert!(labelled.is_empty(), "generic-secret labels nothing");
             }
             let receipts2 = direct_receipts(&sink);
             assert!(
@@ -11883,21 +11943,21 @@ fn key_operation_kem_wire_to_commit_link() {
     assert_eq!(referenced_total, 2);
     assert_eq!(direct_receipts(&sink).len(), 2);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(committed.key_operations.is_empty());
+    let mut rows = unknown_metadata_rows(&committed);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("decapsulate", 1), ("encapsulate", 1)],
+        "the two qualified uses row under unknown metadata"
+    );
+    assert_eq!(committed.key_operations.len(), 2, "no invented label");
     let mut unknown: Vec<_> = committed
         .unknown_key_operations
         .iter()
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
     unknown.sort();
-    assert_eq!(
-        unknown,
-        vec![
-            ("decapsulate", "metadata_unknown", 1),
-            ("encapsulate", "metadata_unknown", 1),
-            ("encapsulate", "role_unavailable", 1),
-        ]
-    );
+    assert_eq!(unknown, vec![("encapsulate", "role_unavailable", 1)]);
     let creations: Vec<_> = committed
         .objects
         .iter()
@@ -12019,19 +12079,25 @@ fn key_operation_kem_wire_to_commit_link() {
     }
     assert_eq!(direct_receipts(&sink).len(), 30);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    let mut unknown: Vec<_> = committed
-        .unknown_key_operations
-        .iter()
-        .map(|row| (row.category, row.reason, row.completed))
+    let total: Vec<(&str, u64)> = ["decapsulate", "encapsulate"]
+        .into_iter()
+        .map(|category| {
+            (
+                category,
+                unknown_metadata_rows(&committed)
+                    .iter()
+                    .filter(|(row, _)| *row == category)
+                    .map(|(_, completed)| completed)
+                    .sum(),
+            )
+        })
         .collect();
-    unknown.sort();
     assert_eq!(
-        unknown,
-        vec![
-            ("decapsulate", "metadata_unknown", 15),
-            ("encapsulate", "metadata_unknown", 15),
-        ]
+        total,
+        vec![("decapsulate", 15), ("encapsulate", 15)],
+        "every proved use rows under unknown metadata, none invented"
     );
+    assert!(committed.unknown_key_operations.is_empty());
     assert_eq!(committed.objects.len(), 31, "create plus thirty outputs");
     assert!(
         committed.objects.len() <= crate::semantics_objects::ObjectLimits::policy().object_records,
@@ -12381,8 +12447,9 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "v1 rows bind v1"
     );
     assert_reconstructed_eq_json(&reconstruct(&v1lines), &section, true);
-    // Revision 2: creation-only KEM on a fresh unestablished input
-    // (the r1 input carries AES, which would prove a row).
+    // Revision 2: creation-only KEM on a fresh input whose metadata
+    // conflicts (the r1 input carries AES, which would prove a row;
+    // an unconflicted label-less input would row under `unknown`).
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -12394,6 +12461,20 @@ fn key_operation_kem_jsonl_version_dispatch() {
             ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
         },
     );
+    for value in [3u16, 4u16] {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                input0: Some((0xF00D_F00D_F00D_F00D, 1)),
+                getattr_cells: vec![(1u8, 1u8, value)],
+                ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+            },
+        );
+    }
     drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -21330,7 +21411,7 @@ fn key_operation_info_call_before_seal_keeps_joint_feed() {
 /// back or lost authority keeps its already-attributed and
 /// S1-preserved rows under `partial`, with the unattributed calls
 /// counted per named reason beside them. The healthy twin stays
-/// populated with zero unattributed and byte-stable v1 JSON.
+/// populated with zero unattributed.
 #[test]
 fn key_operation_partial_publication_counts_unattributed() {
     let instance = RegistryInstanceId::from_raw(3);
@@ -21360,10 +21441,13 @@ fn key_operation_partial_publication_counts_unattributed() {
         "a fully sealed flow attributes everything"
     );
     let healthy_json = object_observations_json(&healthy);
-    assert_eq!(healthy_json["version"], 1, "healthy output stays v1");
-    assert!(
-        healthy_json.get("unattributed").is_none(),
-        "no unattributed key while every count is zero"
+    // The label-less proved key rows under `unknown` metadata, which
+    // stamps v4; v4 always carries `unattributed`, empty here.
+    assert_eq!(healthy_json["version"], 4, "unknown metadata rows stamp v4");
+    assert_eq!(
+        healthy_json["unattributed"],
+        serde_json::json!([]),
+        "nothing unattributed while every count is zero"
     );
 
     // Proof-only fallback: replayed S1 rows stay visible as partial,
@@ -23415,16 +23499,13 @@ fn pqc_parameter_set_partial_error_preserves_neighbors() {
         "a failed GET establishes nothing"
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(
-        committed.key_operations.is_empty(),
-        "no proved row without establishment"
+    assert_eq!(
+        unknown_metadata_rows(&committed),
+        vec![("sign", 1)],
+        "no label without establishment: the use rows under unknown metadata exactly once"
     );
-    let unknown: Vec<_> = committed
-        .unknown_key_operations
-        .iter()
-        .map(|row| (row.category, row.reason, row.completed))
-        .collect();
-    assert_eq!(unknown, vec![("sign", "metadata_unknown", 1)]);
+    assert_eq!(committed.key_operations.len(), 1);
+    assert!(committed.unknown_key_operations.is_empty());
 }
 
 /// F16: the v5 schema file mirrors the frozen contract tables: same
@@ -23730,17 +23811,11 @@ fn key_operation_pqc_version_follows_content() {
             "unknown"
         );
         assert!(section["objects"][0]["label"].is_null());
-        assert!(
-            section["key_operations"].as_array().unwrap().is_empty(),
-            "no proved row without a label"
-        );
-        let unknown = section["unknown_key_operations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
-            .expect("the live scene rows its sign use unknown");
-        assert_eq!(unknown["completed"], 1);
+        let rows = section["key_operations"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "no label: one unknown-metadata row");
+        assert_eq!(rows[0]["category"], "sign");
+        assert_eq!(rows[0]["metadata_at_use"], "unknown", "no guessed label");
+        assert_eq!(rows[0]["completed"], 1);
     }
     // A parameter-set query outcome alone versions v5: the RSA row
     // stays proved (the scene is live) while the refused set query
@@ -23828,13 +23903,11 @@ fn key_operation_pqc_version_follows_content() {
         "unknown"
     );
     assert!(section["objects"][0]["label"].is_null());
-    let unknown = section["unknown_key_operations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
-        .expect("the live scene rows its sign use unknown");
-    assert_eq!(unknown["completed"], 1);
+    let rows = section["key_operations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "requested-only: one unknown-metadata row");
+    assert_eq!(rows[0]["category"], "sign");
+    assert_eq!(rows[0]["metadata_at_use"], "unknown", "no guessed label");
+    assert_eq!(rows[0]["completed"], 1);
 }
 
 /// F16: the PQC constructor refuses everything outside the valid
@@ -23954,17 +24027,11 @@ fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
         section["objects"][0]["label"].is_null(),
         "a wrong-family pair labels nothing"
     );
-    assert!(
-        section["key_operations"].as_array().unwrap().is_empty(),
-        "no proved row without a label"
-    );
-    let unknown = section["unknown_key_operations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
-        .expect("the live scene rows its sign use unknown");
-    assert_eq!(unknown["completed"], 1);
+    let rows = section["key_operations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "no label: one unknown-metadata row");
+    assert_eq!(rows[0]["category"], "sign");
+    assert_eq!(rows[0]["metadata_at_use"], "unknown", "no guessed label");
+    assert_eq!(rows[0]["completed"], 1);
 }
 
 /// F16 residual (review item 4): the ML-KEM labelled path rows

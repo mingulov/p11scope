@@ -2593,6 +2593,17 @@ class JointActiveGate(unittest.TestCase):
                 min_rate=1000)
             self.assertEqual(result["verdict"], "pass")
 
+    def test_unknown_metadata_key_rows_pass(self):
+        # The current product shape for a generic-secret key the
+        # workload never queries: each proved key keeps its per-key
+        # row under the honest `unknown` metadata label.
+        with tempfile.TemporaryDirectory(prefix="joint-unkrow-") as tmp:
+            def mutate(doc):
+                for row in doc["object_observations"]["key_operations"]:
+                    row["metadata_at_use"] = "unknown"
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+
     def test_labelled_and_unknown_signs_sum_exactly(self):
         with tempfile.TemporaryDirectory(prefix="joint-mixed-") as tmp:
             def mutate(doc):

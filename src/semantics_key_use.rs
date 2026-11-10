@@ -1819,22 +1819,21 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
 }
 
 /// The metadata label a receipt rows under: its usable established
-/// label, or — for a first-observed object (DEMO-4 late attach: the
-/// key's creation/lookup predates the observed window) with valid
-/// attribution and no established label and no metadata conflict —
-/// the honest `unknown` label. The per-key row is kept with the
-/// object id and its exact counts; no type or size is guessed.
+/// label, or — for any proved object (first-observed under DEMO-4
+/// late attach, or created in the observed window but never given an
+/// established type/size, such as a generic-secret HMAC key or a key
+/// whose attributes were never read back) with valid attribution, no
+/// established label and no metadata conflict — the honest `unknown`
+/// label. The per-key row is kept with the object id and its exact
+/// counts; no type or size is guessed (requested-only sizes still
+/// never label). Calls happened on a proved key, so its row shows.
 /// Later learned metadata never rewrites this snapshot: a later use
 /// after an established attribute read buckets under its own label.
 fn row_label(receipt: &KeyReceipt) -> Option<&'static str> {
     if let Some(label) = usable_label(receipt) {
         return Some(label);
     }
-    if receipt.first_observed
-        && receipt.attribution_valid
-        && receipt.label.is_none()
-        && receipt.metadata.conflicted == 0
-    {
+    if receipt.attribution_valid && receipt.label.is_none() && receipt.metadata.conflicted == 0 {
         return Some(crate::key_operation_projection::METADATA_UNKNOWN);
     }
     None

@@ -1384,6 +1384,16 @@ backfilled. No `CKA_ID`, object handle, label, PIN or payload is read
 or published for these rows. Version 4 is present exactly when such
 a row exists; versions 1, 2 and 3 stay frozen and byte-stable.
 
+**Extended 2026-11-10 (v0.7.0, owner rule "data always").** The same
+`unknown` label also rows a key created in the observed window whose
+type/size were never established (for example a generic-secret HMAC
+key, which has no label family, or any key whose attributes are never
+read back), provided its attribution is valid and no metadata field
+conflicts. Like the first-observed case it grants no read and states
+only the absence of established facts; requested template values
+still never label. Conflicted or invalid-attribution uses keep
+counting in the fixed unknown summaries and never row.
+
 ## PQC parameter-set metadata (F16, 2026-11-06)
 
 **Status: IMPLEMENTED in v0.7.0 by owner decision 2026-11-06 evening

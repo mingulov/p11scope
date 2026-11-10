@@ -488,7 +488,9 @@ def observer_argv(observer, provider, built, ledger, pub_gate, entry_gate,
     argv = [str(observer), "run", "--trace"]
     if mode in MODES_WITH_MODULE:
         argv += ["--module", str(provider)]
-    argv += ["--pause", pause, "-o", str(trace_path), "--",
+    # -v: compare_streams requires stdout/file terminal evidence parity,
+    # and only -v stdout carries EVIDENCE.
+    argv += ["--pause", pause, "-o", str(trace_path), "-v", "--",
             str(built["driver"]), str(provider), str(ledger),
             str(pub_gate), str(entry_gate),
             "--mode", mode, "--delay-us", str(delay_us)]

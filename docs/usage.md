@@ -374,8 +374,9 @@ semantics, use the separate
 
 Terminal text is short by default: the main results (providers, callers,
 functions and mechanisms, key-operation rows), one coverage status line
-(`coverage: complete`, `coverage: counts complete` when only names are
-unconfirmed, or `coverage: partial` with plain-word reasons), and a
+(`coverage: complete`, or `coverage: partial` with plain-word reasons —
+including `coverage: partial — counts complete; …` when only names are
+unconfirmed), and a
 `run with -v for details` hint. `-v` / `--verbose` shows the full detail —
 every gap and limitation with reasons, evidence, per-slot or per-table data,
 timing — plus the informational stderr notes. `--quiet` prints only the
@@ -1072,7 +1073,7 @@ Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-
 
 A current capture's coverage line names why it is `PARTIAL`, grouped by the
 same classes `evidence.gap_classes` publishes, in plain words: for example
-`coverage: counts complete; function names follow the standard PKCS#11 table
+`coverage: partial — counts complete; function names follow the standard PKCS#11 table
 and were not confirmed by a manifest (add --manifest to confirm)` for
 a clean scan-only capture (`verdict_detail: "attribution_only"`: counts are
 exact, only the names are unconfirmed), or

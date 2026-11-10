@@ -4028,10 +4028,11 @@ pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
 }
 
 /// The one coverage line shared by the profile summary and the trace
-/// tail: `coverage: complete`; `coverage: counts complete; …` when
-/// names are the only gap; the owned-run missed-load remedy; or
-/// `coverage: partial — <reasons>`. Verbose keeps the full grouped
-/// reasons beside the special cases.
+/// tail: `coverage: complete`; `coverage: partial — counts complete; …`
+/// when names are the only gap (the text states the same PARTIAL verdict
+/// as JSON, with counts complete in plain words); the owned-run
+/// missed-load remedy; or `coverage: partial — <reasons>`. Verbose keeps
+/// the full grouped reasons beside the special cases.
 pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
     if ev.completeness == "COMPLETE" {
         return "coverage: complete".to_string();
@@ -4053,10 +4054,10 @@ pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
     {
         let fragments = cause_fragments(ev, &classes.attribution.causes, verbose);
         if fragments.is_empty() {
-            return "coverage: counts complete".to_string();
+            return "coverage: partial — counts complete".to_string();
         }
         return format!(
-            "coverage: counts complete; {}",
+            "coverage: partial — counts complete; {}",
             escape_controls(&fragments.join("; "))
         );
     }
@@ -7236,7 +7237,7 @@ pub(crate) mod tests {
         );
         assert!(
             output.contains(
-                "coverage: counts complete; function names follow the standard PKCS#11 table"
+                "coverage: partial — counts complete; function names follow the standard PKCS#11 table"
             ),
             "{output}"
         );
@@ -8581,7 +8582,7 @@ pub(crate) mod tests {
         );
         assert!(
             out.contains(
-                "coverage: counts complete; function names follow the standard PKCS#11 table \
+                "coverage: partial — counts complete; function names follow the standard PKCS#11 table \
                  and were not confirmed by a manifest (add --manifest to confirm)"
             ),
             "{out}"
@@ -8594,7 +8595,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(out.contains("counts complete"), "{out}");
+        assert!(out.contains("coverage: partial — counts complete"), "{out}");
         assert!(out.contains("semantic_unverified_slots"), "{out}");
         assert!(out.contains("68"), "{out}");
         // Beside a concrete gap the group keeps its label, reworded.
@@ -8627,12 +8628,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let out = scope_summary_with_verbosity(
-                "pid",
-                &reports_fixture(),
-                &ev,
-                verbosity,
-            );
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
                 out.contains("coverage: partial"),
                 "{verbosity:?} states partial like JSON: {out}"
@@ -9709,7 +9705,7 @@ pub(crate) mod tests {
 
     /// Zero calls with only attribution gaps (counts complete) must use
     /// one consistent coverage statement, not "coverage incomplete"
-    /// beside "coverage: counts complete".
+    /// beside "coverage: partial — counts complete".
     #[test]
     fn scope_summary_with_zero_calls_and_attribution_only_gaps_is_consistent() {
         let mut ev = evidence();
@@ -12210,13 +12206,13 @@ pub(crate) mod tests {
                 e.template_tail_failures = 1;
             }),
             (
-                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                "coverage: partial — counts complete; function names follow the standard PKCS#11 table",
                 |e| {
                     e.semantic_unverified_slots = 1;
                 },
             ),
             (
-                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                "coverage: partial — counts complete; function names follow the standard PKCS#11 table",
                 |e| {
                     e.semantic_unverified_slots = 2;
                 },

@@ -1939,24 +1939,27 @@ The old bounds are measurements, not a product startup SLA.
 - Workaround: `--max-scan-pids`, `--module`, narrower scopes.
 - Planned: v0.3.0 (C7 kernel-side identity; M1 at 10,000).
 
-### Lifetime identity/ticket budget 16,384 (DR-06)
+### Lifetime identity/ticket budget 262,144 (DR-06; 16,384 before v0.7.0)
 
 - What the user sees: long `--cgroup`/`--system` captures of busy hosts can
-  spend the 16,384-identity budget (about an hour at 5 new processes/s);
-  later processes get no identity: the capture prints
-  `p11scope: kernel could not give a process an identity (lifetime budget
-  of 16384 identities spent); its calls and fork records are not captured
-  and the report is PARTIAL`, counts each refusal in
-  `evidence.kernel_control.identity_unavailable` with
+  spend the 262,144-identity budget (about 14 hours at 5 new processes/s,
+  about 3.6 hours at 20/s); later processes get no identity: the capture
+  prints `p11scope: kernel could not give a process an identity (N refused
+  so far; lifetime budget of 262144 identities spent); ...`, counts each
+  refusal in `evidence.kernel_control.identity_unavailable` with
   `identity_budget_exhausted: true`, and inventory callers show a `usage
   coverage health regression` gap naming the refused identity counts.
+  (Quoted wording before v0.7.0: `... (lifetime budget of 16384 identities
+  spent); ...` with no refusal count.)
 - Kernels/conditions: all kernels; Detailed `task_newtask` fork-wrapper
   ticket burn in `--system` Detailed subsets is unmeasured.
 - Disclosure: `evidence.kernel_control` (`identity_budget_exhausted`,
   `identity_unavailable`, `owner_admission_failures`), gaps, `PARTIAL`.
 - Workaround: `--pid` or a narrow `--cgroup`, or split the capture.
 - Planned: reusable identity slots are not in 0.6.0; v0.6.0 keeps
-  the 16,384 budget with the named gaps above.
+  the 16,384 budget with the named gaps above. v0.7.0 widens the budget
+  to 262,144 per capture, still never reused; ticket recycling (bank
+  epoch rollover) is planned for 0.7.1.
 
 ### Provisional P/N defaults (DR-07)
 

@@ -850,7 +850,7 @@ only:
   invalid key, or collision).
 - `identity_unavailable` (u64): process identities the kernel could not
   allocate or read. This includes every fork record dropped after the
-  lifetime identity budget (16,384 tickets) is spent.
+  lifetime identity budget (262,144 tickets) is spent.
 - `identity_budget_exhausted` (boolean): the lifetime identity budget is
   spent. Informational on its own; the refusals it causes are counted above.
 - `root_affiliation_failures`: sorted, unique names from `bad_control`,

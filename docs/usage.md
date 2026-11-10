@@ -2707,11 +2707,12 @@ Kernel-side capture state has its own fixed limits, all disclosed in
 `evidence.kernel_control` and each forcing `PARTIAL` when exceeded:
 
 - **Identity budget (lifetime).** Detailed capture (`profile`, `trace`) gives
-  each process it tracks a private identity ticket. The budget is **16,384
+  each process it tracks a private identity ticket. The budget is **262,144
   tickets for the whole capture**; tickets are never reused. Under `--cgroup`
   and `--system`, *every* process created in scope spends tickets at fork
   time (parent and child), whether or not it ever calls PKCS #11. On a host
-  creating about 5 processes per second the budget lasts under an hour. Once
+  creating about 5 processes per second the budget lasts about 14 hours
+  (about 3.6 hours at 20 per second). Once
   it is spent, new processes in scope get no identity: their fork records
   are dropped and their calls count only as `semantic_capture_failures` and
   in-flight calls. Each refusal is counted in

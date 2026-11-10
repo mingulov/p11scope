@@ -70,6 +70,11 @@ versioned separately and are opaque, exact dispatch keys.
   a named `(provider_partial)` gap instead of being refused whole, small
   providers decide first within their class, and whole capacity refusals
   are named in the default output, not just `-v`.
+- The lifetime identity budget is **262,144 tickets per capture** (was
+  16,384): system-wide captures on busy hosts stay sighted for hours
+  instead of minutes (about 3.6 hours at 20 new processes/s). Tickets
+  are still never reused; a spent budget is still disclosed with counts
+  on every surface (`identity_budget_exhausted`, `identity_unavailable`).
 - The default EVENTS ring is 32 MiB (was 4 MiB) for `profile`, `trace`
   and `run` in profile and trace modes, and the key-operations (Joint)
   lane's ring is 32 MiB (was 16 MiB). `--mode metrics` (with or without

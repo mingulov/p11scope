@@ -559,9 +559,14 @@ def default_absent(cfg_attrs):
     """True when the cfg gates need a cargo feature (absent by default).
 
     `not(...)` spans are removed first, so `cfg(not(feature = "x"))`
-    counts as present while `cfg(feature = "x")` counts as absent.
+    counts as present while `cfg(feature = "x")` counts as absent —
+    except `wide-detailed-2112`, the default profile since v0.7.0,
+    which counts as present. Only plain `feature = "..."` gates occur.
     """
     remaining = re.sub(r"not\s*\([^()]*\)", "", cfg_attrs)
+    feats = re.findall(r'feature\s*=\s*"([^"]+)"', remaining)
+    if feats:
+        return any(f != "wide-detailed-2112" for f in feats)
     return "feature" in remaining
 
 

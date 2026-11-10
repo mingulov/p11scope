@@ -118,9 +118,8 @@
 # the curation against the binary's own `--list --ignored` output and refuse
 # on drift, so a new ignored test can never be silently dropped and a
 # renamed one can never silently pass. The wide-Detailed campaign below is
-# separate: it selects only the ignored tests that exist in a
-# --features wide-detailed-2112 libtest binary, when --wide-detailed-2112
-# is passed in run or --list mode; any other binary is refused cleanly.
+# empty since v0.7.0 (its cells run in the default campaign); the
+# --wide-detailed-2112 flag stays accepted as a no-op alias for one release.
 # The integration curation below that names the ignored integration tests
 # as file:path selectors; --list-integration verifies each selector
 # against built test binaries (exactly one binary, exactly one test) and
@@ -224,10 +223,21 @@ attach::inventory::activation::privileged_tests::privileged_inventory_caller_sys
 attach::inventory::activation::privileged_tests::privileged_inventory_caller_system_lp64
 attach::inventory::activation::privileged_tests::privileged_stop_gate_freezes_capture_state_after_quiescence
 attach::inventory::activation::privileged_tests::privileged_stop_gate_keeps_calls_in_flight_as_residual
+# Wide-Detailed load proof, promoted to the default campaign with the
+# 2,112-slot release profile (this cell plus the task4 cells below in
+# byte order; n512 was already here under both profiles).
+attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
 attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64
 attach::inventory::activation::privileged_tests::privileged_task4_detailed_n512_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64
 attach::inventory::activation::privileged_tests::privileged_task4_detailed_physical_identity_controls
 attach::inventory::activation::privileged_tests::privileged_task4_inventory_2112_lp64
 attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64
@@ -286,6 +296,8 @@ attach::object_stop::tests::object_stop_reports_real_scrub_failure
 attach::tests::collected_partial_group_real_session_guards_refuse_until_terminal_lp64
 attach::tests::collected_retirement_singles_session_defers_close_to_terminal_detach_lp64
 attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
+attach::tests::revival_probe_clears_a_live_detached_slot_lp64
+attach::tests::revival_probe_never_clears_a_singles_slot_lp64
 # Installed linked control: a real Session sealed over the loaded journal
 # pair drains linked through the live wiring (behavioral seal-to-drain
 # linkage, 6.06). Same owned fixture Session shape as the retirement
@@ -869,22 +881,11 @@ XFAIL_OWNERS=(
 "src/inventory/privileged_tests.rs"
 )
 
-# Wide-Detailed campaign: the ignored tests that exist only in a
-# --features wide-detailed-2112 libtest binary — the four wide-gated fns
-# plus the five wide-gated detailed_sweep_test! expansions (source order).
-# Selected only with --wide-detailed-2112 in run or --list mode; the
-# default campaign's exact-cover check cannot see these tests because a
-# default binary does not contain them.
+# Wide-Detailed campaign: empty since v0.7.0 made 2,112 slots the default
+# profile — the nine load-proof cells run in the default campaign now.
+# Kept (with the --wide-detailed-2112 no-op alias) for one release.
 WIDE_DETAILED_2112_TESTS=(
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_n512_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64
-attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit
-attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec
-attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
+# no members: promoted to DEFAULT_TESTS above
 )
 
 # Counter-build curation (checker-enforced, never executed by this
@@ -968,13 +969,12 @@ K1 deep-scan twins, which mount their own loop overlays; lane B only).
 --include-expected-failures additionally runs the known-failing
 reproducers with inverted judging (failures record XFAIL, passes fail
 the run as XPASS).
---wide-detailed-2112 runs only the wide-Detailed campaign cells (a binary
-built with --features wide-detailed-2112 is required; any other binary
-is refused). It cannot be combined with any --include-* flag.
+--wide-detailed-2112 is accepted as a no-op alias: 2,112 slots are the
+default profile since v0.7.0, so the wide-Detailed cells run in the
+default campaign. Kept for one release.
 --list prints the curated default, long, skipped-with-reason, btrfs,
 overlay, and expected-failure lists and verifies them against
-the binary, without running anything. With --wide-detailed-2112 it
-prints and verifies only the wide-Detailed list.
+the binary, without running anything.
 --list-integration prints the curated integration-test selectors and
 verifies each against the built test binaries in TEST_BINARY_DIR
 (exactly one binary and exactly one selected test per entry), without
@@ -1209,7 +1209,10 @@ check_wide_curation() {
 # --list mode: curated lists plus a verification footer. Unprivileged-safe.
 list_mode() {
     local bin name i wide=0
-    if [ "${1:-}" = "--wide-detailed-2112" ]; then wide=1; shift; fi
+    if [ "${1:-}" = "--wide-detailed-2112" ]; then
+        echo "$PROG: note: wide-detailed-2112 is the default profile since v0.7.0; the flag is ignored" >&2
+        shift
+    fi
     [ $# -eq 1 ] || { usage >&2; return 2; }
     bin=$1
     [ -x "$bin" ] || { echo "$PROG: not an executable test binary: $bin" >&2; return 1; }
@@ -1387,7 +1390,7 @@ main() {
             --include-btrfs) include_btrfs=1 ;;
             --include-overlay) include_overlay=1 ;;
             --include-expected-failures) include_xfail=1 ;;
-            --wide-detailed-2112) wide=1 ;;
+            --wide-detailed-2112) echo "$PROG: note: wide-detailed-2112 is the default profile since v0.7.0; the flag is ignored" >&2 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
             *) SELECTORS+=("$arg") ;;
         esac

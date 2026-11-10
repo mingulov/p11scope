@@ -259,8 +259,10 @@ jobs:
         run: |
           set -euo pipefail
           toolchain=$(cat .release-rust-version)
-          cargo +"$toolchain" build --locked --offline -p p11scope -p p11scope-discover
-          cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
+          # The production journal builds at the 512-slot profile only;
+          # the wide default omits it (see the v0.7.0 release notes).
+          cargo +"$toolchain" build --locked --offline --no-default-features -p p11scope -p p11scope-discover
+          cargo +"$toolchain" test --locked --offline --no-default-features --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
           lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
           test -x "$lib"
           out="$RUNNER_TEMP/privileged-inputs-journal"

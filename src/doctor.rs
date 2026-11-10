@@ -3810,7 +3810,9 @@ mod tests {
 
     /// The journal row is preflight only: present in every probe, but
     /// never a requested/capture lane, so neither its Ok nor its Warn
-    /// can move the verdict or the exit code.
+    /// can move the verdict or the exit code. The wide default build
+    /// omits the production journal, where the row is honestly
+    /// NotApplicable instead of assessed.
     #[test]
     fn journal_pair_row_is_preflight_only_and_never_gates() {
         let checks = probe(None, None);
@@ -3818,10 +3820,17 @@ mod tests {
             .iter()
             .find(|c| c.name == JOURNAL_PAIR_ROW)
             .unwrap_or_else(|| panic!("journal pair row is missing: {checks:?}"));
-        assert!(
-            matches!(row.status, Status::Ok(_) | Status::Warn(_)),
-            "assessed on every host, never Fail or NotApplicable: {row:?}"
-        );
+        if cfg!(feature = "wide-detailed-2112") {
+            assert!(
+                matches!(row.status, Status::NotApplicable(_)),
+                "omitted from the wide build, never Fail: {row:?}"
+            );
+        } else {
+            assert!(
+                matches!(row.status, Status::Ok(_) | Status::Warn(_)),
+                "assessed on every host, never Fail or NotApplicable: {row:?}"
+            );
+        }
         assert!(!is_capture_row(JOURNAL_PAIR_ROW));
         assert!(!is_requested_lane(JOURNAL_PAIR_ROW));
         // Doctor success alone changes no verdict: an available journal

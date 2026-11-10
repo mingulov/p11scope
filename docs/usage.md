@@ -777,11 +777,12 @@ discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
 rarest providers first). Scope admission does not promise that every process
 or call is captured (see the
 [known limitations](../CHANGELOG.md#known-limitations)), and the whole-machine
-scope shares the 512 attach slots with every ambient provider. Without
-`--module`, a `--cgroup` or `--system` capture admits each provider whole or
-not at all, by value: `--manifest` providers, then providers with a
-corroborated function table, then heuristic finds, proxy closure arrays last;
-heuristic finds and closure arrays may not use the last 128 slots (25%), kept
+scope shares the 2,112 attach slots with every ambient provider. Without
+`--module`, a `--cgroup` or `--system` capture admits each provider whole,
+in part when it does not fit whole, or not at all, by value: `--manifest`
+providers, then providers with a corroborated function table, then heuristic
+finds, proxy closure arrays last; smallest fresh demand first within each
+class; heuristic finds and closure arrays may not use the last 528 slots (25%), kept
 for corroborated providers found later. A refusal names what holds the slots,
 the reserve, and `--module <path>` as the way to capture one provider, which
 admits in discovery order as `--pid` and `run` do.
@@ -2678,7 +2679,7 @@ applies to that check, though it still guards memory snapshots and identity
 hashing. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
 cgroup discovery considers at most 256 members by default (`--max-scan-pids`)
-and planning has 512 attach slots. Every bounded omission forces `PARTIAL`;
+and planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;
 no retry renews a budget.
 
 Kernel-side capture state has its own fixed limits, all disclosed in

@@ -382,8 +382,7 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup",
       "reason": "root-owned BPF lane; 2112-slot Detailed stop publishes before cleanup",
-      "cell": "feature",
-      "owner": "wide-detailed-2112 runner"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -522,8 +521,7 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
       "reason": "root-owned BPF lane; 2112 distinct physical Detailed slots, 4224 CALL events and exact raw RV rows",
-      "cell": "feature",
-      "owner": "wide-detailed-2112 runner"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -535,15 +533,13 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec",
       "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 nonleader-exec START cleanup",
-      "cell": "feature",
-      "owner": "wide-detailed-2112 runner"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit",
       "reason": "root-owned BPF lane; 2049 physical endpoints and slot 2048 worker-exit START cleanup",
-      "cell": "feature",
-      "owner": "wide-detailed-2112 runner"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -2139,6 +2135,18 @@
       "path": "privileged_trace_pid_names_target_on_stderr",
       "reason": "privileged: loads BPF; run as root with --ignored --test-threads=1",
       "cell": "live-kernel"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::revival_probe_clears_a_live_detached_slot_lp64",
+      "reason": "privileged: real Detailed Session revival probe",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::revival_probe_never_clears_a_singles_slot_lp64",
+      "reason": "privileged: real Detailed Session revival probe",
+      "cell": "privileged"
     }
   ]
 }

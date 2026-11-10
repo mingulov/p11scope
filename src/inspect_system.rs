@@ -7843,22 +7843,23 @@ mod tests {
         fn inspect_aimed_system_capture_admits_heuristic_prefix_first_come() {
             // `inspect --system` lowers under the Detailed policy with the
             // same aim rule the capture engine keeps: an aimed capture
-            // admits first-come with no reserve, so a 600-endpoint
-            // heuristic provider admits its strongest 450-endpoint prefix
+            // admits first-come with no reserve, so a four-table heuristic
+            // provider over budget admits its strongest three-table prefix
             // and discloses the spilled table. JK-22a: the unaimed capture
-            // admits the reserve-capped 300-endpoint prefix with a named
+            // admits the reserve-capped two-table prefix with a named
             // provider-prefix gap instead of refusing the module whole; the
             // catalog files that gapped prefix as partial with its
             // attached count, carrying the prefix reason.
+            let entries = p11scope_ebpf_common::MAX_SLOTS as usize / 4 + 10;
             let aimed = scoped_catalog(
-                heuristic_provider(4, 150),
+                heuristic_provider(4, entries),
                 AdmissionPolicy::detailed(),
                 &[PathBuf::from(PATH)],
             );
             match catalog_admission(&aimed) {
                 AdmissionRecord::Admitted { class, endpoints } => {
                     assert_eq!(*class, "heuristic");
-                    assert_eq!(*endpoints, 450);
+                    assert_eq!(*endpoints, 3 * entries);
                 }
                 other => panic!("an aimed inspect must admit the prefix, got {other:?}"),
             }
@@ -7866,8 +7867,11 @@ mod tests {
                 aimed.admission.uncorroborated_candidates, 1,
                 "the spilled table stays disclosed"
             );
-            let unaimed =
-                scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
+            let unaimed = scoped_catalog(
+                heuristic_provider(4, entries),
+                AdmissionPolicy::detailed(),
+                &[],
+            );
             match catalog_admission(&unaimed) {
                 AdmissionRecord::Partial {
                     class,
@@ -7875,11 +7879,14 @@ mod tests {
                     reason,
                 } => {
                     assert_eq!(*class, "heuristic");
-                    assert_eq!(*endpoints, 300);
+                    assert_eq!(*endpoints, 2 * entries);
                     assert!(reason.contains("reserved"), "{reason}");
                     assert!(
-                        reason.contains("300 of 600 endpoints attached")
-                            && reason.contains("(provider_prefix)"),
+                        reason.contains(&format!(
+                            "{} of {} endpoints attached",
+                            2 * entries,
+                            4 * entries
+                        )) && reason.contains("(provider_prefix)"),
                         "the unaimed inspect carries the prefix gap: {reason}"
                     );
                 }
@@ -7892,8 +7899,12 @@ mod tests {
             // A prefix-admitted object is partially covered, never
             // refused: JSON and text must agree on the partial state
             // and carry the attached-vs-needed counts.
-            let unaimed =
-                scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
+            let entries = p11scope_ebpf_common::MAX_SLOTS as usize / 4 + 10;
+            let unaimed = scoped_catalog(
+                heuristic_provider(4, entries),
+                AdmissionPolicy::detailed(),
+                &[],
+            );
             let json = render_json(&unaimed);
             let admission = json["objects"]
                 .as_array()
@@ -7904,11 +7915,14 @@ mod tests {
                 .clone();
             assert_eq!(admission["state"], "partial");
             assert_eq!(admission["class"], "heuristic");
-            assert_eq!(admission["endpoints"], 300);
+            assert_eq!(admission["endpoints"], 2 * entries);
             let reason = admission["reason"].as_str().unwrap();
             assert!(
-                reason.contains("300 of 600 endpoints attached")
-                    && reason.contains("(provider_prefix)"),
+                reason.contains(&format!(
+                    "{} of {} endpoints attached",
+                    2 * entries,
+                    4 * entries
+                )) && reason.contains("(provider_prefix)"),
                 "the partial record keeps the prefix counts: {reason}"
             );
             let text = render_text(&unaimed);

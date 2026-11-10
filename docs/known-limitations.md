@@ -36,6 +36,16 @@ The following limits are new or changed in v0.7.0. Limits from
 [Known limitations in 0.6.0](#known-limitations-in-060) below still
 apply unless a subsection here says otherwise.
 
+### Counter and journal companions at the wide profile
+
+Detailed per-call capture now plans 2,112 attach slots, but its counter
+banks and production journal are still built at the 512-slot profile:
+`--counter-mode` selections refuse with the documented "builds without
+counter objects" reason, and journal-lane captures refuse
+`journal-pair-unavailable-in-build` (`doctor` shows the pair as
+unavailable). Profile and trace captures are unaffected. Restoring the
+companions at the wide profile is 0.7.x work.
+
 ### Copy-up in-place truncation
 
 A spanning capture now attributes both sides of a container copy-up,
@@ -498,7 +508,7 @@ names the source SHA behind each check the release rounds re-measured.
   per endpoint of payload, attach costs about 256 bytes of kernel
   memory per attached endpoint, and per-hit cost does not grow with
   the endpoint count. Detailed per-call capture keeps its separate
-  512-slot budget (2112 in the wide build) and counter modes keep
+  2,112-slot budget (512 with `--no-default-features`) and counter modes keep
   their 8192 planner ceiling, because their per-CPU maps scale with
   slot count times CPU count and are not equally cheap to raise.
   Caller-pair, discovery-owner and work limits stay separate, and

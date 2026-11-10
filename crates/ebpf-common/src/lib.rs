@@ -133,7 +133,9 @@ pub fn target_stack_arg_address(stack_pointer: u64, index: u8, layout: LinuxLayo
 
 /// Attach slots. One slot per unique {object, file_offset} target, not
 /// per function name — aliased names share a slot by construction.
-/// The wide build is an explicit, finite Detailed qualification envelope.
+/// The wide build is the release profile: an explicit, finite Detailed
+/// qualification envelope, default since v0.7.0. The 512 build stays
+/// available via `--no-default-features` as the comparison build.
 /// Inventory selects its own checked pre-load endpoint capacity.
 #[cfg(not(feature = "wide-detailed-2112"))]
 pub const MAX_SLOTS: u32 = 512;

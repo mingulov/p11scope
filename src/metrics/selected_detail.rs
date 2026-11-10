@@ -6191,7 +6191,9 @@ mod tests {
         // accepts (100→110, seq 2), the gate succeeds, then placement
         // fails occupied; the refusal must publish the accepted
         // receipt and abandon the real reservation (dummy stays).
-        let pool = test_pool();
+        // The pool fits two detail-child envelopes at the release
+        // profile; the 64 MiB staging pool only fits two at 512 slots.
+        let pool = SemanticResourcePool::reference_limit(256 * 1024 * 1024);
         let scene = stage_two_providers(pool);
         let mut brackets =
             BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());

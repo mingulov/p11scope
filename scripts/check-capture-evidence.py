@@ -734,9 +734,12 @@ UNKNOWN_NULL_SKIP = {"name": "unknown", "reason": "null pointer"}
 # doubled; the unwalked one is a single scan-side record.
 G1_SURFACES = Counter({("full", 68): 2, ("full", 92): 2, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
-# `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
-# attach ceiling a whole-module capacity refusal is taken against.
-MAX_SLOTS = 512
+# `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the
+# release attach ceiling a whole-module capacity refusal is taken against.
+MAX_SLOTS = 2112
+# `shared_scope_reserve(MAX_SLOTS)` (src/plan.rs): a quarter of the budget,
+# never under one whole 3.2 function list.
+SHARED_SCOPE_RESERVE = max(MAX_SLOTS * 25 // 100, 104)
 # What the installed libp11-kit really maps (Task 1.4, refreshed for the
 # first-plan prefix): 67 static CK_FUNCTION_LIST_3_2 closure templates on
 # the lane hosts, 104 entries each, ordinals 65/66 shared by all
@@ -770,9 +773,9 @@ PROXY_DECODED_ENTRIES = PROXY_SPILL * PROXY_TABLE_ENTRIES + PROXY_PREFIX_TABLES 
 # `LEGACY_PREFIX_SLOTS` (src/discovery/scan.rs): a short accept decodes the
 # known 68-entry prefix, never the declared layout.
 SHORT_PREFIX_SLOTS = 68
-# The prefix never takes the reserve (`shared_scope_reserve(512)`): with
+# The prefix never takes the reserve (`shared_scope_reserve(2112)`): with
 # the 68-slot backend admitted first, the prefix fills at most this many.
-PROXY_PREFIX_CEILING = MAX_SLOTS - 128
+PROXY_PREFIX_CEILING = MAX_SLOTS - SHARED_SCOPE_RESERVE
 
 SAFE_ALLOWANCES = {
     "semantic_capture_failures": 3,

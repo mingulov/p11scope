@@ -16,6 +16,7 @@ name = "p11scope"
 path = "src/lib.rs"
 
 [features]
+default = ["wide-detailed-2112"]
 unsafe-unvalidated-metadata = []
 wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 # P0 explicit option: build the Detailed object with the H7-E4

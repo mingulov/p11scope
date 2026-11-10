@@ -131,7 +131,7 @@ See [output verbosity](usage.md#text-output-concise-by-default--v-for-detail).
 Inventory holds up to 131,072 physical endpoint IDs with
 `--max-endpoints`; `inventory --system` on hosts with uprobe_multi defaults
 to 32,768. An endpoint is a provider object plus function
-offset, not a process. Detailed per-call capture has a separate 512-slot limit
+offset, not a process. Detailed per-call capture has a separate 2,112-slot limit
 in release builds. These are different modes and budgets; unloading does not
 refund Inventory IDs during a capture.
 
@@ -425,7 +425,7 @@ report format.
   `PARTIAL`, not a claim that the proxy layer was captured. A live capture
   instead admits the forwarding layer by what it publishes (below), with
   an unpublished layer staying a named gap while the capture continues.
-- Detailed per-call capture has 512 attach slots in release builds; this is
+- Detailed per-call capture has 2,112 attach slots in release builds; this is
   separate from Inventory's endpoint budget (32,768 by default on
   `inventory --system` with uprobe_multi, up to 131,072 with
   `--max-endpoints`) and the explicit aggregate counter modes. Detailed
@@ -445,7 +445,7 @@ report format.
   layer (`--module <path>`) is the sole exception: it keeps a
   reserve-capped leading-templates prefix, because a remote client's
   tables are handed out before any export probe can observe the return.
-  The prefix leaves at least the reserve (128 of 512 slots) free, so one
+  The prefix leaves at least the reserve (528 of 2,112 slots) free, so one
   later standard function list (at most 104 entries) always fits. Under
   inventory, counter and broad admission a closure array that does not
   fit whole is refused whole with its demand stated. A `--cgroup` or `--system`

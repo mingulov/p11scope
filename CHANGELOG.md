@@ -51,6 +51,21 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Changed
 
+- Detailed per-call capture now plans 2,112 attach slots (was 512), so a
+  busy desktop watches every provider — including Firefox's `libsoftokn3.so`
+  and `p11-kit-trust.so` — instead of refusing them for slots. The wider
+  profile costs about 5.7 MiB more locked kernel memory at 12 CPUs (about
+  7.5 MB of per-CPU counters in all). `--no-default-features` still builds
+  the 512-slot comparison profile. Counter modes and the production journal
+  are unavailable in the wide build for now (they refuse with a named gap);
+  see the release notes.
+- Retired attach slots are reused once their occupant is gone and its
+  counts are final: a provider that leaves and returns reoccupies its own
+  slots, so process churn no longer burns the lifetime budget. A provider
+  that still does not fit whole attaches its most important functions with
+  a named `(provider_partial)` gap instead of being refused whole, small
+  providers decide first within their class, and whole capacity refusals
+  are named in the default output, not just `-v`.
 - The default EVENTS ring is 32 MiB (was 4 MiB) for `profile`, `trace`
   and `run` in profile and trace modes, and the key-operations (Joint)
   lane's ring is 32 MiB (was 16 MiB). `--mode metrics` (with or without

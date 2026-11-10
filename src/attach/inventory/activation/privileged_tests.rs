@@ -5498,7 +5498,7 @@ fn task4_fixture_receipt(fixture: &OwnedFixture) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 fn task4_identity_fixture_receipt(identity: &Task4IdentityFixture) -> Result<()> {
     let directory = PathBuf::from(
         std::env::var_os("P11SCOPE_TASK4_EVIDENCE_DIR")
@@ -5953,7 +5953,7 @@ fn privileged_task4_inventory_2112_lp64() -> Result<()> {
     wide_inventory_gate()
 }
 
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 macro_rules! inventory_sweep_test {
     ($name:ident, $n:literal, $cell:literal) => {
         #[test]
@@ -5963,31 +5963,31 @@ macro_rules! inventory_sweep_test {
         }
     };
 }
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_task4_inventory_n511_lp64,
     511,
     "inventory-default-n511"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_task4_inventory_n512_lp64,
     512,
     "inventory-default-n512"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_task4_inventory_n513_lp64,
     513,
     "inventory-default-n513"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_task4_inventory_n2048_lp64,
     2048,
     "inventory-default-n2048"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_task4_inventory_n2049_lp64,
     2049,
@@ -6000,27 +6000,27 @@ inventory_sweep_test!(
 // the controller checks the FD/link preflight (ordinary T7 math test) first.
 // Keep 6530 as the historical motivating control and 6531 as the actual
 // private Inventory capacity-positive selector.
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(privileged_t7_inventory_n576_lp64, 576, "inventory-t7-n576");
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_t7_inventory_n1024_lp64,
     1024,
     "inventory-t7-n1024"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_t7_inventory_n4097_lp64,
     4097,
     "inventory-t7-n4097"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_t7_inventory_n6530_lp64,
     6530,
     "inventory-t7-n6530"
 );
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 inventory_sweep_test!(
     privileged_t7_inventory_n6531_lp64,
     6531,
@@ -6032,7 +6032,7 @@ inventory_sweep_test!(
 /// FD-exhaustion failure into the same refusal verdict. Both emit
 /// `T7_ENVELOPE_REFUSAL` and return `Ok` as a separate result — never a
 /// coverage pass, never an ambiguous failure. Any other error still fails.
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 fn t7_boundary_cell_gate(n: u32, cell: &'static str) -> Result<()> {
     let open_fds = std::fs::read_dir("/proc/self/fd")?
         .collect::<std::io::Result<Vec<_>>>()?
@@ -6062,7 +6062,7 @@ fn t7_boundary_cell_gate(n: u32, cell: &'static str) -> Result<()> {
     }
 }
 
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 #[test]
 #[ignore = "root-owned BPF lane; bounded physical Inventory sweep with envelope refusal branch"]
 fn privileged_t7_inventory_n8192_boundary_lp64() -> Result<()> {
@@ -6859,8 +6859,8 @@ fn privileged_inventory_multi_n20480_default_lp64() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "wide-detailed-2112"))]
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
+#[cfg(feature = "wide-detailed-2112")]
 #[test]
 #[ignore = "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Inventory targets"]
 fn privileged_task4_inventory_physical_identity_controls() -> Result<()> {
@@ -8679,7 +8679,7 @@ fn task4_detailed_physical_capacity_refusal() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "wide-detailed-2112"))]
+#[cfg(feature = "wide-detailed-2112")]
 #[test]
 #[ignore = "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Detailed targets"]
 fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {

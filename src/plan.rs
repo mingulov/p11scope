@@ -60,7 +60,7 @@ mod selection_recovery_tests;
 /// Immutable admission contract carried by one planner for its whole capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionPolicy {
-    /// Existing metrics/profile/trace behavior: 512 lifetime slots and K4
+    /// Existing metrics/profile/trace behavior: 2,112 lifetime slots and K4
     /// unresolved heuristic tables per physical provider object.
     Detailed,
     /// Compact entry-use inventory: every validated physical target is
@@ -940,13 +940,11 @@ pub enum AdmissionScope {
 /// so a provider whose table is corroborated later in the capture (by a live
 /// `C_GetFunctionList` return, an interface or its exports) still fits.
 ///
-/// A quarter, as the GT-5 review proposed. On the 512-slot release build it
-/// is 128 slots: one whole PKCS#11 3.2 function list (104 entries) or a 2.40
-/// list (68) with room to spare, while the other 384 still hold what a
-/// desktop maps ambiently — `p11-kit-trust` (68) plus an NSS-softokn-sized
-/// multi-table provider. It never drops below one whole largest standard
-/// table (see [`shared_scope_reserve`]), so it keeps its meaning for smaller
-/// budgets, and it scales with the wide profile (528 of 2,112).
+/// A quarter, as the GT-5 review proposed. On the 2,112-slot release build it
+/// is 528 slots, while the other 1,584 still hold what a desktop maps
+/// ambiently — several providers over. It never drops below one whole
+/// largest standard table (see [`shared_scope_reserve`]), so it keeps its
+/// meaning for smaller budgets (128 of 512 on the comparison build).
 pub(crate) const SHARED_SCOPE_RESERVE_PERCENT: usize = 25;
 
 /// Entries of the largest standard function list (PKCS#11 3.2).
@@ -2065,6 +2063,9 @@ impl AttachPlan {
     }
 
     /// Retired targets cleared for same-target revival this rebuild.
+    /// Test-only: production writes clearance wholesale via
+    /// [`Self::set_revivable`] and reads it through merge.
+    #[cfg(test)]
     pub(crate) fn revivable(&self) -> &BTreeMap<AttachKey, usize> {
         &self.revivable
     }
@@ -2728,7 +2729,7 @@ impl AttachPlan {
                 .iter()
                 .filter_map(|(key, position)| {
                     let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
-                    (new != u32::MAX).then(|| (*key, new as usize))
+                    (new != u32::MAX).then_some((*key, new as usize))
                 })
                 .collect();
         }
@@ -13774,6 +13775,13 @@ mod tests {
             .find(|skipped| skipped.subject == path)
     }
 
+    /// Named-closure prefix width in tables: reserve-capped leading
+    /// templates, at most the per-object table cap.
+    fn named_closure_prefix_tables() -> usize {
+        ((MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize)) / 103)
+            .min(MAX_TABLES_PER_OBJECT)
+    }
+
     fn replace_table_targets(
         module: &mut ReconciledModule,
         table: usize,
@@ -13807,7 +13815,9 @@ mod tests {
     fn whole_module_demand_unions_later_tables_views_aliases_and_shared_targets() {
         let existing =
             provider_with_tables(201, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
-        let mut refused = provider_with_tables(202, "/opt/refused.so", 2, 4, true);
+        // Heuristic: class orders the corroborated crowder first at any
+        // width, so the demand union is what the refusal reports.
+        let mut refused = provider_with_tables(202, "/opt/refused.so", 2, 4, false);
         replace_table_targets(
             &mut refused,
             0,
@@ -13925,7 +13935,9 @@ mod tests {
     fn whole_module_demand_excludes_scan_targets_without_a_valid_table() {
         let existing =
             provider_with_tables(221, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
-        let refused = provider_with_tables(222, "/opt/refused.so", 2, 3, true);
+        // Heuristic: class orders the corroborated crowder first at any
+        // width, so the demand union is what the refusal reports.
+        let refused = provider_with_tables(222, "/opt/refused.so", 2, 3, false);
         let mut lowered = lower_scanned(&refused);
         for (table, offset) in [(None, 0x9000), (Some(2), 0xa000)] {
             let mut stray = lower_scanned(&refused).targets.remove(0);
@@ -14405,14 +14417,15 @@ mod tests {
     /// bounded whole like it blocks the prefix.
     #[test]
     fn named_scope_refuses_small_closure_whole_when_a_provider_is_refused() {
-        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let filled = MAX_SLOTS as usize - 135;
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, filled, true);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
         let modules = [filler, trust, crowded, family];
         let named = scoped_plan(&modules, AdmissionScope::Named);
 
-        assert_eq!(slots_of(&named, 50), 400);
+        assert_eq!(slots_of(&named, 50), filled);
         assert_eq!(slots_of(&named, 32), 68);
         assert_eq!(slots_of(&named, 33), 0, "provider crowded out");
         assert_eq!(slots_of(&named, 41), 0, "no whole behind a loss");
@@ -14436,14 +14449,15 @@ mod tests {
     /// is pinned by `named_scope_admits_closure_prefix_when_no_provider_competes`.)
     #[test]
     fn named_scope_refuses_closure_whole_when_a_provider_is_refused() {
-        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let filled = MAX_SLOTS as usize - 135;
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, filled, true);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let modules = [filler, trust, crowded, p11_kit];
         let named = scoped_plan(&modules, AdmissionScope::Named);
 
-        assert_eq!(slots_of(&named, 50), 400);
+        assert_eq!(slots_of(&named, 50), filled);
         assert_eq!(slots_of(&named, 32), 68);
         assert_eq!(slots_of(&named, 33), 0, "provider crowded out");
         assert_eq!(slots_of(&named, 31), 0, "no prefix behind a loss");
@@ -14744,7 +14758,7 @@ mod tests {
     #[test]
     fn named_closure_falling_through_to_published_only_stays_silent() {
         let sidecar = provider_with_tables(32, "/opt/sidecar.so", 1, 1, false);
-        let big = provider_with_tables(33, "/opt/big.so", 1, 600, false);
+        let big = provider_with_tables(33, "/opt/big.so", 1, MAX_SLOTS as usize + 88, false);
         let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
         closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         closure.scanned.tables[63].live_return = true;
@@ -14845,11 +14859,18 @@ mod tests {
         p11_kit.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let named = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
 
-        assert_eq!(slots_of(&named, 31), 3 * 103, "leading-templates prefix");
+        let tables = named_closure_prefix_tables();
+        assert_eq!(
+            slots_of(&named, 31),
+            tables * 103,
+            "leading-templates prefix"
+        );
         assert_eq!(named.modules_skipped.len(), 1);
         let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("3 of 64 template tables attached"),
+            partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
             "{}",
             partial.reason
         );
@@ -15290,8 +15311,8 @@ mod tests {
         let key_of = |plan: &AttachPlan, position: usize| AttachKey::of(&plan.slots[position]);
         let key1 = key_of(&plan, 1);
         let key3 = key_of(&plan, 3);
-        plan.revivable.insert(key1.clone(), 1);
-        plan.revivable.insert(key3.clone(), 3);
+        plan.revivable.insert(key1, 1);
+        plan.revivable.insert(key3, 3);
         // A wholly inactive tail is withdrawn with its memories.
         plan.withdraw_unlinked_additions(3);
         assert_eq!(plan.slots.len(), 3);
@@ -15312,7 +15333,7 @@ mod tests {
         // Excising an inactive tail cell remaps the survivors after it.
         plan.deactivate(2);
         let key2 = key_of(&plan, 2);
-        plan.revivable.insert(key2.clone(), 2);
+        plan.revivable.insert(key2, 2);
         let map = plan.excise_unlinked_tail_cells(1, &BTreeSet::from([1]));
         assert_eq!(map[1], u32::MAX, "the excised cell is gone");
         assert_eq!(plan.slots.len(), 2);
@@ -15399,10 +15420,21 @@ mod tests {
             .map(|field| field.name)
             .collect();
         assert_eq!(names.len(), 68);
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, 344, true);
+        let free = 40;
+        let filler = provider_with_tables(
+            51,
+            "/opt/filler.so",
+            1,
+            MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize) - free,
+            true,
+        );
         let provider = named_table_provider(52, "/opt/trust.so", &names);
         let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
-        assert_eq!(slots_of(&shared, 51), 344, "filler admitted whole");
+        assert_eq!(
+            slots_of(&shared, 51),
+            MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize) - free,
+            "filler admitted whole"
+        );
         assert_eq!(
             slots_of(&shared, 52),
             40,
@@ -15453,9 +15485,27 @@ mod tests {
                 .collect();
             replace_table_targets(&mut provider, table, &targets);
         }
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, 412, true);
-        let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
-        assert_eq!(slots_of(&shared, 51), 412, "filler admitted whole");
+        // Small-first decides every filler (each under the provider's
+        // demand) before the provider, crowding all but 100 slots.
+        let crowded = MAX_SLOTS as usize - 100;
+        let mut modules: Vec<ReconciledModule> = (0..10usize)
+            .map(|filler| {
+                let entries = crowded / 10 + usize::from(filler < crowded % 10);
+                provider_with_tables(100 + filler as u32, "/opt/filler.so", 1, entries, true)
+            })
+            .collect();
+        let filled: usize = modules
+            .iter()
+            .map(|module| module.scanned.tables[0].entries.len())
+            .sum();
+        assert_eq!(filled, crowded);
+        modules.push(provider);
+        let shared = scoped_plan(&modules, AdmissionScope::Shared);
+        assert_eq!(
+            shared.slots.len() - slots_of(&shared, 53),
+            filled,
+            "fillers admitted whole"
+        );
         assert_eq!(slots_of(&shared, 53), 100, "100 endpoints across tables");
         let partial = refusal_of(&shared, "/opt/softokn.so").expect("partial gap reported");
         assert!(
@@ -15516,8 +15566,22 @@ mod tests {
             .map(|(entry, name)| (*name, 54, (entry * 8) as u64))
             .collect();
         replace_table_targets(&mut provider, 0, &targets);
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, 493, true);
-        let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
+        // Small-first decides every filler (each under the provider's
+        // demand) before the provider, crowding all but 19 slots.
+        let crowded = MAX_SLOTS as usize - 19;
+        let mut modules: Vec<ReconciledModule> = (0..73usize)
+            .map(|filler| {
+                let entries = crowded / 73 + usize::from(filler < crowded % 73);
+                provider_with_tables(100 + filler as u32, "/opt/filler.so", 1, entries, true)
+            })
+            .collect();
+        let filled: usize = modules
+            .iter()
+            .map(|module| module.scanned.tables[0].entries.len())
+            .sum();
+        assert_eq!(filled, crowded);
+        modules.push(provider);
+        let shared = scoped_plan(&modules, AdmissionScope::Shared);
         assert_eq!(slots_of(&shared, 54), 19, "tier-0 plus one family plus one");
         let attached: BTreeSet<&str> = shared
             .slots
@@ -15561,7 +15625,7 @@ mod tests {
     /// module over budget is refused whole, never attached in part.
     #[test]
     fn partial_admission_refuses_manifest_modules_whole() {
-        let functions: Vec<FunctionRecord> = (0..513)
+        let functions: Vec<FunctionRecord> = (0..MAX_SLOTS as u64 + 1)
             .map(|entry| resolved("C_Sign", 0x1000 + entry * 8))
             .collect();
         let manifest = manifest_with(functions);
@@ -15599,19 +15663,21 @@ mod tests {
     /// decide what a capture sees.
     #[test]
     fn shared_scope_admits_small_provider_before_big() {
-        let big = provider_with_tables(71, "/opt/big.so", 1, 400, true);
-        let small = provider_with_tables(72, "/opt/small.so", 1, 200, true);
+        let big_demand = MAX_SLOTS as usize - 112;
+        let small_demand = 200;
+        let big = provider_with_tables(71, "/opt/big.so", 1, big_demand, true);
+        let small = provider_with_tables(72, "/opt/small.so", 1, small_demand, true);
         let shared = scoped_plan(&[big, small], AdmissionScope::Shared);
         assert_eq!(
             slots_of(&shared, 72),
-            200,
+            small_demand,
             "the small provider admits whole"
         );
         assert_eq!(slots_of(&shared, 71), 0, "the big provider does not fit");
         let refusal = refusal_of(&shared, "/opt/big.so").expect("whole refusal reported");
         assert_eq!(
             whole_refusal_needed_count(&refusal.reason),
-            Some(400),
+            Some(big_demand),
             "the complete fresh demand: {}",
             refusal.reason
         );
@@ -15646,14 +15712,14 @@ mod tests {
     /// single published table fits. Published tables stay atomic.
     #[test]
     fn shared_scope_refuses_a_provider_whose_published_union_exceeds_the_budget_whole() {
-        let filled = MAX_SLOTS as usize - 112;
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
-        // Two corroborated tables of 60 endpoints each: the 120-endpoint
-        // union exceeds the 112 free slots, but either table alone fits.
-        let published = provider_with_tables(52, "/opt/published.so", 2, 60, true);
+        // Small-first decides the filler before the published module, so
+        // the filler stays small and the union stays big: the union
+        // exceeds the remaining budget, but either table alone fits.
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 150, true);
+        let published = provider_with_tables(52, "/opt/published.so", 2, 1000, true);
         let shared = scoped_plan(&[filler, published], AdmissionScope::Shared);
 
-        assert_eq!(slots_of(&shared, 51), filled, "filler admitted whole");
+        assert_eq!(slots_of(&shared, 51), 150, "filler admitted whole");
         assert_eq!(
             slots_of(&shared, 52),
             0,
@@ -15662,7 +15728,7 @@ mod tests {
         let refusal = refusal_of(&shared, "/opt/published.so").expect("whole refusal reported");
         assert_eq!(
             whole_refusal_needed_count(&refusal.reason),
-            Some(120),
+            Some(2000),
             "the complete fresh demand: {}",
             refusal.reason
         );
@@ -15765,9 +15831,12 @@ mod tests {
     /// to free slots. Every pinned fact stays.
     #[test]
     fn provider_refusal_names_module_and_exclude_remedies_in_every_scope() {
-        let filled = MAX_SLOTS as usize - 112;
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
-        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        // Small-first decides the filler before the crowded module in
+        // both scopes, so the filler stays small and the crowded demand
+        // stays big.
+        let crowded_demand = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 150, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, crowded_demand, true);
         let modules = [filler, crowded];
         for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
             let plan = scoped_plan(&modules, scope);
@@ -15784,7 +15853,9 @@ mod tests {
                 refusal.reason
             );
             assert!(
-                refusal.reason.contains("module needs 150 more"),
+                refusal
+                    .reason
+                    .contains(&format!("module needs {crowded_demand} more")),
                 "{scope:?}: {}",
                 refusal.reason
             );
@@ -15802,9 +15873,12 @@ mod tests {
     /// name it.
     #[test]
     fn provider_refusal_names_counter_mode_only_for_metrics_captures() {
-        let filled = MAX_SLOTS as usize - 112;
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
-        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        // Small-first decides the filler before the crowded module in
+        // both scopes, so the filler stays small and the crowded demand
+        // stays big.
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 150, true);
+        let crowded =
+            provider_with_tables(52, "/opt/crowded.so", 1, MAX_SLOTS as usize - 112, true);
         let modules = [filler, crowded];
         for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
             let plain = scoped_plan(&modules, scope);
@@ -15902,9 +15976,13 @@ mod tests {
             "a quarter of the budget, never under one whole 3.2 function list"
         );
         let open = MAX_SLOTS as usize - reserve;
-        let first = provider_with_tables(61, "/opt/ambient-a.so", 1, open - 80, false);
-        let second = provider_with_tables(62, "/opt/ambient-b.so", 1, 80, false);
-        let third = provider_with_tables(63, "/opt/ambient-c.so", 1, 10, false);
+        // Three equal halves: small-first decides all three by key
+        // order, the first two tile the open budget exactly, and the
+        // reserve refuses the third.
+        let half = open / 2;
+        let first = provider_with_tables(61, "/opt/ambient-a.so", 1, half, false);
+        let second = provider_with_tables(62, "/opt/ambient-b.so", 1, half, false);
+        let third = provider_with_tables(63, "/opt/ambient-c.so", 1, half, false);
         let ambient = [first, second, third];
 
         let mut plan = scoped_plan(&ambient, AdmissionScope::Shared);
@@ -15918,9 +15996,10 @@ mod tests {
         assert!(
             refusal.reason.contains(&format!(
                 "{open} are in use ({open} active, 0 retired; held by /opt/ambient-a.so {}, \
-                 /opt/ambient-b.so 80); {reserve} are reserved for providers with a \
+                 /opt/ambient-b.so {}); {reserve} are reserved for providers with a \
                  corroborated function table — refusing to attach a prefix;",
-                open - 80
+                open / 2,
+                open / 2
             )),
             "{}",
             refusal.reason
@@ -16353,14 +16432,17 @@ mod tests {
         let mut p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         p11_kit.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let tables = named_closure_prefix_tables();
         assert_eq!(
             slots_of(&first, 31),
-            3 * 103,
+            tables * 103,
             "the named closure keeps its prefix"
         );
         let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("3 of 64 template tables attached"),
+            partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
             "{}",
             partial.reason
         );
@@ -16373,7 +16455,7 @@ mod tests {
     /// here), and the backend arriving after it is admitted in full.
     #[test]
     fn refused_provider_in_first_plan_grants_the_closure_no_prefix() {
-        let big = provider_with_tables(50, "/opt/big.so", 1, 600, false);
+        let big = provider_with_tables(50, "/opt/big.so", 1, MAX_SLOTS as usize + 88, false);
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let first = scoped_plan(&[big, p11_kit.clone()], AdmissionScope::Named);
@@ -16434,7 +16516,7 @@ mod tests {
         );
         // Beside refused providers the closure is still published-only:
         // awaiting publication, never a capacity refusal.
-        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, MAX_SLOTS as usize - 135, true);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let named = scoped_plan(&[filler, trust, crowded, p11_kit], AdmissionScope::Named);
@@ -16488,7 +16570,7 @@ mod tests {
         );
         // Whole: a named closure whose prefix a refused provider blocks,
         // beside that provider's own whole refusal.
-        let big = provider_with_tables(32, "/opt/big.so", 1, 600, false);
+        let big = provider_with_tables(32, "/opt/big.so", 1, MAX_SLOTS as usize + 88, false);
         let mut blocked = provider_with_tables(31, P11_KIT, 64, 103, false);
         blocked.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let empty = scoped_plan(&[], AdmissionScope::Named);
@@ -16499,12 +16581,17 @@ mod tests {
         let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
         named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let prefix = scoped_plan(std::slice::from_ref(&named), AdmissionScope::Named);
-        assert_eq!(slots_of(&prefix, 31), 3 * 103, "the named prefix attaches");
+        assert_eq!(
+            slots_of(&prefix, 31),
+            named_closure_prefix_tables() * 103,
+            "the named prefix attaches"
+        );
         assert_eq!(kind_of(&prefix, 31), Some(RefusalKind::ClosurePrefix));
         // Provider prefix: a crowded shared-scope corroborated provider.
-        let filled = MAX_SLOTS as usize - 112;
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
-        let mut mixed = provider_with_tables(52, "/opt/mixed.so", 3, 50, false);
+        // Small-first decides the filler before the mixed module, so the
+        // filler stays small and the mixed demand stays big.
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 150, true);
+        let mut mixed = provider_with_tables(52, "/opt/mixed.so", 3, 700, false);
         mixed.scanned.tables[0].live_return = true;
         let shared = scoped_plan(&[filler, mixed], AdmissionScope::Shared);
         assert_eq!(kind_of(&shared, 52), Some(RefusalKind::ProviderPrefix));
@@ -16583,16 +16670,19 @@ mod tests {
     fn named_prefix_from_an_earlier_pass_crowds_a_later_named_provider() {
         let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
         closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
-        let mut later = provider_with_tables(32, "/opt/late.so", 2, 104, false);
+        // One later table fits beside the held prefix, the second spills.
+        let late_entries = MAX_SLOTS as usize - named_closure_prefix_tables() * 103 - 50;
+        let mut later = provider_with_tables(32, "/opt/late.so", 2, late_entries, false);
         later.scanned.module_hint = Some(std::path::PathBuf::from("/opt/late.so"));
         let first = scoped_plan(std::slice::from_ref(&closure), AdmissionScope::Named);
-        assert_eq!(slots_of(&first, 31), 3 * 103, "named prefix immediate");
-        assert_eq!(first.uncorroborated_candidates, 61);
+        let tables = named_closure_prefix_tables();
+        assert_eq!(slots_of(&first, 31), tables * 103, "named prefix immediate");
+        assert_eq!(first.uncorroborated_candidates, 64 - tables as u64);
         let rebuilt = first.rebuild_from_sources(&[closure, later], &[], &PinnedObjects::empty());
-        assert_eq!(slots_of(&rebuilt, 32), 104, "first table attaches");
-        assert_eq!(rebuilt.uncorroborated_candidates, 62);
+        assert_eq!(slots_of(&rebuilt, 32), late_entries, "first table attaches");
+        assert_eq!(rebuilt.uncorroborated_candidates, 65 - tables as u64);
         assert!(refusal_of(&rebuilt, "/opt/late.so").is_none());
-        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "held prefix kept");
+        assert_eq!(slots_of(&rebuilt, 31), tables * 103, "held prefix kept");
     }
 
     /// Late-start twin (`--pid` on a running process): the closure and
@@ -16726,7 +16816,7 @@ mod tests {
     /// operator already named it.
     #[test]
     fn named_closure_refused_whole_carries_no_module_remedy() {
-        let big = provider_with_tables(32, "/opt/big.so", 1, 600, false);
+        let big = provider_with_tables(32, "/opt/big.so", 1, MAX_SLOTS as usize + 88, false);
         let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
         closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let empty = scoped_plan(&[], AdmissionScope::Named);
@@ -16758,14 +16848,17 @@ mod tests {
             &[],
             &PinnedObjects::empty(),
         );
+        let tables = named_closure_prefix_tables();
         assert_eq!(
             slots_of(&first, 31),
-            3 * 103,
+            tables * 103,
             "the named mid-capture prefix"
         );
         let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("3 of 64 template tables attached"),
+            partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
             "{}",
             partial.reason
         );
@@ -16788,6 +16881,7 @@ mod tests {
             };
             let empty = scoped_plan(&[], AdmissionScope::Named);
             let settled = empty.rebuild_from_sources(&input, &[], &PinnedObjects::empty());
+            let tables = named_closure_prefix_tables();
             assert_eq!(
                 slots_of(&settled, 33),
                 68,
@@ -16795,7 +16889,7 @@ mod tests {
             );
             assert_eq!(
                 slots_of(&settled, 31),
-                3 * 103,
+                tables * 103,
                 "the named closure prefixes after the provider: {order}"
             );
             assert!(
@@ -16805,7 +16899,9 @@ mod tests {
             );
             let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
             assert!(
-                partial.reason.contains("3 of 64 template tables attached"),
+                partial
+                    .reason
+                    .contains(&format!("{tables} of 64 template tables attached")),
                 "{}",
                 partial.reason
             );
@@ -16838,15 +16934,18 @@ mod tests {
         // Named: the reserve-capped prefix after the provider.
         let rebuilt =
             settled.rebuild_from_sources(&[provider.clone(), named], &[], &PinnedObjects::empty());
+        let tables = named_closure_prefix_tables();
         assert_eq!(slots_of(&rebuilt, 33), 68, "the provider stays whole");
         assert_eq!(
             slots_of(&rebuilt, 31),
-            3 * 103,
+            tables * 103,
             "the named closure takes its prefix in the later rebuild"
         );
         let partial = refusal_of(&rebuilt, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("3 of 64 template tables attached"),
+            partial
+                .reason
+                .contains(&format!("{tables} of 64 template tables attached")),
             "{}",
             partial.reason
         );

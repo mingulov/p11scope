@@ -9991,6 +9991,10 @@ pub(crate) mod tests {
         );
     }
 
+    /// Counter objects are omitted from the wide default build (see the
+    /// v0.7.0 release notes); this pins the 512-slot counter build until
+    /// the companions are restored at the wide profile.
+    #[cfg(not(feature = "wide-detailed-2112"))]
     #[test]
     fn format2_preparation_rejects_mixed_profiles_before_lifecycle() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
@@ -10072,6 +10076,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// Counter objects are omitted from the wide default build (see the
+    /// v0.7.0 release notes); this pins the 512-slot counter build until
+    /// the companions are restored at the wide profile.
+    #[cfg(not(feature = "wide-detailed-2112"))]
     #[test]
     fn format2_preparation_charges_custody_and_payload_together() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
@@ -10945,6 +10953,10 @@ pub(crate) mod tests {
         );
     }
 
+    /// Counter objects are omitted from the wide default build (see the
+    /// v0.7.0 release notes); this pins the 512-slot counter build until
+    /// the companions are restored at the wide profile.
+    #[cfg(not(feature = "wide-detailed-2112"))]
     #[test]
     fn counter_preparation_refuses_when_bpf_loop_is_absent() {
         use super::super::{AttachBackend, BpfLoopVerdict};

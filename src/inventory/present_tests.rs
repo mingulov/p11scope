@@ -3617,6 +3617,220 @@ fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
     assert_eq!(gaps.len(), 5, "JSON keeps every record: {document}");
 }
 
+/// Unreachable-process family fold (system demo): ESRCH
+/// retained-root opens across two foreign roots become ONE concise
+/// line naming the outcome with exact object and process counts —
+/// never one machine-token line per root — while verbose keeps
+/// every object row and JSON keeps every record. ESRCH under a
+/// foreign root means the process ended mid-scan or its foreign
+/// root became unusable (a sandbox jail dangling through a dead
+/// pid reads exactly this way on alive processes); the line hedges
+/// honestly instead of claiming every process exited. One row
+/// carries repeats 3: the fold counts rows, like the header.
+#[test]
+fn concise_folds_unreachable_process_races_into_one_counted_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let root_a = "opening object within retained target root: No such process (os error 3) (target root /proc/2431044/fdinfo differs from the observer root)";
+    let root_b = "opening object within retained target root: No such process (os error 3) (target root /proc/2431006/fdinfo differs from the observer root)";
+    let rows = [
+        (2431043u32, root_a, "/snap/firefox/a.so", 1u64),
+        (2431043u32, root_a, "/snap/firefox/b.so", 3u64),
+        (2431043u32, root_a, "/snap/firefox/c.so", 1u64),
+        (2431005u32, root_b, "/snap/firefox/d.so", 1u64),
+        (2431005u32, root_b, "/snap/firefox/e.so", 1u64),
+    ];
+    for (pid, reason, subject, repeats) in rows {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: (*subject).into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("gaps: 5"),
+        "header counts every retained row: {concise}"
+    );
+    assert!(
+        concise.contains(
+            "5 × mapped objects not examined — in 2 processes ended or unreachable (--json lists each)"
+        ),
+        "one family line carries exact object and process counts: {concise}"
+    );
+    assert!(
+        !concise.contains("No such process"),
+        "no machine errno in concise: {concise}"
+    );
+    assert!(
+        !concise.contains("os error 3"),
+        "no raw errno in concise: {concise}"
+    );
+    assert!(
+        !concise.contains("fdinfo"),
+        "no raw target-root path in concise: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for subject in [
+        "/snap/firefox/a.so",
+        "/snap/firefox/b.so",
+        "/snap/firefox/c.so",
+        "/snap/firefox/d.so",
+        "/snap/firefox/e.so",
+    ] {
+        assert!(
+            verbose.contains(subject),
+            "verbose keeps every object row: {verbose}"
+        );
+    }
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = document["gaps"]
+        .as_array()
+        .expect("JSON keeps a gaps array");
+    assert_eq!(gaps.len(), 5, "JSON keeps every record: {document}");
+}
+
+/// Healthy twin: rows outside the unreachable-process family never
+/// join its line — foreign ENOENT keeps its per-root fold, the
+/// fallback keeps its fallback words, size-cap and precondition
+/// keep their own lines, and same-root ESRCH/ENOENT keep their
+/// per-object lines (their reasons still word the race calmly,
+/// pinned above).
+#[test]
+fn concise_keeps_other_object_failures_out_of_the_unreachable_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let foreign_enoent = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)";
+    for subject in ["/lib/a.so", "/lib/b.so"] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(4242),
+            subject: (*subject).into(),
+            reason: (*foreign_enoent).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    for (subject, reason) in [
+        (
+            "/lib/c.so",
+            "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2))",
+        ),
+        (
+            "/lib/big.so",
+            "object is 278755480 bytes; limit is 268435456",
+        ),
+        (
+            "relative/path.so",
+            "target-root object requires an absolute path without parent traversal",
+        ),
+        (
+            "/lib/d.so",
+            "opening object within retained target root: No such file or directory (os error 2)",
+        ),
+        (
+            "/lib/e.so",
+            "opening object within retained target root: No such process (os error 3)",
+        ),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(4243),
+            subject: (*subject).into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("gaps: 7"),
+        "header counts every retained row: {concise}"
+    );
+    assert!(
+        concise.contains("2 ×")
+            && concise.contains("/etc/avahi")
+            && concise.contains("--json lists each"),
+        "foreign ENOENT keeps its per-root fold: {concise}"
+    );
+    assert!(
+        concise.contains("object unavailable from the process's root or the host-root fallback"),
+        "fallback keeps its fallback words: {concise}"
+    );
+    assert!(
+        concise.contains("/lib/big.so") && concise.contains("relative/path.so"),
+        "size-cap and precondition refusals keep their own lines: {concise}"
+    );
+    assert!(
+        concise.contains("/lib/e.so") && concise.contains("process exited during scan"),
+        "same-root ESRCH keeps its per-object line with calm words: {concise}"
+    );
+    assert!(
+        !concise.contains("mapped objects not examined"),
+        "no family line without a foreign-ESRCH row: {concise}"
+    );
+}
+
+/// Family line boundaries: a single foreign-ESRCH row still reads
+/// as one counted line (never a bare object row), and rows without
+/// a pid read as unreachable objects rather than counting zero
+/// processes.
+#[test]
+fn concise_unreachable_line_handles_single_and_pidless_rows() {
+    let harness = varied_harness();
+    let foreign_esrch = "opening object within retained target root: No such process (os error 3) (target root /srv/jail differs from the observer root)";
+    let mut single = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    single.gaps.clear();
+    single.gaps_suppressed = 0;
+    single.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(4242),
+        subject: "/lib/only.so".into(),
+        reason: (*foreign_esrch).into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&single, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains(
+            "1 × mapped objects not examined — in 1 process ended or unreachable (--json lists each)"
+        ),
+        "a single race reads as one counted line: {concise}"
+    );
+    let mut pidless = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    pidless.gaps.clear();
+    pidless.gaps_suppressed = 0;
+    for subject in ["/lib/x.so", "/lib/y.so"] {
+        pidless.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: (*subject).into(),
+            reason: (*foreign_esrch).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&pidless, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains(
+            "2 × mapped objects not examined — 2 mapped objects unreachable (--json lists each)"
+        ),
+        "pidless rows read as unreachable objects: {concise}"
+    );
+}
+
 /// Twin: marker text without the retained-root prefix is not a
 /// foreign-root failure — it passes through verbatim instead of
 /// borrowing the foreign plain words. (A real foreign reason keeps its

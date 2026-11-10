@@ -15347,6 +15347,44 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
     );
 }
 
+/// Late-route: a provider first mapped after discovery starts keeps one
+/// active slot set across ticks — no duplicate rows, stays attached while
+/// its holder lives. Scan-only (no manifest), like a late `--system`
+/// provider first loaded minutes after start.
+#[test]
+fn a_late_provider_keeps_single_active_slots_across_refreshes() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_scan_only_before_load();
+    fixture.load();
+    refresh_until_provider_mapped(&mut engine, fixture.pid());
+    engine.publish_current_capture_facts().unwrap();
+    let slots_first = engine.plan().slots.len();
+    let active_first = engine.plan().active_slot_count();
+    assert!(
+        slots_first > 0,
+        "a late load must plan slots, got {slots_first}"
+    );
+    assert_eq!(
+        active_first, slots_first,
+        "late slots start active ({active_first}/{slots_first})"
+    );
+    for _ in 0..5 {
+        engine.request_refresh(fixture.pid(), None);
+        refresh_inventory_once(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+    }
+    assert_eq!(
+        engine.plan().slots.len(),
+        slots_first,
+        "no duplicate slot rows across refreshes"
+    );
+    assert_eq!(
+        engine.plan().active_slot_count(),
+        slots_first,
+        "the late provider stays active while its holder lives"
+    );
+}
+
 /// Post-load mapping observation for the lifecycle fixture: the child has
 /// already acknowledged its `dlopen`, so every refresh re-observes stable
 /// target state — but one tick is not guaranteed to serve the retained

@@ -46517,6 +46517,79 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     assert_eq!(session.detached.len(), detached);
 }
 
+/// Twin of the retry re-arm under a starved tick quantum: with a zero
+/// quantum the post-retirement rescan defers (explicit skip, request
+/// retained, no new arm); opening the quantum lets the same drain re-arm
+/// with its owed catch-up.
+#[test]
+fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
+    let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(FAKE_PID_FLOOR + offset),
+            &mut pending,
+        );
+    }
+    assert!(!engine.request_refresh(pid, Some(50)));
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    engine.frame_work_budget_ns = 0;
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(record)))].into();
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(engine.pending_discovery_records.len(), 1);
+    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
+    engine.frame_work_budget_ns = u64::MAX;
+
+    // Starved: the rescan defers, the request is retained, no new arm.
+    engine.scheduler.set_tick_quantum_ns_for_test(0);
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("tick deep-scan quantum exhausted")),
+        "the deferral publishes explicit evidence: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "the deferred refresh request stays queued"
+    );
+    let stalled = engine.loader_registry.ids_for_view(view);
+    assert!(
+        stalled.is_empty() || stalled == [context],
+        "no new arm while the rescan defers: {stalled:?}"
+    );
+    assert!(
+        engine.pending_loader_arm_scans.is_empty(),
+        "no catch-up without a new arm: {:?}",
+        engine.pending_loader_arm_scans
+    );
+
+    // Opened: the same drain re-arms with its owed catch-up.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.drain_discovery_from(&mut session).unwrap();
+    let armed = engine.loader_registry.ids_for_view(view);
+    assert_eq!(armed.len(), 1);
+    assert_ne!(armed[0], context);
+    assert_eq!(
+        engine.pending_loader_arm_scans,
+        BTreeSet::from([PendingLoaderScanKey {
+            view,
+            context: armed[0],
+        }]),
+        "the completed retry owes one catch-up for its newly armed context"
+    );
+    assert!(!engine.refresh_requested.contains_key(&pid));
+}
+
 #[test]
 fn refresh_serial_exhaustion_refuses_without_reuse() {
     let mut engine = Engine::empty();
@@ -52360,6 +52433,29 @@ fn automatic_exec_loader_arm_catchup_discards_obsolete_identity_without_scanning
         assert_eq!(engine.discovery_truncated, losses, "{condition}");
         assert_eq!(session.detached, retired, "{condition}");
     }
+}
+
+/// A catch-up whose authority re-proof fails (notably a transient
+/// interpreter open that exhausted its bounded retries) records a named
+/// skip instead of silently dropping the scan.
+#[test]
+fn automatic_exec_loader_arm_catchup_authority_failure_records_a_named_skip() {
+    let (_fixture, mut engine, mut session, _key) = loader_arm_catchup_route();
+    let before = engine.loader_memory_scan_attempts;
+    engine.fail_next_loader_arm_authority = true;
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(outcome.required_complete());
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, before);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("authority re-proof")),
+        "an authority failure records a named skip, not a silent drop: {:?}",
+        engine.counters.object_skips
+    );
 }
 
 #[test]

@@ -899,6 +899,10 @@ pub struct Engine {
     /// the record-path scan to the loader-timing classifier.
     #[cfg(test)]
     loader_force_record_scan_incomplete: bool,
+    /// Test-only one-shot: the next loader-arm catch-up authority
+    /// re-proof fails, driving the `Err` skip-recording branch past it.
+    #[cfg(test)]
+    fail_next_loader_arm_authority: bool,
     /// Scripted pin-probe answers, consumed in order by the next matching
     /// probe. Test-only: live pins re-observe the kernel on every call, so
     /// a race between two reads (exit proof, then observation failure)
@@ -11258,6 +11262,8 @@ impl Engine {
             #[cfg(test)]
             loader_force_record_scan_incomplete: false,
             #[cfg(test)]
+            fail_next_loader_arm_authority: false,
+            #[cfg(test)]
             pin_probe_script: RefCell::new(VecDeque::new()),
             #[cfg(test)]
             collected_graphs_created: 0,
@@ -17798,6 +17804,10 @@ impl Engine {
         position: usize,
         key: PendingLoaderScanKey,
     ) -> Result<Option<LoaderAuthority>> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_loader_arm_authority) {
+            return Err(anyhow!("test-forced loader arm authority failure"));
+        }
         let Some(context) = self.loader_registry.context(key.context) else {
             return Ok(None);
         };

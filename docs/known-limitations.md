@@ -267,15 +267,11 @@ silently dropped. Sustained rates above 6,250 key operations per
 second with exact per-call rows need the independent event reader,
 planned for 0.7.1.
 
-### High-rate captures can report refused endpoints that are admitted a moment later
+### At very high call rates, up to 2 endpoints can be reported as refused
 
-<!-- REMOVE IF catchup-noreceipt LANDS: delete this subsection when that fix is integrated. -->
-Intermittently, a high-rate capture can report one or two refused
-endpoints even though every endpoint is admitted with complete data
-a moment later; nothing is lost. The count comes from a startup
-ordering race — the first admission attempt can run before the
-session has learned the endpoints — and varies run to run on
-identical builds.
+At very high call rates with many short-lived endpoints, up to 2
+endpoints can be reported as refused ("semantic admission
+deferred"); their calls are still counted.
 
 ### `trace --system` and `profile` rate ceilings on a small VM
 

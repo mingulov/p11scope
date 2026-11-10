@@ -1467,7 +1467,7 @@ pub mod capture {
 /// for all but the worst. The 4 MiB default held 11,155 (about 21 ms) and
 /// overflowed on a fast runner during a 24 ms drain gap; the 256 KiB
 /// default before it held 780 (audit F1). One ring per capture session,
-/// shared by all CPUs, charged as locked kernel memory (about 33.6 MB). The
+/// shared by all CPUs, charged as locked kernel memory (about 33.7 MB). The
 /// `small-ring` feature (off by default; the default build is unaffected)
 /// shrinks this to one page so the induced-gap test (Task 7,
 /// `scripts/verify-induced-gaps.sh`) can force ring-buffer loss

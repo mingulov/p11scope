@@ -1525,6 +1525,8 @@ pub struct ResourceEvidence {
     /// Periodic samples taken.
     pub samples: u64,
     /// Maximum periodic RSS, or `null` when no periodic sample read RSS.
+    /// It includes the EVENTS ring's double user mapping (about twice the
+    /// ring size), which is not extra memory: the ring is charged once.
     pub max_rss_kb: Option<u64>,
     pub start: ResourceSampleEvidence,
     pub readiness: ResourceSampleEvidence,

@@ -278,11 +278,15 @@ kubelet evicts the pod past it), so captures write `-o /tmp/<name>`.
 Kubelet creates that mount 0777 without the sticky bit, which the observer's
 output trust check refuses; `k8s-profile-entry.sh` restores 1777 first.
 
-Resources: requests 50m CPU / 64 Mi, limits 1 CPU / 768 Mi. The observer
-pod's measured peak memory over a full e2e run (profile, trace, inventory and
-BPF maps included) was 55-104 MB across six runs on a one-node kind cluster
-(every run from 99 MB up held two captures at once);
-the e2e records it as `observer-memory`. A node with many processes and providers
+Resources: requests 50m CPU / 128 Mi, limits 1 CPU / 768 Mi. Every capture
+runs through `kubectl exec` in this one pod, so concurrent captures share the
+limit, and each one holds about 34 MB of EVENTS ring memory (the 32M default;
+`--mode metrics` keeps a 4M ring, about 4 MB). The observer pod's measured
+peak memory over a full e2e run (profile, trace, inventory and BPF maps
+included) was 55-104 MB across six runs on a one-node kind cluster (every run
+from 99 MB up held two captures at once), measured with the earlier 4 MiB
+ring; two captures with 32M rings add about 59 MB to that, and it has not
+been re-measured yet. The e2e records it as `observer-memory`. A node with many processes and providers
 needs more for `inventory --system`: the stop also builds one combined view
 of every observed process, which needs extra memory for a short time. Raise
 the limit rather than risk an OOM kill in the middle of a capture or its stop.

@@ -516,7 +516,7 @@
               "description": "Capture-process /proc/self resource timeline.",
               "properties": {
                 "samples": {"type": "integer", "minimum": 0},
-                "max_rss_kb": {"type": ["integer", "null"], "minimum": 0},
+                "max_rss_kb": {"type": ["integer", "null"], "minimum": 0, "description": "Maximum periodic RSS in KiB. It includes the EVENTS ring's double user mapping (about twice the ring size, about 64 MiB at the 32M default), which is not extra memory: the ring is charged once as locked kernel memory."},
                 "start": {"$ref": "#/$defs/resource_sample"},
                 "readiness": {"$ref": "#/$defs/resource_sample"},
                 "end": {"$ref": "#/$defs/resource_sample"},

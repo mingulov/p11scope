@@ -4224,10 +4224,7 @@ fn map_files_open_proven(
             // proof above already bound this fd to the VMA. An unreadable
             // table, or a table that reads anything at all, keeps the
             // guard — a failed resolution there still refuses.
-            let mountinfo_empty = matches!(
-                view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
-                Ok(((), text)) if text.is_empty()
-            );
+            let mountinfo_empty = io.target_mountinfo_is_empty(view, mounts, budget);
             Ok(OpenedMappedObject {
                 file,
                 guard_exempt: mountinfo_empty,
@@ -5968,6 +5965,37 @@ pub(crate) trait ScanIo {
             .iter()
             .map(|&(start, end)| self.range_identity(view, start, end, budget))
             .collect()
+    }
+    /// Whether the target's mount table reads kernel-empty: a read that
+    /// succeeds with empty text (a sandboxed target's dangling root
+    /// breaks table rendering), as opposed to an unreadable or nonempty
+    /// table, which keeps the mount-table guard. The default runs the
+    /// live probe; scripted IOs override it to script the exemption.
+    fn target_mountinfo_is_empty(
+        &mut self,
+        view: &ProcessView,
+        mounts: &mut crate::process::MountTableCache,
+        budget: &mut CaptureWorkBudget,
+    ) -> bool {
+        matches!(
+            view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
+            Ok(((), text)) if text.is_empty()
+        )
+    }
+    /// The served file's own key, re-stated for the exempt-path
+    /// maps-key check (the exemption skips the mount-table guard, so
+    /// the proven file is bound to the maps key here instead — a fresh
+    /// read, never a reused identity). The default stats the live fd;
+    /// scripted IOs override it to script the racing-VMA shape.
+    #[allow(dead_code)] // The exempt-path key check calls it; the call lands with the fix.
+    fn restated_fd_key(&mut self, file: &File) -> std::io::Result<ObjectKey> {
+        file.metadata().map(|metadata| ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        })
     }
     /// Stash a cold-minted survivor for this scan: later `open_maps`
     /// and `range_identity` calls route to it. The default drops the
@@ -17963,6 +17991,14 @@ mod tests {
         /// unlinked: the replaced-on-disk shape (the maps line reads
         /// `<path> (deleted)` while the running bytes stay open).
         deleted_held: Option<File>,
+        /// Scripted mount-table emptiness for the exemption probe;
+        /// `None` runs the live probe (this fixture's own table reads
+        /// nonempty). `Some(false)` scripts both collapsed states at
+        /// once: an unreadable and a nonempty table both keep the guard.
+        mountinfo_empty: Option<bool>,
+        /// Scripted re-stated key of the served file for the
+        /// exempt-path maps-key check; `None` stats the live fd.
+        restated: Option<ObjectKey>,
     }
 
     struct MapFilesFallbackMemory {
@@ -18053,6 +18089,34 @@ mod tests {
                 }),
             }
         }
+        fn target_mountinfo_is_empty(
+            &mut self,
+            view: &ProcessView,
+            mounts: &mut crate::process::MountTableCache,
+            budget: &mut CaptureWorkBudget,
+        ) -> bool {
+            match self.mountinfo_empty {
+                Some(scripted) => scripted,
+                // The live probe, mirroring the default.
+                None => matches!(
+                    view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
+                    Ok(((), text)) if text.is_empty()
+                ),
+            }
+        }
+        fn restated_fd_key(&mut self, file: &File) -> std::io::Result<ObjectKey> {
+            match self.restated {
+                Some(key) => Ok(key),
+                // The live re-stat, mirroring the default.
+                None => file.metadata().map(|metadata| ObjectKey {
+                    device: Device {
+                        major: u64::from(libc::major(metadata.dev())),
+                        minor: u64::from(libc::minor(metadata.dev())),
+                    },
+                    inode: metadata.ino(),
+                }),
+            }
+        }
         fn final_generation(
             &mut self,
             view: &ProcessView,
@@ -18110,6 +18174,8 @@ mod tests {
                 map_files: MapFilesScript::Fail(libc::EPERM),
                 mapped: None,
                 deleted_held: None,
+                mountinfo_empty: None,
+                restated: None,
             }
         }
 
@@ -18422,6 +18488,114 @@ mod tests {
                     && skip.reason.contains("does not match mapped object")
             }),
             "the mount-table guard must refuse the mismatch, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// The exemption's positive half at runtime: a map_files-proven
+    /// file under a kernel-empty mount table is examined even though
+    /// the mount-table guard would refuse its key (the scripted twin
+    /// of the live sandboxed shape). Fails if the exemption is
+    /// disabled: the guard then refuses the arbitrary key.
+    #[test]
+    fn map_files_fallback_examines_proven_object_when_mountinfo_is_empty() {
+        use crate::discovery::identity::{FileIdentity, MappedFile};
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_arbitrary_key(8, 1, 999, "/libfixture-arbitrary.so");
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        let proven = FileIdentity {
+            dev: libc::makedev(8, 1),
+            ino: 999,
+        };
+        fixture.mapped = Some((
+            MappedFile {
+                identity: proven,
+                fs_magic: Some(0xef53),
+            },
+            proven,
+        ));
+        // The exempt path binds the proven file to the maps key rather
+        // than the guard: script the proven rendering at that key.
+        fixture.restated = Some(fixture.key);
+        fixture.mountinfo_empty = Some(true);
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the exempt proven object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.subject != "/libfixture-arbitrary.so"),
+            "no gap may remain for the exempt object, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Safety twin: a scripted nonempty mount table keeps the guard —
+    /// a proven file whose key the guard refuses stays refused (an
+    /// unreadable table collapses to the same `false`, so the one
+    /// script covers both). Fails if the exemption ignores the table.
+    #[test]
+    fn map_files_fallback_runs_the_mount_table_guard_when_mountinfo_is_scripted_nonempty() {
+        use crate::discovery::identity::{FileIdentity, MappedFile};
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_arbitrary_key(8, 1, 999, "/libfixture-arbitrary.so");
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        let proven = FileIdentity {
+            dev: libc::makedev(8, 1),
+            ino: 999,
+        };
+        fixture.mapped = Some((
+            MappedFile {
+                identity: proven,
+                fs_magic: Some(0xef53),
+            },
+            proven,
+        ));
+        fixture.mountinfo_empty = Some(false);
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the key-mismatched object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == "/libfixture-arbitrary.so"
+                    && skip.reason.contains("does not match mapped object")
+            }),
+            "the mount-table guard must refuse the mismatch, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Healthy twin for the exempt path's real comparison: scripted
+    /// empty mountinfo with the fixture's own key examines through
+    /// the live re-stat — fast path or kernel probe, per filesystem —
+    /// the end-to-end shape the live sandbox re-check repeats.
+    #[test]
+    fn map_files_fallback_examines_a_live_key_match_when_mountinfo_is_empty() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        fixture.mountinfo_empty = Some(true);
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the exempt object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().all(|skip| skip.subject != subject),
+            "no gap may remain for the exempt object, got {:?}",
             outcome.skipped()
         );
     }

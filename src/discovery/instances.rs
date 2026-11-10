@@ -1041,11 +1041,15 @@ impl InstanceRouter {
         self.birth_retry.remove(&(ImageKey::from(image), file));
     }
 
-    /// Arm the birth retry for a key just sighted `New`. At the cap,
-    /// entries whose observations were evicted go first; a still-full
-    /// set leaves the key unarmed (the old behavior).
+    /// Arm the birth retry for a key just sighted `New`. A mint is
+    /// always a new incarnation, so an existing entry restarts fresh:
+    /// a dead incarnation's first call never spends the new one's
+    /// offer. At the cap, entries whose observations were evicted go
+    /// first; a still-full set leaves the key unarmed (the old
+    /// behavior).
     fn arm_birth_retry(&mut self, key: (ImageKey, u32)) {
-        if self.birth_retry.contains_key(&key) {
+        if let Some(retry) = self.birth_retry.get_mut(&key) {
+            *retry = BirthRetry::default();
             return;
         }
         if self.birth_retry.len() >= self.limits.observed_keys {

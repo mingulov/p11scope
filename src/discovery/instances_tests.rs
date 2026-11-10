@@ -693,6 +693,65 @@ mod full_image {
             "retirement ends the retry"
         );
     }
+
+    /// A remint is a new incarnation: its retry starts fresh, so a
+    /// call the dead incarnation routed cannot spend the new one's
+    /// offer.
+    #[test]
+    fn remint_rearms_a_fresh_birth_retry() {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumIdentity as Q;
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert!(r.note_birth_offer(identity, FILE, Q::scripted(1)));
+        // The old incarnation routes a call in a quantum that did not
+        // observe it: its retry keeps that quantum as the first call.
+        r.note_routed_call(identity, FILE, Some(Q::scripted(2)));
+        assert!(r.birth_retry_armed(identity, FILE));
+        assert_eq!(
+            r.observe(seal(domain(), identity, 2, 0, r.fence())).0,
+            ObserveOutcome::New,
+            "a moved local epoch remints"
+        );
+        assert!(
+            r.note_birth_offer(identity, FILE, Q::scripted(3)),
+            "the new incarnation offers its own birth"
+        );
+        assert!(r.birth_retry_armed(identity, FILE));
+    }
+
+    /// Eviction ends an evicted key's retry; a re-sighted key arms
+    /// fresh.
+    #[test]
+    fn eviction_ends_the_evicted_keys_birth_retry() {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumIdentity as Q;
+        let mut r = InstanceRouter::new(
+            domain(),
+            RouterLimits {
+                observed_keys: 1,
+                ..RouterLimits::default()
+            },
+        );
+        let first = image(COOKIE, 10);
+        let second = image(COOKIE + 1, 10);
+        r.observe(seal(domain(), first, 1, 0, r.fence()));
+        r.note_routed_call(first, FILE, Some(Q::scripted(2)));
+        assert!(r.birth_retry_armed(first, FILE));
+        assert_eq!(
+            r.observe(seal(domain(), second, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert!(!r.birth_retry_armed(first, FILE), "eviction ends the retry");
+        assert!(r.birth_retry_armed(second, FILE));
+        r.observe(seal(domain(), first, 1, 0, r.fence()));
+        assert!(
+            r.note_birth_offer(first, FILE, Q::scripted(3)),
+            "the re-sighted key offers fresh"
+        );
+    }
 }
 
 #[test]

@@ -46,6 +46,20 @@ counter objects" reason, and journal-lane captures refuse
 unavailable). Profile and trace captures are unaffected. Restoring the
 companions at the wide profile is 0.7.x work.
 
+### Slot revival is same-target only
+
+A retired attach slot revives only when the same provider target
+returns: same-file churn reuses its slot, but a different newcomer
+still consumes fresh lifetime budget, so distinct-file churn can
+starve at the cap. General slot reuse across different targets is
+0.7.x work.
+
+### Changed-evidence revival at a full budget drops ticks
+
+A provider that returns with changed evidence while the slot budget is
+full drops that tick's candidate until the provider leaves, instead of
+reviving onto its retired slot. Rare, self-healing and fail-closed.
+
 ### Copy-up in-place truncation
 
 A spanning capture now attributes both sides of a container copy-up,

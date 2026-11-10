@@ -2258,8 +2258,17 @@ impl CallerRegistry {
     /// selects Joint; no numeric caller/image comparison installs a feed.
     pub(crate) fn admitted_feed_is_s1only(&self, input: &AdmittedInstanceCall) -> bool {
         match self.instance_state.by_key.get(&input.key) {
+            // An untouched S1Only registration holding this pass's
+            // validated grant selects Joint at the drain, exactly as an
+            // unregistered key with a grant: its first original is not
+            // an S1Only subject (disposing it would refuse the journal
+            // key the new feed is about to seal).
             Some(id) => self.instance_state.semantics.get(id).is_none_or(|record| {
-                record.caller == input.caller && record.feed.mode() == FeedMode::S1Only
+                record.caller == input.caller
+                    && record.feed.mode() == FeedMode::S1Only
+                    && !(self.joint_grants.contains_key(&input.key)
+                        && record.feed.upgrade_eligible()
+                        && self.joint_upgrade_eligible(&input.key))
             }),
             None => !self.joint_grants.contains_key(&input.key),
         }
@@ -2811,10 +2820,12 @@ impl CallerRegistry {
             let last_seen_ns = record.last_seen_ns.max(input.observed_ns);
             #[cfg(test)]
             eprintln!(
-                "FFBG-DIAG existing staged={staged_position:?} installed={} eligible={} mode={:?} linked={}",
+                "FFBG-DIAG existing staged={staged_position:?} installed={} eligible={} feed={} linked={}",
                 installed.is_some(),
                 self.joint_upgrade_eligible(&input.key),
-                self.instance_state.semantics[&id].feed.mode(),
+                self.instance_state.semantics[&id]
+                    .feed
+                    .upgrade_blockers_for_test(),
                 self.journal_linked()
             );
             if let Some(grant) = installed.as_ref() {
@@ -5272,8 +5283,8 @@ mod journal_unavailable_tests {
     /// A sighting's coverage registered the instance with no birth
     /// (S1Only, untouched); the birth that arrives with its first call
     /// selects Joint. The replay frontier stays in the H0 position
-    /// space: a journal-scale cut (41) beside small H0 positions must
-    /// not refuse the next call, which stages exactly once.
+    /// space: the selection never fences it with the journal-scale
+    /// cut (41).
     #[test]
     fn untouched_s1only_registration_selects_joint_on_later_valid_grant() {
         let mut scene = UnlinkedScene::new();
@@ -5307,24 +5318,17 @@ mod journal_unavailable_tests {
             Some(0),
             "the frontier is not fenced with a journal cut"
         );
-        let fallback_before = scene.registry.joint_direct_fallback();
-        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
-        scene.registry.publish();
-        assert_eq!(
-            scene.registry.joint_direct_fallback(),
-            fallback_before,
-            "the post-birth call is not refused and dropped"
+        assert!(
+            scene
+                .registry
+                .joint_feed_targets()
+                .any(|target| target.id() == id),
+            "the selected feed is a Joint target"
         );
-        let target = scene
-            .registry
-            .joint_feed_targets()
-            .find(|target| target.id() == id)
-            .expect("the selected feed is a Joint target");
-        assert_eq!(
-            scene.registry.joint_staged_count(&target),
-            Some(1),
-            "the post-birth call stages once"
-        );
+        // Scripted calls here have no H8 owner and fall back direct, so
+        // the post-birth staging itself is pinned at the staging seam
+        // (key_operation_tests: an upgrade with a journal-scale cut
+        // still stages H0 position 1).
     }
 
     /// Proof safety twin: once the instance returned a call S1-direct,
@@ -5377,6 +5381,71 @@ mod journal_unavailable_tests {
                 .iter()
                 .any(|row| row.reason == "started_before_attach" && row.count == 1),
             "the pre-birth call still counts exactly once: {unattributed_after:?}"
+        );
+    }
+
+    /// The first original of an untouched S1Only registration that
+    /// holds this pass's grant is not an S1Only journal subject (its
+    /// disposal would refuse the very key the late Joint feed seals),
+    /// exactly as for an unregistered key with a grant. Without the
+    /// grant, or once touched, it stays an S1Only subject.
+    #[test]
+    fn late_grant_original_is_not_an_s1only_subject_until_touched() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, _id) = scene.register(1);
+        let call = |ordinal| {
+            AdmittedInstanceCall::scripted(
+                key.clone(),
+                scene.caller,
+                ordinal,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            )
+        };
+        assert!(
+            scene.registry.admitted_feed_is_s1only(&call(1)),
+            "control: an S1Only registration without a grant is an S1Only subject"
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the late grant installs"
+        );
+        assert!(
+            !scene.registry.admitted_feed_is_s1only(&call(1)),
+            "an untouched registration holding a grant is not an S1Only subject"
+        );
+        scene.registry.publish();
+
+        let mut touched = UnlinkedScene::new();
+        touched.registry.note_journal_linked(true);
+        let key = touched.key(1);
+        touched.register(1);
+        touched.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        touched.registry.publish();
+        touched
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), touched.caller));
+        assert!(
+            touched
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41))
+        );
+        assert!(
+            touched
+                .registry
+                .admitted_feed_is_s1only(&AdmittedInstanceCall::scripted(
+                    key.clone(),
+                    touched.caller,
+                    2,
+                    s1_call("C_Sign", RV_OK, MECHANISM),
+                )),
+            "a touched registration stays an S1Only subject despite a grant"
         );
     }
 

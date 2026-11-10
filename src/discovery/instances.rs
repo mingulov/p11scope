@@ -749,8 +749,13 @@ pub(crate) struct InstanceRouter {
     /// late for that: by then the image's own records are consumed.
     /// Cleared by the key's first admission mark or by retirement;
     /// capped by the observed-keys cap, where an unarmed key fails
-    /// closed to the old behavior.
-    birth_retry: BTreeSet<(ImageKey, u32)>,
+    /// closed to the old behavior. The value is the quantum whose
+    /// birth the key last offered: a retry fires at most once per
+    /// quantum, and the entry ends with the retry (nothing outlives it).
+    birth_retry: BTreeMap<
+        (ImageKey, u32),
+        Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
+    >,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -888,7 +893,7 @@ impl InstanceRouter {
             observed: BTreeMap::new(),
             admitted_pending: BTreeSet::new(),
             admitted_minted: BTreeSet::new(),
-            birth_retry: BTreeSet::new(),
+            birth_retry: BTreeMap::new(),
             absent: BTreeSet::new(),
             absence_overflowed: false,
             faulted: BTreeSet::new(),
@@ -961,7 +966,30 @@ impl InstanceRouter {
     /// it was sighted `New` and has had no admitted call since.
     pub(crate) fn birth_retry_armed(&self, image: ImageIdentity, file: u32) -> bool {
         let key = (ImageKey::from(image), file);
-        self.birth_retry.contains(&key) && self.observed.contains_key(&key)
+        self.birth_retry.contains_key(&key) && self.observed.contains_key(&key)
+    }
+
+    /// Note that this key's observation offers a birth in `quantum`
+    /// (a `New`, an `AdmittedFirst` or a retry). Returns whether a
+    /// sighting retry may offer it: armed, and not yet offered in this
+    /// quantum. Unarmed keys note nothing.
+    pub(crate) fn note_birth_offer(
+        &mut self,
+        image: ImageIdentity,
+        file: u32,
+        quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    ) -> bool {
+        let key = (ImageKey::from(image), file);
+        if !self.observed.contains_key(&key) {
+            return false;
+        }
+        match self.birth_retry.get_mut(&key) {
+            Some(last) if *last != Some(quantum) => {
+                *last = Some(quantum);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// End a key's sighting retry: its birth candidate was consumed.
@@ -973,16 +1001,16 @@ impl InstanceRouter {
     /// entries whose observations were evicted go first; a still-full
     /// set leaves the key unarmed (the old behavior).
     fn arm_birth_retry(&mut self, key: (ImageKey, u32)) {
-        if self.birth_retry.contains(&key) {
+        if self.birth_retry.contains_key(&key) {
             return;
         }
         if self.birth_retry.len() >= self.limits.observed_keys {
             let observed = &self.observed;
             self.birth_retry
-                .retain(|retained| observed.contains_key(retained));
+                .retain(|retained, _| observed.contains_key(retained));
         }
         if self.birth_retry.len() < self.limits.observed_keys {
-            self.birth_retry.insert(key);
+            self.birth_retry.insert(key, None);
         }
     }
 
@@ -1440,7 +1468,7 @@ impl InstanceRouter {
         self.absent.retain(|(owner, _)| *owner != key);
         self.admitted_pending.retain(|(owner, _)| *owner != key);
         self.admitted_minted.retain(|(owner, _)| *owner != key);
-        self.birth_retry.retain(|(owner, _)| *owner != key);
+        self.birth_retry.retain(|(owner, _), _| *owner != key);
         self.debug_check_absent_subset();
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
@@ -1477,7 +1505,8 @@ impl InstanceRouter {
             .retain(|(owner, _)| owner.cookie != cookie);
         self.admitted_minted
             .retain(|(owner, _)| owner.cookie != cookie);
-        self.birth_retry.retain(|(owner, _)| owner.cookie != cookie);
+        self.birth_retry
+            .retain(|(owner, _), _| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,

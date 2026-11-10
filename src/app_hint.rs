@@ -910,6 +910,25 @@ mod tests {
     }
 
     #[test]
+    fn python_help_and_version_flags_bail_but_verbose_runs() {
+        // `python3 -V app.py` / `-h` / `-?` print and exit (verified
+        // live, rc 0): the trailing token never runs, so it is never
+        // a hint — alone or bundled. `-v` is verbose mode and runs
+        // the script (verified live), so it keeps the hint.
+        for flag in ["-V", "-h", "-?", "-uV", "-Vv"] {
+            let mut cmd = b"python3\x00".to_vec();
+            cmd.extend_from_slice(flag.as_bytes());
+            cmd.extend_from_slice(b"\x00app.py\x00");
+            no_hint(Some("/usr/bin/python3"), None, Some(&cmd), None);
+        }
+        assert_eq!(argv("/usr/bin/python3", &["-v", "app.py"]).value, "app.py");
+        assert_eq!(
+            argv("/usr/bin/python3", &["-Bv", "app.py"]).value,
+            "app.py"
+        );
+    }
+
+    #[test]
     fn python_c_text_is_never_captured() {
         let mut cmd = b"python3\x00-c\x00print('--pin', 1)\x00".to_vec();
         no_hint(Some("/usr/bin/python3"), None, Some(&cmd), None);
@@ -1099,6 +1118,29 @@ mod tests {
     }
 
     #[test]
+    fn java_help_and_version_flags_bail_but_showversion_runs() {
+        // `java -version` / `-fullversion` / `-help` / `-?` / bare `-X`
+        // print and exit (JDK launcher reference): the trailing token
+        // never runs, so it is never a hint. `-showversion` and
+        // `-XshowSettings` print and continue, so the main class still
+        // runs and still labels.
+        for flag in ["-version", "-fullversion", "-help", "-?", "-X"] {
+            let mut cmd = b"java\x00".to_vec();
+            cmd.extend_from_slice(flag.as_bytes());
+            cmd.extend_from_slice(b"\x00com.App\x00");
+            no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
+        }
+        assert_eq!(
+            argv("/usr/bin/java", &["-showversion", "com.App"]).value,
+            "com.App"
+        );
+        assert_eq!(
+            argv("/usr/bin/java", &["-XshowSettings", "com.App"]).value,
+            "com.App"
+        );
+    }
+
+    #[test]
     fn node_script_beats_flags_and_preloads() {
         assert_eq!(argv("/usr/bin/node", &["app.js"]).value, "app.js");
         assert_eq!(
@@ -1174,6 +1216,22 @@ mod tests {
         no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
         cmd = b"node\x00-p\x00script.js\x00".to_vec();
         no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+    }
+
+    #[test]
+    fn node_help_and_version_flags_bail_but_check_and_interactive_run() {
+        // `node -v app.js` / `-h` print and exit (verified live, rc
+        // 0): the trailing token never runs, so it is never a hint.
+        // `-c` names the checked file and `-i` runs the script before
+        // the REPL, so both keep the hint.
+        for flag in ["-v", "-h"] {
+            let mut cmd = b"node\x00".to_vec();
+            cmd.extend_from_slice(flag.as_bytes());
+            cmd.extend_from_slice(b"\x00app.js\x00");
+            no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        }
+        assert_eq!(argv("/usr/bin/node", &["-c", "app.js"]).value, "app.js");
+        assert_eq!(argv("/usr/bin/node", &["-i", "app.js"]).value, "app.js");
     }
 
     #[test]

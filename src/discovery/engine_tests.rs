@@ -5416,10 +5416,9 @@ fn wide_system_engine() -> Engine {
 
 /// A scripted session whose static probes are process-wide.
 fn wide_session() -> ScriptedSession {
-    ScriptedSession {
-        probes_process_wide: true,
-        ..ScriptedSession::default()
-    }
+    let mut session = ScriptedSession::default();
+    session.probes_process_wide = true;
+    session
 }
 
 /// A record of `kind` from `pid`'s thread group at kernel time `hook_ts_ns`.

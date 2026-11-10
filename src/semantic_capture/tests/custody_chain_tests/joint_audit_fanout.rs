@@ -12764,6 +12764,112 @@ fn joint_birth_transient_capacity_defers_for_reoffer() {
     );
 }
 
+/// Batch-wide transient deferral skips births that already hold
+/// a healthy Joint feed: re-offering them would evict a feed
+/// that never failed. The unheld control proves the arm fires
+/// and re-offers (caller-less, with the counted delay gap); the
+/// Joint-held duplicate is skipped and no delay is disclosed.
+#[test]
+fn joint_birth_batch_deferral_skips_healthy_joint_feeds() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstance;
+    use crate::inventory_semantics::RetainedJointBirths;
+    use crate::semantics_objects::journal::BirthKind;
+    for joint in [false, true] {
+        let (mut scene, ingested, attached, _) = prepared_birth_originals(1, false, false);
+        let coordinator = &mut scene.real.scene.coordinator;
+        let (key, caller) = {
+            let batch = coordinator.prepared_semantic_batch().unwrap();
+            let input = batch.admissions().next().expect("one admission");
+            (input.instance_key_for_test(), input.journal_binding().3)
+        };
+        if joint {
+            let proof = {
+                coordinator
+                    .prepared_semantic_batch()
+                    .unwrap()
+                    .claims()
+                    .map(|(_, result)| *result)
+                    .next()
+                    .expect("one claim")
+                    .expect("claim ok")
+            };
+            let receipt =
+                BootstrapReceipt::scripted(proof, BirthKind::ExecMarker, 0, attached.generation());
+            assert!(
+                coordinator
+                    .registry_mut()
+                    .install_joint_receipt(key.clone(), receipt),
+                "the grant installs"
+            );
+            coordinator
+                .registry_mut()
+                .note_instance(AdmittedInstance::scripted(key, caller));
+            coordinator.registry_mut().publish();
+            assert_eq!(
+                coordinator.registry().joint_feeds(),
+                1,
+                "the duplicate's feed is installed Joint"
+            );
+        }
+        coordinator
+            .registry()
+            .clamp_semantic_resource_room_for_test(0);
+        let mut births = RetainedJointBirths::new();
+        let result = coordinator
+            .prepare_joint_births(
+                &ingested,
+                &scene.producers,
+                &mut births,
+                |_, _, _, _, _, _| panic!("batch-wide deferral decides before any consume"),
+            )
+            .unwrap();
+        assert_eq!(result.installed, 0);
+        let deferred: Vec<String> = coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, _)| subject == "Joint birth deferred; retained S1 until re-offer")
+            .map(|(_, reason)| reason)
+            .collect();
+        if joint {
+            assert!(
+                result.reoffers.is_empty(),
+                "a healthy Joint duplicate is never re-offered"
+            );
+            assert!(
+                staged_birth_refusals(coordinator).is_empty(),
+                "no permanent refusal for a skipped duplicate"
+            );
+            assert!(
+                deferred.is_empty(),
+                "no delay is disclosed when nothing was delayed"
+            );
+        } else {
+            assert_eq!(
+                result.reoffers.len(),
+                1,
+                "the control batch defers its birth"
+            );
+            let reoffer = &result.reoffers[0];
+            assert!(
+                reoffer.caller.is_none(),
+                "batch-wide re-offers name no caller"
+            );
+            assert_eq!(reoffer.image.task_cookie, 71);
+            assert_eq!(reoffer.file, 0);
+            assert!(
+                staged_birth_refusals(coordinator).is_empty(),
+                "no permanent refusal for a deferred birth"
+            );
+            assert_eq!(
+                deferred,
+                ["joint_birth_deferred_resource_capacity"],
+                "the association-storage delay is a counted gap"
+            );
+        }
+    }
+}
+
 #[test]
 fn joint_birth_queued_registrations_preserve_actual_first_slot() {
     use crate::inventory_semantics::RetainedJointBirths;

@@ -139,6 +139,14 @@ versioned separately and are opaque, exact dispatch keys.
   unattributable for the rest of the capture with a named gap;
   plain-path counts stay exact.
   See [Key-tracking rate ceiling](docs/known-limitations.md#key-tracking-rate-ceiling).
+- In v0.6.0, a long `--system` capture on a host that starts and
+  ends many processes used growing observer memory (about 1.2 GB for
+  an hour on a busy host). v0.7.0 caps the capture file caches and
+  restores the scan pin layer on every live rebind instead of
+  stacking it: 15-minute churn soaks stay flat at 368 MB peak
+  (VmHWM) on the musl static observer and 322 MB on glibc.
+  See [Observer memory grows under heavy process churn](docs/known-limitations.md#observer-memory-grows-under-heavy-process-churn);
+  bounded memory is planned for v0.8.0.
 
 ### Known limitations
 
@@ -153,9 +161,6 @@ The v0.7.0 limits live in
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting
   a loss. Planned for 0.7.1.
-- A long `--system` capture on a host that starts and ends many
-  processes uses growing observer memory (about 1.2 GB for an hour on
-  a busy host); bounded memory is planned for v0.8.0.
 - Above about 6,000 key operations per second, per-key rows can
   arrive seconds late and part of a window shows as exact named
   counts instead of per-call rows. Exact per-call rows past 6,250/s

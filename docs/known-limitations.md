@@ -77,26 +77,35 @@ observation needs a quiescent scope.
 
 ### Observer memory grows under heavy process churn
 
-A long `--system` capture on a host that starts and ends many processes
-uses more memory over time: about 35 to 50 KB of peak memory per
-short-lived process once the observer's process-identity budget is
-spent. The growth levels off. On a 5-vCPU, 10 GB test VM with about
-700 new processes a minute, the observer's peak (VmHWM) was:
+Fixed in v0.7.0: the capture file caches are now capped and the scan
+pin layer is restored on every live rebind instead of stacking, so
+observer memory no longer grows per short-lived process under churn.
+Fifteen-minute churn soaks stay flat: peak (VmHWM) 368 MB on the musl
+static observer and 322 MB on glibc (pre-fix peaks on the same soak:
+710 MB and 1,837 MB).
+
+Pre-fix measurements, kept for comparison: a long `--system` capture
+on a host that starts and ends many processes used more memory over
+time: about 35 to 50 KB of peak memory per short-lived process once
+the observer's process-identity budget was spent. On a 5-vCPU, 10 GB
+test VM with about 700 new processes a minute, the observer's peak
+(VmHWM) was:
 
 | Capture, 61 min | Peak during capture | Flat from |
 | --- | --- | --- |
 | `profile --system` | 906 MB | minute 55 |
 | `trace --system` | 977 MB | minute 55 |
 
-`trace` rises to about 1.13 GB once more at the end, while it writes
+`trace` rose to about 1.13 GB once more at the end, while it wrote
 its output. Twenty-minute captures on a 3-vCPU VM reached 650 to
-720 MB. Whether and how fast it grows depends on the host and on the
+720 MB. Whether and how fast it grew depended on the host and on the
 callers' binaries: on the same 5-vCPU VM, callers built as non-PIE
-executables kept the observer at 110 to 330 MB. v0.6.0 behaves the same way; this is not new in v0.7.0. Plan
-for about 1.2 GB of observer memory for an hour-long system-wide
-capture on a busy host; `--pid`, cgroup and `run` captures of a
-quiet scope stay far below that. Bounded observer memory is planned
-for v0.8.0.
+executables kept the observer at 110 to 330 MB. v0.6.0 behaves the
+pre-fix way. Plan for about 400 MB of observer memory for a
+quarter-hour system-wide capture on a busy host; `--pid`, cgroup and
+`run` captures of a quiet scope stay far below that. A formal
+long-soak ceiling and bounded observer memory are still planned for
+v0.8.0.
 
 ### Short-lived processes never scanned
 

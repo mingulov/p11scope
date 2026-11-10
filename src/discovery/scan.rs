@@ -12519,7 +12519,9 @@ mod tests {
                 .open_mapped_object(&exe)
                 .expect_err("the gated open must refuse the foreign namespace");
             assert!(
-                gated.reason.contains("opening object within retained target root"),
+                gated
+                    .reason
+                    .contains("opening object within retained target root"),
                 "unexpected gated error: {}",
                 gated.reason
             );
@@ -19261,9 +19263,7 @@ mod tests {
         let map_files = skip
             .reason
             .find("(map_files fallback:")
-            .unwrap_or_else(|| {
-                panic!("the second attempt stays recorded, got {:?}", skip.reason)
-            });
+            .unwrap_or_else(|| panic!("the second attempt stays recorded, got {:?}", skip.reason));
         assert!(
             host < map_files,
             "the host attempt precedes the map_files attempt, got {:?}",

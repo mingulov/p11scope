@@ -1629,4 +1629,32 @@ mod tests {
             assert_eq!(workload_label_for_cgroup_path(path), path, "{path:?}");
         }
     }
+
+    #[test]
+    fn workload_label_prefers_inner_podman_under_docker_runtime() {
+        // Mixed-runtime nesting, docker outer: the inner Podman
+        // container is the workload, not the outer Docker scope.
+        let outer = workload_id('a');
+        let inner = workload_id('b');
+        let path = format!("system.slice/docker-{outer}.scope/libpod-{inner}.scope/container");
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("container {inner} (podman)"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn workload_label_prefers_inner_docker_under_podman_runtime() {
+        // Mirror twin: libpod outer, docker inner — the inner
+        // container wins by position either way.
+        let outer = workload_id('a');
+        let inner = workload_id('b');
+        let path = format!("machine.slice/libpod-{outer}.scope/docker-{inner}.scope");
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("container {inner} (docker)"),
+            "{path}"
+        );
+    }
 }

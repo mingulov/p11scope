@@ -15358,6 +15358,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn profile_json_cgroup_purge_retires_retained_paths() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Purge twin: rows are invalidated, the same cgroup is
+        // renamed and observed fresh, then removed; the fresh
+        // sighting — not the purged one — must name the row.
+        let root = tempfile::tempdir().unwrap();
+        let slice = root.path().join("system.slice");
+        let old = slice.join("old.service");
+        std::fs::create_dir_all(&old).unwrap();
+        let cgroup = std::fs::metadata(&old).unwrap().ino();
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        state.set_cgroup_label_root(root.path().to_path_buf());
+        let mut ev = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        ev.cgroup_id = cgroup;
+        state.observe(&ev);
+        assert_eq!(
+            state.retained_cgroup_path(cgroup).as_deref(),
+            Some("system.slice/old.service")
+        );
+        state.purge_modules(&std::collections::BTreeSet::from([crate::plan::ModuleId(
+            0,
+        )]));
+        assert!(state.cgroups().is_empty());
+        // The retained map must not outlive the rows it names.
+        assert_eq!(state.retained_cgroup_path(cgroup), None);
+        // Same cgroup, new path: renamed while unobserved, then a
+        // fresh call starts a new row lifetime.
+        std::fs::rename(&old, slice.join("new.service")).unwrap();
+        state.observe(&ev);
+        // The cgroup is removed before the report; only the fresh
+        // sighting may serve as fallback.
+        std::fs::remove_dir_all(&slice).unwrap();
+        let rows = cgroups_out_with_live_root(&state, root.path());
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["label"], "system.slice/new.service");
+        assert_eq!(row["workload"], "new.service");
+        assert_eq!(row["calls"], 1);
+    }
+
+    #[test]
     fn cgroup_verbose_section_lists_labeled_rows_per_pod() {
         use std::os::unix::fs::MetadataExt as _;
         // -v text names each pod with its counts.

@@ -32827,6 +32827,74 @@ mod correction1_tests {
     }
 
     #[test]
+    fn correction2_production_admission_split_marks_unadmitted_per_cgroup() {
+        // The production `identify_tracked` arm routes every admission
+        // miss to `reject_unadmitted` (per-row mark) while foreign-domain
+        // and non-CALL rejections keep `reject_history` (no mark).
+        for trace in [false, true] {
+            let mut c = Consumer::new(trace, true);
+            c.state = semantics::State::for_capture(
+                &plan(true),
+                CapturePolicy::Allowlisted,
+                crate::events::EventsDomain::test_standin(1),
+            );
+            c.tracker =
+                process::Tracker::for_producer(crate::events::EventsDomain::test_standin(1), 1);
+            let mut admitted = event(100, 90, 0);
+            admitted.cgroup_id = 1001;
+            c.feed([admitted]);
+            let mut successor = admitted;
+            successor.image.exec_id = 1;
+            successor.cgroup_id = 1002;
+            c.feed([successor]);
+            // Five admission misses, each on its own cgroup row.
+            let mut stale = admitted;
+            stale.cgroup_id = 1011; // lower exec than the recorded successor
+            let mut zero_cookie = event(100, 0, 0);
+            zero_cookie.cgroup_id = 1012;
+            let mut zero_pid = event(0, 90, 0);
+            zero_pid.cgroup_id = 1013;
+            let mut full = event(100, 4, 0);
+            full.cgroup_id = 1014; // registry holds one generation at limit 1
+            c.feed([stale, zero_cookie, zero_pid, full]);
+            let key = semantics::ProcessKey::history(1, 90, 1, 100);
+            apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            let mut closed = successor;
+            closed.cgroup_id = 1015;
+            c.feed([closed]);
+            // Controls: a foreign domain counts without the mark; a
+            // non-CALL kind counts no row at all.
+            let mut foreign = successor;
+            foreign.cgroup_id = 1021;
+            c.feed_domain(2, [foreign]);
+            let mut non_call = successor;
+            non_call.event_type = 99; // unknown non-CALL kind
+            non_call.cgroup_id = 1022;
+            c.feed([non_call]);
+
+            let rows = c.state.cgroups();
+            for id in [1001, 1002] {
+                assert_eq!(rows[&id].calls, 1, "trace={trace} row={id}");
+                assert_eq!(rows[&id].unadmitted, 0, "trace={trace} row={id}");
+            }
+            for id in [1011, 1012, 1013, 1014, 1015] {
+                assert_eq!(rows[&id].calls, 1, "trace={trace} row={id}");
+                assert_eq!(rows[&id].unadmitted, 1, "trace={trace} row={id}");
+            }
+            assert_eq!(rows[&1021].calls, 1, "trace={trace}");
+            assert_eq!(rows[&1021].unadmitted, 0, "trace={trace}");
+            assert!(!rows.contains_key(&1022), "trace={trace}");
+            // The older history/drop accounting is unchanged: five misses
+            // plus the foreign and non-CALL rejections.
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                7,
+                "trace={trace}"
+            );
+        }
+    }
+
+    #[test]
     fn correction2_exit_without_fence_preserves_tail_and_pending_until_explicit_retirement() {
         for trace in [false, true] {
             let mut c = Consumer::new(trace, true);

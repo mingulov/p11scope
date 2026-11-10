@@ -483,7 +483,7 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
       # (mountinfo identity stands in for the map_files proof).
       [ "$rc" -eq 0 ] || pass=0
       grep -qE "^[1-9][0-9]* completed calls" "$out" || pass=0
-      grep -q "^coverage: counts complete" "$out" || pass=0
+      grep -q "^coverage: partial — counts complete" "$out" || pass=0
       ;;
     CAP_DAC_READ_SEARCH)
       # No target read: the coverage line must disclose the partial

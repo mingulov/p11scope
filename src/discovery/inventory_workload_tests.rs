@@ -166,7 +166,8 @@ fn workload_fd_worker() {
     match mode.as_str() {
         "admission" => inject_admission_failures(),
         "mutation" => inject_provider_mutation(),
-        "mutation-uninitialized" => inject_provider_mutation_case(false),
+        "mutation-uninitialized" => inject_provider_mutation_case(false, false),
+        "mutation-hinted" => inject_provider_mutation_case(true, true),
         "discovery-loss" => inject_discovery_loss(),
         "churn" => run_churn_storm(),
         "shutdown" => interrupt_shutdown(),
@@ -1923,13 +1924,24 @@ fn provider_mutation_without_getter_retains_no_uninitialized_table_pins() {
     isolated_workload("mutation-uninitialized");
 }
 
-/// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
-/// callable from the test above and from the RSS worker.
-fn inject_provider_mutation() {
-    inject_provider_mutation_case(true);
+/// The same mutation under `--module`: the hinted rescan examines only
+/// mappings that match the hint, so it mints no complete-scan receipt
+/// and the gone v1 instance reads uncertain with the reason named,
+/// never ended and "unloaded" (docs/known-limitations.md).
+#[test]
+fn provider_mutation_under_a_module_hint_reads_the_gone_instance_uncertain() {
+    isolated_workload("mutation-hinted");
 }
 
-fn inject_provider_mutation_case(invoke_getter: bool) {
+/// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
+/// callable from the test above and from the RSS worker. Unhinted, as
+/// a default `inventory` run: the complete rescan mints the
+/// complete-scan receipt that makes the gone instance's absence final.
+fn inject_provider_mutation() {
+    inject_provider_mutation_case(true, false);
+}
+
+fn inject_provider_mutation_case(invoke_getter: bool, hinted: bool) {
     let base = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -2001,7 +2013,11 @@ fn inject_provider_mutation_case(invoke_getter: bool) {
     let mut coordinator = InventoryCoordinator::new(
         Scope::Pid(driver_pid),
         HookRegistry::builtin(),
-        vec![prov.clone()],
+        if hinted {
+            vec![prov.clone()]
+        } else {
+            Vec::new()
+        },
         vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
@@ -2128,15 +2144,6 @@ fn inject_provider_mutation_case(invoke_getter: bool) {
         ours[0]["identity"]["sha256"], ours[1]["identity"]["sha256"],
         "v1 and v2 bytes differ"
     );
-    let (old, new) = if ours[0]["lifecycle"] == "unloaded" {
-        (ours[0], ours[1])
-    } else {
-        (ours[1], ours[0])
-    };
-    // The complete rescan proved v1 gone (sticky unload) while v2 maps.
-    assert_eq!(old["lifecycle"], "unloaded");
-    assert_eq!(old["unloaded_observed"], true);
-    assert_eq!(new["lifecycle"], "mapped");
     let edge_for = |module: &str| {
         document["edges"]
             .as_array()
@@ -2146,13 +2153,37 @@ fn inject_provider_mutation_case(invoke_getter: bool) {
             .unwrap()
             .clone()
     };
+    // v2 is the instance the rescan re-observed; v1 is the gone one.
+    let (old, new) = if edge_for(ours[1]["id"].as_str().unwrap())["mapping"]["state"] == "mapped" {
+        (ours[0], ours[1])
+    } else {
+        (ours[1], ours[0])
+    };
+    assert_eq!(new["lifecycle"], "mapped");
     let old_edge = edge_for(old["id"].as_str().unwrap());
     let new_edge = edge_for(new["id"].as_str().unwrap());
-    assert_eq!(old_edge["mapping"]["state"], "ended");
-    assert_eq!(old_edge["mapping"]["interruptions"], 1);
-    assert!(old_edge["mapping"]["reason"].is_string());
     assert_eq!(new_edge["mapping"]["state"], "mapped");
     assert_eq!(new_edge["entries"]["count"], 0);
+    if hinted {
+        // The hinted rescan did not examine every mapping: no receipt,
+        // so v1's absence stays uncertain with its reason named.
+        assert_ne!(old["lifecycle"], "unloaded", "{old}");
+        assert_ne!(old["unloaded_observed"], true, "{old}");
+        assert_eq!(old_edge["mapping"]["state"], "uncertain", "{old_edge}");
+        assert!(
+            old_edge["mapping"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("incomplete scan")),
+            "{old_edge}"
+        );
+    } else {
+        // The complete rescan proved v1 gone (sticky unload) while v2 maps.
+        assert_eq!(old["lifecycle"], "unloaded");
+        assert_eq!(old["unloaded_observed"], true);
+        assert_eq!(old_edge["mapping"]["state"], "ended");
+        assert_eq!(old_edge["mapping"]["interruptions"], 1);
+        assert!(old_edge["mapping"]["reason"].is_string());
+    }
     drop(coordinator);
     coordinator_scope.assert_delta(0);
     drop(reaper);
@@ -3122,12 +3153,53 @@ mod c1b {
         assert_eq!(coverage.len(), 7);
     }
 
+    /// The rescan where REP and REP + 5 no longer show the provider. An
+    /// unhinted producer whose deep scan of REP ran to completion mints
+    /// REP's complete-scan receipt (`inspect_system`); `receipt: false`
+    /// models a receipt-less scan (a `--module` hint, or a gap).
+    fn absence_rescan(harness: &Harness, receipt: bool) -> Catalog {
+        let mut rescan = catalog(&[REP, REP + 5], &[]);
+        if receipt {
+            let started = harness.now_ns();
+            let rep = rescan
+                .processes
+                .iter_mut()
+                .find(|process| process.pid == REP)
+                .unwrap();
+            rep.complete_scan = Some(crate::inspect_system::CompleteMemberScan::scripted(
+                generation(REP).unwrap(),
+                started,
+                started + 1,
+            ));
+        }
+        rescan
+    }
+
+    #[test]
+    fn a_receipt_less_deep_scan_absence_stays_uncertain() {
+        let mut harness = spawned();
+        harness.apply_catalog(catalog(&[], &[]));
+        harness.advance(1);
+        let rescan = absence_rescan(&harness, false);
+        harness.apply_catalog(rescan);
+        let document = harness.render();
+        let edge = edge_of(&document, REP).unwrap();
+        assert_eq!(edge["mapping"]["state"], "uncertain", "{edge}");
+        assert!(
+            edge["mapping"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("incomplete scan")),
+            "{edge}"
+        );
+    }
+
     #[test]
     fn a_maps_match_absence_is_uncertain_while_a_deep_scan_absence_ends() {
         let mut harness = spawned();
         harness.apply_catalog(catalog(&[], &[]));
         harness.advance(1);
-        harness.apply_catalog(catalog(&[REP, REP + 5], &[]));
+        let rescan = absence_rescan(&harness, true);
+        harness.apply_catalog(rescan);
         let document = harness.render();
         assert_eq!(
             edge_of(&document, REP).unwrap()["mapping"]["state"],

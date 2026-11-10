@@ -5127,6 +5127,107 @@ fn refresh_requires_pre_and_post_health_and_original_fence() {
         }
     }
 }
+#[test]
+fn admission_deferral_refusals_clear_when_the_retry_mints_a_receipt() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    // Pass 1: the session has not learned the slot's endpoint yet, so
+    // no scan runs and no receipt is minted (the ordering miss).
+    io.endpoints = Some(std::collections::BTreeMap::new());
+    let missed = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(missed.scans, 0);
+    assert_eq!(missed.scan_refusals, vec![ImageQueryRefusal::Coverage]);
+    assert!(
+        missed.current().is_empty(),
+        "no receipt, so admission defers"
+    );
+    ledger.count_refresh(&pin, 0, &missed, &mut total, &mut counts);
+    assert_eq!(total, 1, "an unsettled deferral still counts mid-run");
+    // Pass 2: the endpoint is learned but the scan itself refuses
+    // (the live pre-cookie shape), still with no receipt.
+    io.endpoints.as_mut().unwrap().insert(
+        0,
+        Endpoint {
+            object: PinnedObjectId(0),
+            file_slot: 0,
+            offset: 0x1200,
+        },
+    );
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(refused.scans, 1);
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    assert!(
+        refused.current().is_empty(),
+        "no receipt, so admission defers"
+    );
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 2, "both unsettled deferrals count mid-run");
+    // Pass 3: the retry mints the receipt, so the endpoint is admitted
+    // and neither transient refusal stays a refused endpoint.
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.observations, vec![ObserveOutcome::New]);
+    assert_eq!(admitted.current().len(), 1, "the retry mints the receipt");
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(
+        total, 0,
+        "a minted receipt settles every earlier deferral refusal for the endpoint"
+    );
+    assert_eq!(counts, [0; 12], "per-reason counts settle with the total");
+}
+#[test]
+fn admission_deferral_refusals_stay_counted_and_named_without_a_receipt() {
+    use crate::inventory_semantics::{AdmissionRefusalLedger, scan_refusals_gap_reason};
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    // One ordering miss (slot 99 is never learned) and one scan-ran
+    // refusal (slot 0), with no successful retry for either endpoint.
+    let missed = capture.refresh_with(&mut io, pin.clone(), 99).unwrap();
+    assert_eq!(missed.scans, 0);
+    assert_eq!(missed.scan_refusals, vec![ImageQueryRefusal::Coverage]);
+    ledger.count_refresh(&pin, 99, &missed, &mut total, &mut counts);
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(refused.scans, 1);
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 2, "never-admitted endpoints stay refused");
+    assert_eq!(
+        scan_refusals_gap_reason(&counts),
+        Some("2 scan refusals (coverage=1 unstable=1)".to_string()),
+        "the refusals stay named per reason"
+    );
+    // A later receipt for slot 0 settles only slot 0: the never-learned
+    // slot 99 stays counted and named.
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin, 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    ledger.count_refresh(
+        &admitted.current()[0].original_pin().clone(),
+        0,
+        &admitted,
+        &mut total,
+        &mut counts,
+    );
+    assert_eq!(total, 1, "only the admitted endpoint settles");
+    assert_eq!(
+        scan_refusals_gap_reason(&counts),
+        Some("1 scan refusals (coverage=1)".to_string()),
+        "the never-admitted endpoint stays named"
+    );
+}
 fn decoded_prefix_survives_failure(status: CollectionStatus) {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);

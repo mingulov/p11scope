@@ -7622,12 +7622,11 @@ impl Session {
         // A journal (Joint) capture holds the joint-sized EVENTS ring
         // (currently equal to the default, never smaller): its START and
         // END records cost about 0.86 KiB a call, and the ring is read only
-        // between seals. Every other capture keeps the default.
-        let events_bytes = if journal.is_some() {
-            crate::run::resolve_journal_ring_bytes(ring_bytes)
-        } else {
-            crate::run::resolve_ring_bytes(ring_bytes)
-        };
+        // between seals. An aggregate (metrics/counter) capture writes no
+        // per-call record and keeps 4 MiB; every other capture keeps the
+        // default. The disclosure uses the same resolver.
+        let events_bytes =
+            crate::run::resolve_capture_ring_bytes(policy, journal.is_some(), ring_bytes);
         let mut ebpf = load_capture_object_bytes_with_images(
             host.btf(),
             events_bytes,

@@ -1269,7 +1269,7 @@ mod tests {
                     "host_btf::shared()",
                     "let mut ebpf = load_capture_object_bytes_with_images(",
                     "host.btf()",
-                    "crate::run::resolve_ring_bytes(ring_bytes)",
+                    "crate::run::resolve_capture_ring_bytes(policy, journal.is_some(), ring_bytes)",
                     "discovery_ring_bytes(scope)",
                     "policy.wants_instance_hooks()",
                     ".map_or(crate::EBPF_OBJECT, |prepared| prepared.object)",

@@ -41,12 +41,14 @@ versioned separately and are opaque, exact dispatch keys.
 ### Changed
 
 - The default EVENTS ring is 32 MiB (was 4 MiB) for `profile`, `trace`
-  and `run`, and the key-operations (Joint) lane's ring is 32 MiB (was
-  16 MiB). The 4 MiB ring held about 21 ms of records at the fastest
+  and `run` in profile and trace modes, and the key-operations (Joint)
+  lane's ring is 32 MiB (was 16 MiB). `--mode metrics` (with or without
+  `--counter-mode`) writes no per-call records and keeps 4 MiB. The 4 MiB ring held about 21 ms of records at the fastest
   measured call rate and could overflow during a short drain gap on a
   fast host; 32 MiB holds about 170 ms there and about 470 ms at 190,000
   calls/s. It costs about 29 MB more locked kernel memory per capture
-  (about 34 MB in all; one ring per capture, shared by all CPUs).
+  (about 34 MB in all; one ring per capture, shared by all CPUs) in
+  the per-call modes.
   `--ring-bytes` still accepts 4K to 64M, and `--help` now states the
   default.
 - `p11scope run` now pauses by default (`--pause auto`): a first run

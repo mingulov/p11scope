@@ -517,7 +517,8 @@ produced it.
 
 - `--ring-bytes <n[K|M]>` — the EVENTS ring buffer size: a power of two from
   4K to 64M (default 32M, one ring per capture, held as about 34 MB of
-  locked kernel memory). A larger ring absorbs call bursts without loss; a
+  locked kernel memory). `--mode metrics`, with or without `--counter-mode`,
+  writes no per-call records and keeps a 4M default. A larger ring absorbs call bursts without loss; a
   smaller ring overflows sooner. Overflow never corrupts counts — the
   aggregate maps are the count authority — but it is disclosed as `event_loss`
   with a `PARTIAL` verdict instead of `COMPLETE`. A profile record is 376 B

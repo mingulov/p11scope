@@ -7128,6 +7128,33 @@ pub(crate) fn resolve_journal_ring_bytes(ring_bytes: Option<u32>) -> u32 {
     ring_bytes.unwrap_or(p11scope_ebpf_common::JOINT_RING_BYTES)
 }
 
+/// Default EVENTS ring of a non-journal aggregate capture (`--mode
+/// metrics`, counter modes). The BPF producers write no per-call record
+/// under `FLAG_POLICY_AGGREGATE` (mainly FORK markers remain), so the
+/// 32 MiB per-call sizing would only lock memory; these captures keep the
+/// earlier 4 MiB default. Userspace only: the loader sets `max_entries`.
+pub(crate) const AGGREGATE_RING_BYTES: u32 = 4 * 1024 * 1024;
+const _: () = assert!(
+    AGGREGATE_RING_BYTES.is_power_of_two()
+        && AGGREGATE_RING_BYTES <= p11scope_ebpf_common::RING_BYTES
+);
+
+/// The one EVENTS ring size a capture loads and discloses: an explicit
+/// `--ring-bytes` wins, then a journal capture takes the joint ring, then
+/// an aggregate policy takes [`AGGREGATE_RING_BYTES`], else the default.
+pub(crate) fn resolve_capture_ring_bytes(
+    policy: CapturePolicy,
+    journal: bool,
+    ring_bytes: Option<u32>,
+) -> u32 {
+    match ring_bytes {
+        Some(bytes) => bytes,
+        None if journal => resolve_journal_ring_bytes(None),
+        None if policy.is_aggregate() => AGGREGATE_RING_BYTES,
+        None => resolve_ring_bytes(None),
+    }
+}
+
 struct CaptureConsumers<'state> {
     state: &'state mut semantics::State,
     tracker: &'state mut process::Tracker,
@@ -8755,9 +8782,9 @@ fn capture_profile(
                 policy,
                 scope: scope.kind(),
                 caller: target_caller.clone(),
-                // Equal to the journal ring default while the two agree;
-                // pinned by `disclosed_ring_bytes_default_matches_the_journal_ring`.
-                ring_bytes: resolve_ring_bytes(ring_bytes),
+                // The loader's own resolver; `capture_profile` never takes a
+                // journal, so the disclosure is the ring that was loaded.
+                ring_bytes: resolve_capture_ring_bytes(policy, false, ring_bytes),
                 drain_interval_ms: drain.as_millis() as u64,
             };
             let j = if profile {
@@ -26008,18 +26035,44 @@ int main(int argc, char **argv) {
         assert_eq!(resolve_journal_ring_bytes(Some(1 << 20)), 1 << 20);
     }
 
-    /// Every `capture.ring_bytes` disclosure (`capture_profile`'s
-    /// `CaptureMeta`, the render and metrics defaults) is built from
-    /// `resolve_ring_bytes` / `RING_BYTES`, while a journal capture sizes
-    /// its ring with `resolve_journal_ring_bytes`. The disclosure is right
-    /// for a journal capture only while both defaults agree, so a future
-    /// divergence must fail here instead of misreporting the ring size.
+    /// The loader (`prepare_inner_unlinked_with_object`) and the
+    /// `capture_profile` disclosure share `resolve_capture_ring_bytes`, so a
+    /// per-policy default cannot misreport the loaded ring. Pins the table:
+    /// explicit wins, journal takes the joint ring, aggregate policies keep
+    /// 4 MiB, per-call policies take the 32 MiB default.
     #[test]
-    fn disclosed_ring_bytes_default_matches_the_journal_ring() {
-        assert_eq!(resolve_ring_bytes(None), resolve_journal_ring_bytes(None));
+    fn capture_ring_bytes_resolve_per_policy() {
+        let joint = p11scope_ebpf_common::JOINT_RING_BYTES;
+        let default = p11scope_ebpf_common::RING_BYTES;
+        assert_eq!(AGGREGATE_RING_BYTES, 4 * 1024 * 1024);
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            assert_eq!(resolve_capture_ring_bytes(policy, false, None), default);
+            assert_eq!(resolve_capture_ring_bytes(policy, true, None), joint);
+        }
+        for policy in [
+            CapturePolicy::AggregateOnly,
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts),
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Timestamps),
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Latency),
+        ] {
+            assert_eq!(policy.config_bit(), p11scope_ebpf_common::FLAG_POLICY_AGGREGATE);
+            assert_eq!(
+                resolve_capture_ring_bytes(policy, false, None),
+                AGGREGATE_RING_BYTES
+            );
+            assert_eq!(resolve_capture_ring_bytes(policy, true, None), joint);
+            assert_eq!(resolve_capture_ring_bytes(policy, false, Some(1 << 26)), 1 << 26);
+        }
         assert_eq!(
-            p11scope_ebpf_common::RING_BYTES,
-            p11scope_ebpf_common::JOINT_RING_BYTES
+            resolve_capture_ring_bytes(CapturePolicy::Allowlisted, true, Some(4096)),
+            4096
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("metrics", false, false).unwrap(),
+            CapturePolicy::AggregateOnly
         );
     }
 

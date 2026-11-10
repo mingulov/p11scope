@@ -947,11 +947,13 @@ def check_conservation(view, selected, doc, joint=False):
         "calls": sum(view["fn_table"][fn]["total"] for fn in teardown_fns),
         "errors": sum(view["fn_table"][fn]["errors"] for fn in teardown_fns),
     }
-    return {"entries": entries["count"], "operations": operations["calls"],
-            "api_returns": api_total, "mechanisms": checked,
-            "teardown": teardown, "slot_refused": slot,
-            "demoted_unattributed": demoted,
-            "shed_unrouted": shed}
+    verdict = {"entries": entries["count"], "operations": operations["calls"],
+               "api_returns": api_total, "mechanisms": checked,
+               "teardown": teardown, "slot_refused": slot}
+    if joint:
+        verdict["demoted_unattributed"] = demoted
+        verdict["shed_unrouted"] = shed
+    return verdict
 
 
 def _other_caller_unrouted(gap, selected):
@@ -1131,6 +1133,7 @@ def check_loss(selected, doc, events, joint=False):
     _require(type(gaps) is list, "inventory gaps must be a list")
     foreign_gaps = 0
     other_caller_unrouted = 0
+    conserved_shed = set()
     prebinding_resolved = False
     if joint:
         pre_shed, pre_noted = _prebinding_counts(gaps)
@@ -1164,8 +1167,10 @@ def check_loss(selected, doc, events, joint=False):
                 continue
             _require(gap.get("module") in (None, selected["edge"]["module"]),
                      "gap references another caller/module/PID")
-            if _is_conserved_demoted_gap(gap, selected) or _is_conserved_shed_gap(
-                gap, selected, pre_noted):
+            if _is_conserved_demoted_gap(gap, selected):
+                continue
+            if _is_conserved_shed_gap(gap, selected, pre_noted):
+                conserved_shed.add((subject, reason))
                 continue
         else:
             _require(gap.get("caller") in (None, selected["edge"]["caller"])
@@ -1198,8 +1203,13 @@ def check_loss(selected, doc, events, joint=False):
             if _is_module_only_foreign(payload, selected):
                 foreign_gaps += 1
                 continue
-            if _is_conserved_demoted_gap(payload, selected) or _is_conserved_shed_gap(
-                payload, selected, pre_noted):
+            if _is_conserved_demoted_gap(payload, selected):
+                continue
+            # A payload mirrors a conserved snapshot row exactly:
+            # shape alone never exempts an unconserved disclosure.
+            if ((subject, reason) in conserved_shed
+                    and _is_conserved_shed_gap(payload, selected,
+                                               pre_noted)):
                 continue
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)

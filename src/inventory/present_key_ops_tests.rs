@@ -1188,6 +1188,44 @@ fn synthetic_bootstrap_gap_matcher_rejects_near_misses() {
         !is_synthetic_bootstrap_gap(&other_subject),
         "the same reason under another subject is a retained row"
     );
+    }
+
+/// A deferred Joint birth already names the silent bootstrap: no
+/// synthetic `joint_birth_unoffered` on top. The deferred subject
+/// renders the late-start wording with its machine token beside
+/// it; the deferred reason has no plain mapping and surfaces
+/// verbatim.
+#[test]
+fn silent_bootstrap_deferred_birth_is_named_once() {
+    let silent = ObjectObservations::unavailable(7, "bootstrap_unavailable");
+    let deferred = [named_gap(
+        JOINT_BIRTH_DEFERRED_SUBJECT,
+        "joint_birth_deferred_registration_Capacity",
+    )];
+    assert!(
+        silent_bootstrap_gap(&silent, 1, &deferred).is_none(),
+        "a deferred birth already names it"
+    );
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+    presentation.gaps.push(named_gap(
+        JOINT_BIRTH_DEFERRED_SUBJECT,
+        "joint_birth_deferred_registration_Capacity",
+    ));
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("Per-key tracking started late for this process; earlier calls keep plain counts"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("(Joint birth deferred; retained S1 until re-offer)"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("joint_birth_deferred_registration_Capacity")
+            && !verbose.contains("(joint_birth_deferred_registration_Capacity)"),
+        "{verbose}"
+    );
 }
 
 /// The wiring's twin: a linked capture without any observed semantic

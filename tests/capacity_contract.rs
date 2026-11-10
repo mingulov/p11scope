@@ -391,6 +391,22 @@ fn attach_program_load_teardown_and_links_are_accounted_separately() {
 
 // Admission envelope: qualification only after this contract.
 #[test]
+fn default_build_is_the_wide_profile() {
+    assert_eq!(
+        MAX_SLOTS, 2112,
+        "the default build carries the 2,112-slot Detailed profile"
+    );
+    assert_eq!(
+        RV_ENTRIES, 8192,
+        "the default build carries the 8,192-key RV map"
+    );
+    let compiled = DetailedResources::compiled(12).unwrap();
+    assert_eq!(compiled.inputs.slots, 2112);
+    assert_eq!(compiled.inputs.rv_capacity, 8192);
+    assert_eq!(compiled.inputs.possible_cpus, 12);
+}
+
+#[test]
 fn admission_envelope_publishes_limits_and_qualification_state() {
     let envelope = admission_envelope();
     assert!(

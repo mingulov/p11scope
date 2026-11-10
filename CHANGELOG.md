@@ -69,8 +69,8 @@ versioned separately and are opaque, exact dispatch keys.
   limits line says "recorded, 0 attached" for scan-only inventories,
   and discovery stops read as discovery events, never file counts.
 - A stopped pass-0 collection is kept as scan-only inventory under
-  `--pid`/`--system` (modules and callers shown, counts not attached)
-  instead of being discarded.
+  every scope (`--pid`/`--system`/`--cgroup`) (modules and callers
+  shown, counts not attached) instead of being discarded.
 - On hosts without usable `uprobe_multi`, `inventory --system` and
   `inventory --cgroup` with the default `--capture auto` now exit 0 with
   a PARTIAL scan report carrying the `native usage feed unavailable` gap

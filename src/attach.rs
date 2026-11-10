@@ -2677,23 +2677,29 @@ fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
 
 /// Retired slots whose probes are provably gone: `blocked` folds the
 /// Multi-only, native-retirement and group-deferral gates (see
-/// [`Session::revival_detached`]); the survivors need no covering link
-/// and no retained static target.
+/// [`Session::revival_detached`]); a global detach quarantine clears
+/// nothing, and the survivors need no covering link, no retained
+/// static target and no per-slot quarantine. A quarantined slot never
+/// re-clears: the next admission takes a fresh slot instead of looping
+/// a refused re-attach.
 fn revival_detached_from(
     links: &[RegisteredLink],
     retained: &BTreeMap<u32, RetainedStaticTarget>,
-    _quarantine: &BTreeSet<DetachQuarantine>,
+    quarantine: &BTreeSet<DetachQuarantine>,
     blocked: bool,
     retired: &BTreeSet<usize>,
 ) -> BTreeSet<u32> {
-    if blocked {
+    if blocked || quarantine.contains(&DetachQuarantine::Global) {
         return BTreeSet::new();
     }
     retired
         .iter()
         .filter_map(|position| {
             let slot = u32::try_from(*position).ok()?;
-            if links_cover_slot(links, slot) || retained.contains_key(&slot) {
+            if links_cover_slot(links, slot)
+                || retained.contains_key(&slot)
+                || quarantine.contains(&DetachQuarantine::Slot(slot))
+            {
                 return None;
             }
             Some(slot)
@@ -10295,9 +10301,10 @@ impl Session {
 
     /// Retired slots whose probes are provably gone: the Multi backend,
     /// no owned link covers them, no retained static target or group
-    /// deferral names them, and no native retirement is pending or
-    /// uncertain. Singles never clears: it retires logically and closes
-    /// links only at the terminal detach.
+    /// deferral names them, no native retirement is pending or
+    /// uncertain, and no detach quarantine refuses them. Singles never
+    /// clears: it retires logically and closes links only at the
+    /// terminal detach.
     pub(crate) fn revival_detached(&self, retired: &BTreeSet<usize>) -> BTreeSet<u32> {
         let blocked = self.backend != AttachBackend::Multi
             || self.native_retirement.blocking()

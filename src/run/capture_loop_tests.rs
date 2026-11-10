@@ -3465,3 +3465,40 @@ fn terminal_snapshot_failure_without_last_good_returns_the_error() {
         "with nothing to seal from there is no fallback to name"
     );
 }
+
+/// Data always, degraded terminal order: `run_terminal` publishes the `-o`
+/// report before failing with the terminal read error, so a degraded
+/// snapshot still seals its report and the run exits nonzero. Deleting the
+/// `terminal_error` return must fail this test, not silently succeed.
+#[test]
+fn degraded_terminal_publishes_before_failing_with_terminal_error() {
+    let source = include_str!("../run.rs");
+    let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+    let terminal = production
+        .split_once("fn run_terminal(")
+        .unwrap()
+        .1
+        .split_once("\nfn write_json_report")
+        .unwrap()
+        .0;
+    assert_eq!(
+        terminal.matches("snapshot.terminal_error()").count(),
+        1,
+        "run_terminal fails once on the degraded terminal error"
+    );
+    let commit = terminal
+        .find("out_file.commit()")
+        .expect("run_terminal publishes the -o report");
+    let failure = terminal
+        .find("snapshot.terminal_error()")
+        .expect("run_terminal checks the degraded terminal error");
+    assert!(
+        commit < failure,
+        "the report commits before the terminal error fails the run"
+    );
+    let tail = &terminal[failure..];
+    assert!(
+        tail.contains("return Err(anyhow::Error::msg(error.to_string()))"),
+        "the degraded terminal error returns Err after publishing"
+    );
+}

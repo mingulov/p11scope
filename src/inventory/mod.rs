@@ -8532,11 +8532,11 @@ fn run_dashboard(
     if let Some(zero) = &zero_pass {
         display.notice(&zero.stderr_line());
     }
-    // The terminal honesty line, from the same snapshot as the sinks below;
-    // verbose-only, like the per-pass gap line on the classic path.
-    if crate::cli::text_is_verbose()
-        && let Some(line) = final_gap_line(&presentation)
-    {
+    // The terminal honesty line, from the same snapshot as the sinks below.
+    // Always shown: the dashboard shows per-pass gap progress at every
+    // verbosity, so the correction must appear there too, or the user sees
+    // only the stale number. Within the shared notice budget (shed past it).
+    if let Some(line) = final_gap_line(&presentation) {
         display.notice(&line);
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.

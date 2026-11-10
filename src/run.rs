@@ -18644,6 +18644,30 @@ int main(int argc, char **argv) {
             seal.contains("apply_original_root_retirement("),
             "a completed tail must retire its processes"
         );
+        let tail = seal
+            .find("drain_original_root_events(")
+            .expect("the tail drain call");
+        let events = seal.find("drain_trace_events(").expect("the EVENTS drain");
+        assert!(
+            tail < events,
+            "the tail must drain ahead of the EVENTS ring, as the terminal path does"
+        );
+        assert!(
+            seal.contains("OriginalRootDrain::Cancelled"),
+            "the seal must handle a cancelled tail drain"
+        );
+        assert!(
+            seal.contains("HANDOFF_REASON_TAIL_CANCELLED"),
+            "a cancelled tail must file its named gap"
+        );
+        assert!(
+            seal.contains("HANDOFF_REASON_TAIL_DRAIN"),
+            "a failed tail drain must file its named gap"
+        );
+        assert!(
+            seal.contains("HANDOFF_REASON_TAIL_RETIRE"),
+            "a failed tail retirement must file its named gap"
+        );
     }
 
     /// Both handoff seals handle the root-tail deadline abandon in its own

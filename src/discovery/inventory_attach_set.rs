@@ -2427,12 +2427,17 @@ pub(crate) mod tests {
         // tail and starve the token providers queued behind it. Discovery
         // order still puts the giant first (low endpoint IDs); the drain
         // must lead with the small providers, then the giant before the
-        // other large provider.
+        // other large provider. The two boundary providers share one
+        // mapper count, so only the 512 threshold separates them: the
+        // exact-512 module drains in the small tier while the 513 module
+        // drains in the large tier.
         let dir = tempfile::tempdir().unwrap();
         let kit = provider(&dir, "libp11-kit.so.0", "provider-p11kit");
         let opensc = provider(&dir, "opensc.so", "provider-opensc");
         let ykcs11 = provider(&dir, "ykcs11.so", "provider-ykcs11");
         let other = provider(&dir, "other.so", "provider-other");
+        let boundary512 = provider(&dir, "boundary512.so", "provider-boundary512");
+        let boundary513 = provider(&dir, "boundary513.so", "provider-boundary513");
         let mut set = InventoryAttachSet::new(budget(32768));
         let policy = AdmissionPolicy::Inventory(set.budget());
         let pins = pass_pins(&[
@@ -2440,19 +2445,28 @@ pub(crate) mod tests {
             (&opensc, "sha-opensc"),
             (&ykcs11, "sha-ykcs11"),
             (&other, "sha-other"),
+            (&boundary512, "sha-boundary512"),
+            (&boundary513, "sha-boundary513"),
         ]);
         let modules = [
             module(&pins, &kit, &offsets(6734)),
             module(&pins, &opensc, &offsets(70)),
             module(&pins, &ykcs11, &offsets(100)),
             module(&pins, &other, &offsets(1000)),
+            module(&pins, &boundary512, &offsets(512)),
+            module(&pins, &boundary513, &offsets(513)),
         ];
         let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
-        assert_eq!(absorbed.delta.endpoints.len(), 6734 + 70 + 100 + 1000);
+        assert_eq!(
+            absorbed.delta.endpoints.len(),
+            6734 + 70 + 100 + 1000 + 512 + 513
+        );
         let kit_key = module_key(&kit, "sha-kit").object;
         let opensc_key = module_key(&opensc, "sha-opensc").object;
         let ykcs11_key = module_key(&ykcs11, "sha-ykcs11").object;
         let other_key = module_key(&other, "sha-other").object;
+        let boundary512_key = module_key(&boundary512, "sha-boundary512").object;
+        let boundary513_key = module_key(&boundary513, "sha-boundary513").object;
         set.note_mappers(
             true,
             [
@@ -2460,26 +2474,33 @@ pub(crate) mod tests {
                 (&opensc_key, 1),
                 (&ykcs11_key, 6),
                 (&other_key, 10),
+                (&boundary512_key, 5),
+                (&boundary513_key, 5),
             ],
         );
         let mut endpoints = absorbed.delta.endpoints;
         set.sort_drain_order(&mut endpoints, AttachBackend::Multi);
         let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         // Endpoint IDs follow discovery order: kit 0..6734, opensc
-        // 6734..6804, ykcs11 6804..6904, other 6904..7904.
+        // 6734..6804, ykcs11 6804..6904, other 6904..7904, boundary512
+        // 7904..8416, boundary513 8416..8929.
         let ykcs11_ids: Vec<u32> = (6804..6904).collect();
+        let boundary512_ids: Vec<u32> = (7904..8416).collect();
         let opensc_ids: Vec<u32> = (6734..6804).collect();
         let kit_ids: Vec<u32> = (0..6734).collect();
         let other_ids: Vec<u32> = (6904..7904).collect();
+        let boundary513_ids: Vec<u32> = (8416..8929).collect();
         assert_eq!(
             ids,
             ykcs11_ids
                 .into_iter()
+                .chain(boundary512_ids)
                 .chain(opensc_ids)
                 .chain(kit_ids)
                 .chain(other_ids)
+                .chain(boundary513_ids)
                 .collect::<Vec<_>>(),
-            "small providers drain first (most-mapped among them), then p11-kit before the other large provider"
+            "small providers drain first (most-mapped among them, exact-512 in the small tier), then p11-kit before the other large providers"
         );
     }
 

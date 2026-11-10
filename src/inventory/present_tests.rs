@@ -3723,6 +3723,84 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     }
 }
 
+/// Concise gaps use plain words for the semantic-tracking tokens, never
+/// the machine names: the pre-registration boundary, the Joint birth
+/// registration refusal, and the deferred admission note. Verbose keeps
+/// each token beside its plain words; JSON keeps the stored reason.
+#[test]
+fn concise_gap_summary_uses_plain_words_for_semantic_tracking_tokens() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for (subject, reason) in [
+        (
+            "physical provider use preceded first observed semantic registration",
+            "before_semantic_boundary",
+        ),
+        (
+            JOINT_BIRTH_UNAVAILABLE_SUBJECT,
+            "joint_birth_registration_Capacity",
+        ),
+        (
+            "semantic admission deferred",
+            "semantic_unavailable:no_receipt",
+        ),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    for plain in [
+        "earlier calls not counted",
+        "per-key tracking hit its capacity",
+        "will retry on the next scan; no calls lost",
+    ] {
+        assert!(out.contains(plain), "{plain} missing: {out}");
+    }
+    for machine in [
+        "before_semantic_boundary",
+        "joint_birth_registration_Capacity",
+        "semantic_unavailable:no_receipt",
+    ] {
+        assert!(!out.contains(machine), "{machine} leaked to concise: {out}");
+    }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for (plain, machine) in [
+        ("earlier calls not counted", "before_semantic_boundary"),
+        (
+            "per-key tracking hit its capacity",
+            "joint_birth_registration_Capacity",
+        ),
+        (
+            "will retry on the next scan; no calls lost",
+            "semantic_unavailable:no_receipt",
+        ),
+    ] {
+        assert!(verbose.contains(plain), "{plain} missing in -v: {verbose}");
+        assert!(
+            verbose.contains(&format!("{plain} ({machine})")),
+            "{machine} not paired in -v: {verbose}"
+        );
+    }
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let text = serde_json::to_string(&document).unwrap();
+    for machine in [
+        "before_semantic_boundary",
+        "joint_birth_registration_Capacity",
+        "semantic_unavailable:no_receipt",
+    ] {
+        assert!(text.contains(machine), "{machine} missing in JSON: {text}");
+    }
+}
+
 /// F1: the readable gaps block lists every group on its own indented
 /// line under `gaps: N` while the group count stays within the fold
 /// boundary (twenty; beyond that the block folds, pinned by

@@ -990,7 +990,9 @@ impl InstanceRouter {
 
     /// Whether this key's continued observation still carries a birth:
     /// it was sighted `New` and its retry has not ended (see
-    /// [`BirthRetry`]).
+    /// [`BirthRetry`]). Test-only: production decisions use
+    /// [`Self::note_birth_offer`] and [`Self::end_birth_retry`].
+    #[cfg(test)]
     pub(crate) fn birth_retry_armed(&self, image: ImageIdentity, file: u32) -> bool {
         let key = (ImageKey::from(image), file);
         self.birth_retry.contains_key(&key) && self.observed.contains_key(&key)

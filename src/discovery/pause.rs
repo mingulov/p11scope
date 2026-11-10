@@ -10188,6 +10188,23 @@ mod tests {
             2,
             "commit_staged_duration_handoff must keep its definition plus the one owned-run call"
         );
+        // Order, not just count: the one call sits in the owned run after
+        // `run_loop` returns (cleanup and settlement already ran there).
+        let owned_run = production
+            .split_once("fn run_owned_inner_with_host(")
+            .expect("owned run")
+            .1;
+        let owned_run = &owned_run[..owned_run.find("\nfn ").unwrap_or(owned_run.len())];
+        let loop_call = owned_run
+            .find("let evidence = run_loop(")
+            .expect("owned run calls run_loop");
+        let commit_call = owned_run
+            .find("commit_staged_duration_handoff(")
+            .expect("owned run commits the staged duration handoff");
+        assert!(
+            loop_call < commit_call,
+            "the staged duration commit must follow run_loop in the owned run"
+        );
         // No new direct reaps: every production terminate_and_reap call
         // stays in its audited function.
         let mut reapers = std::collections::BTreeSet::new();

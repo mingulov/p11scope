@@ -1284,6 +1284,118 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
 }
 
 // ---------------------------------------------------------------------------
+// E2 twins: the kill-cadence guard's admitting-pass bookkeeping, scripted.
+// ---------------------------------------------------------------------------
+//
+// The pump records the admitting pass as one past the last published
+// marker, because caller events precede their pass marker in the commit
+// batch. These twins pin that bookkeeping for both tick interleavings
+// without running the observer: the whole batch landing in one tick (the
+// marker is already processed when the kill check runs), and events and
+// marker split across two ticks.
+
+// Above PID_MAX_LIMIT (2^22): these pids can never be live, and the
+// driver path exists nowhere, so `pid_is_driver` is doubly false and the
+// scripted kill latch below can never signal anything.
+const GUARD_ANCHOR: u32 = 4_190_305;
+const GUARD_CHURN_A: u32 = 4_190_306;
+const GUARD_CHURN_B: u32 = 4_190_307;
+const GUARD_DRIVER: &str = "/nonexistent/churn-guard-driver";
+
+/// Scripted `ChurnCondition` over dead pids and a fake driver path: the
+/// kill latch fires on the admitted event, but no signal is ever sent.
+fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
+    let ready = dir.join("ready");
+    std::fs::create_dir_all(&ready).unwrap();
+    for (name, pid) in [
+        ("anchor.ready", GUARD_ANCHOR),
+        ("churn-a.ready", GUARD_CHURN_A),
+        ("churn-b.ready", GUARD_CHURN_B),
+    ] {
+        std::fs::write(ready.join(name), format!("READY {pid}\n")).unwrap();
+    }
+    ChurnCondition {
+        ready,
+        events: dir.join("events.jsonl"),
+        birth_fifo: dir.join("birth.fifo"),
+        driver_exe: GUARD_DRIVER.to_owned(),
+        offset: 0,
+        pending: String::new(),
+        anchor: None,
+        churn_a: None,
+        churn_b: None,
+        spawner: None,
+        churn_c: None,
+        admitted: BTreeSet::new(),
+        exited: BTreeSet::new(),
+        killed: false,
+        birth_fired: false,
+        last_pass: None,
+        kill_admitting_pass: None,
+    }
+}
+
+fn guard_admitted_line(pid: u32) -> String {
+    format!(
+        "{{\"kind\":\"caller_event\",\"event\":{{\"event\":\"admitted\",\"identity_context\":{{\"caller\":{{\"pid\":{pid},\"executable\":{{\"path\":\"{GUARD_DRIVER}\"}}}}}}}}}}\n"
+    )
+}
+
+fn guard_pass_marker_line(pass: u64) -> String {
+    format!("{{\"kind\":\"pass_committed\",\"event\":{{\"pass\":{pass}}}}}\n")
+}
+
+#[test]
+fn churn_kill_guard_records_admitting_pass_on_same_tick_batch() {
+    // The whole commit batch lands in one pump tick: the admitted line
+    // and its pass-0 marker are processed together, and the kill check
+    // runs after. The admitting pass is 0, not one past the marker the
+    // same tick already processed.
+    let dir = tmp("inventory-churn-guard-same-tick");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}",
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(0)
+        ),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.last_pass, Some(0));
+    assert_eq!(
+        condition.kill_admitting_pass,
+        Some(0),
+        "same-tick batch: churn-A admitted by pass 0, not one past its marker"
+    );
+}
+
+#[test]
+fn churn_kill_guard_records_admitting_pass_on_split_ticks() {
+    // Twin: the admitted line lands one tick before its marker. The
+    // admitting pass is still 0, and the marker tick must not move it.
+    let dir = tmp("inventory-churn-guard-split-tick");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(&condition.events, guard_admitted_line(GUARD_CHURN_A)).unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.last_pass, None);
+    assert_eq!(condition.kill_admitting_pass, Some(0));
+    let mut later = std::fs::read_to_string(&condition.events).unwrap();
+    later.push_str(&guard_pass_marker_line(0));
+    std::fs::write(&condition.events, later).unwrap();
+    condition.pump();
+    assert_eq!(condition.last_pass, Some(0));
+    assert_eq!(
+        condition.kill_admitting_pass,
+        Some(0),
+        "marker tick keeps the admitting pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // C1: slow output — backpressure delays, never loses.
 // ---------------------------------------------------------------------------
 

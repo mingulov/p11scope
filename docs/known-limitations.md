@@ -529,10 +529,15 @@ after the stop. Only a run whose deadline already passed before
 the first collection starts reports 0 callers with the `no complete
 collection pass` gap and one informational stderr line. An operator
 stop during a `--cgroup` pass-0 collection still cancels it
-promptly, so Ctrl-C stays responsive: that run reports 0 callers
-with the `cgroup scope transaction incomplete` gap, while
-`--pid`/`--system` finish the in-flight collection and keep it
-scan-only. The first
+promptly, so Ctrl-C stays responsive: that run publishes the
+callers scanned so far with the `collection incomplete (stopped by
+operator)` gap (scan-only, counts not attached, no completeness
+claimed), while `--pid`/`--system` finish the in-flight collection
+and keep it scan-only. Overrun past a deadline is bounded by one
+full bounded pass (cgroup walk limits: 1M work units, 4096
+directories, 65536 members, 8 MiB total, 70 FDs; at most 128 pinned
+processes; deep-scan cap default 32; no wall-clock cap; a hung
+filesystem call still blocks like before). The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or

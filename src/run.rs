@@ -3587,6 +3587,10 @@ fn capture_with_host(
     // Capture-process resource baseline, before the discovery scan charges
     // its first byte: threaded to the loops as the timeline's start point.
     let resource_start = crate::timing::read_resource_sample();
+    // The slow startup (discovery scan, then attach) follows: one
+    // stderr line first so the run never looks hung. After the fast
+    // fail-fast checks above, before the first slow step.
+    emit_capture_diagnostic(&capture_starting_line());
     let discovered = Engine::discover(a, &scope, named_view);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
@@ -6328,6 +6332,10 @@ fn run_owned_inner_with_host(
                 reason: reason.to_owned(),
             });
 
+    // The slow startup (BPF loads, spawn, discovery, attach)
+    // follows: one stderr line first so the run never looks hung.
+    // After the fast name/host/hazard refusals above.
+    emit_capture_diagnostic(&capture_starting_line());
     // The overlay-witness BPF session load is process setup, not query
     // work: run it before the child exists, never lazily inside a
     // pause-cycle engine apply it can outlast (see preload_session).
@@ -8257,6 +8265,19 @@ fn observe_capture_cancel(
 pub(crate) fn capture_diagnostics_on() -> bool {
     crate::cli::text_is_verbose()
         || std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
+}
+
+/// The one startup line, printed on stderr as the first action of
+/// every live capture, before the slow discovery/attach work: the
+/// flagship command spends tens of seconds between launch and the
+/// readiness line with no feedback, which reads as hung.
+/// Default-visible,
+/// quiet-visible and JSON-safe (stderr only, never stdout); the
+/// readiness needle keeps its own prefix so harnesses waiting for
+/// `p11scope: capturing: ` see no earlier false trip.
+pub(crate) fn capture_starting_line() -> String {
+    "p11scope: starting: loading probes and scanning processes (a busy machine can take a minute or more); stop with Ctrl-C"
+        .to_string()
 }
 
 pub(crate) fn capture_ready_line(attached_probes: usize, owned: bool) -> String {
@@ -25739,6 +25760,30 @@ int main(int argc, char **argv) {
         assert_eq!(
             capture_ready_line(1, false),
             "p11scope: capturing: 1 probe attached; stop with Ctrl-C"
+        );
+    }
+
+    /// The startup line precedes the readiness line: every live
+    /// capture prints it on stderr before the slow discovery/attach
+    /// work, so the run never looks hung. It carries the same stop
+    /// hint but a distinct needle — harnesses keep waiting for
+    /// `p11scope: capturing: `, which an earlier extra line does not
+    /// break.
+    #[test]
+    fn starting_line_precedes_ready_line() {
+        assert_eq!(
+            capture_starting_line(),
+            "p11scope: starting: loading probes and scanning processes \
+             (a busy machine can take a minute or more); stop with Ctrl-C"
+        );
+        let ready = capture_ready_line(136, false);
+        assert!(
+            ready.starts_with("p11scope: capturing: "),
+            "the readiness needle keeps its prefix: {ready}"
+        );
+        assert!(
+            !capture_starting_line().contains("capturing: "),
+            "the startup line must not trip the readiness needle"
         );
     }
 

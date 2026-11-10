@@ -1600,6 +1600,13 @@ fn run_with_terminal_budget(
             "p11scope: --event-log - owns stdout; the text summary goes to stderr",
         );
     }
+    // The slow live startup (probe loads, then the scan loop) follows:
+    // one stderr line first so the run never looks hung. After the
+    // fast usage/host refusals and sink setup above. Scan-only runs
+    // load no probes and stay silent here.
+    if capture != CaptureMode::Scan {
+        inventory_diagnostic(&crate::run::capture_starting_line());
+    }
     let mut stream = EventLogState::new(writer);
     #[cfg(test)]
     if let Some(writer) = stream.writer.as_mut() {

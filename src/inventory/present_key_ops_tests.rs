@@ -1121,6 +1121,75 @@ fn silent_bootstrap_unavailable_is_named_once() {
     assert!(silent_bootstrap_gap(&populated(7), 1, &[]).is_none());
 }
 
+/// The stream filter's matcher recognizes only the row the producer
+/// emits: bare identities plus the synthesized subject and reason. A
+/// retained row sharing the reason (or the subject with a real refusal
+/// reason) must never match, so a future producer of the same reason
+/// string cannot silently change filter behavior.
+#[test]
+fn synthetic_bootstrap_gap_matcher_rejects_near_misses() {
+    use crate::discovery::caller_registry::{BudgetRefusal, CallerId};
+
+    let silent = ObjectObservations::unavailable(7, "bootstrap_unavailable");
+    let produced = silent_bootstrap_gap(&silent, 1, &[]).expect("silent bootstrap names its gap");
+    assert!(
+        is_synthetic_bootstrap_gap(&produced),
+        "the producer's row is the row the matcher recognizes"
+    );
+    let synth = named_gap(
+        JOINT_BIRTH_UNAVAILABLE_SUBJECT,
+        JOINT_BIRTH_UNOFFERED_REASON,
+    );
+    assert!(
+        is_synthetic_bootstrap_gap(&synth),
+        "the bare synthesized row matches"
+    );
+    let mut with_caller = synth.clone();
+    with_caller.caller = Some(CallerId(7));
+    assert!(
+        !is_synthetic_bootstrap_gap(&with_caller),
+        "the same reason with a caller is a retained row"
+    );
+    let mut with_module = synth.clone();
+    with_module.module = Some(ModuleId(9));
+    assert!(
+        !is_synthetic_bootstrap_gap(&with_module),
+        "the same reason with a module is a retained row"
+    );
+    let mut with_pid = synth.clone();
+    with_pid.pid = Some(1234);
+    assert!(
+        !is_synthetic_bootstrap_gap(&with_pid),
+        "the same reason with a pid is a retained row"
+    );
+    let mut with_budget = synth.clone();
+    with_budget.budget = Some(BudgetRefusal {
+        resource: "edges",
+        limit: 1,
+        requested: 2,
+    });
+    assert!(
+        !is_synthetic_bootstrap_gap(&with_budget),
+        "the same reason with a budget is a retained row"
+    );
+    let retained_refusal = named_gap(
+        JOINT_BIRTH_UNAVAILABLE_SUBJECT,
+        "joint_birth_registration_Capacity",
+    );
+    assert!(
+        !is_synthetic_bootstrap_gap(&retained_refusal),
+        "the same subject with a real refusal reason is a retained row"
+    );
+    let other_subject = named_gap(
+        "native usage feed unavailable",
+        JOINT_BIRTH_UNOFFERED_REASON,
+    );
+    assert!(
+        !is_synthetic_bootstrap_gap(&other_subject),
+        "the same reason under another subject is a retained row"
+    );
+}
+
 /// The wiring's twin: a linked capture without any observed semantic
 /// call has nothing to name, so its presentation adds no gap.
 #[test]

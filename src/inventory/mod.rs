@@ -14998,6 +14998,54 @@ mod tests {
         }
     }
 
+    // The healthy-install shape: mid-run passes carry the synthesized row
+    // while `bootstrap_unavailable`, then the feed installs with zero
+    // birth refusals, so the synthesized row vanishes with no replacement
+    // row. The retained rows must still stream at stable indexes.
+    #[test]
+    fn stream_synthetic_bootstrap_gap_vanishing_without_refusal_keeps_indexes() {
+        let (mut view, _) = stream_identity_fixture(1);
+        let report = stream_identity_report(Vec::new());
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_boot_synth(),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 2).unwrap();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_fixture_row("retained row", "second"),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 3).unwrap();
+        state.gaps.emit(&mut writer, &view.gaps, true, 4).unwrap();
+        let records = stream_sink_records(&mut reader);
+        let gaps = stream_gap_records(&records);
+        assert!(
+            gaps.iter()
+                .all(|gap| gap["reason"] != "joint_birth_unoffered"),
+            "the synthetic row must never stream mid-run: {gaps:?}"
+        );
+        let reasons: Vec<&str> = gaps
+            .iter()
+            .map(|gap| gap["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["first", "second"]);
+        for (position, gap) in gaps.iter().enumerate() {
+            assert_eq!(
+                gap["index"].as_u64().unwrap(),
+                position as u64,
+                "stream indexes must match the final gaps[] order"
+            );
+        }
+        let fresh: Vec<u64> = records
+            .iter()
+            .filter(|record| record["kind"] == "pass_committed")
+            .map(|record| record["event"]["new_gaps"].as_u64().unwrap())
+            .collect();
+        assert_eq!(fresh, [1, 1]);
+    }
+
     // Catches turnover contexts read from a later live PID instead of the
     // exact old/new publication records, and a contextless native stop path.
     #[test]

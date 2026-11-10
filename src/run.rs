@@ -5169,6 +5169,22 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                     reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
                 });
             }
+            // The root-tail deadline abandons the tail like a signal: the
+            // remaining records go to the ordinary terminal drain, and the
+            // unretired tail files the same schema-valid cancelled reason.
+            Ok(OriginalRootDrain::DeadlineAbandoned {
+                malformed,
+                remaining,
+            }) => {
+                malformed_records = malformed_records.saturating_add(malformed);
+                let _ = crate::sink::try_stderr_line(&format!(
+                    "p11scope: root_tail_incomplete: deadline; remaining={remaining}"
+                ));
+                handoff_gaps.push(render::SkippedOut {
+                    name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                    reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
+                });
+            }
             Err(error) => {
                 emit_capture_diagnostic(&format!(
                     "p11scope: original-root drain failed; sealing the report from partial \
@@ -5548,6 +5564,22 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             malformed_records = malformed_records.saturating_add(malformed);
             let _ = crate::sink::try_stderr_line(&format!(
                 "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
+            });
+        }
+        // The root-tail deadline abandons the tail like a signal: the
+        // remaining records go to the ordinary terminal drain, and the
+        // unretired tail files the same schema-valid cancelled reason.
+        Ok(OriginalRootDrain::DeadlineAbandoned {
+            malformed,
+            remaining,
+        }) => {
+            malformed_records = malformed_records.saturating_add(malformed);
+            let _ = crate::sink::try_stderr_line(&format!(
+                "p11scope: root_tail_incomplete: deadline; remaining={remaining}"
             ));
             handoff_gaps.push(render::SkippedOut {
                 name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),

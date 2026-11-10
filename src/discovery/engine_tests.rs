@@ -30088,7 +30088,10 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
     );
     // Tick 6: one retained view's generation is lost; both record it. The
     // retirement terminal path builds one detachment candidate on top of the
-    // tick's two, identically on both engines.
+    // tick's two on the full path; the fast path reuses the committed
+    // candidate for the module-empty churn (the drain-stall empty-churn
+    // path, 1b4ea0fff), so it builds only the one detachment candidate
+    // (cumulative 5,5 instead of 7,7) with byte-identical decisions.
     fourth.kill().unwrap();
     fourth.wait().unwrap();
     tick_both(
@@ -30096,13 +30099,16 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         &mut full,
         &mut fast_counts,
         &mut full_counts,
-        3,
+        1,
         3,
     );
     for engine in [&fast, &full] {
         assert!(engine.views.iter().all(|view| view.pid() != p4));
     }
-    // Tick 7: a refresh rescan of a retained view rebuilds on both.
+    // Tick 7: a refresh rescan of a retained view rebuilds on both; the
+    // rescan carries no modules, so the fast path again reuses the committed
+    // candidate (the drain-stall empty-churn path, 1b4ea0fff) and builds once
+    // instead of twice, with byte-identical decisions.
     assert!(fast.request_refresh_consumed(p3, Some(2_000)));
     assert!(full.request_refresh_consumed(p3, Some(2_000)));
     tick_both(
@@ -30110,7 +30116,7 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         &mut full,
         &mut fast_counts,
         &mut full_counts,
-        2,
+        1,
         2,
     );
     for child in [&mut first, &mut second, &mut waiting] {

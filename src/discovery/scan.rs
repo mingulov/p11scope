@@ -4134,78 +4134,77 @@ struct OpenedMappedObject {
     guard_exempt: bool,
 }
 
-/// Open a mapped object whose target-root open failed only because the
-/// root is unreachable (`ESRCH` under a live generation pin — a sandboxed
-/// process jailed in a dead helper's `/proc/<pid>/fdinfo`, not an exit):
-/// read the VMA's own file through `/proc/<pid>/map_files/<start>-<end>`
-/// instead, and prove it like-for-like (the served fd's self-mapped
-/// `vm_file` against the range's `map_files` stat — kernel identities on
-/// both sides, never `fstat` vs maps). The served file then runs the
-/// ordinary opened-file and `mapped_file_guard` checks, so a same-key
-/// different file still refuses — except the mount-table guard, which is
-/// exempted only once the proof passed under a kernel-empty mount table.
-///
-/// The group's first range names the VMA. Any other errno keeps the
-/// original failure untouched — only an unreachable root retries, and
-/// only once. Every fallback outcome is recorded: a served file joins
-/// the ordinary scan body, while a failed or unproven attempt keeps the
-/// original failure counted and named, with the attempt beside it in the
-/// established `(host-root fallback: …)` style. Only a proven different
-/// file refuses with its own reason.
+/// Whether a target-root open failure retries through the VMA's own
+/// `map_files` link: an unreachable root (`ESRCH` under a live
+/// generation pin — a sandboxed process jailed in a dead helper's
+/// `/proc/<pid>/fdinfo`, not an exit), or a file the retained root
+/// cannot see (`ENOENT` under a foreign root — a chrooted daemon whose
+/// foreign mount namespace correctly refuses the host fallback, not an
+/// exit either). `ENOENT` under the observer's own root is a genuinely
+/// missing file and never retries.
+fn map_files_fallback_triggered(failure: &MappedOpenError) -> bool {
+    failure.errno == Some(libc::ESRCH)
+        || (failure.errno == Some(libc::ENOENT) && failure.foreign_target_root.is_some())
+}
+
+/// How the `map_files` open-and-prove core failed, before the caller
+/// maps it to its own gap vocabulary: an attempt that never produced
+/// a provable file (the open, the metadata, or either identity
+/// unreadable) keeps the caller's own failure record, while a served
+/// file refused on its own evidence (non-regular, over the shared
+/// size cap, or a proven stranger) refuses with its own reason. The
+/// `Unproven` detail is the `(map_files fallback: …)` text.
+enum MapFilesRefusal {
+    Unproven(String),
+    Refused(String),
+}
+
+/// Open the group's first VMA range through
+/// `/proc/<pid>/map_files/<start>-<end>` and prove the served fd
+/// like-for-like (its self-mapped `vm_file` against the range's
+/// `map_files` stat — kernel identities on both sides, never `fstat`
+/// vs maps). Shared by the unreachable-root fallback below and the
+/// replaced-file join in the scan loop, so both prove the same way.
 #[allow(clippy::too_many_arguments)]
-fn open_object_with_map_files_fallback(
+fn map_files_open_proven(
     io: &mut impl ScanIo,
     view: &ProcessView,
-    failure: MappedOpenError,
     key: ObjectKey,
     group: &[&MapEntry],
     budget: &mut CaptureWorkBudget,
     mounts: &mut crate::process::MountTableCache,
-) -> Result<OpenedMappedObject, MappedOpenError> {
-    if failure.errno != Some(libc::ESRCH) {
-        return Err(failure);
-    }
+) -> Result<OpenedMappedObject, MapFilesRefusal> {
     let Some(first) = group.first() else {
-        return Err(failure);
+        return Err(MapFilesRefusal::Unproven(
+            "the group has no VMA range to open".into(),
+        ));
     };
     let (start, end) = (first.start, first.end);
     let file = match io.open_map_files(view, start, end, budget) {
         Ok(file) => file,
         Err(error) => {
-            return Err(MappedOpenError {
-                reason: format!("{} (map_files fallback: {error})", failure.reason),
-                foreign_target_root: failure.foreign_target_root,
-                errno: failure.errno,
-            });
+            return Err(MapFilesRefusal::Unproven(error.to_string()));
         }
     };
     let metadata = match file.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
-            return Err(MappedOpenError {
-                reason: format!("{} (map_files fallback: {error})", failure.reason),
-                foreign_target_root: failure.foreign_target_root,
-                errno: failure.errno,
-            });
+            return Err(MapFilesRefusal::Unproven(error.to_string()));
         }
     };
     if !metadata.is_file() {
-        return Err(MappedOpenError {
-            reason: format!("map_files range {start:x}-{end:x} is not a regular file; refused"),
-            foreign_target_root: None,
-            errno: None,
-        });
+        return Err(MapFilesRefusal::Refused(format!(
+            "map_files range {start:x}-{end:x} is not a regular file; refused"
+        )));
     }
     // The shared object size cap applies to the served file exactly as
     // to a root-opened one: same limit, same wording, never lowered.
     let size = metadata.len();
     let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
     if size > limit {
-        return Err(MappedOpenError {
-            reason: format!("object is {size} bytes; limit is {limit}"),
-            foreign_target_root: None,
-            errno: None,
-        });
+        return Err(MapFilesRefusal::Refused(format!(
+            "object is {size} bytes; limit is {limit}"
+        )));
     }
     // The like-for-like proof, read fresh on both sides: the served
     // fd's self-mapped `vm_file` against this range's `map_files`
@@ -4234,45 +4233,73 @@ fn open_object_with_map_files_fallback(
                 guard_exempt: mountinfo_empty,
             })
         }
-        (Some(held), Ok(Ok(ranged))) => Err(MappedOpenError {
-            reason: format!(
-                "map_files range {start:x}-{end:x} is another file (st_dev {} st_ino {}) than the \
-                 opened VMA file (st_dev {} st_ino {}): maps key {}:{} inode {} was refused \
-                 without a proven file",
-                ranged.dev,
-                ranged.ino,
-                held.dev,
-                held.ino,
-                key.device.major,
-                key.device.minor,
-                key.inode
-            ),
+        (Some(held), Ok(Ok(ranged))) => Err(MapFilesRefusal::Refused(format!(
+            "map_files range {start:x}-{end:x} is another file (st_dev {} st_ino {}) than the \
+             opened VMA file (st_dev {} st_ino {}): maps key {}:{} inode {} was refused \
+             without a proven file",
+            ranged.dev,
+            ranged.ino,
+            held.dev,
+            held.ino,
+            key.device.major,
+            key.device.minor,
+            key.inode
+        ))),
+        (None, _) => Err(MapFilesRefusal::Unproven(
+            "the opened file has no readable vm_file identity".into(),
+        )),
+        (Some(_), Err(reason)) => Err(MapFilesRefusal::Unproven(format!(
+            "VMA identity unreadable: {reason}"
+        ))),
+        (Some(_), Ok(Err(error))) => Err(MapFilesRefusal::Unproven(format!(
+            "VMA identity unreadable: {error}"
+        ))),
+    }
+}
+
+/// Open a mapped object whose target-root open failed only because the
+/// root cannot serve it (see [`map_files_fallback_triggered`]): read
+/// the VMA's own file through `/proc/<pid>/map_files/<start>-<end>`
+/// instead, and prove it like-for-like (the served fd's self-mapped
+/// `vm_file` against the range's `map_files` stat — kernel identities on
+/// both sides, never `fstat` vs maps). The served file then runs the
+/// ordinary opened-file and `mapped_file_guard` checks, so a same-key
+/// different file still refuses — except the mount-table guard, which is
+/// exempted only once the proof passed under a kernel-empty mount table.
+///
+/// Only a triggered failure retries, and only once. Every fallback
+/// outcome is recorded: a served file joins the ordinary scan body,
+/// while a failed or unproven attempt keeps the original failure
+/// counted and named, with the attempt beside it in the established
+/// `(host-root fallback: …)` style. Only a proven different file
+/// refuses with its own reason.
+#[allow(clippy::too_many_arguments)]
+fn open_object_with_map_files_fallback(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    failure: MappedOpenError,
+    key: ObjectKey,
+    group: &[&MapEntry],
+    budget: &mut CaptureWorkBudget,
+    mounts: &mut crate::process::MountTableCache,
+) -> Result<OpenedMappedObject, MappedOpenError> {
+    if !map_files_fallback_triggered(&failure) {
+        return Err(failure);
+    }
+    if group.is_empty() {
+        return Err(failure);
+    }
+    match map_files_open_proven(io, view, key, group, budget, mounts) {
+        Ok(opened) => Ok(opened),
+        Err(MapFilesRefusal::Unproven(detail)) => Err(MappedOpenError {
+            reason: format!("{} (map_files fallback: {detail})", failure.reason),
+            foreign_target_root: failure.foreign_target_root,
+            errno: failure.errno,
+        }),
+        Err(MapFilesRefusal::Refused(reason)) => Err(MappedOpenError {
+            reason,
             foreign_target_root: None,
             errno: None,
-        }),
-        (None, _) => Err(MappedOpenError {
-            reason: format!(
-                "{} (map_files fallback: the opened file has no readable vm_file identity)",
-                failure.reason
-            ),
-            foreign_target_root: failure.foreign_target_root,
-            errno: failure.errno,
-        }),
-        (Some(_), Err(reason)) => Err(MappedOpenError {
-            reason: format!(
-                "{} (map_files fallback: VMA identity unreadable: {reason})",
-                failure.reason
-            ),
-            foreign_target_root: failure.foreign_target_root,
-            errno: failure.errno,
-        }),
-        (Some(_), Ok(Err(error))) => Err(MappedOpenError {
-            reason: format!(
-                "{} (map_files fallback: VMA identity unreadable: {error})",
-                failure.reason
-            ),
-            foreign_target_root: failure.foreign_target_root,
-            errno: failure.errno,
         }),
     }
 }
@@ -6871,7 +6898,7 @@ fn scan_view_examined_mode(
                 Resolved::File { path, raw_path, .. } => Some((path, raw_path)),
                 _ => None,
             });
-        let usable = match &named {
+        let mut usable = match &named {
             Some((MappedPath::Usable(path), _)) => Some(path.clone()),
             _ => None,
         };
@@ -6932,6 +6959,40 @@ fn scan_view_examined_mode(
                 key.device.major, key.device.minor, key.inode
             ),
         };
+        // A file replaced on disk still runs its old bytes while
+        // mapped: open the VMA's own file through `map_files` and
+        // prove it like-for-like, so a replaced provider joins the
+        // ordinary scan body below with its replaced marker still
+        // published. Only a proven file joins; a served stranger
+        // refuses by name, and an attempt that never produced a
+        // provable file (notably an unprivileged EPERM) keeps the
+        // exact replaced-file gap below — byte-identical degradation.
+        let mut deleted_open: Option<OpenedMappedObject> = None;
+        let mut deleted_published: Option<String> = None;
+        if usable.is_none()
+            && !narrowed_out
+            && let Some((MappedPath::Unusable { reason }, raw_path)) = &named
+            && reason == "deleted mapping"
+            && group.iter().any(|entry| entry.permissions[2] == b'x')
+        {
+            match map_files_open_proven(io, view, key, &group, budget, &mut mounts) {
+                Ok(opened) => {
+                    if let Some(prefix) = raw_path.strip_suffix(b" (deleted)".as_slice()) {
+                        deleted_published = Some(subject.clone());
+                        usable = Some(PathBuf::from(std::ffi::OsStr::from_bytes(prefix)));
+                        deleted_open = Some(opened);
+                    }
+                }
+                Err(MapFilesRefusal::Refused(reason)) => {
+                    skipped.push(Skipped {
+                        subject: subject.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                Err(MapFilesRefusal::Unproven(_)) => {}
+            }
+        }
         let Some(usable) = usable else {
             if !narrowed_out {
                 // A deleted mapping with executable code still mapped is
@@ -6954,37 +7015,42 @@ fn scan_view_examined_mode(
         };
         let path = usable.display().to_string();
         let sub_open = Instant::now();
-        let (file, guard_exempt) = match io.open_mapped_object(view, &path, budget) {
-            Ok(file) => (file, false),
-            Err(failure) => {
-                match open_object_with_map_files_fallback(
-                    io,
-                    view,
-                    failure,
-                    key,
-                    &group,
-                    budget,
-                    &mut mounts,
-                ) {
-                    Ok(opened) => (opened.file, opened.guard_exempt),
-                    Err(failure) => {
-                        if !narrowed_out {
-                            match failure.foreign_target_root {
-                                Some(root) => foreign_failures.push(ForeignOpenFailure {
-                                    subject,
-                                    reason: failure.reason,
-                                    root,
-                                }),
-                                None => skipped.push(Skipped {
-                                    subject,
-                                    reason: failure.reason,
-                                }),
+        // A joined replaced file is already open and proven above; every
+        // other group opens in the target root (with the fallback).
+        let (file, guard_exempt) = match deleted_open {
+            Some(opened) => (opened.file, opened.guard_exempt),
+            None => match io.open_mapped_object(view, &path, budget) {
+                Ok(file) => (file, false),
+                Err(failure) => {
+                    match open_object_with_map_files_fallback(
+                        io,
+                        view,
+                        failure,
+                        key,
+                        &group,
+                        budget,
+                        &mut mounts,
+                    ) {
+                        Ok(opened) => (opened.file, opened.guard_exempt),
+                        Err(failure) => {
+                            if !narrowed_out {
+                                match failure.foreign_target_root {
+                                    Some(root) => foreign_failures.push(ForeignOpenFailure {
+                                        subject,
+                                        reason: failure.reason,
+                                        root,
+                                    }),
+                                    None => skipped.push(Skipped {
+                                        subject,
+                                        reason: failure.reason,
+                                    }),
+                                }
                             }
+                            continue;
                         }
-                        continue;
                     }
                 }
-            }
+            },
         };
         // Uncollapsed: the inner line is the pinned guard call.
         #[allow(clippy::collapsible_if)]
@@ -7222,7 +7288,9 @@ fn scan_view_examined_mode(
             double_loaded: same_file_loads >= 2,
             same_file_loads,
             pre_copy_up,
-            path,
+            // A joined replaced file publishes its replaced marker:
+            // `-v`/JSON name the running copy this scan examined.
+            path: deleted_published.unwrap_or(path),
             tables_scan_finished: false,
             decoder_abi: Some(abi),
             exports: hook_exports,

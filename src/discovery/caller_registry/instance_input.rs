@@ -1786,16 +1786,24 @@ impl CallerRegistry {
         if input.boundary.is_some_and(|p| p.domain != input.key.domain) {
             return false;
         }
-        // A module the drain has not created yet has no id a
-        // retained negative could name, so only a live module
-        // can be negative-blocked.
-        if let Some(module) = module {
-            for negative in &self.instance_state.negatives {
-                if negative.matches(&input.key, module)
-                    && (negative.authority_exhausted || negative.retirement.is_some())
-                {
-                    return false;
+        // Retained negatives split by what they name: Domain,
+        // Task and Image match without the module id, so they
+        // block a staged-only row exactly as at the drain; only
+        // Module and Exact name a drained module id, which a
+        // module the drain has not created yet cannot have (ids
+        // are never reused).
+        for negative in &self.instance_state.negatives {
+            let blocked = match module {
+                Some(module) => negative.matches(&input.key, module),
+                None => {
+                    matches!(
+                        negative.kind,
+                        NegativeKind::Domain | NegativeKind::Task | NegativeKind::Image
+                    ) && negative.matches(&input.key, ModuleId(0))
                 }
+            };
+            if blocked && (negative.authority_exhausted || negative.retirement.is_some()) {
+                return false;
             }
         }
         true

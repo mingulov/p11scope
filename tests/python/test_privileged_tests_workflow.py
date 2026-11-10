@@ -536,7 +536,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/ci/check-cell-results.py", self.yml)
         self.assertIn("--allow-nonqualifying trace-pid", self.yml)
         self.assertIn("--expected-failure profile-cgroup", self.yml)
-        self.assertIn("--expected-failure inventory-cgroup", self.yml)
+        self.assertNotIn("--expected-failure inventory-cgroup", self.yml)
         self.assertNotIn("--allow-nonqualifying run-short", self.yml)
         self.assertIn("--require doctor", self.yml)
         self.assertIn("--require profile-pid", self.yml)
@@ -544,6 +544,21 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("--require fifo-refused", self.yml)
         self.assertIn("WP-3", self.yml)
         self.assertIn("WP-7", self.yml)
+
+    def test_public_cli_gate_qualifies_inventory_cgroup(self):
+        # The decided no-witness shape qualifies on every leg, so the
+        # uniform inline gate must not list inventory-cgroup in
+        # expected_cells — while still requiring the cell itself.
+        job = job_body(self.yml, "public-cli")
+        gate = re.search(r"expected_cells = \{(.*?)\}", job, re.S)
+        self.assertIsNotNone(gate, "public-cli has no expected_cells gate")
+        self.assertEqual(set(re.findall(r'"([^"]+)"', gate.group(1))),
+                         {"profile-cgroup", "trace-cgroup",
+                          "profile-pid-ia32", "run-ia32"})
+        need = re.search(r"need = \{(.*?)\}", job, re.S)
+        self.assertIsNotNone(need, "public-cli has no need set")
+        self.assertIn("inventory-cgroup", need.group(1),
+                      "the gate must still require the inventory-cgroup cell")
 
     def test_minimal_setcap_leg_runs_on_host_and_guests(self):
         job = job_body(self.yml, "public-cli")

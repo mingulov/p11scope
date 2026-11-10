@@ -324,13 +324,14 @@ class ScriptTextTests(unittest.TestCase):
     def test_expected_reasons_present(self):
         text = QUAL.read_text()
         for name in ("REASON_CGROUP", "REASON_TRACE_CGROUP",
-                     "REASON_INVENTORY_7X",
                      "REASON_IA32"):
             self.assertIn(name, text, f"missing {name} with named product-gap reason")
         self.assertNotIn("REASON_RUN", text,
                          "run exact loss is fixed and qualified; its reason must be gone")
         self.assertNotIn("REASON_INVENTORY_OVERLAY", text,
                          "overlay empty view is fixed and qualified; its reason must be gone")
+        self.assertNotIn("REASON_INVENTORY_7X", text,
+                         "the decided no-witness shape qualifies; its reason must be gone")
         self.assertIn("product fix lane", text)
 
     def test_ia32_prereq_missing_is_expected(self):
@@ -367,11 +368,23 @@ class ScriptTextTests(unittest.TestCase):
         self.assertIn("CGROUPS", text,
                       "owned cgroups must be tracked for EXIT cleanup")
 
-    def test_inventory_conditional_expected(self):
+    def test_inventory_gaps_fail_loudly(self):
+        # The decided no-witness shape qualifies, so the inventory
+        # branch maps every failure to failed: no expected-failure arm
+        # may remain. The oracle still fails loudly on unnamed
+        # owned-module gaps.
         text = QUAL.read_text()
-        self.assertIn("inventory gaps about owned module", text)
-        self.assertIn("REASON_INVENTORY_7X", text,
-                      "inventory 7.x gap must map to expected-failure with named reason")
+        self.assertIn("inventory gaps about owned module", text,
+                      "the oracle must still fail loudly on unnamed owned-module gaps")
+        anchor = 'detail="$detail observer_rc=$observer_rc"'
+        start = text.index(anchor)
+        branch = text[start:text.index("    return 0", start)]
+        self.assertIn('result "$cell" 0 "$detail" failed', branch,
+                      "inventory failures must stay failed")
+        self.assertNotIn("expected-failure", branch,
+                         "no inventory expected-failure arm may remain")
+        self.assertNotIn("REASON_INVENTORY_7X", text,
+                         "the inventory 7.x expected-failure reason must be gone")
 
     def test_inventory_overlay_published_shape_present(self):
         text = QUAL.read_text()

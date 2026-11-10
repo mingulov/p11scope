@@ -5,13 +5,16 @@
 //!
 //! What it watches: per-tick wall time against the worst observed
 //! forced-sweep tick, inter-drain gaps against a stall bound (a loop that
-//! stops draining is a deep freeze), and first-drain loss shares (ramp-up
-//! loss vs steady-state loss, for the early-ring-loss diagnosis). Pure:
-//! every observation is passed in, so the detector is fully testable with
-//! synthetic streams. The capture loop feeds it per tick and attempts one
-//! `p11scope: longrun:` stderr line at loop end. Delivery is best effort;
-//! absence is not a clean result. These diagnostics do not change the
-//! capture verdict or report schema.
+//! stops draining is a deep freeze), first-drain loss shares (ramp-up
+//! loss vs steady-state loss, for the early-ring-loss diagnosis), the
+//! kernel identity budget (a spent budget blinds the capture to new
+//! processes) and the newcomer queue (newcomers still waiting past the
+//! stall bound never got admitted). Pure: every observation is passed
+//! in, so the detector is fully testable with synthetic streams. The
+//! capture loop feeds it per tick and attempts one `p11scope: longrun:`
+//! stderr line at loop end. Delivery is best effort; absence is not a
+//! clean result. These diagnostics do not change the capture verdict or
+//! report schema.
 
 /// Historical forced-sweep maximum (`31r-esys4`, measured 2026-09-20).
 /// This is a diagnostic threshold, not a latency guarantee; see
@@ -25,6 +28,27 @@ pub const FINDING_TICK_OVER_BUDGET: &str = "tick_over_budget";
 pub const FINDING_LOOP_STALLED: &str = "loop_stalled";
 pub const FINDING_EARLY_EVENT_LOSS: &str = "early_event_loss";
 pub const FINDING_EARLY_DISCOVERY_LOSS: &str = "early_discovery_loss";
+pub const FINDING_IDENTITY_BUDGET_EXHAUSTED: &str = "identity_budget_exhausted";
+pub const FINDING_NEWCOMER_QUEUE_STALLED: &str = "newcomer_queue_stalled";
+
+/// The lifetime identity budget the kernel hands out (COOKIE_CTL limit).
+/// Named here so the exhaustion finding states the bound it spent.
+pub const IDENTITY_BUDGET_TICKETS: u64 = 16_384;
+
+/// A newcomer still waiting past this age at loop end never got
+/// admitted: admission normally completes within a scan, so this is
+/// 60x that, and far under the observed 115-minute stall. Bounds are
+/// strict, like the stall gap: exactly at the bound is not a stall.
+/// Self-limiting on short runs: a pending age can never exceed the
+/// run length, so only runs past a minute can trip it.
+pub const NEWCOMER_STALL_AGE_MS: u64 = 60_000;
+
+/// True when the end-of-run newcomer point-in-time proves a stall:
+/// pids still waiting with a known oldest age past the bound. An
+/// unknown oldest age stays unknown, never a stall.
+pub fn newcomer_stalled(pending: u64, oldest_pending_age_ms: Option<u64>) -> bool {
+    pending > 0 && oldest_pending_age_ms.is_some_and(|age| age > NEWCOMER_STALL_AGE_MS)
+}
 
 /// Detector thresholds. Defaults are the module constants; soak policy
 /// can tighten or loosen them without touching the detector.
@@ -140,6 +164,10 @@ pub struct LongRunDetector {
     max_gap_ms: Option<u64>,
     first_event_loss: Option<u64>,
     first_discovery_loss: Option<u64>,
+    identity_budget_exhausted: bool,
+    identity_unavailable: u64,
+    newcomer_pending: u64,
+    newcomer_oldest_pending_age_ms: Option<u64>,
 }
 
 impl LongRunDetector {
@@ -175,6 +203,22 @@ impl LongRunDetector {
     pub fn note_first_drain_loss(&mut self, event_loss: Option<u64>, discovery_loss: u64) {
         self.first_event_loss = event_loss;
         self.first_discovery_loss = Some(discovery_loss);
+    }
+
+    /// Latest kernel identity health (COOKIE_CTL): whether the
+    /// lifetime budget is spent and how many identities were refused.
+    /// Replaced, never merged: the loop syncs the latest snapshot,
+    /// with a final read at loop end.
+    pub fn note_identity_budget(&mut self, exhausted: bool, unavailable: u64) {
+        self.identity_budget_exhausted = exhausted;
+        self.identity_unavailable = unavailable;
+    }
+
+    /// Latest newcomer point-in-time: pids still waiting and their
+    /// oldest known pending age. Replaced per sync, like the budget.
+    pub fn note_newcomer(&mut self, pending: u64, oldest_pending_age_ms: Option<u64>) {
+        self.newcomer_pending = pending;
+        self.newcomer_oldest_pending_age_ms = oldest_pending_age_ms;
     }
 
     /// Splits one loss counter into ramp-up (first drain) and steady
@@ -264,6 +308,36 @@ impl LongRunDetector {
             total_discovery_loss,
         );
         findings.extend(discovery_finding);
+        if self.identity_budget_exhausted || self.identity_unavailable > 0 {
+            let detail = if self.identity_budget_exhausted {
+                format!(
+                    "lifetime budget of {IDENTITY_BUDGET_TICKETS} identities spent; {} refused",
+                    self.identity_unavailable
+                )
+            } else {
+                format!(
+                    "{} refused without a spent budget",
+                    self.identity_unavailable
+                )
+            };
+            findings.push(LongRunFinding {
+                code: FINDING_IDENTITY_BUDGET_EXHAUSTED,
+                detail,
+                at_tick: None,
+            });
+        }
+        if newcomer_stalled(self.newcomer_pending, self.newcomer_oldest_pending_age_ms) {
+            findings.push(LongRunFinding {
+                code: FINDING_NEWCOMER_QUEUE_STALLED,
+                detail: format!(
+                    "{} pending, oldest {}ms (stall bound {NEWCOMER_STALL_AGE_MS}ms)",
+                    self.newcomer_pending,
+                    self.newcomer_oldest_pending_age_ms
+                        .expect("a stall has a known oldest age"),
+                ),
+                at_tick: None,
+            });
+        }
         LongRunReport {
             findings,
             ticks_observed: self.ticks,
@@ -620,7 +694,10 @@ mod tests {
             let mut detector = ordinary_detector();
             detector.note_newcomer(pending, oldest);
             let report = detector.finish(0, 0);
-            assert!(report.is_clean(), "pending={pending} oldest={oldest:?}: {report:?}");
+            assert!(
+                report.is_clean(),
+                "pending={pending} oldest={oldest:?}: {report:?}"
+            );
         }
     }
 

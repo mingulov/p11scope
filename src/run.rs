@@ -9473,6 +9473,14 @@ fn capture_profile(
     );
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
+    // Final identity/newcomer sync for the long-run verdict: the loop
+    // never sampled them per tick, so the detector would otherwise
+    // report clean over a spent budget or a stalled queue. Best
+    // effort: a failed kernel read keeps the last synced state.
+    if let Ok(kernel) = metrics::kernel_evidence(session) {
+        scheduling.sync_identity_health(&kernel.control);
+    }
+    scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
     if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
@@ -10922,6 +10930,13 @@ fn capture_trace(
         loop_end_reason,
     );
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
+    // Final identity/newcomer sync for the long-run verdict, as on
+    // the profile path: without it the detector reports clean over a
+    // spent budget or a stalled queue. Best effort.
+    if let Ok(kernel) = metrics::kernel_evidence(session) {
+        scheduling.sync_identity_health(&kernel.control);
+    }
+    scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
     if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
@@ -12188,7 +12203,28 @@ impl SchedulingAccumulator {
     /// Carries the engine's newcomer queue-age evidence into the snapshot,
     /// sampling pending ages at `now_ns` (the caller's clock poll).
     pub(crate) fn sync_newcomer_stats(&mut self, engine: &Engine, now_ns: Option<u64>) {
-        self.newcomer = engine.newcomer_stats(now_ns);
+        self.note_newcomer_stats(engine.newcomer_stats(now_ns));
+    }
+
+    /// Records newcomer queue-age evidence from a sampled snapshot,
+    /// for callers (and tests) that already hold the stats. The
+    /// long-run detector keeps the latest point-in-time beside the
+    /// snapshot copy, so a queue stalled at loop end warns.
+    pub(crate) fn note_newcomer_stats(&mut self, stats: crate::timing::NewcomerStats) {
+        self.newcomer = stats;
+        self.longrun
+            .note_newcomer(self.newcomer.pending, self.newcomer.oldest_pending_age_ms);
+    }
+
+    /// Carries the kernel identity health (COOKIE_CTL) into the
+    /// long-run detector: a spent lifetime budget blinds the capture
+    /// to new processes, so the loop-end line must name it. Best
+    /// effort like every sync: a failed read keeps the last state.
+    pub(crate) fn sync_identity_health(&mut self, control: &crate::metrics::KernelControl) {
+        self.longrun.note_identity_budget(
+            control.identity_budget_exhausted,
+            control.identity_unavailable,
+        );
     }
 
     /// Carries the engine's batch-tail publication counters into the
@@ -12458,26 +12494,32 @@ fn resource_evidence_of(
 /// (the stop-race oracle cross-checks stderr pending against the
 /// report), the rest verbose-only.
 fn emit_timing_summaries(scheduling: &render::SchedulingEvidence, summaries: &[String]) {
-    let drops = scheduling.newcomer_queue.dropped + scheduling.newcomer_queue.dropped_unknown;
-    for summary in timing_summaries_to_emit(summaries, capture_diagnostics_on(), drops) {
+    let queue = &scheduling.newcomer_queue;
+    let drops = queue.dropped + queue.dropped_unknown;
+    let stalled = crate::longrun::newcomer_stalled(queue.pending, queue.oldest_pending_age_ms);
+    for summary in timing_summaries_to_emit(summaries, capture_diagnostics_on(), drops, stalled) {
         let _ = crate::sink::try_stderr_line(summary);
     }
 }
 
 /// The [`emit_timing_summaries`] gate as a pure predicate, so tests
 /// pin it without capturing stderr. Default stderr keeps only a
-/// newcomer-queue line that reports drops — a real warning; all-clear
-/// statistics print under `-v` or `P11SCOPE_CAPTURE_DIAGNOSTICS=1`,
-/// which is how the stop-race oracle runs.
+/// newcomer-queue line that reports drops or a stall — a real
+/// warning; all-clear statistics print under `-v` or
+/// `P11SCOPE_CAPTURE_DIAGNOSTICS=1`, which is how the stop-race
+/// oracle runs.
 fn timing_summaries_to_emit(
     summaries: &[String],
     diagnostics: bool,
     newcomer_drops: u64,
+    newcomer_stalled: bool,
 ) -> Vec<&String> {
     summaries
         .iter()
         .filter(|summary| {
-            diagnostics || (summary.contains("timing: newcomer queue:") && newcomer_drops > 0)
+            diagnostics
+                || (summary.contains("timing: newcomer queue:")
+                    && (newcomer_drops > 0 || newcomer_stalled))
         })
         .collect()
 }
@@ -13392,7 +13434,7 @@ mod tests {
             "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 0 (max age -)".to_string(),
         ];
         assert_eq!(
-            timing_summaries_to_emit(&summaries, false, 0),
+            timing_summaries_to_emit(&summaries, false, 0, false),
             Vec::<&String>::new(),
         );
     }
@@ -13407,11 +13449,11 @@ mod tests {
             "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 2 (max age -)".to_string(),
         ];
         assert_eq!(
-            timing_summaries_to_emit(&summaries, false, 2),
+            timing_summaries_to_emit(&summaries, false, 2, false),
             vec![&summaries[1]],
         );
         assert_eq!(
-            timing_summaries_to_emit(&summaries, true, 0),
+            timing_summaries_to_emit(&summaries, true, 0, false),
             vec![&summaries[0], &summaries[1]],
         );
     }

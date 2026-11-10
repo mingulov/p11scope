@@ -705,17 +705,31 @@ fn notice_kernel_control(control: &KernelControl) {
             reason_names(control.owner_poison, &OWNER_POISON_NAMES).join(", ")
         );
     }
-    if control.identity_unavailable != 0 && !IDENTITY_NOTICE.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "p11scope: kernel could not give a process an identity{}; its calls \
-             and fork records are not captured and the report is PARTIAL",
-            if control.identity_budget_exhausted {
-                " (lifetime budget of 16384 identities spent)"
-            } else {
-                ""
-            }
-        );
+    if let Some(line) = identity_notice_line(control)
+        && !IDENTITY_NOTICE.swap(true, Ordering::Relaxed)
+    {
+        eprintln!("{line}");
     }
+}
+
+/// The one stderr line for the first sighted identity refusal, so the
+/// operator learns when capture thinned, not only from the final
+/// report. `None` while nothing was refused. Pure, so tests pin the
+/// wording without capturing stderr; the caller prints it once.
+fn identity_notice_line(control: &KernelControl) -> Option<String> {
+    if control.identity_unavailable == 0 {
+        return None;
+    }
+    Some(format!(
+        "p11scope: kernel could not give a process an identity ({} refused so far{}); \
+         its calls and fork records are not captured and the report is PARTIAL",
+        control.identity_unavailable,
+        if control.identity_budget_exhausted {
+            "; lifetime budget of 16384 identities spent"
+        } else {
+            ""
+        }
+    ))
 }
 
 pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {

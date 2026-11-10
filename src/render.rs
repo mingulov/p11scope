@@ -4209,6 +4209,58 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "mechanism never decoded",
                 "mechanisms never decoded",
             ),
+            "kernel_control" => {
+                // One fragment per active kernel-control part, so the
+                // cause never folds into "other gaps": identity
+                // refusals with the spent budget, a halted kernel with
+                // its poison names, refused ownership admissions and
+                // root-affiliation failures. The verdict fires this
+                // cause exactly when one part is active, so at least
+                // one fragment always lands.
+                let control = &ev.kernel_control;
+                if control.capture_halted {
+                    fragments.push(tag(if control.owner_poison.is_empty() {
+                        "kernel capture halted".to_string()
+                    } else {
+                        format!(
+                            "kernel capture halted ({})",
+                            control.owner_poison.join(", ")
+                        )
+                    }));
+                } else {
+                    for reason in &control.owner_poison {
+                        fragments.push(tag(format!("kernel owner refusal: {reason}")));
+                    }
+                }
+                if control.owner_admission_failures > 0 {
+                    fragments.push(tag(count(
+                        control.owner_admission_failures,
+                        "kernel ownership admission refused",
+                        "kernel ownership admissions refused",
+                    )));
+                }
+                if control.identity_unavailable > 0 {
+                    let plain = count(
+                        control.identity_unavailable,
+                        "process refused an identity",
+                        "processes refused an identity",
+                    );
+                    fragments.push(tag(if control.identity_budget_exhausted {
+                        format!("{plain} (lifetime budget of 16384 identities spent)")
+                    } else {
+                        plain
+                    }));
+                } else if control.identity_budget_exhausted {
+                    fragments.push(tag(
+                        "lifetime budget of 16384 identities spent (nothing refused yet)"
+                            .to_string(),
+                    ));
+                }
+                for reason in &control.root_affiliation_failures {
+                    fragments.push(tag(format!("kernel root affiliation failure: {reason}")));
+                }
+                continue;
+            }
             other => {
                 if verbose {
                     fragments.push(other.to_string());

@@ -589,8 +589,8 @@ scope::tests::privileged_run_cgroup_place_moves_a_real_child
 scope::tests::privileged_run_cgroup_create_under_observer_stays_nested
 # Chrooted-target scans: a self-chrooting child keeps host-absolute maps
 # paths (the avahi-daemon shape); same-namespace mappings resolve via the
-# gated host-root fallback, while a foreign mount namespace keeps
-# per-object gaps that concise folds per distinct reason (needs only
+# gated host-root fallback, while a foreign mount namespace refuses that
+# fallback and examines via the proven map_files join instead (needs only
 # root, no BPF).
 discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings
 discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects

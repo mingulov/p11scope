@@ -12451,10 +12451,14 @@ mod tests {
 
     /// Twin: when the target root is foreign AND the mount namespace differs
     /// (a container-like view), the host root must not be trusted at all:
-    /// no fallback is attempted, and every unopenable object keeps its own
-    /// per-object gap naming the foreign root (JSON and `-v` stay complete).
-    /// The retained reasons are identical, so concise rendering folds them
-    /// into one counted line per distinct reason.
+    /// no host-root fallback is attempted. The VMA's own file still opens
+    /// through the kernel's `map_files` link and proves like-for-like, so
+    /// the child's libraries examine exactly like the same-namespace
+    /// twin's — only the host-root fallback stays refused. (Before the
+    /// `map_files` join this cell pinned per-object retained-root gaps
+    /// that concise folded; the rendering of such gaps stays pinned by
+    /// `foreign_root_skips_keep_every_object_with_its_root` and
+    /// `concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete`.)
     #[test]
     #[ignore = "root: self-chrooting scan child in a fresh mount namespace"]
     fn privileged_foreign_mount_namespace_scan_collapses_unopenable_objects() {
@@ -12471,7 +12475,7 @@ mod tests {
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(
             !maps.is_empty(),
-            "the foreign-root child must have mappings to fail on"
+            "the foreign-root child must have mappings to examine"
         );
         let view = ProcessView::open(ProcessViewId(72), pid).expect("retain foreign-root child");
         let hooks = HookRegistry::builtin();
@@ -12481,7 +12485,7 @@ mod tests {
             hooks: &hooks,
         };
         let mut budget = CaptureWorkBudget::default();
-        let outcome = scan_process_view_without_memory(&request, &view, &mut budget)
+        let (outcome, examined, _) = scan_process_view_examined(&request, &view, &mut budget)
             .expect("scan foreign-root child");
         assert!(view.still_the_same());
         assert!(
@@ -12491,7 +12495,7 @@ mod tests {
         );
         assert!(
             outcome.modules().is_empty(),
-            "no provider can be proven from unopenable objects: {:#?}",
+            "no provider can be proven from the fixture's mappings: {:#?}",
             outcome.modules()
         );
         assert!(
@@ -12499,7 +12503,7 @@ mod tests {
                 !skip.subject.contains("unopenable in foreign target root")
                     && !skip.reason.contains("mapped objects unopenable")
             }),
-            "the scan files per-object gaps, never a merged row: {:#?}",
+            "remaining skips stay per-object, never a merged row: {:#?}",
             outcome.skipped()
         );
         assert!(
@@ -12510,42 +12514,47 @@ mod tests {
             "a foreign mount namespace never attempts the host fallback: {:#?}",
             outcome.skipped()
         );
-        let retained: Vec<_> = outcome
-            .skipped()
-            .iter()
-            .filter(|skip| {
-                skip.reason
-                    .contains("opening object within retained target root")
-            })
-            .collect();
+        // The `map_files` join resolves every triggered foreign-ENOENT
+        // failure: no retained-root gap may remain (a served stranger or
+        // the oversized test binary refuses on its own evidence instead).
         assert!(
-            retained.len() >= 2,
-            "several objects stay per-object for JSON and -v: {:#?}",
+            outcome.skipped().iter().all(|skip| {
+                !skip
+                    .reason
+                    .contains("opening object within retained target root")
+            }),
+            "no retained-root gap survives the map_files join: {:#?}",
             outcome.skipped()
         );
-        let root = subject
-            .dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let expected_suffix = format!("(target root {root} differs from the observer root)");
-        for skip in &retained {
+        assert!(
+            !examined.is_empty(),
+            "the foreign-root child's libraries must be examined: {:#?}",
+            outcome.skipped()
+        );
+        // The positive check names real libraries: libc and ld-linux from
+        // the child's own maps (host paths, no hard-coded location) must
+        // resolve to examined keys.
+        let maps_after = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        for want in ["libc.so.6", "ld-linux"] {
+            let path = maps_after
+                .lines()
+                .filter(|line| line.contains(want))
+                .filter_map(|line| line.split_whitespace().last())
+                .find(|path| path.starts_with('/'))
+                .unwrap_or_else(|| panic!("the foreign-root child must map {want}"));
+            let file =
+                std::fs::File::open(path).unwrap_or_else(|_| panic!("host must open {path}"));
+            let key = p11scope_manifest::identity::mapping_file_key(&file)
+                .unwrap_or_else(|_| panic!("host must key {path}"));
             assert!(
-                skip.reason.contains(expected_suffix.as_str()),
-                "every per-object gap names its foreign root: {:#?}",
-                skip
+                examined.iter().any(|object| {
+                    object.key.device.major == key.device_major
+                        && object.key.device.minor == key.device_minor
+                        && object.key.inode == key.inode
+                }),
+                "the foreign-root child's {want} ({path}) must be examined: {examined:#?}"
             );
         }
-        // Identical per-object reasons are what concise folds: one counted
-        // line per distinct reason, with every object kept in JSON and -v.
-        let first = &retained[0].reason;
-        assert!(
-            retained.iter().all(|skip| &skip.reason == first),
-            "identical reasons fold to one concise line: {:#?}",
-            retained
-        );
     }
 
     /// H-3 regression: one scan read its view's `/proc/<pid>/mountinfo` once

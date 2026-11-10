@@ -16,6 +16,7 @@ use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
 use crate::discovery::overlay_witness::{
     OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessDiagnosis, WitnessFailure, WitnessOutcome,
     WitnessStage, WitnessVerdict, original_file_witness_required, prove_original_file_diagnosed,
+    witness_unavailable_refusal,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
@@ -6666,9 +6667,20 @@ fn scan_view_examined_mode(
         // file; an other-file verdict falls back to the mount-table
         // lower candidates (the copy-up shape), and anything else —
         // or no proven lower — refuses with the finite gap, never a
-        // join. Files that prove not to be providers (above) never
-        // spend witness work.
+        // join, except an unavailable witness under scoped collection,
+        // which degrades to publish-with-gap below. Files that prove
+        // not to be providers (above) never spend witness work.
         let mut pre_copy_up: Option<u32> = None;
+        // Scoped (cgroup) collection is userspace-only by design: the
+        // kernel witness never runs there, so without a degrade step
+        // every overlay provider would refuse and the inventory would
+        // publish an empty view. An unavailable witness degrades to
+        // publish-with-gap below (the named reason stands, PARTIAL
+        // coverage downstream, no proof claimed); every decisive
+        // refusal — proven another file, budget exhaustion, anchor
+        // failure — keeps refusing, and unscoped scans keep
+        // fail-closed too.
+        let mut witness_unproven = false;
         if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held) {
             match witness_join_with_copyup(
                 io,
@@ -6681,8 +6693,15 @@ fn scan_view_examined_mode(
                 budget,
             ) {
                 Err(reason) => {
-                    skipped.push(Skipped { subject, reason });
-                    continue;
+                    if !(budget.has_collection_work() && witness_unavailable_refusal(&reason)) {
+                        skipped.push(Skipped { subject, reason });
+                        continue;
+                    }
+                    witness_unproven = true;
+                    skipped.push(Skipped {
+                        subject: subject.clone(),
+                        reason,
+                    });
                 }
                 Ok(CopyUpJoin::Held) => {}
                 Ok(CopyUpJoin::LowerProven(proof)) => {
@@ -6941,6 +6960,7 @@ fn scan_view_examined_mode(
             .any(|skip| scan_skip_truncates(&skip.reason));
         module.tables_scan_finished = !io_exhausted
             && !truncated
+            && !witness_unproven
             && budget.refusal_counts() == refusals_before_module
             && stop_before_module.is_none()
             && budget.stopped_reason().is_none();

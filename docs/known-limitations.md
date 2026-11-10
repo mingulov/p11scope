@@ -2132,9 +2132,14 @@ The old bounds are measurements, not a product startup SLA.
   unproven filesystem) at the same key requires the kernel
   original-file witness before its row joins, one query per file:
   the kernel proves the association or the row is unknown with the
-  `original_file_unproven` gap — never a join to the fresh file, on
-  either identity backend, and the deep-scan row takes no userspace
-  `(dev, ino)` fallback. The row's original edge reads `ended`, its
+  `original_file_unproven` gap — never a join to the fresh file on
+  a proven-another-file verdict, on either identity backend, and
+  the deep-scan row takes no userspace `(dev, ino)` fallback.
+  Under cgroup-scoped collection the witness is deactivated (the
+  userspace-only path), so an unavailable witness there publishes
+  the scanned row with the named gap (PARTIAL coverage, no proof
+  claimed) instead of an empty view; a proven-another-file verdict
+  still never joins. The row's original edge reads `ended`, its
   later calls are not counted, and no new-module edge is emitted; a
   process that maps the upper copy is still attributed exactly. The
   sweep carries the same no-fallback rule: an overlay key (overlayfs

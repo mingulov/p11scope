@@ -12627,12 +12627,17 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         "trace retains both terminal provider checks"
     );
     let loss = trace_terminal.find("report_trace_loss(").unwrap();
-    let reports = trace_terminal.find("let reports = metrics::read(").unwrap();
+    // The terminal reads seal through `seal_terminal_or_last_good` (a failed
+    // read publishes unknown counts with a named gap), so the pins name the
+    // read calls themselves rather than a `?`-propagating binding.
+    let reports = trace_terminal
+        .find("metrics::read(context.1, context.0.plan())")
+        .unwrap();
     let settle = trace_terminal
         .find("context.0.settle_terminal_drain();")
         .unwrap();
     let late_kernel = trace_terminal
-        .find("metrics::kernel_evidence(context.1)?")
+        .find("metrics::kernel_evidence(context.1)")
         .unwrap();
     assert!(trace_terminal.find("drain_trace_events(").unwrap() < checks[0]);
     assert!(checks[0] < loss && loss < reports && reports < checks[1]);

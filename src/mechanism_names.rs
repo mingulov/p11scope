@@ -533,6 +533,15 @@ mod tests {
     }
 
     #[test]
+    fn vendor_range_ids_have_no_vendor_table_name() {
+        // Owner 2026-11-10: no vendor-specific id tables — every vendor's
+        // ids publish by number. The table label carries the number instead.
+        assert_eq!(mechanism_name(0xCE53_4351), None);
+        assert_eq!(mechanism_name(0xCE53_437F), None);
+        assert_eq!(mechanism_name(0xCE53_4380), None);
+    }
+
+    #[test]
     fn unassigned_nss_ids_still_have_no_name() {
         assert_eq!(mechanism_name(0xCE53_43A9), None);
         assert_eq!(mechanism_name(0xCE53_4400), None);

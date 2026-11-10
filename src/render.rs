@@ -12274,6 +12274,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn live_view_shows_vendor_defined_id_by_number() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0xCE53_4351, mech_stat(5, 0))].into_iter().collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_GenerateKeyPair", 5, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("vendor-defined 0xce534351"), "{out}");
+    }
+
+    #[test]
+    fn live_view_shows_unknown_standard_id_by_number() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x0000_FFFF, mech_stat(3, 1))].into_iter().collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_SignInit", 3, 1, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("unknown 0xffff"), "{out}");
+    }
+
+    #[test]
     fn live_view_without_mechanisms_shows_no_table() {
         let mut ev = evidence();
         ev.verdict();
@@ -14102,6 +14142,34 @@ pub(crate) mod tests {
         assert_eq!(row["mechanism"], 0x0D);
         assert_eq!(row["calls"], 1);
         assert_eq!(row["registered"], true);
+    }
+
+    #[test]
+    fn profile_json_carries_numeric_id_and_name_for_every_row() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
+        let mut vendor = init_event(0, 0xCE53_4351, shape::NONE, 0, 0, 0);
+        vendor.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&vendor);
+        let mut unknown = init_event(0, 0xFFFF, shape::NONE, 0, 0, 0);
+        unknown.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&unknown);
+
+        let mechanisms = profile_mechanisms(&state);
+        let rows = mechanisms.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let by_id = |id: u64| rows.iter().find(|row| row["mechanism"] == id).unwrap();
+        assert_eq!(by_id(0x1087)["mechanism"], 0x1087);
+        assert_eq!(by_id(0x1087)["name"], "CKM_AES_GCM");
+        // `.get`: a missing key must fail, never read as null by indexing.
+        assert_eq!(
+            by_id(0xCE53_4351).get("name"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(by_id(0xFFFF).get("name"), Some(&serde_json::Value::Null));
     }
 
     /// Two slots on module 0: `C_SignInit` (index 0) binds a mechanism

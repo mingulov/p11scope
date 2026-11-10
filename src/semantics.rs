@@ -148,6 +148,22 @@ mod corrective_tests {
         assert!(state.semantic_evidence().semantic_state_drops > 0);
     }
 
+    #[test]
+    fn mechanism_table_caps_distinct_ids() {
+        // The per-id table is bounded: past 256 distinct ids further ids
+        // shed with an explicit overflow count instead of growing the table.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        for i in 0..300u64 {
+            state.observe(&mechanism(&p, "C_SignInit", 7, 0x1_0000 + i, 0));
+        }
+        assert!(
+            state.mechanisms().len() <= 256,
+            "table holds {} ids",
+            state.mechanisms().len()
+        );
+    }
+
     /// Two providers sharing one process: slots 0/2 (`C_SignInit`/`C_Sign`)
     /// on module 0, slots 1/3 on module 1, each pair on its own pinned
     /// object — the seam per-provider mechanism attribution is recorded.

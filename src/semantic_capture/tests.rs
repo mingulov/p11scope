@@ -5238,6 +5238,47 @@ fn admission_deferral_refusals_stay_counted_and_named_without_a_receipt() {
     );
 }
 #[test]
+fn scan_refusal_gap_reason_names_unsettled_ledger_overflow() {
+    use crate::inventory_semantics::{count_scan_refusals, scan_refusals_gap_reason_with_overflow};
+
+    // Failure twin: a run that hit the settle-ledger cap names its
+    // unsettled share on the stop scan-refusal gap.
+    let mut counts = [0u64; 12];
+    count_scan_refusals(
+        &mut counts,
+        &[ImageQueryRefusal::Coverage, ImageQueryRefusal::Unstable],
+    );
+    assert_eq!(
+        scan_refusals_gap_reason_with_overflow(&counts, 3),
+        Some("2 scan refusals (coverage=1 unstable=1) (3 not settled: ledger full)".to_string()),
+        "hitting the ledger cap stays visible on the stop gap"
+    );
+}
+#[test]
+fn scan_refusal_gap_reason_unchanged_without_ledger_overflow() {
+    use crate::inventory_semantics::{
+        count_scan_refusals, scan_refusals_gap_reason, scan_refusals_gap_reason_with_overflow,
+    };
+
+    // Healthy twin: no overflow means the historical reason, byte
+    // for byte.
+    let mut counts = [0u64; 12];
+    count_scan_refusals(
+        &mut counts,
+        &[ImageQueryRefusal::Coverage, ImageQueryRefusal::Unstable],
+    );
+    assert_eq!(
+        scan_refusals_gap_reason_with_overflow(&counts, 0),
+        scan_refusals_gap_reason(&counts),
+        "zero overflow keeps the historical reason"
+    );
+    assert_eq!(
+        scan_refusals_gap_reason_with_overflow(&counts, 0),
+        Some("2 scan refusals (coverage=1 unstable=1)".to_string()),
+        "zero overflow carries no suffix"
+    );
+}
+#[test]
 fn admission_deferral_refusals_never_settle_without_a_start_time() {
     use crate::inventory_semantics::AdmissionRefusalLedger;
 

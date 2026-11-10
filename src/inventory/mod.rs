@@ -24918,6 +24918,42 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn legacy_stop_disclosure_names_unsettled_ledger_overflow() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // Failure twin of legacy_stop_disclosure_is_unchanged: a run
+        // that hit the settle-ledger cap says so on its stop
+        // scan-refusal gap, naming the unsettled share.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = wind_down_lane(WindDownIo::completing());
+        let mut counts = scripted_nonzero_stop_counts();
+        counts.overflow_refusals = 3;
+        lane.set_scripted_stop_counts_for_test(Some(counts));
+        lane.note_shed_calls(7);
+        driver.semantic = Some(lane);
+        driver.on_stop_requested();
+        driver.on_lane_stopped();
+        assert_eq!(
+            take_warned_for_test(),
+            vec![expected_stop_line()],
+            "exactly one legacy stop line"
+        );
+        driver
+            .coordinator
+            .commit_batch(false)
+            .expect("the final commit runs");
+        let scans = committed_gaps_by_subject(&mut driver, "semantic scan refused");
+        assert_eq!(scans.len(), 1, "exactly one legacy scan-refusal gap");
+        assert_eq!(
+            scans[0].1, "12 scan refusals (custody=2 unknown=10) (3 not settled: ledger full)",
+            "the gap names the unsettled overflow share"
+        );
+    }
+
+    #[test]
     fn joint_stop_disposition_abandon_discloses_once() {
         use crate::inventory_semantics::SemanticRefusal;
         // Isolate from lines other tests on this thread warned: the

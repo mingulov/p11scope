@@ -11593,20 +11593,33 @@ fn emit_trace_terminal_accounted<W: Write>(
             out_file,
         )?;
     }
-    // The stdout terminal records (COUNT plus the pre-flush EVIDENCE
-    // copy) go through the shared terminal emitter, best-effort under
-    // loss; the file receives COUNT now and its finalized EVIDENCE
-    // record after the terminal flush below.
-    let stdout_line = trace::evidence_line(evidence, policy);
-    let stdout_line_len = stdout_line.len() + 1; // trailing newline
-    emit_trace_terminal(
-        reports,
-        tracer,
-        &stdout_line,
-        stdout,
-        stdout_open,
-        &mut None::<std::io::Sink>,
-    )?;
+    // The stdout terminal records (COUNT plus, under -v, the pre-flush
+    // EVIDENCE copy) go through the shared terminal emitter, best-effort
+    // under loss; the file receives COUNT now and its finalized EVIDENCE
+    // record after the terminal flush below. Default stdout stays
+    // concise: the multi-kilobyte EVIDENCE blob rides the `-o` file
+    // (and `-v` stdout), never default stdout.
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
+    let stdout_line = verbose.then(|| trace::evidence_line(evidence, policy));
+    // Trailing newline included: a withheld line contributes zero bytes,
+    // so the file record below counts the whole line as stdout-missing.
+    let stdout_line_len = stdout_line.as_ref().map_or(0, |line| line.len() + 1);
+    match stdout_line.as_deref() {
+        Some(line) => emit_trace_terminal(
+            reports,
+            tracer,
+            line,
+            stdout,
+            stdout_open,
+            &mut None::<std::io::Sink>,
+        )?,
+        None => emit_trace_line(
+            &terminal_trace_count_line(reports, tracer),
+            stdout,
+            stdout_open,
+            &mut None::<std::io::Sink>,
+        )?,
+    }
     {
         let mut discard = std::io::sink();
         let mut discard_open = true;
@@ -26309,6 +26322,82 @@ int main(int argc, char **argv) {
         serde_json::from_str(lines[evidence_pos].strip_prefix("EVIDENCE ").unwrap()).unwrap()
     }
 
+    /// Runs the accounted terminal emission over a regular-file stdout
+    /// (no drops) and returns the stdout text with the `-o` file bytes.
+    fn terminal_stdout_and_file(
+        verbosity: crate::cli::TextVerbosity,
+        with_file: bool,
+    ) -> (String, Option<Vec<u8>>) {
+        let file = tempfile::tempfile().unwrap();
+        let mut probe = file.try_clone().unwrap();
+        let mut sink = crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(file)).unwrap();
+        let mut stdout_open = true;
+        let mut out_file = with_file.then(Vec::new);
+        let mut scheduling = SchedulingAccumulator::default();
+        sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        let mut evidence =
+            terminal_evidence_for(scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64));
+        let (_, _, tracer) = trace_fixture();
+        emit_trace_terminal_accounted(
+            &mut evidence,
+            CapturePolicy::AggregateOnly,
+            DEFAULT_TRACE_MAX_EVENTS,
+            false,
+            &[],
+            &tracer,
+            &mut scheduling,
+            &mut sink,
+            &mut stdout_open,
+            &mut out_file,
+            verbosity,
+        )
+        .unwrap();
+        drop(sink);
+        use std::io::{Read as _, Seek as _};
+        probe.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut stdout = Vec::new();
+        probe.read_to_end(&mut stdout).unwrap();
+        (String::from_utf8(stdout).unwrap(), out_file)
+    }
+
+    /// Default trace stdout stays concise: the multi-kilobyte EVIDENCE
+    /// blob rides the `-o` file, never default stdout. COUNT and the
+    /// human tail still print there.
+    #[test]
+    fn terminal_trace_concise_stdout_omits_evidence() {
+        let (stdout, file) = terminal_stdout_and_file(crate::cli::TextVerbosity::Concise, true);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
+            "{stdout}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("EVIDENCE ")),
+            "concise stdout must not carry the blob: {stdout}"
+        );
+        assert!(stdout.contains("0 completed calls"), "{stdout}");
+        let file = String::from_utf8(file.unwrap()).unwrap();
+        assert!(
+            file.lines().any(|line| line.starts_with("EVIDENCE ")),
+            "the -o file keeps the record: {file}"
+        );
+    }
+
+    /// `-v` restores the EVIDENCE record on stdout for piped consumers.
+    #[test]
+    fn terminal_trace_verbose_stdout_keeps_evidence() {
+        let (stdout, _) = terminal_stdout_and_file(crate::cli::TextVerbosity::Verbose, false);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
+            "{stdout}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("EVIDENCE ")),
+            "{stdout}"
+        );
+    }
+
     /// F3: the file's EVIDENCE record accounts every terminal drop,
     /// byte-exact against trace-file/stdout comparison. Production order
     /// (pre-terminal flush, snapshot, accounted emission) over a slow
@@ -26355,7 +26444,9 @@ int main(int argc, char **argv) {
             &mut sink,
             &mut stdout_open,
             &mut file,
-            crate::cli::TextVerbosity::Concise,
+            // Verbose: only -v stdout carries EVIDENCE, and this cell
+            // needs the terminal-records drop phase it exercises.
+            crate::cli::TextVerbosity::Verbose,
         )
         .unwrap();
         done.store(true, Ordering::SeqCst);
@@ -26418,7 +26509,9 @@ int main(int argc, char **argv) {
             &mut sink,
             &mut stdout_open,
             &mut None::<Vec<u8>>,
-            crate::cli::TextVerbosity::Concise,
+            // Verbose: only -v stdout carries EVIDENCE, and this cell
+            // needs the terminal-flush drop it exercises.
+            crate::cli::TextVerbosity::Verbose,
         )
         .unwrap();
         let done = Arc::new(AtomicBool::new(true));

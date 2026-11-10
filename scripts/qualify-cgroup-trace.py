@@ -618,13 +618,19 @@ def manifest_arguments(manifests, provider, helper, helper_revision):
 
 
 def trace_capture_argv(binary, provider, scope_path, trace_path, budget, manifest_argv):
+    # -v: the oracle compares stdout/file terminal evidence, and only -v
+    # stdout carries EVIDENCE.
     return [str(binary.path), 'trace', '--cgroup', str(scope_path), '--module', str(provider.path),
-            *manifest_argv, '--duration', f"{budget['duration_seconds']}s", '-o', str(trace_path)]
+            *manifest_argv, '--duration', f"{budget['duration_seconds']}s", '-o', str(trace_path),
+            '-v']
 
 
 def run_trace_argv(binary, provider, caller, trace_path, gate, manifest_argv):
+    # -v: the oracle compares stdout/file terminal evidence, and only -v
+    # stdout carries EVIDENCE.
     return [str(binary.path), 'run', '--trace', '--module', str(provider.path), *manifest_argv,
-            '--pause', 'auto', '--duration', '20s', '-o', str(trace_path), '--', str(caller.path),
+            '--pause', 'auto', '--duration', '20s', '-o', str(trace_path), '-v', '--',
+            str(caller.path),
             str(provider.path), '0', 'selected', '--auto-gate', str(gate), '--canary', CANARIES[2]]
 
 

@@ -852,18 +852,18 @@ def assert_handoff_pair(module):
     assert unattached["start_ns"] <= unattached["end_ns"], windows
 
 def load(name):
-    # EVIDENCE rides on the observer's stdout (diagnostics go to stderr).
-    with open(f"run-prearm-{name}.stdout") as handle:
-        evidence = None
-        for line in handle:
-            if line.startswith("EVIDENCE "):
-                evidence = json.loads(line[len("EVIDENCE "):])
+    # EVIDENCE rides the -o report file (default stdout omits the blob;
+    # diagnostics go to stderr).
+    with open(f"run-prearm-{name}.txt") as handle:
+        text = handle.read()
+    evidence = None
+    for line in text.splitlines():
+        if line.startswith("EVIDENCE "):
+            evidence = json.loads(line[len("EVIDENCE "):])
     if evidence is None:
         raise SystemExit(f"{name}: no EVIDENCE line")
     with open(f"run-prearm-{name}.wl") as handle:
         ledger = [json.loads(line) for line in handle if line.strip()]
-    with open(f"run-prearm-{name}.txt") as handle:
-        text = handle.read()
     return evidence, ledger, text
 
 def prearmed_module(evidence):

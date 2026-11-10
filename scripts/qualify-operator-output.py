@@ -283,9 +283,11 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
             stdout_fd = stdout_file.fileno()
         stderr_pipe = OutputPipe()
         pipes.append(stderr_pipe)
+        # -v: the oracle compares stdout/file terminal evidence, and
+        # only -v stdout carries EVIDENCE.
         argv = [str(binary.path), 'trace', '--pid', str(caller.pid),
                 '--module', str(provider.path), '--ring-bytes', ring,
-                '--duration', '6s', '-o', str(trace_path), *manifest_argv]
+                '--duration', '6s', '-o', str(trace_path), '-v', *manifest_argv]
         # The readiness and mid-final gates key on the verbose
         # diagnostics markers (`capturing:`, `longrun:`); restore them
         # for the observer without touching the caller's environment.

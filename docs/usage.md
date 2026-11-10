@@ -1120,12 +1120,15 @@ namespace; they equal the PIDs `/proc` shows only when p11scope runs in that
 namespace, which `evidence.pid_namespace` states (see
 [PID namespaces](#pid-namespaces)).
 
-Every trace ends with the same machine-readable evidence object used by
-profile output. If the ring buffer drops events, it also emits an explicit
+Every trace report ends with the same machine-readable evidence object used by
+profile output. The `-o` file always carries it; default stdout omits the
+multi-kilobyte `EVIDENCE` blob and keeps the stream concise, while `-v`
+restores it there. If the ring buffer drops events, trace also emits an explicit
 `LOST n events` line rather than silently under-reporting — see
 [Overhead](#overhead-measured) for when that actually happens.
 Immediately before `EVIDENCE`, trace emits one aggregate-only
-`COUNT_EVIDENCE {"stats_entered":…,"stats_returned":…,"raw_calls":…}` line:
+`COUNT_EVIDENCE {"stats_entered":…,"stats_returned":…,"raw_calls":…}` line,
+on stdout at every verbosity:
 the STATS fields include completed and in-flight calls, while `raw_calls`
 counts every well-formed non-fork event consumed before truncation.
 
@@ -1253,7 +1256,9 @@ Limits that matter in pods:
   its own process (`nsenter -m` without `-p`) is refused before attaching.
   To keep no report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
-  already stream to stdout when `-o` is omitted. When stdout is a slow
+  already stream to stdout when `-o` is omitted. Default stdout omits the
+  `EVIDENCE` record (`-v` restores it); the `-o` file always carries it.
+  When stdout is a slow
   pipe, trace output that cannot be delivered within the bounded wait is
   dropped and counted as dropped bytes
   (`scheduling.sink_dropped_bytes` in the JSON evidence), which can cut

@@ -5513,7 +5513,8 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     provider_before = provider_receipt(provider)
     if observer_kind == "trace":
         argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
-               "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+               "--duration", "120s", "-o", str(leg_dir / "trace.file.txt"),
+               "-v"]  # parity needs EVIDENCE on stdout
     else:
         mode = "metrics" if observer_kind == "metrics" else "profile"
         argv = [str(ctx.binary.path), "profile", *scope_args, *module_args,
@@ -5642,7 +5643,8 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
     provider_before = provider_receipt(provider)
     if observer_kind == "trace":
         argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
-               "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+               "--duration", "180s", "-o", str(leg_dir / "trace.file.txt"),
+               "-v"]  # parity needs EVIDENCE on stdout
     else:
         agg = "metrics" if observer_kind == "metrics" else "profile"
         argv = [str(ctx.binary.path), "profile", *scope_args, *module_args,
@@ -6074,7 +6076,8 @@ def run_rapid_trace_leg(ctx, leg_dir, backend, env, pins):
     images = [pins["caller-a"].image_receipt(stdout.record("image", 0), caller)]
     argv = [str(ctx.binary.path), "trace", "--pid", str(caller.pid),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -6157,7 +6160,8 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
     assert caller.pid != dead_pid
     argv = [str(ctx.binary.path), "trace", "--system",
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -6267,7 +6271,8 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     images = [image_pin.image_receipt(stdout.record("image", 0), caller)]
     argv = [str(ctx.binary.path), "trace", "--pid", str(caller.pid),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -6369,7 +6374,8 @@ def run_cgroup_r2(ctx, cell_dir, backend):
     move_and_verify(selected, caller, moves, "initial")
     argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "180s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -7700,7 +7706,8 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     move_and_verify(selected, caller, moves, "initial")
     argv = [str(ctx.binary.path), "trace", "--cgroup", str(operator.path),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -8600,7 +8607,8 @@ def run_cgroup_stop_before(ctx, cell_dir, backend):
     move_and_verify(selected, caller, moves, "initial")
     argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:
@@ -8655,7 +8663,8 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
     move_and_verify(selected, caller, moves, "initial")
     argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
            "--module", str(provider.path), "--attach-backend", backend,
-           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt")]
+           "--duration", "240s", "-o", str(leg_dir / "trace.file.txt"),
+           "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env)
     try:

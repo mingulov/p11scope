@@ -93,7 +93,8 @@ its output. Twenty-minute captures on a 3-vCPU VM reached 650 to
 720 MB. v0.6.0 behaves the same way; this is not new in v0.7.0. Plan
 for about 1.2 GB of observer memory for an hour-long system-wide
 capture on a busy host; `--pid`, cgroup and `run` captures of a
-quiet scope stay far below that. Reducing the growth is 0.7.x work.
+quiet scope stay far below that. Bounded observer memory is planned
+for v0.8.0.
 
 ### Short-lived processes never scanned
 
@@ -1049,6 +1050,9 @@ detail during a counter capture (`--select-endpoint`).
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
   (packet 6.13 follow-ups).
+- Bounded observer memory for long system-wide captures on busy hosts
+  (v0.8.0), for example by keeping capture data on disk and building the
+  report from it separately.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.

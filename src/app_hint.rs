@@ -776,7 +776,8 @@ fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
     matches!((before, after), (Some(t0), Some(t1)) if t0 == t1)
 }
 
-/// Sample one admission hint for `pid` beside its already-read `exe`.
+/// Sample one admission hint for `pid` beside its already-read `exe`,
+/// under the held admission pin.
 ///
 /// Without a readable exe there is no hint and no read. cmdline and the
 /// cgroup text are read only for a tabled runtime, comm only for
@@ -791,6 +792,7 @@ pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
     admitted_start_time: Option<u64>,
+    _pin: &crate::process::PidPin,
 ) -> Option<AppHint> {
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
@@ -1667,7 +1669,7 @@ mod tests {
     #[test]
     fn sampler_refuses_a_generation_other_than_the_admitted_one() {
         use crate::discovery::caller_registry::read_exe_identity;
-        use crate::process::process_start_time;
+        use crate::process::{PidPin, process_start_time};
         use std::process::{Command, Stdio};
         // python3 is a documented test prerequisite
         // (docs/development.md), resolved like the console-script CLI
@@ -1722,17 +1724,18 @@ mod tests {
         }
         let exe = read_exe_identity(pid).expect("child exe identity");
         let admitted = process_start_time(pid).expect("child start time");
-        let hint = sample_for_pid(pid, Some(&exe), Some(admitted))
+        let pin = PidPin::open(pid).expect("child pin");
+        let hint = sample_for_pid(pid, Some(&exe), Some(admitted), &pin)
             .expect("the admitted generation keeps its argv hint");
         assert_eq!(hint.value, script_name);
         assert_eq!(hint.source, AppHintSource::Argv);
         assert_eq!(
-            sample_for_pid(pid, Some(&exe), Some(admitted.wrapping_add(1))),
+            sample_for_pid(pid, Some(&exe), Some(admitted.wrapping_add(1)), &pin),
             None,
             "a generation other than the admitted one drops the hint"
         );
         assert_eq!(
-            sample_for_pid(pid, Some(&exe), None),
+            sample_for_pid(pid, Some(&exe), None, &pin),
             None,
             "an unknown admitted generation drops the hint"
         );
@@ -1744,21 +1747,22 @@ mod tests {
     #[test]
     fn sampler_needs_an_exe_and_a_matching_identity() {
         use crate::discovery::caller_registry::read_exe_identity;
-        use crate::process::process_start_time;
+        use crate::process::{PidPin, process_start_time};
         let pid = std::process::id();
         let admitted = process_start_time(pid).ok();
-        assert_eq!(sample_for_pid(pid, None, admitted), None);
+        let pin = PidPin::open(pid).expect("own pin");
+        assert_eq!(sample_for_pid(pid, None, admitted, &pin), None);
         let mut exe = read_exe_identity(pid).expect("own exe identity");
         exe.ino = exe.ino.wrapping_add(1);
         assert_eq!(
-            sample_for_pid(pid, Some(&exe), admitted),
+            sample_for_pid(pid, Some(&exe), admitted, &pin),
             None,
             "a changed identity drops the hint"
         );
         let exe = read_exe_identity(pid).expect("own exe identity");
         let cgroup = read_cgroup_text(pid);
         assert_eq!(
-            sample_for_pid(pid, Some(&exe), admitted),
+            sample_for_pid(pid, Some(&exe), admitted, &pin),
             app_hint_for(exe.path.as_deref(), None, None, cgroup.as_deref()),
             "a non-interpreter test binary samples nothing at all"
         );

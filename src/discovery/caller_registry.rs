@@ -292,13 +292,15 @@ pub(crate) trait ProcessSource {
     }
     /// Display-only app hint beside the already-read `exe`, for the
     /// `admitted_start_time` generation only: sampled facts belong to
-    /// that generation or the hint is dropped. The default samples
+    /// that generation or the hint is dropped. `pin` is the held
+    /// admission pin, borrowed across the sample. The default samples
     /// nothing: scripted sources gain no process authority here.
     fn app_hint(
         &self,
         _pid: u32,
         _exe: Option<&ExeIdentity>,
         _admitted_start_time: Option<u64>,
+        _pin: &Self::Pin,
     ) -> Option<crate::app_hint::AppHint> {
         None
     }
@@ -733,8 +735,9 @@ impl ProcessSource for OsProcessSource {
         pid: u32,
         exe: Option<&ExeIdentity>,
         admitted_start_time: Option<u64>,
+        pin: &PidPin,
     ) -> Option<crate::app_hint::AppHint> {
-        crate::app_hint::sample_for_pid(pid, exe, admitted_start_time)
+        crate::app_hint::sample_for_pid(pid, exe, admitted_start_time, pin)
     }
 
     fn cgroup_text(&self, pid: u32) -> Option<String> {
@@ -1391,7 +1394,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
-        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
+        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time, &pin);
         let captured = capture_launcher_chain(&self.source, pid, start_time, caller_ppid);
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
@@ -1571,6 +1574,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             prepared.pid,
             prepared.generation.exe.as_ref(),
             prepared.generation.start_time,
+            &prepared.pin,
         );
         self.callers.insert(
             id,
@@ -1688,9 +1692,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             .map_err(|_| failed("caller ID space exhausted"))?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
-        let app_hint = self
-            .source
-            .app_hint(pid, generation.exe.as_ref(), generation.start_time);
+        let app_hint = self.source.app_hint(
+            pid,
+            generation.exe.as_ref(),
+            generation.start_time,
+            &pin,
+        );
         self.callers.insert(
             id,
             TrackedCaller {
@@ -2096,7 +2103,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = self.source.exe_identity(pid);
-        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
+        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time, &pin);
         let captured = capture_launcher_chain(&self.source, pid, start_time, caller_ppid);
         // Per-incarnation detection (F7a): after the validation above.
         let admitted_ns = match detected() {

@@ -2385,6 +2385,48 @@ fn foreign_fold_parts(stored: &str) -> Option<(String, String)> {
     }
 }
 
+/// True for the unlinked-journal gap the concise key-operations line
+/// already states as "per-key tracking is off" (OD33/R-50): concise
+/// shows it once, on that line — never again as a gap group. The
+/// header still counts the row like the coverage line; verbose and
+/// JSON keep it.
+fn is_concise_redundant_per_key_off_gap(gap: &GapView) -> bool {
+    gap.subject == "per-key tracking is off; this capture keeps S1 mechanisms and API results"
+        && gap.reason == "joint_journal_unavailable"
+}
+
+/// The kernel-thread absence note's plural tail, mirroring the
+/// `inspect_system` producer template (`{n} processes examined are
+/// kernel threads with no user memory to scan`).
+const KTHREAD_ABSENCE_PLURAL_TAIL: &str =
+    "processes examined are kernel threads with no user memory to scan";
+
+/// The singular producer template's tail (`1 process examined is a
+/// kernel thread with no user memory to scan`).
+const KTHREAD_ABSENCE_SINGULAR_TAIL: &str =
+    "process examined is a kernel thread with no user memory to scan";
+
+/// The leading examination count of a kernel-thread absence reason,
+/// when it matches the producer's singular or plural template
+/// exactly. `None` for anything else, so an unknown wording never
+/// folds into the summed line.
+fn kernel_thread_absence_count(reason: &str) -> Option<u64> {
+    let (head, tail) = reason.split_once(' ')?;
+    let count = head.parse::<u64>().ok()?;
+    (tail == KTHREAD_ABSENCE_PLURAL_TAIL || tail == KTHREAD_ABSENCE_SINGULAR_TAIL).then_some(count)
+}
+
+/// One folded kernel-thread absence reason carrying the summed
+/// examination total across the folded rows, in the producer's own
+/// singular/plural wording.
+fn kernel_thread_fold_reason(total: u64) -> String {
+    if total == 1 {
+        format!("1 {KTHREAD_ABSENCE_SINGULAR_TAIL}")
+    } else {
+        format!("{total} {KTHREAD_ABSENCE_PLURAL_TAIL}")
+    }
+}
+
 /// Concise gap groups listed before the block folds: per-PID
 /// subjects (one group per unreadable `/proc/{pid}/mem`) could
 /// otherwise print hundreds of lines on a `--system` scan. The
@@ -2423,6 +2465,13 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// `repeats` (JSON carries `repeats`). Empty when no loss gaps are
 /// retained;
 /// suppressed-but-unretained gaps stay in the coverage line.
+/// Per-pass kernel-thread absence notes fold into one counted line
+/// carrying the summed examination total (each row's count times its
+/// repeats) — a sum, never a max; only exact producer wordings on
+/// scope rows fold, and the deferred-attach subject folds with its
+/// own lane, never here. The unlinked-journal per-key-off row reads
+/// on the key-operations line instead of here, so concise states it
+/// once. The header still counts every retained row either way.
 /// Count-explaining subjects read first, in fixed order; then scope
 /// groups (no caller, module or pid) read before per-object groups,
 /// so a single scope row is never buried under frequent object rows;
@@ -2459,9 +2508,24 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     // refusals keep their per-object subject/reason rows below.
     let mut foreign: std::collections::BTreeMap<&str, Vec<&GapView>> =
         std::collections::BTreeMap::new();
+    // Same-kind scope folds: per-pass kernel-thread absence notes
+    // (one row per pass, each carrying its pass examination count)
+    // fold into one counted line with the summed total below. Only
+    // exact producer wordings fold; anything else groups verbatim.
+    let mut kthreads: Vec<&GapView> = Vec::new();
     let mut rest: Vec<&GapView> = Vec::new();
     for gap in gaps.iter() {
-        if is_foreign_root_reason(&gap.reason) {
+        if is_concise_redundant_per_key_off_gap(gap) {
+            continue;
+        }
+        if gap.caller.is_none()
+            && gap.module.is_none()
+            && gap.pid.is_none()
+            && gap_plain_subject(&gap.subject) == "kernel threads"
+            && kernel_thread_absence_count(gap_plain_reason(&gap.reason)).is_some()
+        {
+            kthreads.push(gap);
+        } else if is_foreign_root_reason(&gap.reason) {
             foreign.entry(gap.reason.as_str()).or_default().push(gap);
         } else {
             rest.push(gap);
@@ -2493,6 +2557,23 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         let entry = groups.entry((subject, reason)).or_insert((0, false));
         entry.0 += group.len();
         entry.1 = false;
+    }
+    if !kthreads.is_empty() {
+        // The examination total sums every folded row's count times
+        // its repeats (an identical row recorded twice examined
+        // twice its count). The group count is the folded row
+        // count, like every other group; all members are scope
+        // rows, so a fresh key reads as a scope group.
+        let mut total = 0u64;
+        for gap in &kthreads {
+            if let Some(count) = kernel_thread_absence_count(gap_plain_reason(&gap.reason)) {
+                total = total.saturating_add(count.saturating_mul(gap.repeats));
+            }
+        }
+        let subject = escape_controls("kernel threads").into_owned();
+        let reason = escape_controls(&kernel_thread_fold_reason(total)).into_owned();
+        let entry = groups.entry((subject, reason)).or_insert((0, true));
+        entry.0 += kthreads.len();
     }
     if groups.is_empty() {
         return Vec::new();

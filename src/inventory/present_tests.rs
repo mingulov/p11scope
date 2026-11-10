@@ -3646,7 +3646,10 @@ fn gap_plain_reason_keeps_unprefixed_marker_text_verbatim() {
 }
 
 /// F1+F3: the concise gap summary uses plain words for the Joint
-/// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
+/// seal/fallback gaps, never the raw `S1` / `joint_*` tokens. The
+/// journal gap reads on the key-operations line instead of here, so
+/// concise states "per-key tracking is off" once; verbose keeps its
+/// plain words with the machine tokens beside them.
 #[test]
 fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     let harness = varied_harness();
@@ -3677,18 +3680,21 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for plain in [
         "per-key tracking ended early",
         "per-key tracking fell back to plain counts",
-        "per-key tracking is off in this run",
     ] {
         assert!(out.contains(plain), "{plain} missing: {out}");
     }
+    // The journal gap is not a group here: the key-operations line
+    // states it, so concise shows it once.
+    assert!(
+        !out.contains("per-key tracking is off in this run"),
+        "the journal gap reads on the key-operations line, not here: {out}"
+    );
     // Long plain subjects truncate (marked) to hold the 100-char cap;
     // verbose and JSON keep them whole.
-    for stem in [
-        "Per-key tracking did not start",
-        "per-key tracking is off; function",
-    ] {
-        assert!(out.contains(stem), "{stem} missing: {out}");
-    }
+    assert!(
+        out.contains("Per-key tracking did not start"),
+        "seal subject stem missing: {out}"
+    );
     let lines: Vec<&str> = out.lines().collect();
     let start = lines
         .iter()
@@ -5524,7 +5530,7 @@ fn concise_gap_summary_folds_kernel_thread_notes_with_summed_total() {
         "the header still counts every retained row:\n{concise}"
     );
     assert!(
-        concise.contains("short-lived processes never scanned"),
+        concise.contains("179 short-lived process(es) started and exited before a completed pass"),
         "other subjects keep their own lines:\n{concise}"
     );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
@@ -5535,7 +5541,9 @@ fn concise_gap_summary_folds_kernel_thread_notes_with_summed_total() {
         );
     }
     let document = crate::inventory::render_json_from_presentation(&presentation);
-    let gaps = document["gaps"].as_array().expect("JSON keeps a gaps array");
+    let gaps = document["gaps"]
+        .as_array()
+        .expect("JSON keeps a gaps array");
     assert_eq!(gaps.len(), 6, "JSON keeps every record: {document}");
 }
 
@@ -5688,6 +5696,8 @@ fn concise_gap_summary_shows_per_key_off_once() {
         "verbose keeps the journal row:\n{verbose}"
     );
     let document = crate::inventory::render_json_from_presentation(&presentation);
-    let gaps = document["gaps"].as_array().expect("JSON keeps a gaps array");
+    let gaps = document["gaps"]
+        .as_array()
+        .expect("JSON keeps a gaps array");
     assert_eq!(gaps.len(), 2, "JSON keeps every record: {document}");
 }

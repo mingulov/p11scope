@@ -451,9 +451,9 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
             }
             Case::FinishError => {
                 // The terminal still seals (with unknown child status) and
-                // detach still runs; the finish error stays the error.
-                let message = format!("{:#}", result.unwrap_err());
-                assert!(message.contains("finish failure"), "{message}");
+                // detach still runs; the finish error stays the error,
+                // exactly (a succeeding terminal and detach add no layer).
+                assert_eq!(result.unwrap_err().to_string(), "finish failure");
                 assert_eq!(observed, Some((CaptureEnd::DurationExpired, false)));
                 assert_eq!(phases, ["finish", "terminal", "detach"]);
             }
@@ -4198,4 +4198,24 @@ fn terminal_errors_combine_keeping_every_layer() {
     assert!(message.contains("snapshot failed"), "{message}");
     assert!(message.contains("pinned failed"), "{message}");
     assert!(message.contains("also failed"), "{message}");
+}
+
+/// v070r2: a publication failure after the seal keeps the stored seal
+/// errors instead of dropping them: alone it passes through, beside a
+/// stored failure both layers survive.
+#[test]
+fn terminal_publication_failure_keeps_the_stored_seal_errors() {
+    let alone = terminal_publication_error(None, anyhow::anyhow!("writing stdout"));
+    assert_eq!(format!("{alone:#}"), "writing stdout");
+    let both = terminal_publication_error(
+        Some(anyhow::anyhow!("snapshot failed")),
+        anyhow::anyhow!("writing stdout"),
+    );
+    let message = format!("{both:#}");
+    assert!(message.contains("snapshot failed"), "{message}");
+    assert!(message.contains("writing stdout"), "{message}");
+    assert!(
+        message.contains("terminal publication also failed"),
+        "{message}"
+    );
 }

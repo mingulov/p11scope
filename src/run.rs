@@ -6028,6 +6028,19 @@ fn combine_terminal_errors(
     combined
 }
 
+/// Keeps the stored terminal seal errors alongside a later publication
+/// failure, instead of the `?` dropping the stored ones: the combined
+/// error names every failed step.
+fn terminal_publication_error(
+    stored: Option<anyhow::Error>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match stored {
+        None => error,
+        Some(prior) => also_failed(prior, error, "terminal publication"),
+    }
+}
+
 /// A marker probe is not wired in this slice, so the coordinator is told the
 /// protected marker was never reached. ponytail: fixed `false` until the Gate B
 /// protected-marker probe lands; swap for the real read then.
@@ -10058,6 +10071,14 @@ fn capture_profile(
                 reason: "discovery unavailable".into(),
             });
         }
+        // Every seal failure is kept for the nonzero exit below; later
+        // publication steps combine with it instead of dropping it. The
+        // identity member already names its step ("revalidating pinned
+        // provider identity") and its gap was filed by the latch.
+        let snapshot_error = snapshot_error.map(|error| {
+            error.context("terminal snapshot failed; report sealed from the last good snapshot")
+        });
+        let mut terminal_error = combine_terminal_errors([snapshot_error, pinned_error]);
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
@@ -10166,19 +10187,12 @@ fn capture_profile(
                     Ok(())
                 },
                 frame_error,
-            )?;
+            )
+            .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
         } else if let Some(error) = frame_error {
-            return Err(error);
+            return Err(terminal_publication_error(terminal_error.take(), error));
         }
-        // The report above sealed (from the last good snapshot when the
-        // terminal read failed); the run still exits nonzero with every
-        // terminal failure kept.
-        let snapshot_error = snapshot_error.map(|error| {
-            error.context("terminal snapshot failed; report sealed from the last good snapshot")
-        });
-        // The identity member already names its step ("revalidating
-        // pinned provider identity") and its gap was filed by the latch.
-        if let Some(error) = combine_terminal_errors([snapshot_error, pinned_error]) {
+        if let Some(error) = terminal_error {
             return Err(error);
         }
         // A degraded terminal snapshot publishes first, then fails: the
@@ -11312,6 +11326,34 @@ fn capture_trace(
                     evidence.trace_truncated = trace_truncated;
                     evidence.apply_stop_quiescence(consumers.stop_quiescence);
                     evidence.settle_terminal(true);
+                    // Every seal failure is kept for the nonzero exit below;
+                    // the publication combines with it instead of dropping it.
+                    let snapshot_error = match (reports_error, kernel_error) {
+                        (None, None) => None,
+                        (Some(error), None) | (None, Some(error)) => Some(error),
+                        (Some(reports), Some(kernel)) => {
+                            Some(also_failed(reports, kernel, "terminal snapshot"))
+                        }
+                    };
+                    let pinned_error = match (pinned_before_error, pinned_after_error) {
+                        (None, None) => None,
+                        (Some(error), None) | (None, Some(error)) => Some(error),
+                        (Some(before), Some(after)) => {
+                            Some(also_failed(before, after, "terminal pinned check"))
+                        }
+                    };
+                    let snapshot_error = snapshot_error.map(|error| {
+                        error.context(
+                            "terminal snapshot failed; trace report sealed with unknown counts",
+                        )
+                    });
+                    let watch_error = watch_error.map(|error| {
+                        error.context(
+                            "terminal watch-kernel read failed; trace report sealed with unknown watch health",
+                        )
+                    });
+                    let mut terminal_error =
+                        combine_terminal_errors([snapshot_error, pinned_error, watch_error]);
                     if *consumers.malformed_records > 0 {
                         let _ = crate::sink::try_stderr_line(&format!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",
@@ -11330,7 +11372,8 @@ fn capture_trace(
                         context.6,
                         context.7,
                         crate::cli::text_verbosity(),
-                    )?;
+                    )
+                    .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
                     crate::attach::reexec_diagnostic::terminal!(context.1, |diag| {
                         let gap = context.1.physical_gap_summary();
                         diag.finish(
@@ -11357,36 +11400,7 @@ fn capture_trace(
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
                     emit_timing_summaries(&evidence.scheduling, &summaries);
-                    // The EVIDENCE above sealed (with unknown counts when the
-                    // aggregate reads failed); the run still exits nonzero
-                    // with every terminal failure kept.
-                    let snapshot_error = match (reports_error, kernel_error) {
-                        (None, None) => None,
-                        (Some(error), None) | (None, Some(error)) => Some(error),
-                        (Some(reports), Some(kernel)) => {
-                            Some(also_failed(reports, kernel, "terminal snapshot"))
-                        }
-                    };
-                    let pinned_error = match (pinned_before_error, pinned_after_error) {
-                        (None, None) => None,
-                        (Some(error), None) | (None, Some(error)) => Some(error),
-                        (Some(before), Some(after)) => {
-                            Some(also_failed(before, after, "terminal pinned check"))
-                        }
-                    };
-                    let snapshot_error = snapshot_error.map(|error| {
-                        error.context(
-                            "terminal snapshot failed; trace report sealed with unknown counts",
-                        )
-                    });
-                    let watch_error = watch_error.map(|error| {
-                        error.context(
-                            "terminal watch-kernel read failed; trace report sealed with unknown watch health",
-                        )
-                    });
-                    if let Some(error) =
-                        combine_terminal_errors([snapshot_error, pinned_error, watch_error])
-                    {
+                    if let Some(error) = terminal_error {
                         return Err(error);
                     }
                     Ok(evidence)

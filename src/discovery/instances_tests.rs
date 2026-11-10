@@ -723,6 +723,36 @@ mod full_image {
         assert!(r.birth_retry_armed(identity, FILE));
     }
 
+    /// A consumed retry birth mints: the same-quantum admission mark
+    /// is cancelled, so the next observation stays Continued instead
+    /// of arming a second admitted mint that the Joint drain would
+    /// refuse for the now-Joint key.
+    #[test]
+    fn consumed_retry_birth_mints_and_cancels_same_quantum_mark() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        // Same-quantum order: the admission marks, then the retry
+        // birth is consumed.
+        r.mark_admitted(identity, FILE);
+        r.end_birth_retry(identity, FILE);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Continued,
+            "the consumed retry already minted: no second admitted mint"
+        );
+        // Later admissions stay plain continuations (at most one mint).
+        r.mark_admitted(identity, FILE);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Continued,
+            "the key stays minted"
+        );
+    }
+
     /// Eviction ends an evicted key's retry; a re-sighted key arms
     /// fresh.
     #[test]

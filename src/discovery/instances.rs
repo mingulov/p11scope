@@ -1054,9 +1054,22 @@ impl InstanceRouter {
         }
     }
 
-    /// End a key's sighting retry: its birth candidate was consumed.
+    /// End a key's sighting retry: its birth candidate was consumed
+    /// (attempted, whatever the outcome). The key mints, cancelling
+    /// any same-quantum admission mark, so later admissions stay plain
+    /// continuations and no second birth is offered for the now-Joint
+    /// key (at most one birth attempt per key). Capped like any mint:
+    /// a pending mark swaps for the mint, otherwise the mint needs a
+    /// free union slot.
     pub(crate) fn end_birth_retry(&mut self, image: ImageIdentity, file: u32) {
-        self.birth_retry.remove(&(ImageKey::from(image), file));
+        let key = (ImageKey::from(image), file);
+        self.birth_retry.remove(&key);
+        let had_pending = self.admitted_pending.remove(&key);
+        if had_pending
+            || self.admitted_pending.len() + self.admitted_minted.len() < self.limits.observed_keys
+        {
+            self.admitted_minted.insert(key);
+        }
     }
 
     /// Arm the birth retry for a key just sighted `New`. A mint is

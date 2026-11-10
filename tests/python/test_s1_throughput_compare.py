@@ -2965,6 +2965,22 @@ class JointConservationGate(unittest.TestCase):
                     "gap references another caller/module/PID"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_foreign_module_gap_with_driver_caller_still_fails(self):
+        # A different-module gap that carries the cell's caller references
+        # the cell, so it stays in scope and the module check fails it.
+        with tempfile.TemporaryDirectory(prefix="joint-mcaller-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": "m1", "pid": None,
+                     "subject": "native endpoint attach failed",
+                     "reason": "146 endpoint(s) still deferred when the "
+                               "receipt closed; counted uses are lower bounds",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    "gap references another caller/module/PID"):
+                self.run_joint(Path(tmp), mutate)
+
     def test_callerless_shed_gap_fails(self):
         with tempfile.TemporaryDirectory(prefix="joint-shed-") as tmp:
             def mutate(doc):

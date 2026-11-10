@@ -857,10 +857,10 @@ def check_loss(selected, doc, events, joint=False):
     --joint mode the capture-wide refused/continuity counts are
     recorded, never gated (they count foreign admissions on a
     --system capture), and foreign-scoped gaps are counted, never
-    gated: a gap is in scope only when it references the cell's
-    module, caller or pid, so a module-only gap naming a different
-    module, with no caller and no pid, is foreign; driver gaps and
-    gaps that do reference the cell stay strict. The proven
+    gated: a gap is foreign when its caller or pid names another cell,
+    or when it names only another module (no caller, no pid, a
+    different module); fully-unattributed gaps, driver gaps and gaps
+    that reference the cell stay in scope and stay strict. The proven
     rotation count is recorded as stream_rotations.
     """
     observation = selected["observation"]

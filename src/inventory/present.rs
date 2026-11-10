@@ -1882,6 +1882,27 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
 /// (`disclose_s1_birth_refusal`).
 pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailable; retained S1";
 
+/// The reason only the presentation-synthesized bootstrap row carries
+/// ([`silent_bootstrap_gap`]): no retained registry recording uses it.
+/// Shared with [`is_synthetic_bootstrap_gap`] so the producer and the
+/// stream filter recognize the same row.
+pub(crate) const JOINT_BIRTH_UNOFFERED_REASON: &str = "joint_birth_unoffered";
+
+/// Whether a presented gap row is the presentation-synthesized bootstrap
+/// row rather than a retained registry recording. The stream filter uses
+/// this: a synthesized row can vanish between passes (once a real
+/// Joint-birth refusal lands), which would break the gap emitter's
+/// append-only index space. Matches exactly what the producer emits —
+/// bare identities only — so a retained row can never be mistaken for one.
+pub(crate) fn is_synthetic_bootstrap_gap(gap: &GapView) -> bool {
+    gap.caller.is_none()
+        && gap.module.is_none()
+        && gap.pid.is_none()
+        && gap.budget.is_none()
+        && gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
+        && gap.reason == JOINT_BIRTH_UNOFFERED_REASON
+}
+
 /// A linked lane with registered instances that neither published a
 /// Joint feed nor disclosed why reads `bootstrap_unavailable` with no
 /// cause anywhere in the document. Name that once, at presentation:
@@ -1903,7 +1924,7 @@ pub(crate) fn silent_bootstrap_gap(
         module: None,
         pid: None,
         subject: JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
-        reason: "joint_birth_unoffered".into(),
+        reason: JOINT_BIRTH_UNOFFERED_REASON.into(),
         budget: None,
         repeats: 1,
     })

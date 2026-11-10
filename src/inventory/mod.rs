@@ -7952,7 +7952,30 @@ fn emit_commit(
         )?;
     }
     let metadata_events = state.metadata.emit(writer, presentation, now_ns, false)?;
-    let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
+    // The presentation-synthesized bootstrap row is not a retained
+    // recording: it vanishes once a real Joint-birth refusal lands, which
+    // breaks the gap emitter's append-only index space (a vanished row
+    // swallows the next real row and shifts every later index). Stream
+    // retained rows only; the final flush carries a still-silent
+    // synthesized row at its tail index.
+    let filtered: Option<Vec<crate::inventory_present::GapView>> = presentation
+        .gaps
+        .iter()
+        .any(crate::inventory_present::is_synthetic_bootstrap_gap)
+        .then(|| {
+            presentation
+                .gaps
+                .iter()
+                .filter(|gap| !crate::inventory_present::is_synthetic_bootstrap_gap(gap))
+                .cloned()
+                .collect()
+        });
+    let fresh = state.gaps.emit(
+        writer,
+        filtered.as_deref().unwrap_or(&presentation.gaps),
+        false,
+        now_ns,
+    )?;
     let edges = state.edges.emit(
         writer,
         &presentation.edges,
@@ -14910,7 +14933,8 @@ mod tests {
         let records = stream_sink_records(&mut reader);
         let gaps = stream_gap_records(&records);
         assert!(
-            gaps.iter().all(|gap| gap["reason"] != "joint_birth_unoffered"),
+            gaps.iter()
+                .all(|gap| gap["reason"] != "joint_birth_unoffered"),
             "the synthetic row must never stream mid-run: {gaps:?}"
         );
         let reasons: Vec<&str> = gaps
@@ -14919,11 +14943,7 @@ mod tests {
             .collect();
         assert_eq!(
             reasons,
-            [
-                "first",
-                "second",
-                "joint_birth_registration_Capacity",
-            ],
+            ["first", "second", "joint_birth_registration_Capacity",],
             "the real cause row must stream at its retained index"
         );
         for (position, gap) in gaps.iter().enumerate() {
@@ -14961,10 +14981,7 @@ mod tests {
             stream_gap_boot_synth(),
         ];
         emit_commit(&mut writer, &mut state, &report, &view, false, 3).unwrap();
-        state
-            .gaps
-            .emit(&mut writer, &view.gaps, true, 4)
-            .unwrap();
+        state.gaps.emit(&mut writer, &view.gaps, true, 4).unwrap();
         let records = stream_sink_records(&mut reader);
         let gaps = stream_gap_records(&records);
         let reasons: Vec<&str> = gaps

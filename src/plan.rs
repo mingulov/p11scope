@@ -44,7 +44,7 @@ use crate::kinds::AliasAgreement;
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
 };
-use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
+use p11scope_ebpf_common::SlotSemantics;
 use p11scope_manifest::manifest::{
     Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
     WalkOutcome,
@@ -60,9 +60,11 @@ mod selection_recovery_tests;
 /// Immutable admission contract carried by one planner for its whole capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionPolicy {
-    /// Existing metrics/profile/trace behavior: 2,112 lifetime slots and K4
-    /// unresolved heuristic tables per physical provider object.
-    Detailed,
+    /// Existing metrics/profile/trace behavior: the compiled ceiling (2,112
+    /// lifetime slots on the wide release profile) or a host-sized smaller
+    /// ceiling, with K4 unresolved heuristic tables per physical provider
+    /// object. The loader sizes STATS to the same ceiling.
+    Detailed(crate::capacity::DetailedBudget),
     /// Compact entry-use inventory: every validated physical target is
     /// count-only and the complete union is admitted atomically within this
     /// endpoint/payload budget.
@@ -75,7 +77,11 @@ pub enum AdmissionPolicy {
 
 impl AdmissionPolicy {
     pub const fn detailed() -> Self {
-        Self::Detailed
+        Self::Detailed(crate::capacity::DetailedBudget::compiled())
+    }
+
+    pub fn detailed_sized(slots: u32) -> Self {
+        Self::Detailed(crate::capacity::DetailedBudget::sized(slots))
     }
 
     pub const fn inventory(budget: crate::capacity::InventoryBudget) -> Self {
@@ -88,7 +94,7 @@ impl AdmissionPolicy {
 
     fn endpoint_limit(self) -> usize {
         match self {
-            Self::Detailed => MAX_SLOTS as usize,
+            Self::Detailed(budget) => budget.slots() as usize,
             Self::Inventory(budget) => budget.endpoint_limit() as usize,
             Self::Counters(budget) => budget.endpoint_limit() as usize,
         }
@@ -104,7 +110,7 @@ impl AdmissionPolicy {
 
     fn count_only_subject(self) -> &'static str {
         match self {
-            Self::Detailed => "detailed",
+            Self::Detailed(_) => "detailed",
             Self::Inventory(_) => "inventory",
             Self::Counters(_) => "counter",
         }
@@ -112,16 +118,17 @@ impl AdmissionPolicy {
 
     fn capacity_subject(self) -> &'static str {
         match self {
-            Self::Detailed | Self::Inventory(_) => "attach slots",
+            Self::Detailed(_) | Self::Inventory(_) => "attach slots",
             Self::Counters(_) => "counter endpoints",
         }
     }
 
     fn validate_count(self, endpoints: usize) -> Result<(), String> {
         match self {
-            Self::Detailed if endpoints <= MAX_SLOTS as usize => Ok(()),
-            Self::Detailed => Err(format!(
-                "attach plan requires {endpoints} allocated slots but only {MAX_SLOTS} are available"
+            Self::Detailed(budget) if endpoints <= budget.slots() as usize => Ok(()),
+            Self::Detailed(budget) => Err(format!(
+                "attach plan requires {endpoints} allocated slots but only {} are available",
+                budget.slots()
             )),
             Self::Inventory(budget) => budget.validate_count(endpoints),
             Self::Counters(budget) => budget.validate_count(endpoints),
@@ -132,7 +139,7 @@ impl AdmissionPolicy {
         let required = current.checked_add(additions).ok_or_else(|| {
             match self {
                 Self::Counters(_) => "counter endpoint requirement overflowed",
-                Self::Detailed | Self::Inventory(_) => "attach slot requirement overflowed",
+                Self::Detailed(_) | Self::Inventory(_) => "attach slot requirement overflowed",
             }
             .to_string()
         })?;
@@ -324,7 +331,7 @@ pub(crate) const CLOSURE_ARRAY_NOTE_WHOLE: &str =
 /// Detailed, the whole rule everywhere else (broad admission lifts the
 /// Detailed closure back to the complete-union whole rule).
 fn closure_array_note(policy: AdmissionPolicy, broad_admit: bool) -> &'static str {
-    if matches!(policy, AdmissionPolicy::Detailed) && !broad_admit {
+    if matches!(policy, AdmissionPolicy::Detailed(_)) && !broad_admit {
         CLOSURE_ARRAY_NOTE_DETAILED
     } else {
         CLOSURE_ARRAY_NOTE_WHOLE
@@ -1469,7 +1476,7 @@ impl AttachPlan {
                 *id = ids[id];
             }
         }
-        let mut subset = Self::from_slots_with_policy(slots, AdmissionPolicy::Detailed)?;
+        let mut subset = Self::from_slots_with_policy(slots, AdmissionPolicy::detailed())?;
         subset.modules = self
             .modules
             .iter()
@@ -2092,7 +2099,7 @@ impl AttachPlan {
     /// [`Self::validate_extension_capacity`] so validation counts
     /// exactly what extend allocates.
     fn revival_target(&self, key: &AttachKey, rebuilt: &AttachPlan, slot: &Slot) -> Option<usize> {
-        if !matches!(self.admission_policy, AdmissionPolicy::Detailed) {
+        if !matches!(self.admission_policy, AdmissionPolicy::Detailed(_)) {
             return None;
         }
         if self.slot_by_key.contains_key(key) {
@@ -3224,7 +3231,7 @@ fn merge(
     // their old positions at extend, so they cost no new slot. Counters
     // publish by position and Inventory owns its own budget — neither
     // revives, and their revivable input stays empty.
-    let revival_allowed = matches!(admission_policy, AdmissionPolicy::Detailed);
+    let revival_allowed = matches!(admission_policy, AdmissionPolicy::Detailed(_));
     let revivable = allocated.revivable;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
@@ -3338,7 +3345,7 @@ fn merge(
         let path = group[0].path;
         let (class, table_count) = classes[position];
         let is_detailed_closure = class == AdmissionClass::ClosureArray
-            && matches!(admission_policy, AdmissionPolicy::Detailed)
+            && matches!(admission_policy, AdmissionPolicy::Detailed(_))
             && !broad_admit;
         // Late-start when the object was in the capture's first plan input
         // and that plan also held a non-closure provider (PA-9/C1). An
@@ -3482,7 +3489,7 @@ fn merge(
         // reserve-aware budget. Operator (manifest) modules stay whole —
         // operator-attested targets are admitted whole or refused whole —
         // and Inventory/Counters/broad keep their complete-union whole.
-        let provider_prefix_allowed = matches!(admission_policy, AdmissionPolicy::Detailed)
+        let provider_prefix_allowed = matches!(admission_policy, AdmissionPolicy::Detailed(_))
             && shared
             && !broad_admit
             && matches!(
@@ -4894,6 +4901,34 @@ pub fn build_from_sources_for_policy_scoped_with_prearm(
         admission_policy,
         admission_scope,
         false,
+    )
+}
+
+/// [`build_from_sources_scoped_with_prearm`] under an explicit immutable
+/// admission policy: the capture engine lowers its host-sized Detailed
+/// ceiling through this one entry point, so admission caps and the
+/// count-only-unless-manifest-authorized rule are unchanged. An empty
+/// prearm slice with [`AdmissionPolicy::detailed`] builds exactly the old plan.
+#[allow(clippy::too_many_arguments)]
+pub fn build_from_sources_for_policy_scoped_with_prearm_and_flags(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    broad_admit: bool,
+    admission_policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
+    counter_hint: bool,
+) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        prearm,
+        pinned,
+        broad_admit,
+        admission_policy,
+        admission_scope,
+        counter_hint,
     )
 }
 
@@ -7925,6 +7960,7 @@ mod tests {
     use super::*;
     use crate::discovery::scan::ScannedModule;
     use crate::process::{MountNamespaceId, ProcessViewId};
+    use p11scope_ebpf_common::MAX_SLOTS;
     use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
     use p11scope_manifest::manifest::*;
 
@@ -8948,7 +8984,7 @@ mod tests {
     }
 
     fn object_plan(slots: Vec<Slot>) -> AttachPlan {
-        AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::Detailed).unwrap()
+        AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::detailed()).unwrap()
     }
 
     #[test]
@@ -8980,7 +9016,7 @@ mod tests {
         assert!(detailed.with_counters_policy(tight).is_err());
         assert!(matches!(
             detailed.admission_policy(),
-            AdmissionPolicy::Detailed
+            AdmissionPolicy::Detailed(_)
         ));
     }
 
@@ -9069,7 +9105,7 @@ mod tests {
         assert!(over.admit_counters_under_budget(tight).is_err());
         assert_eq!(over.slots, before.slots, "slots untouched on refusal");
         assert!(
-            matches!(over.admission_policy(), AdmissionPolicy::Detailed),
+            matches!(over.admission_policy(), AdmissionPolicy::Detailed(_)),
             "refusal leaves the Detailed plan untouched"
         );
     }
@@ -10067,32 +10103,38 @@ mod tests {
         let slots: Vec<_> = (0..2_113)
             .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![]))
             .collect();
-        let admitted =
-            AttachPlan::from_slots_with_policy(slots[..2_112].to_vec(), AdmissionPolicy::Detailed)
-                .expect("all 2,112 distinct physical offsets must fit the wide profile");
+        let admitted = AttachPlan::from_slots_with_policy(
+            slots[..2_112].to_vec(),
+            AdmissionPolicy::detailed(),
+        )
+        .expect("all 2,112 distinct physical offsets must fit the wide profile");
         assert_eq!(admitted.slots.len(), 2_112);
         assert_eq!(admitted.slots[2_111].index, 2_111);
-        let error = AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::Detailed)
+        let error = AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::detailed())
             .expect_err("2,113 endpoints must be refused before any attachment");
         assert!(error.contains("2113") && error.contains("2112"), "{error}");
     }
 
     #[test]
     fn sized_detailed_policy_caps_admission_at_the_host_budget() {
-        // A 256-CPU, 2 GiB host sizes the Detailed ceiling to 662: the
-        // 662nd endpoint fits and the 663rd is refused naming 662.
-        let sized = 662u32;
-        let policy = AdmissionPolicy::detailed_sized(sized);
+        // A 256-CPU, 2 GiB host sizes the Detailed ceiling to 662 (wide;
+        // the 512 build clamps the same request to its own ceiling): the
+        // last admitted endpoint fits and the next is refused naming it.
+        let sized = 662.min(MAX_SLOTS);
+        let policy = AdmissionPolicy::detailed_sized(662);
         let object = PinnedObjectId(11);
-        let slots: Vec<_> = (0..663)
+        let slots: Vec<_> = (0..sized + 1)
             .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![]))
             .collect();
-        let admitted = AttachPlan::from_slots_with_policy(slots[..662].to_vec(), policy)
-            .expect("662 endpoints must fit the sized ceiling");
-        assert_eq!(admitted.slots.len(), 662);
+        let admitted = AttachPlan::from_slots_with_policy(slots[..sized as usize].to_vec(), policy)
+            .expect("the sized ceiling must admit exactly its endpoints");
+        assert_eq!(admitted.slots.len(), sized as usize);
         let error = AttachPlan::from_slots_with_policy(slots, policy)
-            .expect_err("endpoint 663 must be refused at the sized ceiling");
-        assert!(error.contains("663") && error.contains("662"), "{error}");
+            .expect_err("one past the sized ceiling must be refused");
+        assert!(
+            error.contains(&(sized + 1).to_string()) && error.contains(&format!("{sized}")),
+            "{error}"
+        );
         // The default stays the compiled ceiling.
         assert_eq!(
             AdmissionPolicy::detailed(),
@@ -11043,7 +11085,7 @@ mod tests {
             in_use,
             retired,
             kept,
-            policy: AdmissionPolicy::Detailed,
+            policy: AdmissionPolicy::detailed(),
             holders: &[],
             provider_remedies: false,
             counter_hint: false,
@@ -11071,7 +11113,7 @@ mod tests {
             in_use: 447,
             retired: 0,
             kept: 1,
-            policy: AdmissionPolicy::Detailed,
+            policy: AdmissionPolicy::detailed(),
             holders: &[("/usr/lib/libp11-kit.so.0", 309)],
             provider_remedies: true,
             counter_hint: false,
@@ -12949,7 +12991,7 @@ mod tests {
 
     #[test]
     fn counter_consumption_refuses_invalid_extents_without_mutation() {
-        for policy in [AdmissionPolicy::Detailed, inventory_policy(8)] {
+        for policy in [AdmissionPolicy::detailed(), inventory_policy(8)] {
             let mut plan =
                 AttachPlan::from_slots_with_policy(counter_history_plan(2).slots, policy).unwrap();
             let before = plan.clone();
@@ -13007,7 +13049,7 @@ mod tests {
         truncated.slot_by_key.retain(|_, position| *position < 1);
         assert!(truncated.validate_slot_index().is_err());
         let mut changed_policy = history;
-        changed_policy.admission_policy = AdmissionPolicy::Detailed;
+        changed_policy.admission_policy = AdmissionPolicy::detailed();
         assert!(changed_policy.validate_slot_index().is_err());
     }
 
@@ -13055,7 +13097,7 @@ mod tests {
     #[test]
     fn unconsumed_policies_preserve_tail_cleanup() {
         for policy in [
-            AdmissionPolicy::Detailed,
+            AdmissionPolicy::detailed(),
             inventory_policy(8),
             counters_policy(8),
         ] {
@@ -13103,7 +13145,7 @@ mod tests {
             assert_eq!(subset.counter_consumed_end(), 0);
         }
         let default = AttachPlan::from_slots(counter_history_plan(1).slots);
-        assert_eq!(default.admission_policy(), AdmissionPolicy::Detailed);
+        assert_eq!(default.admission_policy(), AdmissionPolicy::detailed());
         assert_eq!(default.counter_consumed_end(), 0);
     }
 
@@ -13195,7 +13237,7 @@ mod tests {
         // These are the existing runtime factories. An absent explicit
         // counter admission request keeps their previous policy selection.
         let detailed = build_from_reconciled_modules(&sources);
-        assert_eq!(detailed.admission_policy(), AdmissionPolicy::Detailed);
+        assert_eq!(detailed.admission_policy(), AdmissionPolicy::detailed());
         let inventory = build_from_test_sources_with_policy(&sources, &[], inventory_policy(12));
         assert_eq!(inventory.admission_policy(), inventory_policy(12));
         assert_eq!(inventory.slots.len(), 12);
@@ -13281,7 +13323,7 @@ mod tests {
         assert_eq!(plan, before, "retired IDs cannot fund a partial extension");
         for policy in [
             counters_policy(4),
-            AdmissionPolicy::Detailed,
+            AdmissionPolicy::detailed(),
             inventory_policy(3),
         ] {
             let mut mismatch =

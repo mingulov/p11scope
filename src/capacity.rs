@@ -515,6 +515,188 @@ pub fn native_slot_bound() -> u32 {
     MAX_SLOTS
 }
 
+/// Floor of the host-scaled STATS budget: the per-CPU STATS table plus the
+/// RV per-CPU hash may use up to `max(64 MiB, 1% of MemTotal)` (owner ruling
+/// 2026-11-10: big-CPU hosts also carry big RAM, so a fixed 64 MiB is too
+/// strict). Below 6.4 GiB the floor binds; above it 1% of MemTotal binds.
+pub const STATS_BUDGET_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Load-time slot sizing never drops below the historical 512-slot ceiling:
+/// the capture degrades to a smaller STATS table, never to a refusal.
+pub const MIN_SIZED_SLOTS: u32 = 512;
+
+const _: () = assert!(MAX_SLOTS >= MIN_SIZED_SLOTS);
+
+/// Host-scaled STATS budget in bytes: `max(64 MiB, 1% of MemTotal)`.
+pub fn stats_budget_bytes(mem_total_bytes: u64) -> u64 {
+    STATS_BUDGET_FLOOR_BYTES.max(mem_total_bytes / 100)
+}
+
+/// Kernel bytes of the per-CPU STATS table plus the RV per-CPU hash at
+/// `slots` attach slots and `possible_cpus` Linux possible CPUs: slots times
+/// the 296-byte [`SlotStats`] value times CPUs, plus the RV hash keys once
+/// and its 8-byte per-CPU values times CPUs. This is the same accounting as
+/// [`DetailedResources`]' STATS plus RV payloads; the twin pins both equal.
+pub fn stats_cost_bytes(slots: u32, possible_cpus: u64) -> Result<u64, String> {
+    let slots = u64::from(slots);
+    let stats_value = size_of::<SlotStats>() as u64;
+    let rv = u64::from(RV_ENTRIES);
+    let rv_key = size_of::<RvKey>() as u64;
+    let rv_value = size_of::<u64>() as u64;
+    let stats = slots
+        .checked_mul(stats_value)
+        .and_then(|bytes| bytes.checked_mul(possible_cpus))
+        .ok_or_else(|| "STATS payload overflowed".to_string())?;
+    let keys = rv
+        .checked_mul(rv_key)
+        .ok_or_else(|| "RV key payload overflowed".to_string())?;
+    let values = rv
+        .checked_mul(rv_value)
+        .and_then(|bytes| bytes.checked_mul(possible_cpus))
+        .ok_or_else(|| "RV value payload overflowed".to_string())?;
+    stats
+        .checked_add(keys)
+        .and_then(|bytes| bytes.checked_add(values))
+        .ok_or_else(|| "STATS plus RV payload overflowed".to_string())
+}
+
+/// Load-time Detailed slot sizing for one host geometry: the requested
+/// compiled ceiling, the effective ceiling that fits the host-scaled STATS
+/// budget, and the inputs that decided it. Pure over injected inputs so the
+/// twins never read the real host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SlotSizing {
+    pub requested_slots: u32,
+    pub effective_slots: u32,
+    pub possible_cpus: u64,
+    pub mem_total_bytes: u64,
+    pub budget_bytes: u64,
+    /// STATS plus RV bytes at the effective slot count.
+    pub stats_bytes: u64,
+}
+
+impl SlotSizing {
+    /// True when the host budget trimmed the compiled ceiling.
+    pub fn downsized(self) -> bool {
+        self.effective_slots != self.requested_slots
+    }
+}
+
+/// Size the Detailed attach-slot ceiling for `possible_cpus` Linux possible
+/// CPUs and `mem_total_bytes` of host RAM: the compiled [`MAX_SLOTS`] when
+/// its STATS plus RV cost fits `max(64 MiB, 1% of MemTotal)`, otherwise the
+/// largest slot count that fits, never below [`MIN_SIZED_SLOTS`]. A cost
+/// that overflows u64 counts as over budget and sizes to the floor.
+pub fn size_detailed_slots(possible_cpus: u64, mem_total_bytes: u64) -> SlotSizing {
+    let requested = MAX_SLOTS;
+    let budget = stats_budget_bytes(mem_total_bytes);
+    let over_budget = match stats_cost_bytes(requested, possible_cpus) {
+        Ok(cost) => cost > budget,
+        Err(_) => true,
+    };
+    let mut effective = requested;
+    if over_budget {
+        // Solve slots from (budget minus RV) over (296 bytes times CPUs):
+        // the RV hash is fixed, only the slot count moves.
+        let rv_cost = stats_cost_bytes(0, possible_cpus).unwrap_or(u64::MAX);
+        let per_slot = u64::try_from(size_of::<SlotStats>())
+            .ok()
+            .and_then(|value| value.checked_mul(possible_cpus));
+        let solved = match per_slot {
+            Some(per_slot) if per_slot > 0 => budget.saturating_sub(rv_cost) / per_slot,
+            _ => 0,
+        };
+        effective = u32::try_from(solved)
+            .unwrap_or(u32::MAX)
+            .clamp(MIN_SIZED_SLOTS, requested);
+    }
+    SlotSizing {
+        requested_slots: requested,
+        effective_slots: effective,
+        possible_cpus,
+        mem_total_bytes,
+        budget_bytes: budget,
+        stats_bytes: stats_cost_bytes(effective, possible_cpus).unwrap_or(u64::MAX),
+    }
+}
+
+/// Validated Detailed attach-slot ceiling: the compiled [`MAX_SLOTS`] or a
+/// host-sized smaller ceiling, never below [`MIN_SIZED_SLOTS`]. The loader
+/// sizes STATS to this and the planner admits to it, so the two cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailedBudget {
+    slots: u32,
+}
+
+impl DetailedBudget {
+    /// The compiled ceiling.
+    pub const fn compiled() -> Self {
+        Self { slots: MAX_SLOTS }
+    }
+
+    /// A host-sized ceiling, clamped into `512..=MAX_SLOTS`.
+    pub fn sized(slots: u32) -> Self {
+        Self {
+            slots: slots.clamp(MIN_SIZED_SLOTS, MAX_SLOTS),
+        }
+    }
+
+    pub const fn slots(self) -> u32 {
+        self.slots
+    }
+}
+
+/// Linux possible CPUs (`/sys/devices/system/cpu/possible`), the per-CPU
+/// table multiplier. This must count possible CPUs, never online or affinity.
+pub fn host_possible_cpus() -> Result<u64, String> {
+    let cpus = aya::util::nr_cpus()
+        .map_err(|(path, error)| format!("reading possible CPUs at {path}: {error}"))?;
+    u64::try_from(cpus).map_err(|_| "possible CPU count does not fit u64".to_string())
+}
+
+/// Parse MemTotal (kB) from `/proc/meminfo` text into bytes. Only the
+/// MemTotal line is read; nothing else in the file is parsed or retained.
+pub fn mem_total_bytes_from_meminfo(text: &str) -> Result<u64, String> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let value = parts
+            .next()
+            .ok_or_else(|| "MemTotal line has no value".to_string())?;
+        let unit = parts
+            .next()
+            .ok_or_else(|| "MemTotal line has no unit".to_string())?;
+        if unit != "kB" {
+            return Err(format!("MemTotal unit is {unit}, expected kB"));
+        }
+        let kb: u64 = value
+            .parse()
+            .map_err(|_| format!("MemTotal value {value:?} is not a number"))?;
+        return kb
+            .checked_mul(1024)
+            .ok_or_else(|| "MemTotal does not fit u64 bytes".to_string());
+    }
+    Err("MemTotal not found in meminfo".to_string())
+}
+
+/// Host RAM in bytes from `/proc/meminfo`.
+pub fn mem_total_bytes() -> Result<u64, String> {
+    let text = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("reading /proc/meminfo: {error}"))?;
+    mem_total_bytes_from_meminfo(&text)
+}
+
+/// Size the Detailed ceiling for this host. Possible CPUs are required (a
+/// per-CPU table cannot be sized blind), while an unreadable MemTotal falls
+/// back to exactly the 64 MiB floor budget rather than refusing the capture.
+pub fn sizing_for_host() -> Result<SlotSizing, String> {
+    let cpus = host_possible_cpus()?;
+    let mem = mem_total_bytes().unwrap_or(STATS_BUDGET_FLOOR_BYTES * 100);
+    Ok(size_detailed_slots(cpus, mem))
+}
+
 /// One dense-versus-sparse storage comparison row.
 pub struct StorageRow {
     pub cpus: u32,
@@ -2791,9 +2973,7 @@ mod tests {
         }
         assert_eq!(
             cost,
-            2_112 * 296 * 256
-                + u64::from(RV_ENTRIES) * 16
-                + u64::from(RV_ENTRIES) * 8 * 256
+            2_112 * 296 * 256 + u64::from(RV_ENTRIES) * 16 + u64::from(RV_ENTRIES) * 8 * 256
         );
         // One accounting: the gate cost equals the Detailed calculator's
         // STATS plus RV payloads at the same geometry.

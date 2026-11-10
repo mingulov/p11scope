@@ -3474,6 +3474,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("selected plan builds");
     assert_eq!(selected.slots.len(), (3 * per_table) as usize);
@@ -3496,6 +3497,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         true,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect_err("broad refuses the oversized module whole");
     let text = format!("{error:?}");
@@ -3563,6 +3565,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         true,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("broad plan builds around the refusal");
     assert_eq!(mixed.slots.len(), 10);

@@ -3407,6 +3407,8 @@ pub(crate) fn counter_object_preflight(mode: CounterMode) -> Result<(), String> 
         Some(prepared),
         None,
         false,
+        // Counter objects keep their own fixed STATS: no resize.
+        None,
     )
     .map(|_| ())
     .map_err(|error| counter_load_refusal(&error))
@@ -3538,6 +3540,8 @@ impl Session {
                     Some(preparation),
                     None,
                     false,
+                    // Counter objects keep their own fixed STATS: no resize.
+                    None,
                 )
                 .map_err(map_counter_verifier_budget_refusal)?;
                 let banks = session
@@ -3591,6 +3595,8 @@ impl Session {
             Some(preparation),
             None,
             false,
+            // Counter objects keep their own fixed STATS: no resize.
+            None,
         )
         .map_err(map_counter_verifier_budget_refusal)?;
         // The keepalive is already in Session before the first real producer.

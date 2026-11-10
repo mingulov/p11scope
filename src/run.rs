@@ -29124,7 +29124,7 @@ int main(int argc, char **argv) {
     fn empty_profile_plan_for_test() -> crate::plan::AttachPlan {
         crate::plan::AttachPlan::from_slots_with_policy(
             Vec::new(),
-            crate::plan::AdmissionPolicy::Detailed,
+            crate::plan::AdmissionPolicy::detailed(),
         )
         .expect("an empty profile plan builds")
     }

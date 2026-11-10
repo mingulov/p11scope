@@ -44,7 +44,7 @@ fn detailed_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
         (0..count)
             .map(|index| counter_slot(index, object))
             .collect(),
-        plan::AdmissionPolicy::Detailed,
+        plan::AdmissionPolicy::detailed(),
     )
     .unwrap()
 }
@@ -84,7 +84,7 @@ fn detailed_semantic_plan() -> plan::AttachPlan {
             semantic_slot(0, object, "C_Sign", 0x10),
             semantic_slot(1, object, "C_Encrypt", 0x20),
         ],
-        plan::AdmissionPolicy::Detailed,
+        plan::AdmissionPolicy::detailed(),
     )
     .unwrap()
 }
@@ -191,7 +191,7 @@ fn counter_preflight_refuses_before_session_start_with_zero_links() {
     assert!(
         matches!(
             engine.plan.admission_policy(),
-            plan::AdmissionPolicy::Detailed
+            plan::AdmissionPolicy::Detailed(_)
         ),
         "refusal happens before plan conversion and session start (zero links)"
     );
@@ -811,7 +811,7 @@ fn counter_retain_restore_refuses_an_over_budget_plan_with_its_named_reason() {
     assert!(
         matches!(
             engine.plan.admission_policy(),
-            plan::AdmissionPolicy::Detailed
+            plan::AdmissionPolicy::Detailed(_)
         ),
         "refusal leaves the Detailed plan untouched"
     );

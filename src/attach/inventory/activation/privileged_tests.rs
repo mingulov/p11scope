@@ -803,7 +803,7 @@ fn task4_physical_identity_real_alias_and_same_bytes_distinct_inode() -> Result<
     }
     original.finish()?;
     copy.finish()?;
-    let detailed = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    let detailed = Task4IdentityFixture::build(AdmissionPolicy::detailed())?;
     ensure!(detailed.original_slot != detailed.copy_slot);
     Ok(())
 }
@@ -3359,7 +3359,7 @@ fn task4_identity_source_serialization_synthetic_bundle() -> Result<()> {
 
 #[test]
 fn task4_detailed_identity_source_serialization_synthetic_bundle() -> Result<()> {
-    let mut identity = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    let mut identity = Task4IdentityFixture::build(AdmissionPolicy::detailed())?;
     let scratch = tempfile::tempdir()?;
     let directory = std::env::var_os("P11SCOPE_TASK4_SYNTHETIC_DETAILED_EVIDENCE_DIR")
         .map(PathBuf::from)
@@ -7497,7 +7497,7 @@ fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
     )?;
     evidence.fd_sample("baseline")?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let attach_start = Instant::now();
@@ -7809,7 +7809,7 @@ fn privileged_bench_overhead_detailed_calls() -> Result<()> {
 
     let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = crate::attach::Session::start(
@@ -7919,7 +7919,7 @@ fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
     const PERCALLS: u32 = 200_000;
     let fixture = OwnedFixture::build_n(false, threads)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     // Aggregate policy still pairs every call through the native owner
@@ -8030,7 +8030,7 @@ fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
     const SPIN: u32 = 200;
     let fixture = OwnedFixture::build_n(false, 1)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = crate::attach::Session::start(
@@ -8129,7 +8129,7 @@ fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &
     const PERCALLS: u32 = 300_000;
     let fixture = OwnedFixture::build_n(false, 1)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = crate::attach::Session::start(
@@ -8223,7 +8223,7 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
     const CALLS: u32 = 1_000;
     let fixture = OwnedFixture::build_n(false, 1)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     // Created before the caller, so an early failure drops (kills) the
     // caller first and the cgroup can still be removed.
@@ -8391,7 +8391,7 @@ fn privileged_t7_detailed_hot_slot_third_rv_lp64() -> Result<()> {
     verify_task4_physical_slots(&fixture.plan.slots, N as usize)?;
     task4_fixture_receipt(&fixture)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = crate::attach::Session::start(
@@ -8667,7 +8667,7 @@ fn task4_detailed_physical_capacity_refusal() -> Result<()> {
         verify_task4_physical_slots(&fixture.plan.slots, endpoints as usize)?;
         let error = AttachPlan::from_slots_with_policy(
             fixture.plan.slots.clone(),
-            AdmissionPolicy::Detailed,
+            AdmissionPolicy::detailed(),
         )
         .expect_err("Detailed plan admitted physical capacity overflow");
         ensure!(
@@ -8683,7 +8683,7 @@ fn task4_detailed_physical_capacity_refusal() -> Result<()> {
 #[test]
 #[ignore = "root-owned BPF lane; real aliased symbol and same-byte distinct-inode Detailed targets"]
 fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
-    let mut identity = Task4IdentityFixture::build(AdmissionPolicy::Detailed)?;
+    let mut identity = Task4IdentityFixture::build(AdmissionPolicy::detailed())?;
     task4_identity_fixture_receipt(&identity)?;
     let (mut original, mut copy) = identity.take_callers()?;
     let fixture = &identity.fixture;
@@ -9279,7 +9279,7 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
         Task4Evidence::new(case, "wide-detailed-2112", &fixture, crate::EBPF_OBJECT)?;
     evidence.fd_sample("baseline")?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let attach_start = Instant::now();
@@ -11692,7 +11692,7 @@ fn privileged_stop_gate_freezes_capture_state_after_quiescence() -> Result<()> {
     const ENDPOINTS: u32 = 8;
     let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
@@ -11759,7 +11759,7 @@ fn privileged_detailed_2112_stop_publishes_before_cleanup() -> Result<()> {
     let origin = Instant::now();
     let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
@@ -11866,7 +11866,7 @@ fn privileged_stop_gate_keeps_calls_in_flight_as_residual() -> Result<()> {
     const ENDPOINTS: u32 = 8;
     let fixture = OwnedFixture::build_n(false, ENDPOINTS)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut caller = fixture.spawn_gated()?;
     let mut session = stop_gate_start_session(&plan, &caller, &fixture.pins)?;
@@ -12007,7 +12007,7 @@ fn classic_pid_scope_lane(selection: crate::attach::BackendSelection, label: &st
     let proven = crate::attach::kernel_multi_pid_filter();
     let fixture = OwnedFixture::build_n(false, 1)?;
     let plan =
-        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::detailed())
             .map_err(anyhow::Error::msg)?;
     let mut target = fixture.spawn()?;
     let mut foreign = fixture.spawn()?;

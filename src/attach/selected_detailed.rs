@@ -1161,6 +1161,8 @@ fn start_selected_attempt(
             None,
             // A pre-link probe session never arms extensive mode.
             false,
+            // The loaded STATS map follows the plan's sized ceiling.
+            super::stats_map_slots(plan.admission_policy(), false),
         )
     })()
     .map_err(SelectedPreparationFailure::before_links)?;

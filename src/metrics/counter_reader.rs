@@ -5133,7 +5133,7 @@ mod tests {
         )];
         let plan = crate::plan::AttachPlan::from_slots_with_policy(
             slots,
-            crate::plan::AdmissionPolicy::Detailed,
+            crate::plan::AdmissionPolicy::detailed(),
         )
         .unwrap();
         let pins = std::mem::replace(

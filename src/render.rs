@@ -704,6 +704,12 @@ pub struct DiscoveryEvidence {
     /// live engine state on every `capture_facts()`.
     #[serde(skip)]
     pub gap_exit_mappings: Option<GapExitMappings>,
+    /// Host-sized Detailed attach-slot ceiling, present only when the
+    /// host-scaled STATS budget trimmed the compiled ceiling. Absent,
+    /// never null, when the default loaded unchanged. Stamped from
+    /// live engine state on every `capture_facts()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_sizing: Option<crate::capacity::SlotSizing>,
 }
 
 /// 6.14 Option A exit-time split of the novel unmatched-exit
@@ -859,6 +865,7 @@ impl Default for DiscoveryEvidence {
             forwarding_declared: Vec::new(),
             unmatched_forwarding: Vec::new(),
             gap_exit_mappings: None,
+            slot_sizing: None,
         }
     }
 }
@@ -11212,7 +11219,10 @@ pub(crate) mod tests {
         assert_eq!(json["slot_sizing"]["requested_slots"], 2112);
         assert_eq!(json["slot_sizing"]["effective_slots"], 662);
         assert_eq!(json["slot_sizing"]["possible_cpus"], 256);
-        assert_eq!(json["slot_sizing"]["mem_total_bytes"], 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            json["slot_sizing"]["mem_total_bytes"],
+            2u64 * 1024 * 1024 * 1024
+        );
         assert_eq!(json["slot_sizing"]["budget_bytes"], 64 * 1024 * 1024);
         let mut plain = evidence();
         plain.discovery.slot_sizing = None;

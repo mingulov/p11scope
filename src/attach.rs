@@ -6423,6 +6423,28 @@ pub(crate) fn summarize_load_refusal_for_stderr(error: &anyhow::Error) -> Option
     ))
 }
 
+/// STATS entries the loader creates for this session: a Detailed session
+/// loads the plan's sized ceiling (even when it equals the compiled
+/// default, a no-op override); counter sessions keep their own fixed
+/// STATS, and Inventory plans never reach the Detailed loader.
+fn stats_map_slots(policy: crate::plan::AdmissionPolicy, counter_session: bool) -> Option<u32> {
+    if counter_session {
+        return None;
+    }
+    match policy {
+        crate::plan::AdmissionPolicy::Detailed(budget) => Some(budget.slots()),
+        _ => None,
+    }
+}
+
+/// Host-sized STATS entries for plan-less diagnostic loads, `None` (the
+/// compiled ceiling, today's behavior) when the host is unreadable.
+fn host_stats_slots() -> Option<u32> {
+    crate::capacity::sizing_for_host()
+        .map(|sizing| sizing.effective_slots)
+        .ok()
+}
+
 /// The DISCOVERY ring size this scope loads with.
 /// The one loader configuration of the capture object, shared by capture
 /// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
@@ -6433,7 +6455,10 @@ pub(crate) fn load_capture_object(
     events_bytes: u32,
     discovery_bytes: u32,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
-    load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)
+    // The self-probe sizes STATS exactly as a capture does; an unreadable
+    // host falls back to the compiled ceiling (a transient diagnostic load).
+    let stats_slots = host_stats_slots();
+    load_capture_object_with_images(btf, events_bytes, discovery_bytes, false, stats_slots)
 }
 
 fn load_capture_object_with_images(
@@ -6441,6 +6466,7 @@ fn load_capture_object_with_images(
     events_bytes: u32,
     discovery_bytes: u32,
     full_images: bool,
+    stats_slots: Option<u32>,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
     load_capture_object_bytes_with_images(
         btf,
@@ -6448,6 +6474,7 @@ fn load_capture_object_with_images(
         discovery_bytes,
         full_images,
         crate::EBPF_OBJECT,
+        stats_slots,
     )
 }
 
@@ -6457,16 +6484,21 @@ fn load_capture_object_bytes_with_images(
     discovery_bytes: u32,
     full_images: bool,
     object: &[u8],
+    stats_slots: Option<u32>,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
-    EbpfLoader::new()
+    let mut loader = EbpfLoader::new();
+    loader
         .btf(Some(btf))
         .allow_unsupported_maps()
         .map_max_entries("EVENTS", events_bytes)
         .map_max_entries("DISCOVERY", discovery_bytes)
         .map_max_entries("IMAGE_CONTINUITY", if full_images { 16_384 } else { 1 })
         .map_max_entries("IMAGE_TGID_INDEX", if full_images { 16_384 } else { 1 })
-        .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 })
-        .load(object)
+        .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 });
+    if let Some(slots) = stats_slots {
+        loader.map_max_entries("STATS", slots);
+    }
+    loader.load(object)
 }
 
 pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
@@ -7378,6 +7410,9 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
+        // The loaded STATS map follows the plan's sized Detailed ceiling,
+        // so admission and the kernel table cannot disagree.
+        let stats_slots = stats_map_slots(plan.admission_policy(), counter.is_some());
         let mut session = Self::start_inner(
             scope,
             policy,
@@ -7389,6 +7424,7 @@ impl Session {
             counter,
             journal,
             track_short_lived,
+            stats_slots,
         )
         .map_err(|error| {
             if counter.is_some() {
@@ -7447,6 +7483,7 @@ impl Session {
             None,
             None,
             false,
+            host_stats_slots(),
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -7466,6 +7503,7 @@ impl Session {
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
         track_short_lived: bool,
+        stats_slots: Option<u32>,
     ) -> Result<Self> {
         let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
             scope,
@@ -7478,6 +7516,7 @@ impl Session {
             counter,
             journal,
             track_short_lived,
+            stats_slots,
         )?;
         session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
@@ -7532,6 +7571,7 @@ impl Session {
         counter: Option<&counter_banks::CounterSpec>,
         journal: Option<&journal::JournalSpec>,
         track_short_lived: bool,
+        stats_slots: Option<u32>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         match (counter, journal) {
             (None, None) => Self::prepare_inner_unlinked_with_object(
@@ -7545,6 +7585,7 @@ impl Session {
                 None,
                 None,
                 track_short_lived,
+                stats_slots,
             ),
             (Some(spec), None) => {
                 let prepared = spec.prepare(backend)?;
@@ -7559,6 +7600,7 @@ impl Session {
                     Some(prepared),
                     None,
                     track_short_lived,
+                    stats_slots,
                 )
             }
             (None, Some(spec)) => {
@@ -7574,6 +7616,7 @@ impl Session {
                     None,
                     Some(prepared),
                     track_short_lived,
+                    stats_slots,
                 )
             }
             (Some(_), Some(_)) => {
@@ -7597,6 +7640,7 @@ impl Session {
         counter: Option<counter_banks::CounterPreparation<'_>>,
         journal: Option<journal::JournalPreparation<'_>>,
         track_short_lived: bool,
+        stats_slots: Option<u32>,
     ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         if counter.is_some() && journal.is_some() {
             bail!("journal preparation refuses alongside counter preparation: select one");
@@ -7672,6 +7716,7 @@ impl Session {
             discovery_ring_bytes(scope),
             policy.wants_instance_hooks(),
             object,
+            stats_slots,
         )
         .context("loading BPF object with required task storage")?;
         let native_selection =
@@ -10434,6 +10479,7 @@ impl Session {
             None,
             None,
             false,
+            host_stats_slots(),
         )
     }
 
@@ -11729,9 +11775,10 @@ mod tests {
             super::stats_map_slots(AdmissionPolicy::detailed(), false),
             Some(p11scope_ebpf_common::MAX_SLOTS)
         );
+        // The sized ceiling clamps into 512..=MAX_SLOTS on every build.
         assert_eq!(
             super::stats_map_slots(AdmissionPolicy::detailed_sized(662), false),
-            Some(662)
+            Some(662.min(p11scope_ebpf_common::MAX_SLOTS))
         );
         // Counter sessions keep their own fixed STATS: no resize.
         let budget = crate::capacity::CounterBudget::new(512).unwrap();
@@ -13690,6 +13737,7 @@ mod tests {
             None,
             None,
             false,
+            super::host_stats_slots(),
         )?;
         if super::LOADER_GATE_BUILD {
             let select = session
@@ -16330,6 +16378,7 @@ mod tests {
             None,
             Some(&journal::JournalSpec),
             false,
+            None,
         )
         .err()
         .expect("unbuilt journal preparation refuses");
@@ -16358,6 +16407,7 @@ mod tests {
             None,
             Some(prepared),
             false,
+            None,
         )
         .err()
         .expect("corrupt journal bytes refuse");
@@ -16388,6 +16438,7 @@ mod tests {
             None,
             Some(prepared),
             false,
+            None,
         )
         .err()
         .expect("pair-less journal bytes refuse");
@@ -16423,6 +16474,7 @@ mod tests {
             Some(&counter),
             Some(&journal::JournalSpec),
             false,
+            None,
         )
         .err()
         .expect("counter/journal combination refuses");
@@ -16454,6 +16506,7 @@ mod tests {
             None,
             Some(prepared),
             false,
+            None,
         )
         .err()
         .expect("counter policy with journal bytes refuses");

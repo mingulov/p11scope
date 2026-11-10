@@ -155,6 +155,21 @@ informational only: it never feeds shares, verdicts, `gap_classes` or
 `completeness`, and never forces `PARTIAL`. Like `selected_detail`, it
 is a v3-additive disclosure that introduces no new schema revision.
 
+When the host-scaled STATS budget trims the Detailed attach-slot
+ceiling, the evidence also contains an optional additive `slot_sizing`
+object. Captures whose default ceiling loads unchanged omit it
+(absent, never null). Its keys are `requested_slots` (the compiled
+ceiling), `effective_slots` (the loaded ceiling, never below 512),
+`possible_cpus` (Linux possible CPUs, the per-CPU multiplier),
+`mem_total_bytes` (host RAM), `budget_bytes`
+(`max(64 MiB, 1% of MemTotal)`), and `stats_bytes` (STATS plus RV
+bytes at the effective count). The key is informational only: it
+never feeds shares, verdicts, `gap_classes` or `completeness`, and
+never forces `PARTIAL` — a module the sized ceiling cuts short still
+lands in `modules_skipped[]` with its refusal, which forces `PARTIAL`
+as before. Like `instance_reload_not_excluded`, it is a v3-additive
+disclosure that introduces no new schema revision.
+
 When a capture passes `--exclude-module`, its evidence also contains
 optional additive `excluded_modules` and `unmatched_excludes` keys.
 Captures without the flag omit both. `excluded_modules` lists one row

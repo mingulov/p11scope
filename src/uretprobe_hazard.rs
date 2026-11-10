@@ -1278,7 +1278,9 @@ mod tests {
             )?;
             require(
                 body(attach, "pub(crate) fn load_capture_object(", "\n}\n")?,
-                &["load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)"],
+                &[
+                    "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false, stats_slots)",
+                ],
                 "self-probe wrapper",
             )?;
             require(
@@ -1329,7 +1331,7 @@ mod tests {
                 "shared preparation",
             ),
             (
-                "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)",
+                "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false, stats_slots)",
                 "bare_probe_object(btf)",
                 "self-probe wrapper",
             ),

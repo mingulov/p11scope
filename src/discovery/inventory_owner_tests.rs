@@ -90,7 +90,7 @@ fn explicit_constructor_sets_both_policies_before_any_owner_or_io() {
     assert_eq!(detailed.budget.policy(), DiscoveryPolicy::DetailedLegacy);
     assert_eq!(
         detailed.plan.admission_policy(),
-        plan::AdmissionPolicy::Detailed
+        plan::AdmissionPolicy::detailed()
     );
     assert!(detailed.inventory.is_none());
 }

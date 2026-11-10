@@ -3356,6 +3356,7 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
             false,
             scope,
             false,
+            p11scope_ebpf_common::MAX_SLOTS,
         )
     };
 
@@ -3412,6 +3413,7 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     assert!(plan.slots.is_empty(), "the closure takes no slot");
@@ -3505,6 +3507,7 @@ fn named_capture_startup_twins_beside_an_unpublished_closure() {
             false,
             plan::AdmissionScope::Named,
             false,
+            p11scope_ebpf_common::MAX_SLOTS,
         )
     };
     let empty = build(&[], &PinnedObjects::empty()).expect("nothing mapped still starts");
@@ -3576,6 +3579,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .unwrap();
     engine.counters = counters;
@@ -4475,6 +4479,7 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
@@ -25202,6 +25207,7 @@ fn seed_for_unadmitted_closure_skips_the_owner_check() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     assert!(plan.slots.is_empty(), "the closure takes no slot");
@@ -25289,6 +25295,7 @@ fn seed_for_unknown_or_refused_object_keeps_the_owner_check() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     let unknown = CountOnlySeedWork {
@@ -25369,6 +25376,7 @@ fn seed_loop_skips_an_unadmitted_closure_seed_benignly() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     let seed = CountOnlySeedWork {
@@ -25419,6 +25427,7 @@ fn seed_loop_still_fails_a_non_closure_seed_without_an_owner() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .expect("a named capture beside an unpublished closure alone starts");
     let seed = CountOnlySeedWork {
@@ -36963,7 +36972,7 @@ fn counter_start_readmits_retained_plan_under_its_budget_after_stale_removal() {
     assert!(
         matches!(
             discovered.plan.admission_policy(),
-            crate::plan::AdmissionPolicy::Detailed
+            crate::plan::AdmissionPolicy::Detailed(_)
         ),
         "stale-view removal rebuilds the retained plan Detailed"
     );
@@ -37435,6 +37444,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         false,
         plan::AdmissionScope::Named,
         false,
+        p11scope_ebpf_common::MAX_SLOTS,
     )
     .unwrap();
 

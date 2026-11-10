@@ -407,6 +407,11 @@ pub struct Engine {
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
     discovery: render::DiscoveryEvidence,
+    /// Host-sized Detailed slot ceiling, computed once at the first
+    /// rebuild and reused by every later one: possible CPUs and MemTotal
+    /// are boot-constant, and the plan, the loaded STATS map and the
+    /// disclosure must agree on one value for the whole capture.
+    slot_sizing: Option<crate::capacity::SlotSizing>,
     capture_facts: CaptureFacts,
     views: Vec<ProcessView>,
     trace_seeds: BTreeMap<SeedId, TraceCandidate>,
@@ -7569,6 +7574,13 @@ fn discover_plan(
             eprintln!("{line}");
         }
     }
+    // A host-sized ceiling says so once, in one plain line; an unchanged
+    // ceiling stays silent.
+    if let Some(sizing) = discovered.slot_sizing.as_ref()
+        && let Some(line) = format_slot_sizing_summary(sizing)
+    {
+        eprintln!("{line}");
+    }
     discovered.counters.report(&discovered.plan);
     Ok(discovered)
 }
@@ -7615,15 +7627,17 @@ fn build_current_plan(
     broad_admit: bool,
     admission_scope: plan::AdmissionScope,
     counter_hint: bool,
+    detailed_slots: u32,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan = plan::build_from_sources_scoped_with_prearm(
+    let mut plan = plan::build_from_sources_for_policy_scoped_with_prearm_and_flags(
         modules,
         manifests,
         prearm,
         pinned,
         broad_admit,
+        plan::AdmissionPolicy::detailed_sized(detailed_slots),
         admission_scope,
         counter_hint,
     );
@@ -8247,6 +8261,25 @@ fn format_capacity_refusal_summary(refused: &[&str]) -> Option<String> {
     }
     line.push_str(" — see Module gaps in the report");
     Some(line)
+}
+
+/// The default-verbosity line for a host-sized attach-slot ceiling: one
+/// plain line naming the effective ceiling, the compiled ceiling and the
+/// budget inputs. `None` when the ceiling loaded unchanged.
+fn format_slot_sizing_summary(sizing: &crate::capacity::SlotSizing) -> Option<String> {
+    if !sizing.downsized() {
+        return None;
+    }
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    Some(format!(
+        "p11scope: attach slots sized to {} of {} (STATS budget {} MiB at {} possible CPUs, {} GiB RAM)",
+        sizing.effective_slots,
+        sizing.requested_slots,
+        sizing.budget_bytes / MIB,
+        sizing.possible_cpus,
+        sizing.mem_total_bytes / GIB,
+    ))
 }
 
 /// One member of the scope discovery could not read. `None` when the
@@ -9174,6 +9207,17 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     let broad_admit = discovered.broad_admit;
     let counter_hint = discovered.counter_hint;
     let admission_scope = discovered.admission_scope();
+    // Host-sized Detailed ceiling, once per capture: the first rebuild
+    // computes it and later rebuilds reuse it, so the plan, the loaded
+    // STATS map and the disclosure cannot disagree mid-capture.
+    if discovered.slot_sizing.is_none() {
+        discovered.slot_sizing =
+            Some(crate::capacity::sizing_for_host().map_err(|error| anyhow!("{error}"))?);
+    }
+    let detailed_slots = discovered
+        .slot_sizing
+        .map(|sizing| sizing.effective_slots)
+        .expect("sized above");
     let prearm_pieces = resolve_prearm_pieces(discovered.prearm_input.as_ref(), &pinned);
     let mut plan = build_current_plan(
         &modules,
@@ -9191,6 +9235,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         broad_admit,
         admission_scope,
         counter_hint,
+        detailed_slots,
     )
     .inspect_err(|_| counters.report_notes())?;
     let binding_losses = discovered
@@ -11181,6 +11226,7 @@ impl Engine {
             plan: plan::build_from_reconciled_modules(&[]),
             pinned: PinnedObjects::empty(),
             discovery: render::DiscoveryEvidence::default(),
+            slot_sizing: None,
             capture_facts: CaptureFacts::default(),
             views: Vec::new(),
             trace_seeds: BTreeMap::new(),
@@ -12402,6 +12448,10 @@ impl Engine {
         // current without depending on projection timing.
         let mut discovery = self.discovery.clone();
         discovery.gap_exit_mappings = self.gap_exit_mappings();
+        // The host-sized ceiling rides every read the same way: present
+        // only when the budget trimmed the compiled ceiling, absent
+        // otherwise, and never wiped by a live re-projection.
+        discovery.slot_sizing = self.slot_sizing.filter(|sizing| sizing.downsized());
         render::CaptureFacts {
             discovery,
             table_entries: self.plan.entries_seen,
@@ -23196,7 +23246,7 @@ impl Engine {
             .retain(|slot| retired.contains(&(*slot as usize)));
         let detailed = matches!(
             self.plan.admission_policy(),
-            plan::AdmissionPolicy::Detailed
+            plan::AdmissionPolicy::Detailed(_)
         );
         let mut detached_now = if detailed {
             session.revival_detached(self.plan.retired_slots())

@@ -7849,6 +7849,16 @@ class GroupDeathWiringTest(unittest.TestCase):
         self.assertGreater(H6["GROUP_DEATH_MIN_DWELL_NS"], 0)
 
 
+class CgroupR1ArgvPinTest(unittest.TestCase):
+    """The r1 domain pin matches the harness's own verbose trace argv."""
+
+    def test_pin_expects_the_thirteen_element_verbose_shape(self):
+        source = inspect.getsource(H6["_single_cgroup_provider_domain"])
+        self.assertIn("len(argv) != 13", source)
+        self.assertIn("argv[-2].startswith", source)
+        self.assertIn('"-o", argv[-2], "-v"', source)
+
+
 class GroupDeathObserverFinishTest(unittest.TestCase):
     def observer(self):
         code = ("import signal, sys; "

@@ -70807,3 +70807,171 @@ fn report_after_dropped_tail_carries_earlier_data_and_gap() {
         engine.plan.skipped
     );
 }
+
+/// A live newcomer held behind exhausted view capacity with no evictable
+/// view anywhere waits in the queue instead of admitting — and that wait
+/// must never be silent. The retaining tick records the named capacity gap
+/// while the newcomer stays queued for a real view (fail-closed: the same
+/// stay-queued contract
+/// `probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity`
+/// pins). Pending still counts it every tick, so the stall is named and its
+/// wait is counted; a freed slot still admits it later.
+#[test]
+fn capacity_exhaustion_without_evictable_view_gaps_waiting_live_newcomer() {
+    let (mut fixture, mut engine, _armed, _record, _session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.max_scan_pids = 2;
+    // Dirty-state surgery for the cap filler (see the stay-queued twin):
+    // the seed view holds a loader context and the filler holds scan
+    // evidence, so no evictable view exists anywhere.
+    let filler = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
+    engine.next_view_id = 2;
+    engine.exploratory_dirty.insert(ProcessViewId(1));
+    let seed_pid = engine.views[0].pid();
+    let provider = fixture.spawn_peer();
+    wait_peer_mapped(provider, "seed-provider.so");
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing = format!("{seed_pid}\n{filler}\n{provider}\n");
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    assert_eq!(engine.views.len(), engine.max_scan_pids);
+    assert!(
+        engine.exploratory_evictable_views().is_empty(),
+        "no evictable view exists anywhere"
+    );
+    assert!(engine.request_refresh_consumed(provider, Some(1_200)));
+    refresh_inventory_once(&mut engine);
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.refresh_requested.contains_key(&provider),
+        "the provider-bearing newcomer stays queued for a real view"
+    );
+    let stats = engine.newcomer_stats(crate::attach::monotonic_ns());
+    assert_eq!(stats.pending, 1, "the waiter is counted pending");
+    assert!(
+        stats.oldest_pending_age_ms.is_some(),
+        "the wait ages: {stats:?}"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live process admission"
+                && skip.reason
+                    == "capture process-view capacity was exhausted with no evictable view; a live newcomer waited for admission"
+        }),
+        "the stall records its named capacity gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.probationary_completions, 0,
+        "a provider found never completes viewlessly"
+    );
+    assert_eq!(engine.discovery_truncated, 0, "queued is not loss");
+    assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
+}
+
+/// Exited half of the stale-pending question: a marked, requested newcomer
+/// that departs before admission prunes from pending on the next pass and
+/// counts one short-lived gap — it never sits pending.
+#[test]
+fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = child.id();
+    let (mut engine, dir) = engine_over_cgroup_naming(&[live]);
+    let departed = FAKE_PID_FLOOR + 11;
+    // Present-then-gone: listed (marked and requested) on the first pass.
+    e06_write_listing(dir.path(), &[live, departed]);
+    engine.request_refresh(departed, crate::attach::monotonic_ns());
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.newcomer_first_seen.contains_key(&departed),
+        "the listed newcomer marks on its first pass"
+    );
+    let waiting = engine.newcomer_stats(crate::attach::monotonic_ns());
+    assert_eq!(waiting.pending, 1, "the waiter is counted pending");
+    let gaps_before = engine.pid_descendant_gaps();
+    // Absent on the next pass: pruned, not pending, counted once.
+    e06_write_listing(dir.path(), &[live]);
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&departed),
+        "the departed mark prunes"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&departed),
+        "the departed request settles"
+    );
+    let stats = engine.newcomer_stats(crate::attach::monotonic_ns());
+    assert_eq!(stats.pending, 0, "nothing waits anymore");
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        gaps_before + 1,
+        "the departed birth counts one short-lived gap"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Healthy twin: with an evictable view in the full cap, the next reconcile
+/// pass frees a slot and the waiting live newcomer admits — pending drains
+/// and no capacity gap records (relief, not a stall).
+#[test]
+fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
+    let mut a = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut b = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut c = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (mut engine, dir) = engine_over_cgroup_naming(&[a.id(), b.id()]);
+    engine.max_scan_pids = 2;
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2, "the cap fills first");
+    assert!(
+        !engine.exploratory_evictable_views().is_empty(),
+        "relief exists: a retained view is evictable"
+    );
+    e06_write_listing(dir.path(), &[a.id(), b.id(), c.id()]);
+    engine.request_refresh(c.id(), crate::attach::monotonic_ns());
+    for _ in 0..4 {
+        refresh_inventory_once(&mut engine);
+    }
+    assert!(
+        engine.views.iter().any(|view| view.pid() == c.id()),
+        "the waiter admits through the freed slot: {:?}",
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
+    );
+    let stats = engine.newcomer_stats(crate::attach::monotonic_ns());
+    assert_eq!(stats.pending, 0, "nothing waits anymore");
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live process admission"
+                && skip.reason
+                    == "capture process-view capacity was exhausted with no evictable view; a live newcomer waited for admission"
+        }),
+        "relief records no capacity gap: {:?}",
+        engine.counters.object_skips
+    );
+    a.kill().unwrap();
+    b.kill().unwrap();
+    c.kill().unwrap();
+    a.wait().unwrap();
+    b.wait().unwrap();
+    c.wait().unwrap();
+}

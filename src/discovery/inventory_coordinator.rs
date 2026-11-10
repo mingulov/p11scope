@@ -17426,6 +17426,7 @@ exit 0
             count_manifests: coordinator.count_manifests.clone(),
             prearm_prior: coordinator.prearm_prior,
             scripted_member_gaps: Vec::new(),
+            scripted_member_gaps_only: None,
         };
         let hints = coordinator.engine.module_hints.clone();
         let hooks = coordinator.engine.hooks.clone();

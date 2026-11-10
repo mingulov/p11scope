@@ -1149,9 +1149,7 @@ fn loader_sample_at(exe: &str) -> Option<(bool, bool, bool)> {
     let Ok(snapshot) = p11scope_manifest::elf::ElfSnapshot::read(&file) else {
         return None;
     };
-    let Some(interpreter) = snapshot.interpreter() else {
-        return None;
-    };
+    let interpreter = snapshot.interpreter()?;
     let interpreter = PathBuf::from(std::ffi::OsString::from(
         String::from_utf8_lossy(interpreter).into_owned(),
     ));

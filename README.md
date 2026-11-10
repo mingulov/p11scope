@@ -64,10 +64,7 @@ throwaway SoftHSM token and runs your first observed workload in a few minutes.
 ```
 Doctor: requested-lane checks passed.
 verdict: capture available; run startup capture not in this build (run reports stay partial; run itself works)
-target loader build ............... warn  unbound
-debug-state hook .................. warn  unavailable
-loader-state live read ............ warn  unavailable
-Next: p11scope profile --pid <PID> (or doctor --pid <PID> to check a target).
+Next: choose --pid <PID> or --cgroup <PATH> to assess a target scope.
 run with -v for details
 ```
 

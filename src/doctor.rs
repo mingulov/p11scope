@@ -5113,6 +5113,35 @@ mod tests {
     }
 
     #[test]
+    fn concise_healthy_without_warnings_points_at_scope_assessment() {
+        // README's doctor block: a healthy host with no warning rows
+        // names scope assessment, not a capture command.
+        let checks = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "run initial-set capture".into(),
+                status: Status::NotApplicable("not in this build".into()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::NotApplicable("no --pid".into()),
+            },
+        ];
+        let text = render_concise(&checks);
+        assert!(
+            text.starts_with("Doctor: requested-lane checks passed.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Next: choose --pid <PID> or --cgroup <PATH> to assess a target scope."),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn nested_pid_scope_warn_suggests_cgroup_not_pid() {
         let healthy = vec![
             Check {

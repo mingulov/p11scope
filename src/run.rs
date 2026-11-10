@@ -6427,6 +6427,25 @@ fn profile_tick_snapshot<T: Clone>(
     Ok(snapshot)
 }
 
+/// One rendered profile frame's tail: account the Render phase, then run the
+/// frame's heap hook before the next frame allocates. The loop passes
+/// `crate::inventory::reclaim_pass_heap` — the frame freed its pin batch, so
+/// the peak goes back to the kernel (see that helper) — and the frame tests
+/// pass a counting hook, so the once-per-rendered-frame composition is
+/// production code. Returns true when the stdout sink closed with no file
+/// output, i.e. the loop must end the capture.
+fn finish_profile_render_frame(
+    scheduling: &mut SchedulingAccumulator,
+    render_start: Instant,
+    stdout_open: bool,
+    has_output: bool,
+    reclaim: impl FnOnce(),
+) -> bool {
+    scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
+    reclaim();
+    !stdout_open && !has_output
+}
+
 /// The gate's between-frames question for an owned explicit pause: should
 /// this tick service a pending stop? A pending operator stop wins: the tick
 /// services nothing, the loop's end check ends the capture, and cleanup
@@ -7972,11 +7991,15 @@ fn capture_profile(
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
                 flush_stdout(stdout, &mut stdout_open)?;
             }
-            scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
             // The frame freed its pin batch; hand the peak back before the
             // next frame allocates (see `reclaim_pass_heap`).
-            crate::inventory::reclaim_pass_heap();
-            if !stdout_open && !has_output {
+            if finish_profile_render_frame(
+                &mut scheduling,
+                render_start,
+                stdout_open,
+                has_output,
+                crate::inventory::reclaim_pass_heap,
+            ) {
                 break Ok(CaptureEnd::Error);
             }
         }
@@ -23122,6 +23145,42 @@ int main(int argc, char **argv) {
             code.matches("if ").count(),
             2,
             "the render block holds only its frame-bytes check and the finish call"
+        );
+    }
+
+    /// Every finished profile frame runs its heap hook exactly once: three
+    /// rendered frames with the sink open reclaim three times and keep the
+    /// capture running; a closed sink with no file output reclaims, then ends
+    /// it; a closed sink with file output keeps running for the report.
+    #[test]
+    fn finished_profile_frames_reclaim_once_each() {
+        use std::cell::Cell;
+        let runs = Cell::new(0u64);
+        let mut scheduling = SchedulingAccumulator::default();
+        let ago = |ms: u64| Instant::now() - Duration::from_millis(ms);
+        for _ in 0..3 {
+            assert!(
+                !finish_profile_render_frame(&mut scheduling, ago(5), true, false, || runs
+                    .set(runs.get() + 1),),
+                "an open sink keeps the capture running"
+            );
+        }
+        assert_eq!(runs.get(), 3, "each finished frame reclaims exactly once");
+        assert!(
+            finish_profile_render_frame(&mut scheduling, ago(5), false, false, || runs
+                .set(runs.get() + 1),),
+            "a closed sink with no file output ends the capture"
+        );
+        assert_eq!(runs.get(), 4);
+        assert!(
+            !finish_profile_render_frame(&mut scheduling, ago(5), false, true, || runs
+                .set(runs.get() + 1),),
+            "a closed sink with file output keeps the capture running"
+        );
+        assert_eq!(runs.get(), 5);
+        assert!(
+            scheduling.snapshot(0).phase_ms.render >= 25,
+            "each finish accounts its Render phase"
         );
     }
 

@@ -1249,32 +1249,28 @@ pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64)> {
         return Ok((libc, offset));
     }
     let maps = std::fs::read("/proc/self/maps").context("/proc/self/maps")?;
-    static_probe_anchor(
-        &maps,
-        self_probe_anchor as *const () as usize as u64,
-        |path| std::fs::File::open(path),
-    )
+    static_probe_anchor(&maps, self_probe_anchor as *const () as usize as u64)
 }
 
-/// The static-build fallback behind [`self_probe_anchor`]: the observer's
-/// own entry point, since no libc is mapped. `maps` is this process's
-/// `/proc/self/maps` snapshot and `address` an address in its own
-/// executable text; `open` reads install paths, so tests can inject the
-/// EACCES an execute-only install meets without CAP_DAC_READ_SEARCH.
-fn static_probe_anchor(
-    _maps: &[u8],
-    _address: u64,
-    open: impl Fn(&Path) -> std::io::Result<std::fs::File>,
-) -> Result<(PathBuf, u64)> {
-    let exe = std::fs::read_link("/proc/self/exe").context("/proc/self/exe")?;
-    let file = open(&exe).with_context(|| format!("open {}", exe.display()))?;
-    let offset = p11scope_manifest::elf::entry_file_offset(&file).map_err(anyhow::Error::msg)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "entry point outside every loaded segment of {}; a stripped static build has no anchor",
-            exe.display()
-        )
-    })?;
-    Ok((exe, offset))
+/// The static-build fallback behind [`self_probe_anchor`]: an executable
+/// offset in the observer's own text, since no libc is mapped. `maps` is
+/// this process's `/proc/self/maps` snapshot and `address` an address in
+/// its own executable text. The offset comes from the mappings, opening
+/// no file: the installed binary may be execute-only (751/711), when even
+/// `/proc/self/exe` opens EACCES without CAP_DAC_READ_SEARCH. The kernel
+/// resolves the magic link at attach time, as the pid-filter probe
+/// already relies on.
+fn static_probe_anchor(maps: &[u8], address: u64) -> Result<(PathBuf, u64)> {
+    let entries =
+        p11scope_manifest::maps::parse_maps(maps).map_err(|error| anyhow::anyhow!(error))?;
+    let offset = entries
+        .into_iter()
+        .find_map(|entry| {
+            (entry.permissions[2] == b'x' && (entry.start..entry.end).contains(&address))
+                .then(|| entry.file_offset + (address - entry.start))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no executable mapping contains the self-probe anchor"))?;
+    Ok((PathBuf::from("/proc/self/exe"), offset))
 }
 
 /// Pure seam for the five independent facts behind `R`. Capability bits and
@@ -3035,16 +3031,9 @@ mod tests {
         // the kernel checks the underlying file. The static anchor must
         // derive its offset from its own mappings and attach through the
         // magic link, opening no install path at all.
-        let resolved = std::fs::read_link("/proc/self/exe").expect("own exe link");
         let maps = std::fs::read("/proc/self/maps").expect("own maps");
         let address = self_probe_anchor as *const () as usize as u64;
-        let anchor = static_probe_anchor(&maps, address, |path| {
-            if path == resolved {
-                // What an execute-only install meets without CAP_DAC_READ_SEARCH.
-                return Err(std::io::Error::from_raw_os_error(libc::EACCES));
-            }
-            std::fs::File::open(path)
-        });
+        let anchor = static_probe_anchor(&maps, address);
         assert!(
             anchor.is_ok(),
             "an unreadable install path must not fail the anchor: {anchor:?}"

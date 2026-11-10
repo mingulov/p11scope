@@ -4013,7 +4013,7 @@ fn open_in_target(
     }
 }
 
-/// One foreign-root open failure held back for the end-of-scan collapse.
+/// One foreign-root open failure held for its own per-object gap record.
 struct ForeignOpenFailure {
     subject: String,
     reason: String,

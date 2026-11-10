@@ -787,7 +787,7 @@ impl<'a> ViewFilesystem<'a> {
     /// observer's own root with `RESOLVE_NO_MAGICLINKS`, so a
     /// `/proc/self/fd`-style magic link is refused instead of followed.
     /// The pinned inode is verified regular before the readable reopen.
-    pub(crate) fn open_host_regular(path: &Path) -> Result<std::fs::File, String> {
+    fn open_host_regular(path: &Path) -> Result<std::fs::File, String> {
         if path_needs_absolute_no_traversal(path) {
             return Err(
                 "host-root object requires an absolute path without parent traversal".into(),
@@ -834,7 +834,7 @@ impl<'a> ViewFilesystem<'a> {
 
     /// [`open_host_regular`](Self::open_host_regular) with the shared
     /// object size cap.
-    pub(crate) fn open_host_object(path: &Path) -> Result<std::fs::File, String> {
+    fn open_host_object(path: &Path) -> Result<std::fs::File, String> {
         let file = Self::open_host_regular(path)?;
         let size = file.metadata().map_err(|error| error.to_string())?.len();
         let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
@@ -912,7 +912,8 @@ impl<'a> ViewFilesystem<'a> {
             resolve: 0x10 | 0x02, // RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS
         };
         // SAFETY: live root fd, bounded NUL-terminated relative name, and
-        // the kernel's fixed open_how layout. No failure has a loose fallback.
+        // the kernel's fixed open_how layout. Only a gated resolution
+        // failure retries on the host.
         // Each attempt re-resolves the same confined path, so a transient
         // refusal retries identically and only the final error reports.
         let result = retry_transient_open(|| {
@@ -954,9 +955,10 @@ impl<'a> ViewFilesystem<'a> {
     }
 
     fn open_pinned_regular(pinned: &std::fs::File) -> Result<std::fs::File, String> {
-        // pin_rooted_regular proved the inode before any readable open. Reopen
-        // that held inode, so pathname replacement cannot invoke special-file
-        // open semantics and ordinary provider symlinks remain supported.
+        // pin_rooted_regular_detailed proved the inode before any readable
+        // open. Reopen that held inode, so pathname replacement cannot invoke
+        // special-file open semantics and ordinary provider symlinks remain
+        // supported.
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC)

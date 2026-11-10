@@ -2252,12 +2252,34 @@ fn ellipsize_to(text: &str, max_chars: usize) -> String {
     format!("{kept}…")
 }
 
+/// Char-safe truncation to `max_chars` chars on a word boundary, marked
+/// with `…`. Cuts at the last space within the budget so titles read
+/// whole; a text without spaces in range falls back to a char cut so
+/// long machine names still fit. Fits already return unchanged.
+fn ellipsize_words_to(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars < 2 {
+        return ellipsize_to(text, max_chars);
+    }
+    let kept: String = text.chars().take(max_chars - 1).collect();
+    if let Some(last_space) = kept.rfind(' ') {
+        let trimmed = kept[..last_space].trim_end();
+        if !trimmed.is_empty() {
+            return format!("{trimmed}…");
+        }
+    }
+    ellipsize_to(text, max_chars)
+}
+
 /// One concise gap group line: `  {count} × {subject} — {reason}`.
 /// Short subjects stay whole (cutting a machine name to `nati…`
 /// loses it while saving little); the reason gives way instead.
 /// Long paths keep their tail at a `/` boundary (`…/libc.so.6`) so
-/// distinct files stay distinct; other long subjects keep their head.
-/// Only a reason overflowing on its own truncates the whole line.
+/// distinct files stay distinct; other long subjects keep their head
+/// on a word boundary, never mid-word. Only a reason overflowing on
+/// its own truncates the whole line, likewise on a word boundary.
 fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     let head = format!("  {count} × ");
     let tail = format!(" — {reason}");
@@ -2270,7 +2292,7 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     /// fallback below trims the reason instead.
     const SHORT_SUBJECT_KEEP: usize = 32;
     if subject.chars().count() <= SHORT_SUBJECT_KEEP || budget < 2 {
-        return ellipsize_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS);
+        return ellipsize_words_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS);
     }
     if subject.starts_with('/') {
         let chars: Vec<char> = subject.chars().collect();
@@ -2288,8 +2310,16 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
             return format!("{head}…{shown}{tail}");
         }
     }
-    let kept: String = subject.chars().take(budget - 1).collect();
-    format!("{head}{kept}…{tail}")
+    let kept_full: String = subject.chars().take(budget - 1).collect();
+    // Cut prose on a word boundary so titles read whole; a subject
+    // without spaces still fits via the char cut.
+    if let Some(last_space) = kept_full.rfind(' ') {
+        let trimmed = kept_full[..last_space].trim_end();
+        if !trimmed.is_empty() {
+            return format!("{head}{trimmed}…{tail}");
+        }
+    }
+    format!("{head}{kept_full}…{tail}")
 }
 
 /// The neutral successor spelling of

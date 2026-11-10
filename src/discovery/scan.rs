@@ -12771,6 +12771,95 @@ mod tests {
         }
     }
 
+    /// A memfd's mount (`mnt_id` 0) is absent from every mount
+    /// table, so resolving it fails exactly the way a foreign,
+    /// root-filtered table fails a join: the guard's missing-mount
+    /// arm, unprivileged.
+    fn unresolvable_memfd(name: &std::ffi::CStr) -> File {
+        use std::os::unix::io::FromRawFd as _;
+        // SAFETY: memfd_create with a NUL-terminated name takes no fd input.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: memfd_create returned a fresh owned descriptor.
+        unsafe { File::from_raw_fd(fd) }
+    }
+
+    /// The arm-entry premise both missing-mount twins share: the fd
+    /// must fail resolution with the missing-mount error, or the
+    /// twins below would silently test another path.
+    fn assert_missing_mount_unresolvable(view: &ProcessView, file: &File) {
+        let error = crate::discovery::identity::retained_object_key_cached(
+            view,
+            file,
+            &mut crate::process::MountTableCache::default(),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("a memfd mount stays unresolvable, forcing the guard arm");
+        assert!(
+            p11scope_manifest::identity::is_missing_mount_id_error(&error),
+            "the guard arm needs the missing-mount error, got {error:?}"
+        );
+    }
+
+    /// The missing-mount arm's accept half, at the guard itself: an
+    /// unresolvable fd at its own key accepts without the mount
+    /// table. Fails on an unconditional refusal in the arm.
+    #[test]
+    fn opened_file_identity_guard_accepts_a_missing_mount_match() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let file = unresolvable_memfd(c"guard-missing-mount-match");
+        assert_missing_mount_unresolvable(&view, &file);
+        let metadata = file.metadata().unwrap();
+        let expected = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        assert!(
+            opened_file_identity_guard(
+                &view,
+                &file,
+                expected,
+                &mut crate::process::MountTableCache::default(),
+                &mut CaptureWorkBudget::default(),
+            )
+            .is_ok(),
+            "an unresolvable fd at its own key must be accepted"
+        );
+    }
+
+    /// The missing-mount arm's stranger half, at the guard itself: an
+    /// unresolvable fd under another key refuses with the shared
+    /// mismatch wording. Fails on an unconditional accept in the arm.
+    #[test]
+    fn opened_file_identity_guard_refuses_a_missing_mount_stranger() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let file = unresolvable_memfd(c"guard-missing-mount-stranger");
+        assert_missing_mount_unresolvable(&view, &file);
+        let expected = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 999,
+        };
+        let error = opened_file_identity_guard(
+            &view,
+            &file,
+            expected,
+            &mut crate::process::MountTableCache::default(),
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect_err("an unresolvable stranger must be refused");
+        assert!(
+            error.contains("does not match mapped object"),
+            "the stranger refuses with the shared wording, got {error:?}"
+        );
+    }
+
     #[test]
     fn lower_elf_facts_cache_under_the_lower_files_own_key() {
         // The proven lower file's ELF facts must cache under the

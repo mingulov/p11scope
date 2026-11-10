@@ -6737,12 +6737,12 @@ mod tests {
             "global help must name which commands take --json: {USAGE}"
         );
         assert!(
-            USAGE.contains("-o FILE on profile/trace/run/inventory"),
+            USAGE.contains("-o FILE on profile/run/inventory"),
             "global help must name the -o JSON route: {USAGE}"
         );
         assert!(
-            USAGE.contains("trace takes -o -"),
-            "global help must name trace -o -: {USAGE}"
+            USAGE.contains("trace streams text"),
+            "global help must state trace streams text: {USAGE}"
         );
         assert!(
             USAGE.contains("--event-log"),

@@ -146,6 +146,14 @@ versioned separately and are opaque, exact dispatch keys.
   watching — an empty run reports PARTIAL with the `pid_namespace` cause
   until providers appear, then counts them — instead of refusing with
   `pid-namespace-mismatch` when zero modules are mapped at start.
+- A nested capture that sees only its own container (`docker run`
+  without `--pid=host`) warns at start and in the report ("only this
+  container is visible; run with --pid=host to see the host") instead
+  of silently covering the container alone. Views with other processes
+  visible (kind nodes) are unchanged.
+- `doctor` on the static release build samples the host's loader facts
+  from init when the observer itself is statically linked, instead of
+  warning that the loader is unbound on every host.
 
 ### Corrections
 

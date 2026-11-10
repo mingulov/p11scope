@@ -918,9 +918,10 @@ pub enum AdmissionScope {
     /// `libp11-kit` took a 410-endpoint prefix of its closure array and the
     /// provider the operator cared about was refused. Admission here is
     /// value-ordered — operator-attested (`--manifest`) modules, then
-    /// providers with a corroborated table, then heuristic providers with the
-    /// fewest tables, and proxy closure arrays last, each class ordered by
-    /// `(dev, inode)` so the admitted set never depends on discovery order.
+    /// providers with a corroborated table, then heuristic providers,
+    /// smallest fresh demand first within each class, and proxy closure
+    /// arrays last, ties ordered by `(dev, inode)` so the admitted set
+    /// never depends on discovery order.
     /// Operator-attested modules are admitted whole or not at all, as are
     /// Inventory/Counters/broad modules under their complete-union rule; a
     /// Detailed closure array admits only its published tables when unnamed
@@ -3242,9 +3243,36 @@ fn merge(
     let shared = admission_scope == AdmissionScope::Shared;
     let classes: Vec<(AdmissionClass, usize)> =
         groups.iter().map(|group| admission_class(group)).collect();
+    // Gross fresh demand per group: distinct exact targets not already
+    // active. Computed once before ordering and ignoring cross-group
+    // claiming, so it is order-independent. Small providers decide
+    // first within their class, so more of the machine stays watched
+    // when slots get scarce.
+    let demands: Vec<usize> = groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .flat_map(|module| &module.targets)
+                .map(|target| AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .filter(|key| !existing_slots.contains_key(key))
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .collect();
     let mut order: Vec<usize> = (0..groups.len()).collect();
     if shared {
-        order.sort_by_key(|&position| (classes[position], groups[position][0].key, position));
+        order.sort_by_key(|&position| {
+            (
+                classes[position],
+                demands[position],
+                groups[position][0].key,
+                position,
+            )
+        });
     } else {
         // Named scope keeps first-come discovery order for providers, but a
         // recognized proxy closure array is decided last in every scope, so
@@ -3461,6 +3489,12 @@ fn merge(
                 AdmissionClass::Corroborated | AdmissionClass::Heuristic
             );
         let mut use_provider_prefix_fallback = false;
+        // Function-level partial is the last resort before a whole
+        // refusal: a provider that fits neither whole nor as a table
+        // prefix still attaches its most important functions. Same
+        // scope as the table prefix — operator modules stay whole.
+        let provider_partial_allowed = provider_prefix_allowed;
+        let mut use_provider_partial_fallback = false;
         // Set when this pass refuses an unpublished closure limited to its
         // published tables: no capacity check failed, so the refusal states
         // no demand and leaves a named capture free to start.
@@ -3471,6 +3505,7 @@ fn merge(
             let whole = if published_only
                 || (closure_prefix_allowed && use_prefix_fallback)
                 || use_provider_prefix_fallback
+                || use_provider_partial_fallback
             {
                 false
             } else {
@@ -3634,8 +3669,12 @@ fn merge(
                 // oversized scan as a prefix.
                 // Route A: under published-only the strongest heuristic
                 // table is irrelevant — it never attaches. The published
-                // union check below is the only capacity gate.
-                if !published_only && let Some((top, _, _, _)) = ordered.first() {
+                // union check below is the only capacity gate. The
+                // function-level pass skips both: it subsets tables.
+                if !published_only
+                    && !use_provider_partial_fallback
+                    && let Some((top, _, _, _)) = ordered.first()
+                {
                     let top_fresh: BTreeSet<AttachKey> = keys_of
                         .get(top)
                         .map(|keys| keys.iter().filter(|key| is_fresh(key)).copied().collect())
@@ -3666,16 +3705,22 @@ fn merge(
                         published_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
                     }
                 }
-                if budget
-                    .checked_required(allocated_slots, published_union.len())
-                    .is_err()
+                if !use_provider_partial_fallback
+                    && budget
+                        .checked_required(allocated_slots, published_union.len())
+                        .is_err()
                 {
                     break 'refused published_union;
                 }
-                fresh = published_union;
-                // Empty published tables cost nothing: admitted, never spilled, never
-                // counted — they are corroborated, not uncorroborated.
-                admitted.extend(published.iter().copied());
+                // Published-union atomicity is replaced on the
+                // function-level pass only: it subsets tables, so nothing
+                // is pre-admitted here.
+                if !use_provider_partial_fallback {
+                    fresh = published_union;
+                    // Empty published tables cost nothing: admitted, never spilled, never
+                    // counted — they are corroborated, not uncorroborated.
+                    admitted.extend(published.iter().copied());
+                }
                 // Unresolved heuristic tables admit strongest-first until the
                 // per-object cap or the remaining global budget; the spill is
                 // uncorroborated evidence, never slots.
@@ -3694,7 +3739,152 @@ fn merge(
                 let mut closure_prefix: Option<(usize, usize)> = None;
                 let mut closure_published_partial: Option<(usize, usize)> = None;
                 let mut provider_prefix: Option<(usize, usize)> = None;
-                if whole {
+                let mut partial_pick: Option<(BTreeSet<AttachKey>, usize, usize)> = None;
+                if use_provider_partial_fallback {
+                    // Function-level partial: the tier-greedy subset under
+                    // the same reserve-aware budget. Tier 0 of every table
+                    // first, then tier-1 families (globally atomic — an
+                    // Init is never split from its continuations) and
+                    // singletons, then tier 2; table order, then ordinal,
+                    // inside each phase. Revivable keys ride free.
+                    let table_pos: BTreeMap<TableKey, usize> = ordered
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, (key, _, _, _))| (*key, pos))
+                        .collect();
+                    // Key -> (table position, tier, ordinal, table, family).
+                    let mut key_info: BTreeMap<AttachKey, (usize, u8, u16, TableKey, Option<u8>)> =
+                        BTreeMap::new();
+                    for (piece, module) in group.iter().enumerate() {
+                        let Some(evidence) = &module.scan_evidence else {
+                            continue;
+                        };
+                        for target in &module.targets {
+                            let Some(index) = target.table else {
+                                continue;
+                            };
+                            let Some(table) = evidence.tables.get(index) else {
+                                continue;
+                            };
+                            let key = AttachKey {
+                                object: target.object,
+                                file_offset: target.file_offset,
+                            };
+                            if !admissible(&key) {
+                                continue;
+                            }
+                            let chargeable = is_fresh(&key);
+                            let free = revival_allowed
+                                && revivable.contains_key(&key)
+                                && !claimed.contains(&key);
+                            if !chargeable && !free {
+                                continue;
+                            }
+                            let tkey = table_key(piece, index, table);
+                            let Some(pos) = table_pos.get(&tkey).copied() else {
+                                continue;
+                            };
+                            let canonical = canonical_partial_name(target);
+                            let tier = partial_tier(canonical);
+                            let ordinal = target.ordinal.map(|o| o.ordinal).unwrap_or(u16::MAX);
+                            let family = partial_family(canonical);
+                            key_info
+                                .entry(key)
+                                .or_insert((pos, tier, ordinal, tkey, family));
+                        }
+                    }
+                    let mut needed_set = fresh.clone();
+                    needed_set.extend(key_info.keys().filter(|key| is_fresh(key)).copied());
+                    if key_info.is_empty() {
+                        break 'refused needed_set;
+                    }
+                    // If tier 0 of the strongest table alone does not fit,
+                    // the module is refused whole — never "3 of 104" noise.
+                    let tier0_cost: usize = key_info
+                        .iter()
+                        .filter(|(key, (pos, tier, _, _, _))| {
+                            *pos == 0 && *tier == 0 && is_fresh(key)
+                        })
+                        .count();
+                    if budget
+                        .checked_required(allocated_slots, tier0_cost)
+                        .is_err()
+                    {
+                        break 'refused needed_set;
+                    }
+                    let fits = |spent: usize, cost: usize| {
+                        budget
+                            .checked_required(allocated_slots + spent, cost)
+                            .is_ok()
+                    };
+                    let mut tier0: Vec<(usize, u16, AttachKey)> = Vec::new();
+                    let mut families: BTreeMap<u8, Vec<(usize, u16, AttachKey)>> = BTreeMap::new();
+                    let mut singletons: Vec<(usize, u16, AttachKey)> = Vec::new();
+                    let mut tier2: Vec<(usize, u16, AttachKey)> = Vec::new();
+                    for (key, (pos, tier, ordinal, _, family)) in &key_info {
+                        match (tier, family) {
+                            (0, _) => tier0.push((*pos, *ordinal, *key)),
+                            (1, Some(family)) => families
+                                .entry(*family)
+                                .or_default()
+                                .push((*pos, *ordinal, *key)),
+                            (1, None) => singletons.push((*pos, *ordinal, *key)),
+                            _ => tier2.push((*pos, *ordinal, *key)),
+                        }
+                    }
+                    tier0.sort();
+                    singletons.sort();
+                    tier2.sort();
+                    let mut family_order: Vec<(usize, u16, u8)> = families
+                        .iter()
+                        .map(|(family, members)| {
+                            let (pos, ordinal, _) = members
+                                .iter()
+                                .min()
+                                .copied()
+                                .expect("families hold members");
+                            (pos, ordinal, *family)
+                        })
+                        .collect();
+                    family_order.sort();
+                    let mut chosen: BTreeSet<AttachKey> = BTreeSet::new();
+                    let mut spent_fresh = 0usize;
+                    for (_, _, key) in &tier0 {
+                        let cost = usize::from(is_fresh(key));
+                        if fits(spent_fresh, cost) {
+                            chosen.insert(*key);
+                            spent_fresh += cost;
+                        }
+                    }
+                    for (_, _, family) in &family_order {
+                        let members = &families[family];
+                        let cost: usize =
+                            members.iter().filter(|(_, _, key)| is_fresh(key)).count();
+                        if fits(spent_fresh, cost) {
+                            for (_, _, key) in members {
+                                chosen.insert(*key);
+                            }
+                            spent_fresh += cost;
+                        }
+                    }
+                    for (_, _, key) in singletons.iter().chain(tier2.iter()) {
+                        let cost = usize::from(is_fresh(key));
+                        if fits(spent_fresh, cost) {
+                            chosen.insert(*key);
+                            spent_fresh += cost;
+                        }
+                    }
+                    if chosen.is_empty() {
+                        break 'refused needed_set;
+                    }
+                    fresh.extend(chosen.iter().filter(|key| is_fresh(key)).copied());
+                    for key in &chosen {
+                        if let Some((_, _, _, tkey, _)) = key_info.get(key) {
+                            admitted.insert(*tkey);
+                        }
+                    }
+                    partial_pick = Some((chosen, fresh.len(), needed_set.len()));
+                } else if whole {
                     let mut scan_union = fresh.clone();
                     for (key, _, _, _) in &ordered {
                         if let Some(keys) = keys_of.get(key) {
@@ -3896,7 +4086,12 @@ fn merge(
                         if let Some(keys) = keys_of.get(key) {
                             revived.extend(
                                 keys.iter()
-                                    .filter(|key| revivable.contains_key(key))
+                                    .filter(|key| {
+                                        revivable.contains_key(key)
+                                            && partial_pick
+                                                .as_ref()
+                                                .is_none_or(|(chosen, _, _)| chosen.contains(key))
+                                    })
                                     .copied(),
                             );
                         }
@@ -3921,6 +4116,7 @@ fn merge(
                     closure_published_partial,
                     provider_prefix,
                     revived,
+                    partial_pick,
                 ));
             };
             // Over `kept` alone nothing is fresh, so only the first pass
@@ -4007,60 +4203,72 @@ fn merge(
                 refused_top = None;
                 continue 'admission;
             }
+            if provider_partial_allowed && kept.is_empty() && !use_provider_partial_fallback {
+                use_provider_partial_fallback = true;
+                uncorroborated_candidates = spill_baseline;
+                refused_top = None;
+                continue 'admission;
+            }
             break 'admission Err(refused);
         };
-        let (fresh, admitted, closure_prefix, closure_published_partial, provider_prefix, revived) =
-            match outcome {
-                Ok(admission) => admission,
-                Err(refused) => {
-                    if class != AdmissionClass::ClosureArray {
-                        provider_refused = true;
-                    }
-                    holding.remove(&object);
-                    let refusal = CapacityRefusal {
-                        policy: admission_policy,
-                        needed: refused.len(),
-                        capacity,
-                        in_use: allocated_slots,
-                        retired: retired.saturating_sub(revived_total),
-                        holders: slot_holders(&holding, &paths),
-                        reserve: reserved.then_some(reserve),
-                        closure_tables: (class == AdmissionClass::ClosureArray)
-                            .then_some(table_count),
-                        aim_hint: shared,
-                        naming_hint: is_detailed_closure
-                            && !shared
-                            && !closure_late_start
-                            && !closure_named,
-                        counter_hint,
-                        unpublished: awaiting_publication,
-                        broad_admit,
-                    };
-                    let reason = refusal.reason();
-                    let kind = if awaiting_publication {
-                        RefusalKind::AwaitingPublication
-                    } else {
-                        RefusalKind::CapacityWhole
-                    };
-                    // The kind and the wording agree at construction; later
-                    // rewordings keep the kind. One direction only: whole
-                    // refusals interpolate holder paths verbatim, so the text
-                    // oracle is not a whole-refusal invariant.
-                    debug_assert!(
-                        kind != RefusalKind::AwaitingPublication
-                            || is_closure_awaiting_publication(&reason),
-                        "awaiting kind without awaiting wording: {reason}"
-                    );
-                    decisions[position] = Some(AdmissionDecision::Refused {
-                        skipped: Skipped {
-                            subject: path.to_string(),
-                            reason,
-                        },
-                        kind,
-                    });
-                    continue;
+        let (
+            fresh,
+            admitted,
+            closure_prefix,
+            closure_published_partial,
+            provider_prefix,
+            revived,
+            partial_pick,
+        ) = match outcome {
+            Ok(admission) => admission,
+            Err(refused) => {
+                if class != AdmissionClass::ClosureArray {
+                    provider_refused = true;
                 }
-            };
+                holding.remove(&object);
+                let refusal = CapacityRefusal {
+                    policy: admission_policy,
+                    needed: refused.len(),
+                    capacity,
+                    in_use: allocated_slots,
+                    retired: retired.saturating_sub(revived_total),
+                    holders: slot_holders(&holding, &paths),
+                    reserve: reserved.then_some(reserve),
+                    closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
+                    aim_hint: shared,
+                    naming_hint: is_detailed_closure
+                        && !shared
+                        && !closure_late_start
+                        && !closure_named,
+                    counter_hint,
+                    unpublished: awaiting_publication,
+                    broad_admit,
+                };
+                let reason = refusal.reason();
+                let kind = if awaiting_publication {
+                    RefusalKind::AwaitingPublication
+                } else {
+                    RefusalKind::CapacityWhole
+                };
+                // The kind and the wording agree at construction; later
+                // rewordings keep the kind. One direction only: whole
+                // refusals interpolate holder paths verbatim, so the text
+                // oracle is not a whole-refusal invariant.
+                debug_assert!(
+                    kind != RefusalKind::AwaitingPublication
+                        || is_closure_awaiting_publication(&reason),
+                    "awaiting kind without awaiting wording: {reason}"
+                );
+                decisions[position] = Some(AdmissionDecision::Refused {
+                    skipped: Skipped {
+                        subject: path.to_string(),
+                        reason,
+                    },
+                    kind,
+                });
+                continue;
+            }
+        };
         // PA-5 M3: a provider growth omission blocks the closure prefix
         // below — a prefix never hides a loss. Zero-demand preservation
         // (no record) does not block. A JK-22a provider prefix does not
@@ -4094,8 +4302,8 @@ fn merge(
             closure_prefix,
             closure_published_partial,
             provider_prefix,
-            partial_keys: None,
-            provider_partial: None,
+            partial_keys: partial_pick.as_ref().map(|(keys, _, _)| keys.clone()),
+            provider_partial: partial_pick.map(|(_, attached, needed)| (attached, needed)),
         });
     }
 
@@ -4153,7 +4361,6 @@ fn merge(
                 provider_partial,
             ),
         };
-        let _ = (&partial_keys, &provider_partial);
         // Part 0: a prefix-admitted closure names its covered templates.
         // The module is admitted (its prefix counts), but calls through the
         // other templates are not observed — a partial gap, never silent.
@@ -4213,6 +4420,27 @@ fn merge(
             refused_module_objects.push((object, prefix.clone(), RefusalKind::ProviderPrefix));
             modules_skipped.push(prefix);
         }
+        // Function-level partial: the module is admitted on its most
+        // important endpoints, but calls through the others are not
+        // observed — a partial gap, never silent. Same reserve clause
+        // and appended tag shape as the table prefix above.
+        if let Some((attached, needed)) = provider_partial {
+            let mut reason = format!(
+                "{attached} of {needed} endpoints attached; calls through the others are not counted"
+            );
+            if shared && class.leaves_reserve() {
+                reason.push_str(&format!(
+                    "; {reserve} are reserved for providers with a corroborated function table"
+                ));
+            }
+            reason.push_str(" (provider_partial)");
+            let partial = Skipped {
+                subject: path.to_string(),
+                reason,
+            };
+            refused_module_objects.push((object, partial.clone(), RefusalKind::ProviderPartial));
+            modules_skipped.push(partial);
+        }
         // Per scan piece, per table index: admitted above. Manifest pieces
         // carry `None` and admit every target.
         let admitted_instance: Vec<Option<Vec<bool>>> = group
@@ -4271,6 +4499,20 @@ fn merge(
                         .unwrap_or(false);
                     if !admitted_table {
                         continue;
+                    }
+                }
+                if let Some(chosen) = partial_keys.as_ref() {
+                    // Function-level partial: only the chosen subset
+                    // builds. Manifest pieces admit whole and never
+                    // carry a subset.
+                    if module.scan_evidence.is_some() {
+                        let target_key = AttachKey {
+                            object: target.object,
+                            file_offset: target.file_offset,
+                        };
+                        if !chosen.contains(&target_key) {
+                            continue;
+                        }
                     }
                 }
                 if refused_growth.is_some() {
@@ -15348,6 +15590,30 @@ mod tests {
             !is_partial_coverage(&plan.modules_skipped[0].reason),
             "a manifest module is refused whole: {}",
             plan.modules_skipped[0].reason
+        );
+    }
+
+    /// Shared scope admits the small provider before the big one: two
+    /// corroborated groups where only one fits whole, the big group
+    /// holding the smaller `(dev, inode)` key — inode luck must not
+    /// decide what a capture sees.
+    #[test]
+    fn shared_scope_admits_small_provider_before_big() {
+        let big = provider_with_tables(71, "/opt/big.so", 1, 400, true);
+        let small = provider_with_tables(72, "/opt/small.so", 1, 200, true);
+        let shared = scoped_plan(&[big, small], AdmissionScope::Shared);
+        assert_eq!(
+            slots_of(&shared, 72),
+            200,
+            "the small provider admits whole"
+        );
+        assert_eq!(slots_of(&shared, 71), 0, "the big provider does not fit");
+        let refusal = refusal_of(&shared, "/opt/big.so").expect("whole refusal reported");
+        assert_eq!(
+            whole_refusal_needed_count(&refusal.reason),
+            Some(400),
+            "the complete fresh demand: {}",
+            refusal.reason
         );
     }
 

@@ -11104,6 +11104,32 @@ pub(crate) mod tests {
         assert!(text.contains("100 of 150 endpoints attached"), "{text}");
     }
 
+    /// A function-level partial-admitted provider reads the same way: its
+    /// attached endpoints as partially covered, counted under "modules
+    /// partially covered" rather than "modules refused".
+    #[test]
+    fn scope_summary_names_a_function_partial_provider() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/trust.so".into(),
+            reason: "40 of 68 endpoints attached; calls through the others are not counted (provider_partial)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/trust.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("40 of 68 endpoints attached"), "{text}");
+    }
+
     /// A whole refusal whose holder path names `(provider_prefix)` still
     /// renders as refused, never as partially covered.
     #[test]

@@ -25,12 +25,15 @@ shared-scope Detailed capture may attach in part, as a named partial
 gap, instead of being refused whole. Such a module appears in both
 `discovery[]` and `modules_skipped[]`; its `reason`
 opens with the attached-vs-total counts — `A of N endpoints attached;
-calls through the others are not counted (provider_prefix)` for an
-ordinary provider, `M of N template tables attached; calls through
-the others are not counted (closure_prefix)` for a late-start proxy
-closure array, or `K of M template tables attached; calls through the
-others are not counted (closure_published_only)` for an already-loaded
-unnamed layer's published-only spill — rather than with `module needs`.
+calls through the others are not counted (provider_prefix)` for a
+leading-tables prefix of an ordinary provider, `A of N endpoints
+attached; calls through the others are not counted (provider_partial)`
+for a function-level partial of one, `M of N template tables attached;
+calls through the others are not counted (closure_prefix)` for a
+late-start proxy closure array, or `K of M template tables attached;
+calls through the others are not counted (closure_published_only)` for
+an already-loaded unnamed layer's published-only spill — rather than
+with `module needs`.
 The whole-refusal (`module needs …`) and growth-omission
 (`admitted module needs …`) openings are unchanged, and every kind —
 whole refusal, growth omission, and any of the three named partials —

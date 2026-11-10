@@ -650,10 +650,20 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
         let (class, reason) = partial
             .split_once("): ")
             .ok_or("text partial reason is missing")?;
+        // Endpoint partials open with attached counts ("A of N ...");
+        // template-table partials carry tables instead of endpoints.
+        let endpoints = reason
+            .contains("endpoints attached")
+            .then(|| {
+                reason
+                    .split_once(" of ")
+                    .and_then(|(attached, _)| attached.parse().ok())
+            })
+            .flatten();
         Ok(WholeAdmission {
             state: "partial",
             class,
-            endpoints: None,
+            endpoints,
             reason: Some(reason),
         })
     } else {
@@ -693,6 +703,25 @@ fn validate_whole_admission(
             {
                 return Err(format!(
                     "expected a capacity-shaped whole refusal: {reason}"
+                ));
+            }
+            Ok(())
+        }
+        "partial" if !wide => {
+            let endpoints = admission
+                .endpoints
+                .ok_or("partial admission endpoints are missing")?;
+            let reason = admission.reason.ok_or("partial gap reason is missing")?;
+            if endpoints == 0
+                || endpoints >= fixture.demand as u64
+                || !reason.contains(&format!(
+                    "{endpoints} of {} endpoints attached",
+                    fixture.demand
+                ))
+                || !reason.contains("(provider_partial)")
+            {
+                return Err(format!(
+                    "expected a named function-level partial gap: {reason}"
                 ));
             }
             Ok(())
@@ -903,22 +932,27 @@ fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
     assert_eq!(b["admission"]["scan_only"], true);
     match b["admission"]["state"].as_str() {
         Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
-        Some("partial") if !strict_admission() => {
+        Some("partial") => {
+            // A corroborated provider partial may crowd B out even in
+            // strict mode; the gap stays named with counts either way.
             assert!(b["admission"]["endpoints"].as_u64().unwrap() > 0);
             let reason = b["admission"]["reason"].as_str().unwrap();
             assert!(
-                reason.contains("endpoints attached") && reason.contains("(provider_prefix)"),
-                "relaxed B partial must be a named prefix gap with counts: {reason}"
+                reason.contains("endpoints attached")
+                    && (reason.contains("(provider_prefix)")
+                        || reason.contains("(provider_partial)")),
+                "B partial must be a named prefix/partial gap with counts: {reason}"
             );
         }
-        Some("refused") if !strict_admission() => {
+        Some("refused") => {
             assert!(b["admission"]["endpoints"].is_null());
             let reason = b["admission"]["reason"].as_str().unwrap();
             assert!(
                 reason.contains("attach slots")
                     || (reason.contains("endpoints attached")
-                        && reason.contains("(provider_prefix)")),
-                "relaxed B refusal must be capacity-shaped or a named prefix gap: {reason}"
+                        && (reason.contains("(provider_prefix)")
+                            || reason.contains("(provider_partial)"))),
+                "B refusal must be capacity-shaped or a named prefix/partial gap: {reason}"
             );
         }
         state => panic!("unexpected partial-export admission: {state:?}"),
@@ -969,17 +1003,32 @@ fn catalog_reader_finds_every_fixture_object() {
     assert_eq!(sha256_file(&fixtures.prov), sha256_file(&fixtures.v2));
     assert_ne!(sha256_file(&fixtures.prov), sha256_file(&fixtures.v1));
     assert_eq!(b["admission"]["class"], "corroborated");
-    if strict {
-        assert_eq!(b["admission"]["state"], "admitted");
-        assert_eq!(b["admission"]["endpoints"], 92);
-    } else if b["admission"]["state"] == "refused" {
-        assert!(
-            b["admission"]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("attach slots"),
-            "relaxed B refusal must still be capacity-shaped"
-        );
+    // Live competition decides B's fate: admitted whole with room, a
+    // named partial gap when crowded, or a capacity-shaped refusal when
+    // even tier-0 does not fit. Each state keeps its shape pins.
+    match b["admission"]["state"].as_str() {
+        Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
+        Some("partial") => {
+            let endpoints = b["admission"]["endpoints"].as_u64().unwrap();
+            assert!(endpoints > 0 && endpoints < 92);
+            let reason = b["admission"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(&format!("{endpoints} of 92 endpoints attached"))
+                    && (reason.contains("(provider_prefix)")
+                        || reason.contains("(provider_partial)")),
+                "B partial must be a named gap with counts: {reason}"
+            );
+        }
+        Some("refused") => {
+            assert!(
+                b["admission"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("attach slots"),
+                "B refusal must still be capacity-shaped"
+            );
+        }
+        state => panic!("unexpected B admission: {state:?}"),
     }
 
     // A: same-path dance, V1 bytes. The kernel marks the replaced
@@ -1010,9 +1059,11 @@ fn catalog_reader_finds_every_fixture_object() {
     );
 
     // N: eight interface-linked tables (publication evidence), with 544
-    // distinct physical endpoints. Default refuses the whole object;
-    // strict wide must admit the complete union, never a strongest-table
-    // prefix; relaxed wide may instead report a whole capacity refusal.
+    // distinct physical endpoints. Default attaches the most important
+    // endpoints as a named function-level partial gap (or refuses the
+    // whole object when even tier-0 does not fit); strict wide must
+    // admit the complete union, never a strongest-table prefix; relaxed
+    // wide may instead report a whole capacity refusal.
     let n = object_for(doc, &run.pids, "nss.so");
     let n_tables = tables_of(n);
     assert_eq!(n_tables.len(), 8);
@@ -1078,17 +1129,31 @@ fn catalog_reader_finds_every_fixture_object() {
         );
     }
     assert_eq!(m["admission"]["class"], "heuristic");
-    if strict {
-        assert_eq!(m["admission"]["state"], "admitted");
-        assert_eq!(m["admission"]["endpoints"], 27);
-    } else if m["admission"]["state"] == "refused" {
-        assert!(
-            m["admission"]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("attach slots"),
-            "relaxed MW refusal must still be capacity-shaped"
-        );
+    // Live competition decides MW's fate: a corroborated provider
+    // partial may crowd it out entirely. Each state keeps its shape.
+    match m["admission"]["state"].as_str() {
+        Some("admitted") => assert_eq!(m["admission"]["endpoints"], 27),
+        Some("partial") => {
+            let endpoints = m["admission"]["endpoints"].as_u64().unwrap();
+            assert!(endpoints > 0 && endpoints < 27);
+            let reason = m["admission"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(&format!("{endpoints} of 27 endpoints attached"))
+                    && (reason.contains("(provider_prefix)")
+                        || reason.contains("(provider_partial)")),
+                "MW partial must be a named gap with counts: {reason}"
+            );
+        }
+        Some("refused") => {
+            assert!(
+                m["admission"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("attach slots"),
+                "MW refusal must still be capacity-shaped"
+            );
+        }
+        state => panic!("unexpected MW admission: {state:?}"),
     }
 
     // T: mapped but never called. Zero tables, verified-absence note.
@@ -1192,22 +1257,35 @@ fn catalog_reader_finds_every_fixture_object() {
     // Fixture-owned admissions only: an ambient same-uid process keeps its
     // maps readable under ptrace_scope=1, so a desktop's libp11-kit is
     // cataloged and admitted at 0 endpoints, while a hosted runner maps
-    // none. N/C are default whole-refusals and strict wide whole-admissions;
-    // T/H have zero endpoints and always fit. Wide N/C, like B/M, may be
-    // refused after readable ambient occupancy, hence the strict gate.
+    // none. N is a default partial-or-refusal and a strict wide
+    // whole-admission; C is refused; T/H have zero endpoints and always
+    // fit. B/M/N/C, like wide N/C, may lose room to live competition or
+    // to an earlier corroborated partial, so only T/H are counted here —
+    // every other fixture keeps its per-object shape pins above.
     assert_eq!(h["admission"]["state"], "admitted");
+    assert_eq!(t["admission"]["state"], "admitted");
     let fixture_admitted = [b, m, t, h, n, c]
         .iter()
         .filter(|object| object["admission"]["state"] == "admitted")
         .count();
-    if strict {
+    let fixture_covered = [b, m, t, h, n, c]
+        .iter()
+        .filter(|object| {
+            object["admission"]["state"] == "admitted" || object["admission"]["state"] == "partial"
+        })
+        .count();
+    // T/H (zero endpoints) always admitted; B/M/N each admitted, partial,
+    // or capacity-shaped refused (pinned per object above) depending on
+    // live competition and earlier corroborated partials; C refused. The
+    // strict-wide whole-admission pin is unchanged: partial never fires
+    // when everything fits.
+    if strict && wide {
         assert_eq!(
-            fixture_admitted,
-            if wide { 6 } else { 4 },
-            "B, M, T and H must be admitted, plus N/C in the wide profile"
+            fixture_admitted, 6,
+            "B, M, T, H, N and C must be admitted in the wide profile"
         );
     } else {
-        assert!(fixture_admitted >= 2, "T/H must be admitted");
+        assert!(fixture_covered >= 2, "at least T/H must be admitted");
     }
     for object in objects {
         assert_eq!(object["admission"]["scan_only"], true);

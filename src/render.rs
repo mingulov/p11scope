@@ -2430,31 +2430,44 @@ const GAP_PROVIDERS_SHOWN: usize = 3;
 /// up to `MODULE_GAPS_SHOWN`; quiet shows none.
 pub(crate) const CONCISE_MODULE_GAPS_SHOWN: usize = 2;
 
-/// The concise twin of [`module_gap_lines`]: the first one or two
-/// refused or partially covered providers with file, plain status and
-/// the `--module` remedy, so a concise PARTIAL names its target
-/// without requiring `-v`. Empty when nothing was refused.
+/// Display severity of one `modules_skipped` row, most
+/// decision-relevant first: a whole-refused provider (no calls counted
+/// at all) reads before a partially covered one (some endpoints still
+/// watched), which reads before a refused proxy closure (its forwarded
+/// calls are counted at the attached providers below it).
+fn skipped_severity_rank(reason: &str) -> u8 {
+    if crate::plan::is_partial_coverage(reason) {
+        1
+    } else if crate::plan::is_closure_array_refusal(reason) {
+        2
+    } else {
+        0
+    }
+}
+
+/// `modules_skipped` in display order: severity rank first, plan order
+/// within a rank (the sort is stable, so ties keep their plan order).
+fn ordered_module_gaps(skipped: &[SkippedOut]) -> Vec<&SkippedOut> {
+    let mut ordered: Vec<&SkippedOut> = skipped.iter().collect();
+    ordered.sort_by_key(|row| skipped_severity_rank(&row.reason));
+    ordered
+}
+
+/// The concise twin of [`module_gap_lines`]: the most decision-relevant
+/// one or two refused or partially covered providers with file, plain
+/// status and the `--module` remedy, so a concise PARTIAL names its
+/// target without requiring `-v`. Empty when nothing was refused.
 fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     let total = ev.discovery.modules_skipped.len();
     if total == 0 {
         return String::new();
     }
-    // Whole capacity refusals first, partials second, awaiting-publication
-    // proxy lines last — stable, so JSON order is untouched and ties keep
-    // discovery order. A concise reader sees the real gaps without `-v`.
-    let mut ranked: Vec<&SkippedOut> = ev.discovery.modules_skipped.iter().collect();
-    ranked.sort_by_key(|skipped| {
-        if crate::plan::is_closure_awaiting_publication(&skipped.reason) {
-            2
-        } else if crate::plan::is_partial_coverage(&skipped.reason) {
-            1
-        } else {
-            0
-        }
-    });
     let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
     let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for skipped in ranked.into_iter().take(shown) {
+    for skipped in ordered_module_gaps(&ev.discovery.modules_skipped)
+        .into_iter()
+        .take(shown)
+    {
         out.push_str(&format!(
             "  {}: {}\n",
             escape_controls(&skipped.name),
@@ -2478,7 +2491,10 @@ fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     }
     let shown = total.min(MODULE_GAPS_SHOWN);
     let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+    for skipped in ordered_module_gaps(&ev.discovery.modules_skipped)
+        .into_iter()
+        .take(shown)
+    {
         out.push_str(&format!(
             "  {}: {}\n",
             escape_controls(&skipped.name),
@@ -11527,6 +11543,88 @@ pub(crate) mod tests {
         assert!(text.contains("/opt/refused4.so: not attached — "), "{text}");
         assert!(!text.contains("/opt/refused5.so"), "{text}");
         assert!(text.contains("and 2 more"), "{text}");
+    }
+
+    /// A proxy closure refusal must not push whole-refused providers out
+    /// of the concise list: the plan can order proxies first while the
+    /// refused files (the ones whose calls are not counted at all) hide
+    /// behind "and K more". Concise names the refused providers first.
+    #[test]
+    fn concise_module_gaps_name_refused_providers_before_proxy_closures() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8".into(),
+            reason: format!(
+                "a proxy closure array in a detailed capture attaches only its published tables, \
+                 and none of its 67 lookalike function tables is published yet, so calls through \
+                 it are not counted {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED,
+            ),
+        });
+        for (name, need) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so",
+                "module needs 68 more; only 512 attach slots are available",
+            ),
+            (
+                "/snap/firefox/9057/usr/lib/firefox/libsoftokn3.so",
+                "module needs 212 more; only 512 attach slots are available",
+            ),
+        ] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: need.into(),
+            });
+        }
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "system",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(text.contains("Module gaps (showing 2 of 3):"), "{text}");
+        assert!(text.contains("p11-kit-trust.so"), "{text}");
+        assert!(
+            text.contains("/snap/firefox/9057/usr/lib/firefox/libsoftokn3.so"),
+            "{text}"
+        );
+        assert!(text.contains("and 1 more"), "{text}");
+        assert!(
+            !text.contains("/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8"),
+            "{text}"
+        );
+    }
+
+    /// The verbose list keeps the same severity order: refused providers
+    /// read before proxy closures there too.
+    #[test]
+    fn verbose_module_gaps_name_refused_providers_before_proxy_closures() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/proxy.so".into(),
+            reason: format!(
+                "a proxy closure array in a detailed capture attaches only its published tables, \
+                 and none of its 67 lookalike function tables is published yet, so calls through \
+                 it are not counted {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED,
+            ),
+        });
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/refused.so".into(),
+            reason: "module needs 68 more; only 512 attach slots are available".into(),
+        });
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "system",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("Module gaps (showing 2 of 2):"), "{text}");
+        let refused = text.find("/opt/refused.so").expect("refused row");
+        let proxy = text.find("/opt/proxy.so").expect("proxy row");
+        assert!(refused < proxy, "{text}");
     }
 
     #[test]

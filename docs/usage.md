@@ -897,8 +897,10 @@ captured, whether the stop was a signal, the command's own exit or
   it; p11scope then exits nonzero with the error on stderr.
 
 The terminal gaps above use the existing generic `skipped` pair in JSON
-(`discovery subject` / `discovery unavailable`); the specific failed read
-is named on stderr and in the returned error.
+(`discovery subject` / `discovery unavailable`), except a run that never
+acquired a snapshot: its gap is `evidence.snapshot_failure` alone, with no
+`skipped` entry. The specific failed read is named on stderr and in the
+returned error.
 
 In every case the error names every failed step.
 

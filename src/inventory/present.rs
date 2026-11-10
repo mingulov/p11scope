@@ -2384,6 +2384,50 @@ fn is_foreign_root_reason(reason: &str) -> bool {
         && reason.contains("(target root ")
 }
 
+/// True for an ESRCH retained-root open under a foreign root: the
+/// target process ended mid-scan or its foreign root became
+/// unusable (a sandbox jail dangling through a dead pid reads
+/// exactly this way on alive processes) — the observer cannot tell
+/// which, so concise folds every such row into one counted family
+/// line instead of one machine-token line per root. Same-root ESRCH
+/// keeps the pinned exit-race words; foreign ENOENT keeps its
+/// per-root fold; a host-root fallback attempt names a live process
+/// instead, so those never match.
+fn is_unreachable_process_reason(reason: &str) -> bool {
+    reason.starts_with("opening object within retained target root: No such process")
+        && reason.contains("(target root ")
+        && !reason.contains("(host-root fallback:")
+}
+
+/// One unreachable-process family's concise display: a single counted
+/// line naming the outcome with exact object and process counts.
+/// Rows without a pid read as unreachable objects rather than
+/// counting zero processes.
+fn unreachable_fold_display(group: &[&GapView]) -> (String, String) {
+    let mut processes = std::collections::BTreeSet::new();
+    let mut unnamed = 0usize;
+    for gap in group {
+        match gap.pid {
+            Some(pid) => {
+                processes.insert(pid);
+            }
+            None => {
+                unnamed += 1;
+            }
+        }
+    }
+    let objects = group.len();
+    let reason = if unnamed == 0 {
+        let processes = processes.len();
+        let plural = if processes == 1 { "" } else { "es" };
+        format!("in {processes} process{plural} ended or unreachable (--json lists each)")
+    } else {
+        let plural = if objects == 1 { "" } else { "s" };
+        format!("{objects} mapped object{plural} unreachable (--json lists each)")
+    };
+    ("mapped objects not examined".to_string(), reason)
+}
+
 /// One foreign-root group's concise display: the cause with its target
 /// root, a single keeping its object subject, a group folding to one
 /// counted `mapped objects` line that points at JSON for each object.
@@ -2530,6 +2574,9 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// Deferred-attach per-receipt rows covered by a stop-time summary
 /// group under it, so concise shows one line per module while JSON
 /// keeps every row.
+/// ESRCH opens under a foreign root fold across roots into one
+/// unreachable-process family line (exact object and process
+/// counts); verbose and JSON keep every row.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
@@ -2553,10 +2600,14 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         }
         map
     };
-    // Foreign-root open failures (retained-root prefix plus the
+    // Foreign-root ESRCH opens (an ended process or an unusable
+    // foreign root — see `is_unreachable_process_reason`) fold across
+    // roots into one counted family line below, while other
+    // foreign-root open failures (retained-root prefix plus the
     // target-root suffix) fold by stored reason — one counted line per
-    // distinct reason naming its root — while size-cap and precondition
+    // distinct reason naming its root — and size-cap and precondition
     // refusals keep their per-object subject/reason rows below.
+    let mut unreachable: Vec<&GapView> = Vec::new();
     let mut foreign: std::collections::BTreeMap<&str, Vec<&GapView>> =
         std::collections::BTreeMap::new();
     // Same-kind scope folds: per-pass kernel-thread absence notes
@@ -2576,6 +2627,8 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
             && kernel_thread_absence_count(gap_plain_reason(&gap.reason)).is_some()
         {
             kthreads.push(gap);
+        } else if is_unreachable_process_reason(&gap.reason) {
+            unreachable.push(gap);
         } else if is_foreign_root_reason(&gap.reason) {
             foreign.entry(gap.reason.as_str()).or_default().push(gap);
         } else {
@@ -2625,6 +2678,16 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         let reason = escape_controls(&kernel_thread_fold_reason(total)).into_owned();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += kthreads.len();
+    }
+    if !unreachable.is_empty() {
+        let (subject, reason) = unreachable_fold_display(&unreachable);
+        let subject = escape_controls(&subject).into_owned();
+        let reason = escape_controls(&reason).into_owned();
+        // Unreachable-process rows always name an object, so the family
+        // is never a scope group.
+        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        entry.0 += unreachable.len();
+        entry.1 = false;
     }
     if groups.is_empty() {
         return Vec::new();

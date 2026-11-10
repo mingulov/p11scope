@@ -143,7 +143,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   reads, the final lifecycle drain, the binder's finish): that commit's
   incarnation events and gaps precede one more `pass_committed` with the
   additive `final: true`, the last pass's `pass` number and zero scan
-  counts, so `new_gaps` still sums to every streamed gap. A scan-only
+  counts, so `new_gaps` still sums to every streamed gap. Exception: a
+  still-silent run's final flush carries its one synthesized
+  `joint_birth_unoffered` bootstrap gap outside any marker. A scan-only
   run that ends with zero completed passes by stop/deadline (not error)
   likewise streams its one diagnostic gap under a `final: true` marker
   with `pass` 0 and zero scan counts. Absent `final` means a scan pass.

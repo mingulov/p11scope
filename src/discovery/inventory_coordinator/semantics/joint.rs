@@ -743,15 +743,34 @@ fn disclose_s1_birth_deferred(
 }
 
 /// Every (image, file) key holding a birth receipt in this
-/// batch, deduplicated: the re-offer set for a batch-wide
-/// transient refusal.
+/// batch whose birth is not already a healthy duplicate,
+/// deduplicated: the re-offer set for a batch-wide transient
+/// refusal. A receipt whose admission entry names a key already
+/// holding an installed non-S1Only feed is the same duplicate
+/// offer the per-key path would leave final (`AlreadySelected`):
+/// re-offering it would evict a healthy feed that never failed,
+/// so it is skipped. Keys with no matching entry, unheld keys,
+/// and S1Only-held keys still re-offer, exactly as before.
 fn birth_reoffer_keys(
+    registry: &CallerRegistry,
     batch: &PreparedSemanticBatch,
 ) -> Vec<(p11scope_ebpf_common::ImageIdentity, u32)> {
     let mut keys: Vec<_> = batch
         .current
         .iter()
         .filter(|receipt| receipt.birth_quantum().is_some())
+        .filter(|receipt| {
+            !batch.entries.iter().any(|entry| {
+                let Some(Ok(input)) = entry.input.as_ref() else {
+                    return false;
+                };
+                let (domain, image, router, _) = input.journal_binding();
+                domain == receipt.domain()
+                    && image == receipt.image()
+                    && receipt.instances().contains(&router)
+                    && registry.held_feed_is_not_s1only(input)
+            })
+        })
         .map(|receipt| (receipt.image(), receipt.endpoint().file_slot))
         .collect();
     keys.sort_by_key(|(image, file)| (image.task_cookie, image.exec_id, *file));
@@ -765,7 +784,7 @@ fn deferred_disposition(
     deferred_reason: String,
     original_reason: String,
 ) -> PreparedBirthDisposition {
-    let reoffers = birth_reoffer_keys(batch)
+    let reoffers: Vec<BirthReoffer> = birth_reoffer_keys(registry, batch)
         .into_iter()
         .map(|(image, file)| BirthReoffer {
             caller: None,
@@ -774,6 +793,14 @@ fn deferred_disposition(
             reason: original_reason.clone(),
         })
         .collect();
+    if reoffers.is_empty() {
+        // Every birth-bearing receipt duplicates an installed
+        // feed: nothing was delayed, so no delay is disclosed.
+        return PreparedBirthDisposition {
+            installed: 0,
+            reoffers,
+        };
+    }
     disclose_s1_birth_deferred(registry, None, deferred_reason);
     PreparedBirthDisposition {
         installed: 0,

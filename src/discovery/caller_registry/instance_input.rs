@@ -2341,6 +2341,17 @@ impl CallerRegistry {
         }
     }
 
+    /// Whether this exact admitted key already holds an installed
+    /// feed that is not S1Only: a birth offer for it is a healthy
+    /// duplicate the per-key path would leave final
+    /// (`AlreadySelected`), never defer. The batch-wide deferral
+    /// path skips such keys instead of re-offering — and evicting
+    /// — a feed that never failed. Held S1Only keys and unheld
+    /// keys still re-offer, exactly as the per-key probe decides.
+    pub(crate) fn held_feed_is_not_s1only(&self, input: &AdmittedInstanceCall) -> bool {
+        self.instance_state.by_key.contains_key(&input.key) && !self.admitted_feed_is_s1only(input)
+    }
+
     pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {
         let record = self.instance_state.semantics.get(&target.id)?;
         (record.caller == target.caller
@@ -5007,6 +5018,83 @@ mod journal_unavailable_tests {
             "a linked attachment still selects Joint"
         );
         assert_eq!(scene.registry.joint_feeds(), 1);
+    }
+
+    /// Truth table for the batch-wide duplicate skip: an unheld
+    /// key and an S1Only-held key re-offer (the per-key path
+    /// would install or defer them); a Joint-held key never does
+    /// (the per-key path would leave the healthy duplicate
+    /// final). A key held under another caller reads as held
+    /// too: its duplicate is final there as well.
+    #[test]
+    fn held_feed_probe_skips_only_non_s1only_duplicates() {
+        let mut scene = UnlinkedScene::new();
+        let fresh = scene.key(1);
+        let fresh_input = AdmittedInstanceCall::scripted(
+            fresh,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            !scene.registry.held_feed_is_not_s1only(&fresh_input),
+            "an unheld key still re-offers"
+        );
+        let (s1_key, s1_id) = scene.register(2);
+        assert_eq!(
+            scene.registry.feed_mode_for_test(s1_id),
+            Some(FeedMode::S1Only),
+            "drained without a receipt"
+        );
+        let s1_input = AdmittedInstanceCall::scripted(
+            s1_key.clone(),
+            scene.caller,
+            2,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            !scene.registry.held_feed_is_not_s1only(&s1_input),
+            "an S1Only-held key still re-offers"
+        );
+        let receipt = birth_receipt();
+        let joint_key = scene.key(3);
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(joint_key.clone(), receipt),
+            "the grant installs"
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(joint_key.clone(), scene.caller));
+        scene.registry.publish();
+        assert_eq!(
+            scene
+                .registry
+                .feed_mode_for_test(RegistryInstanceId::from_raw(1)),
+            Some(FeedMode::Joint),
+            "drained with a receipt on a linked journal"
+        );
+        let joint_input = AdmittedInstanceCall::scripted(
+            joint_key,
+            scene.caller,
+            3,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            scene.registry.held_feed_is_not_s1only(&joint_input),
+            "a Joint-held key is a healthy duplicate"
+        );
+        let foreign_input = AdmittedInstanceCall::scripted(
+            s1_key,
+            CallerId(99),
+            4,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            scene.registry.held_feed_is_not_s1only(&foreign_input),
+            "a key held under another caller is a final duplicate"
+        );
     }
 
     /// Without a linked journal the observations read unavailable with

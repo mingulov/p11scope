@@ -779,6 +779,8 @@ fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
 /// Sample one admission hint for `pid` beside its already-read `exe`,
 /// under the held admission pin.
 ///
+/// A fallback pin without a pidfd samples nothing: the start-time
+/// check below is tick-granular and cannot exclude a same-tick reuse.
 /// Without a readable exe there is no hint and no read. cmdline and the
 /// cgroup text are read only for a tabled runtime, comm only for
 /// python/perl/ruby; shells and native exes get no read at all. The exe
@@ -792,8 +794,16 @@ pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
     admitted_start_time: Option<u64>,
-    _pin: &crate::process::PidPin,
+    pin: &crate::process::PidPin,
 ) -> Option<AppHint> {
+    // Without the admission pidfd there is no exact reuse check: the
+    // start-time comparison below is tick-granular and would accept a
+    // same-tick same-binary reuse inside the sample window. Refuse the
+    // label — and read nothing — instead of risking another
+    // generation's facts.
+    if pin.pidfd().is_err() {
+        return None;
+    }
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
@@ -947,10 +957,7 @@ mod tests {
             no_hint(Some("/usr/bin/python3"), None, Some(&cmd), None);
         }
         assert_eq!(argv("/usr/bin/python3", &["-v", "app.py"]).value, "app.py");
-        assert_eq!(
-            argv("/usr/bin/python3", &["-Bv", "app.py"]).value,
-            "app.py"
-        );
+        assert_eq!(argv("/usr/bin/python3", &["-Bv", "app.py"]).value, "app.py");
     }
 
     #[test]

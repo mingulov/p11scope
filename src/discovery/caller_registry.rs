@@ -1692,12 +1692,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             .map_err(|_| failed("caller ID space exhausted"))?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
-        let app_hint = self.source.app_hint(
-            pid,
-            generation.exe.as_ref(),
-            generation.start_time,
-            &pin,
-        );
+        let app_hint =
+            self.source
+                .app_hint(pid, generation.exe.as_ref(), generation.start_time, &pin);
         self.callers.insert(
             id,
             TrackedCaller {

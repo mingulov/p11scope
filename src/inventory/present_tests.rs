@@ -3421,6 +3421,94 @@ fn concise_inventory_points_short_lived_misses_to_run() {
     );
 }
 
+/// Concise inventory must not report "0 refused" without saying how
+/// many endpoints were still deferred at stop: one plain line with
+/// the summed stop-summary total and the lower-bounds caveat.
+/// Per-receipt rows and finished-late modules contribute nothing.
+#[test]
+fn concise_inventory_names_deferred_at_stop_total() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for reason in [
+        "attach unfinished at stop: 6734 endpoint(s) deferred over 4 passes (6734 still \
+         deferred at stop); counted uses are lower bounds",
+        "attach unfinished at stop: 5966 endpoint(s) deferred over 4 passes (1383 attached by \
+         stop; 4583 still deferred at stop); counted uses are lower bounds",
+        "attach finished late: 153 endpoint(s) deferred over 1 pass (all attached by stop); \
+         counted uses are lower bounds",
+        "6734 endpoint(s) still deferred when the receipt closed; counted uses are lower bounds",
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+                .into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("11317 endpoints still deferred at stop; counted uses are lower bounds."),
+        "concise totals the stop-summary deferrals: {out}"
+    );
+}
+
+/// No unfinished deferral rows, no note: a finished-late module
+/// attached everything by stop, so there is nothing still deferred.
+#[test]
+fn concise_inventory_omits_deferred_note_when_nothing_still_deferred() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT.into(),
+        reason: "attach finished late: 153 endpoint(s) deferred over 1 pass (all attached by \
+                 stop); counted uses are lower bounds"
+            .into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.contains("still deferred at stop"),
+        "no unfinished deferral, no note: {out}"
+    );
+}
+
+/// One still-deferred endpoint reads singular.
+#[test]
+fn concise_deferred_note_singularizes_one_endpoint() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT.into(),
+        reason: "attach unfinished at stop: 4 endpoint(s) deferred over 1 pass (3 attached by \
+                 stop; 1 still deferred at stop); counted uses are lower bounds"
+            .into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("note: 1 endpoint still deferred at stop; counted uses are lower bounds."),
+        "{out}"
+    );
+}
+
 /// Concise gap lines keep path tails and short names whole: distinct
 /// files must not collapse to one identical truncated prefix.
 #[test]

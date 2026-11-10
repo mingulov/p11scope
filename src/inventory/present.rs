@@ -2904,6 +2904,49 @@ fn concise_short_lived_pointer(gaps: &[GapView]) -> Option<String> {
     }
 }
 
+/// Concise pointer for endpoints still deferred at stop: the `limits:`
+/// line can read "(0 refused)" while thousands of endpoints never
+/// attached, so the stop-summary total reads here in one plain line
+/// with the lower-bounds caveat. Sums the `{still} still deferred at
+/// stop` count of every deferred-attach stop summary — one row per
+/// module, so the sum is exact across modules; per-receipt rows and
+/// finished-late modules contribute nothing. Still-deferred is a
+/// stop-time level, not an event count, so `repeats` never multiplies
+/// it. `None` when nothing was still deferred.
+fn concise_deferred_pointer(gaps: &[GapView]) -> Option<String> {
+    const STILL_DEFERRED: &str = " still deferred at stop";
+    let mut total = 0u64;
+    let mut unparsable = false;
+    for gap in gaps.iter().filter(|gap| {
+        gap.subject == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+    }) {
+        let Some((head, _)) = gap.reason.split_once(STILL_DEFERRED) else {
+            continue;
+        };
+        // The count reads "({still} still ..." or "; {still} still ...":
+        // the token keeps a leading paren in the first shape.
+        match head
+            .split_whitespace()
+            .next_back()
+            .map(|count| count.trim_start_matches('('))
+            .and_then(|count| count.parse::<u64>().ok())
+        {
+            Some(still) => total = total.saturating_add(still),
+            None => unparsable = true,
+        }
+    }
+    if total > 0 {
+        let noun = if total == 1 { "endpoint" } else { "endpoints" };
+        Some(format!(
+            "note: {total} {noun} still deferred at stop; counted uses are lower bounds."
+        ))
+    } else if unparsable {
+        Some("note: endpoints were still deferred at stop; counted uses are lower bounds.".into())
+    } else {
+        None
+    }
+}
+
 /// The concise limits line (INV-1): the headline budgets in words.
 /// The full budget dump stays verbose-only; `--json` carries `budgets`.
 /// Watched functions count against the real inventory endpoint budget
@@ -4147,6 +4190,9 @@ fn render_snapshot_inner(
             let _ = writeln!(out, "{line}");
         }
         if let Some(line) = concise_short_lived_pointer(&presentation.gaps) {
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(line) = concise_deferred_pointer(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);

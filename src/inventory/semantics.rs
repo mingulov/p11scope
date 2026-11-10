@@ -692,6 +692,11 @@ impl LaneCoverage {
     }
 }
 
+/// Counting parts of one substituted refresh: its scan refusals and
+/// the (original pin, attachment slot) of each receipt it minted.
+#[cfg(test)]
+pub(crate) type RefreshCounts = (Vec<ImageQueryRefusal>, Vec<(Arc<PidPin>, u32)>);
+
 /// Tests-only substituted H0 I/O behind the lane: the lane's tick,
 /// refresh, receipt validation and stop servicing run the real H0
 /// collect→audit→route decisions through this I/O instead of the live
@@ -832,6 +837,15 @@ pub(crate) trait LaneTestIo {
         _producers: &crate::attach::SessionDrainProducers,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         Err(SemanticRefusal::Unavailable)
+    }
+    /// Counting parts of the last refresh this I/O drove: its scan
+    /// refusals and the (original pin, attachment slot) of each
+    /// receipt it minted, taken once. The lane counts them through
+    /// the same admission counting entry the live site uses, into
+    /// its tests-only counter mirror. `None` (the default) models an
+    /// I/O whose refresh reports carry no counting surface.
+    fn take_refresh_counts(&mut self) -> Option<RefreshCounts> {
+        None
     }
     /// Whether stashed evidence awaits a tick (the stop pre-flush gate).
     fn has_pending_evidence(&self) -> bool;
@@ -1101,6 +1115,16 @@ pub(crate) struct AttestedSemanticLane {
     /// stays lane-level and real (`note_shed_calls`).
     #[cfg(test)]
     scripted_stop_counts: Option<ScriptedStopCounts>,
+    /// Tests-only mirror of the live lane's admission-deferral
+    /// counters: substituted lanes count refresh reports through the
+    /// same counting entry into these, so the counting-site wiring
+    /// is observable without a live Session.
+    #[cfg(test)]
+    test_admission_refusals: AdmissionRefusalLedger,
+    #[cfg(test)]
+    test_scan_refusals: u64,
+    #[cfg(test)]
+    test_refusal_counts: [u64; 12],
     /// The last wound-down poll's detach error text, if it failed:
     /// the legacy cleanup gap carries it instead of the mapped
     /// refusal code. Fresh each poll.
@@ -1490,6 +1514,14 @@ pub(crate) fn image_query_refusal_label(refusal: ImageQueryRefusal) -> &'static 
     SCAN_REFUSAL_LABELS[image_query_refusal_index(refusal)]
 }
 
+/// Cap on endpoints with unsettled admission-deferral refusals, the
+/// same 16,448-entry bound as the refused-process memory. Past it,
+/// new endpoints' refusals still count (and stay named per reason)
+/// but are not tracked for settling: overflow is counted in
+/// [`AdmissionRefusalLedger::overflow_refusals`] and degrades to
+/// over-counting, never hiding.
+pub(crate) const MAX_UNSETTLED_ADMISSION_ENDPOINTS: usize = 16_448;
+
 /// Admission-refresh scan refusals that no minted receipt has settled
 /// yet, per endpoint (caller task identity plus attachment slot). A
 /// receipt-less refresh defers admission to a later pass: its refusals
@@ -1497,17 +1529,60 @@ pub(crate) fn image_query_refusal_label(refusal: ImageQueryRefusal) -> &'static 
 /// refresh that mints the endpoint's receipt settles them, so a run
 /// that admits the endpoint with complete data reports no refused
 /// endpoint for it. An endpoint that is never admitted keeps its
-/// refusals counted (and named through the per-reason gap). The live
-/// admission site counts through this ledger; tick scans keep counting
-/// directly, as they are not admission deferrals.
+/// refusals counted (and named through the per-reason gap). Entries
+/// are forgotten when their task retires (`forget_task`, driven by
+/// tick invalidations) and the map is capped, so churned tasks cannot
+/// grow it over a long run. The live admission site counts through
+/// this ledger; tick scans keep counting directly, as they are not
+/// admission deferrals.
 #[derive(Default)]
 pub(crate) struct AdmissionRefusalLedger {
     unsettled: BTreeMap<(u32, u64, u32), [u64; 12]>,
+    /// Refusals counted into the totals but not tracked for settling
+    /// because the ledger was at its cap. They stay counted forever.
+    overflow_refusals: u64,
 }
 
 impl AdmissionRefusalLedger {
-    fn key(pin: &PidPin, slot: u32) -> (u32, u64, u32) {
-        (pin.pid(), pin.start_time().unwrap_or(0), slot)
+    /// The settle key for one endpoint, or `None` when the pin's
+    /// generation is unprovable (no retained start time): a mint
+    /// under an unprovable generation must never settle, since a
+    /// same-pid pin may name a different generation, so its refusals
+    /// stay counted. Residual assumption: no pid reuse within one
+    /// start-time clock tick (~10 ms) at the same slot.
+    fn key(pin: &PidPin, slot: u32) -> Option<(u32, u64, u32)> {
+        pin.start_time().map(|start| (pin.pid(), start, slot))
+    }
+
+    /// Endpoints currently tracked for settling.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn tracked_endpoints(&self) -> usize {
+        self.unsettled.len()
+    }
+
+    /// Refusals that counted but could not be tracked past the cap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn overflow_refusals(&self) -> u64 {
+        self.overflow_refusals
+    }
+
+    /// Drop every unsettled entry for this pin's task (it exited or
+    /// its image retired, so it can never mint). The counted totals
+    /// do not move: a never-admitted task's refusals stay refused.
+    /// A start-less pin names no provable generation and drops
+    /// nothing.
+    pub(crate) fn forget_task(&mut self, pin: &PidPin) {
+        let Some(start) = pin.start_time() else {
+            return;
+        };
+        let keys: Vec<_> = self
+            .unsettled
+            .range((pin.pid(), start, 0)..=(pin.pid(), start, u32::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            self.unsettled.remove(&key);
+        }
     }
 
     /// Count one admission refresh report into the lane totals beside
@@ -1522,23 +1597,96 @@ impl AdmissionRefusalLedger {
         total: &mut u64,
         counts: &mut [u64; 12],
     ) {
+        self.count_parts(
+            pin,
+            slot,
+            &report.scan_refusals,
+            report
+                .current()
+                .iter()
+                .map(|receipt| (receipt.original_pin().as_ref(), receipt.attachment_slot())),
+            total,
+            counts,
+        );
+    }
+
+    /// The shared counting entry behind `count_refresh`: refusals
+    /// count into the totals unconditionally, track per endpoint
+    /// while provable and under the cap, and settle when `minted`
+    /// names this endpoint's receipt.
+    fn count_parts<'a>(
+        &mut self,
+        pin: &PidPin,
+        slot: u32,
+        refusals: &[ImageQueryRefusal],
+        minted: impl IntoIterator<Item = (&'a PidPin, u32)>,
+        total: &mut u64,
+        counts: &mut [u64; 12],
+    ) {
+        *total = total.saturating_add(refusals.len() as u64);
+        count_scan_refusals(counts, refusals);
         let key = Self::key(pin, slot);
-        *total = total.saturating_add(report.scan_refusals.len() as u64);
-        count_scan_refusals(counts, &report.scan_refusals);
-        if !report.scan_refusals.is_empty() {
-            count_scan_refusals(
-                self.unsettled.entry(key).or_default(),
-                &report.scan_refusals,
-            );
+        if !refusals.is_empty() {
+            match key {
+                Some(key)
+                    if self.unsettled.contains_key(&key)
+                        || self.unsettled.len() < MAX_UNSETTLED_ADMISSION_ENDPOINTS =>
+                {
+                    count_scan_refusals(self.unsettled.entry(key).or_default(), refusals);
+                }
+                Some(_) => {
+                    self.overflow_refusals =
+                        self.overflow_refusals.saturating_add(refusals.len() as u64);
+                }
+                // Unprovable generation: counted above, never tracked.
+                None => {}
+            }
         }
-        let minted = report.current().iter().any(|receipt| {
-            receipt.attachment_slot() == slot && Self::key(receipt.original_pin(), slot) == key
+        let Some(key) = key else {
+            return;
+        };
+        let minted = minted.into_iter().any(|(minted_pin, minted_slot)| {
+            minted_slot == slot && Self::key(minted_pin, slot) == Some(key)
         });
         if minted && let Some(settled) = self.unsettled.remove(&key) {
             *total = total.saturating_sub(settled.iter().sum());
             for (count, settled) in counts.iter_mut().zip(settled) {
                 *count = count.saturating_sub(settled);
             }
+        }
+    }
+}
+
+/// Forget ledger entries for tasks this tick report retired: a
+/// retired task (or its retired image) can never mint, so its
+/// entries would otherwise sit tracked for the rest of the run.
+/// Counted totals never move here; the helper only drops
+/// settle-ability, resolving cookies/images to pins through the
+/// bindings the tick was driven with.
+fn forget_retired_admission_refusals(
+    ledger: &mut AdmissionRefusalLedger,
+    bindings: &[SemanticCallerBinding],
+    report: &TickReport,
+) {
+    for outcome in report.outcomes() {
+        let TickOutcome::Invalidation(invalidation) = outcome else {
+            continue;
+        };
+        match invalidation.scope() {
+            InvalidationScope::TaskRetired(cookie) => {
+                for binding in bindings
+                    .iter()
+                    .filter(|binding| binding.image().task_cookie == *cookie)
+                {
+                    ledger.forget_task(&binding.pin());
+                }
+            }
+            InvalidationScope::ImageRetired(image) => {
+                for binding in bindings.iter().filter(|binding| binding.image() == *image) {
+                    ledger.forget_task(&binding.pin());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1942,6 +2090,12 @@ impl AttestedSemanticLane {
             finish_poll_calls: 0,
             #[cfg(test)]
             scripted_stop_counts: None,
+            #[cfg(test)]
+            test_admission_refusals: AdmissionRefusalLedger::default(),
+            #[cfg(test)]
+            test_scan_refusals: 0,
+            #[cfg(test)]
+            test_refusal_counts: [0; 12],
             wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
@@ -2152,6 +2306,12 @@ impl AttestedSemanticLane {
             finish_poll_calls: 0,
             #[cfg(test)]
             scripted_stop_counts: None,
+            #[cfg(test)]
+            test_admission_refusals: AdmissionRefusalLedger::default(),
+            #[cfg(test)]
+            test_scan_refusals: 0,
+            #[cfg(test)]
+            test_refusal_counts: [0; 12],
             wound_down_error: None,
             #[cfg(test)]
             recorded_gaps: Vec::new(),
@@ -2911,6 +3071,15 @@ impl AttestedSemanticLane {
         self.finish_poll_calls
     }
 
+    /// The substituted lane's admission-deferral (total, per-reason)
+    /// scan-refusal counts, mirrored from the live lane's counters:
+    /// refreshes through `refresh_candidate_with_custody_inner`
+    /// count into these through the shared counting entry.
+    #[cfg(test)]
+    pub(crate) fn admission_scan_refusals_for_test(&self) -> (u64, [u64; 12]) {
+        (self.test_scan_refusals, self.test_refusal_counts)
+    }
+
     /// Script the live-derived stop counts (or clear them with
     /// `None`): the stop readers answer them without a live
     /// Session, so the driver's stop disclosure runs unprivileged
@@ -3364,6 +3533,7 @@ impl AttestedSemanticLane {
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
         count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        forget_retired_admission_refusals(&mut live.admission_refusals, bindings, &report);
         live.collected_calls = live
             .collected_calls
             .saturating_add(report.collected_calls as u64);
@@ -3453,6 +3623,7 @@ impl AttestedSemanticLane {
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
         count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        forget_retired_admission_refusals(&mut live.admission_refusals, bindings, &report);
         live.collected_calls = live
             .collected_calls
             .saturating_add(report.collected_calls as u64);
@@ -3551,11 +3722,11 @@ impl AttestedSemanticLane {
                     Site::RefreshTestSeam,
                 ));
             }
-            return match collected {
+            let result = match collected {
                 Some((raw, adapter, producers)) => {
-                    test.refresh_collected(pin, slot, raw, adapter, producers)
+                    test.refresh_collected(pin.clone(), slot, raw, adapter, producers)
                 }
-                None => test.refresh(pin, slot),
+                None => test.refresh(pin.clone(), slot),
             }
             .map_err(|refusal| match refusal {
                 SemanticRefusal::Unavailable => {
@@ -3563,6 +3734,24 @@ impl AttestedSemanticLane {
                 }
                 other => AdmissionPreparationError::refused(other),
             });
+            // Count the substituted refresh through the same counting
+            // entry the live site below uses, into the tests-only
+            // counter mirror beside the ledger.
+            if result.is_ok()
+                && let Some((refusals, minted)) = test.take_refresh_counts()
+            {
+                self.test_admission_refusals.count_parts(
+                    &pin,
+                    slot,
+                    &refusals,
+                    minted
+                        .iter()
+                        .map(|(minted_pin, minted_slot)| (minted_pin.as_ref(), *minted_slot)),
+                    &mut self.test_scan_refusals,
+                    &mut self.test_refusal_counts,
+                );
+            }
+            return result;
         }
         let Some(live) = self.live.as_mut() else {
             return Err(AdmissionPreparationError::unavailable(Site::RefreshNoLive));

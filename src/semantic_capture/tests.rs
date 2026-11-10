@@ -5410,10 +5410,10 @@ fn admission_deferral_ledger_is_capped_with_counted_overflow() {
     let mut ledger = AdmissionRefusalLedger::default();
     let mut total = 0u64;
     let mut counts = [0u64; 12];
-    let mut refuse = |ledger: &mut AdmissionRefusalLedger,
-                      pin: &PidPin,
-                      total: &mut u64,
-                      counts: &mut [u64; 12]| {
+    let refuse = |ledger: &mut AdmissionRefusalLedger,
+                  pin: &PidPin,
+                  total: &mut u64,
+                  counts: &mut [u64; 12]| {
         let mut report = TickReport::default();
         report.scan_refusals.push(ImageQueryRefusal::Unstable);
         ledger.count_refresh(pin, 0, &report, total, counts);
@@ -6513,6 +6513,10 @@ mod custody_chain_tests {
         engagement: std::rc::Rc<std::cell::RefCell<H0Engagement>>,
         attempted_drained: usize,
         last_refresh_deadline: Option<Instant>,
+        /// Counting parts of the last refresh (scan refusals plus
+        /// minted (original pin, slot) pairs), taken by the lane's
+        /// shared admission counting entry.
+        last_refresh_counts: Option<crate::inventory_semantics::RefreshCounts>,
         /// Clock advance applied at the start of every tick:
         /// quiescence tests age receipts per serviced quantum.
         tick_advance: Duration,
@@ -6537,6 +6541,7 @@ mod custody_chain_tests {
                 engagement: std::rc::Rc::new(std::cell::RefCell::new(H0Engagement::default())),
                 attempted_drained: 0,
                 last_refresh_deadline: None,
+                last_refresh_counts: None,
                 tick_advance: Duration::ZERO,
                 shed: 0,
                 quiesce_after: 0,
@@ -6606,10 +6611,22 @@ mod custody_chain_tests {
                 .refresh_with(&mut self.io, pin.clone(), slot)
                 .map_err(|_| SemanticRefusal::Unavailable)?;
             self.last_refresh_deadline = report.current().first().map(|receipt| receipt.deadline);
+            self.last_refresh_counts = Some((
+                report.scan_refusals.clone(),
+                report
+                    .current()
+                    .iter()
+                    .map(|receipt| (receipt.original_pin().clone(), receipt.attachment_slot()))
+                    .collect(),
+            ));
             let effective = effective_refresh_custody(&report, pin);
             let (images, shed) = stash_refresh_report(&mut self.stash, &mut report);
             self.shed = self.shed.saturating_add(shed);
             Ok((images, effective))
+        }
+
+        fn take_refresh_counts(&mut self) -> Option<crate::inventory_semantics::RefreshCounts> {
+            self.last_refresh_counts.take()
         }
 
         fn has_pending_evidence(&self) -> bool {

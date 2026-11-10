@@ -46,6 +46,10 @@ Gates, in order; the first failure refuses with its own reason:
    event stream (ended present, edges_unretained == 0,
    gaps_suppressed == 0, no retention eviction). The v0.5.0
    joint_journal_unavailable lane disclosure is tolerated, never gated.
+   In --joint mode the gate-2 conserved loss is exempt: driver-scoped
+   "rejected demoted count" gaps with usable absolute ranges already
+   held their exact sum against issued, so they are the named
+   disclosure, never an extra loss.
 4. S1-active proof: object_observations reads unavailable with reason
    journal_unavailable (the v0.5.0 marker: no key-operation feed was
    installed, so the S1 path carried every call), and the semantic
@@ -70,7 +74,7 @@ tests/python/test_s1_throughput_compare.py.
 per worker thread (C_GenerateKey, paced C_SignInit + C_Sign under
 CKM_SHA256_HMAC, C_DestroyObject), over a --system capture whose
 semantic lane sealed linked. Gates 1-3 and the latency record are
-shared, with four Joint adjustments: the rate windows align to the
+shared, with five Joint adjustments: the rate windows align to the
 hot files and bin the non-setup calls only (the unpaced setup
 prologue sits outside the paced span by construction; issued
 still counts every ledgered call); the driver's owned graph is
@@ -83,7 +87,11 @@ key close (C_DestroyObject) conserved in the exact totals but
 exempt from the evidence sets, like teardown - except the two
 COUNT_ONLY slot probes, which the product refuses at conversion
 and which conservation accounts through the named slot-refused
-term above; and the
+term above; fenced native growth the physical owner cannot carry
+is disclosed as driver-scoped "rejected demoted count" gaps with
+exact absolute ranges, and conservation holds entries.count plus
+that exact unattributed sum equal to issued (a shortfall past the
+sum, a stray disclosure, or an unusable range still fails); and the
 capture-wide refused_endpoints/continuity_cuts counts are recorded,
 never gated (they count foreign admissions). Gate 4 becomes the
 Joint-active proof: object_observations populated with reason none
@@ -157,6 +165,14 @@ _PREBINDING_SHED = re.compile(
     r"([0-9]+) calls shed without a route \(.*\) with 0 bindings$")
 _PREBINDING_NOTED = re.compile(
     r"([0-9]+) calls shed before the first binding came from callers other ")
+# A fenced native pair discloses each unattributed absolute range as a
+# "rejected demoted count" gap carrying (base, absolute] and its call
+# count. Fullmatch: the product pins this text exactly, so any drift
+# refuses here instead of conserving by guess.
+_DEMOTED_RANGE = re.compile(
+    r"the current physical owner is not proven for absolute count range "
+    r"\(([0-9]+), ([0-9]+)\] \(([0-9]+) unattributed calls\); "
+    r"historical counts remain and no witness or module-level use is recorded")
 # Gap reasons that name a lost feed (the plan-named text above).
 LOSS_GAP_REASONS = frozenset({
     "joint machine unavailable",
@@ -650,6 +666,49 @@ def driver_slot_refused(doc, caller_id, module_id, pid):
     return total
 
 
+def driver_demoted_unattributed(doc, caller_id, module_id, pid):
+    """Driver-scoped owner-unproven growth, exactly counted.
+
+    A fenced native pair discloses each unattributed absolute range
+    through the named gap "rejected demoted count", whose reason carries
+    the exact (base, absolute] range and its call count (absolute - base,
+    cross-checked here). Ranges are pair-absolute, so identical ranges
+    folded into repeats count once per repeat. Only rows scoped exactly
+    to the driver count; a driver-scoped row without a usable range
+    refuses here (fail closed; this gate runs before the loss gate
+    validates gaps).
+    """
+    gaps = doc.get("gaps")
+    _require(type(gaps) is list, "inventory gaps must be a list")
+    total = 0
+    for gap in gaps:
+        _require(type(gap) is dict, "gap entry must be an object")
+        subject = gap.get("subject")
+        reason = gap.get("reason")
+        _require(type(subject) is str and subject
+                 and type(reason) is str and reason,
+                 "gap entry without subject/reason")
+        _require(_u64(gap.get("repeats")) and gap["repeats"] > 0,
+                 "gap entry without a positive repeat count")
+        if subject != "rejected demoted count":
+            continue
+        if gap.get("caller") != caller_id:
+            continue
+        if gap.get("module") not in (None, module_id):
+            continue
+        if gap.get("pid") is not None and gap.get("pid") != pid:
+            continue
+        match = _DEMOTED_RANGE.fullmatch(reason)
+        _require(match is not None,
+                 f"rejected demoted count gap without a call count: {reason!r}")
+        base, absolute, named = (int(group) for group in match.groups())
+        _require(absolute > base and absolute - base == named,
+                 f"rejected demoted count gap range ({base}, {absolute}] "
+                 f"does not match its {named} unattributed calls")
+        total += named * gap["repeats"]
+    return total
+
+
 def check_conservation(view, selected, doc, joint=False):
     """Issued == observed: totals, mechanism rows, function and rv sets.
 
@@ -660,6 +719,10 @@ def check_conservation(view, selected, doc, joint=False):
     count-only setup probes the product refuses at conversion; the
     semantic child counts only applied calls, so its exact totals
     equal issued minus the driver's named slot-refused count above.
+    In --joint mode a fenced native pair withholds growth the physical
+    owner cannot carry, disclosed as driver-scoped "rejected demoted
+    count" gaps with exact absolute ranges; entries.count plus that
+    exact unattributed sum equals issued (anything else fails).
     """
     issued = view["issued"]
     edge = selected["edge"]
@@ -670,8 +733,19 @@ def check_conservation(view, selected, doc, joint=False):
     want = issued - slot
     entries = edge.get("entries")
     _require(type(entries) is dict, "driver edge without entries")
-    _require(_u64(entries.get("count")) and entries["count"] == issued,
-             f"entries.count {entries.get('count')} != issued {issued}")
+    demoted = 0
+    if joint:
+        demoted = driver_demoted_unattributed(doc, edge.get("caller"),
+                                              edge.get("module"),
+                                              selected["pid"])
+    if demoted:
+        _require(_u64(entries.get("count"))
+                 and entries["count"] + demoted == issued,
+                 f"entries.count {entries.get('count')} "
+                 f"+ demoted-unattributed {demoted} != issued {issued}")
+    else:
+        _require(_u64(entries.get("count")) and entries["count"] == issued,
+                 f"entries.count {entries.get('count')} != issued {issued}")
     child = selected["sem_rows"][0]
     operations = child.get("operations")
     _require(type(operations) is dict,
@@ -785,7 +859,8 @@ def check_conservation(view, selected, doc, joint=False):
     }
     return {"entries": entries["count"], "operations": operations["calls"],
             "api_returns": api_total, "mechanisms": checked,
-            "teardown": teardown, "slot_refused": slot}
+            "teardown": teardown, "slot_refused": slot,
+            "demoted_unattributed": demoted}
 
 
 def _other_caller_unrouted(gap, selected):
@@ -841,6 +916,28 @@ def _is_module_only_foreign(gap, selected):
             and gap.get("module") not in (None, selected["edge"]["module"]))
 
 
+def _is_conserved_demoted_gap(gap, selected):
+    """A driver-scoped rejected-demoted-count gap with a usable absolute
+    range: conservation (gate 2, which runs first) already held its exact
+    sum against issued, so the loss gate exempts the named disclosure.
+    Anything else about the row (scope, shape) falls through to the
+    loss-gap verdict."""
+    if gap.get("subject") != "rejected demoted count":
+        return False
+    if gap.get("caller") != selected["edge"]["caller"]:
+        return False
+    if gap.get("module") not in (None, selected["edge"]["module"]):
+        return False
+    pid = gap.get("pid")
+    if pid is not None and pid != selected["pid"]:
+        return False
+    match = _DEMOTED_RANGE.fullmatch(gap.get("reason") or "")
+    if match is None:
+        return False
+    base, absolute, named = (int(group) for group in match.groups())
+    return absolute > base and absolute - base == named
+
+
 def _gap_loss_reason(subject, reason):
     if subject in LOSS_GAP_SUBJECTS or reason in LOSS_GAP_REASONS:
         return "loss gap: published capture loss or retirement"
@@ -860,7 +957,10 @@ def check_loss(selected, doc, events, joint=False):
     gated: a gap is foreign when its caller or pid names another cell,
     or when it names only another module (no caller, no pid, a
     different module); fully-unattributed gaps, driver gaps and gaps
-    that reference the cell stay in scope and stay strict. The proven
+    that reference the cell stay in scope and stay strict, except the
+    gate-2 conserved loss (driver-scoped rejected-demoted-count gaps
+    with usable absolute ranges, whose exact sum conservation already
+    held against issued). The proven
     rotation count is recorded as stream_rotations.
     """
     observation = selected["observation"]
@@ -939,6 +1039,8 @@ def check_loss(selected, doc, events, joint=False):
                 continue
             _require(gap.get("module") in (None, selected["edge"]["module"]),
                      "gap references another caller/module/PID")
+            if _is_conserved_demoted_gap(gap, selected):
+                continue
         else:
             _require(gap.get("caller") in (None, selected["edge"]["caller"])
                      and gap.get("module") in (None, selected["edge"]["module"])
@@ -969,6 +1071,8 @@ def check_loss(selected, doc, events, joint=False):
                 continue
             if _is_module_only_foreign(payload, selected):
                 foreign_gaps += 1
+                continue
+            if _is_conserved_demoted_gap(payload, selected):
                 continue
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)

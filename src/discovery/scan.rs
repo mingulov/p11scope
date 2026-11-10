@@ -12589,11 +12589,13 @@ mod tests {
             .expect("the shared identity guard must run in the scan");
         // The guard decision immediately follows every successful target
         // open; only a map_files-proven file under a kernel-empty mount
-        // table skips the guard itself (the ruled sandbox-maps exemption,
-        // 2026-11-10: a sandboxed target's dangling root breaks table
-        // rendering, so resolution is impossible rather than failed — the
-        // VMA proof already bound that fd, and the range guard plus the
-        // maps bracket still run).
+        // table skips the guard itself (the sandbox-maps exemption,
+        // accepted on its merits by the controller ruling of 2026-11-10
+        // 16:00: the like-for-like map_files proof passed AND the target
+        // mountinfo read OK and empty — a sandboxed target's dangling
+        // root breaks table rendering, so resolution is impossible rather
+        // than failed — the VMA proof already bound that fd, and the
+        // range guard plus the maps bracket still run).
         assert_eq!(
             scan_lines[guard - 1],
             "if !guard_exempt {",

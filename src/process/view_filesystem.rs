@@ -861,9 +861,11 @@ impl<'a> ViewFilesystem<'a> {
 
     /// Best-effort display of the target root for gap reasons. Read at most
     /// once per failed open, only when the root is already known foreign.
+    /// An unreadable link reads `unreadable: …`; the suffix wrapper
+    /// supplies the rest, so the shape never doubles.
     fn target_root_display(&self) -> String {
         std::fs::read_link(self.owned_path("root")).map_or_else(
-            |error| format!("(target root unreadable: {error})"),
+            |error| format!("unreadable: {error}"),
             |link| link.display().to_string(),
         )
     }

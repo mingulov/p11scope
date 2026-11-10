@@ -1339,6 +1339,19 @@ impl PidPin {
         }
     }
 
+    /// Tests-only pidfd custody with no retained start time: the
+    /// shape `open` yields when the pidfd succeeds but the `/proc`
+    /// start-time read does not.
+    #[cfg(test)]
+    pub(crate) fn test_pidfd_only(pid: u32) -> Self {
+        Self {
+            pid,
+            pidfd: pidfd_open(pid).ok(),
+            start_time: None,
+            shared_charge: None,
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

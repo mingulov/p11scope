@@ -1194,6 +1194,10 @@ struct ScriptIo {
     pin: Arc<PidPin>,
     fail_cookie: Option<u64>,
     fail_file: Option<u32>,
+    /// Refuse this many upcoming scans (any file) with Unstable,
+    /// then scan normally: scripts one deferral pass ahead of a
+    /// minting retry through an already-installed lane I/O.
+    fail_next_scans: usize,
     attempts: Vec<(u64, Instant)>,
     attempted_files: Vec<u32>,
     raises: usize,
@@ -1267,6 +1271,7 @@ impl ScriptIo {
             pin: Arc::new(PidPin::open(std::process::id()).unwrap()),
             fail_cookie: None,
             fail_file: None,
+            fail_next_scans: 0,
             attempts: Vec::new(),
             attempted_files: Vec::new(),
             raises: 0,
@@ -1456,6 +1461,10 @@ impl CaptureIo for ScriptIo {
         self.attempts.push((job.image.task_cookie, deadline));
         self.attempted_files.push(job.endpoint.file_slot);
         self.now += self.scan_advance;
+        if self.fail_next_scans > 0 {
+            self.fail_next_scans -= 1;
+            return Err(ImageQueryRefusal::Unstable);
+        }
         if self.fail_cookie == Some(job.image.task_cookie)
             || self.fail_file == Some(job.endpoint.file_slot)
         {
@@ -5228,6 +5237,235 @@ fn admission_deferral_refusals_stay_counted_and_named_without_a_receipt() {
         "the never-admitted endpoint stays named"
     );
 }
+#[test]
+fn admission_deferral_refusals_never_settle_without_a_start_time() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    // Pidfd custody whose `/proc` start time was unreadable at open:
+    // the pin is valid custody, but its generation is unprovable, so
+    // its refusals must stay counted rather than settle against a
+    // same-pid mint that may belong to another generation.
+    let pin = Arc::new(PidPin::test_pidfd_only(std::process::id()));
+    assert_eq!(pin.start_time(), None, "the pin carries no start time");
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    assert!(refused.current().is_empty());
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 1);
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1, "the retry mints the receipt");
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(
+        total, 1,
+        "a mint under an unprovable generation never settles: the refusal stays counted"
+    );
+}
+#[test]
+fn admission_deferral_mint_never_settles_another_tasks_refusals() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let other = Arc::new(PidPin::test_proc_only(999_999));
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    // The other task's slot-0 scan refuses; this task then mints its
+    // own slot-0 receipt. Only a same-task mint may settle.
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, other.clone(), 0).unwrap();
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    ledger.count_refresh(&other, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 1);
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(
+        total, 1,
+        "one task's mint leaves the other task's same-slot refusals counted"
+    );
+}
+#[test]
+fn admission_deferral_refusals_settle_through_an_adopted_custody_arc() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 1);
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    // The live retry counts the mint through the custody Arc H0
+    // retained, not necessarily the Arc the refusals were counted
+    // under: a fresh pin for the same task must still settle.
+    let adopted = Arc::new(PidPin::open(pin.pid()).unwrap());
+    assert!(
+        !Arc::ptr_eq(&adopted, &pin),
+        "the mint is counted through a different custody Arc"
+    );
+    ledger.count_refresh(&adopted, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(total, 0, "same task identity settles across custody Arcs");
+    assert_eq!(counts, [0; 12]);
+}
+#[test]
+fn admission_deferral_refusals_count_fresh_after_a_settle_and_remint() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    io.fail_file = None;
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(total, 0, "the first mint settles");
+    // Evicted and refreshed again: a fresh refusal counts fresh, and
+    // a remint settles it in turn.
+    io.fail_file = Some(0);
+    let refused = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(refused.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+    ledger.count_refresh(&pin, 0, &refused, &mut total, &mut counts);
+    assert_eq!(total, 1, "post-settle refusals count fresh");
+    io.fail_file = None;
+    let readmitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(readmitted.current().len(), 1);
+    ledger.count_refresh(&pin, 0, &readmitted, &mut total, &mut counts);
+    assert_eq!(total, 0, "the remint settles the fresh refusal");
+    assert_eq!(counts, [0; 12]);
+}
+#[test]
+fn admission_deferral_ledger_forgets_exited_tasks_without_unsettling_counts() {
+    use crate::inventory_semantics::AdmissionRefusalLedger;
+
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let other = Arc::new(PidPin::test_proc_only(999_999));
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    // Two unsettled endpoints for this task (slots 0 and 99) and one
+    // for the other task, counted from refusal reports.
+    let refused_report = |ledger: &mut AdmissionRefusalLedger,
+                          pin: &PidPin,
+                          slot: u32,
+                          total: &mut u64,
+                          counts: &mut [u64; 12]| {
+        let mut report = TickReport::default();
+        report.scan_refusals.push(ImageQueryRefusal::Unstable);
+        ledger.count_refresh(pin, slot, &report, total, counts);
+    };
+    refused_report(&mut ledger, &pin, 0, &mut total, &mut counts);
+    refused_report(&mut ledger, &pin, 99, &mut total, &mut counts);
+    refused_report(&mut ledger, &other, 0, &mut total, &mut counts);
+    assert_eq!(total, 3);
+    assert_eq!(ledger.tracked_endpoints(), 3);
+    // A start-less pin names no provable generation: forgetting
+    // through it must not drop another generation's entries.
+    ledger.forget_task(&PidPin::test_pidfd_only(pin.pid()));
+    assert_eq!(ledger.tracked_endpoints(), 3);
+    // The task exits before ever minting: its entries are pruned so
+    // churned tasks cannot grow the ledger, but its refusals stay
+    // counted — it was never admitted.
+    ledger.forget_task(&pin);
+    assert_eq!(ledger.tracked_endpoints(), 1, "only the other task stays");
+    assert_eq!(total, 3, "pruning never un-counts a refusal");
+    // Even a later same-pid mint cannot settle the pruned share.
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(total, 3, "pruned entries stay counted, never hidden");
+}
+#[test]
+fn admission_deferral_ledger_is_capped_with_counted_overflow() {
+    use crate::inventory_semantics::{AdmissionRefusalLedger, MAX_UNSETTLED_ADMISSION_ENDPOINTS};
+
+    assert_eq!(MAX_UNSETTLED_ADMISSION_ENDPOINTS, 16_448);
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let pin = io.pin.clone();
+    let mut ledger = AdmissionRefusalLedger::default();
+    let mut total = 0u64;
+    let mut counts = [0u64; 12];
+    let mut refuse = |ledger: &mut AdmissionRefusalLedger,
+                      pin: &PidPin,
+                      total: &mut u64,
+                      counts: &mut [u64; 12]| {
+        let mut report = TickReport::default();
+        report.scan_refusals.push(ImageQueryRefusal::Unstable);
+        ledger.count_refresh(pin, 0, &report, total, counts);
+    };
+    // One tracked endpoint for the real task, then churned tasks up
+    // to the cap.
+    refuse(&mut ledger, &pin, &mut total, &mut counts);
+    for index in 0..MAX_UNSETTLED_ADMISSION_ENDPOINTS - 1 {
+        let churned = PidPin::test_proc_only(1_000_000 + index as u32);
+        refuse(&mut ledger, &churned, &mut total, &mut counts);
+    }
+    assert_eq!(
+        ledger.tracked_endpoints(),
+        MAX_UNSETTLED_ADMISSION_ENDPOINTS
+    );
+    assert_eq!(ledger.overflow_refusals(), 0);
+    assert_eq!(total, MAX_UNSETTLED_ADMISSION_ENDPOINTS as u64);
+    // Past the cap, a new endpoint's refusals still count (and stay
+    // named per reason) but are not tracked for settling: the named,
+    // counted overflow degrades to over-counting, never hiding.
+    let past_cap = PidPin::test_proc_only(2_000_000);
+    refuse(&mut ledger, &past_cap, &mut total, &mut counts);
+    assert_eq!(
+        ledger.tracked_endpoints(),
+        MAX_UNSETTLED_ADMISSION_ENDPOINTS
+    );
+    assert_eq!(ledger.overflow_refusals(), 1);
+    assert_eq!(total, MAX_UNSETTLED_ADMISSION_ENDPOINTS as u64 + 1);
+    // Refusals for an already-tracked endpoint keep tracking at the
+    // cap, and a mint for a tracked endpoint still settles and frees
+    // its slot for a new endpoint.
+    refuse(&mut ledger, &pin, &mut total, &mut counts);
+    assert_eq!(ledger.overflow_refusals(), 1);
+    let admitted = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+    assert_eq!(admitted.current().len(), 1);
+    ledger.count_refresh(&pin, 0, &admitted, &mut total, &mut counts);
+    assert_eq!(
+        total, MAX_UNSETTLED_ADMISSION_ENDPOINTS as u64,
+        "the tracked endpoint's two refusals settle; the overflow one stays"
+    );
+    assert_eq!(
+        ledger.tracked_endpoints(),
+        MAX_UNSETTLED_ADMISSION_ENDPOINTS - 1
+    );
+    let fresh = PidPin::test_proc_only(2_000_001);
+    refuse(&mut ledger, &fresh, &mut total, &mut counts);
+    assert_eq!(
+        ledger.tracked_endpoints(),
+        MAX_UNSETTLED_ADMISSION_ENDPOINTS
+    );
+    assert_eq!(ledger.overflow_refusals(), 1, "the freed slot tracks again");
+}
 fn decoded_prefix_survives_failure(status: CollectionStatus) {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);
@@ -6748,6 +6986,45 @@ mod custody_chain_tests {
         assert_eq!(
             capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn lane_admission_refresh_settles_deferral_refusals_at_the_counting_site() {
+        // Through the lane's own refresh (the production counting
+        // site in `refresh_candidate_with_custody_inner`), not the
+        // ledger directly: a refused pass counts, the minting retry
+        // settles it, and a never-learned endpoint stays counted.
+        let mut lane = AttestedSemanticLane::start(
+            operation_subset(),
+            &Scope::Pid(std::process::id()),
+            BackendSelection::Auto,
+        )
+        .expect("shell lane starts");
+        let domain = lane.domain();
+        let mut h0 = H0TestIo::new(domain);
+        let pin = h0.io.pin.clone();
+        h0.io.fail_next_scans = 1;
+        lane.install_test_io(Box::new(h0));
+        lane.refresh_candidate_with_custody(pin.clone(), 99)
+            .expect("the unlearned slot refreshes without a receipt");
+        let (total, _) = lane.admission_scan_refusals_for_test();
+        assert_eq!(total, 1, "the unlearned endpoint counts at the lane");
+        lane.refresh_candidate_with_custody(pin.clone(), 0)
+            .expect("the refused scan refreshes without a receipt");
+        let (total, _) = lane.admission_scan_refusals_for_test();
+        assert_eq!(total, 2, "the scan refusal counts at the lane");
+        lane.refresh_candidate_with_custody(pin, 0)
+            .expect("the retry refreshes");
+        let (total, counts) = lane.admission_scan_refusals_for_test();
+        assert_eq!(
+            total, 1,
+            "the lane counting site settles slot 0 on mint; slot 99 stays refused"
+        );
+        assert_eq!(
+            crate::inventory_semantics::scan_refusals_gap_reason(&counts),
+            Some("1 scan refusals (coverage=1)".to_string()),
+            "only the never-admitted endpoint stays named"
         );
     }
 

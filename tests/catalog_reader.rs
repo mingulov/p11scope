@@ -1281,8 +1281,8 @@ fn catalog_reader_finds_every_fixture_object() {
     // when everything fits.
     if strict && wide {
         assert_eq!(
-            fixture_admitted, 6,
-            "B, M, T, H, N and C must be admitted in the wide profile"
+            fixture_admitted, 5,
+            "B, M, T, H and N must be admitted in the wide profile; C stays refused (awaiting publication)"
         );
     } else {
         assert!(fixture_covered >= 2, "at least T/H must be admitted");

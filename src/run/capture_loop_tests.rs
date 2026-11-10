@@ -4200,6 +4200,55 @@ fn terminal_errors_combine_keeping_every_layer() {
     assert!(message.contains("also failed"), "{message}");
 }
 
+/// v070r3 RED: run_terminal must seal events-only when no snapshot was
+/// ever acquired, never return early without a report (data-always).
+#[test]
+fn terminal_without_last_good_seals_events_only_in_profile() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn write_json_report")
+        .unwrap()
+        .0;
+    let terminal = profile.split_once("fn run_terminal(").unwrap().1;
+    assert!(
+        terminal.contains("seal_terminal_snapshot(last_good, acquired)"),
+        "run_terminal must seal through the events-only fallback instead of an early `?`"
+    );
+    assert!(
+        !terminal.contains("seal_terminal_or_last_good"),
+        "run_terminal must not return the unsealable error early without a report"
+    );
+}
+
+/// v070r3 RED: a failed terminal trace-loss report must degrade like the
+/// reads (named gap plus combined error), never return early without
+/// EVIDENCE (data-always). Scoped to the terminal drain region like the
+/// pinned/prearm pins.
+#[test]
+fn terminal_trace_loss_degrades_to_a_gap_in_trace() {
+    let source = include_str!("../run.rs");
+    let trace = source
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .1
+        .split_once("fn terminal_trace_count_line")
+        .unwrap()
+        .0;
+    let terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
+    assert!(
+        terminal.contains("loss_error"),
+        "the trace terminal must keep the loss failure for its gap and error"
+    );
+    assert!(
+        !terminal
+            .contains("report_trace_loss(context.1, context.4, context.5, context.6, context.7)?"),
+        "the loss report must not discard the seal with an early `?`"
+    );
+}
+
 /// v070r2: a publication failure after the seal keeps the stored seal
 /// errors instead of dropping them: alone it passes through, beside a
 /// stored failure both layers survive.

@@ -185,6 +185,7 @@ RUN = [
     ("test_t7_campaign.py", []),
     ("test_uprobe_close_throughput_probe.py", []),
     ("test_vng_wrapper_exits.py", []),
+    ("test_wide_curation_message.py", []),
     ("test_witness_cli_vng.py", []),
 ]
 

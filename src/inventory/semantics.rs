@@ -1490,6 +1490,59 @@ pub(crate) fn image_query_refusal_label(refusal: ImageQueryRefusal) -> &'static 
     SCAN_REFUSAL_LABELS[image_query_refusal_index(refusal)]
 }
 
+/// Admission-refresh scan refusals that no minted receipt has settled
+/// yet, per endpoint (caller task identity plus attachment slot). A
+/// receipt-less refresh defers admission to a later pass: its refusals
+/// count toward `refused_endpoints` while unsettled, and a later
+/// refresh that mints the endpoint's receipt settles them, so a run
+/// that admits the endpoint with complete data reports no refused
+/// endpoint for it. An endpoint that is never admitted keeps its
+/// refusals counted (and named through the per-reason gap). The live
+/// admission site counts through this ledger; tick scans keep counting
+/// directly, as they are not admission deferrals.
+#[derive(Default)]
+pub(crate) struct AdmissionRefusalLedger {
+    unsettled: BTreeMap<(u32, u64, u32), [u64; 12]>,
+}
+
+impl AdmissionRefusalLedger {
+    fn key(pin: &PidPin, slot: u32) -> (u32, u64, u32) {
+        (pin.pid(), pin.start_time().unwrap_or(0), slot)
+    }
+
+    /// Count one admission refresh report into the lane totals beside
+    /// `total`, settling this endpoint's earlier deferral refusals
+    /// when the report mints its receipt (matched by task identity and
+    /// attachment slot, so an adopted custody Arc still settles).
+    pub(crate) fn count_refresh(
+        &mut self,
+        pin: &PidPin,
+        slot: u32,
+        report: &TickReport,
+        total: &mut u64,
+        counts: &mut [u64; 12],
+    ) {
+        let key = Self::key(pin, slot);
+        *total = total.saturating_add(report.scan_refusals.len() as u64);
+        count_scan_refusals(counts, &report.scan_refusals);
+        if !report.scan_refusals.is_empty() {
+            count_scan_refusals(
+                self.unsettled.entry(key).or_default(),
+                &report.scan_refusals,
+            );
+        }
+        let minted = report.current().iter().any(|receipt| {
+            receipt.attachment_slot() == slot && Self::key(receipt.original_pin(), slot) == key
+        });
+        if minted && let Some(settled) = self.unsettled.remove(&key) {
+            *total = total.saturating_sub(settled.iter().sum());
+            for (count, settled) in counts.iter_mut().zip(settled) {
+                *count = count.saturating_sub(settled);
+            }
+        }
+    }
+}
+
 /// Count one report's scan refusals into per-reason slots. The live
 /// tick/refresh sites call this beside the existing total; tests drive
 /// it with scripted refusals.
@@ -1718,6 +1771,9 @@ pub(crate) struct LiveLane {
     collected_calls: u64,
     /// Per-reason scan refusals behind [`Self::scan_refusals`].
     refusal_counts: [u64; 12],
+    /// Unsettled admission-deferral refusals behind the totals: a
+    /// later minted receipt settles its endpoint's share.
+    admission_refusals: AdmissionRefusalLedger,
     continuity_cuts: u64,
     unrouted_returns: u64,
     drained_batches: u64,
@@ -2020,6 +2076,7 @@ impl AttestedSemanticLane {
                 scan_refusals: 0,
                 collected_calls: 0,
                 refusal_counts: [0; 12],
+                admission_refusals: AdmissionRefusalLedger::default(),
                 continuity_cuts: 0,
                 unrouted_returns: 0,
                 drained_batches: 0,
@@ -3532,10 +3589,13 @@ impl AttestedSemanticLane {
             None => live.capture.refresh(&mut live.session, pin.clone(), slot),
         }
         .map_err(|_| AdmissionPreparationError::unavailable(Site::RefreshFailed))?;
-        live.scan_refusals = live
-            .scan_refusals
-            .saturating_add(report.scan_refusals.len() as u64);
-        count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        live.admission_refusals.count_refresh(
+            &pin,
+            slot,
+            &report,
+            &mut live.scan_refusals,
+            &mut live.refusal_counts,
+        );
         // The minted receipt carries the Arc H0 actually retained
         // (adopted across a failed-bind retry, else the passed pin).
         let effective = effective_refresh_custody(&report, pin);

@@ -70820,6 +70820,7 @@ fn report_after_dropped_tail_carries_earlier_data_and_gap() {
 fn capacity_exhaustion_without_evictable_view_gaps_waiting_live_newcomer() {
     let (mut fixture, mut engine, _armed, _record, _session) = armed_seed_route(1);
     engine.frame_work_budget_ns = u64::MAX;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     engine.max_scan_pids = 2;
     // Dirty-state surgery for the cap filler (see the stay-queued twin):
     // the seed view holds a loader context and the filler holds scan
@@ -70884,6 +70885,8 @@ fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
         .unwrap();
     let live = child.id();
     let (mut engine, dir) = engine_over_cgroup_naming(&[live]);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let departed = FAKE_PID_FLOOR + 11;
     // Present-then-gone: listed (marked and requested) on the first pass.
     e06_write_listing(dir.path(), &[live, departed]);
@@ -70937,6 +70940,9 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
         .unwrap();
     let (mut engine, dir) = engine_over_cgroup_naming(&[a.id(), b.id()]);
     engine.max_scan_pids = 2;
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 2, "the cap fills first");
     assert!(

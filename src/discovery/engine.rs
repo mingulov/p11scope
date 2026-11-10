@@ -965,6 +965,13 @@ const DROPPED_PASS_RETAIN_LIMIT: u64 = 2;
 const HELD_BACK_SUBJECT: &str = "live process admission";
 const HELD_BACK_REASON: &str =
     "a process whose data broke the inventory pass is held back from admission and retried later";
+/// Named gap for live newcomers held behind exhausted view capacity with no
+/// evictable view anywhere: ordinary relief cannot free a slot, so the
+/// waiters stay queued until a view exits. Fixed text, so the published
+/// output keeps one entry however many newcomers wait; pending still counts
+/// them every tick and the end-of-run sweep counts leftovers.
+const CAPACITY_NO_VICTIM_SUBJECT: &str = "live process admission";
+const CAPACITY_NO_VICTIM_REASON: &str = "capture process-view capacity was exhausted with no evictable view; a live newcomer waited for admission";
 /// Retry delay for a held-back process, in inventory passes; doubles per
 /// repeated isolation up to `HELD_BACK_RETRY_BASE_PASSES << 6`.
 const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
@@ -25185,6 +25192,17 @@ impl Engine {
                                 self.probationary_completions.saturating_add(1);
                             continue;
                         }
+                    }
+                    // No-victim stall: ordinary relief cannot free a slot
+                    // (no evictable view anywhere), so this live waiter's
+                    // queue wait is named instead of silent. An exit race
+                    // proves nothing waited and stays on the dead path;
+                    // pressure service passes keep their episode accounting.
+                    if self.pressure_selected.is_none()
+                        && self.exploratory_evictable_views().is_empty()
+                        && !process::generation_dead(pid)
+                    {
+                        self.mark_partial(CAPACITY_NO_VICTIM_SUBJECT, CAPACITY_NO_VICTIM_REASON);
                     }
                     skipped.push(Skipped {
                         subject: "process view".into(),

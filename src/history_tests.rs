@@ -1898,3 +1898,42 @@ fn e20_transfer_without_receiver_open_refuses_without_adoption() {
     assert_eq!(s.pending_at_end(), 0);
     assert_eq!(s.semantic_evidence().async_orphans, 0);
 }
+
+/// Wide producer history (ADR identity-design P1.5): a producer tracker at
+/// the ticket budget admits the 16,385th distinct task, fills to 262,144
+/// with an exact admitted count, and refuses the 262,145th.
+#[test]
+fn producer_tracker_admits_past_16384_to_the_wide_budget() {
+    let limit = p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize;
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut tracker = process::Tracker::for_producer(domain, limit);
+    let mut admitted = 0usize;
+    for cookie in 1..=262_145u64 {
+        let image = ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 0,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let pid = cookie as u32;
+        let (key, retired) = tracker.admit_history(1, pid, image);
+        assert!(retired.is_empty(), "cookie={cookie}");
+        if key.is_some() {
+            admitted += 1;
+            assert_eq!(admitted as u64, cookie, "cookie={cookie}");
+        } else {
+            assert_eq!(cookie, 262_145, "first refusal must be past the budget");
+        }
+    }
+    assert_eq!(admitted, 262_144);
+}
+
+/// The producer history bound is the ticket budget (ADR identity-design
+/// Decision 4): one history slot per lifetime ticket, never less.
+#[test]
+fn producer_history_limit_is_the_ticket_budget() {
+    assert_eq!(process::PRODUCER_HISTORY_LIMIT, 262_144);
+    assert_eq!(
+        process::PRODUCER_HISTORY_LIMIT,
+        p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize
+    );
+}

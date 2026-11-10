@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(size_of::<ImageIdentity>(), 16);
         assert_eq!(offset_of!(ImageIdentity, task_cookie), 0);
         assert_eq!(offset_of!(ImageIdentity, exec_id), 8);
-        assert_eq!(IMAGE_IDENTITY_TICKET_LIMIT, 16_384);
+        assert_eq!(IMAGE_IDENTITY_TICKET_LIMIT, 262_144);
     }
 
     #[test]

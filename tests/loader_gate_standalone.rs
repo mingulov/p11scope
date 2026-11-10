@@ -319,13 +319,13 @@ fn loader_ticket_harness_query_failures() {
     );
 }
 
-/// G17-shaped crossing: issuance reaches exactly 16,384, then refuses.
+/// G17-shaped crossing: issuance reaches exactly 262,144, then refuses.
 #[test]
-fn loader_ticket_harness_crosses_16384() {
+fn loader_ticket_harness_crosses_262144() {
     drive_tickets(
-        "ticket-crosses-16384",
+        "ticket-crosses-262144",
         &[
-            "ASSERT watermark_reaches_16384",
+            "ASSERT watermark_reaches_262144",
             "ASSERT next_attempt_quota",
         ],
     );
@@ -390,7 +390,7 @@ fn loader_gate_harness_native_ack() {
     );
 }
 
-/// G17-shaped cut: with B prepared, the 16,385th birth cuts to B
+/// G17-shaped cut: with B prepared, the 262,145th birth cuts to B
 /// exactly once; B quota refuses honestly with counted refusals.
 #[test]
 fn loader_ticket_harness_bank_cut_once() {
@@ -398,7 +398,7 @@ fn loader_ticket_harness_bank_cut_once() {
         "bank-cut-once",
         &[
             "ASSERT cut_flips_to_b_once",
-            "ASSERT total_crosses_16384",
+            "ASSERT total_crosses_262144",
             "ASSERT b_quota_honest",
             "ASSERT bank_refusals_saturate",
         ],

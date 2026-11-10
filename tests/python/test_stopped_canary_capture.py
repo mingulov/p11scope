@@ -263,7 +263,7 @@ class FakeMaps(capture.LiveMaps):
         self.calls.append((item['name'], deadline))
         name, size = item['name'], item['bytes_value']
         workers = [row for row in capture.ready_roster(self.config, deadline) if row['role'] == 'worker']
-        controls = {'COOKIE_CTL': [16384, int(self.config.mode != 'metrics'), 0, 0, 0],
+        controls = {'COOKIE_CTL': [262144, int(self.config.mode != 'metrics'), 0, 0, 0],
                     'OWNER_CTL': [16448, len(workers), 0, 0, 0, 0, 0],
                     'ROOT_CTL': [int(self.config.lane in capture.OWNED_LANES)] + [0] * 7}
         # Empty is the honest dump of an unpopulated hash, prog_array or
@@ -2080,7 +2080,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=IMAGE_CONTINUITY'):
             capture.validate_inventory(aggregate_inventory(), 'default', 'allowlisted')
-        for name, full in (("IMAGE_CONTINUITY", 16384), ("IMAGE_TGID_INDEX", 16384),
+        for name, full in (("IMAGE_CONTINUITY", 262144), ("IMAGE_TGID_INDEX", 262144),
                            ("IMAGE_QUERY_REQUESTS", 1024)):
             with self.subTest(name=name, size="full"):
                 maps = aggregate_inventory()

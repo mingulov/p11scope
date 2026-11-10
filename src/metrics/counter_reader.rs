@@ -2374,7 +2374,7 @@ mod tests {
             .set(
                 0,
                 ImageIdentityControl {
-                    limit: 16384,
+                    limit: 262144,
                     ..ImageIdentityControl::default()
                 },
                 0,
@@ -2726,7 +2726,7 @@ mod tests {
                 ..ThreadOwnerControl::default()
             };
             let cookie = ImageIdentityControl {
-                limit: 16384,
+                limit: 262144,
                 unavailable: u64::from(failure == 2),
                 ..ImageIdentityControl::default()
             };

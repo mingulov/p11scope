@@ -81,7 +81,7 @@ use crate::fixture_guard::DieWithParent as _;
 use crate::process::ProcessView;
 use p11scope_ebpf_common::DISCOVERY_POINTERS;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -3198,27 +3198,31 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     );
 }
 
-/// OD34 release-path cell 3.6 (image half): 16,385 genuine process births
-/// on a real kernel spend the 16,384 image tickets; births past the budget
+/// OD34 release-path cell 3.6 (image half): 262,145 genuine process births
+/// on a real kernel spend the 262,144 image tickets; births past the budget
 /// are counted identity refusals, never silence. Each `/usr/bin/true`
 /// spawn burns at least one ticket through the Detailed fork wrapper, so
 /// the full wave must cross the budget on any controlled host; the cell
 /// then proves the ceiling holds (no reset, no reuse) and the production
-/// evidence names the refusals. Expected ~1-3 min, live 1 child, bounded
-/// 10 min. Deliberate exception to the no-fork-during-capture rule: the
-/// owned, counted, in-loop-reaped spawns are the stimulus, and nothing is
-/// drained while they run.
+/// evidence names the refusals. Expected ~2-6 min, live 8 children, bounded
+/// 10 min. The wave runs 8-wide so the widened budget still fits the
+/// unchanged 600 s wave bound (ADR identity-design R1: sequential spawns
+/// measured ~400/s would need ~11 min for 262,145 births). Deliberate
+/// exception to the no-fork-during-capture rule: the owned, counted,
+/// in-loop-reaped spawns are the stimulus, and nothing is drained while
+/// they run.
 #[test]
-#[ignore = "privileged: live BPF 16385-image ticket-quota gap; run as root with --ignored --test-threads=1 under the privileged lane"]
-fn image_quota_16385_births_are_counted_identity_refusals() {
+#[ignore = "privileged: live BPF 262145-image ticket-quota gap; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn image_quota_262145_births_are_counted_identity_refusals() {
     use p11scope_ebpf_common::{IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl};
     const WHAT: &str = "life-quota-live";
     const BIRTHS: usize = IMAGE_IDENTITY_TICKET_LIMIT as usize + 1;
     const WAVE_DEADLINE: Duration = Duration::from_secs(600);
+    const WAVE_WIDTH: usize = 8;
     assert_privileged_lane(WHAT);
     assert_eq!(
-        IMAGE_IDENTITY_TICKET_LIMIT, 16_384,
-        "{WHAT}: the cell proves the real 16,384"
+        IMAGE_IDENTITY_TICKET_LIMIT, 262_144,
+        "{WHAT}: the cell proves the real 262,144"
     );
     let wall_start = Instant::now();
     let true_bin = ["/usr/bin/true", "/bin/true"]
@@ -3245,41 +3249,54 @@ fn image_quota_16385_births_are_counted_identity_refusals() {
     };
     let start_control = read_control(&session);
     assert_eq!(
-        start_control.limit, 16_384,
+        start_control.limit, 262_144,
         "{WHAT}: the loader publishes the real limit"
     );
     assert!(
-        start_control.next_ticket < 16_384,
+        start_control.next_ticket < 262_144,
         "{WHAT}: REFUSED: ambient already spent the budget (next_ticket={}); the host is not controlled",
         start_control.next_ticket
     );
 
-    for birth in 1..=BIRTHS {
-        let status = Command::new(&true_bin)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_clear()
-            .spawn()
-            .unwrap_or_else(|error| panic!("{WHAT}: spawn {birth}: {error}"))
+    // Bounded-parallel wave: at most WAVE_WIDTH owned children alive, every
+    // child reaped in the loop, exits still asserted one by one.
+    let mut in_flight: VecDeque<Child> = VecDeque::with_capacity(WAVE_WIDTH);
+    let mut spawned = 0usize;
+    let mut reaped = 0usize;
+    while reaped < BIRTHS {
+        while spawned < BIRTHS && in_flight.len() < WAVE_WIDTH {
+            spawned += 1;
+            in_flight.push_back(
+                Command::new(&true_bin)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .env_clear()
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("{WHAT}: spawn {spawned}: {error}")),
+            );
+        }
+        let mut child = in_flight.pop_front().expect("in-flight birth");
+        let status = child
             .wait()
-            .unwrap_or_else(|error| panic!("{WHAT}: reap {birth}: {error}"));
-        assert!(status.success(), "{WHAT}: owned birth {birth} exits 0");
-        if birth % 4096 == 0 {
+            .unwrap_or_else(|error| panic!("{WHAT}: reap {}: {error}", reaped + 1));
+        reaped += 1;
+        assert!(status.success(), "{WHAT}: owned birth {reaped} exits 0");
+        if reaped % 4096 == 0 {
             assert!(
                 wall_start.elapsed() < WAVE_DEADLINE,
-                "{WHAT}: birth wave exceeded its bound at {birth}/{BIRTHS}"
+                "{WHAT}: birth wave exceeded its bound at {reaped}/{BIRTHS}"
             );
             println!(
-                "life: {WHAT}: {birth}/{BIRTHS} births after {:?}",
+                "life: {WHAT}: {reaped}/{BIRTHS} births after {:?}",
                 wall_start.elapsed()
             );
         }
     }
     let quota = read_control(&session);
     assert_eq!(
-        quota.next_ticket, 16_384,
-        "{WHAT}: 16,385 owned births spend the whole budget"
+        quota.next_ticket, 262_144,
+        "{WHAT}: 262,145 owned births spend the whole budget"
     );
     assert!(
         quota.unavailable >= 1,
@@ -3311,7 +3328,7 @@ fn image_quota_16385_births_are_counted_identity_refusals() {
     }
     let held = read_control(&session);
     assert_eq!(
-        held.next_ticket, 16_384,
+        held.next_ticket, 262_144,
         "{WHAT}: the ticket counter never resets or reuses"
     );
     assert!(
@@ -3325,7 +3342,7 @@ fn image_quota_16385_births_are_counted_identity_refusals() {
     drop(engine);
     drop(fixtures);
     println!(
-        "life: quota-live: PASS: 16,385 births, next_ticket=16384, unavailable={} (start {}); wall={:?} VmHWM={}KiB",
+        "life: quota-live: PASS: 262,145 births, next_ticket=262144, unavailable={} (start {}); wall={:?} VmHWM={}KiB",
         held.unavailable,
         start_control.next_ticket,
         wall_start.elapsed(),

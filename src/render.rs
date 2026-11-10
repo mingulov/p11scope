@@ -15810,11 +15810,11 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
         let line = coverage_line(&ev, false);
         assert!(line.contains("7 processes refused an identity"), "{line}");
-        assert!(line.contains("16384"), "{line}");
+        assert!(line.contains("262144"), "{line}");
         assert!(!line.contains("other gap"), "{line}");
         let verbose = coverage_line(&ev, true);
         assert!(verbose.contains("kernel_control"), "{verbose}");
-        assert!(verbose.contains("16384"), "{verbose}");
+        assert!(verbose.contains("262144"), "{verbose}");
     }
 
     // Identity budget (RED): refusals without a spent budget name
@@ -15827,7 +15827,7 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
         let line = coverage_line(&ev, false);
         assert!(line.contains("3 processes refused an identity"), "{line}");
-        assert!(!line.contains("16384"), "{line}");
+        assert!(!line.contains("262144"), "{line}");
     }
 
     // Identity budget (RED): a halted kernel and root-affiliation

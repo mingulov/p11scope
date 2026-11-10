@@ -1874,7 +1874,7 @@ class StoppedPopulationTests(unittest.TestCase):
             records.append({"map_id": 111, "pid": 7001, "tid": 7001, "generation": 900,
                             "value": self.epoch_value()})
         controls = {
-            "COOKIE_CTL": [16384, 7, 0, 0, 0],  # history exceeds live cells
+            "COOKIE_CTL": [262144, 7, 0, 0, 0],  # history exceeds live cells
             "OWNER_CTL": [16448, 0 if empty else 2, 0, 0, 0, 0, 0],
             "ROOT_CTL": [3 if owned else 0, 0, 0, 0, 0, 0, 0, 0],
         }
@@ -2468,7 +2468,7 @@ int main(void) {
                     self.check(root, manifest)
 
     def test_control_health_and_exact_reservations(self):
-        for name, offset, value in (("COOKIE_CTL", 0, 1), ("COOKIE_CTL", 1, 16385),
+        for name, offset, value in (("COOKIE_CTL", 0, 1), ("COOKIE_CTL", 1, 262145),
                                     ("COOKIE_CTL", 1, 2), ("OWNER_CTL", 0, 65),
                                     ("OWNER_CTL", 1, 1), ("ROOT_CTL", 0, 1)):
             with self.subTest(name=name, offset=offset), tempfile.TemporaryDirectory() as directory:

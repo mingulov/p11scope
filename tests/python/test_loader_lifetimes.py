@@ -181,15 +181,15 @@ class LedgerValidationTests(unittest.TestCase):
         summary = ORACLE.validate_ledger(valid_ledger("g16", 300), "g16", 300)
         self.assertEqual((summary["lifetimes"], summary["api_calls"]), (300, 600))
 
-    def test_g17_full_16385_valid(self):
-        summary = ORACLE.validate_ledger(valid_ledger("g17", 16385), "g17", 16385)
-        self.assertEqual(summary["api_calls"], 32770)
+    def test_g17_full_262145_valid(self):
+        summary = ORACLE.validate_ledger(valid_ledger("g17", 262145), "g17", 262145)
+        self.assertEqual(summary["api_calls"], 524290)
 
     def test_g16_256_is_not_positive(self):
         self.assert_refused(valid_ledger("g16", 256), "g16", 300)
 
-    def test_g17_16384_is_not_positive(self):
-        self.assert_refused(valid_ledger("g17", 16384), "g17", 16385)
+    def test_g17_262144_is_not_positive(self):
+        self.assert_refused(valid_ledger("g17", 262144), "g17", 262145)
 
     def test_repeated_context_is_not_positive(self):
         for cell in ("g16", "g17"):
@@ -225,9 +225,9 @@ class LedgerValidationTests(unittest.TestCase):
         self.assert_refused(rows, "g16", 300)
 
     def test_missing_last_leader_is_not_positive(self):
-        rows = valid_ledger("g17", 16385)
+        rows = valid_ledger("g17", 262145)
         rows[-2]["label"] = 1
-        self.assert_refused(rows, "g17", 16385)
+        self.assert_refused(rows, "g17", 262145)
 
     def test_broken_surface_fails_g16_but_not_g17(self):
         broken = valid_ledger("g16", 3)
@@ -415,18 +415,18 @@ class InstalledJudgeTests(unittest.TestCase):
         self.assertIn("installed positive", detail)
 
     def test_g17_valid_profile_is_pass(self):
-        rows = valid_ledger("g17", 16385)
+        rows = valid_ledger("g17", 262145)
         report = json.dumps(valid_report(
-            16385, l4=valid_l4_transitions("g17", 16385)))
+            262145, l4=valid_l4_transitions("g17", 262145)))
         detail = ORACLE.judge("g17", rows, report_text=report)
         self.assertIn("installed positive", detail)
 
     def test_g17_valid_trace_is_pass(self):
         # Full 32,770-row trace (~5 MB); well within the 256 MiB bound.
         detail = ORACLE.judge(
-            "g17", valid_ledger("g17", 16385),
+            "g17", valid_ledger("g17", 262145),
             trace_text=valid_trace(
-                16385, l4=valid_l4_transitions("g17", 16385)))
+                262145, l4=valid_l4_transitions("g17", 262145)))
         self.assertIn("installed positive", detail)
         # Short-trace sanity: exact per-function delivery is checked before
         # the receipts are consulted.
@@ -451,8 +451,8 @@ class InstalledJudgeTests(unittest.TestCase):
             ORACLE.judge("g16", rows, report_text=json.dumps(report))
 
     def test_kernel_loss_is_fail(self):
-        rows = valid_ledger("g17", 16385)
-        report = valid_report(16385)
+        rows = valid_ledger("g17", 262145)
+        report = valid_report(262145)
         report["evidence"]["kernel_control"]["identity_unavailable"] = 7
         with self.assertRaises(ORACLE.JudgeFail):
             ORACLE.judge("g17", rows, report_text=json.dumps(report))
@@ -544,11 +544,11 @@ class InstalledJudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE.JudgeFail):
             ORACLE.judge("g16", broken,
                          report_text=json.dumps(valid_report(300)))
-        independent = valid_ledger("g17", 16385)
+        independent = valid_ledger("g17", 262145)
         independent[1]["surfaces"]["interface"] = 5
         with self.assertRaises(ORACLE.Blocked):
             ORACLE.judge("g17", independent,
-                         report_text=json.dumps(valid_report(16385)))
+                         report_text=json.dumps(valid_report(262145)))
 
     def test_cli_judge_reports_blocked_and_fail_distinctly(self):
         with tempfile.TemporaryDirectory(prefix="p11scope-loader-judge-") as raw:
@@ -612,11 +612,11 @@ class L4ReceiptTests(unittest.TestCase):
             ("g16", 300, "loader_transitions.refusals", 1, "loader_transitions.retained_peak"),
             ("g16", 300, "loader_transitions.reclaims", 301, "loader_transitions.retained_peak"),
             ("g16", 300, "loader_transitions.reclaims", 298, "loader_transitions.refusals"),
-            ("g17", 16385, "image_transitions.tickets_issued", 16384, "image_transitions.bank_cuts"),
-            ("g17", 16385, "image_transitions.bank_cuts", 2, "image_transitions.tickets_issued"),
-            ("g17", 16385, "image_transitions.bank_refusals", 1, "invocation_receipt"),
-            ("g17", 16385, "invocation_receipt", [], "image_transitions.bank_refusals"),
-            ("g17", 16385, "invocation_receipt.id", "", "image_transitions.bank_cuts"),
+            ("g17", 262145, "image_transitions.tickets_issued", 262144, "image_transitions.bank_cuts"),
+            ("g17", 262145, "image_transitions.bank_cuts", 2, "image_transitions.tickets_issued"),
+            ("g17", 262145, "image_transitions.bank_refusals", 1, "invocation_receipt"),
+            ("g17", 262145, "invocation_receipt", [], "image_transitions.bank_refusals"),
+            ("g17", 262145, "invocation_receipt.id", "", "image_transitions.bank_cuts"),
         )
         for cell, count, field, value, missing in cases:
             with self.subTest(cell=cell, field=field, missing=missing):
@@ -636,11 +636,11 @@ class L4ReceiptTests(unittest.TestCase):
             ("g16", 300, {"loader_transitions": {"arms": 300}}),
             ("g16", 300, {"loader_transitions": {"arms": 300, "retained_peak": 1,
                                                  "refusals": 0}}),
-            ("g17", 16385, {}),
-            ("g17", 16385, {"image_transitions": {"tickets_issued": 16385,
+            ("g17", 262145, {}),
+            ("g17", 262145, {"image_transitions": {"tickets_issued": 262145,
                                                    "bank_cuts": 1, "bank_refusals": 0}}),
-            ("g17", 16385, {"invocation_receipt": {"id": "invocation-1"}}),
-            ("g17", 16385, {"image_transitions": {"tickets_issued": 16386}}),
+            ("g17", 262145, {"invocation_receipt": {"id": "invocation-1"}}),
+            ("g17", 262145, {"image_transitions": {"tickets_issued": 262146}}),
         )
         for cell, count, l4 in cases:
             with self.subTest(cell=cell, receipts=l4):
@@ -712,16 +712,16 @@ class L4ReceiptTests(unittest.TestCase):
 
     def test_l4_tickets_never_crossed_is_fail(self):
         l4 = self.with_receipt(
-            "g17", 16385, "image_transitions.tickets_issued", 16384)
+            "g17", 262145, "image_transitions.tickets_issued", 262144)
         with self.assertRaises(ORACLE.JudgeFail) as raised:
-            self.judge_report("g17", 16385, l4)
-        self.assertIn("16,384", str(raised.exception))
+            self.judge_report("g17", 262145, l4)
+        self.assertIn("262,144", str(raised.exception))
 
     def test_l4_second_bank_cut_is_fail(self):
         l4 = self.with_receipt(
-            "g17", 16385, "image_transitions.bank_cuts", 2)
+            "g17", 262145, "image_transitions.bank_cuts", 2)
         with self.assertRaises(ORACLE.JudgeFail) as raised:
-            self.judge_report("g17", 16385, l4)
+            self.judge_report("g17", 262145, l4)
         self.assertIn("cut", str(raised.exception))
 
     def test_l4_receipt_boundaries_and_contradictions(self):
@@ -748,9 +748,9 @@ class L4ReceiptTests(unittest.TestCase):
         }
         for name, (dotted, value) in g17_failures.items():
             with self.subTest(name=name):
-                l4 = self.with_receipt("g17", 16385, dotted, value)
+                l4 = self.with_receipt("g17", 262145, dotted, value)
                 with self.assertRaises(ORACLE.JudgeFail):
-                    self.judge_report("g17", 16385, l4)
+                    self.judge_report("g17", 262145, l4)
         # Exact boundaries pass: peak 8, reclaims at arms-peak, and surplus
         # issuance (crossing, not exact: ambient births may burn tickets).
         for name, peak, reclaims in (
@@ -764,9 +764,9 @@ class L4ReceiptTests(unittest.TestCase):
                 self.assertIn("installed positive",
                               self.judge_report("g16", 300, l4))
         surplus = self.with_receipt(
-            "g17", 16385, "image_transitions.tickets_issued", 16386)
+            "g17", 262145, "image_transitions.tickets_issued", 262146)
         self.assertIn("installed positive",
-                      self.judge_report("g17", 16385, surplus))
+                      self.judge_report("g17", 262145, surplus))
 
     def test_g16_valid_trace_with_l4_receipts_is_pass(self):
         detail = ORACLE.judge(
@@ -783,23 +783,23 @@ class L4ReceiptTests(unittest.TestCase):
         self.assertIn("arming", str(raised.exception))
 
     def test_g17_missing_image_receipts_is_blocked(self):
-        rows = valid_ledger("g17", 16385)
-        report = json.dumps(valid_report(16385))
+        rows = valid_ledger("g17", 262145)
+        report = json.dumps(valid_report(262145))
         with self.assertRaises(ORACLE.Blocked) as raised:
             ORACLE.judge("g17", rows, report_text=report)
         self.assertIn("ticket", str(raised.exception))
 
     def test_g17_missing_invocation_receipt_is_blocked(self):
-        l4 = valid_l4_transitions("g17", 16385)
+        l4 = valid_l4_transitions("g17", 262145)
         del l4["invocation_receipt"]
         with self.assertRaises(ORACLE.Blocked) as raised:
-            self.judge_report("g17", 16385, l4)
+            self.judge_report("g17", 262145, l4)
         self.assertIn("invocation", str(raised.exception))
 
     def test_g17_trace_missing_receipts_is_blocked(self):
         with self.assertRaises(ORACLE.Blocked) as raised:
-            ORACLE.judge("g17", valid_ledger("g17", 16385),
-                         trace_text=valid_trace(16385))
+            ORACLE.judge("g17", valid_ledger("g17", 262145),
+                         trace_text=valid_trace(262145))
         self.assertIn("ticket", str(raised.exception))
 
 
@@ -913,7 +913,7 @@ class FixtureWorkloadTests(unittest.TestCase):
         self.assertEqual(row["provider_ino"], info.st_ino)
 
     def test_driver_refuses_bad_label_and_missing_provider(self):
-        for args in (["0"], ["16386"], ["abc"], []):
+        for args in (["0"], ["262146"], ["abc"], []):
             with self.subTest(args=args):
                 child = subprocess.run(
                     [str(self.driver), str(self.provider), *args],

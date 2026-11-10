@@ -20,7 +20,8 @@ use p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT;
 #[test]
 fn ticket_policy_v1_pins_c1_limit_and_versions_fail_closed() {
     let v1 = TicketPolicy::v1_c1();
-    assert_eq!(v1.limit(), IMAGE_IDENTITY_TICKET_LIMIT);
+    // ADR identity-design Decision 2: v1 is the historical 16,384 literal,
+    // no longer the production constant (v2 carries the live bound).
     assert_eq!(v1.limit(), 16_384);
     assert_eq!(v1.version(), 1);
     assert!(TicketPolicy::reviewed(16_384, 1).is_ok());
@@ -49,6 +50,30 @@ fn ticket_policy_v1_pins_c1_limit_and_versions_fail_closed() {
     dirty.next_ticket = 1;
     assert!(TicketPolicy::validate_control(&dirty, v1).is_err());
     assert!(TicketPolicy::validate_control(&wide.control_image(), wide).is_ok());
+}
+
+// Box 1 (ADR identity-design P1.4): ticket policy v2 is the reviewed
+// 262,144 lifetime bound; v1 stays the historical 16,384.
+#[test]
+fn ticket_policy_v2_is_the_reviewed_wide_limit() {
+    let v2 = TicketPolicy::v2();
+    assert_eq!(v2.limit(), 262_144);
+    assert_eq!(v2.limit(), IMAGE_IDENTITY_TICKET_LIMIT);
+    assert_eq!(v2.version(), 2);
+    assert_eq!(TicketPolicy::v1_c1().limit(), 16_384);
+    assert!(TicketPolicy::reviewed(262_144, 1).is_err());
+    let image = v2.control_image();
+    assert_eq!(
+        (
+            image.limit,
+            image.next_ticket,
+            image.unavailable,
+            image.create_failures,
+            image.retry_exhausted
+        ),
+        (262_144, 0, 0, 0, 0)
+    );
+    assert!(TicketPolicy::validate_control(&image, v2).is_ok());
 }
 
 // Box 1: u64 monotonic tickets mirror native cookie_for (zero reserved, no reuse).

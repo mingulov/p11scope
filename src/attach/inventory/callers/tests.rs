@@ -234,17 +234,17 @@ fn caller_map_contract_refuses_missing_extra_and_each_new_metadata_mutation() {
 #[test]
 fn caller_control_rejects_any_nonfresh_word_or_changed_lifetime_ticket_limit() {
     validate_caller_control(ImageIdentityControl {
-        limit: 16_384,
+        limit: 262_144,
         ..Default::default()
     })
     .unwrap();
     for word in 0..5 {
         let mut control = ImageIdentityControl {
-            limit: 16_384,
+            limit: 262_144,
             ..Default::default()
         };
         match word {
-            0 => control.limit = 16_385,
+            0 => control.limit = 262_145,
             1 => control.next_ticket = 1,
             2 => control.unavailable = 1,
             3 => control.create_failures = 1,

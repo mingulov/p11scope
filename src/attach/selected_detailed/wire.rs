@@ -115,6 +115,19 @@ mod tests {
         zero_cookie[8..16].fill(0);
         assert!(parse_bootstrap(&zero_cookie, 4, 400, 8).is_none());
     }
+    #[test]
+    fn bootstrap_accepts_wide_cookies_and_refuses_past_the_budget() {
+        let mut wide = row(4, 100_000, 0, 1, 400, 1);
+        wide.extend(row(4, 0, 0, 2, 400, 2));
+        let image = parse_bootstrap(&wide, 4, 400, 8).expect("cookie 100000 parses");
+        assert_eq!((image.cookie, image.visits), (100_000, 2));
+        let mut edge = row(4, 262_144, 0, 1, 400, 1);
+        edge.extend(row(4, 0, 0, 2, 400, 2));
+        assert!(parse_bootstrap(&edge, 4, 400, 8).is_some());
+        let mut past = row(4, 262_145, 0, 1, 400, 1);
+        past.extend(row(4, 0, 0, 2, 400, 2));
+        assert!(parse_bootstrap(&past, 4, 400, 8).is_none());
+    }
 }
 
 pub(super) struct BaselineImage {
@@ -211,5 +224,18 @@ mod baseline_tests {
         let mut cookie_duplicate = good.clone();
         cookie_duplicate[48..56].copy_from_slice(&8u64.to_ne_bytes());
         assert!(parse_baseline(&cookie_duplicate, 9, 2, 65536).is_none());
+    }
+    #[test]
+    fn baseline_accepts_wide_cookies_and_refuses_past_the_budget() {
+        let mut wide = row(100_000, 0, 1, 0, 1);
+        wide.extend(row(0, 0, 2, 1, 2));
+        let parsed = parse_baseline(&wide, 9, 1, 65536).expect("cookie 100000 parses");
+        assert_eq!(parsed.images[0].cookie, 100_000);
+        let mut edge = row(262_144, 0, 1, 0, 1);
+        edge.extend(row(0, 0, 2, 1, 2));
+        assert!(parse_baseline(&edge, 9, 1, 65536).is_some());
+        let mut past = row(262_145, 0, 1, 0, 1);
+        past.extend(row(0, 0, 2, 1, 2));
+        assert!(parse_baseline(&past, 9, 1, 65536).is_none());
     }
 }

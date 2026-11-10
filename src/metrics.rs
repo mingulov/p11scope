@@ -1119,7 +1119,7 @@ mod tests {
         })
         .expect("notice line");
         assert!(line.contains("168027"), "{line}");
-        assert!(line.contains("16384"), "{line}");
+        assert!(line.contains("262144"), "{line}");
         assert!(line.contains("PARTIAL"), "{line}");
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
         })
         .expect("notice line");
         assert!(line.contains('3'), "{line}");
-        assert!(!line.contains("16384"), "{line}");
+        assert!(!line.contains("262144"), "{line}");
     }
 
     // Identity budget (RED twin): no refusals, no notice.

@@ -10344,7 +10344,7 @@ fn assert_caller_health(snapshot: &InventoryUsageSnapshot, evidence: [u64; 4]) -
         .caller_control
         .context("caller native control is unknown")?;
     ensure!(
-        control.limit == 16_384 && control.next_ticket > 0,
+        control.limit == 262_144 && control.next_ticket > 0,
         "caller native control {control:?}"
     );
     Ok(())
@@ -10964,7 +10964,7 @@ fn privileged_inventory_caller_cgroup_lp64() -> Result<()> {
         .caller_control
         .context("caller native control after excluded call is unknown")?;
     ensure!(
-        excluded_control.limit == 16_384
+        excluded_control.limit == 262_144
             && excluded_control.next_ticket == 0
             && excluded_control.unavailable == 0
             && excluded_control.create_failures == 0

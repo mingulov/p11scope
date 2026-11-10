@@ -589,7 +589,7 @@ mod tests {
             finding.detail
         );
         assert!(
-            finding.detail.contains("16384"),
+            finding.detail.contains("262144"),
             "unexpected detail: {}",
             finding.detail
         );

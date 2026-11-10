@@ -112,13 +112,13 @@ int main(void) {
     ctl.limit = 1; assert(p11_link_current_identity(&out) == COOKIE_STATUS_BAD_CONFIG);
     ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT; ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT - 1;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_OK);
-    assert(out.task_cookie == 16384 && out.exec_id == 0 && ctl.next_ticket == 16384);
+    assert(out.task_cookie == 262144 && out.exec_id == 0 && ctl.next_ticket == 262144);
     leader.self_exec_id = 1;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_OK);
-    assert(out.task_cookie == 16384 && out.exec_id == 1 && ctl.next_ticket == 16384);
+    assert(out.task_cookie == 262144 && out.exec_id == 1 && ctl.next_ticket == 262144);
     present = 0;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_QUOTA);
-    assert(ctl.next_ticket == 16384 && out.task_cookie == 0 && out.exec_id == 0);
+    assert(ctl.next_ticket == 262144 && out.task_cookie == 0 && out.exec_id == 0);
     ctl.next_ticket = ~0ULL;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_BAD_CONFIG);
     assert(ctl.next_ticket == ~0ULL);

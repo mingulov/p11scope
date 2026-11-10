@@ -703,10 +703,10 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_p
 # (declared-cadence split; same fixture/seam as the short controls).
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64
-# life-1 (OD34 cell 3.6, image half): 16,385 genuine process births spend
-# the 16,384 image tickets; births past the budget are counted identity
-# refusals. Expected ~1-3 min, live 1 child, bounded 10 min, quiet host.
-discovery::engine::pressure_native_tests::image_quota_16385_births_are_counted_identity_refusals
+# life-1 (OD34 cell 3.6, image half): 262,145 genuine process births spend
+# the 262,144 image tickets; births past the budget are counted identity
+# refusals. Expected ~2-6 min, live 8 children, bounded 10 min, quiet host.
+discovery::engine::pressure_native_tests::image_quota_262145_births_are_counted_identity_refusals
 )
 
 # Static skips: external prerequisites or explicitly deferred build cells.

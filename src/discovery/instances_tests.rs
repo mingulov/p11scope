@@ -233,6 +233,33 @@ mod full_image {
         assert_eq!(joined(r.route(facts(3, domain(), old, 1, 0))), old_id);
     }
 
+    /// Wide-ticket boundaries (ADR identity-design P1.2): the ledger spans
+    /// the full 262,144 budget; past-the-end still reads retired.
+    #[test]
+    fn retirement_ledger_covers_wide_tickets_to_the_budget_end() {
+        assert_eq!(RetirementLedger::index(200_000), Some(199_999));
+        assert_eq!(RetirementLedger::index(262_144), Some(262_143));
+        let mut ledger = RetirementLedger::new();
+        let edge = ImageKey {
+            cookie: 262_144,
+            exec: 3,
+        };
+        assert!(!ledger.retired(edge));
+        ledger.retire_image(edge);
+        assert!(ledger.retired(edge));
+        ledger.retire_task(200_000);
+        assert!(ledger.retired(ImageKey {
+            cookie: 200_000,
+            exec: 0
+        }));
+        assert_eq!(RetirementLedger::index(262_145), None);
+        assert!(ledger.retired(ImageKey {
+            cookie: 262_145,
+            exec: 0
+        }));
+        assert_eq!(RetirementLedger::index(0), None);
+    }
+
     #[test]
     fn retired_exec_allows_same_cookie_successor() {
         let mut r = router();

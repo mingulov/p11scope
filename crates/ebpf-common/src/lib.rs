@@ -3349,6 +3349,30 @@ mod tests {
         }
     }
 
+    /// Literal wide boundaries (ADR identity-design P1.1): the old budget is
+    /// interior now; quota sits past 262,144, never at 16,384.
+    #[test]
+    fn exec_binding_id_accepts_literal_wide_boundaries() {
+        for ticket in [16_385, 262_144] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.binding_id = ticket;
+            assert!(
+                valid_discovery_record(&record),
+                "literal accept ticket={ticket}"
+            );
+            assert_eq!(record.exec_task_ticket(), Some(ticket));
+        }
+        for ticket in [262_145, 1 << 32, u64::MAX] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.binding_id = ticket;
+            assert!(
+                !valid_discovery_record(&record),
+                "literal refuse ticket={ticket}"
+            );
+            assert_eq!(record.exec_task_ticket(), None);
+        }
+    }
+
     /// A bounded original task ticket is private EXEC transport, independent
     /// of its finite same-task class; it never relaxes another payload field.
     #[test]

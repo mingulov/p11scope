@@ -103,7 +103,7 @@ fn drive(scenario: &str, asserts: &[&str]) {
 }
 
 /// N6 exhaustion twin: without a prepared successor, `next_ticket` reaches
-/// the real 16,384 limit with successful + burned tickets summing exactly,
+/// the real 262,144 limit with successful + burned tickets summing exactly,
 /// burns reported, and the next attempt refused with QUOTA, `unavailable`
 /// +1, no identity and no record claiming one.
 #[test]
@@ -111,8 +111,8 @@ fn image_bank_harness_exhaustion_without_next_bank_refuses() {
     drive(
         "exhaustion-without-next-bank",
         &[
-            "ASSERT next_ticket_reaches_16384",
-            "ASSERT successful_plus_burned_is_16384",
+            "ASSERT next_ticket_reaches_262144",
+            "ASSERT successful_plus_burned_is_262144",
             "ASSERT burns_reported_384",
             "ASSERT next_attempt_quota",
             "ASSERT unavailable_plus_one",
@@ -133,7 +133,7 @@ fn image_bank_harness_cut_moves_new_admissions_only() {
         &[
             "ASSERT b_ticket_1_in_new_incarnation",
             "ASSERT a_next_ticket_unchanged",
-            "ASSERT leader_16385_holds_b_identity",
+            "ASSERT leader_262145_holds_b_identity",
             "ASSERT a_admission_frozen",
             "ASSERT bank_counts_sum_to_ledger",
             "ASSERT a_completion_only_via_routed_return",

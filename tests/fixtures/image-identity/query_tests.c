@@ -493,6 +493,16 @@ int main(int argc, char **argv)
     query_tgid = 106;
     assert(!p11_image_entry(106, (1ULL << 15) + IMG_LIMIT + 1, 9));
     assert(coverage == IMG_FAILED);
+    /* Wide bank-B cookies (ADR identity-design P1.6): bit 19 carries the
+     * bank and tickets span the full 262,144 budget. */
+    reset();
+    query_tgid = 107;
+    assert(p11_image_entry(107, (1ULL << 19) | 200000, 9));
+    assert(coverage == IMG_ENABLED);
+    reset();
+    query_tgid = 108;
+    assert(!p11_image_entry(108, (1ULL << 19) | 262145, 9));
+    assert(coverage == IMG_FAILED);
     puts("image continuity: qualified bank-B cookies seed, query and invalidate");
 #endif
     puts("image continuity: entry/index_cookie/poison/query/limits verified");

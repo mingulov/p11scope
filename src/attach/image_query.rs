@@ -1733,7 +1733,7 @@ mod tests {
         );
         assert!(read_fd_access_mode(-1).is_err());
         for (name, value) in [("IMAGE_CONTINUITY", 24), ("IMAGE_TGID_INDEX", 8)] {
-            for count in [1, 16_384] {
+            for count in [1, 262_144] {
                 let expected =
                     super::super::map_metadata(aya::maps::MapType::Hash, 8, value, count, 1);
                 validate_image_map_contract(name, expected, expected, write_only.as_fd()).unwrap();

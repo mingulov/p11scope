@@ -1184,18 +1184,18 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     assert_eq!(churn_b["lifecycle"], "mapped");
     assert_eq!(churn_b["retired"], false);
     // The mid-run birth: churn-C is forked after the first published
-    // pass and lives to run end, so it is admitted mid-run and settled
-    // mapped — or, when it died first, settled dead when admitted, else
-    // counted in its named gap. Every leg is exact; no leg passes
-    // vacuously. (A SIGKILLed harness orphans the FIFO-blocked spawner
+    // pass. When a later pass enumerates it, it is admitted mid-run and
+    // settled mapped; when no pass ever enumerates it (the next pass
+    // enumerates within milliseconds of the trigger under overrun), it
+    // is alive at stop and the stop disclosure names its pid. Death
+    // legs below cover a fixture that died first. Every leg is exact;
+    // no leg passes vacuously. (A SIGKILLed harness orphans the spawner
     // the same way it orphans sleepers; every other exit path kills it
     // through the guard above, including assert panics.)
     let churn_c_incarnations = incarnations(churn_c_pid);
-    if pid_is_driver(churn_c_pid, &condition.driver_exe) {
-        assert!(
-            condition.admitted.contains(&churn_c_pid),
-            "churn-C (pid {churn_c_pid}) born mid-run admitted"
-        );
+    let churn_c_alive = pid_is_driver(churn_c_pid, &condition.driver_exe);
+    let churn_c_admitted = condition.admitted.contains(&churn_c_pid);
+    if churn_c_alive && churn_c_admitted {
         assert!(
             !condition.exited.contains(&churn_c_pid),
             "churn-C (pid {churn_c_pid}) stays alive to run end"
@@ -1204,7 +1204,31 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         let churn_c = churn_c_incarnations[0];
         assert_eq!(churn_c["lifecycle"], "mapped");
         assert_eq!(churn_c["retired"], false);
-    } else if condition.admitted.contains(&churn_c_pid) {
+    } else if churn_c_alive {
+        // Alive but never admitted: born after the last enumeration
+        // that could see it, so the stop disclosure names it — the
+        // never-scanned diff on scan capture, the pending-coverage gap
+        // where exec hooks tracked it. Never a caller row, never
+        // silent. (The pid lists bound at ten shown; churn-C sorts
+        // first as the earliest missed birth, so truncation cannot
+        // hide it behind later starters.)
+        assert!(
+            churn_c_incarnations.is_empty(),
+            "churn-C (pid {churn_c_pid}) never admitted and must leave no caller row"
+        );
+        let gaps = doc["gaps"].as_array().unwrap();
+        let named = gaps.iter().any(|gap| {
+            (gap["subject"] == "processes missed by every scan"
+                || gap["subject"] == "discovery coverage ended before stop")
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| gap_reason_names_pid(reason, churn_c_pid))
+        });
+        assert!(
+            named,
+            "churn-C (pid {churn_c_pid}) born mid-run but never enumerated must be named by the stop disclosure"
+        );
+    } else if churn_c_admitted {
         // Died after admission: settled dead, never silently dropped.
         assert_eq!(churn_c_incarnations.len(), 1, "one churn-C incarnation");
         let churn_c = churn_c_incarnations[0];

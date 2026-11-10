@@ -1493,16 +1493,22 @@ impl CaptureWorkBudget {
         entries: usize,
         entry_limit: Option<usize>,
     ) -> bool {
-        let Some(limits) = self.inventory_limits() else {
-            return true;
-        };
+        // Capture scans (DetailedLegacy) enforce the capture ceilings; without
+        // them every distinct scanned file stayed cached forever (v070-musl-rss).
+        // Callers pass the capture entry ceiling as the fallback, so by the time
+        // this runs `entry_limit` is always `Some`.
+        let byte_limit = self
+            .inventory_limits()
+            .map_or(CAPTURE_RETAINED_CACHE_BYTES, |limits| {
+                limits.retained.cache_bytes
+            });
         if old_bytes.is_none() && entry_limit.is_some_and(|limit| entries >= limit) {
             return false;
         }
         self.retained_cache_bytes
             .checked_sub(old_bytes.unwrap_or(0))
             .and_then(|bytes| bytes.checked_add(new_bytes))
-            .is_some_and(|bytes| bytes <= limits.retained.cache_bytes)
+            .is_some_and(|bytes| bytes <= byte_limit)
     }
 
     fn set_scan_stop(&mut self, reason: &'static str) {
@@ -1877,7 +1883,8 @@ impl CaptureWorkBudget {
             bytes,
             self.inspected_files.len(),
             self.inventory_limits()
-                .map(|limits| limits.retained.inspection_cache_entries),
+                .map(|limits| limits.retained.inspection_cache_entries)
+                .or(Some(CAPTURE_INSPECTION_CACHE_ENTRIES)),
         ) {
             return false;
         }
@@ -1919,7 +1926,8 @@ impl CaptureWorkBudget {
             bytes,
             self.loader_elf_facts.len(),
             self.inventory_limits()
-                .map(|limits| limits.retained.export_cache_entries),
+                .map(|limits| limits.retained.export_cache_entries)
+                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
         ) {
             return false;
         }
@@ -1954,7 +1962,8 @@ impl CaptureWorkBudget {
             bytes,
             self.elf_export_facts.len(),
             self.inventory_limits()
-                .map(|limits| limits.retained.export_cache_entries),
+                .map(|limits| limits.retained.export_cache_entries)
+                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
         ) {
             return false;
         }

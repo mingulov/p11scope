@@ -745,6 +745,10 @@ pub struct Engine {
     /// group other than its own leader-exit hooks (`u64::MAX`: an unstamped
     /// record, unknown order). Bounded by retained pids plus one batch.
     group_last_record_ns: BTreeMap<u32, u64>,
+    /// Counted leader-exit views removed after their group provably fully
+    /// exited, with their pid and known exit hook time, so capture end can
+    /// still judge them. At most one entry per counted view.
+    exited_removed_leader_exit_views: BTreeMap<ProcessViewId, (u32, u64)>,
     /// Views with a matched EXEC whose PID-bound static links may be dead
     /// while still recorded as attached. At most one marker per retained
     /// view: the next refresh rearms even an unchanged plan, ordinary-delta
@@ -11218,6 +11222,7 @@ impl Engine {
             counted_leader_exit_views: BTreeSet::new(),
             leader_exit_hook_ns: BTreeMap::new(),
             group_last_record_ns: BTreeMap::new(),
+            exited_removed_leader_exit_views: BTreeMap::new(),
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
             run_tree_handed_back: 0,
@@ -20889,9 +20894,11 @@ impl Engine {
         // the group carries a stamp at or after its leader-exit hook: a
         // later record proves a member ran userspace while the pid-bound
         // links were dead (a leader that left by pthread_exit), so that
-        // loss stays. Still-live, unanswerable, unknown-order and
-        // already-removed views keep the fail-closed count. Bounded: at
-        // most two timeout-0 polls per retained view, at finish only.
+        // loss stays. A counted view removed earlier is judged from the
+        // exit proof taken at its removal. Still-live, unanswerable,
+        // unknown-order and unproven removed views keep the fail-closed
+        // count. Bounded: at most two timeout-0 polls per retained view,
+        // at finish only.
         self.prune_exited_pending_leader_exit_views();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -20943,7 +20950,9 @@ impl Engine {
             .counted_leader_exit_views
             .iter()
             .copied()
-            .filter(|view| self.leader_exit_withdrawable(*view))
+            .filter(|view| {
+                self.leader_exit_withdrawable(*view) || self.removed_leader_exit_withdrawable(*view)
+            })
             .collect();
         for view in exited {
             if self.counted_leader_exit_views.remove(&view) {
@@ -20951,6 +20960,7 @@ impl Engine {
                 self.leader_exit_hook_ns.remove(&view);
             }
         }
+        self.exited_removed_leader_exit_views.clear();
     }
 
     /// True only when the view is still retained, its leader-exit hook
@@ -20958,6 +20968,19 @@ impl Engine {
     /// after that time, and its original generation provably exited
     /// (retained pidfd poll). Missing views, unknown order, post-exit
     /// activity and poll errors stay fail-closed.
+    /// The removed-view twin of `leader_exit_withdrawable`: the group was
+    /// proven fully exited when its view was dropped, and no record from
+    /// its pid is stamped at or after the exit hook since.
+    fn removed_leader_exit_withdrawable(&self, view: ProcessViewId) -> bool {
+        self.exited_removed_leader_exit_views
+            .get(&view)
+            .is_some_and(|(pid, exit_ns)| {
+                self.group_last_record_ns
+                    .get(pid)
+                    .is_none_or(|last| *last < *exit_ns)
+            })
+    }
+
     fn leader_exit_withdrawable(&self, view: ProcessViewId) -> bool {
         let Some(Some(exit_ns)) = self.leader_exit_hook_ns.get(&view).copied() else {
             return false;
@@ -22771,6 +22794,10 @@ impl Engine {
     /// unanswerable one used to reach capture end.
     fn settle_leader_exits_at_removal(&mut self, removed: impl IntoIterator<Item = ProcessViewId>) {
         for view in removed {
+            if self.counted_leader_exit_views.contains(&view) {
+                self.note_counted_leader_exit_removal(view);
+                continue;
+            }
             if !self.pending_leader_exit_views.contains(&view) {
                 continue;
             }
@@ -22792,6 +22819,34 @@ impl Engine {
             if !self.pending_leader_exit_views.contains(&view) {
                 self.pending_leader_exit_order.remove(&view);
             }
+        }
+    }
+
+    /// A counted view is about to be dropped. When its group provably fully
+    /// exited and its exit hook time is known, keep just enough to judge
+    /// the loss at capture end; records stamped later from the same pid
+    /// (even after removal) still keep it.
+    /// Keeps observation stamps only for retained pids and for the pids
+    /// of removed exited views still awaiting capture-end judgment.
+    fn prune_group_last_records(&mut self, retained_pids: &BTreeSet<u32>) {
+        let awaiting: BTreeSet<u32> = self
+            .exited_removed_leader_exit_views
+            .values()
+            .map(|(pid, _)| *pid)
+            .collect();
+        self.group_last_record_ns
+            .retain(|pid, _| retained_pids.contains(pid) || awaiting.contains(pid));
+    }
+
+    fn note_counted_leader_exit_removal(&mut self, view: ProcessViewId) {
+        let Some(Some(exit_ns)) = self.leader_exit_hook_ns.get(&view).copied() else {
+            return;
+        };
+        if let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view)
+            && retained.original_exited() == Ok(true)
+        {
+            self.exited_removed_leader_exit_views
+                .insert(view, (retained.pid(), exit_ns));
         }
     }
 
@@ -22817,6 +22872,9 @@ impl Engine {
 
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
         let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
+        // A reused view id starts a new generation's assessment: a removal
+        // proof left by an earlier generation can no longer withdraw it.
+        self.exited_removed_leader_exit_views.remove(&view);
         let newly_pending = self.pending_leader_exit_views.insert(view);
         if newly_pending {
             // A new assessment dirties the current lap and restarts the
@@ -30802,8 +30860,7 @@ impl Engine {
             }
         };
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
-        self.group_last_record_ns
-            .retain(|pid, _| retained_pids.contains(pid));
+        self.prune_group_last_records(&retained_pids);
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             deferred_exits.extend(queued.extract_if(.., |queued| {
@@ -31024,8 +31081,7 @@ impl Engine {
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
-        self.group_last_record_ns
-            .retain(|pid, _| retained_pids.contains(pid));
+        self.prune_group_last_records(&retained_pids);
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             // Move-only: the deferred exits move out in encounter order;

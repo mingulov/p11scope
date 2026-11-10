@@ -5558,6 +5558,89 @@ fn terminal_drain_keeps_a_loss_whose_exit_order_is_unknown() {
     assert_eq!(engine.task_uprobe_link_losses, 1);
 }
 
+/// Drops `view` the way every engine removal site does: settle at
+/// removal, drop the retained view, release its id.
+fn remove_view_like_retirement(engine: &mut Engine, view: ProcessViewId) {
+    engine.settle_leader_exits_at_removal([view]);
+    engine.views.retain(|candidate| candidate.id() != view);
+    engine.release_view_id(view);
+}
+
+#[test]
+fn terminal_drain_withdraws_a_loss_whose_exited_view_was_removed() {
+    // A counted view is often retired before capture end once its group
+    // is gone; the proof taken at removal still lets capture end
+    // withdraw the transient.
+    let (mut engine, mut child, _) = counted_leader_exit_loss(67);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(67));
+    assert!(engine.views.is_empty());
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    assert!(engine.counted_leader_exit_views.is_empty());
+}
+
+#[test]
+fn terminal_drain_keeps_a_removed_loss_whose_group_ran_after_the_exit() {
+    // Records still in flight when the view was dropped count too.
+    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(68);
+    let pid = engine.views[0].pid();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(68));
+    engine.note_group_record(&group_record_at(
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+        pid,
+        exit_ns + 1,
+    ));
+    // Each batch prunes stamps to retained pids; the pid of a removed
+    // view awaiting judgment must survive that prune.
+    engine.prune_group_last_records(&BTreeSet::new());
+    assert!(engine.group_last_record_ns.contains_key(&pid));
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn terminal_drain_keeps_a_loss_whose_view_was_removed_while_live() {
+    // Removal of a still-live group proves nothing about exit.
+    let (mut engine, mut child, _) = counted_leader_exit_loss(69);
+    remove_view_like_retirement(&mut engine, ProcessViewId(69));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn a_reused_view_id_cancels_an_earlier_removal_proof() {
+    // View ids return to the free list. Once a new generation under the
+    // same id queues its own leader exit, the old proof must not withdraw.
+    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(70);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(70));
+    assert!(
+        engine
+            .exited_removed_leader_exit_views
+            .contains_key(&ProcessViewId(70))
+    );
+    engine.queue_leader_exit_assessment(ProcessViewId(70), Some(exit_ns + 10));
+    assert!(engine.exited_removed_leader_exit_views.is_empty());
+    engine.pending_leader_exit_views.clear();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
 #[test]
 fn leader_exit_records_never_count_as_group_observations() {
     // The exit hooks themselves (kinds 6 and 7) are not member activity.

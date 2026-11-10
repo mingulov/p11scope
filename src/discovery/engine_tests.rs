@@ -2440,6 +2440,83 @@ fn empty_churn_moves_pins_exactly() {
     );
 }
 
+/// The fast path reuses committed modules/plan while committing moved pins,
+/// so pin-side identity consequences land a tick later than the full path
+/// would derive them. The commit's stability gate bounds that deferral to
+/// one tick: committing a candidate with real pin moves clears
+/// plan_rebuild_stable, and the next tick takes the full path from the
+/// committed moved pins. A commit that reproduces the pins preserves
+/// stability, proving the moves are what force the rebuild.
+#[test]
+fn pin_moves_force_a_full_rebuild_on_the_next_tick() {
+    let dir = pinned_churn_dir();
+    let mut built = pinned_churn_engine(&dir);
+    built.engine.fail_full_candidate_rebuild_for_test = true;
+    let removed: BTreeSet<ProcessViewId> = [ProcessViewId(60)].into_iter().collect();
+    let refreshed = vec![(ProcessViewId(62), Vec::new(), built.refresh_pins.clone())];
+    let admitted = ProcessView::open(ProcessViewId(70), std::process::id()).unwrap();
+    let new_views = vec![(
+        ProcessView::open(ProcessViewId(70), std::process::id()).unwrap(),
+        Vec::new(),
+        built.new_pins.clone(),
+    )];
+    let candidate = built
+        .engine
+        .inventory_candidate(
+            &removed,
+            &refreshed,
+            &new_views,
+            Vec::new(),
+            &BTreeSet::new(),
+        )
+        .expect("empty churn with pins takes the fast path");
+    assert!(
+        !Engine::pins_match_for_stability(&candidate.pinned, &built.engine.pinned),
+        "the moved pins fail the stability comparison"
+    );
+    // The admitted view rides as extra_views, the production tick shape, so
+    // admission does not mistake the newcomer for a stale generation.
+    let mut additions_allowed = true;
+    let outcome = built
+        .engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[&admitted],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(additions_allowed);
+    assert!(
+        !built.engine.plan_rebuild_stable,
+        "committing real pin moves clears stability"
+    );
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let err = match built
+        .engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+    {
+        Ok(_) => panic!("the next tick rebuilds from the committed moved pins"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("test-forced full rebuild failure"),
+        "the next tick takes the full path: {err:?}"
+    );
+    let mut idle = pinned_churn_engine(&dir);
+    let settled = idle
+        .engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .expect("an idle tick reuses the committed candidate");
+    apply_loader_planning_candidate(&mut idle.engine, settled);
+    assert!(
+        idle.engine.plan_rebuild_stable,
+        "a commit that reproduces the pins preserves stability"
+    );
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

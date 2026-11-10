@@ -15358,6 +15358,512 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn deferred_receipts_fold_to_one_gap_per_module_at_stop() {
+        // Deferred-gap fold: one module's endpoints attach in batches
+        // across passes, and every pass's receipt defers the rest.
+        // Mid-run each receipt stages its own deferral gap (the
+        // capacity drain gate reads that per-pass activity), but the
+        // stop-time fold leaves exactly one gap for the module, with
+        // the peak deferral, the pass count and the stop outcome. The
+        // rc-8 shape was 13 gaps for one module; the report keeps the
+        // honest lower-bounds cause exactly once, never under a
+        // subject that says "failed".
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(28))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let attached = |id: u32, at_ns: u64| {
+            let target = endpoint(id);
+            AttachedEndpoint {
+                id: target.id,
+                object: target.object,
+                at_ns,
+            }
+        };
+        // Thirteen passes attach two endpoints each and defer the
+        // rest (26 down to 2); a final receipt attaches the last two
+        // cleanly.
+        for pass in 0..13u32 {
+            let rest: Vec<_> = (2 * pass + 2..28).map(endpoint).collect();
+            let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
+            coordinator.note_extend_receipt(&ExtendReceipt {
+                attached: vec![
+                    attached(2 * pass, 100 + u64::from(pass)),
+                    attached(2 * pass + 1, 100 + u64::from(pass)),
+                ],
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: rest,
+                    objects,
+                },
+                ..ExtendReceipt::default()
+            });
+            if pass == 4 {
+                // Apply the first five per-receipt gaps mid-run: the
+                // fold must remove applied rows as well as staged ones.
+                coordinator.commit_batch(false).unwrap();
+            }
+        }
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![attached(26, 200), attached(27, 200)],
+            ..ExtendReceipt::default()
+        });
+        // Mid-run the deferrals never use the failure subject.
+        let failed_deferrals = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == PARTIAL_ATTACH_SUBJECT && gap.reason.contains("still deferred")
+            })
+            .count()
+            + coordinator
+                .registry
+                .staged_gaps_for_test()
+                .iter()
+                .filter(|gap| {
+                    gap.subject == PARTIAL_ATTACH_SUBJECT && gap.reason.contains("still deferred")
+                })
+                .count();
+        assert_eq!(
+            failed_deferrals, 0,
+            "deferrals stage under the deferral subject, never failed: {:?} {:?}",
+            coordinator.registry.gaps(),
+            coordinator.registry.staged_gaps_for_test(),
+        );
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "thirteen deferred receipts fold to one gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "attach finished late: up to 26 endpoint(s) deferred over 13 passes \
+             (all attached by stop); counted uses are lower bounds"
+        );
+        assert!(
+            gaps[0].module.is_some(),
+            "the folded gap attributes to the deferred module: {:?}",
+            gaps[0]
+        );
+        assert!(
+            coordinator.registry.gaps().iter().all(|gap| {
+                !(gap.subject == PARTIAL_ATTACH_SUBJECT && gap.reason.contains("still deferred"))
+            }),
+            "no per-receipt deferral survives under the failure subject: {:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn mixed_failure_and_deferral_splits_causes_and_folds_only_deferrals() {
+        // Deferred-gap fold, sticky-failure twin: a receipt carrying
+        // both a sticky failure and deferrals splits by cause at
+        // birth — the failure keeps the "failed" wording, the
+        // deferral takes the deferral subject — and the stop-time
+        // fold touches only the deferral side. The failure gap stands
+        // exactly as staged; the deferral folds with its counts.
+        use crate::attach::capture::{AttachedEndpoint, EndpointFailure, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(4))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let fail = endpoint(0);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            failed: vec![EndpointFailure {
+                id: fail.id,
+                object: fail.object,
+                reason: "kernel refused".into(),
+                link_retained: false,
+            }],
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: vec![endpoint(1), endpoint(2)],
+                objects: vec![endpoint(1).object, endpoint(2).object],
+            },
+            ..ExtendReceipt::default()
+        });
+        let attach = |id: u32| {
+            let target = endpoint(id);
+            AttachedEndpoint {
+                id: target.id,
+                object: target.object,
+                at_ns: 200,
+            }
+        };
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![attach(1), attach(2), attach(3)],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        let failures: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the mixed receipt stages one failure gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            failures[0].reason,
+            "1 of 4 endpoints failed to attach (sticky, never retried); counted uses are lower bounds"
+        );
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let failures: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the fold leaves the failure gap standing: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            failures[0].reason,
+            "1 of 4 endpoints failed to attach (sticky, never retried); counted uses are lower bounds"
+        );
+        let folded: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            folded.len(),
+            1,
+            "the deferral side folds to one gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            folded[0].reason,
+            "attach finished late: up to 2 endpoint(s) deferred over 1 pass \
+             (all attached by stop); counted uses are lower bounds"
+        );
+    }
+
+    #[test]
+    fn deferrals_outstanding_at_stop_fold_with_the_remainder_named() {
+        // Deferred-gap fold, still-deferred twin: endpoints that never
+        // attached stay named in the folded gap — "still deferred at
+        // stop" with the outstanding count — beside the peak and the
+        // pass count. Counted uses stay lower bounds.
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(4))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let rest: Vec<_> = (0..4).map(endpoint).collect();
+        let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: rest,
+                objects,
+            },
+            ..ExtendReceipt::default()
+        });
+        let first = endpoint(0);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: first.id,
+                object: first.object,
+                at_ns: 200,
+            }],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the deferral folds to one gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "attach unfinished at stop: up to 4 endpoint(s) deferred over 1 pass \
+             (3 still deferred at stop); counted uses are lower bounds"
+        );
+        assert!(
+            gaps[0].module.is_some(),
+            "the folded gap attributes to the deferred module: {:?}",
+            gaps[0]
+        );
+    }
+
+    #[test]
+    fn unclaimed_deferrals_fold_to_one_run_wide_gap() {
+        // Deferred-gap fold, no-recorded-module twin: deferred
+        // endpoints no module claims (evicted before the receipt)
+        // report run-wide, and the stop-time fold leaves exactly one
+        // run-wide gap with the peak, the pass count and the stop
+        // outcome.
+        use crate::attach::capture::ExtendReceipt;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let template = absorbed.delta.endpoints[0];
+        let ghost = |id: u32| crate::discovery::inventory_attach_set::AttachEndpoint {
+            id: crate::discovery::inventory_attach_set::EndpointId(id),
+            ..template
+        };
+        for _ in 0..3 {
+            let rest = vec![ghost(9998), ghost(9999)];
+            let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
+            coordinator.note_extend_receipt(&ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: rest,
+                    objects,
+                },
+                ..ExtendReceipt::default()
+            });
+        }
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "three unclaimed deferral receipts fold to one gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "attach unfinished at stop: up to 2 endpoint(s) with no recorded module deferred \
+             over 3 passes (2 still deferred at stop); counted uses are lower bounds"
+        );
+        assert_eq!(
+            gaps[0].module, None,
+            "the unclaimed fold reports run-wide: {:?}",
+            gaps[0]
+        );
+    }
+
+    #[test]
+    fn folded_deferral_gap_renders_a_single_concise_line() {
+        // Deferred-gap fold, render twin: the folded gap renders as one
+        // concise line carrying the counts, the report stays PARTIAL,
+        // and no "failed" line names a deferral.
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        use crate::inventory_present::{
+            Presentation, render_snapshot_with_verbosity,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(6))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let attach = |id: u32, at_ns: u64| {
+            let target = endpoint(id);
+            AttachedEndpoint {
+                id: target.id,
+                object: target.object,
+                at_ns,
+            }
+        };
+        for pass in 0..2u32 {
+            let rest: Vec<_> = (2 * pass + 2..6).map(endpoint).collect();
+            let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
+            coordinator.note_extend_receipt(&ExtendReceipt {
+                attached: vec![
+                    attach(2 * pass, 100 + u64::from(pass)),
+                    attach(2 * pass + 1, 100 + u64::from(pass)),
+                ],
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: rest,
+                    objects,
+                },
+                ..ExtendReceipt::default()
+            });
+        }
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![attach(4, 200), attach(5, 200)],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "workload", 50, 100, 1);
+        let out =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        assert!(
+            out.contains("coverage: partial"),
+            "the folded deferral keeps the report PARTIAL: {out}"
+        );
+        let deferred_lines: Vec<_> = out
+            .lines()
+            .filter(|line| line.contains("native endpoint attach deferred"))
+            .collect();
+        assert_eq!(
+            deferred_lines.len(),
+            1,
+            "one concise line for the folded deferral: {out}"
+        );
+        assert!(
+            deferred_lines[0].contains("up to 4")
+                && deferred_lines[0].contains("over 2 passes")
+                && deferred_lines[0].contains("all attached by stop"),
+            "the line carries the folded counts: {out}"
+        );
+        assert!(
+            !out.contains("native endpoint attach failed"),
+            "no failed line names a deferral: {out}"
+        );
+    }
+
+    #[test]
     fn partial_or_unrecorded_admission_is_never_watched() {
         use crate::discovery::inventory_attach_set::tests as fx;
         let dir = tempfile::tempdir().unwrap();

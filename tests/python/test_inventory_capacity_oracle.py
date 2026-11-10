@@ -2003,6 +2003,46 @@ class AttachDrainGateTests(unittest.TestCase):
             gate(time.monotonic() + 60, lambda: rows, mock.Mock(), observer)
 
 
+class DeferralSubjectDrainGateTests(unittest.TestCase):
+    """The drain gate matches the folded deferral subject (v0.7.0)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.oracle = runpy.run_path(str(ORACLE))
+
+    def rows(self, *events):
+        return [{"at_ns": at_ns, "kind": kind, "event": event}
+                for at_ns, kind, event in events]
+
+    def test_new_subject_deferred_gap_after_last_pass_blocks(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach deferred",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        self.assertFalse(drained(rows))
+
+    def test_pass_after_new_subject_deferred_gap_is_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach deferred",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "pass_committed", {"pass": 1}))
+        self.assertTrue(drained(rows))
+
+    def test_new_subject_partial_attach_clouds_count_exactness(self):
+        from types import SimpleNamespace
+        oracle = self.oracle
+        edge = {"module": "m", "caller": "c"}
+        view = SimpleNamespace(doc={"gaps": [
+            {"subject": "native endpoint attach deferred",
+             "reason": "attach finished late: up to 68 endpoint(s) deferred over "
+                       "3 passes (all attached by stop); counted uses are lower bounds",
+             "module": "m", "caller": None}]})
+        self.assertTrue(oracle["has_partial_attach"](view, edge))
+
+
 def parse_native_row(line):
     return dict(token.split("=", 1) for token in line.split()[1:])
 

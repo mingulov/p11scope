@@ -24288,7 +24288,11 @@ impl Engine {
         // (remove/replace/absorb on a clone); only the module merge, bind,
         // plan and projection work is skipped. Declined views still rebuild.
         // Pin skips stay local until the path commits, so a fold fallthrough
-        // never absorbs twice.
+        // never absorbs twice. Pin-side identity consequences (rejections,
+        // claim scrubs) defer at most one tick: any real pin move fails
+        // pins_match_for_stability, so committing this candidate clears
+        // plan_rebuild_stable and the next tick takes the full path from
+        // the committed moved pins.
         if declined.is_empty()
             && self.plan_rebuild_stable
             && !fast_path_disabled

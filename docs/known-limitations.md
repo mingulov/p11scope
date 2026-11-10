@@ -102,6 +102,37 @@ never admitted, or discovery deferred by racing exits), not noise.
 Owned-provider counts stay exact with zero loss counters; exact
 observation needs a quiescent scope.
 
+### Long captures go blind to new processes once the 16,384 identity budget is spent
+
+Every process the kernel links consumes one of 16,384 lifetime
+identity tickets, and v0.7.0 never recycles a ticket: the budget is
+per capture, not per live process. On a host starting about 20
+processes/s the budget is spent after about 12–16 minutes (2 h soak
+on fedora-sm1: spent at +12–16 min, 168,027 refusals by the end);
+from then on every new process is invisible — its calls and fork
+records are not captured, providers loaded after that point never
+attach (11 late providers, live and calling, absent from that capture
+while a fresh `inventory` attached them), and the newcomer queue
+stalls (66 pending, oldest wait 115 min). A 6-minute desktop capture
+at 200 new processes/s spent the budget 63 s after `capturing:` with
+57,221 refusals.
+
+Disclosure, all at default verbosity: the first refusal prints
+`p11scope: kernel could not give a process an identity (N refused so
+far; lifetime budget of 16384 identities spent); ...`; the loop-end
+`p11scope: longrun:` line carries `identity_budget_exhausted[...]` and
+`newcomer_queue_stalled[...]` findings with counts instead of `clean`;
+the stalled `p11scope: timing: newcomer queue:` line prints; the
+coverage line names `N processes refused an identity (lifetime budget
+of 16384 identities spent)`; the JSON report is PARTIAL with
+`kernel_control.identity_unavailable`,
+`identity_budget_exhausted: true`, and the `newcomer_queue` counts.
+
+Workaround: bound the capture (`--duration`) or split by `--pid` or
+`--cgroup`. Ticket recycling (bank/incarnation reuse) is planned for
+v0.7.1. This supersedes the v0.3.0 DR-06 rate wording ("about an hour
+at 5/s") for v0.7.0.
+
 ### Observer memory grows under heavy process churn
 
 Fixed in v0.7.0: the capture file caches are now capped and the scan

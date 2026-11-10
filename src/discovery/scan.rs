@@ -5618,6 +5618,21 @@ pub(crate) trait ScanIo {
             crate::discovery::identity::map_files_identity(view.pid(), start, end)
         })
     }
+    /// Every range's `vm_file` identity for one guard group, in input
+    /// order. The default reads them one by one; the production IO
+    /// overrides it to hold one filesystem proof across the group
+    /// instead of re-proving the view around every range.
+    fn range_identities(
+        &mut self,
+        view: &ProcessView,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<Vec<std::io::Result<crate::discovery::identity::FileIdentity>>, String> {
+        ranges
+            .iter()
+            .map(|&(start, end)| self.range_identity(view, start, end, budget))
+            .collect()
+    }
     /// Stash a cold-minted survivor for this scan: later `open_maps`
     /// and `range_identity` calls route to it. The default drops the
     /// stash (scripted IOs never serve survivor reads).
@@ -15624,6 +15639,7 @@ mod tests {
 
     struct K1RedIo {
         reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        batch_calls: Vec<Vec<(u64, u64)>>,
         held_magic: Option<u64>,
         witness: std::collections::VecDeque<K1RedVerdict>,
         prove_calls: usize,
@@ -15638,6 +15654,7 @@ mod tests {
         ) -> Self {
             Self {
                 reads,
+                batch_calls: Vec::new(),
                 held_magic: Some(K1_RED_OVERLAY_MAGIC),
                 witness: std::collections::VecDeque::new(),
                 prove_calls: 0,
@@ -15652,6 +15669,7 @@ mod tests {
         ) -> Self {
             Self {
                 reads,
+                batch_calls: Vec::new(),
                 held_magic: Some(K1_RED_EXT4_MAGIC),
                 witness: std::collections::VecDeque::new(),
                 prove_calls: 0,
@@ -15725,6 +15743,20 @@ mod tests {
                 .get(&(start, end))
                 .copied()
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)))
+        }
+
+        fn range_identities(
+            &mut self,
+            view: &ProcessView,
+            ranges: &[(u64, u64)],
+            budget: &mut CaptureWorkBudget,
+        ) -> Result<Vec<std::io::Result<crate::discovery::identity::FileIdentity>>, String>
+        {
+            self.batch_calls.push(ranges.to_vec());
+            ranges
+                .iter()
+                .map(|&(start, end)| self.range_identity(view, start, end, budget))
+                .collect()
         }
 
         fn prove_original_file(
@@ -16437,6 +16469,49 @@ mod tests {
         );
         assert_eq!(io.prove_calls, 0, "marking spends no query");
         assert_eq!(io.witness_used, 0, "marking spends no budget");
+    }
+
+    /// Busy-host deep scans: the guard reads one group's ranges in
+    /// ONE batched call (production holds a single filesystem proof
+    /// across it) instead of one proved call per range, and a
+    /// different file in the middle of the batch still refuses.
+    #[test]
+    fn guard_reads_a_group_in_one_batch_and_refuses_a_middle_mismatch() {
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..3)
+            .map(|index| k1_red_entry(0x7f10_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let other = crate::discovery::identity::FileIdentity { dev: 42, ino: 8 };
+        let mut reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        reads.insert((entries[1].start, entries[1].end), other);
+        let mut io = K1RedIo::ext4(reads);
+        let reason = run_k1_guard(&mut io, held, &group)
+            .expect_err("a middle range mapping another file refuses");
+        assert!(
+            reason.contains("is another file"),
+            "the mismatch keeps its named refusal: {reason}"
+        );
+        assert_eq!(
+            io.batch_calls.len(),
+            1,
+            "one batched read serves the whole group: {:?}",
+            io.batch_calls
+        );
+        assert_eq!(
+            io.batch_calls[0],
+            entries
+                .iter()
+                .map(|entry| (entry.start, entry.end))
+                .collect::<Vec<_>>(),
+            "the batch carries every range in group order"
+        );
     }
 
     #[test]

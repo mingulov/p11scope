@@ -3726,6 +3726,10 @@ fn concise_keeps_other_object_failures_out_of_the_unreachable_line() {
             "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2))",
         ),
         (
+            "/lib/f.so",
+            "opening object within retained target root: No such process (os error 3) (host-root fallback: open failed: No such file or directory (os error 2)) (target root /etc/avahi differs from the observer root)",
+        ),
+        (
             "/lib/big.so",
             "object is 278755480 bytes; limit is 268435456",
         ),
@@ -3754,8 +3758,12 @@ fn concise_keeps_other_object_failures_out_of_the_unreachable_line() {
     }
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        concise.contains("gaps: 7"),
+        concise.contains("gaps: 8"),
         "header counts every retained row: {concise}"
+    );
+    assert!(
+        concise.contains("host-root fallback") && concise.contains("/etc/avahi"),
+        "an ESRCH row with a fallback attempt keeps the foreign fold: {concise}"
     );
     assert!(
         concise.contains("2 ×")
@@ -3828,6 +3836,166 @@ fn concise_unreachable_line_handles_single_and_pidless_rows() {
             "2 × mapped objects not examined — 2 mapped objects unreachable (--json lists each)"
         ),
         "pidless rows read as unreachable objects: {concise}"
+    );
+}
+
+/// Busy-host folds: replaced-file rows across many files become ONE
+/// concise line with exact row and file counts (a small family keeps
+/// its per-file lines, pinned below and by
+/// `concise_replaced_providers_read_as_gaps`); verbose and JSON keep
+/// every row. One row carries repeats 2: the fold counts rows.
+#[test]
+fn concise_folds_many_replaced_files_into_one_counted_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let rows = [
+        (11u32, "/usr/lib/libpcre2-8.so.0.14.0 (deleted)", 2u64),
+        (12u32, "/usr/lib/libpcre2-8.so.0.14.0 (deleted)", 1u64),
+        (11u32, "/usr/lib/gvfs/libgvfscommon.so (deleted)", 1u64),
+        (13u32, "/usr/lib/gio/modules/libgvfsdbus.so (deleted)", 1u64),
+        (13u32, "/usr/lib/libsoup-3.0.so.0.7.4 (deleted)", 1u64),
+    ];
+    for (pid, subject, repeats) in rows {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: (*subject).into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("gaps: 5"), "header counts rows: {concise}");
+    assert!(
+        concise.contains(
+            "5 × replaced files not examined — 4 files replaced while running (--json lists each)"
+        ),
+        "one family line carries exact row and file counts: {concise}"
+    );
+    assert!(
+        !concise.contains("libpcre2"),
+        "no per-file flood in concise: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("libpcre2-8.so.0.14.0 (deleted)"),
+        "{verbose}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        document["gaps"].as_array().expect("gaps array").len(),
+        5,
+        "JSON keeps every record: {document}"
+    );
+}
+
+/// Healthy twin: a two-file replaced family keeps its named per-file
+/// lines (the fold serves floods, not small named losses), and a
+/// maps-attribution lookalike with an unparsable reason stays out of
+/// the maps family.
+#[test]
+fn concise_keeps_small_replaced_and_unparsable_maps_rows_named() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for (pid, subject) in [
+        (11u32, "/usr/lib/libsoftokn3.so (deleted)"),
+        (12u32, "/usr/lib/p11-kit-trust.so (deleted)"),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: (*subject).into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(14),
+        subject: "maps attribution".into(),
+        reason: "maps snapshots unavailable for this process".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("gaps: 3"), "header counts rows: {concise}");
+    assert!(
+        concise.contains("libsoftokn3") && concise.contains("p11-kit-trust"),
+        "small replaced families stay named per file: {concise}"
+    );
+    assert!(
+        !concise.contains("replaced files not examined"),
+        "no family line for a two-file family: {concise}"
+    );
+    assert!(
+        concise.contains("maps snapshots unavailable"),
+        "an unparsable maps reason keeps its own line: {concise}"
+    );
+}
+
+/// Maps-attribution rows (one per pid per pass, each naming how many
+/// shared objects no deep scan examined) fold into ONE concise line
+/// with exact row, process and object counts; verbose and JSON keep
+/// every row.
+#[test]
+fn concise_folds_maps_attribution_into_one_counted_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let rows = [
+        (
+            21u32,
+            "maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider",
+        ),
+        (
+            22u32,
+            "maps 2 shared objects no deep scan examined this pass; each may be an undiscovered provider",
+        ),
+        (
+            23u32,
+            "maps 4 shared objects no deep scan examined this pass; each may be an undiscovered provider",
+        ),
+        (
+            21u32,
+            "maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider",
+        ),
+    ];
+    for (pid, reason) in rows {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: "maps attribution".into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("gaps: 4"), "header counts rows: {concise}");
+    assert!(
+        concise.contains(
+            "4 × maps attribution — 3 processes map 8 unexamined shared objects (--json lists each)"
+        ),
+        "one family line carries exact row, process and object counts: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("maps 4 shared objects"), "{verbose}");
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        document["gaps"].as_array().expect("gaps array").len(),
+        4,
+        "JSON keeps every record: {document}"
     );
 }
 

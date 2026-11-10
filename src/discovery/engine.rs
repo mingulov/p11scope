@@ -32883,6 +32883,24 @@ impl Engine {
         ))
     }
 
+    /// `p11scope: timing: startup …` marker lines (startup T1): one
+    /// `-v`-only line per initial-start segment, so the silent middle is
+    /// named. Missing clock samples render as `n/a`, never zero.
+    fn startup_segment_line(_segment: &'static str, _elapsed_ms: Option<u64>) -> String {
+        String::new()
+    }
+
+    /// The loader-arming marker with per-arm aggregate counts.
+    fn startup_arming_line(
+        _elapsed_ms: Option<u64>,
+        _views: u64,
+        _gated: u64,
+        _attempted: u64,
+        _attached: u64,
+    ) -> String {
+        String::new()
+    }
+
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,

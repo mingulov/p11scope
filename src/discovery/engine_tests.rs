@@ -71699,3 +71699,72 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
     b.wait().unwrap();
     c.wait().unwrap();
 }
+
+/// Startup T1: the segment marker names the segment and its milliseconds,
+/// or `n/a` when the clock read failed.
+#[test]
+fn startup_segment_line_names_the_segment_and_ms() {
+    assert_eq!(
+        Engine::startup_segment_line("initial_stage", Some(45)),
+        "p11scope: timing: startup initial_stage=45ms"
+    );
+    assert_eq!(
+        Engine::startup_segment_line("initial_backlog", None),
+        "p11scope: timing: startup initial_backlog=n/a"
+    );
+}
+
+/// Startup T1: the arming marker names the per-arm aggregate counts; the
+/// zero-view case prints zeros, never panics.
+#[test]
+fn startup_arming_line_names_counts_and_zero_views() {
+    assert_eq!(
+        Engine::startup_arming_line(Some(12210), 28, 0, 28, 27),
+        "p11scope: timing: startup loader_arming=12210ms views=28 gated=0 attempted=28 attached=27"
+    );
+    assert_eq!(
+        Engine::startup_arming_line(Some(0), 0, 0, 0, 0),
+        "p11scope: timing: startup loader_arming=0ms views=0 gated=0 attempted=0 attached=0"
+    );
+    assert_eq!(
+        Engine::startup_arming_line(None, 1, 0, 1, 0),
+        "p11scope: timing: startup loader_arming=n/a views=1 gated=0 attempted=1 attached=0"
+    );
+}
+
+/// Startup T1: every `start_session_with` segment is bracketed by its
+/// marker, in emission order. The start needs a live session, so the
+/// bracketing is pinned statically; the acceptance transcripts prove the
+/// lines print.
+#[test]
+fn start_session_with_brackets_every_startup_segment_with_a_marker() {
+    let source = include_str!("engine.rs");
+    let body = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("pub(crate) mod session_fixture")
+        .expect("session fixture bounds the start path")
+        .0;
+    let markers = [
+        "start_retained_with(self",
+        "\"session_start\"",
+        "session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;",
+        "startup_segment_line(\"initial_stage\"",
+        "arm_initial_views(",
+        "startup_arming_line(",
+        "attach_initial_exports(",
+        "startup_segment_line(\"initial_exports\"",
+        "publish_current_capture_facts()?",
+        "startup_segment_line(\"initial_backlog\"",
+        "finalize_prearm_witness(",
+        "startup_segment_line(\"finalize_prearm\"",
+    ];
+    let mut pos = 0;
+    for marker in markers {
+        let at = body[pos..]
+            .find(marker)
+            .unwrap_or_else(|| panic!("start_session_with lacks {marker}"));
+        pos += at + marker.len();
+    }
+}

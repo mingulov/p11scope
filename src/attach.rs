@@ -7420,6 +7420,12 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `p11scope: timing: startup …` load/attach split (startup T1):
+    /// `-v`-only. Counter sessions skip the static attach (`n/a`).
+    fn startup_session_split_line(_load_ms: Option<u64>, _static_attach_ms: Option<u64>) -> String {
+        String::new()
+    }
+
     fn start_on_backend(
         plan: &AttachPlan,
         scope: &Scope,
@@ -20930,6 +20936,52 @@ mod tests {
             raise < backend,
             "the soft-limit raise must precede backend start (first links)"
         );
+    }
+
+    /// Startup T1: the split marker names BPF load and the static attach
+    /// separately; counter sessions skip the static attach (`n/a`).
+    #[test]
+    fn startup_session_split_line_names_load_and_static_attach() {
+        assert_eq!(
+            Session::startup_session_split_line(Some(8000), Some(620)),
+            "p11scope: timing: startup session_load=8000ms static_attach=620ms"
+        );
+        assert_eq!(
+            Session::startup_session_split_line(Some(8000), None),
+            "p11scope: timing: startup session_load=8000ms static_attach=n/a"
+        );
+        assert_eq!(
+            Session::startup_session_split_line(None, None),
+            "p11scope: timing: startup session_load=n/a static_attach=n/a"
+        );
+    }
+
+    /// Startup T1: the backend start brackets BPF load and the static
+    /// attach with the split marker. Needs a live backend, so the
+    /// bracketing is pinned statically.
+    #[test]
+    fn start_on_backend_brackets_load_and_static_attach_with_a_marker() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let body = production
+            .split_once("    fn start_on_backend(")
+            .expect("start_on_backend exists")
+            .1
+            .split_once("pub(crate) fn preflight(")
+            .expect("preflight bounds the start path")
+            .0;
+        let markers = [
+            "start_inner(",
+            "attach_plan(",
+            "startup_session_split_line(",
+        ];
+        let mut pos = 0;
+        for marker in markers {
+            let at = body[pos..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("start_on_backend lacks {marker}"));
+            pos += at + marker.len();
+        }
     }
 
     #[test]

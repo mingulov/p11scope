@@ -8397,6 +8397,11 @@ fn loader_readiness_line(active_hooks: usize) -> String {
     format!("p11scope: loader readiness: {active_hooks} active hook(s)")
 }
 
+/// `p11scope: timing: startup …` hook-recount cost (startup T1): `-v`-only.
+fn startup_hook_recount_line(_elapsed_ms: Option<u64>) -> String {
+    String::new()
+}
+
 /// Inserts a report line before the trailing `-v` hint of a concise
 /// frame, or appends it to a frame without one (quiet, verbose).
 /// Matched on the shared hint constant, never a copy of its text.
@@ -26341,6 +26346,47 @@ int main(int argc, char **argv) {
             (256, "p11scope: loader readiness: 256 active hook(s)"),
         ] {
             assert_eq!(loader_readiness_line(count), expected);
+        }
+    }
+
+    /// Startup T1: the recount marker names its milliseconds, or `n/a`
+    /// when the clock read failed.
+    #[test]
+    fn startup_hook_recount_line_names_ms_or_na() {
+        assert_eq!(
+            startup_hook_recount_line(Some(123)),
+            "p11scope: timing: startup hook_recount=123ms"
+        );
+        assert_eq!(
+            startup_hook_recount_line(None),
+            "p11scope: timing: startup hook_recount=n/a"
+        );
+    }
+
+    /// Startup T1: both capture loops bracket the loader-hook recount
+    /// with its marker. The loops need a live session, so the bracketing
+    /// is pinned statically.
+    #[test]
+    fn both_capture_loops_bracket_the_hook_recount_with_a_marker() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production
+                .matches("engine.active_loader_hook_count(session)")
+                .count(),
+            2,
+            "the profile and trace loops each recount once"
+        );
+        let mut pos = 0;
+        for _ in 0..2 {
+            let call = "engine.active_loader_hook_count(session)";
+            let at = production[pos..].find(call).expect("recount call");
+            pos += at + call.len();
+            let marker = "startup_hook_recount_line(";
+            let at = production[pos..]
+                .find(marker)
+                .expect("recount marker after the call");
+            pos += at + marker.len();
         }
     }
 

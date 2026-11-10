@@ -3409,6 +3409,321 @@ fn demotion_retirement_proven_absence_revokes_ordinary_checkpoint() {
     );
 }
 
+fn round4_queue_ownership_same_pass(
+    ownership: &mut CountOwnership,
+    scene: &Scene,
+    mut modules: Vec<ModuleKey>,
+    at: u64,
+) {
+    modules.sort();
+    ownership.invalidate_memberships(scene.native.scene.coordinator.attach_set.count_revision());
+    assert!(ownership.queue_observation(
+        scene.caller,
+        modules,
+        Some(crate::inspect_system::CompleteMemberScan::scripted(
+            scene.generation.clone(),
+            at,
+            at + 1
+        ))
+    ));
+}
+
+fn round4_ownership_with_sole(scene: &Scene, object: u32) -> CountOwnership {
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(ownership.register_pair(scene.caller, object));
+    round4_queue_ownership(&mut ownership, scene, vec![round4_a_key(scene)], 200);
+    round4_settle_ownership(&mut ownership, scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    ownership
+}
+
+#[test]
+fn demotion_retirement_missing_pass_unknown_keeps_ordinary_checkpoint() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    // The caller misses one catalog pass entirely: no observation, no
+    // failure recorded. The summary can only finish an unproven Unknown
+    // on the invalid-slot leg, which retains ordinary continuity while
+    // serving no current candidate.
+    ownership.begin_catalog_pass();
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(matches!(
+        ownership.candidates(scene.caller, object),
+        CurrentCandidates::Unknown
+    ));
+    assert_eq!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "a missing pass with no failure must not revoke ordinary continuity"
+    );
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::InvalidSlot,
+        "the retained finish still names its leg for diagnostics"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::None,
+        "a retained finish records no revocation"
+    );
+    // Returning in the same pass resumes on the original checkpoint.
+    round4_queue_ownership_same_pass(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_eq!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "the returning same-carrier Sole resumes on the original checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_missing_pass_then_proven_absence_revokes_checkpoint() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    ownership.begin_catalog_pass();
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "the missing pass itself retains ordinary continuity"
+    );
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::InvalidSlot
+    );
+    // A later complete observation without the carrier proves absence:
+    // the retained checkpoint must still revoke rather than resume.
+    round4_queue_ownership_same_pass(&mut ownership, &scene, Vec::new(), 300);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_ne!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "a proven absence after a retained missing pass must revoke continuity"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::ProvenAbsence
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across the proven absence needs a new fence, not the old checkpoint"
+    );
+}
+
+fn round4_note_a_double_loaded(scene: &mut Scene, double_loaded: bool) {
+    use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+    let key = round4_a_key(scene);
+    scene.native.scene.coordinator.registry.note_mapping(
+        scene.caller,
+        7,
+        ModuleInfo {
+            path: scene.a.to_string_lossy().into_owned(),
+            key: key.clone(),
+            double_loaded,
+            build_id: None,
+            identity_source: Some("mountinfo".into()),
+            admission: AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        400,
+    );
+    scene.native.scene.coordinator.registry.publish();
+    let id = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .module_id_for(&key)
+        .expect("published carrier module");
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry
+            .edge(scene.caller, id)
+            .expect("carrier edge")
+            .double_loaded,
+        double_loaded,
+        "the mapping note deterministically sets the carrier edge latch"
+    );
+}
+
+fn round4_grow_attach_revision(scene: &mut Scene) {
+    let grown = fx::lower_named(
+        &[fx::module_with_targets(
+            &scene.pins,
+            &scene.b,
+            &[(&scene.a, 0x1000), (&scene.b, 0x2000)],
+        )],
+        &scene.pins,
+        crate::plan::AdmissionPolicy::Inventory(scene.native.scene.coordinator.attach_set.budget()),
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .attach_set
+        .absorb(&grown, &scene.pins);
+}
+
+#[test]
+fn demotion_retirement_double_loaded_edge_unknown_keeps_ordinary_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    // A new membership revision forces reclassification, and the carrier
+    // edge is double-loaded: the summary can only finish an unproven
+    // Unknown on the invalid-edge leg, which retains ordinary
+    // continuity while serving no current candidate.
+    round4_grow_attach_revision(&mut scene);
+    round4_note_a_double_loaded(&mut scene, true);
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 300);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(matches!(
+        ownership.candidates(scene.caller, object),
+        CurrentCandidates::Unknown
+    ));
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::InvalidEdge,
+        "the retained finish names the invalid-edge leg for diagnostics"
+    );
+    assert_eq!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "an unproven invalid-edge Unknown must not revoke ordinary continuity"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::None
+    );
+    // Unlatching the edge resumes the same carrier on the checkpoint.
+    round4_note_a_double_loaded(&mut scene, false);
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_eq!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "the returning same-carrier Sole resumes on the original checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_double_loaded_edge_then_proven_absence_revokes_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    round4_grow_attach_revision(&mut scene);
+    round4_note_a_double_loaded(&mut scene, true);
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 300);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::InvalidEdge
+    );
+    assert_eq!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "the invalid-edge finish itself retains ordinary continuity"
+    );
+    // A later complete observation without the carrier proves absence:
+    // the retained checkpoint must still revoke rather than resume.
+    round4_note_a_double_loaded(&mut scene, false);
+    round4_queue_ownership(&mut ownership, &scene, Vec::new(), 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_ne!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "a proven absence after a retained invalid-edge finish must revoke continuity"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::ProvenAbsence
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 500);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across the proven absence needs a new fence, not the old checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_fresh_first_finish_skew_revokes_initial_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(ownership.register_pair(scene.caller, object));
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    // The pair's first scan is queued under the current membership
+    // revision, but the attach set grows before any classification
+    // runs, so the first finish is an unproven revision-skew Unknown.
+    // A fresh summary has no proven Sole to retain: the initial
+    // checkpoint revokes (fail-closed), and growth fences into exact
+    // named gaps at first Sole service instead of resuming ordinary.
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_grow_attach_revision(&mut scene);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(matches!(
+        ownership.candidates(scene.caller, object),
+        CurrentCandidates::Unknown
+    ));
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "the first finish is the revision-skew leg"
+    );
+    assert_ne!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "a fresh pair's first unproven finish still revokes the initial checkpoint"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::MembersFilter
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across the first-finish skew fences instead of resuming ordinary"
+    );
+}
+
 #[test]
 fn demotion_retirement_fresh_summary_staging_after_accepted_scan_keeps_checkpoint() {
     let scene = round4_placed_with_known_b();

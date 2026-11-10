@@ -713,7 +713,7 @@ fn validate_whole_admission(
                 .ok_or("partial admission endpoints are missing")?;
             let reason = admission.reason.ok_or("partial gap reason is missing")?;
             if endpoints == 0
-                || endpoints >= fixture.demand as u64
+                || endpoints >= fixture.demand
                 || !reason.contains(&format!(
                     "{endpoints} of {} endpoints attached",
                     fixture.demand

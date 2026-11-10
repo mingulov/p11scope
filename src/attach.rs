@@ -22278,7 +22278,7 @@ mod tests {
                 p11scope_ebpf_common::StartKey,
                 p11scope_ebpf_common::CallStart,
             > = aya::maps::HashMap::try_from(session.ebpf.map_mut("START").context("START map")?)?;
-            starts.insert(&fake, &p11scope_ebpf_common::CallStart::default(), 0)?;
+            starts.insert(fake, p11scope_ebpf_common::CallStart::default(), 0)?;
         }
         anyhow::ensure!(
             !session.revival_finalized(0),
@@ -22304,8 +22304,8 @@ mod tests {
                     .context("OBJECT_START map")?,
             )?;
             object_starts.insert(
-                &fake,
-                &[0u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
+                fake,
+                [0u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
                 0,
             )?;
         }

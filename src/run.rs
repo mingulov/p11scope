@@ -13179,7 +13179,8 @@ pub(crate) fn evidence_for(
         uretprobe_override,
         handoff_child_pid,
         pid_namespace: crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
-        container_only_view: false,
+        container_only_view: crate::pidns::container_only_warning_live(crate::pidns::numbering())
+            .is_some(),
         p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };

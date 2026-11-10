@@ -500,8 +500,17 @@ pub fn container_only_warning(
     visible: &[u32],
     own_pid: u32,
 ) -> Option<String> {
-    let _ = (numbering, visible, own_pid);
-    None
+    if !matches!(numbering.observer, ObserverPidNs::Nested)
+        || numbering.proc_view != ProcView::Own
+        || !visible.contains(&own_pid)
+        || visible.iter().any(|pid| *pid != 1 && *pid != own_pid)
+    {
+        return None;
+    }
+    Some(
+        "p11scope: WARNING: only this container is visible; run with --pid=host to see the host"
+            .to_string(),
+    )
 }
 
 /// The live [`container_only_warning`]: this observer's numbering and

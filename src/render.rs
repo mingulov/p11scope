@@ -3858,10 +3858,22 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             "proc_namespace_mismatch" => {
                 "process numbering is foreign: kernel PIDs unresolvable".to_string()
             }
-            "pid_namespace" => format!(
-                "observer PID namespace {}: kernel PIDs unresolvable",
-                ev.pid_namespace.observer
-            ),
+            "pid_namespace" => {
+                let base = format!(
+                    "observer PID namespace {}: kernel PIDs unresolvable",
+                    ev.pid_namespace.observer
+                );
+                // `docker run` without `--pid=host`: the evidence saw
+                // only this container, so the gap names it and its
+                // remedy in the same plain words as the start warning.
+                if ev.container_only_view {
+                    format!(
+                        "{base}; only this container is visible; run with --pid=host to see the host"
+                    )
+                } else {
+                    base
+                }
+            }
             "unprotected_live_windows" => {
                 "calls made while probes were being attached may be missing".to_string()
             }

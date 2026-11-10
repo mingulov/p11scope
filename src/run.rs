@@ -3583,7 +3583,7 @@ fn capture_with_host(
     // instead of after a scan — and still before any probe is on. The profile
     // sink stays an atomically-published temp file; opening it early only
     // moves the trust failure earlier.
-    let out = OutputSink::open(kind, a.out.as_deref())?;
+    let out = OutputSink::open(kind, a.out.as_deref(), a.out_is_stdout)?;
     // Capture-process resource baseline, before the discovery scan charges
     // its first byte: threaded to the loops as the timeline's start point.
     let resource_start = crate::timing::read_resource_sample();
@@ -3805,11 +3805,15 @@ enum OutputSink {
     Profile(Box<AtomicFile>),
     /// Truncated only once the trace loop begins (M-2).
     Trace(crate::output::PrivateStream),
+    /// Trace `-o -`: no file; stdout takes the file's role as the
+    /// complete sink, so the terminal EVIDENCE stays on stdout.
+    TraceStdout,
 }
 
 impl OutputSink {
-    fn open(kind: Kind, out: Option<&Path>) -> Result<Self> {
+    fn open(kind: Kind, out: Option<&Path>, out_is_stdout: bool) -> Result<Self> {
         match (kind, out) {
+            (Kind::Trace, None) if out_is_stdout => Ok(Self::TraceStdout),
             (_, None) => Ok(Self::None),
             (Kind::Profile, Some(path)) => AtomicFile::create(path)
                 .map(|file| Self::Profile(Box::new(file)))
@@ -3897,9 +3901,10 @@ fn run_loop(
             )
         }
         Kind::Trace => {
-            let out = match out {
-                OutputSink::Trace(file) => Some(file),
-                _ => None,
+            let (out, stdout_is_file) = match out {
+                OutputSink::Trace(file) => (Some(file), false),
+                OutputSink::TraceStdout => (None, true),
+                _ => (None, false),
             };
             capture_trace(
                 engine,
@@ -3909,6 +3914,7 @@ fn run_loop(
                 duration,
                 max_events,
                 out,
+                stdout_is_file,
                 interrupted,
                 owned,
                 drain,
@@ -3940,7 +3946,7 @@ pub(crate) fn run_profile_loop_for_test(
     select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     let stop = SignalState::new();
-    let out = OutputSink::open(Kind::Profile, Some(out_path))?;
+    let out = OutputSink::open(Kind::Profile, Some(out_path), false)?;
     let resource_start = crate::timing::read_resource_sample();
     run_loop(
         engine,
@@ -5446,6 +5452,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
 /// lines' error beside the handoff error.
 fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     let taken = std::mem::replace(context.out, OutputSink::None);
+    let stdout_is_file = matches!(taken, OutputSink::TraceStdout);
     let mut out_file: Option<std::io::BufWriter<std::fs::File>> = match taken {
         OutputSink::Trace(stream) => match stream.begin() {
             Ok(file) => Some(buffered_sink(file)),
@@ -5458,7 +5465,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 None
             }
         },
-        OutputSink::None => None,
+        OutputSink::TraceStdout | OutputSink::None => None,
         OutputSink::Profile(_) => {
             return Err(anyhow::anyhow!(
                 "run: handoff report kind mismatch (profile sink for a trace)"
@@ -5790,6 +5797,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
         &mut stdout_sink,
         &mut stdout_open,
         &mut out_file,
+        stdout_is_file,
         crate::cli::text_verbosity(),
     )?;
     if let Some(file) = out_file.as_mut() {
@@ -6457,7 +6465,7 @@ fn run_owned_inner_with_host(
     // signalled `always` failure can be named an interruption, not a refusal.
     // Before the attach, and before the child crosses its barrier: a bad `-o`
     // path must never cost a released child or a loaded session.
-    let mut out = OutputSink::open(args.kind, args.out.as_deref())
+    let mut out = OutputSink::open(args.kind, args.out.as_deref(), args.out_is_stdout)
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     // 7.10b: arm extensive mode before the session publishes its
@@ -10450,6 +10458,7 @@ fn capture_trace(
     duration: Option<Duration>,
     max_events: Option<u64>,
     out: Option<crate::output::PrivateStream>,
+    stdout_is_file: bool,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
     drain: Duration,
@@ -11477,6 +11486,7 @@ fn capture_trace(
                         context.5,
                         context.6,
                         context.7,
+                        stdout_is_file,
                         crate::cli::text_verbosity(),
                     )
                     .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
@@ -11584,6 +11594,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
+    stdout_is_file: bool,
     verbosity: crate::cli::TextVerbosity,
 ) -> Result<()> {
     if evidence.trace_truncated {
@@ -11594,14 +11605,16 @@ fn emit_trace_terminal_accounted<W: Write>(
             out_file,
         )?;
     }
-    // The stdout terminal records (COUNT plus, under -v, the pre-flush
-    // EVIDENCE copy) go through the shared terminal emitter, best-effort
-    // under loss; the file receives COUNT now and its finalized EVIDENCE
-    // record after the terminal flush below. Default stdout stays
-    // concise: the multi-kilobyte EVIDENCE blob rides the `-o` file
-    // (and `-v` stdout), never default stdout.
+    // The stdout terminal records (COUNT plus, under -v or -o -, the
+    // pre-flush EVIDENCE copy) go through the shared terminal emitter,
+    // best-effort under loss; the file receives COUNT now and its
+    // finalized EVIDENCE record after the terminal flush below. Default
+    // stdout stays concise: the multi-kilobyte EVIDENCE blob rides the
+    // `-o` file (and `-v` stdout), never default stdout — except `-o -`,
+    // where stdout IS the file.
     let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
-    let stdout_line = verbose.then(|| trace::evidence_line(evidence, policy));
+    let emit_evidence = verbose || stdout_is_file;
+    let stdout_line = emit_evidence.then(|| trace::evidence_line(evidence, policy));
     // Trailing newline included: a withheld line contributes zero bytes,
     // so the file record below counts the whole line as stdout-missing.
     let stdout_line_len = stdout_line.as_ref().map_or(0, |line| line.len() + 1);
@@ -26331,10 +26344,11 @@ int main(int argc, char **argv) {
 
     /// Runs the accounted terminal emission over a regular-file stdout
     /// (no drops) and returns the stdout text with the `-o` file bytes.
+    /// `stdout_is_file` selects the `-o -` shape (stdout is the sink).
     fn terminal_stdout_and_file(
         verbosity: crate::cli::TextVerbosity,
         with_file: bool,
-        _stdout_is_file: bool,
+        stdout_is_file: bool,
     ) -> (String, Option<Vec<u8>>) {
         let file = tempfile::tempfile().unwrap();
         let mut probe = file.try_clone().unwrap();
@@ -26357,6 +26371,7 @@ int main(int argc, char **argv) {
             &mut sink,
             &mut stdout_open,
             &mut out_file,
+            stdout_is_file,
             verbosity,
         )
         .unwrap();
@@ -26369,7 +26384,8 @@ int main(int argc, char **argv) {
     }
 
     /// Default trace stdout stays concise: the multi-kilobyte EVIDENCE
-    /// blob rides the `-o` file, never default stdout. COUNT and the
+    /// blob rides the `-o` file, never default stdout (plain `-o FILE`
+    /// or omitted; `-o -` is the twin that keeps it). COUNT and the
     /// human tail still print there.
     #[test]
     fn terminal_trace_concise_stdout_omits_evidence() {
@@ -26493,8 +26509,9 @@ int main(int argc, char **argv) {
             &mut sink,
             &mut stdout_open,
             &mut file,
-            // Verbose: only -v stdout carries EVIDENCE, and this cell
-            // needs the terminal-records drop phase it exercises.
+            false,
+            // Verbose stdout carries EVIDENCE, and this cell needs the
+            // terminal-records drop phase it exercises.
             crate::cli::TextVerbosity::Verbose,
         )
         .unwrap();
@@ -26558,8 +26575,9 @@ int main(int argc, char **argv) {
             &mut sink,
             &mut stdout_open,
             &mut None::<Vec<u8>>,
-            // Verbose: only -v stdout carries EVIDENCE, and this cell
-            // needs the terminal-flush drop it exercises.
+            false,
+            // Verbose stdout carries EVIDENCE, and this cell needs the
+            // terminal-flush drop it exercises.
             crate::cli::TextVerbosity::Verbose,
         )
         .unwrap();

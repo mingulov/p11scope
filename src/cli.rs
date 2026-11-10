@@ -2353,7 +2353,7 @@ pub fn parse_capture(
     TextVerbosity::resolve(common.verbose, common.quiet)?;
 
     let metrics = common.metrics_for(kind, "trace")?;
-    let out = resolve_dash_out(kind, "profile", common.out)?;
+    let (out, out_is_stdout) = resolve_dash_out(kind, "profile", common.out)?;
     Ok(CaptureArgs {
         kind,
         modules: common.modules,
@@ -2368,7 +2368,7 @@ pub fn parse_capture(
         select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
-        out_is_stdout: false,
+        out_is_stdout,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2465,7 +2465,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
     }
     TextVerbosity::resolve(common.verbose, common.quiet)?;
     let metrics = common.metrics_for(kind, "run --trace")?;
-    let out = resolve_dash_out(kind, "run without --trace", common.out)?;
+    let (out, out_is_stdout) = resolve_dash_out(kind, "run without --trace", common.out)?;
     Ok(RunArgs {
         kind,
         modules: common.modules,
@@ -2479,7 +2479,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
-        out_is_stdout: false,
+        out_is_stdout,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2501,21 +2501,22 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
 /// `run --trace` print their lines to stdout when `-o` is omitted), and
 /// is refused for profile, whose report requires a file: stdout carries
 /// display frames only there. Either way no file literally named `-`
-/// is ever created.
+/// is ever created. The returned flag records the dash: stdout takes
+/// the file's role as the complete sink there.
 fn resolve_dash_out(
     kind: Kind,
     profile_subject: &str,
     out: Option<PathBuf>,
-) -> Result<Option<PathBuf>, CliError> {
+) -> Result<(Option<PathBuf>, bool), CliError> {
     match out {
         Some(path) if path.as_os_str() == std::ffi::OsStr::new("-") => match kind {
-            Kind::Trace => Ok(None),
+            Kind::Trace => Ok((None, true)),
             Kind::Profile => Err(usage_err(format!(
                 "-o - writes to stdout, which {profile_subject} does not support for its report \
                  (omit -o for display frames on stdout; the report requires a file)"
             ))),
         },
-        out => Ok(out),
+        out => Ok((out, false)),
     }
 }
 

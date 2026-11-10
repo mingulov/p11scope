@@ -399,11 +399,11 @@ def _single_cgroup_provider_domain(ev, receipt, ledger, capture, mode):
                 or type(mapping["length"]) is not int or mapping["length"] <= 0):
             return False
         argv = receipt["observer_argv"]
-        if (not isinstance(argv, list) or len(argv) != 12 or not all(isinstance(arg, str) for arg in argv)
-                or not argv[0].startswith("/") or not argv[-1].startswith("/")
+        if (not isinstance(argv, list) or len(argv) != 13 or not all(isinstance(arg, str) for arg in argv)
+                or not argv[0].startswith("/") or not argv[-2].startswith("/")
                 or argv != [argv[0], "trace", "--cgroup", receipt["operator_path"]["initial"]["path"],
                     "--module", pin["path"], "--attach-backend", receipt["requested_backend"],
-                    "--duration", "240s", "-o", argv[-1]]):
+                    "--duration", "240s", "-o", argv[-2], "-v"]):
             return False
         backend = ev["attach_backend"]
         if (ev["authority"] != "hash-pinned" or backend["fallback"] is not None

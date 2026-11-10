@@ -23073,6 +23073,64 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn output_sink_open_marks_dash_stdout_for_trace() {
+        // `-o -` on a trace opens no file but records stdout as the
+        // complete sink; plain omission stays sink-less, and profile
+        // (which refuses the dash at parse) never takes the arm.
+        assert!(matches!(
+            OutputSink::open(Kind::Trace, None, true),
+            Ok(OutputSink::TraceStdout)
+        ));
+        assert!(matches!(
+            OutputSink::open(Kind::Trace, None, false),
+            Ok(OutputSink::None)
+        ));
+        assert!(matches!(
+            OutputSink::open(Kind::Profile, None, false),
+            Ok(OutputSink::None)
+        ));
+    }
+
+    #[test]
+    fn run_loop_forwards_stdout_sink_to_capture_trace() {
+        // `-o -` opens no file: the dash rides run_loop into
+        // capture_trace as the operator's variable (never a bare
+        // out=None collapse or a false literal), where the terminal
+        // keeps EVIDENCE on stdout. The emitter twins prove the
+        // behavior; this pins the wiring in source.
+        let source = include_str!("run.rs");
+        let trace_arm = source
+            .split_once("fn run_loop(")
+            .expect("run loop")
+            .1
+            .split_once("Kind::Trace =>")
+            .expect("trace arm")
+            .1
+            .split_once("engine.report_discovery_noise();")
+            .expect("loop end")
+            .0;
+        assert!(
+            trace_arm.contains("OutputSink::TraceStdout => (None, true)"),
+            "run_loop must map the dash sink to no file plus the stdout flag"
+        );
+        let call = trace_arm
+            .split_once("capture_trace(")
+            .expect("trace call")
+            .1
+            .split_once(')')
+            .expect("call end")
+            .0;
+        assert!(
+            call.contains("stdout_is_file,"),
+            "forward the stdout flag, not a literal"
+        );
+        assert!(
+            !call.contains("false"),
+            "no false literal in the forwarded positions"
+        );
+    }
+
+    #[test]
     fn run_loop_forwards_built_counter_inputs_to_capture_profile() {
         // The profile loop builds real CounterCaptureInputs from the active
         // policy instead of passing None. The privileged collection cell

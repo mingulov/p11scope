@@ -3329,6 +3329,56 @@ fn flagged_unregistered_mechanism_renders_row_without_name() {
     assert_eq!((row.calls, row.errors), (1, 0));
 }
 
+/// Observe one vendor mechanism id through the edge and return its
+/// inventory row name. The `C_SignInit` carrier is incidental (an
+/// admission vehicle); the row name depends only on the id resolving
+/// through the display-only vendor table.
+fn vendor_row_name(id: u64) -> Option<&'static str> {
+    use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+    use p11scope_ebpf_common::capture;
+    let mut edge = EdgeSemantics::default();
+    edge.observe(&SemanticCall {
+        function: "C_SignInit".into(),
+        session: 7,
+        mechanism: id,
+        capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+        ts_ns: 100,
+        ..SemanticCall::default()
+    });
+    let view = super::semantics_view(Some(&edge), false);
+    assert_eq!(view.mechanisms.len(), 1);
+    let row = &view.mechanisms[0];
+    assert_eq!(row.id, id);
+    assert_eq!((row.calls, row.errors), (1, 0));
+    row.name
+}
+
+#[test]
+fn nss_mechanism_row_carries_vendor_name() {
+    assert_eq!(
+        vendor_row_name(0xCE53_437F),
+        Some("CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN")
+    );
+}
+
+#[test]
+fn cloudhsm_mechanism_row_carries_vendor_name() {
+    assert_eq!(vendor_row_name(0x8000_1087), Some("CKM_CLOUDHSM_AES_GCM"));
+}
+
+#[test]
+fn yubico_mechanism_row_carries_vendor_name() {
+    assert_eq!(
+        vendor_row_name(0xD955_4204),
+        Some("CKM_YUBICO_AES_CCM_WRAP")
+    );
+}
+
+#[test]
+fn luna_mechanism_row_carries_vendor_name() {
+    assert_eq!(vendor_row_name(0x8000_0A02), Some("CKM_NIST_PRF_KDF"));
+}
+
 /// CLI-1: the concise snapshot keeps the summary head, the limits
 /// line and the `-v` hint; the `Details:` tail is verbose-only.
 #[test]

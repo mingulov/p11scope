@@ -12305,7 +12305,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn live_view_shows_vendor_defined_id_by_number() {
+    fn live_view_names_listed_vendor_id() {
         let mut ev = evidence();
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
@@ -12321,7 +12321,27 @@ pub(crate) mod tests {
             &mechanisms,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(out.contains("vendor-defined 0xce534351"), "{out}");
+        assert!(out.contains("CKM_NSS_AES_KEY_WRAP"), "{out}");
+    }
+
+    #[test]
+    fn live_view_shows_unnamed_vendor_id_by_number() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0xCE53_43A9, mech_stat(5, 0))].into_iter().collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_GenerateKeyPair", 5, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("vendor-defined 0xce5343a9"), "{out}");
     }
 
     #[test]
@@ -14256,11 +14276,71 @@ pub(crate) mod tests {
         assert_eq!(by_id(0x1087)["mechanism"], 0x1087);
         assert_eq!(by_id(0x1087)["name"], "CKM_AES_GCM");
         // `.get`: a missing key must fail, never read as null by indexing.
+        assert_eq!(by_id(0xCE53_4351)["name"], "CKM_NSS_AES_KEY_WRAP");
+        assert_eq!(by_id(0xFFFF).get("name"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn profile_json_counts_and_ids_survive_name_table_removal() {
+        // The vendor table is a display-only layer: the same capture
+        // rendered with and without it must carry identical counts and
+        // ids, differing only in the displayed name. Counts and ids
+        // come from the semantic state, which never consults the table;
+        // the table-free lookup resolves no name for the listed vendor
+        // ids, so without the table these rows would render `name: null`
+        // with the same counts and ids.
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let flagged = |slot: u32, id: u64| {
+            let mut ev = init_event(slot, id, shape::NONE, 0, 0, 0);
+            ev.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+            ev
+        };
+        state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
+        state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
+        state.observe(&flagged(0, 0xCE53_4351));
+        state.observe(&flagged(0, 0x8000_0001));
+        state.observe(&flagged(0, UNREGISTERED_SENTINEL));
+
+        let mechanisms = profile_mechanisms(&state);
+        let rows = mechanisms.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        let by_id = |id: u64| rows.iter().find(|row| row["mechanism"] == id).unwrap();
+        // Every row's counts and ids equal the semantic state, with or
+        // without names.
+        for (id, calls) in [(0x1087u64, 2u64), (0xCE53_4351, 1), (0x8000_0001, 1)] {
+            let row = by_id(id);
+            let stat = &state.mechanisms()[&id];
+            assert_eq!(row["mechanism"], id);
+            assert_eq!(row["mechanism_hex"], format!("0x{id:x}"));
+            assert_eq!(row["calls"], calls);
+            assert_eq!(row["calls"], stat.calls);
+            assert_eq!(row["errors"], stat.errors);
+        }
+        let sentinel_row = by_id(UNREGISTERED_SENTINEL);
+        assert_eq!(sentinel_row["calls"], 1);
+        // The table-free lookup names none of the vendor ids.
+        for id in [0xCE53_4351, 0x8000_0001, UNREGISTERED_SENTINEL] {
+            assert_eq!(
+                crate::mechanism_names::official_mechanism_name(id),
+                None,
+                "id 0x{id:x}"
+            );
+        }
+        // With the table, the listed ids carry names and the unlisted
+        // gap stays null — counts and ids above are unchanged.
+        assert_eq!(by_id(0x1087)["name"], "CKM_AES_GCM");
+        assert_eq!(by_id(0xCE53_4351)["name"], "CKM_NSS_AES_KEY_WRAP");
         assert_eq!(
-            by_id(0xCE53_4351).get("name"),
+            by_id(0x8000_0001)["name"],
+            "CKM_CLOUDHSM_SP800_108_COUNTER_KDF"
+        );
+        assert_eq!(
+            by_id(UNREGISTERED_SENTINEL).get("name"),
             Some(&serde_json::Value::Null)
         );
-        assert_eq!(by_id(0xFFFF).get("name"), Some(&serde_json::Value::Null));
     }
 
     /// Two slots on module 0: `C_SignInit` (index 0) binds a mechanism
@@ -15075,10 +15155,7 @@ pub(crate) mod tests {
         assert_eq!(rows.len(), 2);
         let by_id = |id: u64| rows.iter().find(|row| row["mechanism"] == id).unwrap();
         assert_eq!(by_id(0x0D)["name"], "CKM_RSA_PKCS_PSS");
-        assert_eq!(
-            by_id(0xCE53_4351).get("name"),
-            Some(&serde_json::Value::Null)
-        );
+        assert_eq!(by_id(0xCE53_4351)["name"], "CKM_NSS_AES_KEY_WRAP");
     }
 
     #[test]

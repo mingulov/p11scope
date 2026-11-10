@@ -15,7 +15,11 @@
 /// Official `CKM_*` name for a standard mechanism id, or `None` when
 /// the id is vendor-defined or otherwise unknown. The caller renders
 /// `None` through [`mechanism_label`], never by guessing a name.
-pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
+///
+/// This is the table-free lookup: what [`mechanism_name`] resolves
+/// without the display-only vendor table. The invariance tests render
+/// the same capture through both and require identical counts and ids.
+pub(crate) fn official_mechanism_name(id: u64) -> Option<&'static str> {
     match id {
         0x00000000 => Some("CKM_RSA_PKCS_KEY_PAIR_GEN"),
         0x00000001 => Some("CKM_RSA_PKCS"),
@@ -484,6 +488,13 @@ pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
     }
 }
 
+/// `CKM_*` display name for a mechanism id: the official name when
+/// the id is a known standard mechanism, else `None` — never guessed.
+/// The caller renders `None` through [`mechanism_label`].
+pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
+    official_mechanism_name(id)
+}
+
 /// Table label for any observed mechanism id: the `CKM_*` name when
 /// the id is a known standard mechanism, `vendor-defined 0x…` for ids
 /// at or above `CKM_VENDOR_DEFINED` (`0x8000_0000`), and `unknown 0x…`
@@ -491,7 +502,19 @@ pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
 /// spelling as `mechanism_hex`); a label never guesses a vendor's
 /// name for its number.
 pub(crate) fn mechanism_label(id: u64) -> String {
-    if let Some(name) = mechanism_name(id) {
+    mechanism_label_with(id, mechanism_name)
+}
+
+/// [`mechanism_label`] with an injectable name lookup: production
+/// passes [`mechanism_name`]; the invariance tests pass
+/// [`official_mechanism_name`] to render the same capture as if the
+/// display-only vendor table were removed. The generic fallback is
+/// identical either way — only the resolved name can differ.
+pub(crate) fn mechanism_label_with(
+    id: u64,
+    name_of: fn(u64) -> Option<&'static str>,
+) -> String {
+    if let Some(name) = name_of(id) {
         return name.to_string();
     }
     if id >= 0x8000_0000 {
@@ -534,7 +557,13 @@ mod tests {
             mechanism_label(pkcs11_types::CkMechanismType::AES_GCM.0),
             "CKM_AES_GCM"
         );
-        assert_eq!(mechanism_label(0xCE53_4351), "vendor-defined 0xce534351");
+        // A listed vendor id carries its display name; unlisted ids
+        // keep the generic number.
+        assert_eq!(mechanism_label(0xCE53_4351), "CKM_NSS_AES_KEY_WRAP");
+        assert_eq!(
+            mechanism_label(0xCE53_43A9),
+            "vendor-defined 0xce5343a9"
+        );
         assert_eq!(mechanism_label(0x0000_FFFF), "unknown 0xffff");
     }
 
@@ -546,12 +575,113 @@ mod tests {
     }
 
     #[test]
-    fn vendor_range_ids_have_no_vendor_table_name() {
-        // Owner 2026-11-10: no vendor-specific id tables — every vendor's
-        // ids publish by number. The table label carries the number instead.
-        assert_eq!(mechanism_name(0xCE53_4351), None);
-        assert_eq!(mechanism_name(0xCE53_437F), None);
-        assert_eq!(mechanism_name(0xCE53_4380), None);
+    fn nss_vendor_keygen_ids_are_named() {
+        // NSS `lib/util/pkcs11n.h` (`CKM_NSS` = `0xCE534350`): the TLS
+        // ephemeral keygen ids from the display-only vendor table, not
+        // guesses.
+        assert_eq!(
+            mechanism_name(0xCE53_437F),
+            Some("CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN")
+        );
+        assert_eq!(
+            mechanism_name(0xCE53_4380),
+            Some("CKM_NSS_ML_KEM_KEY_PAIR_GEN")
+        );
+        assert_eq!(
+            mechanism_name(0xCE53_437D),
+            Some("CKM_NSS_KYBER_KEY_PAIR_GEN")
+        );
+    }
+
+    #[test]
+    fn cloudhsm_vendor_ids_are_named() {
+        // AWS CloudHSM Client SDK 5 `cloudhsm_pkcs11_vendor_defs.h`
+        // (`CKM_VENDOR_DEFINED |` the documented offset or id).
+        for (id, name) in [
+            (0x8000_0001, "CKM_CLOUDHSM_SP800_108_COUNTER_KDF"),
+            (0x8000_001C, "CKM_CLOUDHSM_ML_DSA_KEY_PAIR_GEN"),
+            (0x8000_1087, "CKM_CLOUDHSM_AES_GCM"),
+            (0x8000_2109, "CKM_CLOUDHSM_AES_KEY_WRAP_NO_PAD"),
+            (0x8000_210A, "CKM_CLOUDHSM_AES_KEY_WRAP_PKCS5_PAD"),
+            (0x8000_216F, "CKM_CLOUDHSM_AES_KEY_WRAP_ZERO_PAD"),
+        ] {
+            assert_eq!(mechanism_name(id), Some(name), "id 0x{id:x}");
+        }
+    }
+
+    #[test]
+    fn yubico_vendor_ids_are_named() {
+        // Yubico YubiHSM 2, yubihsm-shell `pkcs11/pkcs11y.h`
+        // (`CKM_VENDOR_DEFINED | 0x59554200 |` the `lib/yubihsm.h`
+        // object type).
+        assert_eq!(mechanism_name(0xD955_4204), Some("CKM_YUBICO_AES_CCM_WRAP"));
+        assert_eq!(mechanism_name(0xD955_4209), Some("CKM_YUBICO_RSA_WRAP"));
+    }
+
+    #[test]
+    fn luna_vendor_ids_are_named() {
+        // Thales Luna, spelled exactly as the vendor spells them (no
+        // vendor prefix of their own): the 7.1 counter-mode KDF page
+        // and the JSP 7.1.0 `LunaAPI` constant values.
+        for (id, name) in [
+            (0x8000_0160, "CKM_ECDSA_KEY_PAIR_GEN_W_EXTRA_BITS"),
+            (0x8000_0A02, "CKM_NIST_PRF_KDF"),
+            (0x8000_0A03, "CKM_PRF_KDF"),
+            (0x8000_0B04, "CKM_SM3_KEY_DERIVATION"),
+        ] {
+            assert_eq!(mechanism_name(id), Some(name), "id 0x{id:x}");
+        }
+    }
+
+    #[test]
+    fn excluded_vendor_ids_still_have_no_name() {
+        // Verified vendor ids the display table purpose-filters out stay
+        // bare numbers: pure sign/verify (CloudHSM ML-DSA, ext-mu
+        // ML-DSA, EdDSA), pure encrypt (Luna ECIES), and two further
+        // Luna ids reserved for unobserved vendor cloning functions,
+        // left unnamed.
+        assert_eq!(mechanism_name(0x8000_001D), None);
+        assert_eq!(mechanism_name(0x8000_001E), None);
+        assert_eq!(mechanism_name(0x8000_1057), None);
+        assert_eq!(mechanism_name(0x8000_0A00), None);
+        assert_eq!(mechanism_name(0x8000_0208), None);
+        assert_eq!(mechanism_name(0x8000_0209), None);
+    }
+
+    #[test]
+    fn vendor_labels_differ_from_table_free_labels_only_by_name() {
+        // Removing the display-only vendor table must change only the
+        // displayed name: the same ids through the table-free lookup
+        // keep every generic label and swap each listed vendor name
+        // for its exact-number fallback.
+        let with_table = mechanism_label;
+        let without_table = |id| mechanism_label_with(id, official_mechanism_name);
+        // Official, unlisted-vendor and unknown ids are identical
+        // either way.
+        for id in [
+            pkcs11_types::CkMechanismType::AES_GCM.0,
+            0xCE53_43A9,
+            0x8000_1042,
+            0x0000_FFFF,
+            0x8000_0000,
+        ] {
+            assert_eq!(with_table(id), without_table(id), "id 0x{id:x}");
+        }
+        // Listed vendor ids swap name for number, nothing else.
+        for (id, name) in [
+            (0xCE53_4351, "CKM_NSS_AES_KEY_WRAP"),
+            (0xCE53_437F, "CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN"),
+            (0x8000_0001, "CKM_CLOUDHSM_SP800_108_COUNTER_KDF"),
+            (0xD955_4204, "CKM_YUBICO_AES_CCM_WRAP"),
+            (0x8000_0A02, "CKM_NIST_PRF_KDF"),
+        ] {
+            assert_eq!(with_table(id), name, "id 0x{id:x}");
+            assert_eq!(
+                without_table(id),
+                format!("vendor-defined 0x{id:x}"),
+                "id 0x{id:x}"
+            );
+        }
     }
 
     #[test]

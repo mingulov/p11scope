@@ -191,6 +191,35 @@ mod corrective_tests {
         assert_eq!(state.semantic_evidence().mechanism_id_overflow, 2);
     }
 
+    #[test]
+    fn mechanism_cap_sheds_op_attributed_binding_after_init_shed() {
+        // Twin of the init-path cap tests for the operations-path cap
+        // site: a 257th id shed at init time still leaves its session
+        // binding behind, and the later operational call attributed
+        // through that binding must shed again — not grow a 257th row.
+        let p = plan(&["C_SignInit", "C_Sign"]);
+        let mut state = State::new(&p);
+        for i in 0..256u64 {
+            state.observe(&mechanism(&p, "C_SignInit", 7, 0x1_0000 + i, 0));
+        }
+        assert_eq!(state.mechanisms().len(), MAX_MECHANISMS);
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 0);
+
+        // The 257th init sheds its row but binds the fresh session.
+        state.observe(&mechanism(&p, "C_SignInit", 4242, 0x2_0000, 0));
+        assert_eq!(state.mechanisms().len(), MAX_MECHANISMS);
+        assert!(!state.mechanisms().contains_key(&0x2_0000));
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 1);
+
+        // The operational call finds that binding (no orphan) and sheds
+        // a second observation instead of adding a row.
+        state.observe(&event(&p, "C_Sign", 4242, 0));
+        assert_eq!(state.orphan_ops(), 0);
+        assert_eq!(state.mechanisms().len(), MAX_MECHANISMS);
+        assert!(!state.mechanisms().contains_key(&0x2_0000));
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 2);
+    }
+
     /// Two providers sharing one process: slots 0/2 (`C_SignInit`/`C_Sign`)
     /// on module 0, slots 1/3 on module 1, each pair on its own pinned
     /// object — the seam per-provider mechanism attribution is recorded.

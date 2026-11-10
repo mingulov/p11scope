@@ -3545,9 +3545,8 @@ impl TerminalSealContext {
 }
 
 /// Owned terminal consumers: the state keeps no borrow on the plan it
-/// was built from, so the whole setup lives in one fixture.
+/// was built from, so the fixture owns the live consumers only.
 struct TerminalSealSetup {
-    plan: crate::plan::AttachPlan,
     state: semantics::State,
     tracker: process::Tracker,
     malformed: u64,
@@ -3561,7 +3560,6 @@ impl TerminalSealSetup {
         let tracker =
             process::Tracker::for_producer(crate::events::EventsDomain::test_standin(7), 16);
         Self {
-            plan,
             state,
             tracker,
             malformed: 0,

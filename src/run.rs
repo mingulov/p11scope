@@ -5954,14 +5954,29 @@ struct OpenedCaptureStdout {
 /// run exits nonzero. Only a `/dev/null` failure itself still aborts
 /// before the loop — the caller routes that through settlement.
 fn open_capture_stdout(
-    _note_gap: impl FnOnce(),
+    note_gap: impl FnOnce(),
     open: impl FnOnce() -> std::io::Result<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
 ) -> std::io::Result<OpenedCaptureStdout> {
-    open().map(|sink| OpenedCaptureStdout {
-        sink,
-        open: true,
-        deferred: None,
-    })
+    match open() {
+        Ok(sink) => Ok(OpenedCaptureStdout {
+            sink,
+            open: true,
+            deferred: None,
+        }),
+        Err(error) => {
+            note_gap();
+            emit_capture_diagnostic(&format!(
+                "p11scope: capture stdout unavailable ({}); continuing without stdout",
+                crate::render::escape_controls(&error.to_string()),
+            ));
+            let sink = crate::sink::null_sink()?;
+            Ok(OpenedCaptureStdout {
+                sink,
+                open: false,
+                deferred: Some(anyhow::Error::new(error).context("opening capture stdout")),
+            })
+        }
+    }
 }
 
 /// Reports a failure deferred past publication (an unusable capture
@@ -5981,10 +5996,20 @@ fn combine_deferred_failure<T>(sealed: Result<T>, deferred: Option<anyhow::Error
 /// caller fails after publication so the run still exits nonzero. A
 /// proven outcome — changed or not — keeps its existing path untouched.
 fn terminal_identity_or_gap(
-    _note_gap: impl FnOnce(),
+    note_gap: impl FnOnce(),
     check: std::result::Result<bool, String>,
 ) -> Result<()> {
-    check.map(|_| ()).map_err(anyhow::Error::msg)
+    match check {
+        Ok(_) => Ok(()),
+        Err(failure) => {
+            note_gap();
+            emit_capture_diagnostic(&format!(
+                "p11scope: provider identity revalidation failed; sealing the report with the provider treated as changed: {}",
+                crate::render::escape_controls(&failure),
+            ));
+            Err(anyhow::Error::msg(failure).context("revalidating pinned provider identity"))
+        }
+    }
 }
 
 /// A marker probe is not wired in this slice, so the coordinator is told the
@@ -8680,9 +8705,9 @@ fn drain_capture_terminal_with<'state, C, T>(
         &mut C,
         &mut CaptureConsumers<'state>,
     ) -> (Result<OriginalRootDrain>, Option<anyhow::Error>),
-    _root_gap: impl FnOnce(&mut C),
+    root_gap: impl FnOnce(&mut C),
     drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<()>,
-    _drain_gap: impl FnOnce(&mut C),
+    drain_gap: impl FnOnce(&mut C),
     snapshot_and_publish: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<T>,
 ) -> Result<T> {
     {
@@ -8697,7 +8722,23 @@ fn drain_capture_terminal_with<'state, C, T>(
     let (root_result, mut root_write_error) = root(context, consumers);
     let root_result = root_result
         .map_err(|error| combine_trace_errors(Err(error), root_write_error.take()).unwrap_err());
-    terminal_after_root(root_result, diagnostics, |(malformed, completed)| {
+    // A failed original-root tail drain still seals: the gap names the
+    // unfinished tail, the seal proceeds with no completed tail, and the
+    // error returns after publication so the run exits nonzero.
+    let mut root_error = None;
+    let root_result = match root_result {
+        Ok(drain) => Ok(drain),
+        Err(error) => {
+            root_gap(context);
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal original-root drain failed; sealing the report from partial state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            root_error = Some(error);
+            Ok(OriginalRootDrain::Absent)
+        }
+    };
+    let sealed = terminal_after_root(root_result, diagnostics, |(malformed, completed)| {
         *consumers.malformed_records += malformed;
         let retirement = if let Some(completed) = completed {
             apply_original_root_retirement(consumers.tracker, consumers.state, completed)
@@ -8705,9 +8746,33 @@ fn drain_capture_terminal_with<'state, C, T>(
             Ok(())
         };
         combine_trace_errors(retirement, root_write_error)?;
-        drain(context, consumers)?;
-        snapshot_and_publish(context, consumers)
-    })
+        // A failed terminal events drain still seals: the gap names the
+        // unfinished drain, publication runs from partial state, and the
+        // drain error returns so the run exits nonzero.
+        match drain(context, consumers) {
+            Ok(()) => snapshot_and_publish(context, consumers),
+            Err(drain_error) => {
+                drain_gap(context);
+                emit_capture_diagnostic(&format!(
+                    "p11scope: terminal events drain failed; sealing the report from partial state: {}",
+                    crate::render::escape_controls(&format!("{drain_error:#}")),
+                ));
+                match snapshot_and_publish(context, consumers) {
+                    Ok(_) => Err(drain_error),
+                    Err(publish_error) => Err(also_failed(
+                        drain_error,
+                        publish_error,
+                        "terminal publication",
+                    )),
+                }
+            }
+        }
+    });
+    match (sealed, root_error) {
+        (result, None) => result,
+        (Ok(_), Some(error)) => Err(error),
+        (Err(sealed_error), Some(root)) => Err(also_failed(root, sealed_error, "terminal seal")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9844,11 +9909,12 @@ fn capture_profile(
         consumers
             .scheduling
             .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
-        context
-            .0
-            .pinned()
-            .check_unchanged()
-            .map_err(anyhow::Error::msg)?;
+        let identity_check = context.0.pinned().check_unchanged();
+        let identity_error = terminal_identity_or_gap(
+            || context.0.note_terminal_identity_check_failed(),
+            identity_check,
+        )
+        .err();
         let (prearm_hold, prearm_owned_run, prearm_release_ns) =
             owned_prearm_hold(context.2.as_deref());
         finish_prearm_terminal(
@@ -10098,6 +10164,9 @@ fn capture_profile(
         // exits nonzero with the read error.
         if let Some(error) = snapshot.terminal_error() {
             return Err(anyhow::Error::msg(error.to_string()));
+        }
+        if let Some(error) = identity_error {
+            return Err(error);
         }
         Ok(ev)
     }
@@ -11002,11 +11071,12 @@ fn capture_trace(
                 |context, consumers| {
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
-                    context
-                        .0
-                        .pinned()
-                        .check_unchanged()
-                        .map_err(anyhow::Error::msg)?;
+                    let identity_check = context.0.pinned().check_unchanged();
+                    let mut identity_error = terminal_identity_or_gap(
+                        || context.0.note_terminal_identity_check_failed(),
+                        identity_check,
+                    )
+                    .err();
                     report_trace_loss(context.1, context.4, context.5, context.6, context.7)?;
                     let maps_start = Instant::now();
                     // A failed aggregate read seals with unknown counts
@@ -11028,11 +11098,14 @@ fn capture_trace(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
-                    context
-                        .0
-                        .pinned()
-                        .check_unchanged()
-                        .map_err(anyhow::Error::msg)?;
+                    let identity_recheck = context.0.pinned().check_unchanged();
+                    if identity_error.is_none() {
+                        identity_error = terminal_identity_or_gap(
+                            || context.0.note_terminal_identity_check_failed(),
+                            identity_recheck,
+                        )
+                        .err();
+                    }
                     // Terminal observation health is sampled beside the
                     // reports, before the watches close on it. This feeds
                     // watch health only; the publication sample stays after
@@ -11249,6 +11322,9 @@ fn capture_trace(
                         return Err(error.context(
                             "terminal snapshot failed; trace report sealed with unknown counts",
                         ));
+                    }
+                    if let Some(error) = identity_error {
+                        return Err(error);
                     }
                     Ok(evidence)
                 },

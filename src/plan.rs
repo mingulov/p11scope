@@ -384,6 +384,10 @@ pub(crate) enum RefusalKind {
     /// A JK-22a provider leading-tables prefix partial (`A of N endpoints
     /// attached ... (provider_prefix)`).
     ProviderPrefix,
+    /// A function-level provider partial (`A of N endpoints attached ...
+    /// (provider_partial)`): the most important endpoints attached when
+    /// the provider does not fit whole.
+    ProviderPartial,
     /// A G-03 growth omission (`admitted module needs N more; ...`).
     GrowthOmission,
 }
@@ -409,6 +413,15 @@ pub(crate) fn is_provider_prefix(reason: &str) -> bool {
         && reason.contains("(provider_prefix)")
 }
 
+/// Whether a `modules_skipped` reason records a function-level
+/// partial-admitted ordinary provider: its most important endpoints
+/// attached, the rest not counted. Partially covered, never a whole
+/// refusal. Same counted-phrase-plus-tag shape as a provider prefix.
+pub(crate) fn is_provider_partial(reason: &str) -> bool {
+    reason.contains("endpoints attached; calls through the others are not counted")
+        && reason.contains("(provider_partial)")
+}
+
 /// Whether a `modules_skipped` reason records a partially covered
 /// module rather than one refused whole: a growth omission that kept
 /// its endpoints, a prefix-admitted closure array, or a
@@ -416,7 +429,109 @@ pub(crate) fn is_provider_prefix(reason: &str) -> bool {
 /// refused — the report, the terminal verdict, the system catalog —
 /// keys on this one predicate, so the three verdicts cannot disagree.
 pub(crate) fn is_partial_coverage(reason: &str) -> bool {
-    is_growth_omission(reason) || is_closure_array_prefix(reason) || is_provider_prefix(reason)
+    is_growth_omission(reason)
+        || is_closure_array_prefix(reason)
+        || is_provider_prefix(reason)
+        || is_provider_partial(reason)
+}
+
+/// Operation-closed importance tier for function-level partial
+/// admission: lifecycle (0), crypto families and object operations (1),
+/// everything else (2). Unknown names are tier 2 — least important,
+/// never dropped silently (the partial record counts them).
+fn partial_tier(canonical: &str) -> u8 {
+    if partial_tier0(canonical) {
+        0
+    } else if partial_family(canonical).is_some() || partial_tier1_singleton(canonical) {
+        1
+    } else {
+        2
+    }
+}
+
+/// The operation family a canonical name belongs to, for atomic
+/// tier-1 admission: an Init is never split from its continuations.
+/// Recover and dual-operation variants belong to their Init's family.
+fn partial_family(canonical: &str) -> Option<u8> {
+    Some(match canonical {
+        "C_SignInit"
+        | "C_Sign"
+        | "C_SignUpdate"
+        | "C_SignFinal"
+        | "C_SignRecoverInit"
+        | "C_SignRecover"
+        | "C_SignEncryptUpdate" => 0,
+        "C_VerifyInit"
+        | "C_Verify"
+        | "C_VerifyUpdate"
+        | "C_VerifyFinal"
+        | "C_VerifyRecoverInit"
+        | "C_VerifyRecover"
+        | "C_DecryptVerifyUpdate" => 1,
+        "C_EncryptInit" | "C_Encrypt" | "C_EncryptUpdate" | "C_EncryptFinal" => 2,
+        "C_DecryptInit" | "C_Decrypt" | "C_DecryptUpdate" | "C_DecryptFinal" => 3,
+        "C_DigestInit"
+        | "C_Digest"
+        | "C_DigestUpdate"
+        | "C_DigestKey"
+        | "C_DigestFinal"
+        | "C_DigestEncryptUpdate"
+        | "C_DecryptDigestUpdate" => 4,
+        "C_FindObjectsInit" | "C_FindObjects" | "C_FindObjectsFinal" => 5,
+        _ => return None,
+    })
+}
+
+/// Tier-1 operations admitted individually: single-key units with no
+/// Init to stay closed with.
+fn partial_tier1_singleton(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        "C_GenerateKey"
+            | "C_GenerateKeyPair"
+            | "C_DeriveKey"
+            | "C_WrapKey"
+            | "C_UnwrapKey"
+            | "C_GetAttributeValue"
+            | "C_CreateObject"
+            | "C_DestroyObject"
+    )
+}
+
+/// Tier-0 lifecycle operations, admitted before anything else.
+fn partial_tier0(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        "C_Initialize"
+            | "C_Finalize"
+            | "C_GetSlotList"
+            | "C_GetSlotInfo"
+            | "C_GetTokenInfo"
+            | "C_OpenSession"
+            | "C_CloseSession"
+            | "C_CloseAllSessions"
+            | "C_GetSessionInfo"
+            | "C_Login"
+            | "C_Logout"
+            | "C_GetMechanismList"
+            | "C_GetMechanismInfo"
+            | "C_GenerateRandom"
+    )
+}
+
+/// The canonical name tiering decides by: the authorized name, else the
+/// ordinal's pinned catalog name, else the raw decoded label (which
+/// tiers unknown).
+fn canonical_partial_name<'a>(target: &Target<'a>) -> &'a str {
+    if target.name_authorized {
+        return target.name;
+    }
+    if let Some(ordinal) = target.ordinal
+        && let Some(canonical) = pkcs11_module::function_name(usize::from(ordinal.ordinal))
+    {
+        return canonical;
+    }
+    target.name
 }
 
 /// The omitted count a growth omission states — the `N` of
@@ -637,6 +752,13 @@ enum AdmissionDecision {
         /// prefix (not whole) names its attached endpoints beside its
         /// needed endpoints for the report.
         provider_prefix: Option<(usize, usize)>,
+        /// Function-level partial: the admitted subset, or `None` for a
+        /// whole- or prefix-admitted module. The build filters targets
+        /// to this set when present.
+        partial_keys: Option<BTreeSet<AttachKey>>,
+        /// Function-level partial record: attached endpoints beside
+        /// needed endpoints for the report.
+        provider_partial: Option<(usize, usize)>,
     },
     Refused {
         skipped: Skipped,
@@ -3972,6 +4094,8 @@ fn merge(
             closure_prefix,
             closure_published_partial,
             provider_prefix,
+            partial_keys: None,
+            provider_partial: None,
         });
     }
 
@@ -3999,6 +4123,8 @@ fn merge(
             closure_prefix,
             closure_published_partial,
             provider_prefix,
+            partial_keys,
+            provider_partial,
         ) = match decision.expect("merge decides every module before building it") {
             AdmissionDecision::Refused { skipped, kind } => {
                 refused_module_objects.push((object, skipped.clone(), kind));
@@ -4013,6 +4139,8 @@ fn merge(
                 closure_prefix,
                 closure_published_partial,
                 provider_prefix,
+                partial_keys,
+                provider_partial,
             } => (
                 admitted,
                 refused_growth,
@@ -4021,8 +4149,11 @@ fn merge(
                 closure_prefix,
                 closure_published_partial,
                 provider_prefix,
+                partial_keys,
+                provider_partial,
             ),
         };
+        let _ = (&partial_keys, &provider_partial);
         // Part 0: a prefix-admitted closure names its covered templates.
         // The module is admitted (its prefix counts), but calls through the
         // other templates are not observed — a partial gap, never silent.
@@ -14948,6 +15079,298 @@ mod tests {
         assert!(
             !plan.retired_keys.contains_key(&key1),
             "excised leaves memory"
+        );
+    }
+
+    /// The partial-admission tier contract: lifecycle first, crypto
+    /// families and object operations next, everything else last.
+    #[test]
+    fn partial_tiers_classify_lifecycle_crypto_and_rest() {
+        for name in [
+            "C_Initialize",
+            "C_Finalize",
+            "C_GetSlotList",
+            "C_Login",
+            "C_GenerateRandom",
+        ] {
+            assert_eq!(partial_tier(name), 0, "{name} is lifecycle");
+        }
+        for name in [
+            "C_SignInit",
+            "C_Sign",
+            "C_Verify",
+            "C_EncryptUpdate",
+            "C_DecryptFinal",
+            "C_DigestInit",
+            "C_FindObjects",
+            "C_GenerateKey",
+            "C_CreateObject",
+        ] {
+            assert_eq!(partial_tier(name), 1, "{name} is a crypto operation");
+        }
+        for name in [
+            "C_GetInfo",
+            "C_CancelFunction",
+            "C_CopyObject",
+            "C_Bogus",
+            "unknown",
+        ] {
+            assert_eq!(partial_tier(name), 2, "{name} is the rest");
+        }
+        for (name, family) in [
+            ("C_SignInit", 0),
+            ("C_Sign", 0),
+            ("C_VerifyFinal", 1),
+            ("C_Encrypt", 2),
+            ("C_DecryptUpdate", 3),
+            ("C_DigestKey", 4),
+            ("C_FindObjectsFinal", 5),
+        ] {
+            assert_eq!(partial_family(name), Some(family), "{name} families");
+        }
+        for name in ["C_GenerateKey", "C_Initialize", "C_GetInfo", "C_Bogus"] {
+            assert_eq!(partial_family(name), None, "{name} has no family");
+        }
+    }
+
+    /// A single-table provider with real function names at 8-byte
+    /// intervals, for tier twins. Heuristic (tiers resolve by ordinal).
+    fn named_table_provider(inode: u32, path: &str, names: &[&'static str]) -> ReconciledModule {
+        let mut module = provider_with_tables(inode, path, 1, names.len(), false);
+        let targets: Vec<(&'static str, u32, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(entry, name)| (*name, inode, (entry * 8) as u64))
+            .collect();
+        replace_table_targets(&mut module, 0, &targets);
+        module
+    }
+
+    /// Function-level partial admission: a 68-entry heuristic provider
+    /// with 40 slots free under its ceiling attaches its 40 most
+    /// important endpoints — never refused whole — with a named
+    /// `(provider_partial)` gap.
+    #[test]
+    fn partial_admission_attaches_important_functions() {
+        let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        assert_eq!(names.len(), 68);
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 344, true);
+        let provider = named_table_provider(52, "/opt/trust.so", &names);
+        let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
+        assert_eq!(slots_of(&shared, 51), 344, "filler admitted whole");
+        assert_eq!(
+            slots_of(&shared, 52),
+            40,
+            "the 40 most important endpoints attach"
+        );
+        let partial = refusal_of(&shared, "/opt/trust.so").expect("partial gap reported");
+        assert!(
+            partial.reason.contains("40 of 68 endpoints attached")
+                && partial.reason.contains("(provider_partial)"),
+            "needed versus attached: {}",
+            partial.reason
+        );
+        assert!(
+            is_provider_partial(&partial.reason) && is_partial_coverage(&partial.reason),
+            "recognized as partial coverage: {}",
+            partial.reason
+        );
+        assert!(
+            whole_refusal_needed_count(&partial.reason).is_none(),
+            "never a whole refusal: {}",
+            partial.reason
+        );
+        let kind = shared
+            .refused_modules_typed()
+            .find(|(_, skipped, _)| skipped.subject == "/opt/trust.so")
+            .map(|(_, _, kind)| kind);
+        assert_eq!(kind, Some(RefusalKind::ProviderPartial));
+    }
+
+    /// Function-level partial admission spans published tables: a
+    /// corroborated 213-demand provider with 100 free attaches 100
+    /// endpoints across its tables. Published-union atomicity is
+    /// replaced only on this fallback path.
+    #[test]
+    fn partial_admission_spans_published_tables() {
+        let mut names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        names.extend(["C_GetInfo", "C_CancelFunction", "C_GetFunctionStatus"]);
+        assert_eq!(names.len(), 71);
+        let mut provider = provider_with_linked_tables(53, "/opt/softokn.so", 3, 71);
+        for table in 0..3 {
+            let targets: Vec<(&'static str, u32, u64)> = names
+                .iter()
+                .enumerate()
+                .map(|(entry, name)| (*name, 53, (table * 71 + entry) as u64 * 8))
+                .collect();
+            replace_table_targets(&mut provider, table, &targets);
+        }
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 412, true);
+        let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
+        assert_eq!(slots_of(&shared, 51), 412, "filler admitted whole");
+        assert_eq!(slots_of(&shared, 53), 100, "100 endpoints across tables");
+        let partial = refusal_of(&shared, "/opt/softokn.so").expect("partial gap reported");
+        assert!(
+            partial.reason.contains("100 of 213 endpoints attached")
+                && partial.reason.contains("(provider_partial)"),
+            "needed versus attached: {}",
+            partial.reason
+        );
+        assert!(
+            is_provider_partial(&partial.reason) && is_partial_coverage(&partial.reason),
+            "recognized as partial coverage: {}",
+            partial.reason
+        );
+    }
+
+    /// Function-level partial admission keeps operation families
+    /// closed: an admitted family is admitted whole, and no
+    /// continuation attaches without its Init — asserted over the
+    /// built plan's observable slot names.
+    #[test]
+    fn partial_admission_keeps_operation_families_closed() {
+        let names = [
+            "C_Initialize",
+            "C_Finalize",
+            "C_GetSlotList",
+            "C_GetSlotInfo",
+            "C_GetTokenInfo",
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_CloseAllSessions",
+            "C_GetSessionInfo",
+            "C_Login",
+            "C_Logout",
+            "C_GetMechanismList",
+            "C_GetMechanismInfo",
+            "C_GenerateRandom",
+            "C_SignInit",
+            "C_Sign",
+            "C_SignUpdate",
+            "C_SignFinal",
+            "C_VerifyInit",
+            "C_Verify",
+            "C_VerifyUpdate",
+            "C_VerifyFinal",
+            "C_EncryptInit",
+            "C_Encrypt",
+            "C_EncryptUpdate",
+            "C_EncryptFinal",
+            "C_GetInfo",
+            "C_GetFunctionList",
+            "C_CancelFunction",
+            "C_GetFunctionStatus",
+        ];
+        let mut provider = provider_with_linked_tables(54, "/opt/family.so", 1, names.len());
+        let targets: Vec<(&'static str, u32, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(entry, name)| (*name, 54, (entry * 8) as u64))
+            .collect();
+        replace_table_targets(&mut provider, 0, &targets);
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 493, true);
+        let shared = scoped_plan(&[filler, provider], AdmissionScope::Shared);
+        assert_eq!(slots_of(&shared, 54), 19, "tier-0 plus one family plus one");
+        let attached: BTreeSet<&str> = shared
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(54))
+            .flat_map(|slot| slot.names.iter().map(String::as_str))
+            .collect();
+        for family in [
+            ["C_SignInit", "C_Sign", "C_SignUpdate", "C_SignFinal"],
+            [
+                "C_VerifyInit",
+                "C_Verify",
+                "C_VerifyUpdate",
+                "C_VerifyFinal",
+            ],
+            [
+                "C_EncryptInit",
+                "C_Encrypt",
+                "C_EncryptUpdate",
+                "C_EncryptFinal",
+            ],
+        ] {
+            let present = family
+                .iter()
+                .filter(|name| attached.contains(*name))
+                .count();
+            assert!(
+                present == 0 || present == family.len(),
+                "a family admits whole or not at all: {family:?} has {present} attached"
+            );
+        }
+        assert!(
+            ["C_SignInit", "C_VerifyInit", "C_EncryptInit"]
+                .iter()
+                .any(|init| attached.contains(*init)),
+            "one family fits beside tier-0: {attached:?}"
+        );
+    }
+
+    /// Operator-attested modules stay whole-or-refused: a manifest
+    /// module over budget is refused whole, never attached in part.
+    #[test]
+    fn partial_admission_refuses_manifest_modules_whole() {
+        let functions: Vec<FunctionRecord> = (0..513)
+            .map(|entry| resolved("C_Sign", 0x1000 + entry * 8))
+            .collect();
+        let manifest = manifest_with(functions);
+        let plan = build_from_sources_with(
+            &[],
+            std::slice::from_ref(&manifest),
+            &[],
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+                first_plan: None,
+                first_plan_had_provider: false,
+            },
+            false,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Shared,
+            false,
+        );
+        assert_eq!(plan.slots.len(), 0, "nothing attaches");
+        assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+        assert!(
+            !is_partial_coverage(&plan.modules_skipped[0].reason),
+            "a manifest module is refused whole: {}",
+            plan.modules_skipped[0].reason
+        );
+    }
+
+    /// Counters keep their complete union: an over-budget module is
+    /// refused whole, never attached in part.
+    #[test]
+    fn partial_admission_refuses_counters_modules_whole() {
+        let policy = AdmissionPolicy::counters(crate::capacity::CounterBudget::new(100).unwrap());
+        let filler = provider_with_tables(61, "/opt/filler.so", 1, 60, true);
+        let provider = provider_with_tables(62, "/opt/counter.so", 1, 68, false);
+        let plan = build_from_sources_for_policy(
+            &[filler, provider],
+            &[],
+            &PinnedObjects::empty(),
+            policy,
+        );
+        assert_eq!(slots_of(&plan, 61), 60, "filler admitted whole");
+        assert_eq!(slots_of(&plan, 62), 0, "nothing attaches");
+        let refusal = refusal_of(&plan, "/opt/counter.so").expect("whole refusal reported");
+        assert!(
+            !is_partial_coverage(&refusal.reason),
+            "a counter module is refused whole: {}",
+            refusal.reason
         );
     }
 

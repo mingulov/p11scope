@@ -61,7 +61,7 @@ use crate::discovery::sweep_attribution::AttributionLoss;
 use crate::discovery::unbound_exe::{ExeResolver, ProcReads, ScanLearned};
 use crate::inspect_system::inventory_cgroup::{
     CgroupAdmissionPermit, CgroupCollectRequest, CgroupCollection, CgroupFence,
-    ScopedCollectionOutcome, SharedCollectionWork,
+    OPERATOR_STOP_PARTIAL_SCAN_GAP_SUBJECT, ScopedCollectionOutcome, SharedCollectionWork,
 };
 use crate::inventory_diagnostics::{
     Decision as DiagnosticDecision, DiagnosticConfig, DiagnosticKind, DiagnosticOutcome,
@@ -10139,6 +10139,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut scoped_scan_callers = 0;
         let mut cgroup_proof_complete = false;
         if let Some((collection, now_ns)) = &mut publishing_cgroup {
+            // Data-always scan-only (owner 2026-11-09): an operator stop
+            // during the first pass publishes the members it actually
+            // scanned, without end-sample permits or native attach. Later
+            // passes keep the trailing discard (results already exist).
+            let scan_only_observed = collection.scan_only_observed();
+            let scan_only = collection.outcome()
+                == ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop,
+                )
+                && self.passes == 1
+                && self.adapter.len() == 0
+                && !scan_only_observed.is_empty();
             // Dead custody can never re-enter: release those handoffs
             // before the transaction prepares anything.
             self.release_dead_handoffs();
@@ -10361,7 +10373,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             } else {
                 BTreeSet::new()
             };
-            collection.sample_end(&requested);
+            if !scan_only {
+                collection.sample_end(&requested);
+            }
             // Admission detection runs per incarnation at commit, after
             // the end sample and the commit validation: stale native
             // records order against detection time, never the
@@ -10431,6 +10445,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }),
                 }
             }
+            if scan_only {
+                // No permits past an operator stop (F9): admit the scanned
+                // pids scan-pinned for display only. No native owners stage
+                // from this pass (prepared is empty, so the owner blocks
+                // above staged nothing), and no attach starts below.
+                allowed = scan_only_observed.clone();
+                let events = self.adapter.reconcile_detected(
+                    &scan_only_observed,
+                    &mut |_| ImageAuthority::ScanPinned,
+                    *now_ns,
+                    &mut crate::attach::monotonic_ns,
+                );
+                for event in &events {
+                    if matches!(event, CallerEvent::Admitted { .. }) {
+                        scoped_admitted += 1;
+                    }
+                }
+                scoped_events.extend(events);
+                for pid in &scan_only_observed {
+                    if let Some(id) = self.adapter.live_id(*pid) {
+                        allowed_callers.insert(id);
+                    }
+                }
+            }
             if self.adapter.take_detection_clock_failed() {
                 Self::note_exit_clocks_incomparable(
                     &mut self.exit_clocks_comparable,
@@ -10439,7 +10477,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             scoped_scan_callers = allowed.len();
             collection.observe_allowed(&allowed);
-            let mut catalog = collection.catalog(&allowed);
+            let mut catalog = if scan_only {
+                collection.catalog_scan_only(&allowed)
+            } else {
+                collection.catalog(&allowed)
+            };
             // Same fold as `absorb_catalog_excluded`, inline: `provider`
             // borrows the attach set, so only disjoint field access fits.
             for record in std::mem::take(&mut catalog.excluded) {
@@ -10645,7 +10687,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // the non-unwinding handler before revisions are cut.
             self.revise_engine_tail_after_scoped_owners();
             let outcome = collection.outcome(); // final cancellation/deadline poll
-            if outcome != ScopedCollectionOutcome::Complete {
+            if scan_only {
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: OPERATOR_STOP_PARTIAL_SCAN_GAP_SUBJECT.into(),
+                    reason: format!(
+                        "operator stop cut pass-0 short after {} member(s) scanned; \
+                         rows are scan-only, counts not attached",
+                        scoped_scan_callers,
+                    ),
+                    budget: None,
+                });
+            } else if outcome != ScopedCollectionOutcome::Complete {
                 allowed_callers.clear();
                 self.registry.record_gap(RegistryGap {
                     caller: None,
@@ -17137,6 +17192,101 @@ exit 0
     }
 
     #[test]
+    fn cgroup_operator_stop_mid_collection_publishes_scanned_member() {
+        // True mid-worker stop: two provider members, the operator stop
+        // lands as the second member's deep scan starts, after the first
+        // member fully scanned. Only the scanned member publishes, with
+        // the partial-scan gap; the unscanned member stays out.
+        use crate::inspect_system::inventory_cgroup::{CollectionStage, collect_with};
+        let (fixture, first, mut coordinator) = cgroup_provider_scene();
+        let provider = coordinator.engine.module_hints[0].clone();
+        let second = spawn_cgroup_provider_child(fixture.path(), &provider, "ready-second");
+        std::fs::write(
+            fixture.path().join("cgroup.procs"),
+            format!("{}\n{}\n", first.id(), second.id()),
+        )
+        .unwrap();
+        let control = CollectionControl::new(None);
+        let worker_control = control.clone();
+        let Scope::Cgroup { dir, .. } = &coordinator.engine.scope else {
+            panic!("provider scene must hold a cgroup root");
+        };
+        let crate::discovery::scan::DiscoveryPolicy::Inventory(work) =
+            coordinator.engine.budget.policy()
+        else {
+            panic!("cgroup inventory requires the Inventory work policy");
+        };
+        let request = CgroupCollectRequest {
+            root: Arc::clone(dir),
+            fence: coordinator.cgroup_fence.issue(),
+            state: CgroupWalkState::default(),
+            limits: CgroupWalkLimits::default(),
+            control: control.clone(),
+            max_scan_pids: None,
+            scan_budget: coordinator.collector_budget(
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+                false,
+            ),
+            observer: None,
+            count_manifests: coordinator.count_manifests.clone(),
+            prearm_prior: coordinator.prearm_prior,
+            scripted_member_gaps: Vec::new(),
+        };
+        let hints = coordinator.engine.module_hints.clone();
+        let hooks = coordinator.engine.hooks.clone();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let deep_scans = Cell::new(0);
+        let collection = collect_with(request, &hints, &hooks, policy, &mut |stage| {
+            if stage == CollectionStage::DeepScan {
+                let seen = deep_scans.get() + 1;
+                deep_scans.set(seen);
+                if seen == 2 {
+                    worker_control.cancel();
+                }
+            }
+        });
+        assert_eq!(deep_scans.get(), 2, "the stop landed mid-collection");
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            coordinator.registry.caller_count(),
+            1,
+            "the scanned member publishes; the cut-off member stays out"
+        );
+        assert!(
+            coordinator.registry.edges().next().is_some(),
+            "the scanned member's module edge publishes"
+        );
+        let gaps: Vec<String> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|subject| subject == "collection incomplete (stopped by operator)"),
+            "the partial scan names the operator stop: {gaps:?}"
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            completion.outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+        assert_eq!(completion.admitted, 1);
+    }
+
+    #[test]
     fn cgroup_operator_stop_before_any_scan_stays_honest_empty() {
         // Healthy twin: the stop landed before traversal saw any member,
         // so nothing was collected and 0 callers is honest. No partial-scan
@@ -17360,7 +17510,11 @@ exit 0
     }
 
     #[test]
-    fn cgroup_stop_after_apply_never_admits_or_publishes_complete_scope_receipt() {
+    fn cgroup_stop_after_apply_publishes_scan_only_without_complete_receipt() {
+        // Data-always (owner 2026-11-09, F1): a stop after apply still
+        // publishes the scanned member scan-only with the partial-scan
+        // gap; only the complete-scope receipt stays withheld (no
+        // end-sample proof, no attach, original custody released).
         let (_fixture, child, mut coordinator) = cgroup_os_scene();
         let control = CollectionControl::new(None);
         let collection = coordinator
@@ -17377,7 +17531,22 @@ exit 0
             .unwrap();
         control.cancel();
         coordinator.commit_batch(false).unwrap();
-        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(
+            coordinator.adapter.len(),
+            1,
+            "the scanned member publishes scan-only instead of discarding"
+        );
+        let gaps: Vec<String> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|subject| subject == "collection incomplete (stopped by operator)"),
+            "the partial scan names the operator stop: {gaps:?}"
+        );
         assert!(original.upgrade().is_none());
         assert_eq!(
             coordinator.take_cgroup_completion().unwrap().outcome,

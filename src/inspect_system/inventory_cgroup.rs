@@ -276,6 +276,13 @@ pub(crate) struct CgroupCollectRequest {
     pub(crate) scripted_member_gaps: Vec<String>,
 }
 
+/// Registry gap subject for a pass-0 collection an operator stop cut
+/// short after real members scanned (data-always, owner 2026-11-09):
+/// the partial scan publishes scan-only with this gap, never claiming
+/// completeness.
+pub(crate) const OPERATOR_STOP_PARTIAL_SCAN_GAP_SUBJECT: &str =
+    "collection incomplete (stopped by operator)";
+
 pub(crate) struct CgroupCollection {
     root: Arc<File>,
     state: CgroupWalkState,
@@ -642,6 +649,96 @@ impl CgroupCollection {
         catalog.stage_timings = std::mem::take(&mut self.timings);
         catalog
     }
+    /// Members a stopped pass-0 actually scanned (data-always): deep-scan
+    /// attributable with their pinned generation still matching. Pure and
+    /// bounded by the already-collected members; no work charge, fence, or
+    /// end-sample proof, so it must only feed the scan-only commit path,
+    /// which discloses the stop and never attaches counts.
+    pub(crate) fn scan_only_observed(&self) -> BTreeSet<u32> {
+        let mut observed = BTreeSet::new();
+        let Some(collection) = &self.collection else {
+            return observed;
+        };
+        for member in &collection.members {
+            if member.status.attributable()
+                && member.generation.as_ref()
+                    == self
+                        .originals
+                        .get(&member.pid)
+                        .map(|original| &original.generation)
+            {
+                observed.insert(member.pid);
+            }
+        }
+        if let Some(attributed) = &self.attributed {
+            for member in &attributed.attribution.members {
+                if self.originals.get(&member.pid).is_some_and(|original| {
+                    original.generation.start_time == Some(member.start_time)
+                        && original.generation.exe.as_ref() == Some(&member.exe)
+                }) {
+                    observed.insert(member.pid);
+                }
+            }
+        }
+        observed
+    }
+    /// Lower a stopped pass-0's scanned members for display only. Like
+    /// `catalog` but without work charges or end-sample authority: members
+    /// the stop skipped stay out, a bind the stop skipped runs now over the
+    /// bounded partial input, and the outcome gap always discloses the
+    /// incomplete transaction.
+    pub(crate) fn catalog_scan_only(&mut self, allowed: &BTreeSet<u32>) -> Catalog {
+        let mut collection = self
+            .collection
+            .take()
+            .expect("one collection consumes its facts once");
+        let mut bound = self
+            .bound
+            .take()
+            .expect("one collection consumes its bound facts once");
+        let mut attributed = self.attributed.take();
+        if bound.reconciled.is_empty() && bound.unresolved.is_empty() {
+            let manifests = std::mem::take(&mut bound.count_manifests);
+            let mut fresh = bind_collection(&mut collection);
+            fresh.count_manifests = manifests;
+            bound = fresh;
+        }
+        collection
+            .members
+            .retain(|member| allowed.contains(&member.pid));
+        bound.reconciled.retain(|(pid, _, _)| allowed.contains(pid));
+        bound
+            .unresolved
+            .retain(|(pid, _, _, _)| allowed.contains(pid));
+        bound
+            .bind_gaps
+            .retain(|gap| gap.pid.is_none_or(|pid| allowed.contains(&pid)));
+        if let Some(attributed) = &mut attributed {
+            attributed
+                .attribution
+                .members
+                .retain(|member| allowed.contains(&member.pid));
+            attributed
+                .attribution
+                .unexamined
+                .retain(|pid, _| allowed.contains(pid));
+        }
+        self.note(ScopedCollectionOutcome::Incomplete(
+            ScopedCollectionGap::ScanIncomplete,
+        ));
+        // No generic scope-gap push here: the coordinator records the
+        // specific operator-stop gap for this path, so the report names
+        // the stop once instead of carrying a duplicate generic entry.
+        let mut catalog = assemble(
+            collection,
+            bound,
+            attributed,
+            self.policy,
+            self.admission_scope,
+        );
+        catalog.stage_timings = std::mem::take(&mut self.timings);
+        catalog
+    }
     pub(crate) fn finish(self) -> (CgroupWalkState, ScopedCollectionOutcome) {
         let outcome = self.outcome();
         (self.state, outcome)
@@ -738,7 +835,7 @@ fn with_scripted_gaps(mut member: MemberResult, reasons: &[String]) -> MemberRes
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CollectionStage {
+pub(crate) enum CollectionStage {
     Traversed,
     Begin,
     Sweep,
@@ -755,7 +852,7 @@ pub(crate) fn collect(
 ) -> CgroupCollection {
     collect_with(request, hints, hooks, policy, &mut |_| {})
 }
-fn collect_with(
+pub(crate) fn collect_with(
     mut request: CgroupCollectRequest,
     hints: &[PathBuf],
     hooks: &HookRegistry,

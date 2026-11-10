@@ -3417,8 +3417,8 @@ where
                 // Attaching after the stop stays blocked: the cgroup
                 // commit hooks already refuse extension past a latched
                 // stop, and the run breaks after this pass publishes.
-                // A cancelled collection keeps today's path (no marker
-                // here; the transaction gap names it at commit).
+                // Any other cancelled collection keeps today's path (no
+                // marker here; the transaction gap names it at commit).
                 if control.is_some()
                     && passes == 0
                     && let Some(cause) = clock.stop_cause()
@@ -3436,6 +3436,38 @@ where
                             format!(
                                 "{} ({} elapsed); the completed collection applied scan-only: \
                                  modules and callers shown, counts not attached",
+                                ZeroPassStop::cause_event(cause, true),
+                                elapsed_secs_2dp(loop_start.elapsed()),
+                            ),
+                        );
+                    }
+                }
+                // Data-always scan-only (owner 2026-11-09): an operator
+                // stop during pass-0's collection still publishes the
+                // members scanned so far. The commit below takes the
+                // scan-only path (no permits, no attach); a live lane
+                // names stopped-before-attach beside the rows. An empty
+                // partial (nothing scanned) keeps today's path above.
+                if control.is_some()
+                    && passes == 0
+                    && let Some(cause) = clock.stop_cause()
+                    && matches!(
+                        &collected,
+                        CollectedPass::Cgroup(Ok(collection))
+                            if collection.outcome()
+                                == crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Cancelled(
+                                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop,
+                                )
+                                && !collection.scan_only_observed().is_empty()
+                    )
+                {
+                    stop_cause.get_or_insert(cause);
+                    if lane.is_some() {
+                        driver.host().note_scope_gap(
+                            STOPPED_BEFORE_ATTACH_SUBJECT.into(),
+                            format!(
+                                "{} ({} elapsed); the partial collection applied scan-only: \
+                                 scanned modules and callers shown, counts not attached",
                                 ZeroPassStop::cause_event(cause, true),
                                 elapsed_secs_2dp(loop_start.elapsed()),
                             ),

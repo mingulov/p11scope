@@ -18414,11 +18414,23 @@ impl Engine {
         // retained after their pins revalidate instead of being replaced by
         // partial results. Metadata-only scans keep their own explicit
         // table restoration above; failed revalidation falls through to the
-        // replacement below, so stale identity still retires.
-        let revalidated = !found_complete
+        // replacement below, so stale identity still retires. A rescan that
+        // finds exactly the same files also retains: replacing stable pins
+        // with fresh IDs would allocate duplicate slots for targets that
+        // already have them.
+        let retained_keys: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view_id)
+            .map(|module| module.scanned.key)
+            .collect();
+        let found_keys: BTreeSet<_> = found.iter().map(|module| module.key).collect();
+        let same_files = found_keys == retained_keys && self.views[position].still_the_same();
+        let revalidated = (!found_complete
             && mode == LoaderScanMode::Memory
             && self.views[position].still_the_same()
-            && self.view_pins_unchanged(view_id);
+            && self.view_pins_unchanged(view_id))
+            || same_files;
         let (candidate_pins, raw_modules) = if revalidated {
             let mut candidate_pins = self.pinned.clone();
             // Fresh pins cover only newly observed modules: re-pinning
@@ -18464,21 +18476,7 @@ impl Engine {
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            let mut preserve: BTreeSet<PinnedObjectId> = candidate_pins
-                .view_claims(view_id)
-                .map(|claims| {
-                    claims
-                        .tables
-                        .iter()
-                        .copied()
-                        .chain(claims.targets.iter().map(|(id, _)| *id))
-                        .chain(claims.pins.iter().copied())
-                        .collect()
-                })
-                .unwrap_or_default();
-            preserve.insert(loader);
-            let preserve: Vec<PinnedObjectId> = preserve.into_iter().collect();
-            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &preserve));
+            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()

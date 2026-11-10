@@ -926,6 +926,13 @@ impl ChurnCondition {
         }
         self.offset += fresh.len() as u64;
         self.pending.push_str(&fresh);
+        // Snapshot before draining: a commit batch can land whole in one
+        // tick, so the admitting pass's own marker may be processed below
+        // before the kill check runs. The admitting pass is always one
+        // past the last marker seen on an earlier tick: admitted events
+        // precede their marker in one sequential byte stream, and
+        // complete-lines-only processing keeps that order.
+        let pass_before_tick = self.last_pass;
         // Complete lines only: the observer may be mid-write, and files
         // flush per line, so a newline-terminated line parses whole.
         while let Some(end) = self.pending.find('\n') {
@@ -940,10 +947,11 @@ impl ChurnCondition {
             self.killed = true;
             // Admitted events precede their pass marker in the commit
             // batch, so the admitting pass is one past the last marker
-            // seen (pass 0 when none seen yet); the kill-cadence assert
-            // below needs a later pass observing the deaths.
+            // seen before this tick (pass 0 when none seen yet); the
+            // kill-cadence assert below needs a later pass observing the
+            // deaths.
             self.kill_admitting_pass = Some(
-                self.last_pass
+                pass_before_tick
                     .map(|pass| pass.saturating_add(1))
                     .unwrap_or(0),
             );
@@ -1209,9 +1217,11 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         // that could see it, so the stop disclosure names it — the
         // never-scanned diff on scan capture, the pending-coverage gap
         // where exec hooks tracked it. Never a caller row, never
-        // silent. (The pid lists bound at ten shown; churn-C sorts
-        // first as the earliest missed birth, so truncation cannot
-        // hide it behind later starters.)
+        // silent. (The pid lists bound at ten shown; churn-C's pid is
+        // the smallest among missed births absent pid wrap or reuse —
+        // pids allocate sequentially and missed births postdate the
+        // last enumeration — so truncation cannot hide it behind
+        // later starters.)
         assert!(
             churn_c_incarnations.is_empty(),
             "churn-C (pid {churn_c_pid}) never admitted and must leave no caller row"
@@ -1238,9 +1248,13 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     } else {
         // Died before admission: never a caller row, counted in its
         // named gap — the short-lived aggregate once two passes miss
-        // it, else the pending-coverage gap naming its pid. (Scan-only
-        // capture has no exec hooks, so an unadmitted death there fails
-        // loudly here instead of passing silently.)
+        // it, else the pending-coverage gap naming its pid. The
+        // aggregate is count-only by product design and names no pid,
+        // so that disjunct is attribution by elimination (dead plus
+        // unadmitted plus the aggregate present), confounded by any
+        // ambient short-lived program on the host. (Scan-only capture
+        // has no exec hooks, so an unadmitted death there fails loudly
+        // here instead of passing silently.)
         assert!(
             churn_c_incarnations.is_empty(),
             "churn-C (pid {churn_c_pid}) died unadmitted and must leave no caller row"

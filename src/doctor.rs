@@ -4477,15 +4477,16 @@ mod tests {
         use crate::fixture_guard::DieWithParent as _;
 
         let dir = tempfile::tempdir().expect("a fixture directory");
-        let blocked = static_exe_fixture(dir.path()).to_string_lossy().into_owned();
+        let blocked = static_exe_fixture(dir.path())
+            .to_string_lossy()
+            .into_owned();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .die_with_parent()
             .spawn()
             .expect("a dynamic control process");
         let dynamic = format!("/proc/{}/exe", child.id());
-        let expected =
-            loader_sample_at(&dynamic).expect("a dynamic executable offers a sample");
+        let expected = loader_sample_at(&dynamic).expect("a dynamic executable offers a sample");
         assert_eq!(loader_facts_from(&[blocked.clone(), dynamic]), expected);
         assert_eq!(
             loader_facts_from(&[blocked.clone(), blocked]),

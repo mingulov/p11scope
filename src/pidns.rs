@@ -1067,7 +1067,10 @@ mod tests {
     fn a_nested_observer_seeing_only_itself_and_init_warns_container_only() {
         let warning = container_only_warning(&nested_own(), &[1, 999], 999)
             .expect("observer plus init warns");
-        assert!(warning.contains("only this container is visible"), "{warning}");
+        assert!(
+            warning.contains("only this container is visible"),
+            "{warning}"
+        );
         assert!(warning.contains("--pid=host"), "{warning}");
     }
 
@@ -1078,7 +1081,10 @@ mod tests {
         for (visible, own) in [(vec![7], 7), (vec![1], 1)] {
             let warning = container_only_warning(&nested_own(), &visible, own)
                 .expect("a lone observer warns");
-            assert!(warning.contains("only this container is visible"), "{warning}");
+            assert!(
+                warning.contains("only this container is visible"),
+                "{warning}"
+            );
             assert!(warning.contains("--pid=host"), "{warning}");
         }
     }

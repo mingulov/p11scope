@@ -2346,6 +2346,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn drain_order_prefers_the_most_mapped_module_first() {
+        // A busy desktop: the big module (40 endpoints here, p11-kit's shape)
+        // is mapped by 35 processes, the small one by a single caller.
+        // Discovery order still puts the big module first (low endpoint IDs);
+        // the drain must lead with what applications actually map.
+        let dir = tempfile::tempdir().unwrap();
+        let big = provider(&dir, "big.so", "provider-big");
+        let small = provider(&dir, "small.so", "provider-small");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[(&big, "sha-big"), (&small, "sha-small")]);
+        let modules = [
+            module(&pins, &big, &offsets(40)),
+            module(&pins, &small, &[0x2000, 0x2010]),
+        ];
+        let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
+        assert_eq!(absorbed.delta.endpoints.len(), 42);
+        let big_key = module_key(&big, "sha-big").object;
+        let small_key = module_key(&small, "sha-small").object;
+        set.note_mappers(true, [(&big_key, 35), (&small_key, 1)]);
+        let mut endpoints = absorbed.delta.endpoints;
+        set.sort_drain_order(&mut endpoints);
+        let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
+        let big_ids: Vec<u32> = (0..40).collect();
+        let small_ids: Vec<u32> = (40..42).collect();
+        assert_eq!(
+            ids,
+            big_ids.into_iter().chain(small_ids).collect::<Vec<_>>(),
+            "the most-mapped module drains first, ID order holds within each module"
+        );
+    }
+
+    #[test]
+    fn drain_order_with_scope_limited_counts_keeps_smallest_first() {
+        // A scope-limited view (--pid) counts only what it sees while the
+        // kernel walks every mapper, so its counts never order the drain:
+        // smallest-module-first still applies.
+        let dir = tempfile::tempdir().unwrap();
+        let big = provider(&dir, "big.so", "provider-big");
+        let small = provider(&dir, "small.so", "provider-small");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[(&big, "sha-big"), (&small, "sha-small")]);
+        let modules = [
+            module(&pins, &big, &offsets(40)),
+            module(&pins, &small, &[0x2000, 0x2010]),
+        ];
+        let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
+        assert_eq!(absorbed.delta.endpoints.len(), 42);
+        let big_key = module_key(&big, "sha-big").object;
+        let small_key = module_key(&small, "sha-small").object;
+        set.note_mappers(false, [(&big_key, 35), (&small_key, 1)]);
+        let mut endpoints = absorbed.delta.endpoints;
+        set.sort_drain_order(&mut endpoints);
+        let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
+        let small_ids: Vec<u32> = (40..42).collect();
+        let big_ids: Vec<u32> = (0..40).collect();
+        assert_eq!(
+            ids,
+            small_ids.into_iter().chain(big_ids).collect::<Vec<_>>(),
+            "scope-limited counts keep smallest-module-first"
+        );
+    }
+
+    #[test]
     fn drain_order_keeps_a_small_module_first_past_the_membership_bound() {
         // Budget 16: membership bound 64. P holds 8 endpoints; seven
         // forwarders each target all eight (64 memberships, exactly the

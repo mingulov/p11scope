@@ -412,6 +412,12 @@ impl ExtendWindow {
             deadline,
         })
     }
+
+    /// The entry bound (scripted facades honour it, like [`ReadWindow::max_rows`]).
+    #[cfg(test)]
+    pub(crate) fn max_entries(&self) -> usize {
+        self.max_entries
+    }
 }
 
 /// One read quantum: at most `max_rows` CALLER_USE keys (or discovery

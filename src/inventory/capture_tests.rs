@@ -506,6 +506,8 @@ struct ScriptedLane {
     /// `acquisition_active` (the production facade's Active state).
     acquisition: Option<ScriptedAcquisition>,
     acquisition_active: bool,
+    /// The attach backend this scripted lane reports (Singles by default).
+    backend: LaneBackend,
 }
 
 impl Drop for ScriptedLane {
@@ -556,6 +558,7 @@ impl ScriptedLane {
             io_deadlines: Rc::default(),
             acquisition: None,
             acquisition_active: false,
+            backend: LaneBackend::singles(),
         }
     }
 
@@ -607,11 +610,15 @@ impl CaptureLane<Pin> for ScriptedLane {
         self.scope_coverage
     }
 
+    fn backend(&self) -> LaneBackend {
+        self.backend.clone()
+    }
+
     fn extend(
         &mut self,
         mut delta: TargetDelta,
         _: &dyn CaptureTargets,
-        _: ExtendWindow,
+        window: ExtendWindow,
     ) -> ExtendReceipt {
         let ids: Vec<String> = delta
             .endpoints
@@ -633,9 +640,18 @@ impl CaptureLane<Pin> for ScriptedLane {
             receipt.activated_roots = true;
             receipt.exec_coverage = Some(ExecCoverage::scripted(self.domain, self.stamps.next()));
         }
+        // Honor the lane's window like production: at most `max_entries`
+        // attach attempts per extend; the rest defer in order. Scripted
+        // time never advances, so the deadline never binds here.
+        if delta.endpoints.len() > window.max_entries() {
+            receipt.deferred.endpoints = delta.endpoints.split_off(window.max_entries());
+        }
         let keep = delta.endpoints.len().saturating_sub(self.defer_next);
         if self.defer_next > 0 && !delta.endpoints.is_empty() {
-            receipt.deferred.endpoints = delta.endpoints.split_off(keep);
+            receipt
+                .deferred
+                .endpoints
+                .extend(delta.endpoints.split_off(keep));
             self.defer_next = 0;
         }
         for endpoint in delta.endpoints {
@@ -1621,6 +1637,130 @@ fn mid_run_arrivals_merge_with_the_deferred_backlog_in_host_order() {
     assert!(
         log_entries.iter().any(|entry| entry == "extend[3,2,0]"),
         "the second pass orders the deferred backlog and fresh arrivals together: {log_entries:?}"
+    );
+}
+
+/// A host that serves one fabricated delta and records every extend
+/// receipt as (attached, deferred), so the twins below observe the pass
+/// quantum the lane actually sends. Drain order is ID order: these tests
+/// isolate the quantum, not the ordering.
+struct ReceiptHost {
+    set: InventoryAttachSet,
+    delta: TargetDelta,
+    receipts: Vec<(usize, usize)>,
+}
+
+impl ReceiptHost {
+    fn with_delta(delta: TargetDelta) -> Self {
+        Self {
+            set: InventoryAttachSet::new(InventoryBudget::new(32768, 32768 * 8).unwrap()),
+            delta,
+            receipts: Vec::new(),
+        }
+    }
+}
+
+impl LaneHost<Pin> for ReceiptHost {
+    fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
+    fn abandon_capture_coverage(&mut self) {}
+    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+        self.receipts
+            .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
+    }
+    fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+    fn take_target_delta(&mut self) -> TargetDelta {
+        std::mem::take(&mut self.delta)
+    }
+    fn capture_targets(&self) -> &dyn CaptureTargets {
+        &self.set
+    }
+    fn stage_native(
+        &mut self,
+        _batch: NativeBatch,
+        _identity: &mut dyn NativeIdentity<Pin>,
+        _now_ns: u64,
+    ) -> NativeReceipt {
+        NativeReceipt::default()
+    }
+    fn end_capture_coverage(&mut self, _at_ns: u64) {}
+    fn note_native_lane(&mut self) {}
+    fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+    fn note_refresh_loss(&mut self, _reason: String) {}
+}
+
+/// `count` fabricated endpoints of one scripted object, in ID order: the
+/// scripted lane attaches blindly, so no catalog lowering is needed to
+/// observe the pass quantum.
+fn fabricated_delta(count: u32) -> TargetDelta {
+    use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
+    TargetDelta {
+        endpoints: (0..count)
+            .map(|id| AttachEndpoint {
+                id: EndpointId(id),
+                object: AttachObjectId::scripted(0),
+                file_offset: 0x1000 + u64::from(id) * 16,
+                abi: p11scope_manifest::elf::ElfAbi::Lp64,
+            })
+            .collect(),
+        objects: Vec::new(),
+    }
+}
+
+fn multi_lane(log: &Log) -> ScriptedLane {
+    let mut lane = ScriptedLane::new(log);
+    lane.backend = LaneBackend {
+        selection: BackendSelection::Multi,
+        backend: AttachBackend::Multi,
+        fallback: None,
+        scope_filter: ScopeFilter::None,
+    };
+    lane
+}
+
+/// p11-kit's shape on the busy desktop: 6734 endpoints of the most-mapped
+/// provider. One Multi pass must carry the whole provider, not 512 of it:
+/// coverage stays unknown until every endpoint is attached.
+#[test]
+fn multi_lane_attaches_a_whole_provider_in_one_pass() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(6734));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts.len(),
+        2,
+        "activation plus one pass: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.receipts[1],
+        (6734, 0),
+        "one Multi pass attaches the whole 6734-endpoint provider"
+    );
+}
+
+/// Old kernels keep the exact provisional Singles quantum: 512 attach
+/// attempts per pass, the rest deferred in order.
+#[test]
+fn singles_lane_keeps_the_512_entry_pass_quantum() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(6734));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts.len(),
+        2,
+        "activation plus one pass: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.receipts[1],
+        (512, 6222),
+        "one Singles pass still attempts 512 and defers the rest"
     );
 }
 

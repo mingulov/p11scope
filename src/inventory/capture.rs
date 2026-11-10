@@ -492,9 +492,10 @@ pub(crate) trait LaneHost<Pin> {
     /// Order one extend window's endpoints before the lane sends them:
     /// the deferred backlog plus the fresh delta, merged. The lane passes
     /// its attach backend so the order can differ per backend. Defaults to
-    /// the merged (ID) order; the coordinator sorts most-mapped-first
-    /// (smallest-module tiebreak) so the providers applications actually
-    /// map attach before a cut-short run ends.
+    /// the merged (ID) order; the coordinator sorts small modules first
+    /// on Multi (most-mapped among them, then most-mapped large modules)
+    /// and smallest-module-first on Singles, so the providers small token
+    /// callers use attach before a cut-short run ends.
     fn order_drain_targets(&self, _endpoints: &mut [AttachEndpoint], _backend: AttachBackend) {}
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(

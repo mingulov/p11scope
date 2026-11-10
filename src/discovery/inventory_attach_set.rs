@@ -600,45 +600,72 @@ impl InventoryAttachSet {
             })
     }
 
-    /// Drain order for one extend window: most-mapped object first
-    /// (provider importance: what applications actually map), then
-    /// smallest-module-first (shortest-job-first), endpoint-ID tiebreak.
-    /// Endpoints no admitted module claims drain last. Mapper counts come
-    /// from the latest whole-system pass; a scope-limited view or a pass
-    /// that has not reported counts every object at zero, so those keep
-    /// smallest-module-first. This decides only the attempt order within
-    /// one window, never what attaches: the backlog merges ahead of the
-    /// fresh delta as sort input, and the sort then interleaves both by
-    /// (mappers, size, id), so a fresh small module still sorts ahead of
-    /// an old giant tail when both map equally many processes. The lane
-    /// passes its attach backend so the order can differ per backend.
+    /// Drain order for one extend window, per attach backend. On Multi,
+    /// small modules (at most [`SMALL_MODULE_DRAIN_ENDPOINTS`] endpoints)
+    /// drain first — most-mapped first among them, then
+    /// smallest-module-first (shortest-job-first), endpoint-ID tiebreak —
+    /// and larger modules follow most-mapped-first: a heavily-mapped
+    /// giant's tail spans passes, so leading with it would starve the
+    /// token providers queued behind it. On Singles the previous
+    /// smallest-module-first order holds (mapper counts never apply):
+    /// at 512 endpoints per pass the giant takes the whole run, so small
+    /// providers must not wait behind it. Endpoints no admitted module
+    /// claims drain last. Mapper counts come from the latest whole-system
+    /// pass; a scope-limited view or a pass that has not reported counts
+    /// every object at zero, so those keep smallest-module-first. This
+    /// decides only the attempt order within one window, never what
+    /// attaches: the backlog merges ahead of the fresh delta as sort
+    /// input, and the sort then interleaves both, so a fresh small module
+    /// still sorts ahead of an old giant tail.
     pub(crate) fn sort_drain_order(
         &self,
         endpoints: &mut [AttachEndpoint],
         backend: AttachBackend,
     ) {
-        let _ = backend;
-        endpoints.sort_by_key(|endpoint| {
-            let hinted = self
-                .drain_hint
-                .get(endpoint.id.0 as usize)
-                .copied()
-                .filter(|hint| *hint != usize::MAX);
-            let size = hinted
-                .or_else(|| {
-                    self.modules_with_member(endpoint.id)
-                        .filter_map(|module| self.module_endpoints(module))
-                        .min()
-                })
-                .unwrap_or(usize::MAX);
-            let mappers = match self.mappers(endpoint.object) {
-                MapperEstimate::System(count) => count,
-                MapperEstimate::ScopeLimited | MapperEstimate::Unknown => 0,
-            };
-            (std::cmp::Reverse(mappers), size, endpoint.id.0)
-        });
+        match backend {
+            AttachBackend::Multi => {
+                endpoints.sort_by_key(|endpoint| {
+                    let size = self.drain_size(endpoint);
+                    let mappers = match self.mappers(endpoint.object) {
+                        MapperEstimate::System(count) => count,
+                        MapperEstimate::ScopeLimited | MapperEstimate::Unknown => 0,
+                    };
+                    (
+                        size > SMALL_MODULE_DRAIN_ENDPOINTS,
+                        std::cmp::Reverse(mappers),
+                        size,
+                        endpoint.id.0,
+                    )
+                });
+            }
+            AttachBackend::Singles => {
+                endpoints.sort_by_key(|endpoint| (self.drain_size(endpoint), endpoint.id.0));
+            }
+        }
+    }
+
+    /// One endpoint's smallest admitting-module size: the per-endpoint
+    /// hint, else the smallest recorded membership holding it, else
+    /// `usize::MAX` when no admitted module claims it (those drain last).
+    fn drain_size(&self, endpoint: &AttachEndpoint) -> usize {
+        self.drain_hint
+            .get(endpoint.id.0 as usize)
+            .copied()
+            .filter(|hint| *hint != usize::MAX)
+            .or_else(|| {
+                self.modules_with_member(endpoint.id)
+                    .filter_map(|module| self.module_endpoints(module))
+                    .min()
+            })
+            .unwrap_or(usize::MAX)
     }
 }
+
+// Modules with at most this many endpoints drain before larger ones on
+// the Multi backend: a module this small fits in one Singles pass (512
+// endpoints), so leading with them keeps token providers from starving
+// behind a heavily-mapped giant's multi-pass tail.
+const SMALL_MODULE_DRAIN_ENDPOINTS: usize = 512;
 
 // Private preparation ceilings. Existing state remains bounded by InventoryBudget.
 const PREPARED_INPUT_LIMIT: usize = 512;

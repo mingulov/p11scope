@@ -3397,6 +3397,67 @@ fn demotion_retirement_proven_absence_revokes_ordinary_checkpoint() {
 }
 
 #[test]
+fn demotion_retirement_fresh_summary_staging_after_accepted_scan_keeps_checkpoint() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    // A catalog scan for this caller is accepted (POST 201) before the
+    // pair's first count stages: no summary exists yet, so no completed
+    // classification can have revoked continuity. Live joint cells stage
+    // the driver's setup count exactly here; taking checkpoint 0 fences
+    // all later steady sole growth at the first Sole service.
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(scene.caller), 201);
+    assert!(ownership.register_pair(scene.caller, object));
+    let checkpoint = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(150);
+    assert_eq!(
+        checkpoint, 1,
+        "a fresh summary with no completed classification keeps the initial checkpoint"
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_eq!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        checkpoint,
+        "the returning same-carrier Sole resumes on the fresh checkpoint"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::None
+    );
+}
+
+#[test]
+fn demotion_retirement_finished_summary_old_read_cannot_borrow_current_sequence() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(ownership.register_pair(scene.caller, object));
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(scene.caller), 401);
+    let view = ownership.ordinary_view(scene.caller, object);
+    assert_eq!(
+        view.checkpoint(300),
+        0,
+        "a finished summary's old read still cannot borrow the current sequence"
+    );
+    assert_eq!(
+        view.checkpoint(500),
+        view.sequence,
+        "a read after the newest accepted POST keeps the sequence"
+    );
+    assert_ne!(view.sequence, 0);
+}
+
+#[test]
 fn demotion_retirement_round4_failed_caller_source_survives_lagging_summary() {
     let scene = round4_placed_with_known_b();
     let object = scene.native.scene.delta.endpoints[0].object.index();

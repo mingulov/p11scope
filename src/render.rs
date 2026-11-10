@@ -3203,7 +3203,7 @@ pub(crate) fn apply_snapshot_failure(
 /// Snapshot frame plus the pid-scope caller line, so profile stdout
 /// names the caller program. `None` caller renders no line.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn live_snapshot_scoped_with_caller(
+pub(crate) fn live_snapshot_scoped(
     snapshot: &crate::metrics::CaptureSnapshot,
     ev: &Evidence,
     elapsed: Duration,
@@ -5265,7 +5265,7 @@ pub(crate) mod tests {
             };
             assert_eq!(with_counter_snapshot(document.clone(), &snapshot), document);
             assert_eq!(
-                live_snapshot_scoped_with_caller(
+                live_snapshot_scoped(
                     &snapshot,
                     &ev,
                     Duration::ZERO,
@@ -5388,7 +5388,7 @@ pub(crate) mod tests {
             );
             assert_eq!(ev.gap_classes.attribution, attribution);
             assert_eq!(ev.gap_classes.semantics, semantics);
-            let frame = live_snapshot_scoped_with_caller(
+            let frame = live_snapshot_scoped(
                 &stale,
                 &ev,
                 Duration::ZERO,
@@ -9447,7 +9447,7 @@ pub(crate) mod tests {
         let snapshot = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
         let mut ev = evidence();
         ev.verdict();
-        let frame = live_snapshot_scoped_with_caller(
+        let frame = live_snapshot_scoped(
             &snapshot,
             &ev,
             Duration::ZERO,

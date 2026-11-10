@@ -9297,7 +9297,7 @@ fn capture_profile(
             render::apply_counter_snapshot(&mut ev, &snapshot);
             render::apply_legacy_gaps(&mut ev, &snapshot);
             render::apply_snapshot_failure(&mut ev, &snapshot);
-            let frame = render::live_snapshot_scoped_with_caller(
+            let frame = render::live_snapshot_scoped(
                 &snapshot,
                 &ev,
                 elapsed,
@@ -10129,7 +10129,7 @@ fn capture_profile(
         render::apply_legacy_gaps(&mut ev, &snapshot);
         render::apply_snapshot_failure(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
-        let mut frame = render::live_snapshot_scoped_with_caller(
+        let mut frame = render::live_snapshot_scoped(
             &snapshot,
             &ev,
             clock.elapsed(),

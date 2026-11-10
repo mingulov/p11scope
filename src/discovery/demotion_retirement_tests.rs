@@ -3816,6 +3816,57 @@ fn demotion_retirement_fresh_summary_after_replaced_scan_takes_no_checkpoint() {
 }
 
 #[test]
+fn demotion_retirement_equal_replacement_before_registration_keeps_fresh_bypass() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 100);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(scene.caller), 101);
+    // A new endpoint on another object bumps the attach count revision,
+    // so the second [A] scan arrives under a new membership revision. It
+    // carries the same modules and generation, so the equal branch swaps
+    // the receipt without replacing ownership evidence or counting.
+    let grown = fx::lower_named(
+        &[fx::module_with_targets(
+            &scene.pins,
+            &scene.b,
+            &[(&scene.b, 0x1000), (&scene.b, 0x2000)],
+        )],
+        &scene.pins,
+        crate::plan::AdmissionPolicy::Inventory(scene.native.scene.coordinator.attach_set.budget()),
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .attach_set
+        .absorb(&grown, &scene.pins);
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(scene.caller),
+        201,
+        "the equal scan is accepted under the new revision"
+    );
+    assert_eq!(
+        ownership
+            .supporting_scan(scene.caller)
+            .map(|scan| scan.finished_ns()),
+        Some(201),
+        "the equal branch swaps the active receipt to the new scan"
+    );
+    assert!(ownership.register_pair(scene.caller, object));
+    let view = ownership.ordinary_view(scene.caller, object);
+    assert_eq!(
+        view.checkpoint(50),
+        view.sequence,
+        "an equal pre-registration replacement keeps the fresh-summary bypass"
+    );
+    assert_ne!(view.sequence, 0);
+}
+
+#[test]
 fn demotion_retirement_finished_summary_old_read_cannot_borrow_current_sequence() {
     let scene = round4_placed_with_known_b();
     let object = scene.native.scene.delta.endpoints[0].object.index();

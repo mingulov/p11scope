@@ -990,9 +990,10 @@ fn bpf_checks_with_seccomp<T>(
 }
 
 /// The self-probe row: `(self)` because the anchor is the observer's
-/// own libc mapping, falling back to its own entry point for static
-/// linkage — never libc alone. The diagnostic session links it on
-/// multi hosts and keeps the perf single elsewhere. One constant for
+/// own libc mapping, falling back to an offset in its own text (the
+/// self-exe link) for static linkage — never libc alone. The diagnostic
+/// session links it on multi hosts and keeps the perf single elsewhere.
+/// One constant for
 /// the producer and the tier classifier, so the two cannot drift
 /// again (F-09).
 const UPROBE_ATTACH_SELF_ROW: &str = "uprobe attach (self)";
@@ -1076,7 +1077,7 @@ fn uretprobe_seccomp_check() -> Check {
     }
 }
 
-/// Resolve the anchor (own libc, else own entry point), then give the
+/// Resolve the anchor (own libc, else an offset in own text), then give the
 /// concrete link to Session.
 fn attach_self_probe(session: &mut crate::attach::Session) -> Result<(), String> {
     let (anchor_path, offset) = self_probe_anchor().map_err(|error| format!("{error:#}"))?;
@@ -1236,9 +1237,9 @@ fn libc_path_in_maps(bytes: &[u8]) -> Option<PathBuf> {
 }
 
 /// Where the self-probe attaches: the observer's own libc (dynamic builds)
-/// at `getpid`, else the observer's own entry point (static builds, which
-/// map no libc). Either site only proves attach works — the probe is dropped
-/// immediately without ever firing.
+/// at `getpid`, else an offset in its own text through the self-exe link
+/// (static builds, which map no libc). Either site only proves attach
+/// works — the probe is dropped immediately without ever firing.
 pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64)> {
     if let Ok(libc) = own_libc_path() {
         let file =
@@ -1255,7 +1256,8 @@ pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64)> {
 /// The static-build fallback behind [`self_probe_anchor`]: an executable
 /// offset in the observer's own text, since no libc is mapped. `maps` is
 /// this process's `/proc/self/maps` snapshot and `address` an address in
-/// its own executable text. The offset comes from the mappings, opening
+/// its own executable text. No path check is done: callers must not pass
+/// foreign addresses. The offset comes from the mappings, opening
 /// no file: the installed binary may be execute-only (751/711), when even
 /// `/proc/self/exe` opens EACCES without CAP_DAC_READ_SEARCH. The kernel
 /// resolves the magic link at attach time, as the pid-filter probe
@@ -3014,7 +3016,7 @@ mod tests {
             Some(PathBuf::from("/lib64/libc.so.6"))
         );
         // A statically linked observer maps no libc at all — that selects the
-        // entry-point fallback, never a failure.
+        // own-text fallback, never a failure.
         let static_maps = "555555554000-555555555000 r-xp 00000000 00:20 12 /usr/bin/tool\n\
                            7ffffffff000-7ffffffff010 r--p 00000000 00:00 0 [vdso]\n";
         assert_eq!(libc_path_in_maps(static_maps.as_bytes()), None);
@@ -3030,15 +3032,84 @@ mod tests {
         // CAP_DAC_READ_SEARCH — and /proc/self/exe opens no better, since
         // the kernel checks the underlying file. The static anchor must
         // derive its offset from its own mappings and attach through the
-        // magic link, opening no install path at all.
+        // magic link, opening no install path at all. Live miss-DAC cells
+        // cover the real EACCES; the body pin below keeps the open out of
+        // CI-green code.
         let maps = std::fs::read("/proc/self/maps").expect("own maps");
         let address = self_probe_anchor as *const () as usize as u64;
         let anchor = static_probe_anchor(&maps, address);
         assert!(
             anchor.is_ok(),
-            "an unreadable install path must not fail the anchor: {anchor:?}"
+            "static anchor must resolve through the self-exe link: {anchor:?}"
         );
-        assert_eq!(anchor.unwrap().0, PathBuf::from("/proc/self/exe"));
+        let anchor = anchor.unwrap();
+        assert_eq!(anchor.0, PathBuf::from("/proc/self/exe"));
+        let entries = p11scope_manifest::maps::parse_maps(&maps).expect("parse own maps");
+        let expected = entries
+            .into_iter()
+            .find_map(|entry| {
+                (entry.permissions[2] == b'x' && (entry.start..entry.end).contains(&address))
+                    .then(|| entry.file_offset + (address - entry.start))
+            })
+            .expect("own text mapping");
+        assert_ne!(expected, 0, "offset pin would be vacuous");
+        assert_eq!(anchor.1, expected);
+    }
+
+    #[test]
+    fn static_anchor_body_opens_no_install_path() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n}")
+                .unwrap()
+                .0
+        }
+        // The EACCES guard the unit suite can still give: the helper takes
+        // its offset from the passed mappings, so any install-path open in
+        // its body is the execute-only regression back again.
+        fn contract(text: &str) -> bool {
+            !text.contains("File::open")
+                && !text.contains("read_link")
+                && !text.contains("std::fs::open")
+        }
+        let source = include_str!("doctor.rs");
+        let text = body(source, "fn static_probe_anchor(maps: &[u8], address: u64)");
+        assert!(contract(text), "static anchor must open no path: {text}");
+        // The pin is non-vacuous: the pre-fix open fails it.
+        let mutant = format!(
+            "{text}\n    let exe = std::fs::read_link(\"/proc/self/exe\")?;\n    let _ = std::fs::File::open(&exe)?;\n"
+        );
+        assert!(
+            !contract(&mutant),
+            "pin must catch an open-reintroducing mutant"
+        );
+    }
+
+    #[test]
+    fn static_anchor_offset_comes_from_the_containing_executable_mapping() {
+        // One executable mapping at a known range/offset, a non-executable
+        // decoy, and a second executable mapping not containing the address.
+        let fixture = "00400000-00401000 r--p 00000000 00:20 12 /usr/bin/tool\n\
+                       00401000-00402000 r-xp 00001000 00:20 12 /usr/bin/tool\n\
+                       7f0000000000-7f0000001000 r-xp 00000000 00:20 11 /lib64/libc.so.6\n";
+        let address = 0x0040_1234;
+        let anchor = static_probe_anchor(fixture.as_bytes(), address).expect("containing mapping");
+        assert_eq!(anchor.0, PathBuf::from("/proc/self/exe"));
+        assert_eq!(anchor.1, 0x1000 + 0x234);
+        // No containing executable mapping: the failure twin.
+        let error = static_probe_anchor(fixture.as_bytes(), 0x0060_0000).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no executable mapping contains the self-probe anchor"),
+            "{error:?}"
+        );
+        // The non-executable decoy alone cannot anchor either.
+        let no_x = "00400000-00401000 r--p 00000000 00:20 12 /usr/bin/tool\n";
+        assert!(static_probe_anchor(no_x.as_bytes(), 0x0040_0500).is_err());
     }
 
     #[test]

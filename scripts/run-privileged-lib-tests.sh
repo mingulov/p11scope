@@ -944,6 +944,7 @@ tests/run_tree.rs:privileged_run_tree_shell_wrapper_shows_grandchild_calls
 tests/run_tree.rs:privileged_run_tree_double_fork_shows_reparented_calls
 tests/run_tree.rs:privileged_run_tree_outliving_child_is_disclosed
 tests/run_tree.rs:privileged_run_tree_many_children_land_exact
+tests/trace_pid_target.rs:privileged_trace_pid_names_target_on_stderr
 )
 
 usage() {

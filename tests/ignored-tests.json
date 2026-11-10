@@ -2133,6 +2133,12 @@
       "path": "privileged_run_tree_many_children_land_exact",
       "reason": "privileged: run-tree many-children cell (root BPF capture, runtime SoftHSM workload + token)",
       "cell": "live-kernel"
+    },
+    {
+      "file": "tests/trace_pid_target.rs",
+      "path": "privileged_trace_pid_names_target_on_stderr",
+      "reason": "privileged: loads BPF; run as root with --ignored --test-threads=1",
+      "cell": "live-kernel"
     }
   ]
 }

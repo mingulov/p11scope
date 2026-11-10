@@ -3806,9 +3806,11 @@ fn a_lossy_start_never_claims_a_watch() {
     assert!(entries(&log).contains(&"note_capture_custody".to_string()));
 }
 
-/// The native lane's uncovered reason: an edge no coverage note reached (its
-/// first projection fell in a pass whose health was unproven) reads
-/// `not_attached`, never `scan_only`.
+/// The native lane's stop re-projection: an edge whose first projection fell
+/// in a pass whose health was unproven (so no coverage note reached it then),
+/// but whose endpoints attached with proven health by stop, reads watched —
+/// never `scan_only`, and no longer `not_attached`. (Historical test name:
+/// the `not_attached` pin predates the stop re-projection.)
 #[test]
 fn an_edge_no_coverage_note_reached_reads_not_attached_in_the_native_lane() {
     let log = Log::default();
@@ -3818,10 +3820,14 @@ fn an_edge_no_coverage_note_reached_reads_not_attached_in_the_native_lane() {
     let mut lane = ScriptedLane::new(&log);
     lane.unproven_reads = 1;
     run(&mut scene, lane, 2);
-    assert_eq!(
-        scene.coverage_of(8),
-        UseCoverage::Unknown(UnknownReason::NotAttached)
-    );
+    // Controller ruling (round 3): 4e38345da replays the withheld projection
+    // with the final attach state at stop, so this fully attached edge reads
+    // watched. The stamps ride the wall clock, so pin the state structurally.
+    let UseCoverage::WatchedNoUse { since_ns, until_ns } = scene.coverage_of(8) else {
+        panic!("{:?}", scene.coverage_of(8));
+    };
+    let until = until_ns.expect("the stop freezes the watch");
+    assert!(since_ns <= until, "{since_ns} {until}");
 }
 
 /// C5.7 (ruling D8), the threading boundary: the pass's collection runs on

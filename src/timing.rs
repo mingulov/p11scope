@@ -776,6 +776,32 @@ mod tests {
     }
 
     #[test]
+    fn status_parses_the_hwm_peak() {
+        let status =
+            "Name:\tp11scope\nVmRSS:\t   12084 kB\nVmHWM:\t   906112 kB\nRssAnon:\t  3088 kB\n";
+        assert_eq!(parse_status_hwm_kb(status), Some(906112));
+        assert_eq!(parse_status_hwm_kb("Name:\tp11scope\n"), None);
+        assert_eq!(parse_status_hwm_kb(""), None);
+        assert_eq!(parse_status_hwm_kb("VmHWM:\t   xx kB\n"), None);
+    }
+
+    /// The kernel high-water mark keeps a freed peak visible: a 64 MiB
+    /// allocation, faulted and dropped, must still read back from the
+    /// peak meter even though current RSS fell again.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn peak_rss_observes_a_freed_allocation() {
+        let block = vec![0xA5u8; 64 * 1024 * 1024];
+        std::hint::black_box(&block);
+        drop(block);
+        let peak = read_peak_rss_kb().expect("peak RSS reads on Linux");
+        assert!(
+            peak >= 60 * 1024,
+            "a freed 64 MiB peak stays visible: {peak} kB"
+        );
+    }
+
+    #[test]
     fn pin_gate_sweeps_on_revision_change_or_frame_only() {
         let mut gate = PinSweepGate::new();
         // First tick always sweeps.

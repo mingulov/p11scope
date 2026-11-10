@@ -5,7 +5,9 @@
 //! never overflow a conversion. (Cgroup membership is `pub(crate)`; its
 //! hostile tests live in that module's own test section.)
 
-use p11scope::timing::{parse_io_bytes, parse_stat_cpu_ms, parse_statm_rss_kb};
+use p11scope::timing::{
+    parse_io_bytes, parse_stat_cpu_ms, parse_statm_rss_kb, parse_status_hwm_kb,
+};
 
 /// Fixed seed for the mutation loops below; recorded so a failure reproduces.
 const STAT_SEED: u64 = 0xC2E1_F00D_0000_0004;
@@ -222,4 +224,27 @@ fn io_mutations_report_only_present_counters() {
             );
         }
     }
+}
+
+#[test]
+fn hwm_requires_a_clean_counter_line() {
+    assert_eq!(
+        parse_status_hwm_kb("Name:\tp11scope\nVmHWM:\t   906112 kB\n"),
+        Some(906112)
+    );
+    assert_eq!(parse_status_hwm_kb(""), None);
+    assert_eq!(parse_status_hwm_kb("Name:\tp11scope\n"), None);
+    // A VmRSS line never answers for VmHWM.
+    assert_eq!(parse_status_hwm_kb("VmRSS:\t   12084 kB\n"), None);
+    assert_eq!(parse_status_hwm_kb("VmHWM:\t   xx kB\n"), None);
+    assert_eq!(parse_status_hwm_kb("VmHWM:\t   -5 kB\n"), None);
+    assert_eq!(parse_status_hwm_kb("VmHWM:\n"), None);
+    assert_eq!(
+        parse_status_hwm_kb("VmHWM:\t   18446744073709551616 kB\n"),
+        None
+    );
+    assert_eq!(
+        parse_status_hwm_kb("VmHWM:\t   18446744073709551615 kB\n"),
+        Some(u64::MAX)
+    );
 }

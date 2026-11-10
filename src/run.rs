@@ -23907,6 +23907,29 @@ int main(int argc, char **argv) {
         assert_eq!(ev.max_inter_drain_gap_ms, 40);
     }
 
+    /// The published maximum is the true process peak: the kernel
+    /// high-water mark wins over the sparse periodic samples, and the
+    /// periodic maximum survives only as the fallback when the peak
+    /// read failed.
+    #[test]
+    fn resource_evidence_reports_the_kernel_peak_over_the_sampled_max() {
+        let mut timeline = crate::timing::ResourceTimeline::new();
+        timeline.note(
+            crate::timing::ResourcePoint::Periodic,
+            crate::timing::ResourceSample {
+                rss_kb: Some(100),
+                ..Default::default()
+            },
+        );
+        let ev = resource_evidence_of(&timeline, Some(900));
+        assert_eq!(ev.max_rss_kb, Some(900));
+        assert_eq!(ev.samples, 1);
+        let ev = resource_evidence_of(&timeline, None);
+        assert_eq!(ev.max_rss_kb, Some(100));
+        let ev = resource_evidence_of(&crate::timing::ResourceTimeline::new(), None);
+        assert_eq!(ev.max_rss_kb, None);
+    }
+
     /// The inter-drain gap is a capture-loop quantity: drains after
     /// loop end (the undrained detach window, then the terminal drain)
     /// must not extend it — the detach window is separately counted

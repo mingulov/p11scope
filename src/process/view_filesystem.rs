@@ -1923,4 +1923,96 @@ mod tests {
         proof.validate(&mut work).unwrap();
         group.call_three();
     }
+
+    /// A live local view with only its retained root id flipped foreign: a
+    /// chroot-like gate (foreign root, shared mount namespace) without
+    /// needing root. The namespace half stays real; the flipped id is
+    /// display-only here, so the held root fd still serves real opens.
+    fn foreign_root_shared_namespace_view<'a>(
+        pin: &'a PidPin,
+        work: &mut CaptureWorkBudget,
+    ) -> ViewFilesystem<'a> {
+        let mut proof = ViewFilesystem::open(pin, work).unwrap();
+        proof
+            .cold
+            .as_mut()
+            .expect("leave_leader proves a cold view")
+            .filesystem
+            .root_id
+            .inode ^= 1;
+        proof
+    }
+
+    /// The gate lives at the call site: a real non-resolution failure in a
+    /// gated view never retries on the host — the original reason is
+    /// preserved byte-identical. `/bin/sh` would open on the host if the
+    /// gate leaked, so a preserved error proves no retry was attempted.
+    #[test]
+    fn gated_view_skips_the_host_fallback_for_non_resolution_failures() {
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let proof = foreign_root_shared_namespace_view(&pin, &mut work);
+        let failure = proof
+            .open_rooted_detailed(Path::new("/../outside"))
+            .unwrap_err();
+        assert_eq!(failure.resolution_errno, None);
+        let error = proof
+            .open_mapped_fallback(Path::new("/bin/sh"), failure.clone(), false)
+            .unwrap_err();
+        assert_eq!(error.reason, failure.reason);
+        assert!(
+            !error.reason.contains("(host-root fallback:"),
+            "a non-resolution failure must never retry: {}",
+            error.reason
+        );
+        group.call_three();
+    }
+
+    /// Twin: a real resolution failure in the same gated view retries, and
+    /// the call site retries through `open_host_regular` — an ordinary host
+    /// file opens, while a magic link is refused with ELOOP, never followed
+    /// to "not a regular file".
+    #[test]
+    fn gated_view_retries_resolution_failures_through_the_host_opener() {
+        use std::os::unix::io::AsRawFd as _;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pin = PidPin::open(group.pid()).unwrap();
+        let mut work = CaptureWorkBudget::default();
+        let proof = foreign_root_shared_namespace_view(&pin, &mut work);
+        let missing = proof
+            .open_rooted_detailed(Path::new("/definitely/not/under/any/root"))
+            .unwrap_err();
+        assert_eq!(missing.resolution_errno, Some(libc::ENOENT));
+        proof
+            .open_mapped_fallback(Path::new("/bin/sh"), missing, false)
+            .expect("a resolution failure in a gated view retries on the host");
+        let missing = proof
+            .open_rooted_detailed(Path::new("/definitely/not/under/any/root"))
+            .unwrap_err();
+        let held = std::fs::File::open("/dev/null").unwrap();
+        let magic = format!("/proc/self/fd/{}", held.as_raw_fd());
+        let error = proof
+            .open_mapped_fallback(Path::new(&magic), missing, false)
+            .unwrap_err();
+        assert!(
+            error.reason.contains("(host-root fallback:"),
+            "a resolution failure must attempt the host fallback: {}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("Too many levels of symbolic links")
+                || error.reason.contains("os error 40"),
+            "the call site must refuse magic links (ELOOP): {}",
+            error.reason
+        );
+        assert!(
+            !error.reason.contains("not a regular file"),
+            "the call site must not follow the link: {}",
+            error.reason
+        );
+        group.call_three();
+    }
 }

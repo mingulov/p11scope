@@ -2617,8 +2617,11 @@ a silent drop.
   `inventory --pid` are refused with `pid-namespace-mismatch`;
   `--cgroup`/`--system` run but read `PARTIAL` with cause `pid_namespace`
   and/or `proc_namespace_mismatch`, and `inventory --system` carries a
-  scope-level `pid namespace` gap. With no `/proc` entry for the observer
-  at all, every capture except `inventory --system` is refused instead.
+  scope-level `pid namespace` gap. Exception: `inventory --cgroup` is
+  refused for a nested observer with `pid-namespace-mismatch`; use
+  `inventory --system`, which proceeds with that scope-level gap. With no
+  `/proc` entry for the observer at all, every capture except
+  `inventory --system` is refused instead.
   Trace PIDs are initial-ns PIDs; inventory/`--pid` PIDs are the mounted
   `/proc` view; they agree only when `observer: initial` and
   `proc_pids: observer`.
@@ -2639,13 +2642,17 @@ a silent drop.
 ### `--cgroup` with no visible member reads like "no provider" (DR-K8S-5)
 
 - What the user sees: without hostPID the observer resolves the pod cgroup
-  but sees none of its processes; a capture that finds no modules refuses
-  with `pid-namespace-mismatch`, naming the container PID namespace and
-  the hostPID remedy (exit nonzero, no report). Fixed in v0.7.0 (was:
-  exit 0 with "no PKCS#11 modules discovered", not naming the cause).
-- Kernels/conditions: cgroup and system captures without PID visibility
-  that find zero modules; captures that find in-namespace providers
-  proceed with the PID-namespace warning as before.
+  but sees none of its processes; a `--cgroup` capture that finds no modules
+  and cannot prove every member visible refuses with `pid-namespace-mismatch`,
+  naming the container PID namespace and the hostPID remedy (exit nonzero, no
+  report). A `--system` capture instead starts on the idle node and keeps
+  watching: an empty run reports PARTIAL with the `pid_namespace` cause until
+  providers appear, then counts them. Fixed in v0.7.0 (was: exit 0 with "no
+  PKCS#11 modules discovered", not naming the cause; `--system` refused the
+  same way until rc-18, when idle-node start became the behavior).
+- Kernels/conditions: cgroup captures without PID visibility that find zero
+  modules and prove no membership; captures that find in-namespace providers,
+  and every `--system` capture, proceed with the PID-namespace warning as before.
 - Disclosure: the refusal names hostPID/PID visibility; troubleshooting
   doc covers it.
 - Workaround: run with hostPID.

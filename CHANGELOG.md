@@ -142,6 +142,10 @@ versioned separately and are opaque, exact dispatch keys.
 - Transient admission-deferral scan refusals settle when the endpoint
   is admitted instead of staying refused (was: up to 2 endpoints
   reported as refused at very high call rates).
+- A nested observer's `--system` capture starts on an idle node and keeps
+  watching — an empty run reports PARTIAL with the `pid_namespace` cause
+  until providers appear, then counts them — instead of refusing with
+  `pid-namespace-mismatch` when zero modules are mapped at start.
 
 ### Corrections
 

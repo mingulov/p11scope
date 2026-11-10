@@ -23513,6 +23513,33 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// An idle node at capture start is normal (pods arrive later):
+    /// a nested observer's `--system` capture with zero modules
+    /// proceeds as an ordinary empty capture — PARTIAL with the
+    /// `pid_namespace` observation cause — instead of refusing.
+    /// The forced sweeps attach providers that appear mid-run.
+    #[test]
+    fn nested_system_capture_with_zero_modules_proceeds_empty() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over an empty cgroup captures");
+        assert!(engine.plan().modules.is_empty());
+        assert!(empty_plan_is_clean(engine.plan()));
+        refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::System,
+            "a --system capture",
+            &engine,
+        )
+        .expect("an idle nested --system capture proceeds, degraded with its gap");
+    }
+
     /// An empty cgroup (no members at all, fully readable, no `0`
     /// entries) proves vacuous emptiness: nothing is hidden, so the
     /// capture proceeds and names its zero-member proof.

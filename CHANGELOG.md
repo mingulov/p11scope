@@ -6,7 +6,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.7.0] - 2026-11-09
+## [0.7.0] - 2026-11-10
 
 ### Added
 
@@ -37,6 +37,17 @@ versioned separately and are opaque, exact dispatch keys.
   `"layer": "pre_copy_up"` in JSON (`(file before copy-up)` in verbose
   text), so stale-mapping calls count on the lower edge.
   <!-- lane: copyup -->
+- Failed calls explain themselves per caller: the trace tail carries
+  a `CALLER ERROR REASONS` section naming each failing
+  caller-and-function pair with its return codes and counts, and
+  profile output explains per-function failures with CKR names.
+- `p11scope inventory cbom input.json -o out.cdx.json` converts a
+  saved inventory or profile report offline to a CycloneDX 1.6 bill
+  of materials; it reads only the published JSON and captures
+  nothing new.
+- Short-lived tracking (`--track-short-lived`) now covers trace,
+  metrics, pid and run captures, including the owned tree under
+  `run`.
 
 ### Changed
 
@@ -92,6 +103,9 @@ versioned separately and are opaque, exact dispatch keys.
   resumes and hands the live child back instead of killing it (unless
   `--kill-on-timeout` was given), exiting 1 with the cleanup error and the
   surviving PID on stderr.
+- A `run` whose `--pause always` cycle is refused keeps its report:
+  the sealed report names the refused pause instead of the run
+  failing without one.
 
 ### Fixed
 
@@ -106,6 +120,10 @@ versioned separately and are opaque, exact dispatch keys.
 - The nested-capture refusal says "no countable modules" instead of
   "found no PKCS#11 modules", and the discovery-stop hint lists stop
   reasons without repeating the subject.
+- A scoped (`--cgroup`) capture on an overlay filesystem publishes
+  the scan-found module as PARTIAL with its named gap when the
+  file-identity witness is unavailable (was: the module was refused
+  and the capture could show no countable endpoints).
 
 ### Corrections
 
@@ -135,6 +153,17 @@ The v0.7.0 limits live in
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting
   a loss. Planned for 0.7.1.
+- A long `--system` capture on a host that starts and ends many
+  processes uses growing observer memory (about 1.2 GB for an hour on
+  a busy host); bounded memory is planned for v0.8.0.
+- Above about 6,000 key operations per second, per-key rows can
+  arrive seconds late and part of a window shows as exact named
+  counts instead of per-call rows. Exact per-call rows past 6,250/s
+  wait for the 0.7.1 event reader.
+<!-- REMOVE IF catchup-noreceipt LANDS: delete the next bullet when that fix is integrated. -->
+- A high-rate capture can intermittently report one or two refused
+  endpoints that are admitted with complete data a moment later;
+  nothing is lost.
 
 ## [0.6.0] - 2026-11-06
 

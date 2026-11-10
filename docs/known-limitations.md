@@ -253,13 +253,29 @@ its later calls are counted in named `not attributed` reasons with
 a named gap, while exact per-key rows continue for the rest. Carrying
 a proved key across such a skip is future work.
 
-### Key operations above 7,500 calls/s settle late and can lose events
+### Key operations at sustained 6,000+ calls/s arrive late and can show count-only rows
 
-At 7,500 or more key operations per second, joining calls to their
-keys can lag by seconds (5-12 s seen on rc-8), and the event ring
-can then overflow. Overflowed records are counted and named as
-event loss; the affected calls are not silently dropped. Sustained
-rates above 6,250 key operations per second are future work.
+Above about 6,000 key operations per second, joining calls to their
+keys can lag by seconds (5-12 s seen at 7,500/s), and part of a
+window can be recorded as exact named counts instead of per-call
+rows: in one high-rate run about 16 s of calls showed as exact
+`rejected demoted count` ranges (271,085 + 103,921 = 375,006 calls),
+with the kernel ring losing nothing and every call collected and
+joined. If the event ring itself overflows, the overflowed records
+are counted and named as event loss; the affected calls are not
+silently dropped. Sustained rates above 6,250 key operations per
+second with exact per-call rows need the independent event reader,
+planned for 0.7.1.
+
+### High-rate captures can report refused endpoints that are admitted a moment later
+
+<!-- REMOVE IF catchup-noreceipt LANDS: delete this subsection when that fix is integrated. -->
+Intermittently, a high-rate capture can report one or two refused
+endpoints even though every endpoint is admitted with complete data
+a moment later; nothing is lost. The count comes from a startup
+ordering race — the first admission attempt can run before the
+session has learned the endpoints — and varies run to run on
+identical builds.
 
 ### `trace --system` and `profile` rate ceilings on a small VM
 
@@ -1148,6 +1164,13 @@ detail during a counter capture (`--select-endpoint`).
   pre side included), and the joint arbitration is order-independent
   within one pass only — a plain side admitted in an earlier pass
   still leaves a later pre side refused.
+- An independent event reader for sustained 10,000 key
+  operations per second with exact per-call rows (0.7.1).
+- Per-key tracking for programs started after a background caller
+  (0.7.1).
+- Narrower count-only windows at high key-operation rates (0.7.1).
+- A kernel-side witness for library loads after the main thread
+  exits (0.7.x).
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

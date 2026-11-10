@@ -4249,6 +4249,73 @@ fn terminal_trace_loss_degrades_to_a_gap_in_trace() {
     );
 }
 
+/// v070r3: a failed terminal snapshot with no last good value seals
+/// events-only (empty reports, default kernel evidence) with the failure
+/// kept for the nonzero exit, landing PARTIAL through the terminal gap;
+/// a clean read seals fresh with no error; the last-good fallback is
+/// unchanged.
+#[test]
+fn terminal_snapshot_without_last_good_seals_events_only() {
+    use p11scope_ebpf_common::CounterMode;
+    // Failure twin: no last good value, failed read.
+    let (snapshot, error) = seal_terminal_snapshot(None, Err(anyhow::anyhow!("STATS map gone")));
+    assert!(snapshot.reports().is_empty());
+    assert_eq!(
+        snapshot.kernel_evidence(),
+        crate::metrics::KernelEvidence::default()
+    );
+    let message = format!("{:#}", error.expect("the failure stays an error"));
+    assert!(message.contains("STATS map gone"), "{message}");
+    // The events-only seal still lands PARTIAL through the terminal gap.
+    let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+    let state = semantics::State::new(engine.plan());
+    let mut ev = evidence_for(
+        &engine,
+        engine.capture_facts(),
+        0,
+        false,
+        false,
+        Default::default(),
+        crate::render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+        &[],
+        snapshot.reports(),
+        snapshot.kernel_evidence(),
+        crate::process::TrackingEvidence::default(),
+        0,
+        &state,
+        false,
+        true,
+        Default::default(),
+        0,
+        None,
+        false,
+        crate::render::SchedulingEvidence::default(),
+        None,
+        None,
+        None,
+        0,
+    );
+    ev.skipped.push(crate::render::SkippedOut {
+        name: "discovery subject".into(),
+        reason: "discovery unavailable".into(),
+    });
+    ev.apply_stop_quiescence(crate::render::StopQuiescence::default());
+    ev.settle_terminal(true);
+    assert_eq!(ev.completeness, "PARTIAL");
+    assert_eq!(ev.verdict_detail, crate::render::VERDICT_CONCRETE_GAP);
+    // Healthy twin: a clean read seals fresh with no error.
+    let (snapshot, error) = seal_terminal_snapshot(None, Ok(metrics::CaptureSnapshot::empty()));
+    assert!(snapshot.reports().is_empty());
+    assert!(error.is_none());
+    // Stale twin: the last-good fallback is unchanged.
+    let mut fixture = crate::metrics::ConsumerFixture::new();
+    let last_good = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let (snapshot, error) =
+        seal_terminal_snapshot(Some(&last_good), Err(anyhow::anyhow!("STATS map gone")));
+    assert_eq!(snapshot.reports()[0].calls, 5);
+    assert!(error.is_some());
+}
+
 /// v070r2: a publication failure after the seal keeps the stored seal
 /// errors instead of dropping them: alone it passes through, beside a
 /// stored failure both layers survive.

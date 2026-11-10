@@ -745,12 +745,14 @@ fn disclose_s1_birth_deferred(
 /// Every (image, file) key holding a birth receipt in this
 /// batch whose birth is not already a healthy duplicate,
 /// deduplicated: the re-offer set for a batch-wide transient
-/// refusal. A receipt whose admission entry names a key already
-/// holding an installed non-S1Only feed is the same duplicate
-/// offer the per-key path would leave final (`AlreadySelected`):
-/// re-offering it would evict a healthy feed that never failed,
-/// so it is skipped. Keys with no matching entry, unheld keys,
-/// and S1Only-held keys still re-offer, exactly as before.
+/// refusal. A receipt whose every matched admission entry names
+/// a key already holding an installed non-S1Only feed is the
+/// same duplicate offer the per-key path would leave final
+/// (`AlreadySelected`): re-offering it would evict a healthy
+/// feed that never failed, so it is skipped. Receipts with no
+/// matching entry, unheld keys, and S1Only-held keys still
+/// re-offer, exactly as before — and so does a mixed receipt,
+/// whose fresh partitions keep their birth.
 fn birth_reoffer_keys(
     registry: &CallerRegistry,
     batch: &PreparedSemanticBatch,
@@ -760,16 +762,29 @@ fn birth_reoffer_keys(
         .iter()
         .filter(|receipt| receipt.birth_quantum().is_some())
         .filter(|receipt| {
-            !batch.entries.iter().any(|entry| {
+            // Skip only a wholly duplicated receipt: at least one
+            // admission entry must match, and every matched entry
+            // must name an installed non-S1Only feed. A mixed
+            // receipt re-offers, so its fresh partitions keep
+            // their birth; unmatched routers need no decision.
+            let mut matched = false;
+            for entry in &batch.entries {
                 let Some(Ok(input)) = entry.input.as_ref() else {
-                    return false;
+                    continue;
                 };
                 let (domain, image, router, _) = input.journal_binding();
-                domain == receipt.domain()
-                    && image == receipt.image()
-                    && receipt.instances().contains(&router)
-                    && registry.held_feed_is_not_s1only(input)
-            })
+                if domain != receipt.domain()
+                    || image != receipt.image()
+                    || !receipt.instances().contains(&router)
+                {
+                    continue;
+                }
+                if !registry.held_feed_is_not_s1only(input) {
+                    return true;
+                }
+                matched = true;
+            }
+            !matched
         })
         .map(|receipt| (receipt.image(), receipt.endpoint().file_slot))
         .collect();

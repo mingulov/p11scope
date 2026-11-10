@@ -3617,6 +3617,34 @@ fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
     assert_eq!(gaps.len(), 5, "JSON keeps every record: {document}");
 }
 
+/// Twin: marker text without the retained-root prefix is not a
+/// foreign-root failure — it passes through verbatim instead of
+/// borrowing the foreign plain words. (A real foreign reason keeps its
+/// plain words, pinned by
+/// `concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete`.)
+#[test]
+fn gap_plain_reason_keeps_unprefixed_marker_text_verbatim() {
+    for reason in [
+        "lane noted (target root /etc/avahi) mid-text",
+        "lane noted (host-root fallback: refused) mid-text",
+    ] {
+        assert_eq!(gap_plain_reason(reason), reason);
+    }
+    // Healthy halves: the real foreign forms keep their plain words.
+    assert_eq!(
+        gap_plain_reason(
+            "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)"
+        ),
+        "object unavailable in foreign target root"
+    );
+    assert_eq!(
+        gap_plain_reason(
+            "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2)) (target root /etc/avahi differs from the observer root)"
+        ),
+        "object unavailable from the process's root or the host-root fallback"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

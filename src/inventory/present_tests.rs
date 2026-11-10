@@ -5210,6 +5210,23 @@ fn gap_group_line_keeps_prose_head() {
          'p11scope doctor'"
     );
 }
+
+/// Concise gap lines cut prose subjects on a word boundary, never
+/// mid-word, so titles read whole.
+#[test]
+fn gap_group_line_cuts_prose_on_word_boundary() {
+    let line = gap_group_line(
+        1,
+        "native usage feed unavailable for this capture window",
+        "live capture refused (missing capabilities); run 'p11scope doctor'",
+    );
+    assert!(
+        line.contains("native usage feed…"),
+        "cuts on a word boundary: {line}"
+    );
+    assert!(!line.contains("unavai…"), "never cuts mid-word: {line}");
+    assert!(line.chars().count() <= 100, "over 100 chars: {line}");
+}
 /// F1: an empty inventory with replaced-file gaps names the loss:
 /// "No counted associations; N programs run files replaced on disk
 /// (below)" plus one not-counted line per program/file with restart

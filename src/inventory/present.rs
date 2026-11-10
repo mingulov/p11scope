@@ -3080,6 +3080,13 @@ fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
     if reason == "joint_birth_original_mismatch" {
         return "tracking origin mismatched";
     }
+    // A deferred birth is a counted delay (capacity), never a refusal:
+    // the re-offered birth still installs. Name the deferral ahead of
+    // the generic refusal fallback below; verbose keeps each token
+    // beside the words.
+    if reason.strip_prefix("joint_birth_deferred_").is_some() {
+        return "per-key tracking for this process was deferred (capacity)";
+    }
     if reason.strip_prefix("joint_birth_").is_some() {
         return "per-key tracking refused this process";
     }

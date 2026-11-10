@@ -15934,6 +15934,46 @@ mod tests {
         staged.terminate_and_reap().unwrap();
     }
 
+    /// Both terminal seals (profile `run_terminal` and the trace terminal)
+    /// reap an already-exited staged handoff immediately before their
+    /// `evidence_for`, so the sealed disposition and the process exit agree.
+    /// A merge that drops either hook leaves a sealed handed-back claim
+    /// for a child that already exited.
+    #[test]
+    fn both_terminal_seals_reap_an_exited_handoff_before_evidence() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let hook = "reap_exited_staged_handoff_before_seal(";
+        for (mode, start, end) in [
+            ("profile", "    fn run_terminal(", "fn write_json_report("),
+            ("trace", "fn capture_trace(", "\n/// Prints (and, if given,"),
+        ] {
+            let body = production
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{mode} terminal moved"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{mode} terminal end moved"))
+                .0;
+            let at = body
+                .find(hook)
+                .unwrap_or_else(|| panic!("{mode} terminal lost the pre-seal reap"));
+            let seal = body[at..]
+                .find("evidence_for(")
+                .unwrap_or_else(|| panic!("{mode} terminal seal after the reap moved"));
+            let between = &body[at..at + seal];
+            assert!(
+                !between.contains("fn ") && between.matches(';').count() <= 2,
+                "{mode}: the pre-seal reap must sit immediately before evidence_for"
+            );
+        }
+        assert_eq!(
+            production.matches(hook).count(),
+            3,
+            "one definition and exactly the two terminal seal call sites"
+        );
+    }
+
     /// The owned-run terminal block prints the note the settlement stored
     /// when it committed the handoff — never a reason text formatted at
     /// the terminal site, which cannot know which end handed the child

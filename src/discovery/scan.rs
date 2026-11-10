@@ -9595,6 +9595,32 @@ mod tests {
             .expect("the table after the zero run still decodes");
         assert_eq!(table.entries.len(), 1);
         assert_eq!(table.entries[0].name, "C_Initialize");
+        // The same run without anchor rescue: two valid but
+        // unexported pointers (0x1508 sits in the fixture's r-xp
+        // mapping but names no export) still decode at the exact
+        // address. Only the header visit finds them, so a skip that
+        // overshoots the header loses the table.
+        let mut snapshot = vec![0u8; (gap_words + 105) * 8];
+        let at = gap_words * 8;
+        snapshot[at..at + 8].copy_from_slice(&0x2802u64.to_le_bytes());
+        snapshot[at + 8..at + 16].copy_from_slice(&0x1508u64.to_le_bytes());
+        snapshot[at + 16..at + 24].copy_from_slice(&0x1508u64.to_le_bytes());
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "no evidence invented: {skipped:?}");
+        let table = tables
+            .iter()
+            .find(|table| table.address == 0x7000 + at as u64)
+            .expect("the unanchored table after the zero run still decodes");
+        assert_eq!(table.entries.len(), 2);
     }
 
     #[test]
@@ -11413,6 +11439,55 @@ mod tests {
         assert_eq!(interfaces[0].name_class, "unreadable");
         assert_eq!(operation_bytes, 0);
         assert_eq!(budget.attempted_io_bytes(), 0);
+    }
+
+    /// Busy-host guard twin for the interface zero-run skip: one
+    /// valid triple immediately after a multi-window zero run still
+    /// decodes exactly once, pinning the skip landing.
+    #[test]
+    fn interfaces_after_a_long_zero_run_still_decode() {
+        let maps = parse_maps(
+            b"0-1000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              1000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        };
+        let gap_words = 20_000usize;
+        let mut snapshot = vec![0u8; (gap_words + 3) * WORD];
+        snapshot[gap_words * WORD + WORD..gap_words * WORD + 2 * WORD]
+            .copy_from_slice(&0x7000u64.to_ne_bytes());
+        let mem = tempfile::tempfile().unwrap();
+        let mut operation_bytes = 0;
+        let (interfaces, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            std::slice::from_ref(&table),
+            &map_index,
+            ObjectKey::of(&maps[0]),
+            &mut CaptureWorkBudget::default(),
+            &mut operation_bytes,
+        );
+        assert!(skipped.is_empty(), "no evidence invented: {skipped:?}");
+        assert_eq!(
+            interfaces.len(),
+            1,
+            "the triple after the zero run still decodes"
+        );
+        assert_eq!(interfaces[0].table, Some(0));
+        assert_eq!(interfaces[0].name_class, "null");
+        assert_eq!(interfaces[0].flags, 0);
     }
 
     /// A hint naming a path that exists only inside the target's mount namespace has no
@@ -15838,6 +15913,7 @@ mod tests {
     struct K1RedIo {
         reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
         batch_calls: Vec<Vec<(u64, u64)>>,
+        short_batch: bool,
         held_magic: Option<u64>,
         witness: std::collections::VecDeque<K1RedVerdict>,
         prove_calls: usize,
@@ -15853,6 +15929,7 @@ mod tests {
             Self {
                 reads,
                 batch_calls: Vec::new(),
+                short_batch: false,
                 held_magic: Some(K1_RED_OVERLAY_MAGIC),
                 witness: std::collections::VecDeque::new(),
                 prove_calls: 0,
@@ -15868,6 +15945,7 @@ mod tests {
             Self {
                 reads,
                 batch_calls: Vec::new(),
+                short_batch: false,
                 held_magic: Some(K1_RED_EXT4_MAGIC),
                 witness: std::collections::VecDeque::new(),
                 prove_calls: 0,
@@ -15899,6 +15977,12 @@ mod tests {
 
         fn exhaust(&mut self) {
             self.witness_used = self.witness_max;
+        }
+
+        /// Drop the last verdict from the next batch: a faulty IO
+        /// shape the guard must refuse, never silently truncate.
+        fn truncate_batch(&mut self) {
+            self.short_batch = true;
         }
     }
 
@@ -15951,10 +16035,15 @@ mod tests {
         ) -> Result<Vec<std::io::Result<crate::discovery::identity::FileIdentity>>, String>
         {
             self.batch_calls.push(ranges.to_vec());
-            ranges
-                .iter()
-                .map(|&(start, end)| self.range_identity(view, start, end, budget))
-                .collect()
+            let mut verdicts: Vec<std::io::Result<crate::discovery::identity::FileIdentity>> =
+                ranges
+                    .iter()
+                    .map(|&(start, end)| self.range_identity(view, start, end, budget))
+                    .collect::<Result<_, _>>()?;
+            if self.short_batch {
+                verdicts.pop();
+            }
+            Ok(verdicts)
         }
 
         fn prove_original_file(
@@ -16709,6 +16798,145 @@ mod tests {
                 .map(|entry| (entry.start, entry.end))
                 .collect::<Vec<_>>(),
             "the batch carries every range in group order"
+        );
+    }
+
+    /// Comparable verdict for one range-identity read: the kernel
+    /// identity on success, errno plus kind on refusal. Unprivileged
+    /// self reads refuse; parity — not success — is the pin.
+    fn identity_verdict_key(
+        verdict: &std::io::Result<crate::discovery::identity::FileIdentity>,
+    ) -> String {
+        match verdict {
+            Ok(identity) => format!("ok:{}:{}", identity.dev, identity.ino),
+            Err(error) => format!("err:{:?}:{:?}", error.raw_os_error(), error.kind()),
+        }
+    }
+
+    /// The production batch override reads what the sequential path
+    /// reads: `ProcScanIo::range_identities` across one filesystem
+    /// proof returns the same per-range verdicts, in input order, as
+    /// one proved `range_identity` call per range. The trailing
+    /// invalid range keeps the group order-sensitive, so a dropped
+    /// or reordered range fails the comparison.
+    #[test]
+    fn production_batch_matches_sequential_range_reads() {
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        // The test's own first file-backed mappings (its executable,
+        // never unloaded mid-test) keep every range mapped for both
+        // passes over the group.
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let mut ranges: Vec<(u64, u64)> = maps
+            .iter()
+            .filter(|entry| {
+                entry
+                    .raw_path
+                    .as_deref()
+                    .is_some_and(|path| path.starts_with(b"/"))
+            })
+            .take(4)
+            .map(|entry| (entry.start, entry.end))
+            .collect();
+        assert!(
+            ranges.len() >= 2,
+            "the test process maps file-backed ranges"
+        );
+        // Invalid (start >= end): refused before any filesystem read,
+        // so its verdict differs from every mapped range on any host.
+        ranges.push((0x1000, 0x1000));
+        let mut batch = ProcScanIo::new();
+        let batched = batch
+            .range_identities(&view, &ranges, &mut CaptureWorkBudget::default())
+            .expect("one filesystem proof brackets the group");
+        assert_eq!(
+            batched.len(),
+            ranges.len(),
+            "the batch returns one verdict per range"
+        );
+        let mut sequential_io = ProcScanIo::new();
+        let sequential: Vec<std::io::Result<crate::discovery::identity::FileIdentity>> = ranges
+            .iter()
+            .map(|&(start, end)| {
+                sequential_io
+                    .range_identity(&view, start, end, &mut CaptureWorkBudget::default())
+                    .expect("each range proves on its own")
+            })
+            .collect();
+        let batched_keys: Vec<String> = batched.iter().map(identity_verdict_key).collect();
+        let sequential_keys: Vec<String> = sequential.iter().map(identity_verdict_key).collect();
+        assert_ne!(
+            batched_keys.first(),
+            batched_keys.last(),
+            "the invalid range keeps the group order-sensitive"
+        );
+        assert_eq!(
+            batched_keys, sequential_keys,
+            "the batch reads what the sequential path reads, in order"
+        );
+    }
+
+    /// A batch that returns fewer verdicts than ranges refuses the
+    /// group: the guard never silently truncates to the short batch.
+    #[test]
+    fn guard_refuses_a_short_identity_batch() {
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..3)
+            .map(|index| k1_red_entry(0x7f10_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        let mut io = K1RedIo::ext4(reads);
+        io.truncate_batch();
+        let reason = run_k1_guard(&mut io, held, &group)
+            .expect_err("a short batch refuses instead of truncating");
+        assert!(
+            reason.contains("2 verdicts for 3 ranges"),
+            "the refusal names the short batch: {reason}"
+        );
+    }
+
+    /// The sub-stage readout shares the stage gate exactly: any value
+    /// but `=1` (including `=0`) prints neither line.
+    #[test]
+    fn substage_gate_matches_the_stage_gate() {
+        struct RestoreEnv {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                // SAFETY: no other thread in this test process touches
+                // this variable (no other Rust test reads it), and the
+                // value is restored on every exit path.
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv {
+            key: "P11SCOPE_STAGE_TIMINGS",
+            previous: std::env::var_os("P11SCOPE_STAGE_TIMINGS"),
+        };
+        // SAFETY: same confinement as the `Drop` above.
+        unsafe {
+            std::env::set_var("P11SCOPE_STAGE_TIMINGS", "0");
+        }
+        assert!(
+            !crate::inspect_system::stage_timings_requested(),
+            "=0 requests no stage line"
+        );
+        assert!(
+            !crate::discovery::scan::substage::enabled(),
+            "=0 enables no sub-stage line either"
         );
     }
 

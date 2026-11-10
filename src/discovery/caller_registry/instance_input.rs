@@ -2098,6 +2098,10 @@ impl CallerRegistry {
         for grant in self.joint_grants.values_mut() {
             grant.application = None;
         }
+        // A filtered grant for an already-registered key drops its
+        // exempted original silently (neither S1Only-disposed nor
+        // Joint-consumed). Name it, like any refused late birth.
+        let mut dropped_registered: Vec<InstanceKey> = Vec::new();
         for (at, mutation) in self.staged.iter().enumerate() {
             let (key, caller, original) = match mutation {
                 Mutation::NoteInstance(input) => (&input.key, input.caller, None),
@@ -2138,7 +2142,22 @@ impl CallerRegistry {
                 },
             };
             if !valid {
+                if self.instance_state.by_key.contains_key(key) {
+                    dropped_registered.push(key.clone());
+                }
                 self.joint_grants.remove(key);
+            }
+        }
+        for (key, grant) in self.joint_grants.iter() {
+            if grant.origin.is_none() {
+                continue;
+            }
+            let keep = grant.application.as_ref().is_some_and(|application| {
+                Some(application.registration) == grant.registration
+                    && application.original == grant.origin
+            });
+            if !keep && self.instance_state.by_key.contains_key(key) {
+                dropped_registered.push(key.clone());
             }
         }
         self.joint_grants.retain(|_, grant| {
@@ -2148,6 +2167,20 @@ impl CallerRegistry {
                         && application.original == grant.origin
                 })
         });
+        for key in dropped_registered {
+            if let Some(id) = self.instance_state.by_key.get(&key).copied()
+                && let Some(record) = self.instance_state.records.get(&id)
+            {
+                self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                    caller: Some(record.caller),
+                    module: Some(record.module),
+                    pid: None,
+                    subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+                    reason: "joint_birth_original_mismatch".into(),
+                    budget: None,
+                });
+            }
+        }
     }
 
     /// Legacy reducer algorithms install their existing scripted receipt.
@@ -2795,17 +2828,20 @@ impl CallerRegistry {
         staged_position: Option<usize>,
         mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
-        let installed = self
-            .joint_grants
-            .remove(&input.key)
-            .filter(|grant| match grant.origin {
-                Some(origin) => grant.application.as_ref().is_some_and(|application| {
-                    Some(application.registration) == staged_position
-                        && grant.registration == staged_position
-                        && application.original == Some(origin)
-                }),
-                None => cfg!(test),
-            });
+        let removed = self.joint_grants.remove(&input.key);
+        let had_grant = removed.is_some();
+        let installed = removed.filter(|grant| match grant.origin {
+            Some(origin) => grant.application.as_ref().is_some_and(|application| {
+                Some(application.registration) == staged_position
+                    && grant.registration == staged_position
+                    && application.original == Some(origin)
+            }),
+            None => cfg!(test),
+        });
+        // A filtered grant for an already-registered key drops its
+        // exempted original silently. Name it at the drain below.
+        let filtered_registered =
+            had_grant && installed.is_none() && self.instance_state.by_key.contains_key(&input.key);
         let module = self.modules_by_key.get(&input.key.module).copied();
         let refuse = if matches!(input.key.module, ModuleKey::Unidentified { .. })
             || input.key.image.task_cookie == 0
@@ -2918,6 +2954,20 @@ impl CallerRegistry {
                         });
                     }
                 }
+            } else if filtered_registered
+                && self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only
+            {
+                // The grant never reached the upgrade: its staged
+                // original did not match. The exempted original was
+                // neither disposed nor consumed, so name the drop.
+                self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                    caller: Some(input.caller),
+                    module: Some(module),
+                    pid: None,
+                    subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+                    reason: "joint_birth_original_mismatch".into(),
+                    budget: None,
+                });
             }
             self.instance_state
                 .records
@@ -5635,6 +5685,190 @@ mod journal_unavailable_tests {
                     s1_call("C_Sign", RV_OK, MECHANISM),
                 )),
             "a touched registration stays an S1Only subject despite a grant"
+        );
+    }
+
+    /// Grant plus an exempted original that the drain then refuses:
+    /// the loss staged before the re-registration invalidates the
+    /// untouched instance, so the upgrade refuses with a named gap,
+    /// the exempted call still counts once via S1Only, the lane never
+    /// trips the watchdog, and a second call still progresses.
+    #[test]
+    fn late_grant_exempted_original_refused_at_drain_counts_once() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene
+            .registry
+            .note_instance_semantic_loss(InstanceSemanticLoss {
+                scope: InstanceScope::Exact(key.clone()),
+                position: Some(SemanticPosition {
+                    domain: key.domain,
+                    ordinal: 1,
+                }),
+                reason: InstanceReason::SemanticLoss,
+            });
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the late grant installs"
+        );
+        let first = AdmittedInstanceCall::scripted(
+            key.clone(),
+            scene.caller,
+            2,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            !scene.registry.admitted_feed_is_s1only(&first),
+            "the first original is exempted while the grant is held"
+        );
+        scene.registry.observe_instance_semantic(first);
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "the invalidated feed never selects Joint late"
+        );
+        scene.registry.publish();
+        assert!(
+            scene.registry.gaps().iter().any(|gap| gap.subject
+                == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                && gap.reason == "joint_birth_semantic_loss"),
+            "the refused birth names the loss: {:?}",
+            scene.registry.gaps()
+        );
+        let observations = scene.registry.joint_observations(2);
+        assert!(
+            observations
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 1),
+            "the exempted call counts exactly once: {:?}",
+            observations.unattributed
+        );
+        assert!(
+            !observations
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "watchdog_no_progress"),
+            "no watchdog trip: {:?}",
+            observations.unattributed
+        );
+        let record = scene
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained");
+        assert!(
+            !record.feed.watchdog_tripped(),
+            "the lane keeps progressing"
+        );
+        scene
+            .registry
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key.clone(),
+                scene.caller,
+                3,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            ));
+        scene.registry.publish();
+        let later = scene.registry.joint_observations(3);
+        assert!(
+            later
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 2),
+            "a second call still progresses: {:?}",
+            later.unattributed
+        );
+    }
+
+    /// A filtered late grant for an already-registered key must name a
+    /// gap: the exempted original was neither disposed as S1Only nor
+    /// consumed by a Joint feed, so silence would drop the birth.
+    /// The call still counts once and the lane never trips.
+    #[test]
+    fn filtered_late_grant_for_registered_key_names_gap_and_counts_once() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the late grant installs"
+        );
+        {
+            let grant = scene
+                .registry
+                .joint_grants
+                .get_mut(&key)
+                .expect("grant installed");
+            grant.origin = Some(CollectedCallOrigin::scripted(999));
+            grant.registration = Some(0);
+        }
+        let first = AdmittedInstanceCall::scripted(
+            key.clone(),
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            !scene.registry.admitted_feed_is_s1only(&first),
+            "the first original is exempted while the grant is held"
+        );
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "a filtered grant never selects Joint"
+        );
+        scene.registry.publish();
+        assert!(
+            scene.registry.gaps().iter().any(|gap| gap.subject
+                == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                && gap.reason == "joint_birth_original_mismatch"),
+            "the filtered birth is named: {:?}",
+            scene.registry.gaps()
+        );
+        let observations = scene.registry.joint_observations(2);
+        assert!(
+            observations
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 1),
+            "the exempted call counts exactly once: {:?}",
+            observations.unattributed
+        );
+        assert!(
+            !observations
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "watchdog_no_progress"),
+            "no watchdog trip: {:?}",
+            observations.unattributed
+        );
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        let later = scene.registry.joint_observations(3);
+        assert!(
+            later
+                .unattributed
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 2),
+            "a second call still progresses: {:?}",
+            later.unattributed
         );
     }
 

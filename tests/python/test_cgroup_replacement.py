@@ -121,6 +121,17 @@ class ReplacementOracleTests(unittest.TestCase):
         self.assertTrue(result["pass"], result["errors"])
         self.assertEqual((result["calls"], result["named"], result["unknown"]), (6, 6, 0))
 
+    def test_observer_argv_carries_verbose_for_evidence_parity(self):
+        argv = synthetic_inputs()[3]["observer_argv"]
+        self.assertEqual(len(argv), 13)
+        self.assertEqual(argv[-1], "-v")
+
+    def test_observer_argv_without_verbose_is_rejected(self):
+        receipt = synthetic_inputs()[3]
+        receipt["observer_argv"] = [arg for arg in receipt["observer_argv"] if arg != "-v"]
+        result = self.evaluate(receipt=receipt)
+        self.assertFalse(result["pass"], result["errors"])
+
     def test_initial_public_proof_is_required_and_independent_of_named_measurement(self):
         receipt = synthetic_inputs()[3]
         del receipt["initial_ready"]

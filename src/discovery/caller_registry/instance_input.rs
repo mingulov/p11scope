@@ -5701,6 +5701,176 @@ mod journal_unavailable_tests {
             "a tripped row still refuses Capacity"
         );
     }
+
+    /// First-quantum wall: the genuine caller's module and edge
+    /// exist only as a staged `NoteMapping` ahead of its staged
+    /// registration (the census stages both; the drain applies
+    /// the mapping first). The fits priority must see that staged
+    /// mapping, or the genuine row sorts with the unbound churn
+    /// by registration order and a full staging window refuses
+    /// its birth on an otherwise idle registry.
+    #[test]
+    fn genuine_birth_with_only_staged_mapping_still_fits() {
+        use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+        let mut scene = UnlinkedScene::new();
+        scene.registry.reference_instance_limit(8);
+        for i in 0..8u64 {
+            let junk = InstanceKey::scripted(
+                scene.domain,
+                ImageIdentity {
+                    task_cookie: 777,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(1000 + i),
+                scene.module.clone(),
+            );
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(junk, CallerId(99)));
+        }
+        let genuine_caller = CallerId(8);
+        let genuine_module = ModuleKey::Physical {
+            dev_major: 9,
+            dev_minor: 9,
+            ino: 99,
+            sha256: None,
+        };
+        scene.registry.note_mapping(
+            genuine_caller,
+            4242,
+            ModuleInfo {
+                path: "/genuine/driver.so".into(),
+                key: genuine_module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: None,
+                admission: AdmissionState::Admitted,
+                admission_class: None,
+                admission_endpoints: None,
+                admission_reasons: Vec::new(),
+            },
+            1,
+        );
+        let genuine = InstanceKey::scripted(
+            scene.domain,
+            ImageIdentity {
+                task_cookie: 999,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(99999),
+            genuine_module,
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(genuine.clone(), genuine_caller));
+        let input = AdmittedInstanceCall::scripted(
+            genuine,
+            genuine_caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        let fit = plan.position(&input, &window);
+        assert!(
+            fit.is_ok(),
+            "genuine birth behind churn with a staged mapping must fit, got {fit:?}"
+        );
+        drop(plan);
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.instance_state.records.len(),
+            1,
+            "the drain mints only the genuine row"
+        );
+    }
+
+    /// Ordering control for the staged-mapping priority: a
+    /// mapping staged AFTER the genuine registration applies
+    /// after it at the drain, so the row still cannot mint and
+    /// keeps no priority.
+    #[test]
+    fn mapping_staged_after_registration_grants_no_priority() {
+        use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+        let mut scene = UnlinkedScene::new();
+        scene.registry.reference_instance_limit(8);
+        for i in 0..8u64 {
+            let junk = InstanceKey::scripted(
+                scene.domain,
+                ImageIdentity {
+                    task_cookie: 777,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(1000 + i),
+                scene.module.clone(),
+            );
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(junk, CallerId(99)));
+        }
+        let genuine_caller = CallerId(8);
+        let genuine_module = ModuleKey::Physical {
+            dev_major: 9,
+            dev_minor: 9,
+            ino: 99,
+            sha256: None,
+        };
+        let genuine = InstanceKey::scripted(
+            scene.domain,
+            ImageIdentity {
+                task_cookie: 999,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(99999),
+            genuine_module.clone(),
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(genuine.clone(), genuine_caller));
+        scene.registry.note_mapping(
+            genuine_caller,
+            4242,
+            ModuleInfo {
+                path: "/genuine/driver.so".into(),
+                key: genuine_module,
+                double_loaded: false,
+                build_id: None,
+                identity_source: None,
+                admission: AdmissionState::Admitted,
+                admission_class: None,
+                admission_endpoints: None,
+                admission_reasons: Vec::new(),
+            },
+            1,
+        );
+        let input = AdmittedInstanceCall::scripted(
+            genuine,
+            genuine_caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            matches!(
+                plan.position(&input, &window),
+                Err(JointReceiptInstallRefusal::Capacity)
+            ),
+            "a late mapping cannot mint the earlier registration at the drain"
+        );
+    }
 }
 
 #[cfg(test)]

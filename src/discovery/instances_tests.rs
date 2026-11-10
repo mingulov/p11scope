@@ -752,6 +752,69 @@ mod full_image {
             "the re-sighted key offers fresh"
         );
     }
+
+    /// A transiently refused birth is re-offered by evicting the
+    /// key's observation: the minted mark clears, the eviction
+    /// loss names the old instance, and the next scan mints a
+    /// fresh instance that can carry a new birth. The re-offer
+    /// budget is bounded per key; once spent, the key keeps its
+    /// observation and minted mark (the refusal stays final).
+    #[test]
+    fn birth_reoffer_evicts_and_remints_within_budget() {
+        let mut r = router();
+        assert_eq!(
+            r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+            ObserveOutcome::New
+        );
+        let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+        r.mark_admitted(image(COOKIE, 0), FILE);
+        assert_eq!(
+            r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+            ObserveOutcome::AdmittedFirst
+        );
+        r.note_minted(image(COOKIE, 0), FILE);
+        assert_eq!(r.admitted_mint_counts().1, 1);
+        // Unknown keys are never re-offered.
+        assert!(!r.evict_for_birth_reoffer(image(0x99, 0), FILE));
+        assert!(r.evict_for_birth_reoffer(image(COOKIE, 0), FILE));
+        assert_eq!(
+            r.admitted_mint_counts().1,
+            0,
+            "the re-offer clears the minted mark"
+        );
+        let losses = r.take_observation_losses();
+        assert_eq!(losses.len(), 1, "the eviction loss is disclosed");
+        assert_eq!(losses[0].ids, vec![first]);
+        assert_eq!(
+            r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+            ObserveOutcome::New,
+            "the next scan re-mints after the re-offer eviction"
+        );
+        let second = joined(r.route(call(2, stamp(2, 0, 0), ip_in(BASE_A))));
+        assert_ne!(first, second, "the re-offered key gets a fresh instance");
+        // The budget is bounded: further re-offers eventually
+        // refuse and then leave the observation untouched.
+        let mut evictions = 1;
+        while r.evict_for_birth_reoffer(image(COOKIE, 0), FILE) {
+            evictions += 1;
+            assert!(evictions <= 8, "the re-offer budget must be small");
+            assert_eq!(
+                r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+                ObserveOutcome::New
+            );
+        }
+        let kept = joined(r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A))));
+        assert_eq!(
+            r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
+            ObserveOutcome::Continued,
+            "an exhausted budget evicts nothing"
+        );
+        assert_eq!(
+            joined(r.route(call(4, stamp(2, 0, 0), ip_in(BASE_A)))),
+            kept,
+            "the retained instance survives budget exhaustion"
+        );
+    }
 }
 
 #[test]

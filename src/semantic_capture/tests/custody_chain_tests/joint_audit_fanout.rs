@@ -12688,6 +12688,66 @@ fn joint_birth_full_registration_table_discloses_retained_s1() {
     fixture.finish_bounded_batch(frame, false);
 }
 
+/// A birth refused only for transient registration capacity is
+/// deferred, not final: the disposition names the key for a
+/// bounded re-offer, the staged gap reads as a delay under the
+/// deferred subject, and no permanent refusal is recorded. When
+/// the re-offer budget is spent, the exhausted disclosure lands
+/// the original refusal exactly once under the retained-S1
+/// subject.
+#[test]
+fn joint_birth_transient_capacity_defers_for_reoffer() {
+    use crate::inventory_semantics::RetainedJointBirths;
+    let (mut scene, ingested, _attached, _) = prepared_birth_originals(1, false, false);
+    scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .reference_instance_limit(0);
+    let mut births = RetainedJointBirths::new();
+    let result = scene
+        .real
+        .scene
+        .coordinator
+        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
+            panic!("a capacity-refused registration refuses before New")
+        })
+        .unwrap();
+    assert_eq!(result.installed, 0);
+    assert_eq!(
+        result.reoffers.len(),
+        1,
+        "the transiently refused birth is named for re-offer"
+    );
+    let reoffer = &result.reoffers[0];
+    assert_eq!(reoffer.image.task_cookie, 71);
+    assert_eq!(reoffer.file, 0);
+    let coordinator = &mut scene.real.scene.coordinator;
+    assert!(
+        staged_birth_refusals(coordinator).is_empty(),
+        "no permanent refusal is recorded for a deferred birth"
+    );
+    let deferred: Vec<String> = coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "Joint birth deferred; retained S1 until re-offer")
+        .map(|(_, reason)| reason)
+        .collect();
+    assert_eq!(
+        deferred,
+        ["joint_birth_deferred_registration_Capacity"],
+        "the delay is a counted, named gap"
+    );
+    coordinator.disclose_birth_reoffer_exhausted(reoffer);
+    assert_eq!(
+        staged_birth_refusals(coordinator),
+        ["joint_birth_registration_Capacity"],
+        "budget exhaustion lands the original refusal exactly once"
+    );
+}
+
 #[test]
 fn joint_birth_queued_registrations_preserve_actual_first_slot() {
     use crate::inventory_semantics::RetainedJointBirths;

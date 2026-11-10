@@ -194,6 +194,11 @@ struct CallerObservation {
     epoch: Option<u64>,
     last_authority_failure: u64,
     newest_accepted_post: u64,
+    /// Authoritative active observations since replaced by a different
+    /// accepted observation. A summary registered afterwards never
+    /// classified the replaced scans, so it cannot trust that the
+    /// currently active scan speaks for the whole growth window.
+    accepted_replacements: u64,
     /// Existing summaries that consumed the active observation before it can
     /// be replaced. This cursor advances only through completed results.
     classified_after: Option<u32>,
@@ -449,7 +454,10 @@ impl OrdinaryView<'_> {
         // result can be contradicted and every later invalidation still
         // revokes through the sequence: the accepted-scan POST guard
         // below exists for finished summaries, whose old reads must not
-        // borrow the current sequence retroactively.
+        // borrow the current sequence retroactively. `initial_fresh` is
+        // set only when no authoritative scan was ever replaced for this
+        // caller, so the scan this summary will classify first is the
+        // only accepted scan its growth window can contain.
         if self.startup
             || self.initial_fresh
             || self.origin_after.is_some_and(|post| original_pre > post)
@@ -544,6 +552,7 @@ impl CountOwnership {
             epoch: Some(0),
             last_authority_failure: 0,
             newest_accepted_post: 0,
+            accepted_replacements: 0,
             classified_after: None,
             active: None,
             processing: None,
@@ -794,13 +803,20 @@ impl CountOwnership {
         // result, a failure, a carrier change) still revokes continuity
         // through the sequence. Without this, every pair whose first count
         // stages after catalog observations exist takes checkpoint 0 and can
-        // never count ordinarily, so steady sole growth is fenced.
+        // never count ordinarily, so steady sole growth is fenced. The
+        // bypass covers only the caller's own initial accepted scan: once
+        // an authoritative scan has been replaced, a summary registered
+        // afterwards never classified the replaced scan, which may have
+        // proven a transient Shared or absence inside the growth window,
+        // so such pairs keep the accepted-scan POST guard below and fence.
         let initial_fresh = summary.ordinary_sequence == 1
             && summary.result_caller_epoch.is_none()
             && !summary.finished;
         if initial_fresh
             && self.pass.is_some()
-            && slot.is_some_and(|slot| slot.live && slot.last_authority_failure == 0)
+            && slot.is_some_and(|slot| {
+                slot.live && slot.last_authority_failure == 0 && slot.accepted_replacements == 0
+            })
             && index.is_none_or(|index| {
                 !index.refused && !index.unknown && index.last_authority_failure == 0
             })
@@ -1116,7 +1132,17 @@ impl CountOwnership {
                     Ordering::Relaxed,
                 );
                 observation.cursor = 0;
-                slot.active.replace(observation)
+                let replaced = slot.active.replace(observation);
+                if replaced
+                    .as_ref()
+                    .is_some_and(|replaced| replaced.authoritative)
+                {
+                    // The equal branch above keeps the same modules and
+                    // generation, so it replaces no ownership evidence
+                    // and does not count here.
+                    slot.accepted_replacements = slot.accepted_replacements.saturating_add(1);
+                }
+                replaced
             };
             slot.valid = slot.live
                 && slot.epoch.is_some()

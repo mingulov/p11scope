@@ -5472,3 +5472,222 @@ fn replaced_notices_name_unknown_program_and_retained_pid() {
         "the caller without a pid keeps its retained pid: {out}"
     );
 }
+
+/// v0.7.0 demo: the per-pass kernel-thread absence notes (rc-11 showed
+/// five lines for 108/109/121/122/123) fold into one concise line that
+/// carries the summed examination total, never a max. The header still
+/// counts every retained row; verbose keeps every row; JSON keeps every
+/// record.
+#[test]
+fn concise_gap_summary_folds_kernel_thread_notes_with_summed_total() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for absences in [108u64, 109, 121, 122, 123] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "kernel threads".into(),
+            reason: format!(
+                "{absences} processes examined are kernel threads with no user memory to scan"
+            ),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "short-lived processes never scanned".into(),
+        reason: "179 short-lived process(es) started and exited before a completed pass".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains(
+            "  5 × kernel threads — 583 processes examined are kernel threads with no user memory to scan"
+        ),
+        "one folded line carries the summed total:\n{concise}"
+    );
+    for count in [108u64, 109, 121, 122, 123] {
+        assert!(
+            !concise.contains(&format!("{count} processes examined")),
+            "pass count {count} folds away:\n{concise}"
+        );
+    }
+    assert!(
+        concise.lines().any(|line| line == "gaps: 6"),
+        "the header still counts every retained row:\n{concise}"
+    );
+    assert!(
+        concise.contains("short-lived processes never scanned"),
+        "other subjects keep their own lines:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for count in [108u64, 109, 121, 122, 123] {
+        assert!(
+            verbose.contains(&format!("{count} processes examined")),
+            "verbose keeps the pass row {count}:\n{verbose}"
+        );
+    }
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = document["gaps"].as_array().expect("JSON keeps a gaps array");
+    assert_eq!(gaps.len(), 6, "JSON keeps every record: {document}");
+}
+
+/// The kernel-thread fold multiplies by `repeats` (an identical row
+/// recorded twice examined twice its count) and folds the singular
+/// producer template with the plural one.
+#[test]
+fn concise_kernel_thread_fold_sums_repeats_and_singular_template() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "kernel threads".into(),
+        reason: "108 processes examined are kernel threads with no user memory to scan".into(),
+        budget: None,
+        repeats: 2,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "kernel threads".into(),
+        reason: "1 process examined is a kernel thread with no user memory to scan".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains(
+            "  2 × kernel threads — 217 processes examined are kernel threads with no user memory to scan"
+        ),
+        "two rows fold with repeats multiplied (108x2 + 1):\n{concise}"
+    );
+}
+
+/// The kernel-thread fold is narrow: an unparsable kernel-thread
+/// reason, an attributed kernel-thread row, and same-shaped numeric
+/// reasons under any other subject all keep their own lines.
+#[test]
+fn concise_kernel_thread_fold_keeps_other_reasons_separate() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "kernel threads".into(),
+        reason: "kthreads seen: many".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(4321),
+        subject: "kernel threads".into(),
+        reason: "7 processes examined are kernel threads with no user memory to scan".into(),
+        budget: None,
+        repeats: 1,
+    });
+    for count in [3u64, 5] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "widget scans".into(),
+            reason: format!("{count} widgets scanned this pass"),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("kthreads seen: many"),
+        "an unparsable kernel-thread reason keeps its line:\n{concise}"
+    );
+    assert!(
+        concise.contains("7 processes examined are kernel threads"),
+        "an attributed kernel-thread row keeps its line:\n{concise}"
+    );
+    for count in [3u64, 5] {
+        assert!(
+            concise.contains(&format!("{count} widgets scanned this pass")),
+            "other numeric subjects never fold ({count}):\n{concise}"
+        );
+    }
+    assert!(
+        !concise.contains("8 widgets scanned"),
+        "no summed line for other subjects:\n{concise}"
+    );
+}
+
+/// v0.7.0 demo: the concise key-operations line already states that
+/// per-key tracking is off, so the concise gaps block shows it once —
+/// on that line, never again as a gap. The seal/fallback gaps still
+/// show; verbose and JSON keep the journal row.
+#[test]
+fn concise_gap_summary_shows_per_key_off_once() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.object_observations =
+        crate::key_operation_projection::ObjectObservations::unavailable(7, "journal_unavailable");
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "per-key tracking is off; this capture keeps S1 mechanisms and API results".into(),
+        reason: "joint_journal_unavailable".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_seal_h3_loss_history_loss".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("key operations: not reported (per-key tracking is off)"),
+        "the key-operations line states it:\n{concise}"
+    );
+    assert_eq!(
+        concise.matches("per-key tracking is off").count(),
+        1,
+        "concise states it exactly once:\n{concise}"
+    );
+    assert!(
+        concise.contains("per-key tracking ended early"),
+        "the seal gap still shows:\n{concise}"
+    );
+    assert!(
+        concise.lines().any(|line| line == "gaps: 2"),
+        "the header still counts every retained row:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("per-key tracking is off in this run"),
+        "verbose keeps the journal row:\n{verbose}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = document["gaps"].as_array().expect("JSON keeps a gaps array");
+    assert_eq!(gaps.len(), 2, "JSON keeps every record: {document}");
+}

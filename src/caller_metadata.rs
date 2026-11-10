@@ -681,7 +681,19 @@ pub(crate) fn workload_label_for_cgroup_path(path: &str) -> String {
     // The exact docker/Kubernetes grammars, over the relative path as
     // the `0::/` membership line the label resolver walked.
     let membership = parse_cgroup_membership(format!("0::/{path}\n").as_bytes());
+    // Podman/libpod grammar, local to workload labels: the shared
+    // membership parser leaves libpod unrecognized.
+    let libpod = parse_libpod_container_id(path);
     if membership.status == ParseStatus::Recognized {
+        // Mixed-runtime nesting (a docker scope around a libpod scope,
+        // or the reverse): the innermost container wins by path
+        // position, whichever grammar recognized it.
+        if let (Some((libpod_id, libpod_at)), Some(shared)) = (libpod, membership.container)
+            && shared_container_index(path, shared.id)
+                .is_some_and(|shared_at| libpod_at > shared_at)
+        {
+            return format!("container {} (podman)", libpod_id.as_str());
+        }
         if let (Some(pod), Some(container)) = (membership.pod, membership.container) {
             return format!(
                 "pod {} / container {}",
@@ -697,9 +709,7 @@ pub(crate) fn workload_label_for_cgroup_path(path: &str) -> String {
             );
         }
     }
-    // Podman/libpod grammar, local to workload labels: the shared
-    // membership parser leaves libpod unrecognized.
-    if let Some(id) = parse_libpod_container_id(path) {
+    if let Some((id, _)) = libpod {
         return format!("container {} (podman)", id.as_str());
     }
     // systemd unit fallback: the first unit past leading slices, the
@@ -714,18 +724,34 @@ pub(crate) fn workload_label_for_cgroup_path(path: &str) -> String {
 /// `libpod-<64hex>.scope` unit (systemd driver, with any trailing
 /// sub-cgroup such as `/container`) or a bare `libpod-<64hex>`
 /// component (cgroupfs driver), anywhere in the path. The innermost
-/// match wins, mirroring the membership parser's container rule.
-/// Local to workload labels; the shared membership parser leaves
-/// libpod unrecognized.
-fn parse_libpod_container_id(path: &str) -> Option<ContainerId> {
+/// match wins, mirroring the membership parser's container rule,
+/// with its `/`-separated component index for mixed-runtime nesting
+/// comparison. Local to workload labels; the shared membership parser
+/// leaves libpod unrecognized.
+fn parse_libpod_container_id(path: &str) -> Option<(ContainerId, usize)> {
     let mut found = None;
-    for component in path.split('/') {
+    for (index, component) in path.split('/').enumerate() {
         let Some(rest) = component.strip_prefix("libpod-") else {
             continue;
         };
         let id_bytes = rest.strip_suffix(".scope").unwrap_or(rest);
         if let Some(id) = parse_container_id(id_bytes.as_bytes()) {
-            found = Some(id);
+            found = Some((id, index));
+        }
+    }
+    found
+}
+
+/// Component index of the shared parser's chosen container: the last
+/// component containing its canonical id (hex case-insensitive).
+/// `None` when the id names no component, in which case the existing
+/// shared-first precedence holds.
+fn shared_container_index(path: &str, id: ContainerId) -> Option<usize> {
+    let needle = id.as_str();
+    let mut found = None;
+    for (index, component) in path.split('/').enumerate() {
+        if component.len() >= needle.len() && component.to_ascii_lowercase().contains(needle) {
+            found = Some(index);
         }
     }
     found

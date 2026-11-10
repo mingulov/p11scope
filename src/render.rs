@@ -5082,9 +5082,10 @@ struct CgroupOut {
     /// Every event observed with this `cgroup_id`, regardless of kind.
     calls: u64,
     errors: u64,
-    /// Calls counted for events whose process missed admission (zero
-    /// identity cookie, full history registry, closed generation): a
-    /// subset of `calls` above, grouped per pod/unit in `-v` text.
+    /// Calls counted for events whose process missed admission (including
+    /// a zero identity cookie, a zero pid, a stale exec generation, a full
+    /// history registry, or a closed generation): a subset of `calls`
+    /// above, grouped per pod/unit in `-v` text.
     unadmitted: u64,
     /// The subset of `calls` a mechanism could be attributed to.
     mechanisms: Vec<CgroupMechOut>,
@@ -5142,7 +5143,19 @@ fn cgroups_out_with_live_root(
 /// Renders from the same rows the JSON report carries, so text and
 /// JSON cannot drift.
 pub(crate) fn cgroup_verbose_section(state: &crate::semantics::State, ev: &Evidence) -> String {
-    let rows = cgroups_out(state);
+    cgroup_verbose_section_with_live_root(state, ev, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+/// [`cgroup_verbose_section`] against an explicit live root: the test
+/// seam. Fixture cgroups resolve without touching the host's
+/// `/sys/fs/cgroup`, so a fixture inode can never collide with a live
+/// host cgroup id.
+fn cgroup_verbose_section_with_live_root(
+    state: &crate::semantics::State,
+    ev: &Evidence,
+    live_root: &std::path::Path,
+) -> String {
+    let rows = cgroups_out_with_live_root(state, live_root);
     if rows.is_empty() {
         return String::new();
     }
@@ -15420,7 +15433,7 @@ pub(crate) mod tests {
         let mut ev = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
         ev.cgroup_id = cgroup;
         state.observe(&ev);
-        let text = cgroup_verbose_section(&state, &evidence());
+        let text = cgroup_verbose_section_with_live_root(&state, &evidence(), root.path());
         assert!(
             text.contains(&format!("pod {uid} / container {id}")),
             "{text}"
@@ -15432,7 +15445,9 @@ pub(crate) mod tests {
     fn cgroup_verbose_section_marks_unknown_paths_and_unadmitted() {
         // Unknown cgroups degrade to their numeric id, never vanish;
         // unadmitted calls show per row; kernel-dropped completions
-        // are named as unattributable, never grouped.
+        // are named as unattributable, never grouped. The empty
+        // fixture root keeps the id unknown without touching the
+        // host, where that inode might name a live cgroup.
         let mut state =
             crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
         let mut missed = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
@@ -15441,7 +15456,8 @@ pub(crate) mod tests {
         state.reject_unadmitted(&missed);
         let mut ev = evidence();
         ev.semantic_capture_failures = 862455;
-        let text = cgroup_verbose_section(&state, &ev);
+        let root = tempfile::tempdir().unwrap();
+        let text = cgroup_verbose_section_with_live_root(&state, &ev, root.path());
         assert!(text.contains("cgroup 555121"), "{text}");
         assert!(text.contains("unadmitted"), "{text}");
         assert!(text.contains("862455"), "{text}");

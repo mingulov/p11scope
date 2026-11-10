@@ -2223,9 +2223,10 @@ pub struct CgroupStat {
     /// mechanism).
     pub mechanisms: BTreeMap<u64, MechCallStat>,
     /// Calls counted for events whose process missed admission
-    /// ([`State::reject_unadmitted`]): a zero identity cookie, a full
-    /// history registry, or a closed generation. A subset of `calls`
-    /// above; the per-pod missed grouping renders from this.
+    /// ([`State::reject_unadmitted`]), including a zero identity cookie,
+    /// a zero pid, a stale exec generation, a full history registry, or
+    /// a closed generation. A subset of `calls` above; the per-pod missed
+    /// grouping renders from this.
     pub unadmitted: u64,
 }
 
@@ -2609,11 +2610,12 @@ pub struct State {
     /// historical behavior: no paths retained, report-time
     /// resolution only.
     cgroup_label_root: Option<std::path::PathBuf>,
-    /// Raw relative path retained at each cgroup id's first sighting,
-    /// while its processes are alive. Bounded by the cgroup count,
-    /// which shares the state key budget. Report-time resolution
-    /// prefers the live path; this is the fallback for cgroups that
-    /// were removed before the report (exited pods under churn).
+    /// Raw relative path retained at each cgroup id's first sighting
+    /// within the current row lifetime, while its processes are alive.
+    /// Bounded by the cgroup count, which shares the state key budget.
+    /// Report-time resolution prefers the live path; this is the fallback
+    /// for cgroups that were removed before the report (exited pods under
+    /// churn). A purge retires these with the rows.
     cgroup_retained_paths: BTreeMap<u64, String>,
     orphan_ops: u64,
     unmatched_closes: u64,
@@ -2811,6 +2813,10 @@ impl State {
         self.templates.clear();
         self.logins.clear();
         self.cgroups.clear();
+        // Retained sightings name rows: a purge retires them with the
+        // rows, so a fresh row re-resolves instead of inheriting a
+        // purged path.
+        self.cgroup_retained_paths.clear();
         self.sessions = SessionStats::default();
         self.orphan_ops = 0;
         self.unmatched_closes = 0;
@@ -2943,9 +2949,10 @@ impl State {
     }
 
     /// Count-only CALL evidence for an event whose process missed
-    /// admission (a zero identity cookie, a full history registry, or
-    /// a closed generation): like [`State::reject_history`], plus the
-    /// row's `unadmitted` mark for the per-pod missed grouping.
+    /// admission (including a zero identity cookie, a zero pid, a stale
+    /// exec generation, a full history registry, or a closed generation):
+    /// like [`State::reject_history`], plus the row's `unadmitted` mark
+    /// for the per-pod missed grouping.
     /// Foreign-domain rejections keep using [`State::reject_history`];
     /// they are not admission misses.
     pub(crate) fn reject_unadmitted(&mut self, ev: &Event) {
@@ -2959,11 +2966,12 @@ impl State {
         }
     }
 
-    /// Retain `cgroup_id`'s current path at first sighting, while its
-    /// processes are alive. Best effort: without a label root nothing
-    /// is retained; an unresolvable id retains nothing; an already
-    /// retained id keeps its first path (first sighting wins, and
-    /// report time prefers the live path anyway).
+    /// Retain `cgroup_id`'s current path at first sighting within the
+    /// current row lifetime, while its processes are alive. Best effort:
+    /// without a label root nothing is retained; an unresolvable id
+    /// retains nothing; an already retained id keeps its first path
+    /// (first sighting wins, and report time prefers the live path
+    /// anyway). Purges clear these with the rows.
     fn note_cgroup_sighting(&mut self, cgroup_id: u64) {
         if self.cgroup_retained_paths.contains_key(&cgroup_id) {
             return;

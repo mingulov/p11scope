@@ -464,6 +464,54 @@ pub fn nested_warning(numbering: &PidNumbering) -> Option<String> {
     })
 }
 
+/// Numeric PIDs the procfs mounted at `proc_root` shows: every
+/// all-digit directory name that parses as a `u32`. `None` when the
+/// directory cannot be listed exactly (unreadable, or an entry fails):
+/// a partial count must never back a claim about what is visible.
+/// Names only — no status, cmdline or environ is read.
+pub fn visible_pids_at(proc_root: &std::path::Path) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir(proc_root).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) || text.is_empty() {
+            continue;
+        }
+        let Ok(pid) = text.parse::<u32>() else {
+            continue;
+        };
+        pids.push(pid);
+    }
+    Some(pids)
+}
+
+/// `docker run` without `--pid=host`: a nested observer whose own
+/// `/proc` shows nothing beyond init and itself sees only its own
+/// container — the host's processes are invisible, so a `--system`
+/// capture silently covers the container alone. Anything else is
+/// silent: an initial observer sees the host; a kind node shows other
+/// processes (its guidance is hostPID-on-a-real-node, not this line);
+/// a foreign `/proc` shows another namespace, not this container; an
+/// unreadable namespace cannot prove host invisibility (DR-K8S-5).
+/// `visible` is [`visible_pids_at`] output, `own_pid` this process.
+pub fn container_only_warning(
+    numbering: &PidNumbering,
+    visible: &[u32],
+    own_pid: u32,
+) -> Option<String> {
+    let _ = (numbering, visible, own_pid);
+    None
+}
+
+/// The live [`container_only_warning`]: this observer's numbering and
+/// the PIDs its mounted `/proc` shows right now. Silent whenever the
+/// view cannot be listed exactly.
+pub fn container_only_warning_live(numbering: &PidNumbering) -> Option<String> {
+    let visible = visible_pids_at(std::path::Path::new("/proc"))?;
+    container_only_warning(numbering, &visible, std::process::id())
+}
+
 /// The scope-level gap a document without an `exact` flag (inventory)
 /// carries when `/proc` PIDs are not the kernel's: subject and reason.
 pub fn numbering_gap(numbering: &PidNumbering) -> Option<(&'static str, String)> {
@@ -980,5 +1028,81 @@ mod tests {
                 "/proc/1 shares this namespace"
             );
         }
+    }
+
+    /// The visible-PID lister reads directory names only: digits that
+    /// parse become PIDs, everything else is skipped, and an unreadable
+    /// directory is `None` (never a partial count).
+    #[test]
+    fn visible_pids_list_exactly_the_numeric_entries() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        for name in ["1", "42", "007", "self", "sys", "1x", "4294967296"] {
+            std::fs::create_dir(dir.path().join(name)).expect("a fixture entry");
+        }
+        let mut pids = visible_pids_at(dir.path()).expect("a listable fixture");
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1, 7, 42]);
+        assert_eq!(visible_pids_at(&dir.path().join("missing")), None);
+    }
+
+    fn nested_own() -> PidNumbering {
+        PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        }
+    }
+
+    /// `docker run` without `--pid=host`, observer plus init: only the
+    /// container is visible, so the start warning names `--pid=host`.
+    #[test]
+    fn a_nested_observer_seeing_only_itself_and_init_warns_container_only() {
+        let warning = container_only_warning(&nested_own(), &[1, 999], 999)
+            .expect("observer plus init warns");
+        assert!(warning.contains("only this container is visible"), "{warning}");
+        assert!(warning.contains("--pid=host"), "{warning}");
+    }
+
+    /// `docker run` without `--pid=host`, observer as the only process
+    /// (or its own init): nothing else visible still warns.
+    #[test]
+    fn a_nested_observer_seeing_only_itself_warns_container_only() {
+        for (visible, own) in [(vec![7], 7), (vec![1], 1)] {
+            let warning = container_only_warning(&nested_own(), &visible, own)
+                .expect("a lone observer warns");
+            assert!(warning.contains("only this container is visible"), "{warning}");
+            assert!(warning.contains("--pid=host"), "{warning}");
+        }
+    }
+
+    /// A kind node shows other processes: its guidance stays the nested
+    /// warning and the kept refusals, never the container-only line.
+    /// An initial observer, a foreign `/proc`, an unreadable namespace
+    /// and a view that hides the observer itself stay silent too.
+    #[test]
+    fn other_processes_visible_or_no_proven_nesting_stays_silent() {
+        let foreign = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Foreign("/proc/self: gone".into()),
+        };
+        let unknown = PidNumbering {
+            observer: ObserverPidNs::Unknown("gone".into()),
+            proc_view: ProcView::Own,
+        };
+        for (name, numbering, visible, own) in [
+            ("kind-like", nested_own(), vec![1, 42, 999], 999),
+            ("initial", PidNumbering::agreeing(), vec![1, 999], 999),
+            ("foreign proc", foreign, vec![1, 999], 999),
+            ("unknown observer", unknown, vec![1, 999], 999),
+            ("self not listed", nested_own(), vec![1], 999),
+            ("empty view", nested_own(), vec![], 999),
+        ] {
+            assert_eq!(
+                container_only_warning(&numbering, &visible, own),
+                None,
+                "{name} stays silent"
+            );
+        }
+        // The live read on a test host (initial, many processes) is silent.
+        assert_eq!(container_only_warning_live(numbering()), None);
     }
 }

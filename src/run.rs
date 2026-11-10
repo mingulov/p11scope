@@ -3524,6 +3524,9 @@ fn capture_with_host(
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
         emit_capture_diagnostic(&warning);
     }
+    if let Some(line) = crate::pidns::container_only_warning_live(crate::pidns::numbering()) {
+        emit_capture_diagnostic(&line);
+    }
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
             // Never-stop: a named pid that exits before the view opens
@@ -13176,6 +13179,7 @@ pub(crate) fn evidence_for(
         uretprobe_override,
         handoff_child_pid,
         pid_namespace: crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
+        container_only_view: false,
         p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };

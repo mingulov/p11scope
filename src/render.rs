@@ -1352,6 +1352,14 @@ pub struct Evidence {
     /// `foreign` `/proc` is `proc_namespace_mismatch`: live discovery keys
     /// on kernel PIDs this observer cannot resolve through `/proc`.
     pub pid_namespace: crate::pidns::PidNamespaceEvidence,
+    /// A nested observer whose `/proc` showed nothing beyond its own
+    /// container when this evidence was built (`docker run` without
+    /// `--pid=host`): the `pid_namespace` gap text then names the
+    /// container-only view and its remedy. Render-only, never
+    /// serialized: the published `pid_namespace` evidence and the
+    /// `pid_namespace` cause already carry the machine-readable fact.
+    #[serde(skip)]
+    pub container_only_view: bool,
     /// Active values of every capture-visible `P11SCOPE_*` switch
     /// ([`P11SCOPE_ENV_VARS`]), so the document says which behavior
     /// switches were live (SYSPLAN residual F-26).
@@ -5539,6 +5547,7 @@ pub(crate) mod tests {
             pid_namespace: crate::pidns::PidNamespaceEvidence::of(
                 &crate::pidns::PidNumbering::agreeing(),
             ),
+            container_only_view: false,
             p11scope_env: vec![],
             completeness: "UNKNOWN",
         }
@@ -7237,6 +7246,38 @@ pub(crate) mod tests {
                 "{reasons}"
             );
         }
+    }
+
+    /// `docker run` without `--pid=host`: when the evidence says the
+    /// observer saw only its own container, the `pid_namespace` gap in
+    /// the report names the container-only view and its remedy — the
+    /// same plain words as the start warning. Without the flag the
+    /// gap text stays exactly what it was.
+    #[test]
+    fn a_container_only_view_is_named_in_the_report_gap() {
+        use crate::pidns::{PidNamespaceEvidence, PidNumbering};
+        let mut ev = evidence();
+        ev.pid_namespace = PidNamespaceEvidence::of(&PidNumbering {
+            observer: crate::pidns::ObserverPidNs::Nested,
+            proc_view: crate::pidns::ProcView::Own,
+        });
+        ev.container_only_view = true;
+        ev.verdict();
+        assert_eq!(ev.gap_classes.observation.causes, ["pid_namespace"]);
+        let reasons = verdict_reasons(&ev, false);
+        assert!(
+            reasons.contains("only this container is visible"),
+            "{reasons}"
+        );
+        assert!(reasons.contains("--pid=host"), "{reasons}");
+        // The flag is render-only: never serialized, never a new cause.
+        let value = serde_json::to_value(&ev).unwrap();
+        assert!(value.get("container_only_view").is_none(), "{value}");
+        let mut plain = evidence();
+        plain.pid_namespace = ev.pid_namespace;
+        plain.verdict();
+        let reasons = verdict_reasons(&plain, false);
+        assert!(!reasons.contains("only this container"), "{reasons}");
     }
 
     /// M1 (review): an initial observer reading another namespace's /proc

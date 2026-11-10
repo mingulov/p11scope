@@ -17268,6 +17268,7 @@ fn evidence_verdict(
             &crate::pidns::PidNumbering::agreeing(),
         ),
         p11scope_env: vec![],
+        container_only_view: false,
         completeness: "UNKNOWN",
     };
     evidence.verdict();
@@ -38034,6 +38035,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
             &crate::pidns::PidNumbering::agreeing(),
         ),
         p11scope_env: vec![],
+        container_only_view: false,
         completeness: "UNKNOWN",
     };
     evidence.verdict();

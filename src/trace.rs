@@ -1347,6 +1347,7 @@ mod tests {
             pid_namespace: crate::pidns::PidNamespaceEvidence::of(
                 &crate::pidns::PidNumbering::agreeing(),
             ),
+            container_only_view: false,
             p11scope_env: vec![],
             completeness: "COMPLETE",
         }

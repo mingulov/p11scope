@@ -1193,6 +1193,20 @@ class ConservationGate(unittest.TestCase):
             self.run_mutation(mutate)
         self.assertIn("entries.count 20 != issued 25", str(ctx.exception))
 
+    def test_shed_gaps_do_not_relax_s1_conservation(self):
+        # S1 keeps strict entries == issued: a pre-binding shed never
+        # excuses a shortfall outside --joint.
+        def mutate(inventory):
+            inventory["edges"][0]["entries"]["count"] = 20
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "semantic calls unrouted",
+                 "reason": _shed_unrouted_reason(5, {"unobserved": 5}),
+                 "budget": None, "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate)
+        self.assertIn("entries.count 20 != issued 25", str(ctx.exception))
+
 
 def _demoted_range_reason_named(base, absolute, named):
     """Product retirement-gap reason with an explicit named count."""
@@ -1205,6 +1219,13 @@ def _demoted_range_reason_named(base, absolute, named):
 def _demoted_range_reason(base, absolute):
     """Product retirement-gap reason for absolute range (base, absolute]."""
     return _demoted_range_reason_named(base, absolute, absolute - base)
+
+
+def _shed_unrouted_reason(total, labels):
+    """Product unrouted-shed reason for {total} calls shed pre-binding."""
+    inner = " ".join(f"{name}={count}" for name, count in labels.items())
+    return (f"{total} calls shed without a route "
+            f"({inner}) with 0 bindings")
 
 
 class LossGate(unittest.TestCase):
@@ -3166,6 +3187,278 @@ class JointConservationGate(unittest.TestCase):
                      "budget": None, "repeats": 2})
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "minus slot-refused 0"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_loss_conserves_as_named_counted_loss(self):
+        # The live r14a shape: the setup prologue shed before the first
+        # binding while the observer was still admitting the driver, so
+        # physical entries and the semantic totals fall short of issued
+        # by exactly the named shed count. Conservation holds as named
+        # counted loss and records the shed total beside entries.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["entries"], 20002)
+            self.assertEqual(result["conservation"]["shed_unrouted"], 4)
+
+    def test_driver_shed_unrouted_shortfall_beyond_sheds_fails(self):
+        # Named loss excuses only what it counts: a shortfall past the
+        # sheds' exact sum still fails, naming entries, loss and issued.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-short-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 6
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 6
+                child["api_returns"]["count"] -= 6
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 20000 \+ shed-unrouted "
+                    r"4 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_entries_short_without_shed_gaps_fails(self):
+        # No named loss, no excuse: the plain shortfall message stands.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-none-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 3000
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        r"entries\.count 17006 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_malformed_reason_fails(self):
+        # An unattributed shed gap whose reason carries no usable call
+        # count fails closed instead of conserving by guess, whether
+        # the shape or a label count is unusable.
+        for reason in ("4 calls shed without a route (unobserved=four) "
+                       "with 0 bindings",
+                       "shed calls without a route with 0 bindings"):
+            with tempfile.TemporaryDirectory(prefix="joint-shed-bad-") as tmp:
+                def mutate(doc, reason=reason):
+                    edge = next(row for row in doc["edges"]
+                                if row["caller"] == "c1")
+                    edge["entries"]["count"] -= 4
+                    child = doc["semantic_edges"][0]
+                    child["operations"]["calls"] -= 4
+                    child["api_returns"]["count"] -= 4
+                    doc["gaps"].append(
+                        {"caller": None, "module": None, "pid": None,
+                         "subject": "semantic calls unrouted",
+                         "reason": reason, "budget": None, "repeats": 1})
+                with self.assertRaisesRegex(
+                        require_s1(self).S1Error,
+                        "semantic calls unrouted gap without a call count"):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_label_sum_mismatch_fails(self):
+        # The label counts cross-check the named total: a gap whose
+        # labels sum past or short of its total fails closed.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-sum-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(
+                         4, {"unobserved": 2, "pending": 1}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"labels sum 3 != its 4 shed calls"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_caller_shed_gap_does_not_conserve_joint_entries(self):
+        # Never trust the shape alone: a caller-attributed shed is not
+        # the unattributed pre-binding loss, so it never enters the
+        # driver's sum and the plain shortfall message stands.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-fc-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": "c0", "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        r"entries\.count 20002 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_module_shed_gap_does_not_conserve_joint_entries(self):
+        with tempfile.TemporaryDirectory(prefix="joint-shed-fm-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": "m1", "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        r"entries\.count 20002 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_pid_shed_gap_does_not_conserve_joint_entries(self):
+        with tempfile.TemporaryDirectory(prefix="joint-shed-fp-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": 999,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        r"entries\.count 20002 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_shed_setup_with_unbootstrapped_feed_fails_at_joint_active(self):
+        # The full live r14a shape: gates 2-3 hold the shed loss
+        # exactly, and gate 4 plainly marks the missing key proof
+        # (the shed setup carried the session birth).
+        with tempfile.TemporaryDirectory(prefix="joint-shed-live-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+                doc["object_observations"]["status"] = "partial"
+                doc["object_observations"]["reason"] = "bootstrap_unavailable"
+                doc["object_observations"]["key_operations"] = []
+                doc["object_observations"]["objects"] = []
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "bootstrap_unavailable"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_repeats_multiply(self):
+        # Identical shed disclosures folded into repeats count once
+        # per repeat toward the exact sum.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-rep-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(2, {"unobserved": 2}),
+                     "budget": None, "repeats": 2})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["shed_unrouted"], 4)
+
+    def test_driver_shed_unrouted_operations_shortfall_fails(self):
+        # Entries conserved but the semantic child not short by the
+        # shed count: the operations equation names the shed term.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-ops-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"operations\.calls 20006 != issued 20006 "
+                    r"minus slot-refused 0 and shed-unrouted 4"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_api_returns_shortfall_fails(self):
+        # Entries and operations conserved but api_returns not short
+        # by the shed count: the api equation names the shed term.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-api-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"api_returns 20006 != issued 20006 "
+                    r"minus slot-refused 0 and shed-unrouted 4"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_shed_unrouted_multi_label_sum_conserves(self):
+        # Aggregated sheds carry several labels; their sum is the
+        # cross-checked total.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-ml-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(
+                         4, {"unobserved": 3, "pending": 1}),
+                     "budget": None, "repeats": 1})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["shed_unrouted"], 4)
+
+    def test_bound_shed_gap_stays_a_loss_gap(self):
+        # Sheds disclosed while bindings existed are mid-run loss,
+        # never pre-binding unattributed loss: the loss gap stands.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-bound-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": "2 calls shed without a route "
+                               "(unobserved=2) with 1 bindings",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
                 self.run_joint(Path(tmp), mutate)
 
     def test_cross_row_mechanism_swap_fails(self):

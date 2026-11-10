@@ -571,7 +571,8 @@
                   "the EVENTS reader could not be opened; calls are unproven",
                   "the terminal counter read failed; counts are unproven",
                   "the ring-loss line could not be emitted; loss is unproven",
-                  "the terminal kernel evidence read failed; loss is unproven"
+                  "the terminal kernel evidence read failed; loss is unproven",
+                  "the reaped child's tail drain reached its deadline; its events are unproven"
                 ]
               }
             }

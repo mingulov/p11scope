@@ -4949,6 +4949,10 @@ const HANDOFF_REASON_TAIL_RETIRE: &str =
     "the reaped child's tail could not be retired; its events may be missing or double-counted";
 const HANDOFF_REASON_TAIL_CANCELLED: &str =
     "the reaped child's tail drain was cancelled; its events are unproven";
+/// The root-tail drain deadline passed (never a cancellation: a deadline
+/// is never relabeled as one).
+const HANDOFF_REASON_TAIL_DEADLINE: &str =
+    "the reaped child's tail drain reached its deadline; its events are unproven";
 const HANDOFF_REASON_TAIL_DRAIN: &str =
     "the reaped child's tail drain failed; its events are unproven";
 const HANDOFF_REASON_EVENTS_DRAIN: &str =
@@ -5169,9 +5173,9 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                     reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
                 });
             }
-            // The root-tail deadline abandons the tail like a signal: the
-            // remaining records go to the ordinary terminal drain, and the
-            // unretired tail files the same schema-valid cancelled reason.
+            // The root-tail deadline abandons the tail: the remaining records
+            // go to the ordinary terminal drain, and the unretired tail files
+            // its own deadline reason (never relabeled as a cancellation).
             Ok(OriginalRootDrain::DeadlineAbandoned {
                 malformed,
                 remaining,
@@ -5182,7 +5186,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 ));
                 handoff_gaps.push(render::SkippedOut {
                     name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
-                    reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
+                    reason: HANDOFF_REASON_TAIL_DEADLINE.to_string(),
                 });
             }
             Err(error) => {
@@ -5572,9 +5576,9 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
             });
         }
-        // The root-tail deadline abandons the tail like a signal: the
-        // remaining records go to the ordinary terminal drain, and the
-        // unretired tail files the same schema-valid cancelled reason.
+        // The root-tail deadline abandons the tail: the remaining records
+        // go to the ordinary terminal drain, and the unretired tail files
+        // its own deadline reason (never relabeled as a cancellation).
         Ok(OriginalRootDrain::DeadlineAbandoned {
             malformed,
             remaining,
@@ -5585,7 +5589,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             ));
             handoff_gaps.push(render::SkippedOut {
                 name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
-                reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
+                reason: HANDOFF_REASON_TAIL_DEADLINE.to_string(),
             });
         }
         Err(error) => {
@@ -18532,6 +18536,7 @@ int main(int argc, char **argv) {
             HANDOFF_REASON_IDENTITY,
             HANDOFF_REASON_TAIL_RETIRE,
             HANDOFF_REASON_TAIL_CANCELLED,
+            HANDOFF_REASON_TAIL_DEADLINE,
             HANDOFF_REASON_TAIL_DRAIN,
             HANDOFF_REASON_EVENTS_DRAIN,
             HANDOFF_REASON_EVENTS_OPEN,
@@ -18569,6 +18574,74 @@ int main(int argc, char **argv) {
             seal.contains("apply_original_root_retirement("),
             "a completed tail must retire its processes"
         );
+    }
+
+    /// Both handoff seals handle the root-tail deadline abandon in its own
+    /// arm: the deadline reason (never relabeled as a cancellation) and the
+    /// `deadline` stderr token, while the cancelled arm keeps its own
+    /// reason. Deleting either deadline arm, or filing the cancelled
+    /// reason in it, fails here.
+    #[test]
+    fn owned_handoff_seals_file_the_tail_deadline_in_its_own_arm() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let window = |start: &str, end: &str| -> &'static str {
+            production
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {start}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing end {end}"))
+                .0
+        };
+        let arm = |seal: &'static str, variant: &str| -> &'static str {
+            let head = format!("Ok(OriginalRootDrain::{variant} {{");
+            let (_, rest) = seal
+                .split_once(head.as_str())
+                .unwrap_or_else(|| panic!("the seal lost its {variant} arm"));
+            let next = ["Ok(OriginalRootDrain::", "Err("]
+                .iter()
+                .filter_map(|marker| rest.find(marker))
+                .min()
+                .expect("a following arm");
+            &rest[..next]
+        };
+        for (mode, seal) in [
+            (
+                "profile",
+                window(
+                    "fn seal_owned_handoff_profile(",
+                    "\nfn seal_owned_handoff_trace(",
+                ),
+            ),
+            (
+                "trace",
+                window("fn seal_owned_handoff_trace(", "fn finish_capture_loop("),
+            ),
+        ] {
+            assert_eq!(
+                seal.matches("OriginalRootDrain::DeadlineAbandoned").count(),
+                1,
+                "{mode}: one deadline arm"
+            );
+            let deadline = arm(seal, "DeadlineAbandoned");
+            assert!(
+                deadline.contains("reason: HANDOFF_REASON_TAIL_DEADLINE")
+                    && !deadline.contains("HANDOFF_REASON_TAIL_CANCELLED"),
+                "{mode}: the deadline arm files the deadline reason"
+            );
+            assert!(
+                deadline.contains("root_tail_incomplete: deadline;")
+                    && deadline.contains("name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL"),
+                "{mode}: the deadline arm names itself under the tail subject"
+            );
+            let cancelled = arm(seal, "Cancelled");
+            assert!(
+                cancelled.contains("reason: HANDOFF_REASON_TAIL_CANCELLED")
+                    && !cancelled.contains("HANDOFF_REASON_TAIL_DEADLINE"),
+                "{mode}: the cancelled arm keeps the cancelled reason"
+            );
+        }
     }
 
     /// The handoff failure happens before any loop starts, so its gap

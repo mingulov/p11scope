@@ -646,6 +646,10 @@ HANDOFF_TAIL_RETIRE = (
 HANDOFF_TAIL_CANCELLED = (
     "the reaped child's tail drain was cancelled; its events are unproven"
 )
+HANDOFF_TAIL_DEADLINE = (
+    "the reaped child's tail drain reached its deadline; "
+    "its events are unproven"
+)
 HANDOFF_TAIL_DRAIN = (
     "the reaped child's tail drain failed; its events are unproven"
 )
@@ -674,7 +678,8 @@ HANDOFF_SUBJECTS = HANDOFF_STEP_SUBJECTS | HANDOFF_GAP_SUBJECTS
 HANDOFF_REASONS_BY_SUBJECT = {
     HANDOFF_GAP_PROVIDER_IDENTITY: frozenset({HANDOFF_IDENTITY}),
     HANDOFF_GAP_ORIGINAL_ROOT_TAIL: frozenset({
-        HANDOFF_TAIL_RETIRE, HANDOFF_TAIL_CANCELLED, HANDOFF_TAIL_DRAIN,
+        HANDOFF_TAIL_RETIRE, HANDOFF_TAIL_CANCELLED, HANDOFF_TAIL_DEADLINE,
+        HANDOFF_TAIL_DRAIN,
     }),
     HANDOFF_GAP_EVENTS_DRAIN: frozenset(
         {HANDOFF_EVENTS_DRAIN, HANDOFF_EVENTS_OPEN}
@@ -6056,6 +6061,11 @@ def self_test():
     for reason in HANDOFF_REASONS:
         bad = copy.deepcopy(bounded_skips)
         bad["skipped"] = [{"name": DISCOVERY_SUBJECT, "reason": reason}]
+        rejected(lambda bad=bad: discovery_skips(bad))
+    # The deadline reason belongs to the original root tail only.
+    for name in HANDOFF_SUBJECTS - {HANDOFF_GAP_ORIGINAL_ROOT_TAIL}:
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"] = [{"name": name, "reason": HANDOFF_TAIL_DEADLINE}]
         rejected(lambda bad=bad: discovery_skips(bad))
     print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)

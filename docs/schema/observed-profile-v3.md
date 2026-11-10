@@ -905,7 +905,8 @@ own subject, with `reason` exactly the paired sentence:
   `the reaped child's tail could not be retired; its events may be missing
   or double-counted`, `the reaped child's tail drain was cancelled; its
   events are unproven`, `the reaped child's tail drain failed; its events
-  are unproven`
+  are unproven`, `the reaped child's tail drain reached its deadline; its
+  events are unproven`
 - `{name: "events drain", reason}` with `reason` exactly one of
   `the terminal event drain failed; calls past the failure are unproven`,
   `the EVENTS reader could not be opened; calls are unproven`

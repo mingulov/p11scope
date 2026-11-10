@@ -90,7 +90,9 @@ spent. The growth levels off. On a 5-vCPU, 10 GB test VM with about
 
 `trace` rises to about 1.13 GB once more at the end, while it writes
 its output. Twenty-minute captures on a 3-vCPU VM reached 650 to
-720 MB. v0.6.0 behaves the same way; this is not new in v0.7.0. Plan
+720 MB. Whether and how fast it grows depends on the host and on the
+callers' binaries: on the same 5-vCPU VM, callers built as non-PIE
+executables kept the observer at 110 to 330 MB. v0.6.0 behaves the same way; this is not new in v0.7.0. Plan
 for about 1.2 GB of observer memory for an hour-long system-wide
 capture on a busy host; `--pid`, cgroup and `run` captures of a
 quiet scope stay far below that. Bounded observer memory is planned

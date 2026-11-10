@@ -162,6 +162,7 @@ struct JointRegistrationSlot {
     registration: Option<usize>,
     first_call: Option<usize>,
     fits: bool,
+    mintable: bool,
 }
 
 /// One paid temporary index of the registry's ORIGINAL staging rows. The
@@ -1719,8 +1720,14 @@ impl CallerRegistry {
     /// Whether a staged registration row could mint at the drain:
     /// identified module, proven image, live caller with an edge,
     /// in-domain boundary, and no blocking negative. Mirrors the
-    /// drain's refusal checks in [`Self::apply_instance`];
-    /// ordering-only, never authority (the drain re-checks
+    /// drain's refusal checks in [`Self::apply_instance`] against
+    /// the state the drain will have applied by the row's turn:
+    /// a `NoteMapping` staged BEFORE the row creates its module
+    /// and edge at the drain, so it counts here too — in the
+    /// first quantum the genuine caller's module and edge exist
+    /// only as such a staged mapping, and reading drained state
+    /// alone sorts the genuine row with the unbound churn.
+    /// Ordering-only, never authority (the drain re-checks
     /// everything at apply time, and the fits count is unchanged
     /// — misclassification only costs a row its priority, never
     /// correctness). Keys already held need no mirror: the fits
@@ -1737,20 +1744,39 @@ impl CallerRegistry {
         if self.retired.contains_key(&input.caller) {
             return false;
         }
-        let Some(module) = self.modules_by_key.get(&input.key.module).copied() else {
-            return false;
+        let module = self.modules_by_key.get(&input.key.module).copied();
+        // Mappings staged before this row apply before it at the
+        // drain: any caller creates the module, this caller
+        // creates the edge. Scans the staged prefix only when the
+        // drained state lacks the piece; allocates nothing.
+        let staged_mapping = |caller: Option<CallerId>| {
+            self.staged[..at].iter().any(|mutation| {
+                matches!(mutation, Mutation::NoteMapping { caller: noted, info, .. }
+                    if info.key == input.key.module
+                        && caller.is_none_or(|caller| *noted == caller))
+            })
         };
-        if !self.edges.contains_key(&(input.caller, module)) {
+        if module.is_none() && !staged_mapping(None) {
+            return false;
+        }
+        let live_edge =
+            module.is_some_and(|module| self.edges.contains_key(&(input.caller, module)));
+        if !live_edge && !staged_mapping(Some(input.caller)) {
             return false;
         }
         if input.boundary.is_some_and(|p| p.domain != input.key.domain) {
             return false;
         }
-        for negative in &self.instance_state.negatives {
-            if negative.matches(&input.key, module)
-                && (negative.authority_exhausted || negative.retirement.is_some())
-            {
-                return false;
+        // A module the drain has not created yet has no id a
+        // retained negative could name, so only a live module
+        // can be negative-blocked.
+        if let Some(module) = module {
+            for negative in &self.instance_state.negatives {
+                if negative.matches(&input.key, module)
+                    && (negative.authority_exhausted || negative.retirement.is_some())
+                {
+                    return false;
+                }
             }
         }
         true
@@ -1813,6 +1839,7 @@ impl CallerRegistry {
                 registration,
                 first_call,
                 fits: false,
+                mintable: false,
             });
         }
         rows.sort_unstable_by_key(|row| (row.hash, row.row));
@@ -1844,15 +1871,15 @@ impl CallerRegistry {
         // slot priority changes (registration order within each
         // class, as before). Rows the drain will refuse keep
         // fits=false exactly when oversubscribed, as before.
-        rows.sort_by(|a, b| {
-            let key = |row: &JointRegistrationSlot| {
-                let mintable = row
-                    .registration
-                    .is_some_and(|at| self.staged_row_could_mint(at));
-                (!mintable, row.registration.unwrap_or(usize::MAX))
-            };
-            key(a).cmp(&key(b))
-        });
+        // Mintability is judged once per row against drained state
+        // plus the mappings staged ahead of it (the drain applies
+        // those first), never inside the sort comparator.
+        for row in &mut rows {
+            row.mintable = row
+                .registration
+                .is_some_and(|at| self.staged_row_could_mint(at));
+        }
+        rows.sort_by_key(|row| (!row.mintable, row.registration.unwrap_or(usize::MAX)));
         let mut occupied = self.instance_state.records.len();
         for row in &mut rows {
             if row.registration.is_some()

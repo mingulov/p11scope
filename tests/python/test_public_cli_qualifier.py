@@ -69,13 +69,13 @@ NATIVE = ("no settled expected native image for this caller in the "
           "acquisition domain; scan-pinned fallback retained")
 
 
-def overlay_report():
-    """The exact 0-module overlay signature (CI guest shape).
+PUBLISHED_PIN = {"dev": [8, 1], "ino": 42, "sha256": "ab" * 32}
 
-    Post-fix shape: the unproven member gaps no longer incomplete
-    the shared transaction, so 'cgroup member scan was incomplete'
-    is NOT part of the signature — its reappearance must fail loudly
-    as an extra gap, never hide inside expected-failure.
+
+def overlay_report():
+    """The regressed 0-module overlay shape: the scan-pinned fallback
+    dropped the found module. This must fail loudly (never
+    expected-failure, never a pass): an empty view never qualifies.
     """
     return {
         "schema": "p11scope/inventory/v1",
@@ -83,6 +83,36 @@ def overlay_report():
         "modules": [],
         "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
         "edges": [],
+        "gaps": [
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": NATIVE, "subject": "native owner activation refused",
+             "repeats": 11},
+            {"caller": "c1", "module": None, "pid": 101,
+             "reason": UNPROVEN, "subject": MODPATH, "repeats": 10},
+            {"caller": "c1", "module": None, "pid": 101,
+             "reason": NATIVE, "subject": "native owner activation refused",
+             "repeats": 9},
+        ],
+    }
+
+
+def overlay_published_report():
+    """The qualified overlay shape: the owned module is published with
+    inside edges and keeps the named unproven gap per inside caller
+    (PARTIAL coverage via the gaps).
+    """
+    return {
+        "schema": "p11scope/inventory/v1",
+        "scope": "cgroup",
+        "modules": [{"id": "m0",
+                     "identity": {"device": {"major": 8, "minor": 1},
+                                  "inode": 42, "sha256": "ab" * 32},
+                     "admission": {"state": "admitted"}}],
+        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        "edges": [{"caller": "c0", "module": "m0"},
+                  {"caller": "c1", "module": "m0"}],
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
@@ -294,11 +324,13 @@ class ScriptTextTests(unittest.TestCase):
     def test_expected_reasons_present(self):
         text = QUAL.read_text()
         for name in ("REASON_CGROUP", "REASON_TRACE_CGROUP",
-                     "REASON_INVENTORY_7X", "REASON_INVENTORY_OVERLAY",
+                     "REASON_INVENTORY_7X",
                      "REASON_IA32"):
             self.assertIn(name, text, f"missing {name} with named product-gap reason")
         self.assertNotIn("REASON_RUN", text,
                          "run exact loss is fixed and qualified; its reason must be gone")
+        self.assertNotIn("REASON_INVENTORY_OVERLAY", text,
+                         "overlay empty view is fixed and qualified; its reason must be gone")
         self.assertIn("product fix lane", text)
 
     def test_ia32_prereq_missing_is_expected(self):
@@ -341,95 +373,113 @@ class ScriptTextTests(unittest.TestCase):
         self.assertIn("REASON_INVENTORY_7X", text,
                       "inventory 7.x gap must map to expected-failure with named reason")
 
-    def test_inventory_overlay_reason_present(self):
+    def test_inventory_overlay_published_shape_present(self):
         text = QUAL.read_text()
-        self.assertIn("REASON_INVENTORY_OVERLAY", text,
-                      "overlay unproven signature needs a named reason")
+        self.assertNotIn("REASON_INVENTORY_OVERLAY", text,
+                         "the overlay empty view is fixed; its reason must be gone")
+        self.assertNotIn("inventory overlay unproven signature", text,
+                         "the empty-view signature must be gone: it never qualifies")
         self.assertIn('module_fs=$(stat -f -c %T "$MODULE"', text,
                       "the overlay branch must be gated on the module fs")
         self.assertIn("modfs=='overlayfs'", text,
                       "the gate must use stat(1)'s spelling: GNU stat "
                       "prints 'overlayfs', never 'overlay'")
-        pos = text.index("inventory\\ overlay\\ unproven\\ signature")
-        segment = text[pos:pos + 400]
-        self.assertIn("REASON_INVENTORY_OVERLAY", segment)
-        self.assertIn("expected-failure", segment,
-                      "the overlay signature must map to expected-failure")
+        self.assertIn("empty view never qualifies", text,
+                      "the oracle must refuse an empty view on every filesystem")
+        self.assertIn("overlay unproven caller cover", text,
+                      "the published overlay shape must keep the named unproven gaps")
+        self.assertIn("overlay published extra gap", text,
+                      "unknown overlay gaps must fail loudly")
 
 
 class InventoryOverlayTests(unittest.TestCase):
-    def test_overlay_signature_emits_the_marker(self):
+    def test_overlay_published_shape_passes(self):
+        rc, out = run_oracle(overlay_published_report(), pin=PUBLISHED_PIN)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("inventory cgroup: inside=100 child=101 "
+                      "outside=102 excluded module=m0 admission=admitted "
+                      "unproven=2 gaps=4", out)
+
+    def test_overlay_published_shape_passes_unresolved(self):
+        report = overlay_published_report()
+        report["modules"][0]["admission"] = {"state": "unresolved"}
+        rc, out = run_oracle(report, pin=PUBLISHED_PIN)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("admission=unresolved unproven=2 gaps=4", out)
+
+    def test_overlay_empty_view_fails_loudly(self):
+        # The regressed 0-module shape: no signature, no
+        # expected-failure — an empty view never qualifies.
         rc, out = run_oracle(overlay_report())
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("inventory overlay unproven signature: "
-                      "0 modules, 2 unproven gaps", out)
+        self.assertIn("empty view never qualifies", out)
+        self.assertNotIn("inventory overlay unproven signature", out)
 
     def test_overlay_accepts_designed_collection_deadline_gap(self):
         # A pass that starts just before the run deadline is cancelled
         # mid-flight by the designed collection bound and honestly
         # records 'cgroup collection deadline reached' (once per gap
-        # site, as the sibling transaction reasons). The overlay
-        # signature must survive that reason: the cell stays a
-        # recognized expected-failure instead of misclassifying as
-        # failed with 'overlay unproven extra gap'.
-        report = overlay_report()
+        # site, as the sibling transaction reasons). The published
+        # shape must survive that reason and still qualify.
+        report = overlay_published_report()
         report["gaps"].append(
             {"caller": None, "module": None, "pid": None,
              "reason": "cgroup collection deadline reached",
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})
-        rc, out = run_oracle(report)
-        self.assertNotEqual(rc, 0, out)
-        self.assertIn("inventory overlay unproven signature: "
-                      "0 modules, 2 unproven gaps", out)
+        rc, out = run_oracle(report, pin=PUBLISHED_PIN)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=2 gaps=5", out)
 
     def test_overlay_branch_rejects(self):
         cases = []
+        empty = overlay_report()
+        cases.append(("empty-view", empty, "overlayfs",
+                      "empty view never qualifies"))
         ext4 = overlay_report()
-        cases.append(("ext4", ext4, "ext4", "owned provider not inventoried"))
-        other = overlay_report()
-        other["modules"] = [{"id": "m9", "identity": {}}]
-        cases.append(("nonempty-modules", other, "overlayfs",
-                      "owned provider not inventoried"))
-        dropped = overlay_report()
+        cases.append(("ext4-empty", ext4, "ext4",
+                      "empty view never qualifies"))
+        dropped = overlay_published_report()
         dropped["gaps"] = [g for g in dropped["gaps"]
                            if g.get("caller") != "c1"
                            or g.get("reason") != UNPROVEN]
         cases.append(("dropped-unproven", dropped, "overlayfs",
                       "overlay unproven caller cover"))
-        leaked = overlay_report()
+        leaked = overlay_published_report()
         leaked["callers"].append({"id": "c2", "pid": 102})
         cases.append(("outside-leak", leaked, "overlayfs",
                       "outside workload leaked into cgroup inventory"))
-        edged = overlay_report()
-        edged["edges"] = [{"caller": "c0", "module": "m0"}]
-        cases.append(("edges-present", edged, "overlayfs",
-                      "overlay unproven edges present"))
-        extra = overlay_report()
+        edgeless = overlay_published_report()
+        edgeless["edges"] = []
+        cases.append(("no-edge", edgeless, "overlayfs",
+                      "no inside edge to owned module"))
+        extra = overlay_published_report()
         extra["gaps"].append({"caller": None, "module": None, "pid": None,
                              "reason": "something new",
                              "subject": "novel gap", "repeats": 1})
         cases.append(("extra-gap", extra, "overlayfs",
-                      "overlay unproven extra gap"))
-        # The pre-fix truncation symptom: unproven member gaps used to
-        # incomplete the shared transaction. Post-fix they degrade per
-        # caller, so this reason must fail loudly here (a regression
-        # signal for the cgroup-scan lane), never classify as
-        # expected-failure.
-        trunc = overlay_report()
+                      "overlay published extra gap"))
+        # Unproven member gaps degrade per caller without incompleting
+        # the shared transaction, so this reason must fail loudly here
+        # (a regression signal for the cgroup-scan lane), never hide.
+        trunc = overlay_published_report()
         trunc["gaps"].append({"caller": None, "module": None, "pid": None,
                              "reason": "cgroup member scan was incomplete",
                              "subject": "cgroup scope transaction incomplete",
                              "repeats": 24})
         cases.append(("truncated-transaction", trunc, "overlayfs",
-                      "overlay unproven extra gap"))
-        subject = overlay_report()
+                      "overlay published extra gap"))
+        subject = overlay_published_report()
         subject["gaps"][0]["subject"] = "/some/other/path.so"
         cases.append(("wrong-subject", subject, "overlayfs",
                       "overlay unproven subject"))
+        refused = overlay_published_report()
+        refused["modules"][0]["admission"] = {"state": "refused"}
+        cases.append(("refused-admission", refused, "overlayfs",
+                      "overlay owned provider admission"))
         for name, report, modfs, marker in cases:
             with self.subTest(name=name):
-                rc, out = run_oracle(report, modfs=modfs)
+                rc, out = run_oracle(report, modfs=modfs, pin=PUBLISHED_PIN)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn(marker, out)
                 self.assertNotIn("inventory overlay unproven signature",
@@ -439,10 +489,13 @@ class InventoryOverlayTests(unittest.TestCase):
         # stat(1) never emits the bare 'overlay' spelling (coreutils
         # S_MAGIC_OVERLAYFS prints 'overlayfs'); the gate must not
         # accept it, so a reintroduced misspelling fails loudly here
-        # instead of misclassifying CI guests.
-        rc, out = run_oracle(overlay_report(), modfs="overlay")
+        # instead of misclassifying CI guests. The unresolved
+        # admission qualifies only through the overlay gate.
+        report = overlay_published_report()
+        report["modules"][0]["admission"] = {"state": "unresolved"}
+        rc, out = run_oracle(report, modfs="overlay", pin=PUBLISHED_PIN)
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("owned provider not inventoried", out)
+        self.assertIn("owned provider not admitted", out)
         self.assertNotIn("inventory overlay unproven signature",
                          out)
 
@@ -463,7 +516,8 @@ class InventoryOverlayTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="ext4", pin=pin)
         self.assertEqual(rc, 0, out)
         self.assertIn("inventory cgroup: inside=100 child=101 "
-                      "outside=102 excluded module=m0 gaps=0", out)
+                      "outside=102 excluded module=m0 admission=admitted "
+                      "unproven=0 gaps=0", out)
 
 
 def extract_handoff_oracle():

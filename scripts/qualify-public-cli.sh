@@ -195,7 +195,6 @@ PY
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
 REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
-REASON_INVENTORY_OVERLAY="inventory cgroup overlay unproven (K1 collection witness unavailable, owned file unproven with 0 modules); product fix lane for inventory overlay witness"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
 asuser_conf() {
   local conf=$1; shift
@@ -686,37 +685,18 @@ for mid,m in modules.items():
     dev=ident.get('device',{})
     if [dev.get('major'),dev.get('minor')]==pin['dev'] and ident.get('inode')==pin['ino'] and ident.get('sha256')==pin['sha256']:
         owned=mid; break
-assert owned is not None or modfs=='overlayfs', 'owned provider not inventoried (modfs=%s)' % modfs
-if owned is None:
-    assert modules=={}, 'owned provider not inventoried'
-    callers={c['id']:c for c in report.get('callers',[])}
-    inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
-    child_ids=[cid for cid,c in callers.items() if c.get('pid')==child_pid]
-    outside_ids=[cid for cid,c in callers.items() if c.get('pid')==outside_pid]
-    assert inside_ids, 'overlay unproven inside parent not a caller'
-    assert child_ids, 'overlay unproven fork-after-attach child not a caller'
-    assert not outside_ids, 'outside workload leaked into cgroup inventory'
-    assert report.get('edges',[])==[], 'overlay unproven edges present'
-    want=sorted(set(inside_ids+child_ids))
-    unproven=[g for g in report.get('gaps',[]) if (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
-    assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
-    pidof={cid:callers[cid].get('pid') for cid in want}
-    for g in unproven:
-        assert g.get('subject')==modpath, 'overlay unproven subject'
-        assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
-    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
-    # The exact overlay signature: the per-caller activation refusal
-    # plus, when a pass straddles the run deadline, the designed
-    # collection bound (ruling CI-GAP-2, confirmed
-    # docs/superpowers/decisions/2026-11-06-schedule-dl10.md). The
-    # unproven member gaps degrade per caller without incompleting
-    # the shared transaction, so 'cgroup member scan was incomplete'
-    # is deliberately NOT known here: its reappearance fails loudly
-    # below instead of hiding inside expected-failure.
-    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
-    assert all(g.get('reason') in known for g in rest), 'overlay unproven extra gap: %r' % rest
-    assert False, 'inventory overlay unproven signature: 0 modules, %d unproven gaps' % len(unproven)
-assert modules[owned].get('admission',{}).get('state')=='admitted', 'owned provider not admitted'
+# Data-always: the scan-pinned fallback publishes the found module
+# with its named gap on every filesystem — an empty view never
+# qualifies, on overlayfs or anywhere else.
+assert owned is not None, 'owned provider not inventoried (modfs=%s): empty view never qualifies' % modfs
+state=modules[owned].get('admission',{}).get('state')
+if modfs=='overlayfs':
+    # The cgroup witness stays deactivated (the userspace-only path),
+    # so the published module carries its named unproven gap per
+    # inside caller below; the attach set may or may not judge it.
+    assert state in ('admitted','unresolved'), 'overlay owned provider admission: %r' % state
+else:
+    assert state=='admitted', 'owned provider not admitted'
 callers={c['id']:c for c in report.get('callers',[])}
 inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
 child_ids=[cid for cid,c in callers.items() if c.get('pid')==child_pid]
@@ -727,8 +707,37 @@ assert not outside_ids, 'outside workload leaked into cgroup inventory'
 edges=report.get('edges',[])
 assert any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module'
 owned_gaps=[g for g in report.get('gaps',[]) if g.get('module')==owned]
-assert owned_gaps==[], 'inventory gaps about owned module: %r' % owned_gaps
-print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s gaps=%d' % (inside_pid,child_pid,outside_pid,owned,len(report.get('gaps',[]))))
+if modfs=='overlayfs':
+    # An admission rise across passes is an informative note, not
+    # loss; anything else about the owned module still fails.
+    owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed']
+    assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
+else:
+    assert owned_gaps==[], 'inventory gaps about owned module: %r' % owned_gaps
+unproven=[]
+if modfs=='overlayfs':
+    # The published overlay shape keeps the named unproven gap per
+    # inside caller (PARTIAL coverage via the gaps): the witness
+    # never ran, so no proof is claimed.
+    want=sorted(set(inside_ids+child_ids))
+    unproven=[g for g in report.get('gaps',[]) if (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
+    assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
+    pidof={cid:callers[cid].get('pid') for cid in want}
+    for g in unproven:
+        assert g.get('subject')==modpath, 'overlay unproven subject'
+        assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
+    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed']
+    # The per-caller activation refusal plus, when a pass straddles
+    # the run deadline, the designed collection bound (ruling CI-GAP-2,
+    # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md).
+    # The unproven member gaps degrade per caller without incompleting
+    # the shared transaction, so 'cgroup member scan was incomplete'
+    # is deliberately NOT known here: its reappearance fails loudly
+    # below instead of hiding.
+    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
+    assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
+    assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
+print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY
     rc=$?
     detail=$(cat "$cell.detail" 2>/dev/null || echo "inventory check failed rc=$rc")
@@ -739,8 +748,6 @@ PY
       case "$detail" in
         *inventory\ gaps\ about\ owned\ module*)
           result "$cell" 0 "$REASON_INVENTORY_7X: [failed] $detail" expected-failure ;;
-        *inventory\ overlay\ unproven\ signature*)
-          result "$cell" 0 "$REASON_INVENTORY_OVERLAY: [failed] $detail" expected-failure ;;
         *) result "$cell" 0 "$detail" failed ;;
       esac
     fi

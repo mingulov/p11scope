@@ -6124,7 +6124,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             // Only a complete deep scan makes absence authoritative: a
             // maps match decoded nothing, so its absences read uncertain.
-            let complete = matches!(process.status, MemberStatus::Scanned);
+            // Scanned alone is not enough: a scan cut short by a
+            // truncating gap (a provider replaced mid-capture mints
+            // none) carries no receipt, and ending edges from it
+            // would report collected data unloaded. The receipt is
+            // the absence-authority token.
+            let complete =
+                matches!(process.status, MemberStatus::Scanned) && process.complete_scan.is_some();
             if complete && deep_scanned {
                 // Complete same-custody caller/provider/full-image proof:
                 // the generation join held above, the member image

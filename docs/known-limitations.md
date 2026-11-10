@@ -1034,12 +1034,12 @@ any other replaced executable file, not only providers. Restart the
 program so it maps the on-disk file.
 
 If the file is replaced during a running inventory capture instead,
-inventory ends the program's edge at the next pass ("absent from a
-complete rescan of the live caller", module "unloaded") and the
-program's later calls are not counted. `profile` counts through the
-same replacement with PARTIAL coverage and a "provider file changed
-during capture" gap. Re-run an inventory capture after the upgrade
-settles.
+inventory keeps the program's collected edge as uncertain at the next
+pass ("absent from an incomplete scan") with the gap named, instead of
+ending the edge and reporting the module "unloaded"; coverage stays
+PARTIAL. `profile` counts through the same replacement with PARTIAL
+coverage and a "provider file changed during capture" gap. Re-run an
+inventory capture after the upgrade settles.
 
 ## Planned for later versions
 

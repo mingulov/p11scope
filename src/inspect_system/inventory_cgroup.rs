@@ -811,16 +811,23 @@ fn scope_gap(reason: &str) -> PidGap {
 /// stays on the member), never per transaction: nothing was cut
 /// short, and poisoning the shared transaction would block every
 /// other member's native activation behind one member's proof refusal
-/// (JK-22). Only that family is exempt: scoped collection early-outs
+/// (JK-22). The replaced-file gap is likewise exempt: the member was
+/// scanned to completion and only the replaced file went unexamined,
+/// so suspending the whole transaction behind one upgraded library
+/// would stop every other member's tracking for no local reason.
+/// Only those two families are exempt: scoped collection early-outs
 /// before any witness query, so proven-stale, spent-budget and failed
 /// anchor outcomes are unproducible here, and they keep truncating so
 /// a future witness in this path fails closed. Every other truncation
 /// signal keeps the scan-to-live-candidate boundary, and retirement
 /// still withholds absence authority for these members through
-/// `CompleteMemberScan`.
+/// `CompleteMemberScan`. The replaced-file gap is a real scan skip,
+/// so a replaced member mints no receipt: its own absences still
+/// read uncertain even as its transaction completes.
 fn member_gap_truncates_transaction(reason: &str) -> bool {
     scan_skip_truncates(reason)
         && !crate::discovery::overlay_witness::witness_unavailable_refusal(reason)
+        && reason != crate::discovery::scan::REPLACED_PROVIDER_REASON
 }
 
 /// Append one scripted gap per reason to a scanned member (test
@@ -2106,9 +2113,10 @@ mod tests {
             GAP_ANCHOR_BINDING_FAILED,
             "opened object identity 1:2 inode 3 does not match mapped object 1:2 inode 4",
             // Owner rule 2026-11-09 (data-always): a deleted mapping may
-            // still carry executable code, so it fails closed.
+            // still carry executable code, so it fails closed. (The
+            // replaced-file gap degrades per caller instead; see
+            // replaced_member_gap_degrades_per_caller_without_incompleting_transaction.)
             "deleted mapping",
-            crate::discovery::scan::REPLACED_PROVIDER_REASON,
             "some future unknown omission",
         ] {
             assert!(

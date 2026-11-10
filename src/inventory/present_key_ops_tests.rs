@@ -1214,7 +1214,9 @@ fn silent_bootstrap_deferred_birth_is_named_once() {
     ));
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
-        verbose.contains("Per-key tracking started late for this process; earlier calls keep plain counts"),
+        verbose.contains(
+            "Per-key tracking started late for this process; earlier calls keep plain counts"
+        ),
         "{verbose}"
     );
     assert!(

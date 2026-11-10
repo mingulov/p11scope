@@ -311,6 +311,12 @@ does any capture that lost or dropped discovery records. The count can still ove
 (a thread's record racing the exit, an unknown exit order). Seeing
 those later loads needs a kernel-side witness and is 0.7.x work.
 
+### Multi attach steps stall the loop; detach can outlast the report
+
+A 4 s Multi attach step can delay lifecycle-ring service under heavy
+exec churn. Detach may finish after the report on desktops with very
+many mapping processes.
+
 ### Test-only: overlay-witness flake
 
 `witness_every_keep_reason_keeps_todays_window_when_mapped` fails

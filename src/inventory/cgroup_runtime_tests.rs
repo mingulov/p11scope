@@ -714,6 +714,41 @@ fn cgroup_runtime_fast_result_stop_is_checked_before_apply_commit() {
     );
 }
 
+/// Twin with a wide return window: the stop lands after the collection
+/// completed but before the loop receives it, and several collection
+/// ticks run in between. A tick must not reach back into the returned
+/// worker's control and cancel the completed pass 0 (the race CI hit
+/// under coverage), so the scanned caller still publishes.
+#[test]
+fn cgroup_runtime_stop_after_return_survives_collection_ticks() {
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let stop = Arc::new(AtomicBool::new(false));
+    let control = CollectionControl::new(None);
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    let worker_stop = stop.clone();
+    driver.wrapper = Some(Box::new(move |job| {
+        Box::new(move || {
+            let collection = job();
+            worker_stop.store(true, Ordering::SeqCst);
+            // The test clock ticks every millisecond: hold the result
+            // long enough that ticks always run inside the window.
+            std::thread::sleep(Duration::from_millis(30));
+            collection
+        })
+    }));
+    let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+        &mut driver,
+        None,
+        &clock(&|| stop.load(Ordering::SeqCst)),
+        None,
+        &mut |_, _| Ok(()),
+    );
+    assert!(result.error.is_none());
+    assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
+    assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
+    assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+}
+
 #[test]
 fn cgroup_runtime_spawn_failure_never_runs_collection_inline() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

@@ -23944,6 +23944,27 @@ int main(int argc, char **argv) {
         assert_eq!(ev.max_rss_kb, None);
     }
 
+    /// The scheduling snapshot re-reads the kernel high-water mark: the
+    /// one production caller of `resource_evidence_of` passes a live
+    /// `read_peak_rss_kb()`, never `None` or a cached value.
+    #[test]
+    fn scheduling_snapshot_reads_the_kernel_peak_rss() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("resource_evidence_of(").count(),
+            2,
+            "the definition and its one snapshot caller"
+        );
+        assert_eq!(
+            production
+                .matches("resource: resource_evidence_of(&self.resource, crate::timing::read_peak_rss_kb()),")
+                .count(),
+            1,
+            "the snapshot passes a live high-water read"
+        );
+    }
+
     /// The inter-drain gap is a capture-loop quantity: drains after
     /// loop end (the undrained detach window, then the terminal drain)
     /// must not extend it — the detach window is separately counted

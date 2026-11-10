@@ -3318,9 +3318,7 @@ fn demotion_retirement_revision_skew_unknown_keeps_ordinary_checkpoint() {
             &[(&scene.a, 0x1000), (&scene.b, 0x2000)],
         )],
         &scene.pins,
-        crate::plan::AdmissionPolicy::Inventory(
-            scene.native.scene.coordinator.attach_set.budget(),
-        ),
+        crate::plan::AdmissionPolicy::Inventory(scene.native.scene.coordinator.attach_set.budget()),
     );
     scene
         .native

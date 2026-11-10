@@ -244,6 +244,11 @@ struct CandidateSummary {
     result: CurrentCandidates,
     result_caller_epoch: Option<u64>,
     ordinary_sequence: u64,
+    /// The retained proven Sole result could not be recomputed under the
+    /// current revision (an unproven Unknown finish). It is never served
+    /// as a current candidate, but ordinary continuity survives it: only
+    /// a proven classification or an unconsumed authority may revoke it.
+    stale: bool,
 }
 impl CandidateSummary {
     fn new() -> Self {
@@ -259,6 +264,7 @@ impl CandidateSummary {
             result: CurrentCandidates::Unknown,
             result_caller_epoch: None,
             ordinary_sequence: 1,
+            stale: false,
         }
     }
     fn restart(&mut self, caller_epoch: Option<u64>, revision: AttachRevision) {
@@ -286,6 +292,12 @@ impl CandidateSummary {
     }
 
     fn classified(&self, caller_epoch: Option<u64>, revision: AttachRevision) -> bool {
+        if self.stale {
+            // An unproven finish consumed this caller epoch as far as the
+            // current index allows; a newer observation must be able to
+            // replace the active one so classification can progress.
+            return self.result_caller_epoch.is_some() && self.result_caller_epoch == caller_epoch;
+        }
         self.result_caller_epoch.is_some()
             && self.result_caller_epoch == caller_epoch
             && match &self.result {
@@ -297,13 +309,32 @@ impl CandidateSummary {
     }
 
     /// Commit invalidation before replacing the completed result/provenance.
+    /// An *unproven* Unknown (the classification could not be computed:
+    /// revision skew, an unknown/refused index, an invalid slot or a
+    /// not-yet-committed edge) is not evidence the owner changed, so it
+    /// retains a proven Sole result and ordinary continuity instead of
+    /// revoking them. Proven classifications and unconsumed authority
+    /// failures still revoke exactly as before.
     fn finish(
         &mut self,
         result: CurrentCandidates,
         caller_epoch: Option<u64>,
         caller_failure: u64,
         index_failure: u64,
+        proven: bool,
     ) {
+        if caller_epoch.is_some()
+            && !proven
+            && matches!(result, CurrentCandidates::Unknown)
+            && matches!(self.result, CurrentCandidates::Sole { .. })
+            && self.ordinary_sequence != 0
+            && !self.unconsumed_failure(caller_failure, index_failure)
+        {
+            self.finished = true;
+            self.result_caller_epoch = caller_epoch;
+            self.stale = true;
+            return;
+        }
         let first_sole = self.result_caller_epoch.is_none()
             && self.ordinary_sequence == 1
             && !self.finished
@@ -334,6 +365,7 @@ impl CandidateSummary {
         self.finished = true;
         self.result = result;
         self.result_caller_epoch = caller_epoch;
+        self.stale = false;
     }
 }
 
@@ -716,6 +748,7 @@ impl CountOwnership {
             return view;
         };
         if summary.finished
+            && !summary.stale
             && summary.caller_epoch == slot.epoch
             && summary.revision == Some(index.revision)
         {
@@ -724,7 +757,12 @@ impl CountOwnership {
         let initial = summary.result_caller_epoch.is_none()
             && !summary.finished
             && summary.ordinary_sequence == 1;
-        if (initial || matches!(view.candidate, Some(CurrentCandidates::Sole { .. })))
+        // A stale retained Sole backs ordinary continuity (the confirmed
+        // refresh arm still needs its own present-tense proof to stage),
+        // but it is never served as the current candidate above.
+        if (initial
+            || matches!(view.candidate, Some(CurrentCandidates::Sole { .. }))
+            || summary.stale && matches!(summary.result, CurrentCandidates::Sole { .. }))
             && !summary
                 .unconsumed_failure(slot.last_authority_failure, index.last_authority_failure)
         {
@@ -756,6 +794,7 @@ impl CountOwnership {
             .get(&(caller, object))
             .filter(|summary| {
                 summary.finished
+                    && !summary.stale
                     && summary.caller_epoch == slot.epoch
                     && summary.revision == Some(index.revision)
             })
@@ -1074,6 +1113,7 @@ impl CountOwnership {
                             caller_slot.and_then(|slot| slot.epoch),
                             caller_slot.map_or(u64::MAX, |slot| slot.last_authority_failure),
                             index.last_authority_failure,
+                            false,
                         );
                     }
                 }
@@ -1084,6 +1124,7 @@ impl CountOwnership {
                 summary.restart(slot.epoch, index.revision);
             }
             if summary.finished
+                && !summary.stale
                 && !matches!(summary.result, CurrentCandidates::Unknown)
                 && !index.refused
                 && !index.unknown
@@ -1107,6 +1148,7 @@ impl CountOwnership {
                     slot.epoch,
                     slot.last_authority_failure,
                     index.last_authority_failure,
+                    false,
                 );
                 continue;
             };
@@ -1137,6 +1179,7 @@ impl CountOwnership {
                                 slot.epoch,
                                 slot.last_authority_failure,
                                 index.last_authority_failure,
+                                false,
                             );
                             continue;
                         }
@@ -1179,6 +1222,7 @@ impl CountOwnership {
                 slot.epoch,
                 slot.last_authority_failure,
                 index.last_authority_failure,
+                true,
             );
             summary.candidate = None;
         }

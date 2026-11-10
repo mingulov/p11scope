@@ -11566,6 +11566,13 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         "the retained view is the lowest-pid member"
     );
     engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    // Deterministic paging (same confound as the E05 scale twin): the
+    // wall-time quanta are covered by their own tests, so pin them here —
+    // the pass pins below measure rotation/rarity/cursor arithmetic, not
+    // scheduler wall time under parallel load (a quantum-cut admission
+    // otherwise defers the pass-1 rotation scan with correct explicit
+    // evidence).
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
 
     // Passes 1-3 are ordinary: only the pass-1 rotation admission charges
     // (initial discovery agreed on exactly the lowest rep, so one free slot
@@ -14356,6 +14363,11 @@ fn pause_gate_proofs_missing_release_must_not_prove() {
 fn lifecycle_scan_only_exit_reports_zero_active_slots() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_scan_only_before_load();
+    // The slot pins below assert in-frame refresh outcomes: hold the tick
+    // quantum's wall clock like RefreshFairnessFixture does, so a loaded
+    // runner cannot defer the rescan past the 200ms default and leave the
+    // table unscanned while the (retained) request waits for the next frame.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     fixture.load();
     engine.request_refresh(fixture.child.pid(), None);
     refresh_inventory_once(&mut engine);
@@ -47483,6 +47495,11 @@ fn pressure_services_unprotected_request_before_original_head() {
     let (mut oracle_fixture, mut oracle, _oarmed, _orecord, mut oracle_session) =
         armed_seed_route(1);
     oracle.frame_work_budget_ns = u64::MAX;
+    // The exact scan/work pins below assert in-frame pressure outcomes:
+    // hold the tick quantum's wall clock like RefreshFairnessFixture does,
+    // so a loaded runner cannot defer the service pass past the 200ms
+    // default and rule the entry out without an attempt.
+    oracle.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let oracle_pid = oracle.views[0].pid();
     let mut oracle_peers: Vec<u32> = (0..2).map(|_| oracle_fixture.spawn_peer()).collect();
     // Exact work equality needs identical maps censuses: a deep scan
@@ -47621,6 +47638,9 @@ fn pressure_services_unprotected_request_before_original_head() {
     // protected and is never selected.
     let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
     engine.frame_work_budget_ns = u64::MAX;
+    // Same in-frame hold as the oracle above: the episode pins exact
+    // scans, attempts and work deltas, not scheduler wall time.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let pid = engine.views[0].pid();
     let mut peers: Vec<u32> = (0..2).map(|_| fixture.spawn_peer()).collect();
     assert_eq!(

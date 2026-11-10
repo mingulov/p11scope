@@ -57438,6 +57438,53 @@ fn midfinal_residual_deferred_inventory_keeps_named_view_until_proven_exit() {
     );
 }
 
+/// Live rebinds must restore the scan-owned pin layer before appending the
+/// fresh module/entry pins (like the inventory path's
+/// `reset_scan_pin_claims`) instead of stacking a new pin layer per tick:
+/// the stacked duplicates are the rc-8 release RSS growth.
+#[test]
+fn live_rebind_restores_scan_pin_layer_instead_of_stacking() {
+    let (_fixture, mut engine, _session) = continuity_route();
+    let view = engine.views[0].id();
+    // Drive the per-tick commit path directly (clone, rebind, commit): a
+    // settled capture skips the rebind, so plain batches cannot observe
+    // the stacking.
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    assert!(
+        !raw_modules.is_empty(),
+        "precondition: the attached view owns scanned modules"
+    );
+    let first = engine
+        .live_candidate(engine.pinned.clone(), raw_modules.clone(), Vec::new())
+        .expect("a repeated inventory tick never fails the capture");
+    engine.pinned = first.pinned;
+    let pins_after_first = engine
+        .pinned
+        .view_claims(view)
+        .expect("the view keeps its claims across a tick")
+        .pins
+        .len();
+    let second = engine
+        .live_candidate(engine.pinned.clone(), raw_modules, Vec::new())
+        .expect("a second repeated inventory tick never fails the capture");
+    engine.pinned = second.pinned;
+    let pins_after_second = engine
+        .pinned
+        .view_claims(view)
+        .expect("the view keeps its claims across two ticks")
+        .pins
+        .len();
+    assert_eq!(
+        pins_after_first, pins_after_second,
+        "a repeated rebind restores the scan pin layer instead of stacking: \
+         first={pins_after_first} second={pins_after_second}"
+    );
+}
+
 /// Midfinal residual P1, multi-process scope: a declined loss report must
 /// govern the inventory removal sets. A live system-scope view whose pin
 /// is unprovable keeps its view ID, claims, contexts and slots through

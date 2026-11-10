@@ -2758,6 +2758,61 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
+    // The deferred-admission note (a non-loss retry) names its retry;
+    // every other semantic-unavailable site is plain unavailability.
+    // Verbose keeps the machine token beside the words, JSON verbatim.
+    if reason == "semantic_unavailable:no_receipt" {
+        return "will retry on the next scan; no calls lost";
+    }
+    if reason == "semantic_unavailable" || reason.starts_with("semantic_unavailable:") {
+        return "per-key tracking unavailable";
+    }
+    // Joint birth refusals: capacity names its limit, registration and
+    // install name their stage, native observation names its refusal,
+    // and every claim variant keeps the first-call wording. A generic
+    // joint-birth fallback catches future variants so no token leaks
+    // to concise; verbose keeps each token beside the words.
+    if reason == "joint_birth_registration_Capacity"
+        || reason == "joint_birth_install_Capacity"
+        || reason == "semantic_resource_capacity"
+    {
+        return "per-key tracking hit its capacity";
+    }
+    if reason.strip_prefix("joint_birth_registration_").is_some() {
+        return "per-key tracking registration refused";
+    }
+    if reason.strip_prefix("joint_birth_install_").is_some() {
+        return "per-key tracking install refused";
+    }
+    if reason.strip_prefix("joint_birth_native_").is_some() {
+        return "per-key tracking observation refused";
+    }
+    if reason.strip_prefix("joint_birth_claim_").is_some() {
+        return "process was not tracked from its first call";
+    }
+    // Existing specific birth refusals keep their wording ahead of the
+    // generic fallback below.
+    if reason == "joint_birth_unoffered" {
+        return "no key session was offered to track";
+    }
+    if reason == "joint_birth_no_admission" {
+        return "process was not admitted for tracking";
+    }
+    if reason == "joint_birth_unbound" {
+        return "caller not bound for tracking";
+    }
+    if reason == "joint_birth_admission_mismatch" {
+        return "tracking admission mismatched";
+    }
+    if reason == "joint_birth_candidate_missing" {
+        return "tracking candidate missing";
+    }
+    if reason == "joint_birth_original_mismatch" {
+        return "tracking origin mismatched";
+    }
+    if reason.strip_prefix("joint_birth_").is_some() {
+        return "per-key tracking refused this process";
+    }
     // A chrooted-target failure that attempted the gated host-root
     // fallback names a live process whose object missed (or was refused)
     // under both roots — never an exit race, even when the target half
@@ -2827,12 +2882,26 @@ fn gap_plain_reason(reason: &str) -> &str {
         return "call counts unavailable on this host (see 'p11scope doctor')";
     }
     match reason {
-        "joint_birth_unoffered" => "no key session was offered to track",
-        "joint_image_refused" | "joint_birth_claim_ImageTainted" => {
-            "process was not tracked from its first call"
-        }
-        "joint_birth_no_admission" => "process was not admitted for tracking",
+        "joint_image_refused" => "process was not tracked from its first call",
         "joint_journal_unavailable" => "per-key tracking is off in this run",
+        "before_semantic_boundary" => "earlier calls not counted",
+        "no_calls" => "no calls to track",
+        "instance_unproven" => "instance not proven",
+        "provider_instance_unproven" => "provider instance not proven",
+        "caller_unbound" => "caller not bound",
+        "unauthorized" => "not authorized",
+        "ambiguous_descriptor" => "ambiguous descriptor",
+        "count_only" => "counts only, no details",
+        "semantic_loss" => "semantic data lost",
+        "out_of_order_return" => "out-of-order return",
+        "instance_retired" => "instance retired",
+        "image_retired" => "image retired",
+        "task_retired" => "task retired",
+        "capture_stopped" => "capture stopped",
+        "instance_capacity" => "instance capacity reached",
+        "semantic_state_capacity" => "tracking state full",
+        "authority_exhausted" => "tracking authority exhausted",
+        "negative_state_capacity" => "tracking state full",
         "foreign_or_unproven_caller" => "caller not confirmed",
         "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection" => {
             "some processes were identified from /proc only"

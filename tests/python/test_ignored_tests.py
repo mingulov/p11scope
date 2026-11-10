@@ -13,9 +13,12 @@ runner's WIDE_DETAILED_2112_TESTS list, and every `live-kernel` or
 INTEGRATION_TESTS list. These tests prove the checked-in inventory
 matches the sources, then exercise each failure mode on synthetic
 fixture trees so a regression in the checker cannot hide behind a clean
-real tree. Final groups drive the runner's wide-list and integration
-modes against fake binaries: a matching binary is accepted, a default
-or incomplete one is refused cleanly.
+real tree. Final groups drive the runner's list and integration modes
+against fake binaries: a matching binary is accepted, a default
+or incomplete one is refused cleanly. Since v0.7.0 made 2,112 slots
+the default profile, --wide-detailed-2112 is a no-op alias: the flag
+is accepted and ignored, and the promoted wide cells run in the
+default campaign.
 
 Run: python3 -I tests/python/test_ignored_tests.py -v
 """
@@ -47,9 +50,12 @@ CELLS = {
 
 WIDE_OWNER = "wide-detailed-2112 runner"
 
-# The exact wide-featured lib tests: the four wide-gated fns plus the
-# five wide-gated detailed_sweep_test! expansions. Pinned literally so a
-# runner edit that drops or renames one fails here, not silently.
+# The nine wide-Detailed cells, promoted to DEFAULT_TESTS since v0.7.0
+# made 2,112 slots the default profile (the four wide-gated fns plus
+# the five wide-gated detailed_sweep_test! expansions). Pinned
+# literally so a runner edit that drops or renames one fails here, not
+# silently. Kept for one release; remove with the --wide-detailed-2112
+# no-op alias.
 WIDE_EXPECTED = [
     "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
     "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64",
@@ -1618,8 +1624,8 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 230 + 2.
-        self.assertIn("default (232)", result.stdout)
+        # exactly one), so the default section shows 240 + 2.
+        self.assertIn("default (242)", result.stdout)
         self.assertIn("btrfs (17, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (14, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
@@ -1627,7 +1633,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (306 tests)",
+        self.assertIn("verify: curation matches the binary (316 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1823,7 +1829,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=230",
+            "DEFAULT_TESTS=240",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
             "BTRFS_TESTS=17",
@@ -1833,7 +1839,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_FIXTURE_TESTS=27",
             "WRAP_FIXTURE_TESTS=7",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",
-            "WIDE_DETAILED_2112_TESTS=9",
+            "WIDE_DETAILED_2112_TESTS=0",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
             "DISCOVER_BTRFS_SUBVOL_TESTS=1",
@@ -1842,19 +1848,38 @@ class IgnoredTestsTests(unittest.TestCase):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
 
-    def test_wide_list_mode_accepts_a_wide_binary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            binary = Path(tmp) / "libtest-wide"
-            write_fake_binary(binary, WIDE_EXPECTED + ["plain::t_one"])
-            result = run_runner("--list", "--wide-detailed-2112",
-                                str(binary))
-        self.assertEqual(result.returncode, 0,
-                         result.stdout + result.stderr)
-        self.assertIn("wide-detailed-2112 (9)", result.stdout)
+    def test_wide_flag_is_accepted_and_ignored_in_list_mode(self):
+        # --wide-detailed-2112 is a no-op alias since v0.7.0: the flag
+        # is accepted, a note names it on stderr, and the run lists the
+        # default campaign exactly as without the flag. The nine
+        # promoted cells now live in DEFAULT_TESTS; the wide list is
+        # empty. Kept for one release; remove with the alias.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         for name in WIDE_EXPECTED:
-            self.assertIn(name, result.stdout)
-        self.assertIn("verify: wide-detailed-2112 curation matches "
-                      "the binary (9 tests)", result.stdout)
+            with self.subTest(name=name):
+                self.assertIn(name, lists["DEFAULT_TESTS"])
+        self.assertEqual(len(lists["WIDE_DETAILED_2112_TESTS"]), 0)
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-wide-alias"
+            write_fake_binary(binary, sorted(full - proof))
+            plain = run_runner("--list", str(binary))
+            aliased = run_runner("--list", "--wide-detailed-2112",
+                                 str(binary))
+        self.assertEqual(plain.returncode, 0,
+                         plain.stdout + plain.stderr)
+        self.assertEqual(aliased.returncode, 0,
+                         aliased.stdout + aliased.stderr)
+        self.assertEqual(aliased.stdout, plain.stdout)
+        self.assertIn("wide-detailed-2112 is the default profile",
+                      aliased.stderr)
+        self.assertNotIn("wide-detailed-2112", plain.stderr)
 
     def test_wide_list_mode_refuses_a_default_binary(self):
         # A default binary carries none of the wide tests: the mode must
@@ -1872,20 +1897,31 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("privileged_task4_detailed_2112_lp64", result.stderr)
         self.assertNotIn("verify:", result.stdout)
 
-    def test_wide_list_mode_refuses_a_duplicated_listing(self):
-        # A binary listing one curated member twice selects two tests,
-        # not exactly one: the mode must refuse instead of deduping
-        # the duplicate away and printing a verify receipt.
+    def test_wide_flag_ignores_a_duplicated_default_listing(self):
+        # The old wide mode refused duplicated listings; the no-op alias
+        # follows the default campaign, which dedupes the binary list
+        # (sort -u), so a duplicated member still verifies. Kept for one
+        # release; remove with the alias.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        members = sorted(full - proof)
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "libtest-dup"
-            write_fake_binary(binary, WIDE_EXPECTED + [WIDE_EXPECTED[0]])
+            write_fake_binary(binary, members + [members[0]])
             result = run_runner("--list", "--wide-detailed-2112",
                                 str(binary))
-        self.assertEqual(result.returncode, 1,
+        self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("more than one", result.stderr)
-        self.assertIn(WIDE_EXPECTED[0], result.stderr)
-        self.assertNotIn("verify:", result.stdout)
+        self.assertIn("wide-detailed-2112 is the default profile",
+                      result.stderr)
+        self.assertIn("verify: curation matches the binary",
+                      result.stdout)
 
     def test_integration_entry_without_curation_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

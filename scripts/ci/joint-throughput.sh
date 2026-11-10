@@ -67,11 +67,12 @@
 # The joint cells spawn the generator after the observer's pass 0, so
 # its exec lands after the linked lane seals and its key is created
 # inside the observed window. The generator prints MAPPED once the
-# provider is mapped but before its first call; the cell waits for an
-# admission pass, opens the setup gate, waits for READY, waits for a
-# second pass so bindings install, then opens GO. First use after
-# admission keeps the usage edge counted (use before admission voids
-# it for good), and the unpaced setup prologue stays outside the
+# provider is mapped but before its first call; the cell waits for two
+# admission passes (the first published after mapping may have scanned
+# before it), opens the setup gate, waits for READY, waits for another
+# pass so bindings install, then opens GO. First use after admission
+# keeps the usage edge counted (use before admission voids it for
+# good), and the unpaced setup prologue stays outside the
 # paced rate windows by oracle design. Every cell holds its target
 # through the observer drain with the FINISH gate and proves the hold
 # (live PID plus provider mapping) before releasing it. The oracle
@@ -742,7 +743,14 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=mapped-timeout" || return 1
         return 0
     fi
-    log "$cell: provider mapped; waiting for an admission pass"
+    # Two passes, not one: the first pass published after MAPPED may
+    # have scanned before the generator mapped the provider (r14a/r14c
+    # shed the whole setup prologue pre-binding this way), while the
+    # second pass necessarily scanned after mapping (the observer loop
+    # is sequential: each pass scans only after the previous one
+    # published) and admits the generator in that same pass. Setup
+    # after admission keeps the usage edge counted.
+    log "$cell: provider mapped; waiting for two admission passes"
     passes_before=$(pass_count "$dir/observer.out")
     if ! wait_for_pass "$dir/observer.out" "$passes_before" 180; then
         log "$cell: no admission pass after mapping"
@@ -751,6 +759,17 @@ run_joint_cell() {
         wait 2>/dev/null || true
         exec 9>&-
         fail_flow "$dir" "no admission pass after mapping"
+        finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
+        return 0
+    fi
+    passes_before=$(pass_count "$dir/observer.out")
+    if ! wait_for_pass "$dir/observer.out" "$passes_before" 180; then
+        log "$cell: no second admission pass after mapping"
+        kill_pidfile "$dir/gen.pid"
+        kill_observer "$dir/observer.pid"
+        wait 2>/dev/null || true
+        exec 9>&-
+        fail_flow "$dir" "no second admission pass after mapping"
         finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
         return 0
     fi

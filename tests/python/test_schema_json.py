@@ -13,6 +13,7 @@ Run: python3 -I tests/python/test_schema_json.py -v
 
 import copy
 import json
+import re
 import runpy
 import unittest
 from pathlib import Path
@@ -1063,7 +1064,40 @@ class SchemaOracleAgreement(unittest.TestCase):
             skip_reasons,
             set(CHECKER["ENTRY_REASONS"])
             | set(CHECKER["DISCOVERY_REASONS"])
-            | set(CHECKER["RUN_TREE_REASONS"]),
+            | set(CHECKER["RUN_TREE_REASONS"])
+            | set(CHECKER["HANDOFF_REASONS"]),
+        )
+
+    def test_handoff_partial_profile_validates(self):
+        """A handoff `-o` JSON — the failed step plus every drain/read gap
+        the seals file — validates against the oracle behind the schema."""
+        document = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}))
+        evidence = document["evidence"]
+        evidence["skipped"] = [
+            {"name": name, "reason": reason}
+            for name, reasons in CHECKER["HANDOFF_REASONS_BY_SUBJECT"].items()
+            for reason in sorted(reasons)
+        ]
+        CHECKER["settle_fixture_verdict"](document)
+        CHECKER["discovery_skips"](evidence)
+        CHECKER["exact_profile_v3_selection"](document)
+
+    def test_handoff_vocabulary_matches_producer(self):
+        """The oracle's handoff vocabulary is exactly what `src/run.rs`
+        emits: transcription drift between the producer consts and this
+        checker fails closed here."""
+        run_rs = (ROOT / "src" / "run.rs").read_text(encoding="utf-8")
+        kinds = {"REASON": set(), "GAP": set(), "STEP": set()}
+        for const, value in re.findall(
+            r'const (HANDOFF_(?:REASON|GAP|STEP)_\w+): &str =\s*"([^"]*)";',
+            run_rs,
+        ):
+            kinds[const.split("_")[1]].add(value)
+        self.assertEqual(set(kinds["REASON"]), set(CHECKER["HANDOFF_REASONS"]))
+        self.assertEqual(
+            set(kinds["GAP"]) | set(kinds["STEP"]),
+            set(CHECKER["HANDOFF_SUBJECTS"]),
         )
         self.assertEqual(
             set(SCHEMA["properties"]["lane"]["enum"]),

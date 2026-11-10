@@ -560,7 +560,18 @@
                   "discovery transport unavailable",
                   "process-tree members were still present when the command exited; their calls after the run end are out of scope",
                   "only the started command is observed",
-                  "handed-back descendants are unknown"
+                  "handed-back descendants are unknown",
+                  "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
+                  "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure",
+                  "the terminal identity recheck failed; provider sameness is unproven",
+                  "the reaped child's tail could not be retired; its events may be missing or double-counted",
+                  "the reaped child's tail drain was cancelled; its events are unproven",
+                  "the reaped child's tail drain failed; its events are unproven",
+                  "the terminal event drain failed; calls past the failure are unproven",
+                  "the EVENTS reader could not be opened; calls are unproven",
+                  "the terminal counter read failed; counts are unproven",
+                  "the ring-loss line could not be emitted; loss is unproven",
+                  "the terminal kernel evidence read failed; loss is unproven"
                 ]
               }
             }

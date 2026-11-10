@@ -885,6 +885,37 @@ retired cleanly. It is annotation only — the paired `run process tree`
 skip carries the verdict through the `skipped` cause, like every other
 non-null-pointer skip.
 
+Owned-handoff gaps file under the failed step and their own gap subjects.
+When an owned startup step fails after probes attached, the partial report
+names the step in one record — `{name, reason}` with `name` exactly one of
+`pause arm`, `exec handoff`, `post-release pause revalidation` and `reason`
+exactly one of:
+
+- `the owned startup step failed before the capture loop; the report holds
+  what was captured up to the failure` (profile and metrics documents)
+- `the owned startup step failed before the capture loop; the trace holds
+  what was captured up to the failure` (trace `EVIDENCE`)
+
+Every drain and read failure behind the handoff files beside it under its
+own subject, with `reason` exactly the paired sentence:
+
+- `{name: "provider identity", reason: "the terminal identity recheck
+  failed; provider sameness is unproven"}`
+- `{name: "original root tail", reason}` with `reason` exactly one of
+  `the reaped child's tail could not be retired; its events may be missing
+  or double-counted`, `the reaped child's tail drain was cancelled; its
+  events are unproven`, `the reaped child's tail drain failed; its events
+  are unproven`
+- `{name: "events drain", reason}` with `reason` exactly one of
+  `the terminal event drain failed; calls past the failure are unproven`,
+  `the EVENTS reader could not be opened; calls are unproven`
+- `{name: "counter collection", reason: "the terminal counter read failed;
+  counts are unproven"}`
+- `{name: "ring loss report", reason: "the ring-loss line could not be
+  emitted; loss is unproven"}` (trace only)
+- `{name: "kernel evidence", reason: "the terminal kernel evidence read
+  failed; loss is unproven"}` (trace only)
+
 Counts are array lengths; no path, PID, or error chain leaves diagnostics.
 
 `evidence.pause_unavailable` (integer, required, default 0) counts `--pause

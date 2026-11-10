@@ -618,6 +618,80 @@ RUN_TREE_REASONS = {
     RUN_TREE_DEGRADED,
     RUN_TREE_MEMBERSHIP_UNKNOWN,
 }
+# Owned-handoff (v0.7.0): a run whose startup step failed after probes
+# attached seals a partial report naming the failed step, with every
+# drain and read failure behind it as a named gap under its own subject
+# (src/run.rs `HANDOFF_REASON_*` / `HANDOFF_GAP_*`). The raw error chains
+# stay in diagnostics; the document keeps these fixed pairs only.
+HANDOFF_STEP_SUBJECTS = frozenset({
+    "pause arm",
+    "exec handoff",
+    "post-release pause revalidation",
+})
+HANDOFF_STEP_PROFILE = (
+    "the owned startup step failed before the capture loop; "
+    "the report holds what was captured up to the failure"
+)
+HANDOFF_STEP_TRACE = (
+    "the owned startup step failed before the capture loop; "
+    "the trace holds what was captured up to the failure"
+)
+HANDOFF_IDENTITY = (
+    "the terminal identity recheck failed; provider sameness is unproven"
+)
+HANDOFF_TAIL_RETIRE = (
+    "the reaped child's tail could not be retired; "
+    "its events may be missing or double-counted"
+)
+HANDOFF_TAIL_CANCELLED = (
+    "the reaped child's tail drain was cancelled; its events are unproven"
+)
+HANDOFF_TAIL_DRAIN = (
+    "the reaped child's tail drain failed; its events are unproven"
+)
+HANDOFF_EVENTS_DRAIN = (
+    "the terminal event drain failed; calls past the failure are unproven"
+)
+HANDOFF_EVENTS_OPEN = "the EVENTS reader could not be opened; calls are unproven"
+HANDOFF_COUNTER = "the terminal counter read failed; counts are unproven"
+HANDOFF_RING_LOSS = "the ring-loss line could not be emitted; loss is unproven"
+HANDOFF_KERNEL = "the terminal kernel evidence read failed; loss is unproven"
+HANDOFF_GAP_PROVIDER_IDENTITY = "provider identity"
+HANDOFF_GAP_ORIGINAL_ROOT_TAIL = "original root tail"
+HANDOFF_GAP_EVENTS_DRAIN = "events drain"
+HANDOFF_GAP_COUNTER_COLLECTION = "counter collection"
+HANDOFF_GAP_RING_LOSS = "ring loss report"
+HANDOFF_GAP_KERNEL_EVIDENCE = "kernel evidence"
+HANDOFF_GAP_SUBJECTS = frozenset({
+    HANDOFF_GAP_PROVIDER_IDENTITY,
+    HANDOFF_GAP_ORIGINAL_ROOT_TAIL,
+    HANDOFF_GAP_EVENTS_DRAIN,
+    HANDOFF_GAP_COUNTER_COLLECTION,
+    HANDOFF_GAP_RING_LOSS,
+    HANDOFF_GAP_KERNEL_EVIDENCE,
+})
+HANDOFF_SUBJECTS = HANDOFF_STEP_SUBJECTS | HANDOFF_GAP_SUBJECTS
+HANDOFF_REASONS_BY_SUBJECT = {
+    HANDOFF_GAP_PROVIDER_IDENTITY: frozenset({HANDOFF_IDENTITY}),
+    HANDOFF_GAP_ORIGINAL_ROOT_TAIL: frozenset({
+        HANDOFF_TAIL_RETIRE, HANDOFF_TAIL_CANCELLED, HANDOFF_TAIL_DRAIN,
+    }),
+    HANDOFF_GAP_EVENTS_DRAIN: frozenset(
+        {HANDOFF_EVENTS_DRAIN, HANDOFF_EVENTS_OPEN}
+    ),
+    HANDOFF_GAP_COUNTER_COLLECTION: frozenset({HANDOFF_COUNTER}),
+    HANDOFF_GAP_RING_LOSS: frozenset({HANDOFF_RING_LOSS}),
+    HANDOFF_GAP_KERNEL_EVIDENCE: frozenset({HANDOFF_KERNEL}),
+}
+HANDOFF_REASONS_BY_SUBJECT.update({
+    subject: frozenset({HANDOFF_STEP_PROFILE, HANDOFF_STEP_TRACE})
+    for subject in HANDOFF_STEP_SUBJECTS
+})
+HANDOFF_REASONS = frozenset(
+    reason
+    for reasons in HANDOFF_REASONS_BY_SUBJECT.values()
+    for reason in reasons
+)
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
@@ -2673,14 +2747,18 @@ def bounded_skip(item):
     entry = item["name"].startswith("C_")
     gated_null = item == UNKNOWN_NULL_SKIP
     run_tree = item["name"] == RUN_TREE_SUBJECT
+    handoff = item["name"] in HANDOFF_SUBJECTS
     require(
-        entry or gated_null or run_tree or item["name"] == DISCOVERY_SUBJECT,
+        entry or gated_null or run_tree or handoff
+        or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
     if entry or gated_null:
         allowed = ENTRY_REASONS
     elif run_tree:
         allowed = RUN_TREE_REASONS
+    elif handoff:
+        allowed = HANDOFF_REASONS_BY_SUBJECT[item["name"]]
     else:
         allowed = DISCOVERY_REASONS
     require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
@@ -5952,6 +6030,32 @@ def self_test():
     for wrong_reason in (DISCOVERY_UNAVAILABLE, TABLE_UNAVAILABLE, ENTRY_UNAVAILABLE):
         bad = copy.deepcopy(bounded_skips)
         bad["skipped"] = [{"name": "unknown", "reason": wrong_reason}]
+        rejected(lambda bad=bad: discovery_skips(bad))
+    handoff = copy.deepcopy(bounded_skips)
+    handoff["skipped"] = [
+        {"name": name, "reason": reason}
+        for name, reasons in HANDOFF_REASONS_BY_SUBJECT.items()
+        for reason in sorted(reasons)
+    ]
+    discovery_skips(handoff)
+    require(
+        entry_skips(handoff) == [],
+        f"handoff gaps leak into entry skips: {entry_skips(handoff)}",
+    )
+    require(
+        discovery_skips(handoff) == [],
+        f"handoff gaps leak into discovery skips: {discovery_skips(handoff)}",
+    )
+    for name, reasons in HANDOFF_REASONS_BY_SUBJECT.items():
+        for reason in DISCOVERY_REASONS | ENTRY_REASONS | RUN_TREE_REASONS:
+            if reason in reasons:
+                continue
+            bad = copy.deepcopy(bounded_skips)
+            bad["skipped"] = [{"name": name, "reason": reason}]
+            rejected(lambda bad=bad: discovery_skips(bad))
+    for reason in HANDOFF_REASONS:
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"] = [{"name": DISCOVERY_SUBJECT, "reason": reason}]
         rejected(lambda bad=bad: discovery_skips(bad))
     print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)

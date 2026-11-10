@@ -5303,7 +5303,7 @@ fn terminal_drain_withdraws_a_counted_loss_whose_group_exited() {
         .unwrap();
     let view = ProcessView::open(ProcessViewId(60), child.id()).unwrap();
     let view_exit_ns = view.admitted_ns();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(60), Some(view_exit_ns));
     // `Ok(false)` from a live group stands in for a sample landing
@@ -5347,7 +5347,7 @@ fn terminal_drain_prunes_a_pending_assessment_whose_group_exited() {
         .unwrap();
     let view = ProcessView::open(ProcessViewId(61), child.id()).unwrap();
     let view_exit_ns = view.admitted_ns();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(61), Some(view_exit_ns));
     child.kill().unwrap();
@@ -5375,7 +5375,7 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
         .unwrap();
     let view = ProcessView::open(ProcessViewId(62), child.id()).unwrap();
     let view_exit_ns = view.admitted_ns();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(62), Some(view_exit_ns));
     let polled = engine.views[0].original_exited();
@@ -5405,6 +5405,23 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
     child.wait().unwrap();
 }
 
+/// An engine whose leader-exit losses may be withdrawn: system scope, and
+/// every session so far attached its static probes process-wide.
+fn wide_system_engine() -> Engine {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.static_probes_process_wide = Some(true);
+    engine
+}
+
+/// A scripted session whose static probes are process-wide.
+fn wide_session() -> ScriptedSession {
+    ScriptedSession {
+        probes_process_wide: true,
+        ..ScriptedSession::default()
+    }
+}
+
 /// A record of `kind` from `pid`'s thread group at kernel time `hook_ts_ns`.
 fn group_record_at(kind: u8, pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -5424,7 +5441,7 @@ fn counted_leader_exit_loss(id: u32) -> (Engine, std::process::Child, u64) {
         .unwrap();
     let view = ProcessView::open(ProcessViewId(id), child.id()).unwrap();
     let exit_ns = view.admitted_ns();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(id), Some(exit_ns));
     let polled = engine.views[0].original_exited();
@@ -5453,7 +5470,7 @@ fn terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit() 
     let pid = engine.views[0].pid();
     engine
         .apply_discovery_batch(
-            &mut ScriptedSession::default(),
+            &mut wide_session(),
             vec![group_record_at(
                 DISCOVERY_KIND_FUNCTION_LIST_RETURN,
                 pid,
@@ -5487,7 +5504,7 @@ fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit
     let pid = engine.views[0].pid();
     engine
         .apply_discovery_batch(
-            &mut ScriptedSession::default(),
+            &mut wide_session(),
             vec![group_record_at(
                 DISCOVERY_KIND_FUNCTION_LIST_RETURN,
                 pid,
@@ -5517,7 +5534,7 @@ fn terminal_drain_keeps_a_pending_assessment_observed_after_the_exit() {
     let view = ProcessView::open(ProcessViewId(65), child.id()).unwrap();
     let exit_ns = view.admitted_ns();
     let pid = view.pid();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(65), Some(exit_ns));
     engine.note_group_record(&group_record_at(DISCOVERY_KIND_EXEC, pid, exit_ns + 5));
@@ -5539,7 +5556,7 @@ fn terminal_drain_keeps_a_loss_whose_exit_order_is_unknown() {
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(66), child.id()).unwrap();
-    let mut engine = Engine::empty();
+    let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(66), None);
     let polled = engine.views[0].original_exited();
@@ -5619,22 +5636,167 @@ fn terminal_drain_keeps_a_loss_whose_view_was_removed_while_live() {
     assert_eq!(engine.task_uprobe_link_losses, 1);
 }
 
+/// A second `sleep` opened under `id` after the first process's id was
+/// released, with its own leader exit queued at `exit_ns`.
+fn reuse_id_for_new_process(engine: &mut Engine, id: u32, exit_ns: u64) -> std::process::Child {
+    assert_eq!(engine.allocate_view_id().unwrap(), ProcessViewId(id));
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+    engine.queue_leader_exit_assessment(ProcessViewId(id), Some(exit_ns));
+    child
+}
+
 #[test]
-fn a_reused_view_id_cancels_an_earlier_removal_proof() {
-    // View ids return to the free list. Once a new generation under the
-    // same id queues its own leader exit, the old proof must not withdraw.
-    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(70);
+fn a_later_process_on_a_reused_id_cannot_withdraw_an_earlier_real_loss() {
+    // The first process ran after its leader exit (a real loss); its id
+    // goes back to the free list. A second process on the same id exits
+    // cleanly. Its clean exit must not take back the first process's count.
+    let (mut engine, mut first, exit_ns) = counted_leader_exit_loss(71);
+    let first_pid = engine.views[0].pid();
+    engine.note_group_record(&group_record_at(
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+        first_pid,
+        exit_ns + 1,
+    ));
+    first.kill().unwrap();
+    first.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(71));
+
+    let mut second = reuse_id_for_new_process(&mut engine, 71, exit_ns + 100);
+    second.kill().unwrap();
+    second.wait().unwrap();
+    let polled = engine.views[0].original_exited();
+    assert_eq!(polled, Ok(true));
+    settle_leader_exit_view(
+        &mut engine.pending_leader_exit_views,
+        &mut engine.counted_leader_exit_views,
+        &mut engine.task_uprobe_link_losses,
+        ProcessViewId(71),
+        polled,
+    );
+    remove_view_like_retirement(&mut engine, ProcessViewId(71));
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(
+        engine.task_uprobe_link_losses, 1,
+        "the first process's real loss stays"
+    );
+}
+
+#[test]
+fn a_reused_id_keeps_each_process_judged_on_its_own_proof() {
+    // The forward direction: the first process's transient is withdrawn
+    // from its own released proof, while the second process on the reused
+    // id, still live at capture end, keeps its own loss.
+    let (mut engine, mut first, exit_ns) = counted_leader_exit_loss(72);
+    first.kill().unwrap();
+    first.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(72));
+    assert_eq!(engine.released_leader_exit_proofs.len(), 1);
+    assert!(engine.counted_leader_exit_views.is_empty());
+
+    let mut second = reuse_id_for_new_process(&mut engine, 72, exit_ns + 100);
+    let polled = engine.views[0].original_exited();
+    assert_eq!(polled, Ok(false));
+    settle_leader_exit_view(
+        &mut engine.pending_leader_exit_views,
+        &mut engine.counted_leader_exit_views,
+        &mut engine.task_uprobe_link_losses,
+        ProcessViewId(72),
+        polled,
+    );
+    assert_eq!(engine.task_uprobe_link_losses, 2);
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    second.kill().unwrap();
+    second.wait().unwrap();
+}
+
+#[test]
+fn a_pending_assessment_is_written_off_when_its_id_is_released() {
+    // An unanswerable assessment must not be inherited by the next
+    // process on the id: it is counted when the id is freed.
+    let mut engine = wide_system_engine();
+    engine.queue_leader_exit_assessment(ProcessViewId(73), Some(10));
+    engine.release_view_id(ProcessViewId(73));
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.counted_leader_exit_views.is_empty());
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn pid_scope_never_withdraws_a_leader_exit_loss() {
+    // Under --pid and run every probe is bound to the leader's task, so
+    // surviving threads leave no record the gate could see.
+    let (mut engine, mut child, _) = counted_leader_exit_loss(74);
+    engine.scope = Scope::Pid(engine.views[0].pid());
     child.kill().unwrap();
     child.wait().unwrap();
-    remove_view_like_retirement(&mut engine, ProcessViewId(70));
-    assert!(
-        engine
-            .exited_removed_leader_exit_views
-            .contains_key(&ProcessViewId(70))
-    );
-    engine.queue_leader_exit_assessment(ProcessViewId(70), Some(exit_ns + 10));
-    assert!(engine.exited_removed_leader_exit_views.is_empty());
-    engine.pending_leader_exit_views.clear();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn a_pid_bound_session_under_system_scope_never_withdraws() {
+    // A selected-endpoint session binds its probes to one pid even under
+    // system scope; one such batch disables withdrawal for the capture.
+    let (mut engine, mut child, _) = counted_leader_exit_loss(75);
+    engine.note_session_probe_scope(&ScriptedSession::default());
+    engine.note_session_probe_scope(&wide_session());
+    assert_eq!(engine.static_probes_process_wide, Some(false));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn lost_discovery_records_never_let_a_leader_exit_loss_be_withdrawn() {
+    // "No later record" proves nothing when records were dropped.
+    let (mut engine, mut child, _) = counted_leader_exit_loss(76);
+    engine.account_unvalidated_discovery(1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn a_system_batch_record_after_removal_keeps_the_removed_loss() {
+    // Through the real batch path under system scope: a group record
+    // stamped after the exit arrives once the view was already dropped.
+    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(77);
+    let pid = engine.views[0].pid();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    remove_view_like_retirement(&mut engine, ProcessViewId(77));
+    engine
+        .apply_discovery_batch(
+            &mut wide_session(),
+            vec![group_record_at(
+                DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+                pid,
+                exit_ns + 1,
+            )],
+            0,
+        )
+        .unwrap();
+    assert!(engine.group_last_record_ns.contains_key(&pid));
 
     engine.settle_terminal_drain();
 

@@ -15570,8 +15570,11 @@ mod tests {
             ChildOutcome::TimedOutRunning
         );
         let mut handoff_note = Some(format_handoff_note(pid));
-        let mut exit_code = None;
-        let mut still_running = true;
+        // Dirty sentinels, like the observer twin: the live arm must
+        // write the disposition itself, so these asserts prove the
+        // write instead of passing on settlement-time values.
+        let mut exit_code = Some(999);
+        let mut still_running = false;
         commit_staged_duration_handoff(
             &mut pending,
             &mut handoff_note,
@@ -15598,11 +15601,13 @@ mod tests {
         );
     }
 
-    /// A staged duration handoff whose child exits before the outer commit
-    /// keeps its natural exit: the commit reaps it, records its status and
-    /// drops the stored handoff note, instead of failing the run.
+    /// A staged duration handoff whose child exits after the report
+    /// sealed keeps the sealed handed-back disposition: the outer commit
+    /// reaps the zombie but records nothing over the sealed claim, so
+    /// the report and the exit agree. The raced exit is named with its
+    /// status for the terminal print instead of the live-handoff note.
     #[test]
-    fn staged_duration_commit_race_reaps_the_exit_and_reports_its_status() {
+    fn staged_duration_commit_after_the_seal_keeps_the_handed_back_claim() {
         let mut child = spawn("/bin/sleep", &["30"]);
         let pid = child.pid();
         child.release().unwrap();
@@ -15612,19 +15617,22 @@ mod tests {
             stage_handoff(&mut retained, &mut pending).unwrap(),
             ChildOutcome::TimedOutRunning
         );
-        // The hook: the observed program exits after the stage, before the
-        // outer commit — the publication window the vng 6.12 cell wins.
-        let exit_before_handback = || {
-            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
-            wait_until(
-                || !pending.as_ref().unwrap().still_running(),
-                "the staged child never reached its exit state",
-            );
-        };
-        exit_before_handback();
         let mut handoff_note = Some(format_handoff_note(pid));
         let mut exit_code = None;
         let mut still_running = true;
+        // The seal: exactly what the terminal evidence_for reads from
+        // this staging (`child_still_running`, `handoff_child_pid`).
+        let sealed_still_running = still_running;
+        let sealed_handoff_pid = still_running.then_some(pid);
+        assert!(sealed_still_running);
+        assert_eq!(sealed_handoff_pid, Some(pid));
+        // The hook: the observed program exits after the seal, before
+        // the outer commit.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        wait_until(
+            || !pending.as_ref().unwrap().still_running(),
+            "the staged child never reached its exit state",
+        );
         commit_staged_duration_handoff(
             &mut pending,
             &mut handoff_note,
@@ -15632,13 +15640,26 @@ mod tests {
             &mut still_running,
         )
         .unwrap();
-        assert_eq!(exit_code, Some(128 + libc::SIGKILL));
-        assert!(!still_running);
+        assert_eq!(
+            exit_code, None,
+            "a post-seal exit must not be recorded over the sealed handed-back claim"
+        );
+        assert_eq!(
+            still_running, sealed_still_running,
+            "the report and the exit disagree on the handed-back child"
+        );
+        assert_eq!(still_running.then_some(pid), sealed_handoff_pid);
         assert!(retained.is_none());
         assert!(pending.is_none());
+        let expected_note = format!(
+            "p11scope: duration expired without --kill-on-timeout; child pid {pid} \
+             exited during hand-back with status {} (the sealed report names it handed back)",
+            128 + libc::SIGKILL
+        );
         assert_eq!(
-            handoff_note, None,
-            "a reaped child must not keep a live-handoff note"
+            handoff_note.as_deref(),
+            Some(expected_note.as_str()),
+            "a post-seal exit must be named with its status, not as a live handoff"
         );
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };

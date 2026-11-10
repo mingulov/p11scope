@@ -3480,8 +3480,10 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         // Zero words are never a version header (major >= 2) or an
         // anchor address, and provider data pages are mostly zero
         // (BSS): bulk-charge the run and skip it in one step. The
-        // charge total and the 4096-word deadline cadence are
-        // unchanged; no candidate can start inside the run.
+        // charge total is unchanged; deadline polls stay at visited
+        // 4096-word boundaries, and a skip can pass one boundary, so
+        // worst-case poll spacing is 8192 words (bounded overshoot).
+        // No candidate can start inside the run.
         if value == 0 {
             let mut run = 0usize;
             while run < 4095 {
@@ -3772,8 +3774,11 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
         // A zero function-list word anchors no triple (a decoded
         // table's address is never zero), and provider data pages
         // are mostly zero: bulk-charge the run of such offsets and
-        // skip it. The charge total and deadline cadence match the
-        // per-word walk; no triple can start inside the run.
+        // skip it. The charge total matches the per-word walk;
+        // deadline polls stay at visited 4096-word boundaries, and a
+        // skip can pass one boundary, so worst-case poll spacing is
+        // 8192 words (bounded overshoot). No triple can start inside
+        // the run.
         if word_at(offset + interface.function_list_offset) == Some(0) {
             let mut run = 1usize;
             while run <= 4095
@@ -4410,6 +4415,16 @@ pub(crate) fn mapped_file_guard(
     // dominates deep-scan time. The verdicts below are unchanged.
     let ranges: Vec<(u64, u64)> = group.iter().map(|entry| (entry.start, entry.end)).collect();
     let identities = io.range_identities(view, &ranges, budget)?;
+    // A short batch refuses the group: joining fewer ranges than
+    // the group holds would skip proof, and every implementation
+    // returns one verdict per range.
+    if identities.len() != ranges.len() {
+        return Err(format!(
+            "range identity batch returned {} verdicts for {} ranges",
+            identities.len(),
+            ranges.len()
+        ));
+    }
     for (entry, mapped) in group.iter().zip(identities) {
         match mapped {
             Ok(identity) if identity == expected => {
@@ -6485,8 +6500,8 @@ fn stripped_deleted_hint_matches(raw_path: &[u8], hints: &[PathBuf]) -> Vec<usiz
 }
 
 /// Sub-stage wall time inside one member scan, accumulated per
-/// thread only while `P11SCOPE_STAGE_TIMINGS` is set (the same gate
-/// as the stage readout): [maps, open+key guard, held+range guard,
+/// thread only while `P11SCOPE_STAGE_TIMINGS=1` (the same gate as
+/// the stage readout): [maps, open+key guard, held+range guard,
 /// provider facts, snapshot reads, table/interface detection].
 /// Busy-host diagnosis only; never rendered in any document.
 pub(crate) mod substage {
@@ -6501,7 +6516,7 @@ pub(crate) mod substage {
     pub(crate) fn enabled() -> bool {
         ENABLED.with(|flag| {
             flag.get().unwrap_or_else(|| {
-                let on = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some();
+                let on = crate::inspect_system::stage_timings_requested();
                 flag.set(Some(on));
                 on
             })

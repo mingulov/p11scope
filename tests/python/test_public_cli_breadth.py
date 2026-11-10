@@ -619,9 +619,15 @@ class SelectEndpoint66GapTests(unittest.TestCase):
         self.assertIn("disclosed 6.6 discovery gap", result["detail"])
         self.assertIn("discovery subject/discovery unavailable", result["detail"])
 
-    def test_exact_gap_fails_in_strict_mode(self):
-        result = self.run_case(gap_66, cell="select-endpoint-system", want=1)
-        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+    def test_exact_gap_passes_strict_as_ambient_gap(self):
+        # Ambient-skip lane 2026-11-10 (supersedes the strict-failure
+        # pin): the lone named skip now qualifies strict scope-wide as
+        # the honest ambient gap; the 6.6 flag only selects the
+        # 66-transient qualification text.
+        result = self.run_case(gap_66, cell="select-endpoint-system")
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
 
     def test_second_gap_record_fails_when_allowed(self):
         def mutate(d, l, r):
@@ -675,9 +681,14 @@ class SelectEndpoint66GapTests(unittest.TestCase):
         self.assertIn("owned target count differs", result["detail"])
 
     def test_gap_flag_ignored_on_other_system_cells(self):
+        # Ambient-skip lane 2026-11-10: the flag stays select-endpoint
+        # only (no 66-transient qualification here), but the lone
+        # named skip now qualifies strict scope-wide as ambient.
         result = self.run_case(gap_66, cell="counter-counts-system",
-                               allow_66_discovery_gap=True, want=1)
-        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+                               allow_66_discovery_gap=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
 
     def test_clean_cell_keeps_plain_qualification_when_allowed(self):
         result = self.run_case(cell="select-endpoint-system",
@@ -1598,19 +1609,100 @@ class SystemAmbientGapTests(unittest.TestCase):
         result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
         self.assertIn("loss or unknown event_loss", result["detail"])
 
-    def test_quiet_lone_skip_fails_on_system_cell(self):
-        # The quiet half is mt-system-only: no other system-scope cell
-        # has shown the lone skip in strict mode.
+    def test_quiet_lone_skip_passes_strict_system_cell(self):
+        # Ambient-skip lane 2026-11-10 (supersedes the mt-system-only
+        # pin): quiet vng guests show the lone named discovery skip
+        # on every system-scope cell (tick-quantum deferral, no exit,
+        # zero loss, exact owned counts), so the quiet half qualifies
+        # strict scope-wide, with both counts printed.
         def mutate(d, l, r):
             self.disclose(d, gaps=0, skips=1)
-        result = self.run_case(mutate, cell="system", want=1)
-        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
 
     def test_quiet_lone_skip_fails_on_pid_cell(self):
         def mutate(d, l, r):
             self.disclose(d, gaps=0, skips=1)
         result = self.run_case_mt(mutate, cell="mt-shared", want=1)
         self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_lone_skip_passes_strict_select_endpoint_system(self):
+        # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows
+        # the lone named skip on select-endpoint-system (tick-quantum
+        # deferral, zero loss, exact owned counts).
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            del d["evidence"]["pid_descendant_gaps"]
+        result = self.run_case(mutate, cell="select-endpoint-system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_quiet_lone_skip_passes_strict_counter_counts_system(self):
+        # Ambient-skip lane 2026-11-10: the loaded 6.12 vng leg shows
+        # the same lone named skip on counter-counts-system.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            del d["evidence"]["pid_descendant_gaps"]
+        result = self.run_case(mutate, cell="counter-counts-system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_quiet_lone_skip_passes_strict_metrics_cgroup(self):
+        # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows
+        # the lone named skip on metrics-cgroup. Production cgroup
+        # evidence carries no pid_descendant_gaps key at all, so the
+        # synthetic shape drops it too.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            del d["evidence"]["pid_descendant_gaps"]
+        result = self.run_case(mutate, cell="metrics-cgroup")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("honest ambient gap", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_quiet_cgroup_wrong_skip_reason_fails(self):
+        # Reject twin: only the exact named pair qualifies on cgroup
+        # scope; any other reason still fails.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=0)
+            del d["evidence"]["pid_descendant_gaps"]
+            d["evidence"]["skipped"] = [{
+                "name": "C_Digest", "reason": "function entry unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+        result = self.run_case(mutate, cell="metrics-cgroup", want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_cgroup_second_cause_fails(self):
+        # Reject twin: a second observation cause beside the lone
+        # skip stays a failure on cgroup scope.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            del d["evidence"]["pid_descendant_gaps"]
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"].append(
+                "multi_rebuild_gaps")
+        result = self.run_case(mutate, cell="metrics-cgroup", want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_quiet_cgroup_owned_loss_fails(self):
+        # Reject twin: owned loss beside the lone skip stays a
+        # failure on cgroup scope.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+            del d["evidence"]["pid_descendant_gaps"]
+            d["evidence"]["event_loss"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"] = [
+                "skipped", "event_loss"]
+        result = self.run_case(mutate, cell="metrics-cgroup", want=1)
+        self.assertIn("loss or unknown event_loss", result["detail"])
 
     def test_provider_linked_hints_fail(self):
         # A gap subject that links the watched provider is not ambient noise.

@@ -17829,6 +17829,10 @@ mod tests {
             crate::discovery::identity::MappedFile,
             crate::discovery::identity::FileIdentity,
         )>,
+        /// A held handle to the fixture file after its path was
+        /// unlinked: the replaced-on-disk shape (the maps line reads
+        /// `<path> (deleted)` while the running bytes stay open).
+        deleted_held: Option<File>,
     }
 
     struct MapFilesFallbackMemory {
@@ -17975,6 +17979,7 @@ mod tests {
                 root_failure: None,
                 map_files: MapFilesScript::Fail(libc::EPERM),
                 mapped: None,
+                deleted_held: None,
             }
         }
 
@@ -17985,6 +17990,72 @@ mod tests {
                 foreign_target_root: Some("/proc/99999/fdinfo".into()),
                 errno: Some(libc::ESRCH),
             }
+        }
+
+        /// The chrooted-daemon shape (rtkit-daemon: target root
+        /// `/proc`, a foreign mount namespace, so no host fallback):
+        /// an existing file the retained root cannot see.
+        fn foreign_enoent() -> MappedOpenError {
+            MappedOpenError {
+                reason: "opening object within retained target root: No such file or directory (os error 2)"
+                    .into(),
+                foreign_target_root: Some("/proc".into()),
+                errno: Some(libc::ENOENT),
+            }
+        }
+
+        /// A genuinely missing file under the observer's own root:
+        /// never a jail, never a fallback trigger.
+        fn same_root_enoent() -> MappedOpenError {
+            MappedOpenError {
+                reason: "opening object within retained target root: No such file or directory (os error 2)"
+                    .into(),
+                foreign_target_root: None,
+                errno: Some(libc::ENOENT),
+            }
+        }
+
+        /// Re-render the fixture maps with the kernel's replaced-file
+        /// marker: the group keeps its key while its path reads
+        /// `<path> (deleted)`.
+        fn render_deleted_maps(&mut self) {
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                self.key.device.major,
+                self.key.device.minor,
+                self.key.inode,
+                self.path.display()
+            );
+            self.maps = format!(
+                "1000-2000 r-xp 00000000 {identity} (deleted)\n\
+                 7000-8000 r--p 00004000 {identity} (deleted)\n"
+            );
+        }
+
+        /// The marker shape with the file still on disk: the scan
+        /// branches on the suffix, not on the unlink.
+        fn set_deleted_suffix(&mut self) {
+            self.render_deleted_maps();
+        }
+
+        /// The faithful replaced-on-disk shape: the path is unlinked
+        /// while a held handle keeps the running bytes (the guard and
+        /// the ELF read below run live against the unlinked fd).
+        fn set_deleted_unlinked(&mut self) {
+            let held = File::open(&self.path).unwrap();
+            std::fs::remove_file(&self.path).unwrap();
+            self.render_deleted_maps();
+            self.deleted_held = Some(held);
+        }
+
+        /// The held running bytes after [`Self::set_deleted_unlinked`],
+        /// cloned for one `map_files` serve.
+        fn deleted_served(&self) -> File {
+            self.deleted_held
+                .as_ref()
+                .expect("set_deleted_unlinked first")
+                .try_clone()
+                .unwrap()
         }
 
         /// Scripted held identities model an ordinary filesystem, like
@@ -18017,9 +18088,16 @@ mod tests {
             &mut self,
             budget: &mut CaptureWorkBudget,
         ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+            self.run_with_hints(budget, &[])
+        }
+
+        fn run_with_hints(
+            &mut self,
+            budget: &mut CaptureWorkBudget,
+            hints: &[PathBuf],
+        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
             let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
             let hooks = HookRegistry::builtin();
-            let hints: &[PathBuf] = &[];
             scan_view_with_examined(
                 &ScanRequest {
                     pid: view.pid(),
@@ -18273,6 +18351,264 @@ mod tests {
             skip.reason,
             format!("object is {} bytes; limit is {limit}", limit + 1),
             "the size cap keeps its exact wording"
+        );
+    }
+
+    /// A library replaced on disk while running (the maps line reads
+    /// `<path> (deleted)`) still runs its old bytes: the scan opens
+    /// the VMA's own file through `map_files`, proves it
+    /// like-for-like, and examines it — the replaced-file gap must go.
+    #[test]
+    fn map_files_deleted_examines_the_running_copy_of_a_replaced_object() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_deleted_unlinked();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Serve(fixture.deleted_served());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the replaced object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.reason != REPLACED_PROVIDER_REASON),
+            "no replaced-file gap may remain for the joined object, got {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the join must open the group's VMA range, got {:?}",
+            fixture.log.borrow()
+        );
+    }
+
+    /// A hinted replaced object mints its module under the replaced
+    /// marker: the published path keeps ` (deleted)` so `-v`/JSON name
+    /// the running copy as replaced on disk, and the hint stays
+    /// matched (never a spurious not-mapped gap).
+    #[test]
+    fn map_files_deleted_hinted_module_keeps_the_replaced_marker_in_its_path() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_deleted_unlinked();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Serve(fixture.deleted_served());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let hint = fixture.path.clone();
+        let (outcome, _, _) = fixture
+            .run_with_hints(
+                &mut CaptureWorkBudget::default(),
+                std::slice::from_ref(&hint),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "the hinted replaced object must mint one module, got {:?} skipped={:?}",
+            outcome.modules(),
+            outcome.skipped()
+        );
+        assert_eq!(
+            outcome.modules()[0].path,
+            format!("{} (deleted)", hint.display()),
+            "the module path names the running copy as replaced"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.reason != REPLACED_PROVIDER_REASON),
+            "no replaced-file gap may remain for the joined module, got {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.reason != HINT_NOT_MAPPED_REASON),
+            "the stripped hint stays matched, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Safety twin: the served file and the VMA's kernel identity
+    /// disagree — refuse with the named `map_files` refusal, never
+    /// examine a stranger as the running copy. (The verbatim
+    /// replaced gap below is only for attempts that never produced a
+    /// provable file.)
+    #[test]
+    fn map_files_deleted_refuses_when_the_vma_identity_differs() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_deleted_suffix();
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((
+            MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
+            FileIdentity { dev: 37, ino: 10 },
+        ));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = format!("{} (deleted)", fixture.path.display());
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the mismatched object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "the mismatched object must not join, got {:?}",
+            outcome.modules()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == subject
+                    && skip.reason.contains("map_files")
+                    && skip.reason.contains("refused")
+            }),
+            "the mismatch must refuse with a named map_files gap, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Without `map_files` (an unprivileged EPERM) the replaced object
+    /// keeps its exact replaced-file gap: byte-identical degradation,
+    /// never a new reason and never silence.
+    #[test]
+    fn map_files_deleted_keeps_the_verbatim_gap_when_map_files_is_unreadable() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_deleted_suffix();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Fail(libc::EPERM);
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = format!("{} (deleted)", fixture.path.display());
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the unopenable object must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert_eq!(
+            skip.reason, REPLACED_PROVIDER_REASON,
+            "the replaced gap keeps its exact wording"
+        );
+    }
+
+    /// A chrooted daemon's root (rtkit-daemon: target root `/proc`, a
+    /// foreign mount namespace, so no host fallback) hides an existing
+    /// file as ENOENT: the VMA's `map_files` link opens the true file
+    /// and the object joins like the ESRCH shape.
+    #[test]
+    fn map_files_fallback_examines_object_on_foreign_root_enoent() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::foreign_enoent());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the foreign-ENOENT object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().all(|skip| skip.subject != subject),
+            "no gap may remain for the examined object, got {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the fallback must open the group's VMA range, got {:?}",
+            fixture.log.borrow()
+        );
+    }
+
+    /// Safety twin: foreign-root ENOENT with a disagreeing VMA refuses
+    /// by name, exactly like the ESRCH shape.
+    #[test]
+    fn map_files_fallback_refuses_foreign_enoent_when_the_vma_identity_differs() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.root_failure = Some(MapFilesFallbackFixture::foreign_enoent());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((
+            MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
+            FileIdentity { dev: 37, ino: 10 },
+        ));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the mismatched object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "the mismatched object must not join, got {:?}",
+            outcome.modules()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == subject
+                    && skip.reason.contains("map_files")
+                    && skip.reason.contains("refused")
+            }),
+            "the mismatch must refuse with a named map_files gap, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// Scope twin: ENOENT under the observer's own root is a genuinely
+    /// missing file, not a jail — no `map_files` attempt even when the
+    /// route would serve, and the original gap stays verbatim.
+    #[test]
+    fn map_files_fallback_ignores_same_root_enoent() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::same_root_enoent());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the missing object must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert_eq!(
+            skip.reason,
+            "opening object within retained target root: No such file or directory (os error 2)",
+            "the same-root gap keeps its exact wording"
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .all(|line| !line.starts_with("map_files")),
+            "the same-root failure must not touch map_files, got {:?}",
+            fixture.log.borrow()
         );
     }
 

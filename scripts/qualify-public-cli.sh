@@ -194,7 +194,6 @@ PY
 # product fix lane. Unexpected passes fail via summary() and the WP-1 template.
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
-REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
 asuser_conf() {
   local conf=$1; shift
@@ -762,11 +761,7 @@ PY
     if [ "$rc" = 0 ] && [ "$observer_rc" = 0 ]; then
       result "$cell" 1 "$detail"
     else
-      case "$detail" in
-        *inventory\ gaps\ about\ owned\ module*)
-          result "$cell" 0 "$REASON_INVENTORY_7X: [failed] $detail" expected-failure ;;
-        *) result "$cell" 0 "$detail" failed ;;
-      esac
+      result "$cell" 0 "$detail" failed
     fi
     return 0
   fi

@@ -785,6 +785,10 @@ mod full_image {
         let losses = r.take_observation_losses();
         assert_eq!(losses.len(), 1, "the eviction loss is disclosed");
         assert_eq!(losses[0].ids, vec![first]);
+        // The eviction arms exactly one birth cooldown, consumed
+        // by the first re-observation.
+        assert!(r.take_birth_reoffer_cooldown(image(COOKIE, 0), FILE));
+        assert!(!r.take_birth_reoffer_cooldown(image(COOKIE, 0), FILE));
         assert_eq!(
             r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
             ObserveOutcome::New,

@@ -216,6 +216,19 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
+        // A drained registration names AlreadySelected exactly, never
+        // as capacity — unless its first call's birth can still
+        // select Joint in place (an untouched row holds its slot
+        // already, so the fits gate admits it without new capacity).
+        if self.registry.instance_state.by_key.contains_key(&input.key)
+            && !self.registry.joint_upgrade_eligible(&input.key)
+        {
+            // The registration already drained and selected its
+            // feed: name that exactly, never as capacity. (The
+            // fits loop leaves such rows fits=false because they
+            // need no slot, which used to misname this case.)
+            return Err(JointReceiptInstallRefusal::AlreadySelected);
+        }
         // An untouched registered row holds its slot already: its
         // first call's birth selects Joint in place instead of
         // minting, so the fits gate admits it without new capacity.
@@ -233,6 +246,12 @@ impl JointRegistrationPlan<'_> {
     ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
         let registration = self.position(input, window)?;
         self.registry.reserve_joint_receipt_at(input, registration)
+    }
+
+    /// The plan holds the registry's exclusive borrow: route
+    /// the caller's feed probe through it while a plan is live.
+    pub(crate) fn admitted_feed_is_s1only(&self, input: &AdmittedInstanceCall) -> bool {
+        self.registry.admitted_feed_is_s1only(input)
     }
 }
 
@@ -5815,6 +5834,41 @@ mod journal_unavailable_tests {
             scene.registry.instance_state.records.len(),
             1,
             "the drain mints only the genuine row"
+        );
+    }
+
+    /// A birth offered for a key whose registration already
+    /// drained (feed already selected) is named AlreadySelected,
+    /// never Capacity: the fits loop leaves held keys fits=false
+    /// because they need no slot, which must not misname the
+    /// refusal the coordinator acts on.
+    #[test]
+    fn held_key_birth_position_names_already_selected() {
+        let mut scene = UnlinkedScene::new();
+        let (key, _) = scene.register(0);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            matches!(
+                plan.position(&input, &window),
+                Err(JointReceiptInstallRefusal::AlreadySelected)
+            ),
+            "a held key names its drained registration, not capacity"
         );
     }
 

@@ -1442,8 +1442,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let reservation = match registrations.reserve(input, &batch.registrations) {
                 Ok(reservation) => reservation,
                 Err(refusal) => {
+                    // AlreadySelected on an S1Only feed means the
+                    // registration drained before this first birth:
+                    // the same transient skew as a capacity wall,
+                    // recoverable by the same bounded re-offer. An
+                    // AlreadySelected Joint feed is a healthy
+                    // duplicate offer and stays final.
+                    let selected_s1only = refusal
+                        == crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal::AlreadySelected
+                        && registrations.admitted_feed_is_s1only(input);
                     let refusal = BirthRefusal::Registration(refusal);
-                    if refusal.transient() {
+                    if refusal.transient() || selected_s1only {
                         association[first].deferred = Some(reoffer_key);
                     }
                     association[first].refusal = Some((caller, refusal));
@@ -1488,7 +1497,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         for link in &association {
             if let Some((caller, refusal)) = link.refusal {
                 match link.deferred {
-                    Some((image, file)) if refusal.transient() => {
+                    Some((image, file)) => {
                         disclose_s1_birth_deferred(
                             &mut self.registry,
                             caller,

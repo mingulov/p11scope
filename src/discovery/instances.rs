@@ -771,6 +771,14 @@ pub(crate) struct InstanceRouter {
     /// table refuses past the observed-keys cap, so a long run
     /// cannot grow it without bound.
     birth_reoffers: BTreeMap<(ImageKey, u32), u8>,
+    /// Keys whose first re-observation after a re-offer eviction
+    /// must not carry a birth yet: the evicted instance's
+    /// retirement (and its journal domain's refusal) lands in
+    /// that same batch's audit, after its claim phase, so a
+    /// birth claimed there would meet the still-live sibling
+    /// key. The capture consumes the flag at that observation;
+    /// the next admitted observation mints as usual.
+    birth_reoffer_cooldown: BTreeSet<(ImageKey, u32)>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -910,6 +918,7 @@ impl InstanceRouter {
             admitted_minted: BTreeSet::new(),
             birth_retry: BTreeMap::new(),
             birth_reoffers: BTreeMap::new(),
+            birth_reoffer_cooldown: BTreeSet::new(),
             absent: BTreeSet::new(),
             absence_overflowed: false,
             faulted: BTreeSet::new(),
@@ -1131,9 +1140,19 @@ impl InstanceRouter {
         self.drop_carry(&key);
         self.admitted_minted.remove(&key);
         self.admitted_pending.remove(&key);
+        self.birth_reoffer_cooldown.insert(key);
         self.counters.observed_evictions = self.counters.observed_evictions.saturating_add(1);
         self.debug_check_absent_subset();
         true
+    }
+
+    /// Consume the one-observation birth cooldown a re-offer
+    /// eviction armed for this key. The capture calls this at
+    /// the key's first re-observation and withholds that
+    /// observation's birth cut when it returns true.
+    pub(crate) fn take_birth_reoffer_cooldown(&mut self, image: ImageIdentity, file: u32) -> bool {
+        self.birth_reoffer_cooldown
+            .remove(&(ImageKey::from(image), file))
     }
 
     /// A continued observation for a marked key reports

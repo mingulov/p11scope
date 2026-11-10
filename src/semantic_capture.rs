@@ -3702,6 +3702,17 @@ impl SemanticCapture {
                         .note_birth_offer(job.image, job.endpoint.file_slot, *quantum)
                 });
                 let birth_retry = outcome == ObserveOutcome::Continued && offered;
+                // A re-offer eviction arms a one-observation
+                // cooldown: this first re-observation carries no
+                // birth (the evicted sibling's journal domain is
+                // refused only in this batch's later audit), and
+                // notes no mint. The coordinator re-marks the key
+                // on its next admission, whose observation mints.
+                let cooled = (outcome == ObserveOutcome::New
+                    || outcome == ObserveOutcome::AdmittedFirst)
+                    && self
+                        .router
+                        .take_birth_reoffer_cooldown(job.image, job.endpoint.file_slot);
                 report.current.push(CurrentPartitionReceipt {
                     domain: self.router.domain(),
                     image: job.image,
@@ -3713,8 +3724,9 @@ impl SemanticCapture {
                     fence,
                     deadline: job.deadline,
                     ids,
-                    birth: if outcome == ObserveOutcome::New
-                        || outcome == ObserveOutcome::AdmittedFirst
+                    birth: if (!cooled
+                        && (outcome == ObserveOutcome::New
+                            || outcome == ObserveOutcome::AdmittedFirst))
                         || birth_retry
                     {
                         job.birth_cut
@@ -3730,7 +3742,7 @@ impl SemanticCapture {
                 // key ever reaches the seal. A tick without a birth cut
                 // attaches nothing and notes nothing: the next admission
                 // re-marks the key and the mint retries.
-                if outcome == ObserveOutcome::AdmittedFirst && job.birth_cut.is_some() {
+                if !cooled && outcome == ObserveOutcome::AdmittedFirst && job.birth_cut.is_some() {
                     self.router.note_minted(job.image, job.endpoint.file_slot);
                 }
             }

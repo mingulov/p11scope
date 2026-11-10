@@ -56,7 +56,8 @@ pub(crate) struct CurrentPartitionReceipt {
         crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
     )>,
     /// The birth rides a continued observation of a key sighted `New`
-    /// with no admitted call yet (not a `New` or `AdmittedFirst` mint).
+    /// whose retry has not ended: no routed call yet, or the quantum of
+    /// its first one (not a `New` or `AdmittedFirst` mint).
     birth_retry: bool,
 }
 impl CurrentPartitionReceipt {

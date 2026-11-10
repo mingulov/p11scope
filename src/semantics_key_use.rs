@@ -479,22 +479,6 @@ impl JointStaging {
             && self.pre_attach_direct == 0
     }
 
-    /// FFBG-DIAG: which upgrade gate refuses (temporary).
-    #[cfg(test)]
-    pub(crate) fn upgrade_blockers_for_test(&self) -> String {
-        format!(
-            "mode={:?} receipt={} fell_back={} degraded_loss={} watchdog={} staged={} reduced={} pre_attach={}",
-            self.mode,
-            self.selected_receipt.is_some(),
-            self.fell_back,
-            self.degraded_loss,
-            self.watchdog_tripped,
-            self.staged.len(),
-            self.reduced,
-            self.pre_attach_direct
-        )
-    }
-
     /// Select Joint late for an untouched S1Only feed, exactly as
     /// [`Self::select_joint`] would have at registration: the replay
     /// frontier is left alone (it counts H0 positions; a birth cut
@@ -576,11 +560,6 @@ impl JointStaging {
         if self.watchdog_tripped {
             return false;
         }
-        #[cfg(test)]
-        eprintln!(
-            "FFBG-DIAG watchdog_trip before: {}",
-            self.upgrade_blockers_for_test()
-        );
         self.watchdog_tripped = true;
         while let Some(head) = self.staged.pop_front() {
             let bytes = head.charged_bytes();
@@ -608,11 +587,6 @@ impl JointStaging {
     /// the degraded window in which direct reductions count under
     /// this ending's reason until the next clean point resumes.
     fn close_segment(&mut self, loss: bool, resumable: bool) {
-        #[cfg(test)]
-        eprintln!(
-            "FFBG-DIAG close_segment loss={loss} resumable={resumable} before: {}",
-            self.upgrade_blockers_for_test()
-        );
         self.mode = FeedMode::S1Only;
         self.segment_resumable = resumable;
         if loss {

@@ -1279,9 +1279,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             let Some(entry) = entry else {
                 let receipt = &batch.current[current];
-                // A sighting retry without its admission: the key's New
-                // already disclosed this, and nothing was missed (the
-                // caller made no call in this pass).
+                // A sighting retry without its admission repeats the
+                // condition the key's New already disclosed once.
                 if receipt.birth_retry() {
                     continue;
                 }

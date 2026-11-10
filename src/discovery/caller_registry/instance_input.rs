@@ -2072,12 +2072,6 @@ impl CallerRegistry {
                 },
             };
             if !valid {
-                #[cfg(test)]
-                eprintln!(
-                    "FFBG-DIAG validate drop at={at} registration={:?} original={}",
-                    grant.registration,
-                    original.is_some()
-                );
                 self.joint_grants.remove(key);
             }
         }
@@ -2724,17 +2718,6 @@ impl CallerRegistry {
         staged_position: Option<usize>,
         mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
-        #[cfg(test)]
-        if let Some(grant) = self.joint_grants.get(&input.key) {
-            eprintln!(
-                "FFBG-DIAG apply staged={staged_position:?} grant.registration={:?} application={:?}",
-                grant.registration,
-                grant
-                    .application
-                    .as_ref()
-                    .map(|a| (a.registration, a.original.is_some()))
-            );
-        }
         let installed = self
             .joint_grants
             .remove(&input.key)
@@ -2818,16 +2801,6 @@ impl CallerRegistry {
                 return;
             }
             let last_seen_ns = record.last_seen_ns.max(input.observed_ns);
-            #[cfg(test)]
-            eprintln!(
-                "FFBG-DIAG existing staged={staged_position:?} installed={} eligible={} feed={} linked={}",
-                installed.is_some(),
-                self.joint_upgrade_eligible(&input.key),
-                self.instance_state.semantics[&id]
-                    .feed
-                    .upgrade_blockers_for_test(),
-                self.journal_linked()
-            );
             if let Some(grant) = installed.as_ref() {
                 // A later birth's validated grant selects Joint for an
                 // untouched S1Only feed. Unlinked attachments route

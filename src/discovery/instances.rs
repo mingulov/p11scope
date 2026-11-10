@@ -752,17 +752,17 @@ pub(crate) struct InstanceRouter {
     /// ready-domain binary search. Marks for these keys are refused;
     /// only retirement clears them.
     admitted_minted: BTreeSet<(ImageKey, u32)>,
-    /// (image, file) keys sighted `New` that have had no admitted call
-    /// yet. Every later continued observation of such a key carries
-    /// that pass's birth quantum, so the pass holding the key's first
-    /// call can birth it (the cut precedes the image's first record,
-    /// as for a same-pass `New`). The admitted mark arrives a pass too
-    /// late for that: by then the image's own records are consumed.
-    /// Cleared by the key's first admission mark or by retirement;
+    /// (image, file) keys sighted `New` that have had no routed call
+    /// yet. A later continued observation of such a key carries that
+    /// quantum's birth, so the quantum holding the key's first call can
+    /// birth it (the cut precedes the image's first record, as for a
+    /// same-pass `New`). The admitted mark arrives a pass too late for
+    /// that: by then the image's own records are consumed. A retry
+    /// fires at most once per quantum and ends with the quantum of the
+    /// key's first routed call (see [`BirthRetry`]), a consumed or
+    /// absence birth, an admission mark, eviction or retirement; it is
     /// capped by the observed-keys cap, where an unarmed key fails
-    /// closed to the old behavior. A retry fires at most once per
-    /// quantum and ends with the quantum of the key's first routed
-    /// call (see [`BirthRetry`]); nothing outlives it.
+    /// closed to the old behavior.
     birth_retry: BTreeMap<(ImageKey, u32), BirthRetry>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
@@ -971,7 +971,8 @@ impl InstanceRouter {
     }
 
     /// Whether this key's continued observation still carries a birth:
-    /// it was sighted `New` and has had no admitted call since.
+    /// it was sighted `New` and its retry has not ended (see
+    /// [`BirthRetry`]).
     pub(crate) fn birth_retry_armed(&self, image: ImageIdentity, file: u32) -> bool {
         let key = (ImageKey::from(image), file);
         self.birth_retry.contains_key(&key) && self.observed.contains_key(&key)

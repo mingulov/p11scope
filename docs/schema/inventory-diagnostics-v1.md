@@ -60,12 +60,14 @@ Reasons are finite: `sole_owner`, `shared_owner`, `ownership_unknown`,
 `not_admitted`, `count_invalid`, `budget_refused`, `capture_loss`, `capture_stopped`,
 `native_unavailable`, `context_unavailable`, `proven_absence`, `different_sole_owner`,
 `members_filter`, `invalid_slot`, `invalid_edge`, and `authority_failure`. The last
-six name the leg that revoked ordinary continuity on an ownership transition: a
-completed classification with no candidate, a different sole carrier, an
-uncomputable membership filter, an invalid caller slot, an invalid caller edge,
-or an unconsumed authority failure. A reason names the branch the
-producer actually took; it adds no attribution predicate. Repeated refusal/stale
-checks may increment reason totals without producing another record.
+six name the latest classification leg: a completed classification with no
+candidate, a different sole carrier, an uncomputable membership filter, an
+invalid caller slot, an invalid caller edge, or an unconsumed authority
+failure. The leg also fires on finishes that retain ordinary continuity, so
+compare checkpoint against sequence to tell whether continuity revoked. A
+reason names the branch the producer actually took; it adds no attribution
+predicate. Repeated refusal/stale checks may increment reason totals without
+producing another record.
 
 Two rolling rings retain recent history: 24,576 ordinary observations, allocations
 and publications, and 8,192 ownership transitions, exceptional decisions and

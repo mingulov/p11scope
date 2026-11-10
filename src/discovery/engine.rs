@@ -10405,6 +10405,13 @@ fn block_unperformed_static(
         );
         candidate_plan.deactivate(slot.index);
     }
+    // A failed replacement must not revive its old descriptor or reuse
+    // its cookie: replacements leave no revival memory behind. Blocked
+    // additions keep theirs (withdrawn with the tail, or revived on the
+    // retry once the engine clears them again).
+    for slot in &delta.replace {
+        candidate_plan.forget_retired_key(slot.index);
+    }
 }
 
 fn lose_unperformed_dynamic_work(timings: &mut CausalTimings, work: &[DynamicExportWork]) {
@@ -15376,6 +15383,30 @@ impl Engine {
     }
 
     fn apply_candidate_with_ended(
+        &mut self,
+        session: &mut dyn EngineSession,
+        candidate: LiveCandidate,
+        additions_allowed: &mut bool,
+        preflighted: bool,
+        extra_views: &[&ProcessView],
+        ended: Option<&PendingEndedPidRetirement>,
+    ) -> Result<ApplyOutcome> {
+        let outcome = self.apply_candidate_inner(
+            session,
+            candidate,
+            additions_allowed,
+            preflighted,
+            extra_views,
+            ended,
+        );
+        // Every application funnels through here, so the revival
+        // clearance the next merge reads is always fresh — including
+        // after a failed application, whose links may still have moved.
+        self.refresh_revivable(session);
+        outcome
+    }
+
+    fn apply_candidate_inner(
         &mut self,
         session: &mut dyn EngineSession,
         mut candidate: LiveCandidate,
@@ -23120,8 +23151,49 @@ impl Engine {
     /// observed physically detached on two consecutive refreshes, and
     /// counts proved final. Runs after every candidate application, so
     /// the merge it feeds always reads fresh session truth.
-    /// STUB: clears nothing and clears no target until revival lands.
-    fn refresh_revivable(&mut self, _session: &dyn EngineSession) {}
+    fn refresh_revivable(&mut self, session: &dyn EngineSession) {
+        let retired = self.plan.retired_slots();
+        self.revival_finalized
+            .retain(|slot| retired.contains(&(*slot as usize)));
+        self.revival_observed_detached
+            .retain(|slot| retired.contains(&(*slot as usize)));
+        let detailed = matches!(
+            self.plan.admission_policy(),
+            plan::AdmissionPolicy::Detailed
+        );
+        let mut detached_now = if detailed {
+            session.revival_detached(self.plan.retired_slots())
+        } else {
+            BTreeSet::new()
+        };
+        // Worker-owned links read detached in the registry while their
+        // probes are still live: never observe ticket-covered slots, and
+        // clear nothing while a ticket is pending at all.
+        let pending = self.pending_global_retirement.is_some();
+        if let Some(ticket) = &self.pending_global_retirement {
+            for index in ticket.retired_slots() {
+                detached_now.remove(index);
+            }
+        }
+        let mut revivable = BTreeMap::new();
+        if detailed && !pending {
+            for (key, position) in self.plan.retired_keys() {
+                let slot = *position as u32;
+                if !detached_now.contains(&slot) || !self.revival_observed_detached.contains(&slot)
+                {
+                    continue;
+                }
+                if !self.revival_finalized.contains(&slot) && session.revival_finalized(slot) {
+                    self.revival_finalized.insert(slot);
+                }
+                if self.revival_finalized.contains(&slot) {
+                    revivable.insert(*key, *position);
+                }
+            }
+        }
+        self.revival_observed_detached = detached_now;
+        self.plan.set_revivable(revivable);
+    }
 
     /// Keep recovery work owed by a later matched EXEC. This only retains an
     /// existing request; it grants no continuity or attachment authority. The

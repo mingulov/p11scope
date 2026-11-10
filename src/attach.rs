@@ -2675,6 +2675,45 @@ fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
     links.iter().any(|link| link.slots().contains(&slot))
 }
 
+/// Whether any START row names `slot`. Map or iteration failures read
+/// as a match: finality needs proof, not absence of evidence.
+fn start_rows_name_slot(ebpf: &Ebpf, slot: u32) -> bool {
+    let map = match ebpf.map("START") {
+        Some(map) => map,
+        None => return true,
+    };
+    let starts: HashMap<_, p11scope_ebpf_common::StartKey, p11scope_ebpf_common::CallStart> =
+        match HashMap::try_from(map) {
+            Ok(starts) => starts,
+            Err(_) => return true,
+        };
+    starts.iter().any(|entry| match entry {
+        Ok((key, _)) => key.slot == slot,
+        Err(_) => true,
+    })
+}
+
+/// Whether any OBJECT_START row names `slot`. Values are opaque bytes
+/// to the scan; failures read as a match, as for START.
+fn object_start_rows_name_slot(ebpf: &Ebpf, slot: u32) -> bool {
+    let map = match ebpf.map("OBJECT_START") {
+        Some(map) => map,
+        None => return true,
+    };
+    let starts: HashMap<
+        _,
+        p11scope_ebpf_common::StartKey,
+        [u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
+    > = match HashMap::try_from(map) {
+        Ok(starts) => starts,
+        Err(_) => return true,
+    };
+    starts.iter().any(|entry| match entry {
+        Ok((key, _)) => key.slot == slot,
+        Err(_) => true,
+    })
+}
+
 /// The smallest requested slot that shares a multi group link with a
 /// slot outside the request, if any. Group links are immutable: a
 /// bundle drops only when every member is requested, so a partially
@@ -10186,16 +10225,53 @@ impl Session {
     /// Retired slots whose probes are provably gone: the Multi backend,
     /// no owned link covers them, no retained static target or group
     /// deferral names them, and no native retirement is pending or
-    /// uncertain. STUB: empty until the revival implementation lands.
-    pub(crate) fn revival_detached(&self, _retired: &BTreeSet<usize>) -> BTreeSet<u32> {
-        BTreeSet::new()
+    /// uncertain. Singles never clears: it retires logically and closes
+    /// links only at the terminal detach.
+    pub(crate) fn revival_detached(&self, retired: &BTreeSet<usize>) -> BTreeSet<u32> {
+        if self.backend != AttachBackend::Multi
+            || self.native_retirement.blocking()
+            || !self.deferred_group_slots.is_empty()
+        {
+            return BTreeSet::new();
+        }
+        retired
+            .iter()
+            .filter_map(|position| {
+                let slot = u32::try_from(*position).ok()?;
+                if links_cover_slot(&self.links, slot) || self.retained_static.contains_key(&slot) {
+                    return None;
+                }
+                Some(slot)
+            })
+            .collect()
     }
 
     /// Whether a detached slot's counts are final and nothing is in
     /// flight: its STATS entered equals returned on every CPU and no
-    /// START or OBJECT_START row names it. STUB: false until revival lands.
-    pub(crate) fn revival_finalized(&self, _slot: u32) -> bool {
-        false
+    /// START or OBJECT_START row names it. Any map failure reads as
+    /// unfinalized: finality needs proof, not absence of evidence.
+    pub(crate) fn revival_finalized(&self, slot: u32) -> bool {
+        let stats: PerCpuArray<_, p11scope_ebpf_common::SlotStats> = match self.ebpf.map("STATS") {
+            Some(map) => match PerCpuArray::try_from(map) {
+                Ok(stats) => stats,
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        let per_cpu = match stats.get(&slot, 0) {
+            Ok(per_cpu) => per_cpu,
+            Err(_) => return false,
+        };
+        let mut entered = 0u64;
+        let mut returned = 0u64;
+        for cpu in per_cpu.iter() {
+            entered = entered.saturating_add(cpu.entered);
+            returned = returned.saturating_add(cpu.returned);
+        }
+        if entered != returned {
+            return false;
+        }
+        !start_rows_name_slot(&self.ebpf, slot) && !object_start_rows_name_slot(&self.ebpf, slot)
     }
 
     /// The retained attach-complete instant for one slot, if it ever

@@ -991,9 +991,9 @@ pub struct AttachPlan {
     pub interface_list: String,
     /// Slots claimed by >=2 modules — count-only, forces PARTIAL (spec §4.7).
     pub module_ambiguous: usize,
-    // Exact target -> allocated slot. Retired targets leave this index so an
-    // exact reappearance gets a fresh monotonic slot rather than reviving a
-    // historical cookie.
+    // Exact target -> allocated slot. Retired targets leave this index;
+    // an exact reappearance revives its retired position once the engine
+    // clears it, else it gets a fresh monotonic slot.
     slot_by_key: BTreeMap<AttachKey, usize>,
     // Exact target -> retired position, for absence-retired slots only.
     // Remembers where a target was so a later reappearance can revive it
@@ -1014,8 +1014,9 @@ pub struct AttachPlan {
     // Identity of every pinned object a slot or module used, recorded where
     // the pins were in hand; capture-lifetime like the slots themselves.
     object_identities: BTreeMap<PinnedObjectId, TargetObject>,
-    // Slot indices never leave this set during one capture. Their historical
-    // aggregate-map cells remain readable but may not receive new links.
+    // Retired slot indices. Their historical aggregate-map cells remain
+    // readable; only a cleared same-target revival takes an index out of
+    // this set and receives new links on it.
     retired_slots: BTreeSet<usize>,
     // Capture-lifetime ownership for every allocated aggregate cell. Active
     // topology remains in `slot_by_key` and each slot's current `module_ids`.
@@ -1946,20 +1947,61 @@ impl AttachPlan {
     }
 
     /// Replaces the revival clearance wholesale; the engine recomputes
-    /// it after every candidate application.
+    /// it after every candidate application. A no-op when unchanged, so
+    /// the plan fence never trips on an identical clearance.
     pub(crate) fn set_revivable(&mut self, revivable: BTreeMap<AttachKey, usize>) {
+        if self.revivable == revivable {
+            return;
+        }
         self.mutations.bump();
         self.revivable = revivable;
     }
 
     /// The retired position a reappearing exact target may reoccupy, or
     /// `None` when it must take a fresh slot: Detailed policy only, the
-    /// key cleared revivable for this rebuild, still retired at its
-    /// remembered position, and the rebuilt slot carrying the same
-    /// descriptor and names (the same function, so counts continue).
-    /// STUB: never revives until the revival implementation lands.
-    fn revival_target(&self, _key: &AttachKey, _rebuilt: &Slot) -> Option<usize> {
-        None
+    /// key cleared revivable for this rebuild and still retired at its
+    /// remembered position, the rebuilt slot carrying the same
+    /// descriptor and names (the same function, so counts continue),
+    /// and no new aggregate ambiguity on a semantic descriptor.
+    /// Every inconsistency fails closed to a fresh slot. Shared by
+    /// [`Self::extend_exact_prepared`] and
+    /// [`Self::validate_extension_capacity`] so validation counts
+    /// exactly what extend allocates.
+    fn revival_target(&self, key: &AttachKey, rebuilt: &AttachPlan, slot: &Slot) -> Option<usize> {
+        if !matches!(self.admission_policy, AdmissionPolicy::Detailed) {
+            return None;
+        }
+        if self.slot_by_key.contains_key(key) {
+            return None;
+        }
+        let position = *self.revivable.get(key)?;
+        if self.retired_keys.get(key) != Some(&position) {
+            return None;
+        }
+        if !self.retired_slots.contains(&position) {
+            return None;
+        }
+        let retired = self.slots.get(position)?;
+        if AttachKey::of(retired) != *key {
+            return None;
+        }
+        if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
+            return None;
+        }
+        // A newly ambiguous aggregate on a semantic descriptor must not
+        // reuse the cookie: like the kept path it would downgrade, and a
+        // downgrade is a fresh slot, never a revival. Count-only and
+        // already-ambiguous aggregates revive unchanged.
+        let previous = self.aggregate_owners.get(position).copied()?;
+        let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
+            AggregateOwner::Ambiguous
+        } else {
+            AggregateOwner::from_module_ids(&slot.module_ids)
+        };
+        if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
+            return None;
+        }
+        Some(position)
     }
 
     /// The slot index for one exact attach target, if this plan holds it
@@ -2155,6 +2197,8 @@ impl AttachPlan {
         let mut slots = self.slots.clone();
         let mut slot_by_key = self.slot_by_key.clone();
         let mut retired_slots = self.retired_slots.clone();
+        let mut retired_keys = self.retired_keys.clone();
+        let mut revivable = self.revivable.clone();
         let mut aggregate_owners = self.aggregate_owners.clone();
         for (owner, slot) in aggregate_owners.iter_mut().zip(&self.slots) {
             *owner = owner.merge(AggregateOwner::from_module_ids(&slot.module_ids));
@@ -2170,6 +2214,7 @@ impl AttachPlan {
                 continue;
             }
             retired_slots.insert(*position);
+            retired_keys.insert(*key, *position);
             slot_by_key.remove(key);
             delta.retire.push(slots[*position].clone());
         }
@@ -2231,6 +2276,26 @@ impl AttachPlan {
                     }
                 }
                 slots[position] = updated;
+            } else if let Some(position) = self.revival_target(&key, &rebuilt, slot) {
+                // Same-target revival: the key cleared revivable and still
+                // matches its retired slot, so it reoccupies its old index
+                // instead of burning a fresh one. Counts continue in
+                // place — revive zeroes nothing.
+                let mut updated = slot.clone();
+                updated.index = position as u32;
+                let previous_owner = aggregate_owners[position];
+                let candidate_owner = if rebuilt.slot_is_module_ambiguous(slot.index) {
+                    AggregateOwner::Ambiguous
+                } else {
+                    AggregateOwner::from_module_ids(&updated.module_ids)
+                };
+                aggregate_owners[position] = previous_owner.merge(candidate_owner);
+                slots[position] = updated.clone();
+                slot_by_key.insert(key, position);
+                retired_slots.remove(&position);
+                retired_keys.remove(&key);
+                revivable.remove(&key);
+                delta.new.push(updated);
             } else {
                 let mut added = slot.clone();
                 added.index = slots.len() as u32;
@@ -2239,6 +2304,10 @@ impl AttachPlan {
                 } else {
                     AggregateOwner::from_module_ids(&added.module_ids)
                 };
+                // An active key leaves the revival memory: it is neither
+                // retired nor cleared anymore, wherever it was before.
+                retired_keys.remove(&key);
+                revivable.remove(&key);
                 slot_by_key.insert(key, slots.len());
                 delta.new.push(added.clone());
                 slots.push(added);
@@ -2267,6 +2336,8 @@ impl AttachPlan {
         self.slot_by_key = slot_by_key;
         self.provisional_get_function_list = rebuilt.provisional_get_function_list;
         self.retired_slots = retired_slots;
+        self.retired_keys = retired_keys;
+        self.revivable = revivable;
         self.aggregate_owners = aggregate_owners;
         self.module_ambiguous = self
             .aggregate_owners
@@ -2304,12 +2375,21 @@ impl AttachPlan {
     }
 
     fn validate_extension_capacity(&self, rebuilt: &AttachPlan) -> Result<(), String> {
+        // Only additions that need a new index count: revived targets
+        // reoccupy retired positions (see `revival_target`, the same
+        // predicate extend allocates by).
         let additions = rebuilt
             .slots
             .iter()
             .filter(|slot| {
-                rebuilt.is_active(slot.index)
-                    && !self.slot_by_key.contains_key(&AttachKey::of(slot))
+                if !rebuilt.is_active(slot.index) {
+                    return false;
+                }
+                let key = AttachKey::of(slot);
+                if self.slot_by_key.contains_key(&key) {
+                    return false;
+                }
+                self.revival_target(&key, rebuilt, slot).is_none()
             })
             .count();
         self.admission_policy
@@ -2400,12 +2480,27 @@ impl AttachPlan {
             return;
         }
         self.retired_slots.insert(position);
+        self.retired_keys.insert(key, position);
         self.slot_by_key.remove(&key);
         self.module_ambiguous = self
             .aggregate_owners
             .iter()
             .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
             .count();
+    }
+
+    /// Forgets a retired key: descriptor-replaced slots must never
+    /// revive their old descriptor or reuse their cookie, so a failed
+    /// replacement leaves no revival memory behind.
+    pub(crate) fn forget_retired_key(&mut self, slot: u32) {
+        self.mutations.bump();
+        let position = slot as usize;
+        if position >= self.slots.len() {
+            return;
+        }
+        let key = AttachKey::of(&self.slots[position]);
+        self.retired_keys.remove(&key);
+        self.revivable.remove(&key);
     }
 
     /// Gives back the cells at `accepted..` — every cell this candidate
@@ -2429,6 +2524,8 @@ impl AttachPlan {
         self.slots.truncate(accepted);
         self.aggregate_owners.truncate(accepted);
         self.retired_slots.retain(|position| *position < accepted);
+        self.retired_keys.retain(|_, position| *position < accepted);
+        self.revivable.retain(|_, position| *position < accepted);
         self.slot_by_key.retain(|_, position| *position < accepted);
         let slot_by_key = &self.slot_by_key;
         self.provisional_get_function_list
@@ -2503,6 +2600,15 @@ impl AttachPlan {
                 (new != u32::MAX).then_some(new as usize)
             })
             .collect();
+        for memory in [&mut self.retired_keys, &mut self.revivable] {
+            *memory = memory
+                .iter()
+                .filter_map(|(key, position)| {
+                    let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+                    (new != u32::MAX).then(|| (*key, new as usize))
+                })
+                .collect();
+        }
         for position in self.slot_by_key.values_mut() {
             let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
             debug_assert!(
@@ -2611,6 +2717,26 @@ impl AttachPlan {
             }
             if AttachKey::of(&self.slots[*position]) != *key {
                 return Err("exact attach index key does not match its slot".into());
+            }
+        }
+        // Structural checks only: `slots` is hand-mutated by legitimate
+        // flows, so position and key agreement are re-verified at use
+        // (see `revival_target`), never here.
+        for (key, position) in &self.retired_keys {
+            if self.slot_by_key.contains_key(key) {
+                return Err(format!(
+                    "retired key at slot {position} remains attach-indexed"
+                ));
+            }
+            if !self.retired_slots.contains(position) {
+                return Err(format!("retired key at slot {position} is not retired"));
+            }
+        }
+        for (key, position) in &self.revivable {
+            if self.retired_keys.get(key) != Some(position) {
+                return Err(format!(
+                    "revivable key at slot {position} has no retired memory"
+                ));
             }
         }
         for (key, object) in &self.provisional_get_function_list {
@@ -2970,6 +3096,12 @@ fn merge(
 ) -> AttachPlan {
     let capacity = admission_policy.endpoint_limit();
     let existing_slots = allocated.active;
+    // Same-target revival (Detailed only): cleared retired keys reoccupy
+    // their old positions at extend, so they cost no new slot. Counters
+    // publish by position and Inventory owns its own budget — neither
+    // revives, and their revivable input stays empty.
+    let revival_allowed = matches!(admission_policy, AdmissionPolicy::Detailed);
+    let revivable = allocated.revivable;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
@@ -3021,8 +3153,9 @@ fn merge(
     // closure first mapped during the capture never gets the prefix; it
     // admits only its publication-authorized tables below. Generic object
     // identity only — no provider names, offsets or symbols.
-    // Retired slots stay allocated for the capture lifetime and are never
-    // reused; refusals say so apart from the active endpoints.
+    // Retired slots stay allocated for the capture lifetime; cleared
+    // ones are reoccupied by same-target revival, and refusals say the
+    // running retired count apart from the active endpoints.
     let retired = allocated.slots.saturating_sub(existing_slots.len());
     let paths: BTreeMap<PinnedObjectId, &str> = groups
         .iter()
@@ -3040,6 +3173,9 @@ fn merge(
     let mut decisions: Vec<Option<AdmissionDecision>> = (0..groups.len()).map(|_| None).collect();
     let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated.slots;
+    // Revived keys un-retire as groups admit: later refusals in this
+    // merge report the running retired count, not the pre-merge one.
+    let mut revived_total = 0usize;
     // PA-5 C1+M3: a closure array takes heuristic room only when no real
     // provider was refused whole or omitted its growth ahead of it. Closures
     // decide last, so this is known. A prefix never hides a loss.
@@ -3254,6 +3390,7 @@ fn merge(
                         admissible(target)
                             && !claimed.contains(target)
                             && !existing_slots.contains_key(target)
+                            && !(revival_allowed && revivable.contains_key(target))
                     })
                     .collect();
                 if budget
@@ -3348,8 +3485,11 @@ fn merge(
                         }
                     }
                 }
-                let is_fresh =
-                    |key: &AttachKey| !claimed.contains(key) && !existing_slots.contains_key(key);
+                let is_fresh = |key: &AttachKey| {
+                    !claimed.contains(key)
+                        && !existing_slots.contains_key(key)
+                        && !(revival_allowed && revivable.contains_key(key))
+                };
                 // A table the module already has attached must never spill:
                 // its kept endpoints would vanish from the snapshot and
                 // retire. Its fresh demand, when it holds any kept endpoint,
@@ -3620,12 +3760,45 @@ fn merge(
                         break 'refused full_union;
                     }
                 }
+                // Revivable keys this pass admits: they reoccupy retired
+                // indices at extend, so they cost no new slot — but they
+                // are claimed and held like fresh ones. Only admitted
+                // tables (and whole-admitted manifest targets) revive; a
+                // spilled table's keys stay retired. The kept-only retry
+                // preserves kept endpoints alone and revives nothing.
+                let revived: BTreeSet<AttachKey> = if kept_only || !revival_allowed {
+                    BTreeSet::new()
+                } else {
+                    let mut revived = BTreeSet::new();
+                    for key in &admitted {
+                        if let Some(keys) = keys_of.get(key) {
+                            revived.extend(
+                                keys.iter()
+                                    .filter(|key| revivable.contains_key(key))
+                                    .copied(),
+                            );
+                        }
+                    }
+                    for module in group.iter().filter(|module| module.scan_evidence.is_none()) {
+                        for target in &module.targets {
+                            let key = AttachKey {
+                                object: target.object,
+                                file_offset: target.file_offset,
+                            };
+                            if revivable.contains_key(&key) {
+                                revived.insert(key);
+                            }
+                        }
+                    }
+                    revived
+                };
                 break 'admission Ok((
                     fresh,
                     admitted,
                     closure_prefix,
                     closure_published_partial,
                     provider_prefix,
+                    revived,
                 ));
             };
             // Over `kept` alone nothing is fresh, so only the first pass
@@ -3653,7 +3826,11 @@ fn merge(
                         object: target.object,
                         file_offset: target.file_offset,
                     })
-                    .filter(|key| !claimed.contains(key) && !existing_slots.contains_key(key))
+                    .filter(|key| {
+                        !claimed.contains(key)
+                            && !existing_slots.contains_key(key)
+                            && !(revival_allowed && revivable.contains_key(key))
+                    })
                     .collect()
             } else {
                 refused
@@ -3710,7 +3887,7 @@ fn merge(
             }
             break 'admission Err(refused);
         };
-        let (fresh, admitted, closure_prefix, closure_published_partial, provider_prefix) =
+        let (fresh, admitted, closure_prefix, closure_published_partial, provider_prefix, revived) =
             match outcome {
                 Ok(admission) => admission,
                 Err(refused) => {
@@ -3723,7 +3900,7 @@ fn merge(
                         needed: refused.len(),
                         capacity,
                         in_use: allocated_slots,
-                        retired,
+                        retired: retired.saturating_sub(revived_total),
                         holders: slot_holders(&holding, &paths),
                         reserve: reserved.then_some(reserve),
                         closure_tables: (class == AdmissionClass::ClosureArray)
@@ -3783,8 +3960,10 @@ fn merge(
         allocated_slots = admission_policy
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
+        revived_total += revived.len();
         claimed.extend(fresh.iter().copied());
-        holding.insert(object, kept.len() + fresh.len());
+        claimed.extend(revived.iter().copied());
+        holding.insert(object, kept.len() + fresh.len() + revived.len());
         decisions[position] = Some(AdmissionDecision::Admitted {
             admitted,
             refused_growth,
@@ -4092,7 +4271,7 @@ fn merge(
                         omitted: omitted.len(),
                         capacity,
                         in_use: allocated_slots,
-                        retired,
+                        retired: retired.saturating_sub(revived_total),
                         kept: kept_attached.len(),
                         policy: admission_policy,
                         holders: &slot_holders(&holders_map, &paths),
@@ -6872,6 +7051,18 @@ impl ConservativePlanCursor {
         out.slot_ordinals = std::mem::take(&mut self.output_ordinals);
         out.object_identities = std::mem::take(&mut self.output_identities);
         out.retired_slots = std::mem::take(&mut self.output_retired);
+        // Mirror extend's retire loop exactly: newly retired positions
+        // are remembered, forgotten keys stay forgotten, and the
+        // removal-only cursor consumes no clearance.
+        out.retired_keys = old.retired_keys.clone();
+        for position in out.retired_slots.iter() {
+            if !old.retired_slots.contains(position)
+                && let Some(slot) = out.slots.get(*position)
+            {
+                out.retired_keys.insert(AttachKey::of(slot), *position);
+            }
+        }
+        out.revivable = old.revivable.clone();
         out.aggregate_owners = std::mem::take(&mut self.output_owners);
         out.entries_seen = self.entries_seen;
         out.module_ambiguous = self.ambiguous_count;
@@ -14578,31 +14769,33 @@ mod tests {
     }
 
     /// The revival gate decides by identity: the same descriptor and
-    /// names revive, anything else takes a fresh slot.
+    /// names revive, anything else takes a fresh slot. Count-only
+    /// targets revive through new aggregate ambiguity; semantic ones
+    /// never do.
     #[test]
     fn revival_target_requires_same_descriptor_and_names() {
         let provider = provider_with_tables(97, "/opt/gate-pkcs11.so", 1, 1, true);
         let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
         plan.deactivate(0);
         let key = AttachKey::of(&plan.slots[0]);
-        plan.revivable.insert(key.clone(), 0);
+        plan.revivable.insert(key, 0);
         let same = plan.slots[0].clone();
         assert_eq!(
-            plan.revival_target(&key, &same),
+            plan.revival_target(&key, &plan, &same),
             Some(0),
             "the same identity revives"
         );
         let mut renamed = same.clone();
         renamed.names = vec!["C_Encrypt".into()];
         assert_eq!(
-            plan.revival_target(&key, &renamed),
+            plan.revival_target(&key, &plan, &renamed),
             None,
             "renamed targets never revive"
         );
         let mut redescribed = same.clone();
         redescribed.descriptor_index += 1;
         assert_eq!(
-            plan.revival_target(&key, &redescribed),
+            plan.revival_target(&key, &plan, &redescribed),
             None,
             "redescribed targets never revive"
         );
@@ -14611,9 +14804,25 @@ mod tests {
             file_offset: key.file_offset + 0x1000,
         };
         assert_eq!(
-            plan.revival_target(&unknown, &same),
+            plan.revival_target(&unknown, &plan, &same),
             None,
             "unknown keys never revive"
+        );
+        let mut co_claimed = same.clone();
+        co_claimed.module_ids = vec![ModuleId(0), ModuleId(1)];
+        let ambiguous = AttachPlan::from_slots(vec![co_claimed]);
+        assert_eq!(
+            plan.revival_target(&key, &ambiguous, &ambiguous.slots[0]),
+            Some(0),
+            "count-only revives through new ambiguity"
+        );
+        plan.slots[0].descriptor_index = 1;
+        let mut semantic = same;
+        semantic.descriptor_index = 1;
+        assert_eq!(
+            plan.revival_target(&key, &ambiguous, &semantic),
+            None,
+            "new ambiguity on a semantic descriptor never revives"
         );
     }
 

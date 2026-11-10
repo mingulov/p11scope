@@ -2048,10 +2048,12 @@ never change.
 ## Pid-scope caller executable (v0.7.0)
 
 **Status: IMPLEMENTED in v0.7.0: a pid-scope profile/metrics capture
-names its target's executable in `capture.caller` and on the stderr
-target line, so the report never shows a pid-scope capture without its
-caller. Allowlist-v1 bytes are unchanged; this section authorizes the
-one new profile/metrics disclosure below, and no other surface gains a
+names its target's executable in `capture.caller`, and pid-scope
+profile/metrics/trace captures name it on the stderr target line, so
+the report never shows a pid-scope capture without its caller.
+Allowlist-v1 bytes are unchanged; this section authorizes the one new
+pid-scope caller-executable disclosure below (JSON for profile/metrics,
+stderr line for profile/metrics/trace), and no other surface gains a
 name or path.** It adds no target-memory, argument, command-line,
 environment, payload, key, or PIN capture: the reads are the
 `/proc/<pid>/exe` link (the same read kind as caller exe identity),

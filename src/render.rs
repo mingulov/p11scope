@@ -8182,6 +8182,47 @@ pub(crate) mod tests {
         );
     }
 
+    /// Concise default output names whole capacity refusals before proxy
+    /// awaiting-publication lines: with two proxy gaps first, the trust
+    /// and snap softokn capacity refusals take the two shown lines, so
+    /// the reader sees the real gaps without `-v`. Reasons are verbatim
+    /// rc16 report text.
+    #[test]
+    fn concise_gaps_name_capacity_refusals_before_proxy_lines() {
+        const PROXY_AWAITING: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole, as a prefix when named by the operator, or as published tables; an unnamed layer in a detailed capture attaches only its published tables); the providers it forwards to attach when they load";
+        const TRUST_CAPACITY: &str = "module needs 68 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105); 128 are reserved for providers with a corroborated function table — refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
+        const SNAP_CAPACITY: &str = "module needs 212 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105) — refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
+        let mut ev = evidence();
+        for name in [
+            "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
+            "/snap/snapd-desktop-integration/391/gnome-platform/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.5",
+        ] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: PROXY_AWAITING.into(),
+            });
+        }
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so".into(),
+            reason: TRUST_CAPACITY.into(),
+        });
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/snap/firefox/9057/usr/lib/firefox/libsoftokn3.so".into(),
+            reason: SNAP_CAPACITY.into(),
+        });
+        let out = concise_module_gap_lines(&ev, &reports_fixture());
+        assert!(out.contains("Module gaps (showing 2 of 4):"), "{out}");
+        assert!(out.contains("p11-kit-trust.so"), "{out}");
+        assert!(
+            out.contains("snap/firefox/9057/usr/lib/firefox/libsoftokn3.so"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("libp11-kit.so"),
+            "proxy lines rank below capacity refusals: {out}"
+        );
+    }
+
     /// F2: the concise profile summary names a refused provider with
     /// its file and the `--module` remedy (not just the aggregate
     /// "1 provider file not watched" fragment).

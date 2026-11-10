@@ -14327,6 +14327,122 @@ mod tests {
         );
     }
 
+    /// The rc16 desktop census as merge inputs: host softokn 212 and
+    /// opensc 105 corroborated, snap softokn 212 corroborated, trust 68
+    /// and nssckbi 68 heuristic — one table each, inodes in decision
+    /// order. Shared by the refusal reproduction and its wide-build
+    /// sibling so the two assert over the same standing set.
+    fn desktop_census_modules() -> [ReconciledModule; 5] {
+        [
+            provider_with_tables(71, "/opt/libsoftokn3.so", 1, 212, true),
+            provider_with_tables(72, "/opt/opensc-pkcs11.so", 1, 105, true),
+            provider_with_tables(73, "/opt/snap-libsoftokn3.so", 1, 212, true),
+            provider_with_tables(74, "/opt/p11-kit-trust.so", 1, 68, false),
+            provider_with_tables(75, "/opt/libnssckbi.so", 1, 68, false),
+        ]
+    }
+
+    /// Desktop census (rc16 runs #5/#6): host softokn 212 + opensc 105
+    /// are admitted and snap softokn 212, p11-kit-trust 68 and nssckbi
+    /// 68 are refused whole at the 512-slot budget — the reproduction
+    /// the attach-slot fix turns green via its wide-build sibling.
+    #[cfg(not(feature = "wide-detailed-2112"))]
+    #[test]
+    fn desktop_census_refuses_snap_softokn_and_trust_at_512() {
+        let census = desktop_census_modules();
+        for (module, class) in census.iter().zip([
+            "corroborated",
+            "corroborated",
+            "corroborated",
+            "heuristic",
+            "heuristic",
+        ]) {
+            assert_eq!(
+                classify_scanned_object(std::slice::from_ref(module)).0,
+                class,
+                "the deciding class of {}",
+                module.scanned.path
+            );
+        }
+        let plan = scoped_plan(&census, AdmissionScope::Shared);
+        assert_eq!(slots_of(&plan, 71), 212, "host softokn admitted whole");
+        assert_eq!(slots_of(&plan, 72), 105, "opensc admitted whole");
+        assert_eq!(plan.slots.len(), 317, "317 in use, as in rc16");
+        assert_eq!(plan.modules_skipped.len(), 3, "{:?}", plan.modules_skipped);
+        for (path, needed) in [
+            ("/opt/snap-libsoftokn3.so", 212),
+            ("/opt/p11-kit-trust.so", 68),
+            ("/opt/libnssckbi.so", 68),
+        ] {
+            let refusal = refusal_of(&plan, path).expect("a whole refusal");
+            assert_eq!(
+                whole_refusal_needed_count(&refusal.reason),
+                Some(needed),
+                "the complete fresh demand: {}",
+                refusal.reason
+            );
+        }
+        let trust = refusal_of(&plan, "/opt/p11-kit-trust.so").expect("trust refused");
+        assert!(
+            trust.reason.contains("are reserved"),
+            "317 + 68 = 385 exceeds the 384 heuristic ceiling: {}",
+            trust.reason
+        );
+    }
+
+    /// Wide-build sibling of the desktop census: at the default
+    /// 2,112-slot budget every standing provider of the rc16 set is
+    /// admitted — 665 slots, no refusal.
+    #[cfg(feature = "wide-detailed-2112")]
+    #[test]
+    fn desktop_census_admits_every_provider_at_default_width() {
+        let census = desktop_census_modules();
+        let plan = scoped_plan(&census, AdmissionScope::Shared);
+        assert_eq!(slots_of(&plan, 71), 212, "host softokn admitted whole");
+        assert_eq!(slots_of(&plan, 72), 105, "opensc admitted whole");
+        assert_eq!(slots_of(&plan, 73), 212, "snap softokn admitted whole");
+        assert_eq!(slots_of(&plan, 74), 68, "trust admitted whole");
+        assert_eq!(slots_of(&plan, 75), 68, "nssckbi admitted whole");
+        assert_eq!(plan.slots.len(), 665, "the whole standing set fits");
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "no refusal at the wide budget: {:?}",
+            plan.modules_skipped
+        );
+    }
+
+    /// Fedora churn shape: opensc 105 + softhsm 68 stay while a 241-slot
+    /// file leaves; the rebuild carries 414 lifetime slots and refuses
+    /// p11-kit-trust 68 although the 173 active endpoints plus 68 would
+    /// fit — retired slots are never reused, so churn starves later
+    /// admissions. Only the 512 build can show it: the wide budget fits
+    /// 414 + 68 under its heuristic ceiling.
+    #[cfg(not(feature = "wide-detailed-2112"))]
+    #[test]
+    fn churn_retired_slots_starve_trust() {
+        let opensc = provider_with_tables(81, "/opt/opensc-pkcs11.so", 1, 105, true);
+        let softhsm = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let churn = provider_with_tables(83, "/opt/churn-pkcs11.so", 1, 241, true);
+        let trust = provider_with_tables(84, "/opt/p11-kit-trust.so", 1, 68, false);
+        let first = scoped_plan(
+            &[opensc.clone(), softhsm.clone(), churn],
+            AdmissionScope::Shared,
+        );
+        assert_eq!(first.slots.len(), 414, "opensc + softhsm + churn");
+        let rebuilt =
+            first.rebuild_from_sources(&[opensc, softhsm, trust], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 81), 105, "opensc kept");
+        assert_eq!(slots_of(&rebuilt, 82), 68, "softhsm kept");
+        let refusal =
+            refusal_of(&rebuilt, "/opt/p11-kit-trust.so").expect("trust refused by dead slots");
+        assert_eq!(
+            whole_refusal_needed_count(&refusal.reason),
+            Some(68),
+            "the complete fresh demand: {}",
+            refusal.reason
+        );
+    }
+
     /// The published-union exception to the strongest-table rule: a fresh
     /// shared-scope provider whose corroborated (published) tables together
     /// exceed the remaining budget is refused whole even when its strongest

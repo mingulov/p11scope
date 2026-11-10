@@ -3211,7 +3211,26 @@ pub(crate) fn live_snapshot_scoped(
     scope: &str,
     mechanisms: &BTreeMap<u64, MechStat>,
 ) -> String {
-    let mut frame = live_scoped(
+    live_snapshot_scoped_with_caller(
+        snapshot, ev, elapsed, module, mode, policy, scope, mechanisms, None,
+    )
+}
+
+/// [`live_snapshot_scoped`] plus the pid-scope caller line, so profile
+/// stdout names the caller program. `None` caller renders no line.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_snapshot_scoped_with_caller(
+    snapshot: &crate::metrics::CaptureSnapshot,
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+    caller: Option<&CaptureCaller>,
+) -> String {
+    let mut frame = live_scoped_with_caller(
         snapshot.reports(),
         ev,
         elapsed,
@@ -3220,6 +3239,8 @@ pub(crate) fn live_snapshot_scoped(
         policy,
         scope,
         mechanisms,
+        caller,
+        crate::cli::text_verbosity(),
     );
     if let Some(summary) = snapshot.counter_summary() {
         // Concise frames end with the `-v` hint: the counter block reads
@@ -3269,9 +3290,16 @@ pub fn live_scoped(
 
 /// The pid-scope caller line for profile stdout, without the PID number
 /// (allowlist v1: the pid is a stderr diagnostic only). `None` for
-/// aggregate scopes, which name no single caller.
-pub fn caller_text_line(_caller: Option<&CaptureCaller>) -> Option<String> {
-    None
+/// aggregate scopes, which name no single caller. The exe is
+/// target-controlled, so it is control-escaped at this boundary, like
+/// the stderr target line.
+pub fn caller_text_line(caller: Option<&CaptureCaller>) -> Option<String> {
+    let caller = caller?;
+    match (&caller.exe, caller.exe_unknown_reason) {
+        (Some(exe), _) => Some(format!("caller: {}", escape_controls(exe))),
+        (None, Some(reason)) => Some(format!("caller unknown: {reason}")),
+        (None, None) => Some("caller unknown: caller unresolved".to_string()),
+    }
 }
 
 /// [`live_scoped_with_verbosity`] plus the pid-scope caller line after
@@ -3287,12 +3315,22 @@ pub fn live_scoped_with_caller(
     policy: CapturePolicy,
     scope: &str,
     mechanisms: &BTreeMap<u64, MechStat>,
-    _caller: Option<&CaptureCaller>,
+    caller: Option<&CaptureCaller>,
     verbosity: crate::cli::TextVerbosity,
 ) -> String {
-    live_scoped_with_verbosity(
+    let frame = live_scoped_with_verbosity(
         reports, ev, elapsed, module, mode, policy, scope, mechanisms, verbosity,
-    )
+    );
+    let Some(line) = caller_text_line(caller) else {
+        return frame;
+    };
+    // After the header so the header stays first and the caller answers
+    // the demo question next, at every verbosity (quiet included).
+    if let Some((header, rest)) = frame.split_once('\n') {
+        format!("{header}\n{line}\n{rest}")
+    } else {
+        format!("{frame}{line}\n")
+    }
 }
 
 /// One plain line naming a refused pause and why. `None` unless a

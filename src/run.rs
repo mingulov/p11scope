@@ -5353,7 +5353,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         render::apply_legacy_gaps(&mut ev, snapshot);
     }
     let facts = context.engine.capture_facts();
-    let frame = render::live_scoped(
+    let frame = render::live_scoped_with_caller(
         &reports,
         &ev,
         context.wall_start.elapsed().unwrap_or(Duration::ZERO),
@@ -5362,6 +5362,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         context.policy,
         context.scope.kind(),
         state.mechanisms(),
+        target_caller.as_ref(),
+        crate::cli::text_verbosity(),
     );
     // The `-o` file is the report when one was given; the stdout frame is
     // display only then. Without `-o` the frame is the report, so its
@@ -9295,7 +9297,7 @@ fn capture_profile(
             render::apply_counter_snapshot(&mut ev, &snapshot);
             render::apply_legacy_gaps(&mut ev, &snapshot);
             render::apply_snapshot_failure(&mut ev, &snapshot);
-            let frame = render::live_snapshot_scoped(
+            let frame = render::live_snapshot_scoped_with_caller(
                 &snapshot,
                 &ev,
                 elapsed,
@@ -9304,6 +9306,7 @@ fn capture_profile(
                 policy,
                 scope.kind(),
                 state.mechanisms(),
+                target_caller.as_ref(),
             );
             if let Some(bytes) = live_display.frame_bytes(&frame, false) {
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
@@ -10126,7 +10129,7 @@ fn capture_profile(
         render::apply_legacy_gaps(&mut ev, &snapshot);
         render::apply_snapshot_failure(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
-        let mut frame = render::live_snapshot_scoped(
+        let mut frame = render::live_snapshot_scoped_with_caller(
             &snapshot,
             &ev,
             clock.elapsed(),
@@ -10135,6 +10138,7 @@ fn capture_profile(
             policy,
             scope.kind(),
             consumers.state.mechanisms(),
+            target_caller.as_ref(),
         );
         // A cleanly closed --select-endpoint window names itself in the
         // report, before the hint: refused and voided selections already

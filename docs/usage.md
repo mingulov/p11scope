@@ -393,7 +393,9 @@ when calls failed, a per-caller error-reason roll-up (below);
 A pid-scope capture names its target on stderr beside the readiness
 line — `p11scope: target: pid <N> exe <path>`, or
 `p11scope: target: pid <N> caller unknown: <reason>` when the exe link
-could not be read — and carries the same identity in `capture.caller`
+could not be read — names the caller program on profile stdout after
+the header (`caller: <path>`, or `caller unknown: <reason>`), and
+carries the same identity in `capture.caller`
 of the JSON report (`{exe, exe_unknown_reason}`, exactly one set).
 The report carries no PID number; the pid is an operator diagnostic
 only. Cgroup and system scopes name no single caller.

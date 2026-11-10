@@ -671,10 +671,70 @@ fn parse_pod_uid(bytes: &[u8]) -> Option<PodUid> {
 /// docker/podman/containerd/cri-o containers, the systemd unit for unit
 /// paths, and the raw path verbatim for unknown shapes. Path-only: no
 /// API calls, no I/O. A lexical hint, never orchestrator proof.
-pub(crate) fn workload_label_for_cgroup_path(_path: &str) -> String {
-    // RED stub: every workload-label test below fails until the
-    // implementation lands.
-    String::from("unstubbed")
+pub(crate) fn workload_label_for_cgroup_path(path: &str) -> String {
+    // Fail closed to raw on control bytes: a newline or carriage
+    // return would re-split the synthetic membership line below into
+    // a unit reading of a path prefix.
+    if path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return path.to_string();
+    }
+    // The exact docker/Kubernetes grammars, over the relative path as
+    // the `0::/` membership line the label resolver walked.
+    let membership = parse_cgroup_membership(format!("0::/{path}\n").as_bytes());
+    if membership.status == ParseStatus::Recognized {
+        if let (Some(pod), Some(container)) = (membership.pod, membership.container) {
+            return format!(
+                "pod {} / container {}",
+                pod.uid.as_str(),
+                container.id.as_str()
+            );
+        }
+        if let Some(container) = membership.container {
+            return format!(
+                "container {} ({})",
+                container.id.as_str(),
+                presentation::runtime_label(container.runtime)
+            );
+        }
+    }
+    // Podman/libpod grammar, local to workload labels: the shared
+    // membership parser leaves libpod unrecognized.
+    if let Some(id) = parse_libpod_container_id(path) {
+        return format!("container {} (podman)", id.as_str());
+    }
+    // systemd unit fallback: the first unit past leading slices, the
+    // same `sd_pid_get_unit` rule the launcher chain publishes.
+    if let Some(unit) = systemd_unit_from_relative_path(path) {
+        return unit;
+    }
+    path.to_string()
+}
+
+/// Podman/libpod container id from a relative cgroup path: a
+/// `libpod-<64hex>.scope` unit (systemd driver, with any trailing
+/// sub-cgroup such as `/container`) or a bare `libpod-<64hex>`
+/// component (cgroupfs driver), anywhere in the path. The innermost
+/// match wins, mirroring the membership parser's container rule.
+/// Local to workload labels; the shared membership parser leaves
+/// libpod unrecognized.
+fn parse_libpod_container_id(path: &str) -> Option<ContainerId> {
+    let mut found = None;
+    for component in path.split('/') {
+        let Some(rest) = component.strip_prefix("libpod-") else {
+            continue;
+        };
+        let id_bytes = rest.strip_suffix(".scope").unwrap_or(rest);
+        if let Some(id) = parse_container_id(id_bytes.as_bytes()) {
+            found = Some(id);
+        }
+    }
+    found
+}
+
+/// [`systemd_unit_from_cgroup_text`] over a cgroup2-relative path: the
+/// `0::/` membership line the label resolver walked.
+fn systemd_unit_from_relative_path(path: &str) -> Option<String> {
+    systemd_unit_from_cgroup_text(&format!("0::/{path}\n"))
 }
 
 #[cfg(test)]
@@ -1551,6 +1611,20 @@ mod tests {
             "p11scope-run-0123456789abcdef/workers/a",
             "system.slice",
             "",
+        ] {
+            assert_eq!(workload_label_for_cgroup_path(path), path, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn workload_label_keeps_control_characters_verbatim() {
+        // A newline or carriage return in a component must not
+        // re-split the synthetic membership line into a unit reading:
+        // fail closed to raw.
+        for path in [
+            "system.slice/x.service\nevil",
+            "system.slice/x.service\revil",
+            "system.slice/x\x7f.service",
         ] {
             assert_eq!(workload_label_for_cgroup_path(path), path, "{path:?}");
         }

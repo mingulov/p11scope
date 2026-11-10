@@ -5124,6 +5124,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let domain = context.session.events_domain();
     let mut state =
         semantics::State::for_capture(context.engine.plan(), context.policy, domain.clone());
+    state.set_cgroup_label_root(std::path::PathBuf::from("/sys/fs/cgroup"));
     let mut tracker = process::Tracker::for_producer(domain, 16_384);
     let mut scheduling = SchedulingAccumulator::default();
     scheduling.note_resource(crate::timing::ResourcePoint::Start, context.resource_start);
@@ -7265,7 +7266,7 @@ fn identify_tracked(
         tracker.history_call(key);
         tracker.history_root(key, ev.root_affiliation);
     } else {
-        state.reject_history(ev);
+        state.reject_unadmitted(ev);
     }
     key
 }
@@ -8998,6 +8999,7 @@ fn capture_profile(
     // drains the ring buffer, so it stays the lighter, maps-only level.
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
+    state.set_cgroup_label_root(std::path::PathBuf::from("/sys/fs/cgroup"));
     let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
     if policy.uses_unsafe_decoders()
         && let Err(error) = load_mech_shapes(&mut state)
@@ -10191,6 +10193,12 @@ fn capture_profile(
             &consumers.state.sessions(),
             consumers.state.logins(),
         );
+        // -v per-cgroup rows, labeled per pod/unit from the same rows
+        // the JSON report carries. Final frame only: periodic frames
+        // never pay for label resolution.
+        if crate::cli::text_verbosity() == crate::cli::TextVerbosity::Verbose {
+            frame.push_str(&render::cgroup_verbose_section(consumers.state, &ev));
+        }
         // A cleanly closed --select-endpoint window names itself in the
         // report, before the hint: refused and voided selections already
         // spoke on stderr, but a success never mentioned its endpoint.

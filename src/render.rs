@@ -5091,33 +5091,7 @@ struct CgroupOut {
 }
 
 fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
-    let root = std::path::Path::new("/sys/fs/cgroup");
-    state
-        .cgroups()
-        .iter()
-        .map(|(&cgroup_id, c)| CgroupOut {
-            cgroup_id,
-            label: crate::scope::label(root, cgroup_id),
-            // RED stub: the workload derivation lands with the
-            // retained/live resolution.
-            workload: None,
-            calls: c.calls,
-            errors: c.errors,
-            unadmitted: c.unadmitted,
-            mechanisms: c
-                .mechanisms
-                .iter()
-                .map(|(&mechanism, m)| CgroupMechOut {
-                    mechanism,
-                    mechanism_hex: format!("0x{mechanism:x}"),
-                    name: mechanism_name(mechanism),
-                    registered: !m.unregistered,
-                    calls: m.calls,
-                    errors: m.errors,
-                })
-                .collect(),
-        })
-        .collect()
+    cgroups_out_with_live_root(state, std::path::Path::new("/sys/fs/cgroup"))
 }
 
 /// [`cgroups_out`] against an explicit live root: the test seam. The
@@ -5127,19 +5101,78 @@ fn cgroups_out_with_live_root(
     state: &crate::semantics::State,
     live_root: &std::path::Path,
 ) -> Vec<CgroupOut> {
-    // RED stub: ignores the seam root until the retained/live
-    // resolution lands.
-    let _ = live_root;
-    cgroups_out(state)
+    state
+        .cgroups()
+        .iter()
+        .map(|(&cgroup_id, c)| {
+            // Live first (current truth), retained fallback (exited
+            // pods under churn); never a guess either way.
+            let label = crate::scope::label(live_root, cgroup_id)
+                .or_else(|| state.retained_cgroup_path(cgroup_id));
+            let workload = label
+                .as_deref()
+                .map(crate::caller_metadata::workload_label_for_cgroup_path);
+            CgroupOut {
+                cgroup_id,
+                label,
+                workload,
+                calls: c.calls,
+                errors: c.errors,
+                unadmitted: c.unadmitted,
+                mechanisms: c
+                    .mechanisms
+                    .iter()
+                    .map(|(&mechanism, m)| CgroupMechOut {
+                        mechanism,
+                        mechanism_hex: format!("0x{mechanism:x}"),
+                        registered: !m.unregistered,
+                        calls: m.calls,
+                        errors: m.errors,
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 /// `-v` per-cgroup section for the final profile frame: one row per
 /// cgroup with its workload label and counts, unknown paths degraded
 /// to their numeric id, and kernel-dropped completions named as
 /// unattributable. Empty when the state holds no cgroup rows.
-pub(crate) fn cgroup_verbose_section(_state: &crate::semantics::State, _ev: &Evidence) -> String {
-    // RED stub: the section renders nothing until GREEN.
-    String::new()
+/// Renders from the same rows the JSON report carries, so text and
+/// JSON cannot drift.
+pub(crate) fn cgroup_verbose_section(state: &crate::semantics::State, ev: &Evidence) -> String {
+    let rows = cgroups_out(state);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("Cgroups ({}):\n", rows.len());
+    let mut missed = 0u64;
+    for row in rows {
+        missed = missed.saturating_add(row.unadmitted);
+        let name = row
+            .workload
+            .unwrap_or_else(|| format!("cgroup {} (unknown)", row.cgroup_id));
+        let mut line = format!(
+            "  {}: {} calls, {} errors",
+            escape_controls(&name),
+            row.calls,
+            row.errors
+        );
+        if row.unadmitted > 0 {
+            line.push_str(&format!(", {} unadmitted", row.unadmitted));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if missed > 0 || ev.semantic_capture_failures > 0 || ev.kernel_control.identity_unavailable > 0
+    {
+        out.push_str(&format!(
+            "  ({} calls above missed process admission; {} semantic capture failures, {} kernel identity refusals; dropped calls carry no per-pod data)\n",
+            missed, ev.semantic_capture_failures, ev.kernel_control.identity_unavailable
+        ));
+    }
+    out
 }
 
 /// `capture` section fields that aren't derived from `reports`/`ev`/`state`.

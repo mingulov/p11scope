@@ -292,7 +292,8 @@ pub(crate) trait DirectoryProof {
 }
 
 /// Canonical container runtime label for the actual parser hint.
-fn runtime_label(runtime: RuntimeHint) -> &'static str {
+/// Shared with workload labels so the two cannot drift.
+pub(crate) fn runtime_label(runtime: RuntimeHint) -> &'static str {
     match runtime {
         RuntimeHint::Unknown => "unknown",
         RuntimeHint::Docker => "docker",

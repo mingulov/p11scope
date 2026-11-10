@@ -2916,6 +2916,7 @@ impl State {
                         unadmitted: 0,
                     },
                 );
+                self.note_cgroup_sighting(ev.cgroup_id);
             }
         } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls = cg.calls.saturating_add(1);
@@ -2948,8 +2949,31 @@ impl State {
     /// Foreign-domain rejections keep using [`State::reject_history`];
     /// they are not admission misses.
     pub(crate) fn reject_unadmitted(&mut self, ev: &Event) {
-        // RED stub: plain rejection until the unadmitted mark lands.
         self.reject_history(ev);
+        // Mark the row the rejection just counted (CALL only; a
+        // refused cell has no row to mark).
+        if ev.event_type == event_type::CALL
+            && let Some(row) = self.cgroups.get_mut(&ev.cgroup_id)
+        {
+            row.unadmitted = row.unadmitted.saturating_add(1);
+        }
+    }
+
+    /// Retain `cgroup_id`'s current path at first sighting, while its
+    /// processes are alive. Best effort: without a label root nothing
+    /// is retained; an unresolvable id retains nothing; an already
+    /// retained id keeps its first path (first sighting wins, and
+    /// report time prefers the live path anyway).
+    fn note_cgroup_sighting(&mut self, cgroup_id: u64) {
+        if self.cgroup_retained_paths.contains_key(&cgroup_id) {
+            return;
+        }
+        let Some(root) = self.cgroup_label_root.clone() else {
+            return;
+        };
+        if let Some(path) = crate::scope::label(&root, cgroup_id) {
+            self.cgroup_retained_paths.insert(cgroup_id, path);
+        }
     }
 
     pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
@@ -2977,6 +3001,7 @@ impl State {
                         unadmitted: 0,
                     },
                 );
+                self.note_cgroup_sighting(ev.cgroup_id);
             }
         } else if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
             cg.calls += 1;

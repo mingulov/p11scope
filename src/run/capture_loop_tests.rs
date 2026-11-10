@@ -3824,10 +3824,40 @@ fn deferred_failure_fails_after_publication() {
     );
 }
 
+/// A degraded-stdout trace that then hits a quiesce failure keeps both
+/// errors: the deferred stdout failure joins the quiesce error union at
+/// the quiesce-error terminal exactly as at the normal terminals, so
+/// the report names it and the run exits nonzero.
+#[test]
+fn trace_quiesce_error_with_degraded_stdout_names_both_failures() {
+    let mut deferred: Option<anyhow::Error> = Some(
+        anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "fd 1 closed",
+        ))
+        .context("opening capture stdout"),
+    );
+    let error = finish_quiesce_error(
+        anyhow::anyhow!("quiesce failure"),
+        Ok(CaptureEnd::DurationExpired),
+        &mut (),
+        |_| {},
+        |_, _| Ok(()),
+        |_| combine_deferred_failure(Ok(()), deferred.take()),
+        |_| Ok(()),
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("quiesce failure") && message.contains("opening capture stdout"),
+        "either error dropped: {message}"
+    );
+}
+
 /// Both capture paths file the terminal-drain gaps, open stdout
 /// through the degrading opener, and report the deferred failure after
-/// publication (profile: quiesce-error and normal terminals; trace:
-/// the normal terminal — its quiesce path already fails).
+/// publication at both terminals (quiesce-error and normal): a
+/// degraded-stdout run that then hits a quiesce failure still names
+/// the deferred failure and exits nonzero.
 #[test]
 fn terminal_drain_and_stdout_degradations_are_wired_at_both_capture_paths() {
     let source = include_str!("../run.rs");
@@ -3845,7 +3875,7 @@ fn terminal_drain_and_stdout_degradations_are_wired_at_both_capture_paths() {
         .split_once("fn terminal_trace_count_line")
         .unwrap()
         .0;
-    for (function, body, deferred) in [("capture_profile", profile, 2), ("capture_trace", trace, 1)]
+    for (function, body, deferred) in [("capture_profile", profile, 2), ("capture_trace", trace, 2)]
     {
         for site in [
             "note_terminal_events_drain_failure()",

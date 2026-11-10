@@ -51047,6 +51047,155 @@ fn terminal_discovery_failure_publishes_unfinished_terminal_work() {
     );
 }
 
+/// A terminal events drain that failed at any stop files unfinished
+/// work as a live loss: the named gap is published, causal timing is
+/// invalidated (no causal claim spans the failure), and the seal
+/// proceeds from partial state.
+#[test]
+fn terminal_events_drain_failure_files_live_loss_without_causal_timing() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let timing = timing_key(0);
+    engine.timings.observe(&timing, 10);
+    engine.timings.complete(&timing, 20);
+    assert_eq!(engine.timings.gap_ns(&timing), Some(10));
+    engine.note_terminal_events_drain_failure();
+    let gaps: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "terminal events drain")
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the failure publishes its named gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        gaps[0].reason,
+        "the terminal events drain failed; the report holds what was captured up to the failure"
+    );
+    assert_eq!(
+        engine.timings.gap_ns(&timing),
+        None,
+        "a failed terminal drain invalidates causal timing"
+    );
+}
+
+/// A terminal original-root tail drain that failed at any stop files
+/// unfinished work as a live loss: the named gap is published, causal
+/// timing is invalidated, and the seal proceeds with no completed tail.
+#[test]
+fn terminal_original_root_drain_failure_files_live_loss_without_causal_timing() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let timing = timing_key(0);
+    engine.timings.observe(&timing, 10);
+    engine.timings.complete(&timing, 20);
+    assert_eq!(engine.timings.gap_ns(&timing), Some(10));
+    engine.note_terminal_original_root_drain_failure();
+    let gaps: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "terminal original-root drain")
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the failure publishes its named gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        gaps[0].reason,
+        "the terminal original-root tail drain failed; the report holds what was captured up to the failure"
+    );
+    assert_eq!(
+        engine.timings.gap_ns(&timing),
+        None,
+        "a failed root tail drain invalidates causal timing"
+    );
+}
+
+/// An unusable capture stdout the run degraded around files a
+/// transport-only gap: the named gap is published, but no observation
+/// is lost, so causal timing stands.
+#[test]
+fn stdout_unavailable_files_partial_gap_with_causal_timing_intact() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let timing = timing_key(0);
+    engine.timings.observe(&timing, 10);
+    engine.timings.complete(&timing, 20);
+    assert_eq!(engine.timings.gap_ns(&timing), Some(10));
+    engine.note_stdout_unavailable();
+    let gaps: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "capture stdout")
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the degradation publishes its named gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        gaps[0].reason,
+        "capture stdout was unusable; the run continued without it and the report holds what the other transports published"
+    );
+    assert_eq!(
+        engine.timings.gap_ns(&timing),
+        Some(10),
+        "a transport-only gap leaves causal timing standing"
+    );
+}
+
+/// A terminal provider-identity revalidation whose `fstat` itself
+/// failed latches fail closed: the provider counts as changed (the
+/// report must not read clean on unproven identity), the named gap is
+/// published, and a second failure files no duplicate gap. The
+/// revalidation is unfinished work, not lost observation, so causal
+/// timing stands.
+#[test]
+fn terminal_identity_check_failed_latches_provider_changed_with_one_gap() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let timing = timing_key(0);
+    engine.timings.observe(&timing, 10);
+    engine.timings.complete(&timing, 20);
+    assert_eq!(engine.timings.gap_ns(&timing), Some(10));
+    assert!(
+        !engine.pinned().provider_changed(),
+        "identity starts unproven-clean"
+    );
+    engine.note_terminal_identity_check_failed();
+    assert!(
+        engine.pinned().provider_changed(),
+        "a failed revalidation latches the provider as changed"
+    );
+    engine.note_terminal_identity_check_failed();
+    let gaps: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "provider identity revalidation")
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "a repeated failure files no duplicate gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        gaps[0].reason,
+        "the terminal held-fd identity check failed; the provider is treated as changed"
+    );
+    assert_eq!(
+        engine.timings.gap_ns(&timing),
+        Some(10),
+        "an unfinished revalidation leaves causal timing standing"
+    );
+}
+
 /// A capture loop that failed before its stop still seals its report:
 /// the failure is a named live loss, never a silent clean window.
 #[test]

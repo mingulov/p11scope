@@ -208,6 +208,22 @@ impl Clone for CaptureSnapshot {
 }
 
 impl CaptureSnapshot {
+    /// The events-only terminal seal: empty aggregate reports with default
+    /// (unknown) kernel evidence and clean read gaps, for a terminal that
+    /// never acquired a snapshot. The caller files its named gap and keeps
+    /// the acquisition error for the nonzero exit; this is never a fresh
+    /// acquisition.
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: CaptureData::Legacy(
+                Vec::new(),
+                KernelEvidence::default(),
+                LegacyReadGaps::default(),
+            ),
+            new_acquisition: false,
+        }
+    }
+
     fn from_counter(snapshot: CounterSnapshot) -> anyhow::Result<Self> {
         if !snapshot.has_data() || snapshot.kernel_evidence().is_none() {
             anyhow::bail!(

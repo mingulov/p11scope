@@ -5938,6 +5938,33 @@ fn seal_terminal_or_last_good<T: Clone>(
     }
 }
 
+/// Seals the profile/metrics terminal snapshot: a failed terminal read
+/// seals stale from the last good snapshot when one exists, and
+/// events-only (empty reports, unknown kernel evidence) when none was
+/// ever acquired. Both fallbacks name the failure for the caller's gap
+/// and keep the error for the nonzero exit — a run that collected data
+/// always writes its report (data-always).
+fn seal_terminal_snapshot(
+    last_good: Option<&metrics::CaptureSnapshot>,
+    acquired: Result<metrics::CaptureSnapshot>,
+) -> (metrics::CaptureSnapshot, Option<anyhow::Error>) {
+    match seal_terminal_or_last_good(last_good, acquired, |error| {
+        emit_capture_diagnostic(&format!(
+            "p11scope: terminal snapshot failed; sealing the report from the last good snapshot: {}",
+            crate::render::escape_controls(&format!("{error:#}")),
+        ));
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal snapshot failed with no last good snapshot; sealing the report with unknown aggregate counts: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            (metrics::CaptureSnapshot::empty(), Some(error))
+        }
+    }
+}
+
 /// An opened capture stdout: the sink, whether fd 1 backs it (false
 /// when the run degraded to a closed null sink), and the deferred
 /// failure the terminal reports after publication so a degraded run
@@ -9879,16 +9906,10 @@ fn capture_profile(
                 ));
             }
         }
-        let (snapshot, snapshot_error) = seal_terminal_or_last_good(
-            last_good,
-            acquired,
-            |error| {
-                emit_capture_diagnostic(&format!(
-                    "p11scope: terminal snapshot failed; sealing the report from the last good snapshot: {}",
-                    crate::render::escape_controls(&format!("{error:#}")),
-                ));
-            },
-        )?;
+        // A failed terminal read seals stale from the last good
+        // snapshot, or events-only when none was ever acquired — never
+        // an early return without a report (data-always).
+        let (snapshot, snapshot_error) = seal_terminal_snapshot(last_good, acquired);
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,
@@ -10048,12 +10069,12 @@ fn capture_profile(
             context.1.unpublished_mechanisms(),
         );
         // An unsettled child (settlement failed), a failed terminal
-        // snapshot (sealed from the last good snapshot above), and a failed
-        // pinned-object revalidation each force PARTIAL via the `skipped`
-        // cause with the existing generic vocabulary; the specific failure
-        // is on stderr and in the returned error. `run_tree_handed_back`
-        // stays present (it was measured before settlement) even though the
-        // child flag is absent.
+        // snapshot (sealed stale above, or events-only when no snapshot
+        // was ever acquired), and a failed pinned-object revalidation each
+        // force PARTIAL via the `skipped` cause with the existing generic
+        // vocabulary; the specific failure is on stderr and in the
+        // returned error. `run_tree_handed_back` stays present (it was
+        // measured before settlement) even though the child flag is absent.
         let settlement_unknown = context
             .2
             .as_deref()
@@ -10075,9 +10096,12 @@ fn capture_profile(
         // publication steps combine with it instead of dropping it. The
         // identity member already names its step ("revalidating pinned
         // provider identity") and its gap was filed by the latch.
-        let snapshot_error = snapshot_error.map(|error| {
-            error.context("terminal snapshot failed; report sealed from the last good snapshot")
-        });
+        let snapshot_context = if last_good.is_some() {
+            "terminal snapshot failed; report sealed from the last good snapshot"
+        } else {
+            "terminal snapshot failed with no last good snapshot; report sealed with unknown aggregate counts"
+        };
+        let snapshot_error = snapshot_error.map(|error| error.context(snapshot_context));
         let mut terminal_error = combine_terminal_errors([snapshot_error, pinned_error]);
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
@@ -11112,7 +11136,22 @@ fn capture_trace(
                         identity_check,
                     )
                     .err();
-                    report_trace_loss(context.1, context.4, context.5, context.6, context.7)?;
+                    // A failed terminal loss report degrades like the
+                    // reads below: unknown loss accounting with a named
+                    // gap, never an early return that would suppress the
+                    // terminal EVIDENCE (data-always).
+                    let loss_error = match report_trace_loss(
+                        context.1, context.4, context.5, context.6, context.7,
+                    ) {
+                        Ok(()) => None,
+                        Err(error) => {
+                            emit_capture_diagnostic(&format!(
+                                "p11scope: terminal trace-loss report failed; sealing the trace report with unknown loss accounting: {}",
+                                crate::render::escape_controls(&format!("{error:#}")),
+                            ));
+                            Some(error)
+                        }
+                    };
                     let maps_start = Instant::now();
                     // A failed aggregate read seals with unknown counts
                     // (empty reports) and a named gap instead of suppressing
@@ -11288,9 +11327,10 @@ fn capture_trace(
                             context.1.unpublished_mechanisms(),
                         );
                     // An unsettled child, failed terminal reads (sealed
-                    // with unknown counts/evidence above), and failed
-                    // pinned/watch reads each force PARTIAL via the `skipped`
-                    // cause, like the profile terminal.
+                    // with unknown counts/evidence above), a failed loss
+                    // report, and failed pinned/watch reads each force
+                    // PARTIAL via the `skipped` cause, like the profile
+                    // terminal.
                     let settlement_unknown = context
                         .2
                         .as_deref()
@@ -11309,9 +11349,9 @@ fn capture_trace(
                         });
                     }
                     // A failed identity revalidation is already filed by the
-                    // latch through the engine gap; only the watch read
-                    // files here.
-                    if watch_error.is_some() {
+                    // latch through the engine gap; the watch read and the
+                    // loss report file here.
+                    if watch_error.is_some() || loss_error.is_some() {
                         evidence.skipped.push(crate::render::SkippedOut {
                             name: "discovery subject".into(),
                             reason: "discovery unavailable".into(),
@@ -11352,8 +11392,17 @@ fn capture_trace(
                             "terminal watch-kernel read failed; trace report sealed with unknown watch health",
                         )
                     });
-                    let mut terminal_error =
-                        combine_terminal_errors([snapshot_error, pinned_error, watch_error]);
+                    let loss_error = loss_error.map(|error| {
+                        error.context(
+                            "terminal trace-loss report failed; trace report sealed with unknown loss accounting",
+                        )
+                    });
+                    let mut terminal_error = combine_terminal_errors([
+                        snapshot_error,
+                        pinned_error,
+                        watch_error,
+                        loss_error,
+                    ]);
                     if *consumers.malformed_records > 0 {
                         let _ = crate::sink::try_stderr_line(&format!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",

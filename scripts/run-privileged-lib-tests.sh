@@ -1265,7 +1265,7 @@ check_wide_curation() {
         {
             echo "$PROG: wide-detailed-2112 curation refused against $bin"
             if [ "${#missing[@]}" -ne 0 ]; then
-                echo "curated but absent from the binary (a default build lacks these; rebuild with --features wide-detailed-2112):"
+                echo "curated but absent from the binary (a --no-default-features build lacks these; rebuild with default features):"
                 printf '  %s\n' "${missing[@]}"
             fi
             if [ "${#multi[@]}" -ne 0 ]; then

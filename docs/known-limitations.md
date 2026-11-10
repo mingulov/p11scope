@@ -1037,9 +1037,11 @@ If the file is replaced during a running inventory capture instead,
 inventory keeps the program's collected edge as uncertain at the next
 pass ("absent from an incomplete scan") with the gap named, instead of
 ending the edge and reporting the module "unloaded"; coverage stays
-PARTIAL. `profile` counts through the same replacement with PARTIAL
-coverage and a "provider file changed during capture" gap. Re-run an
-inventory capture after the upgrade settles.
+PARTIAL. Calls made after the replacement stay unattributed
+(`rejected demoted count` ranges) until a fresh capture. `profile`
+counts through the same replacement with PARTIAL coverage and a
+"provider file changed during capture" gap. Re-run an inventory
+capture after the upgrade settles.
 
 ## Planned for later versions
 

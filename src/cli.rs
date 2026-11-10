@@ -305,7 +305,7 @@ pub struct InventoryArgs {
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
     /// System and cgroup scopes may scan multiple members; this is not a tree cap.
     pub max_scan_pids: Option<usize>,
-    /// `--max-gaps`: retained gap history bound; None ⇒ 1024 default.
+    /// `--max-gaps`: retained gap history bound; None ⇒ 8192 default.
     pub max_gaps: Option<usize>,
     /// `--max-endpoints`: capture-lifetime physical endpoint IDs; None ⇒ 32768.
     pub max_endpoints: Option<u64>,
@@ -3659,7 +3659,7 @@ mod tests {
 
     #[test]
     fn inventory_max_gaps_defaults_to_none_and_parses_when_set() {
-        // Absent ⇒ None; the runner applies the 1024 default.
+        // Absent ⇒ None; the runner applies the 8192 default.
         let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
             panic!("expected inventory")
         };

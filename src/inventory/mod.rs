@@ -15309,12 +15309,12 @@ mod tests {
     }
 
     #[test]
-    fn gap_bound_defaults_to_1024_and_honors_the_override() {
+    fn gap_bound_defaults_to_8192_and_honors_the_override() {
         use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
         let absent = registry_limits(None);
         assert_eq!(absent, RegistryLimits::default_limits());
         assert_eq!(absent.max_gaps, DEFAULT_MAX_GAPS);
-        assert_eq!(absent.max_gaps, 1024);
+        assert_eq!(absent.max_gaps, 8192);
         // The override touches only the gap bound.
         let set = registry_limits(Some(3));
         assert_eq!(set.max_gaps, 3);

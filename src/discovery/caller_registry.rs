@@ -3275,7 +3275,7 @@ pub(crate) const MAX_ADMISSION_REASONS: usize = 8;
 pub(crate) const DEFAULT_MAX_CALLERS: usize = 4096;
 pub(crate) const DEFAULT_MAX_MODULES: usize = 4096;
 pub(crate) const DEFAULT_MAX_EDGES: usize = 32768;
-pub(crate) const DEFAULT_MAX_GAPS: usize = 1024;
+pub(crate) const DEFAULT_MAX_GAPS: usize = 8192;
 /// Stop-time gap headroom above the bound: in-run gaps keep the full
 /// `max_gaps`, and terminal gaps (staged after
 /// [`CallerRegistry::enter_terminal_phase`]) may use up to `max_gaps +
@@ -9151,6 +9151,38 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn default_gap_bound_retains_8192_distinct_gaps() {
+        // The default `--max-gaps` bound: 8,192 distinct gaps retain
+        // with nothing suppressed, and the 8,193rd counts suppressed
+        // exactly. First-N-wins, like the tiny-bound twin above.
+        let mut registry = registry();
+        for n in 0..8192 {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(n),
+                subject: format!("subject-{n}"),
+                reason: format!("reason-{n}"),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 8192);
+        assert_eq!(registry.gaps_suppressed(), 0);
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(8192),
+            subject: "subject-8192".into(),
+            reason: "reason-8192".into(),
+            budget: None,
+        });
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 8192);
+        assert_eq!(registry.gaps_suppressed(), 1);
+    }
+
     fn collapse_gap() -> RegistryGap {
         RegistryGap {
             caller: None,
@@ -9443,7 +9475,7 @@ pub(crate) mod tests {
         // crowded out by a per-drain flood: in-run gaps keep the full
         // bound, and terminal gaps use headroom above it.
         let mut registry = registry();
-        for n in 0..1100 {
+        for n in 0..DEFAULT_MAX_GAPS + 76 {
             registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -9509,7 +9541,7 @@ pub(crate) mod tests {
         // holds the flood to the bound, so the headroom stays whole
         // for the terminal disclosures.
         let mut registry = registry();
-        for n in 0..1100 {
+        for n in 0..DEFAULT_MAX_GAPS + 76 {
             registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,

@@ -227,9 +227,9 @@ fn spawn_with_peak_pumping(
 /// live machine state (unreadable pids per pass × passes), so the
 /// in-crate retention test pins exactness (476) while command level
 /// pins structure, budget-row agreement, and cap engagement. The in-run
-/// cap is 1024 (`DEFAULT_MAX_GAPS`); stop-time disclosures may add up to
+/// cap is 8192 (`DEFAULT_MAX_GAPS`); stop-time disclosures may add up to
 /// 64 headroom rows (`TERMINAL_GAP_RESERVE`), so an engaged cap reads
-/// 1024..=1088.
+/// 8192..=8256.
 fn assert_settled_consistent(doc: &Value) {
     let suppressed = doc["gaps_suppressed"].as_u64().unwrap();
     assert_settled(doc, suppressed);
@@ -243,8 +243,8 @@ fn assert_settled_consistent(doc: &Value) {
     if suppressed > 0 {
         let len = doc["gaps"].as_array().unwrap().len();
         assert!(
-            (1024..=1088).contains(&len),
-            "suppression means the 1024 in-run retention cap engaged; stop-time headroom allows up to 1088 rows, got {len}"
+            (8192..=8256).contains(&len),
+            "suppression means the 8192 in-run retention cap engaged; stop-time headroom allows up to 8256 rows, got {len}"
         );
     }
 }

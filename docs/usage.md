@@ -1821,7 +1821,7 @@ Limits that matter in pods:
   independently, with returned sink failures reported as exit 1. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
-  (1..=65536; 1024 when absent); gaps past the bound count in
+  (1..=65536; 8192 when absent); gaps past the bound count in
   `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
   selects the capture-lifetime physical endpoint budget (1–131072;
   `inventory --system` on hosts with uprobe_multi defaults to 32,768),

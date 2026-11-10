@@ -967,7 +967,7 @@ and never proves an app identity. See the app identity rows of
   budget gap) plus per-edge keys past the S1 bounds),
   and `retained_history` (`limit`, `retained`, `suppressed` — the gap
   retention cap and its eviction marker; `limit` is the `--max-gaps`
-  bound, 1024 unless the operator overrode it), and
+  bound, 8192 unless the operator overrode it), and
   `native_preadmission` (additive within v1; `null` in the scan lane:
   `{limit, occupied, refused, pruned}` — the native lane's unbound use
   rows held per (pid, module) until their caller's admission;

@@ -215,7 +215,7 @@ impl Dance {
 
 /// Run the observe script once. `json_out` selects the JSON dance
 /// (strict asserts) or the text dance (rendering asserts). `max_gaps`
-/// passes an explicit `--max-gaps` bound; None keeps the 1024 default.
+/// passes an explicit `--max-gaps` bound; None keeps the 8192 default.
 fn dance(fixtures: &FixtureSet, json_out: bool, max_gaps: Option<usize>) -> Dance {
     let _ = std::fs::remove_dir_all(&fixtures.ready);
     std::fs::create_dir_all(&fixtures.ready).unwrap();

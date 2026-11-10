@@ -1235,16 +1235,16 @@ fn s1_command_degraded_run_keeps_stderr_honest() {
 }
 
 #[test]
-fn max_gaps_knob_defaults_to_1024_and_binds_retention() {
+fn max_gaps_knob_defaults_to_8192_and_binds_retention() {
     // End-to-end wiring: the enforced gap bound renders in
-    // budgets.retained_history, 1024 when the flag is absent, the
+    // budgets.retained_history, 8192 when the flag is absent, the
     // override when set; retained/suppressed always agree with the
     // gaps array and its counter.
     let _guard = serial_guard();
     let dir = tmp("inventory-command-max-gaps");
     let driver = LiveDriver::spawn(&dir, "mg", &["mg-p1.so"]);
     for (args, expected_limit) in [
-        (vec!["--capture", "scan", "--json"], 1024),
+        (vec!["--capture", "scan", "--json"], 8192),
         (vec!["--capture", "scan", "--json", "--max-gaps", "3"], 3),
     ] {
         let output = observe(driver.pid, &args);

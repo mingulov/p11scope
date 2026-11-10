@@ -2389,14 +2389,14 @@ The old bounds are measurements, not a product startup SLA.
 - Workaround: none needed; the live read is honest now.
 - Planned: done.
 
-### Gap retention is first-1024-wins (DR-41)
+### Gap retention is first-8192-wins (DR-41)
 
 - What the user sees: on busy hosts (ambient ~1,470 gaps observed),
-  first-1024-wins ascending-pid retention starves later pids' gaps; user
+  first-8192-wins ascending-pid retention starves later pids' gaps; user
   workload gaps are suppressed and counted only.
 - Kernels/conditions: busy hosts with many gaps.
 - Disclosure: `gaps_suppressed`, `budgets.retained_history`.
-- Workaround: raise `--max-gaps` (1–65,536; default 1,024).
+- Workaround: raise `--max-gaps` (1–65,536; default 8,192).
 - Planned: v0.3.0 (per-pid/per-subject fair retention; busy-host cell must
   retain owned gaps).
 

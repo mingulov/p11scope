@@ -366,6 +366,14 @@ class ObserverArgvTests(unittest.TestCase):
                 self.assertNotIn("--module", self.argv(sweep, mode))
         self.assertIn("--module", self.argv(sweep, "late-heap"))
 
+    def test_verbose_flag_precedes_the_child_separator(self):
+        sweep = require_sweep(self)
+        for mode in ("known-inode", "equal-bytes-new-inode"):
+            with self.subTest(mode=mode):
+                argv = self.argv(sweep, mode)
+                self.assertIn("-v", argv)
+                self.assertLess(argv.index("-v"), argv.index("--"))
+
 
 class TimeoutTests(unittest.TestCase):
     def test_bounded_run_kills_a_hung_command(self):

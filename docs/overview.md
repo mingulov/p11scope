@@ -122,8 +122,10 @@ sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 
 Terminal text is concise by default — main results, one coverage line, and a
 hint. Add `-v` / `--verbose` for full detail (every gap and reason, evidence,
-timing) or `--quiet` for the summary head; `--json` and `-o` are always
-complete. See [output verbosity](usage.md#text-output-concise-by-default--v-for-detail).
+timing) or `--quiet` for the summary head. Complete JSON: `--json` on
+inspect/inventory (incl. diff, cbom); `-o FILE` on profile/trace/run/inventory;
+trace takes `-o -`; inventory streams `--event-log`; doctor is text-only.
+See [output verbosity](usage.md#text-output-concise-by-default--v-for-detail).
 
 Inventory holds up to 131,072 physical endpoint IDs with
 `--max-endpoints`; `inventory --system` on hosts with uprobe_multi defaults

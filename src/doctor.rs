@@ -1816,12 +1816,18 @@ fn next_line(
     let caps_lacking = checks
         .iter()
         .any(|check| check.name == MINIMAL_SETCAP_ROW && matches!(check.status, Status::Warn(_)));
+    let pid_scope_unavailable = checks.iter().any(|check| {
+        is_pid_namespace_row(&check.name)
+            && matches!(check.status, Status::Warn(_) | Status::Fail(_))
+    });
     let next = match problem {
         Some(check) if matches!(check.status, Status::Fail(_)) || extra_strict => {
             next_step_with_host(check, host, privileged, caps_lacking)
         }
         // No requested lane failed: point at the capture to run next,
-        // not at the warning rows below.
+        // not at the warning rows below. A nested observer cannot use
+        // PID scope, so it gets the cgroup capture instead of --pid.
+        Some(_) if pid_scope_unavailable => NESTED_ACTIONABLE_NEXT.into(),
         Some(_) => ACTIONABLE_NEXT.into(),
         None if scope == "unassessed" =>
             "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
@@ -1835,6 +1841,13 @@ fn next_line(
 /// captures; a deprived operator never sees this line.
 const ACTIONABLE_NEXT: &str =
     "p11scope profile --pid <PID> (or doctor --pid <PID> to check a target)";
+
+/// The Next step when every requested lane passed but PID scope is
+/// unavailable (a nested observer): the same capture via --cgroup,
+/// which does not depend on PID numbering. The verdict line above
+/// already names the unavailable scope.
+const NESTED_ACTIONABLE_NEXT: &str =
+    "p11scope profile --cgroup <PATH> (or doctor --cgroup <PATH> to check a target)";
 
 /// Whether this process runs as uid 0. Only used to pick operator
 /// guidance, never to prove capability.

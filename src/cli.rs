@@ -20,7 +20,8 @@ pub enum Kind {
 
 /// Terminal text verbosity (CLI-1 owner ruling): default output is
 /// concise, `-v`/`--verbose` shows full detail, and `--quiet` prints
-/// only the summary head. `--json` and `-o` are always complete and
+/// only the summary head. Where present, `--json` (inspect, inventory)
+/// and `-o` (profile, trace, run, inventory) are always complete and
 /// never consult this switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextVerbosity {
@@ -577,7 +578,8 @@ usage:
 
 discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
 Live capture needs root; inspect, inventory diff, inventory cbom and inventory --capture scan do not.
-Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head. --json and -o are always complete.
+Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head.
+Complete JSON: --json on inspect/inventory (incl. diff, cbom); -o FILE on profile/trace/run/inventory; trace takes -o -; inventory streams --event-log; doctor is text-only.
 --help and --version also answer to -h and -V.
 Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
 
@@ -2254,6 +2256,11 @@ fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, 
                      to check a target",
                 ));
             }
+            "--json" => {
+                return Err(usage_err(
+                    "unknown argument: --json (doctor is text-only; inspect and inventory take --json)",
+                ));
+            }
             other => return Err(unknown_arg(other)),
         }
     }
@@ -2294,6 +2301,13 @@ pub fn parse_capture(
                 cgroup = Some(require_path(&mut args, "--cgroup")?);
             }
             "--system" => system = true,
+            "--json" => {
+                let route = match kind {
+                    Kind::Profile => "profile writes JSON with -o FILE",
+                    Kind::Trace => "trace writes with -o FILE (or -o - for stdout)",
+                };
+                return Err(usage_err(format!("unknown argument: --json ({route})")));
+            }
             other => return Err(unknown_arg(other)),
         }
     }
@@ -2408,6 +2422,11 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
             "--" => {
                 command.extend(args.by_ref());
                 break;
+            }
+            "--json" => {
+                return Err(usage_err(
+                    "unknown argument: --json (run writes JSON with -o FILE; run --trace also takes -o -)",
+                ));
             }
             other => return Err(run_unknown_arg(other)),
         }
@@ -5720,8 +5739,13 @@ mod tests {
         // 2913 / 0x10e2dd34bc1280dd (paused run example): diff vs the
         // 2900/0x503e1b5b770a1434 pin is exactly ` --pause auto` on the
         // run example line (+13); no other drift.
-        assert_eq!(USAGE.len(), 2913);
-        assert_eq!(hash, 0x10e2dd34bc1280dd);
+        // 3051 / 0x7e7075c0c7f701ba (qualified JSON routes): diff vs the
+        // 2913/0x10e2dd34bc1280dd pin is exactly the completeness line
+        // split into the short text line plus the `Complete JSON:` route
+        // line naming --json/-o/-o -/--event-log per command (+138); no
+        // other drift.
+        assert_eq!(USAGE.len(), 3051);
+        assert_eq!(hash, 0x7e7075c0c7f701ba);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

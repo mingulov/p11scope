@@ -74,7 +74,7 @@ run with -v for details
 Rows vary by host; `run with -v for details` lists every check.
 
 `12345` is a placeholder PID. If a command refuses instead of capturing, see [troubleshooting](docs/troubleshooting.md).
-Text is concise by default; `-v` shows full detail and `--json` is always complete.
+Text is concise by default; `-v` shows full detail. Complete JSON: `--json` on inspect/inventory (incl. diff, cbom); `-o FILE` on profile/trace/run/inventory; trace takes `-o -`; inventory streams `--event-log`; doctor is text-only.
 
 ## Requirements
 

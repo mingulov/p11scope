@@ -378,8 +378,10 @@ unconfirmed, or `coverage: partial` with plain-word reasons), and a
 `run with -v for details` hint. `-v` / `--verbose` shows the full detail —
 every gap and limitation with reasons, evidence, per-slot or per-table data,
 timing — plus the informational stderr notes. `--quiet` prints only the
-summary head, for scripts. `--json` and `-o` are always complete at every
-verbosity. Gap names in default text are plain words; the machine names stay
+summary head, for scripts. Complete JSON at every verbosity: `--json` on
+inspect/inventory (incl. diff, cbom); `-o FILE` on profile/trace/run/inventory;
+trace takes `-o -` (and run --trace); inventory streams `--event-log`; doctor
+is text-only. Gap names in default text are plain words; the machine names stay
 in JSON, and in `-v` beside the plain words. `trace` streams one line per
 event at every level and ends with the same totals and coverage lines plus,
 when calls failed, a per-caller error-reason roll-up (below);

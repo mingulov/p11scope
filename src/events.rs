@@ -811,6 +811,28 @@ impl<S: BoundedRecordSource> EventDrain<StagedEvents<S>> {
 }
 
 pub(crate) const ROOT_TAIL_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Decode budget the root tail adds per KiB of its snapshot, on top of
+/// [`ROOT_TAIL_FENCE_TIMEOUT`]: about 47 us per 376 B record, roughly 35x
+/// the measured drain cost, so a full 32 MiB ring gets about 4.2 s more and
+/// a full 64 MiB ring about 8.4 s. The fixed timeout alone did not scale
+/// with the ring: a full ring at the child's exit could miss it.
+pub(crate) const ROOT_TAIL_DECODE_BUDGET_PER_KIB: std::time::Duration =
+    std::time::Duration::from_micros(128);
+
+/// The extra root-tail deadline a snapshot of `distance` bytes earns.
+pub(crate) fn root_tail_decode_budget(distance: usize) -> std::time::Duration {
+    ROOT_TAIL_DECODE_BUDGET_PER_KIB
+        .saturating_mul(u32::try_from(distance.div_ceil(1024)).unwrap_or(u32::MAX))
+}
+
+/// Why an optional root retirement was abandoned while the report is still
+/// finalized and published: a signal, or the root-tail deadline. Neither
+/// loses a record; the ordinary terminal drain reduces the remaining ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootTailAbandon {
+    Cancelled,
+    Deadline,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RootTailProgress {
     Pending,
@@ -854,6 +876,8 @@ impl OwnedRootTail {
             failed: false,
         }
     }
+    /// Test probe of every refusal reason, the deadline included.
+    #[cfg(test)]
     pub(crate) fn check(&mut self, cancelled: bool, now: std::time::Instant) -> Result<()> {
         let reason = if self.failed {
             Some("previous failure")
@@ -873,20 +897,39 @@ impl OwnedRootTail {
         }
         Ok(())
     }
-    /// Expected cancellation abandons only this optional retirement. Existing
-    /// failure and deadline checks take precedence; they remain genuine errors.
-    pub(crate) fn cancellation(
+    /// A recorded failure stays a genuine error; the deadline is not checked
+    /// here (the drain loop turns it into [`RootTailAbandon::Deadline`]).
+    fn check_failed(&mut self) -> Result<()> {
+        if self.failed {
+            anyhow::bail!(
+                "root_tail_incomplete: previous failure; remaining={}",
+                self.remaining
+            );
+        }
+        Ok(())
+    }
+    /// A signal or the deadline abandons only this optional retirement, and
+    /// the report is still published; a recorded failure remains a genuine
+    /// error. The deadline wins over a signal so it is never relabeled as a
+    /// cancellation. `now: None` skips the deadline: once the prefix is
+    /// reached, completing it is never worse than abandoning it.
+    pub(crate) fn abandonment(
         &mut self,
         cancelled: bool,
-        now: std::time::Instant,
-    ) -> Result<Option<usize>> {
-        self.check(false, now)?;
-        if cancelled {
-            self.failed = true;
-            Ok(Some(self.remaining))
+        now: Option<std::time::Instant>,
+    ) -> Result<Option<(RootTailAbandon, usize)>> {
+        self.check_failed()?;
+        let reason = if now.is_some_and(|now| now >= self.deadline) {
+            Some(RootTailAbandon::Deadline)
+        } else if cancelled {
+            Some(RootTailAbandon::Cancelled)
         } else {
-            Ok(None)
+            None
+        };
+        if reason.is_some() {
+            self.failed = true;
         }
+        Ok(reason.map(|reason| (reason, self.remaining)))
     }
     pub(crate) fn complete(self) -> Result<ConsumedOriginalRootTail> {
         anyhow::ensure!(
@@ -903,7 +946,7 @@ impl<S: RecordSource> EventDrain<S> {
         S: BoundedRecordSource,
     {
         let result = (|| {
-            tail.check(false, std::time::Instant::now())?;
+            tail.check_failed()?;
             anyhow::ensure!(tail.positions.is_none(), "root tail snapshot already taken");
             anyhow::ensure!(
                 self.domain_id() == tail.exit.domain().id(),
@@ -921,6 +964,10 @@ impl<S: RecordSource> EventDrain<S> {
             );
             tail.remaining = distance;
             tail.positions = Some(p);
+            // The deadline grows with the snapshot it must reduce.
+            if let Some(deadline) = tail.deadline.checked_add(root_tail_decode_budget(distance)) {
+                tail.deadline = deadline;
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -939,7 +986,7 @@ impl<S: RecordSource> EventDrain<S> {
         S: BoundedRecordSource,
     {
         let result = (|| {
-            tail.check(false, std::time::Instant::now())?;
+            tail.check_failed()?;
             let p = tail
                 .positions
                 .as_mut()
@@ -5755,6 +5802,62 @@ pub(crate) mod root_fence_tests {
         );
         assert!(tail.complete().is_ok());
     }
+    /// I1: the root-tail deadline scales with the snapshot distance, so a
+    /// full ring at the child's exit is not cut at the fixed 1 s timeout.
+    #[test]
+    fn root_tail_deadline_grows_with_the_snapshot() {
+        assert_eq!(root_tail_decode_budget(0), Duration::ZERO);
+        assert_eq!(root_tail_decode_budget(1), Duration::from_micros(128));
+        assert!(root_tail_decode_budget(32 << 20) >= Duration::from_secs(4));
+        assert_eq!(
+            root_tail_decode_budget(64 << 20),
+            Duration::from_micros(128 * 65536)
+        );
+        assert_eq!(
+            root_tail_decode_budget(usize::MAX),
+            Duration::from_micros(128) * u32::MAX
+        );
+        let domain = EventsDomain::test_standin(104);
+        let mut tail = tail(domain.clone());
+        let before = tail.deadline;
+        let mut source = source([Event::default()]);
+        // Only the snapshot distance matters here; nothing is reduced.
+        source.capacity = 1 << 20;
+        source.producer = 512 << 10;
+        let distance = source.producer;
+        let mut drain = EventDrain::over_domain(source, domain);
+        drain.begin_root_tail(&mut tail).unwrap();
+        assert!(distance > 0);
+        assert_eq!(tail.deadline, before + root_tail_decode_budget(distance));
+    }
+
+    /// I1: a passed deadline abandons only the retirement, named, and wins
+    /// over a concurrent signal; a reached prefix ignores the deadline.
+    #[test]
+    fn root_tail_deadline_abandons_instead_of_failing() {
+        let domain = EventsDomain::test_standin(105);
+        let mut tail = OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(domain),
+            Instant::now(),
+        );
+        assert_eq!(tail.abandonment(false, None).unwrap(), None);
+        assert_eq!(
+            tail.abandonment(true, Some(Instant::now())).unwrap(),
+            Some((RootTailAbandon::Deadline, 0))
+        );
+        assert!(tail.abandonment(false, None).is_err());
+        let domain = EventsDomain::test_standin(106);
+        let mut tail = tail_with_deadline(domain, Instant::now() + Duration::from_secs(3600));
+        assert_eq!(
+            tail.abandonment(true, Some(Instant::now())).unwrap(),
+            Some((RootTailAbandon::Cancelled, 0))
+        );
+    }
+
+    fn tail_with_deadline(domain: EventsDomain, deadline: Instant) -> OwnedRootTail {
+        OwnedRootTail::new(crate::run::OriginalRootExit::test_reaped(domain), deadline)
+    }
+
     #[test]
     fn root_fence_foreign_cursor_busy_timeout_cancel_and_reduction_refuse_completion() {
         for failure in 0..5 {

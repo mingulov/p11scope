@@ -1243,18 +1243,93 @@ fn root_cancel_keeps_real_write_and_settlement_failures() {
     assert_eq!(signals.first_signal(), Some(libc::SIGTERM));
 }
 
+/// I1: a passed root-tail deadline (here with a signal pending as well)
+/// still finalizes and publishes the report. It abandons only the optional
+/// retirement, names the deadline (never "cancelled"), and leaves the
+/// snapshot record to the ordinary terminal drain. Before I1 this was a
+/// hard error and the report was dropped.
 #[test]
-fn root_cancel_never_relabels_timeout_domain_reducer_or_crossing_failures() {
-    for failure in 0..4 {
+fn root_tail_deadline_publishes_the_report_with_a_named_diagnostic() {
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let tail = crate::events::OwnedRootTail::new(
+        OriginalRootExit::test_reaped(domain.clone()),
+        Instant::now() - Duration::from_secs(1),
+    );
+    let mut drain = EventDrain::over_domain(
+        crate::events::root_fence_tests::source([ev(100, 10, 0, 7)]),
+        domain,
+    );
+    let signals = SignalState::new();
+    signals.observe(libc::SIGINT);
+    let root = drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
+        panic!("an expired tail reduced a record")
+    });
+    let mut diagnostic = Vec::new();
+    let mut finalized = None;
+    terminal_after_root(root, &mut diagnostic, |(malformed, completed)| {
+        finalized = Some((malformed, completed.is_some()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(finalized, Some((0, false)), "published without retirement");
+    let diagnostic = String::from_utf8(diagnostic).unwrap();
+    assert!(
+        diagnostic.contains("root_tail_incomplete: deadline; remaining=8"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("cancelled"), "{diagnostic}");
+    assert_eq!(
+        drain.source().records.len(),
+        1,
+        "left to the terminal drain"
+    );
+}
+
+/// I1 healthy twin: with the deadline met and no signal, the same tail
+/// completes, retirement is handed to the finalizer and no root-tail
+/// diagnostic is written, so the report is unchanged.
+#[test]
+fn root_tail_met_deadline_publishes_the_report_unchanged() {
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let tail = crate::events::OwnedRootTail::new(
+        OriginalRootExit::test_reaped(domain.clone()),
+        Instant::now() + Duration::from_secs(60 * 60),
+    );
+    let mut drain = EventDrain::over_domain(
+        crate::events::root_fence_tests::source([ev(100, 10, 0, 7)]),
+        domain,
+    );
+    let signals = SignalState::new();
+    let mut reduced = 0;
+    let root = drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
+        reduced += 1;
+        Ok(())
+    });
+    let mut diagnostic = Vec::new();
+    let mut finalized = None;
+    terminal_after_root(root, &mut diagnostic, |(malformed, completed)| {
+        finalized = Some((malformed, completed.is_some()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(reduced, 1);
+    assert_eq!(finalized, Some((0, true)), "published with retirement");
+    assert!(
+        diagnostic.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&diagnostic)
+    );
+    assert!(drain.source().records.is_empty());
+}
+
+#[test]
+fn root_cancel_never_relabels_domain_reducer_or_crossing_failures() {
+    for failure in 1..4 {
         let domain = crate::events::EventsDomain::test_standin(1);
-        let deadline = if failure == 0 {
-            Instant::now() - Duration::from_secs(1)
-        } else {
-            // These cases assert domain, reducer, and cursor-crossing
-            // failures. Keep the wall clock from becoming a competing
-            // failure source when the full suite deschedules this test.
-            Instant::now() + Duration::from_secs(60 * 60)
-        };
+        // These cases assert domain, reducer, and cursor-crossing
+        // failures. Keep the wall clock from becoming a competing
+        // failure source when the full suite deschedules this test.
+        let deadline = Instant::now() + Duration::from_secs(60 * 60);
         let tail = crate::events::OwnedRootTail::new(
             OriginalRootExit::test_reaped(domain.clone()),
             deadline,

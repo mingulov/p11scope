@@ -6036,6 +6036,28 @@ enum OriginalRootDrain {
         malformed: u64,
         remaining: usize,
     },
+    /// The root-tail deadline passed: retirement is abandoned exactly as on
+    /// a signal and the report is still published; the remaining records
+    /// go to the ordinary terminal drain.
+    DeadlineAbandoned {
+        malformed: u64,
+        remaining: usize,
+    },
+}
+
+impl OriginalRootDrain {
+    fn abandoned(reason: crate::events::RootTailAbandon, malformed: u64, remaining: usize) -> Self {
+        match reason {
+            crate::events::RootTailAbandon::Cancelled => Self::Cancelled {
+                malformed,
+                remaining,
+            },
+            crate::events::RootTailAbandon::Deadline => Self::DeadlineAbandoned {
+                malformed,
+                remaining,
+            },
+        }
+    }
 }
 
 /// The only production root-tail orchestration. A live handoff or an unowned
@@ -6075,23 +6097,29 @@ fn drain_original_root_events_from<S: crate::events::BoundedRecordSource>(
     drain.begin_root_tail(&mut tail)?;
     let domain = drain.domain_id();
     loop {
-        if let Some(remaining) = tail.cancellation(signals.interrupted(), Instant::now())? {
+        if let Some((reason, remaining)) =
+            tail.abandonment(signals.interrupted(), Some(Instant::now()))?
+        {
             // The original child and domain stay retained until this explicit
             // abandonment; this outcome cannot carry a retirement token.
-            return Ok(OriginalRootDrain::Cancelled {
-                malformed: drain.take_malformed_delta(),
+            return Ok(OriginalRootDrain::abandoned(
+                reason,
+                drain.take_malformed_delta(),
                 remaining,
-            });
+            ));
         }
         match drain.poll_root_tail(&mut tail, crate::events::LIVE_POLL_QUANTUM, |ev| {
             reduce(domain, ev)
         })? {
             crate::events::RootTailProgress::Reached => {
-                if let Some(remaining) = tail.cancellation(signals.interrupted(), Instant::now())? {
-                    return Ok(OriginalRootDrain::Cancelled {
-                        malformed: drain.take_malformed_delta(),
+                // A reached prefix ignores the deadline: completing it is
+                // never worse than abandoning it.
+                if let Some((reason, remaining)) = tail.abandonment(signals.interrupted(), None)? {
+                    return Ok(OriginalRootDrain::abandoned(
+                        reason,
+                        drain.take_malformed_delta(),
                         remaining,
-                    });
+                    ));
                 }
                 return Ok(OriginalRootDrain::Completed {
                     malformed: drain.take_malformed_delta(),
@@ -6124,6 +6152,18 @@ fn terminal_after_root<T>(
             writeln!(
                 diagnostics,
                 "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
+            )
+            .context("writing incomplete root-tail diagnostic"),
+        ),
+        OriginalRootDrain::DeadlineAbandoned {
+            malformed,
+            remaining,
+        } => (
+            malformed,
+            None,
+            writeln!(
+                diagnostics,
+                "p11scope: root_tail_incomplete: deadline; remaining={remaining}"
             )
             .context("writing incomplete root-tail diagnostic"),
         ),
@@ -26058,13 +26098,19 @@ int main(int argc, char **argv) {
             CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Timestamps),
             CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Latency),
         ] {
-            assert_eq!(policy.config_bit(), p11scope_ebpf_common::FLAG_POLICY_AGGREGATE);
+            assert_eq!(
+                policy.config_bit(),
+                p11scope_ebpf_common::FLAG_POLICY_AGGREGATE
+            );
             assert_eq!(
                 resolve_capture_ring_bytes(policy, false, None),
                 AGGREGATE_RING_BYTES
             );
             assert_eq!(resolve_capture_ring_bytes(policy, true, None), joint);
-            assert_eq!(resolve_capture_ring_bytes(policy, false, Some(1 << 26)), 1 << 26);
+            assert_eq!(
+                resolve_capture_ring_bytes(policy, false, Some(1 << 26)),
+                1 << 26
+            );
         }
         assert_eq!(
             resolve_capture_ring_bytes(CapturePolicy::Allowlisted, true, Some(4096)),

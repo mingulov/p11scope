@@ -1194,12 +1194,17 @@ class ConservationGate(unittest.TestCase):
         self.assertIn("entries.count 20 != issued 25", str(ctx.exception))
 
 
-def _demoted_range_reason(base, absolute):
-    """Product retirement-gap reason for absolute range (base, absolute]."""
+def _demoted_range_reason_named(base, absolute, named):
+    """Product retirement-gap reason with an explicit named count."""
     return ("the current physical owner is not proven for absolute "
             f"count range ({base}, {absolute}] "
-            f"({absolute - base} unattributed calls); historical counts "
+            f"({named} unattributed calls); historical counts "
             "remain and no witness or module-level use is recorded")
+
+
+def _demoted_range_reason(base, absolute):
+    """Product retirement-gap reason for absolute range (base, absolute]."""
+    return _demoted_range_reason_named(base, absolute, absolute - base)
 
 
 class LossGate(unittest.TestCase):
@@ -3361,6 +3366,100 @@ class JointConservationGate(unittest.TestCase):
             with self.assertRaisesRegex(
                     require_s1(self).S1Error,
                     "rejected demoted count gap without a call count"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_caller_demoted_gap_does_not_conserve_joint_entries(self):
+        # Only driver-scoped demoted gaps are exempt: a well-formed
+        # foreign-caller gap naming the exact shortfall must not
+        # conserve; the plain shortfall message stands.
+        with tempfile.TemporaryDirectory(prefix="joint-demoted-fc-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 1000
+                base = edge["entries"]["count"]
+                doc["gaps"].append(
+                    {"caller": "c0", "module": None, "pid": None,
+                     "subject": "rejected demoted count",
+                     "reason": _demoted_range_reason(base, base + 1000),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 19006 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_module_demoted_gap_does_not_conserve_joint_entries(self):
+        # Same exclusion via the module scope: a driver-caller gap on
+        # another module must not conserve either.
+        with tempfile.TemporaryDirectory(prefix="joint-demoted-fm-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 1000
+                base = edge["entries"]["count"]
+                doc["gaps"].append(
+                    {"caller": "c1", "module": "m1", "pid": None,
+                     "subject": "rejected demoted count",
+                     "reason": _demoted_range_reason(base, base + 1000),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 19006 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_pid_demoted_gap_does_not_conserve_joint_entries(self):
+        # Same exclusion via the pid scope: a driver-caller gap on
+        # another pid must not conserve either.
+        with tempfile.TemporaryDirectory(prefix="joint-demoted-fp-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 1000
+                base = edge["entries"]["count"]
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": 999,
+                     "subject": "rejected demoted count",
+                     "reason": _demoted_range_reason(base, base + 1000),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 19006 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_demoted_range_count_mismatch_fails(self):
+        # The named count must match its own (base, absolute] range: a
+        # valid shape naming 999 calls for a 1000-wide range fails
+        # closed, even when the named sum would otherwise conserve.
+        with tempfile.TemporaryDirectory(prefix="joint-demoted-x-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 999
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": "rejected demoted count",
+                     "reason": _demoted_range_reason_named(1000, 2000, 999),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"does not match its 999 unattributed calls"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_driver_demoted_stray_disclosure_fails(self):
+        # A disclosed demoted count with no matching missing entries
+        # must fail: entries already full plus a valid driver gap
+        # names entries, loss and issued.
+        with tempfile.TemporaryDirectory(prefix="joint-demoted-stray-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": "rejected demoted count",
+                     "reason": _demoted_range_reason(5000, 6000),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 20006 \+ demoted-unattributed "
+                    r"1000 != issued 20006"):
                 self.run_joint(Path(tmp), mutate)
 
 

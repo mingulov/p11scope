@@ -469,14 +469,22 @@ impl JointStaging {
     /// reduced, no pre-birth direct call). The registry also requires
     /// that the instance never returned a call.
     pub(crate) fn upgrade_eligible(&self) -> bool {
-        self.mode == FeedMode::S1Only
-            && self.selected_receipt.is_none()
-            && !self.fell_back
-            && !self.degraded_loss
-            && !self.watchdog_tripped
-            && self.staged.is_empty()
-            && self.reduced == 0
-            && self.pre_attach_direct == 0
+        self.upgrade_block().is_none()
+    }
+
+    /// Why a late Joint selection is refused (`None`: eligible), as a
+    /// gap reason: calls the feed already carried, or its own
+    /// fallback, loss or trip history.
+    pub(crate) fn upgrade_block(&self) -> Option<&'static str> {
+        if self.mode != FeedMode::S1Only || self.selected_receipt.is_some() {
+            Some("joint_birth_feed_selected")
+        } else if !self.staged.is_empty() || self.reduced != 0 || self.pre_attach_direct != 0 {
+            Some("joint_birth_after_calls")
+        } else if self.fell_back || self.degraded_loss || self.watchdog_tripped {
+            Some("joint_birth_feed_degraded")
+        } else {
+            None
+        }
     }
 
     /// Select Joint late for an untouched S1Only feed, exactly as

@@ -1914,23 +1914,36 @@ impl CallerRegistry {
     /// that arrives with its first call must still select Joint, or
     /// the key stays S1Only for the run.
     fn joint_upgrade_eligible(&self, key: &InstanceKey) -> bool {
+        self.joint_upgrade_block(key).is_none()
+    }
+
+    /// Why [`Self::joint_upgrade_eligible`] refuses (`None`: eligible),
+    /// as the gap reason naming the actual blocker: only calls that
+    /// predate the birth are `joint_birth_after_calls`.
+    fn joint_upgrade_block(&self, key: &InstanceKey) -> Option<String> {
         let Some(id) = self.instance_state.by_key.get(key).copied() else {
-            return false;
+            return Some("joint_birth_unregistered".into());
         };
         let Some(record) = self.instance_state.records.get(&id) else {
-            return false;
+            return Some("joint_birth_unregistered".into());
         };
         if record.state != InstanceLifecycle::Observed {
-            return false;
+            let cause = record
+                .reason
+                .map_or(record.state.label(), InstanceReason::label);
+            return Some(format!("joint_birth_{cause}"));
         }
         if self.retired.contains_key(&record.caller) {
-            return false;
+            return Some("joint_birth_caller_retired".into());
         }
         let Some(semantics) = self.instance_state.semantics.get(&id) else {
-            return false;
+            return Some("joint_birth_unregistered".into());
         };
         if semantics.authority_exhausted {
-            return false;
+            return Some(format!(
+                "joint_birth_{}",
+                InstanceReason::AuthorityExhausted.label()
+            ));
         }
         // Untouched: the instance never returned a call, so no call
         // predates the birth and no S1Only original was disposed
@@ -1939,16 +1952,22 @@ impl CallerRegistry {
             || semantics.historical_only_returns != 0
             || semantics.last_reduced.is_some()
         {
-            return false;
+            return Some("joint_birth_after_calls".into());
         }
         for negative in &self.instance_state.negatives {
-            if negative.matches(key, semantics.module)
-                && (negative.authority_exhausted || negative.retirement.is_some())
-            {
-                return false;
+            if !negative.matches(key, semantics.module) {
+                continue;
+            }
+            let cause = if negative.authority_exhausted {
+                Some(InstanceReason::AuthorityExhausted)
+            } else {
+                negative.retirement
+            };
+            if let Some(cause) = cause {
+                return Some(format!("joint_birth_{}", cause.label()));
             }
         }
-        semantics.feed.upgrade_eligible()
+        semantics.feed.upgrade_block().map(Into::into)
     }
 
     fn reserve_joint_receipt_at(
@@ -2811,29 +2830,35 @@ impl CallerRegistry {
                     self.instance_state.joint_backstop_routed =
                         self.instance_state.joint_backstop_routed.saturating_add(1);
                     self.disclose_joint_journal_unavailable_once();
-                } else if self.joint_upgrade_eligible(&input.key)
-                    && self
-                        .instance_state
-                        .semantics
-                        .get_mut(&id)
-                        .expect("retained edge")
-                        .feed
-                        .upgrade_to_joint(&grant.receipt)
-                {
-                    self.joint_feeds = self.joint_feeds.saturating_add(1);
-                    self.joint_accounting = true;
-                } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
-                    // The validated birth arrived after the instance was
-                    // touched: it keeps S1Only, and the refused birth is
-                    // named instead of dropped silently.
-                    self.record_gap(crate::discovery::caller_registry::RegistryGap {
-                        caller: Some(input.caller),
-                        module: Some(module),
-                        pid: None,
-                        subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
-                        reason: "joint_birth_after_calls".into(),
-                        budget: None,
-                    });
+                } else {
+                    let block = self.joint_upgrade_block(&input.key);
+                    if block.is_none()
+                        && self
+                            .instance_state
+                            .semantics
+                            .get_mut(&id)
+                            .expect("retained edge")
+                            .feed
+                            .upgrade_to_joint(&grant.receipt)
+                    {
+                        self.joint_feeds = self.joint_feeds.saturating_add(1);
+                        self.joint_accounting = true;
+                    } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
+                        // The validated birth cannot select Joint: the
+                        // feed keeps S1Only, and the refused birth is
+                        // named by its actual blocker (calls before the
+                        // birth, lifecycle, exhaustion or feed history)
+                        // instead of dropped silently.
+                        self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                            caller: Some(input.caller),
+                            module: Some(module),
+                            pid: None,
+                            subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                                .into(),
+                            reason: block.unwrap_or_else(|| "joint_birth_feed_selected".into()),
+                            budget: None,
+                        });
+                    }
                 }
             }
             self.instance_state
@@ -5354,6 +5379,62 @@ mod journal_unavailable_tests {
                 .iter()
                 .any(|row| row.reason == "started_before_attach" && row.count == 1),
             "the pre-birth call still counts exactly once: {unattributed_after:?}"
+        );
+    }
+
+    /// Reason twin: an untouched registration invalidated by a barrier
+    /// loss (zero calls) refuses the late grant too, and the gap names
+    /// the loss, not calls before the birth.
+    #[test]
+    fn invalidated_untouched_registration_names_its_actual_blocker() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene
+            .registry
+            .note_instance_semantic_loss(InstanceSemanticLoss {
+                scope: InstanceScope::Exact(key.clone()),
+                position: Some(SemanticPosition {
+                    domain: key.domain,
+                    ordinal: 1,
+                }),
+                reason: InstanceReason::SemanticLoss,
+            });
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.instance_state.records[&id].state,
+            InstanceLifecycle::Uncertain,
+            "the barrier loss invalidates the untouched instance"
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the late grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "an invalidated instance never selects Joint late"
+        );
+        scene.registry.publish();
+        let reasons: Vec<_> = scene
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT)
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["joint_birth_semantic_loss"],
+            "the refused birth names the loss, not calls: {:?}",
+            scene.registry.gaps()
         );
     }
 

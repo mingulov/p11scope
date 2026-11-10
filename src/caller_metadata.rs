@@ -440,7 +440,7 @@ struct ParsedHints {
     pod: Option<PodHint>,
 }
 
-fn recognize_components(components: &[&[u8]]) -> Result<Option<ParsedHints>, ParseReason> {
+fn collect_candidates(components: &[&[u8]]) -> (Vec<ContainerCandidate>, Vec<PodCandidate>) {
     let mut containers = Vec::new();
     let mut pods = Vec::new();
     for start in 0..components.len() {
@@ -463,6 +463,11 @@ fn recognize_components(components: &[&[u8]]) -> Result<Option<ParsedHints>, Par
             pods.push(candidate);
         }
     }
+    (containers, pods)
+}
+
+fn recognize_components(components: &[&[u8]]) -> Result<Option<ParsedHints>, ParseReason> {
+    let (containers, pods) = collect_candidates(components);
     if containers.is_empty() && pods.is_empty() {
         return Ok(None);
     }
@@ -688,11 +693,17 @@ pub(crate) fn workload_label_for_cgroup_path(path: &str) -> String {
         // Mixed-runtime nesting (a docker scope around a libpod scope,
         // or the reverse): the innermost container wins by path
         // position, whichever grammar recognized it.
-        if let (Some((libpod_id, libpod_at)), Some(shared)) = (libpod, membership.container)
-            && shared_container_index(path, shared.id)
-                .is_some_and(|shared_at| libpod_at > shared_at)
-        {
-            return format!("container {} (podman)", libpod_id.as_str());
+        if let (Some((libpod_id, libpod_at)), Some(shared)) = (libpod, membership.container) {
+            match shared_container_index(path, shared) {
+                Some(shared_at) if libpod_at > shared_at => {
+                    return format!("container {} (podman)", libpod_id.as_str());
+                }
+                Some(_) => {}
+                // No exact shared component to order against: fail
+                // closed to the raw path rather than assert the outer
+                // workload.
+                None => return path.to_string(),
+            }
         }
         if let (Some(pod), Some(container)) = (membership.pod, membership.container) {
             return format!(
@@ -742,19 +753,22 @@ fn parse_libpod_container_id(path: &str) -> Option<(ContainerId, usize)> {
     found
 }
 
-/// Component index of the shared parser's chosen container: the last
-/// component containing its canonical id (hex case-insensitive).
-/// `None` when the id names no component, in which case the existing
-/// shared-first precedence holds.
-fn shared_container_index(path: &str, id: ContainerId) -> Option<usize> {
-    let needle = id.as_str();
-    let mut found = None;
-    for (index, component) in path.split('/').enumerate() {
-        if component.len() >= needle.len() && component.to_ascii_lowercase().contains(needle) {
-            found = Some(index);
-        }
-    }
-    found
+/// Component index of the shared parser's chosen container: the
+/// id-bearing component (`end - 1`) of the innermost exact candidate
+/// matching its hint, re-derived with the same candidate collection
+/// the membership parser walked. A substring search would also match
+/// an unrelated child unit or an inner libpod component repeating
+/// the id and misplace the nesting comparison. `None` when no exact
+/// candidate matches, in which case the caller falls back to the raw
+/// path rather than asserting an ordering it cannot place.
+fn shared_container_index(path: &str, hint: ContainerHint) -> Option<usize> {
+    let components: Vec<&[u8]> = path.split('/').map(str::as_bytes).collect();
+    let (containers, _) = collect_candidates(&components);
+    containers
+        .iter()
+        .filter(|candidate| candidate.hint.id == hint.id && candidate.hint.runtime == hint.runtime)
+        .max_by_key(|candidate| candidate.end)
+        .map(|candidate| candidate.end - 1)
 }
 
 /// [`systemd_unit_from_cgroup_text`] over a cgroup2-relative path: the

@@ -6932,6 +6932,31 @@ impl p11scope_manifest::identity::ProbeBudget for BudgetAdapter<'_> {
     }
 }
 
+/// Whether one opened fd may stand for a maps identity when mount
+/// resolution is impossible (neither the target nor the observer table
+/// names the fd's mount): equal keys accept; otherwise the kernel's own
+/// rendering of this exact fd decides. Unlike
+/// [`opened_file_matches_maps`] this consults the probe beyond
+/// overlayfs: a btrfs subvolume file renders its filesystem device in
+/// maps while `fstat` reports the subvolume's anonymous device, and
+/// only the kernel can bridge the two. The caller must have proven the
+/// fd is the VMA's file first (the held-vs-range proof) — this compares
+/// renderings against the maps key, it does not identify files across
+/// subvolumes. An inconclusive probe always refuses.
+pub(crate) fn unresolved_fd_matches_maps(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    maps_key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+) -> bool {
+    if fd_key == maps_key {
+        return true;
+    }
+    KernelSelfMappingProbe
+        .kernel_maps_key(file, &mut BudgetAdapter(budget))
+        .is_some_and(|probed| probed == maps_key)
+}
+
 /// Whether one opened fd may stand for a maps identity: equal keys accept
 /// without consulting the probe; a split identity accepts only when the
 /// kernel renders this exact fd at the maps key.

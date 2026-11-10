@@ -4509,8 +4509,39 @@ fn opened_file_identity_guard(
     mounts: &mut crate::process::MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
-    let actual =
-        crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)?;
+    match crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget) {
+        Ok(actual) => check_opened_key(file, actual, expected, budget),
+        // Mount resolution is impossible, not failed: an observer-opened
+        // `map_files` join under a foreign, root-filtered mount table (a
+        // chrooted daemon) names a mount neither table lists. The
+        // like-for-like proof already bound this fd to the VMA; compare
+        // what the kernel renders for this exact fd against the maps key
+        // instead — a stranger still refuses. (Target-root opens always
+        // resolve above; only a join reaches this arm.)
+        Err(error) if p11scope_manifest::identity::is_missing_mount_id_error(&error) => {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            let fd_key = ObjectKey {
+                device: Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
+            };
+            check_unresolved_key(file, fd_key, expected, budget)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The shared accept/refuse comparison for one opened fd against its maps
+/// key: equal keys accept; a split identity accepts only when the kernel
+/// renders this exact fd at the maps key.
+fn check_opened_key(
+    file: &File,
+    actual: ObjectKey,
+    expected: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(), String> {
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately carry
     // different keys (overlay vs backing device); the self-mapping probe
     // asks the kernel how it renders this exact fd before refusing.
@@ -4523,7 +4554,27 @@ fn opened_file_identity_guard(
     ) {
         return Ok(());
     }
-    Err(format!(
+    Err(opened_key_mismatch(actual, expected))
+}
+
+/// The resolution-impossible comparison: the fd's own key against the
+/// maps key, with the kernel's rendering deciding splits on any
+/// filesystem (see `unresolved_fd_matches_maps`). Same refusal wording
+/// as [`check_opened_key`].
+fn check_unresolved_key(
+    file: &File,
+    actual: ObjectKey,
+    expected: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(), String> {
+    if crate::discovery::identity::unresolved_fd_matches_maps(file, actual, expected, budget) {
+        return Ok(());
+    }
+    Err(opened_key_mismatch(actual, expected))
+}
+
+fn opened_key_mismatch(actual: ObjectKey, expected: ObjectKey) -> String {
+    format!(
         "opened object identity {}:{} inode {} does not match mapped object {}:{} inode {}",
         actual.device.major,
         actual.device.minor,
@@ -4531,7 +4582,7 @@ fn opened_file_identity_guard(
         expected.device.major,
         expected.device.minor,
         expected.inode
-    ))
+    )
 }
 
 /// Physical proof that the opened path is the mapped file. A maps key is
@@ -6969,8 +7020,17 @@ fn scan_view_examined_mode(
         // exact replaced-file gap below — byte-identical degradation.
         let mut deleted_open: Option<OpenedMappedObject> = None;
         let mut deleted_published: Option<String> = None;
+        // A memfd rendering (`/memfd:name (deleted)`) is anonymous
+        // memory, never a replaced disk file: it keeps the
+        // replaced-file gap below, with no `map_files` attempt.
+        let memfd = named.as_ref().is_some_and(|(_, raw_path)| {
+            raw_path
+                .strip_suffix(b" (deleted)".as_slice())
+                .is_some_and(|prefix| prefix.starts_with(b"/memfd:"))
+        });
         if usable.is_none()
             && !narrowed_out
+            && !memfd
             && let Some((MappedPath::Unusable { reason }, raw_path)) = &named
             && reason == "deleted mapping"
             && group.iter().any(|entry| entry.permissions[2] == b'x')

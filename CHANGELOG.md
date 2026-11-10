@@ -107,6 +107,18 @@ versioned separately and are opaque, exact dispatch keys.
   "found no PKCS#11 modules", and the discovery-stop hint lists stop
   reasons without repeating the subject.
 
+### Corrections
+
+- The v0.6.0 claim of exact per-key rows at 6,250 calls/s for 60 s
+  does not reproduce on the reference host: re-measured 2026-11-10
+  on fedora.local (5 vCPU, kernel 7.2.9, SoftHSM 2.7.0-rc1), the
+  published v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250
+  calls/s for 60 s. <!-- keyops-fix-pending -->
+  Under sustained high call rates on small VMs, the key-operations
+  view may show the instance as uncertain with no per-key rows;
+  plain-path counts stay exact. <!-- keyops-fix-pending -->
+  See [Key-tracking rate ceiling](docs/known-limitations.md#key-tracking-rate-ceiling).
+
 ### Known limitations
 
 The v0.7.0 limits live in

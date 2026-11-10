@@ -230,8 +230,14 @@ the end-of-capture executable is 0.7.x work.
 
 ### Key-tracking rate ceiling
 
-Key-operation rows keep the v0.6.0 ceiling: exact rows at 6,250
-calls/s for 60 s, plain counts exact at 10,000 calls/s.
+The v0.6.0 ceiling of exact per-key rows at 6,250 calls/s for 60 s
+does not reproduce: re-measured 2026-11-10 on fedora.local (5 vCPU,
+kernel 7.2.9, SoftHSM 2.7.0-rc1), the published v0.6.0, rc-5 and rc-8
+all show 0 per-key rows at 6,250 calls/s for 60 s in the
+joint-10k-single cell. <!-- keyops-fix-pending -->
+Under sustained high call rates on small VMs, the key-operations
+view shows no per-key rows and the instance reads `uncertain` with
+reason `semantic_loss`; plain-path counts stay exact. <!-- keyops-fix-pending -->
 
 ### Browser after a background caller: per-key tracking may not start
 
@@ -286,7 +292,9 @@ names the source SHA behind each check the release rounds re-measured.
   been re-measured and can only overflow later) the event ring can
   overflow between reads and key-operation tracking ends with a named
   gap. 10,000 calls/s with key operations
-  is not yet sustained.
+  is not yet sustained. Re-measured 2026-11-10 on the reference host,
+  v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250 calls/s for
+  60 s; see [Key-tracking rate ceiling](#key-tracking-rate-ceiling). <!-- keyops-fix-pending -->
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
   qualified 60 s runs), against the 1.5 s target; under host load it
@@ -936,7 +944,9 @@ With `--key-operations`, the v0.6.0 measurements in
 [Known limitations in 0.6.0](#known-limitations-in-060) supersede the
 older lane numbers: key operations sustain 6,250 calls/s for 60 s with
 exact rows, and key-operation rows lag their calls by about 1.6-1.9 s
-p99 in quiet runs. The older 1,000 calls/s ceiling describes the pre-integration
+p99 in quiet runs. (That 6,250 calls/s ceiling did not reproduce on
+re-measurement; see [Key-tracking rate ceiling](#key-tracking-rate-ceiling).) <!-- keyops-fix-pending -->
+The older 1,000 calls/s ceiling describes the pre-integration
 lane, not this release. The `authority_lost` reason is still live: it
 latches after a watchdog trip or disposed staged history and renders
 "per-key tracking stopped" even while exact rows continue beside

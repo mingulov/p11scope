@@ -292,7 +292,9 @@ printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level 
 SOFTHSM2_CONF="$SOFTHSM2_CONF" softhsm2-util --init-token --free --label container-cell \
     --so-pin 5678 --pin 1234 || exit 2
 timeout --signal=TERM --kill-after=10s 60s gcc -O0 -o "$WORK/harness" spike/harness.c -ldl || exit 2
-timeout --signal=TERM --kill-after=10s 600s docker build -q -t "$VICTIM_IMAGE" \
+# --progress=plain, not -q (the two are mutually exclusive): a snapshot
+# fetch failure must leave apt's own error in the log, not a bare exit code.
+timeout --signal=TERM --kill-after=10s 600s docker build --progress=plain -t "$VICTIM_IMAGE" \
     ${P11SCOPE_MATRIX_BUILD_NETWORK:+--network "$P11SCOPE_MATRIX_BUILD_NETWORK"} \
     -f scripts/matrix/Dockerfile scripts/matrix >"$OUT/victim-build.log" 2>&1 || {
     tail -n 30 "$OUT/victim-build.log" >&2 || true

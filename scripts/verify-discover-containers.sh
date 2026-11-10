@@ -829,10 +829,10 @@ GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
     "$DISCOVER_GLIBC_RUN_PLATFORM_IMAGE" sh -ec '
-  apt-get update -q >/dev/null
-  apt-get install -qy --no-install-recommends ca-certificates >/dev/null
-  apt-get -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null
-  apt-get -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update -q >/dev/null
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -qy --no-install-recommends ca-certificates >/dev/null
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
       p11scope-discover "$@"

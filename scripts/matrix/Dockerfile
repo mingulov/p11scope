@@ -18,10 +18,12 @@ ARG UBUNTU_APT_SNAPSHOT=20260810T000000Z
 # the archive to HTTPS snapshot.ubuntu.com, so the snapshot is unreachable until
 # a trust store exists. Bootstrap exactly that one package from the image's own
 # http sources, then take every real package from the frozen snapshot.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && apt-get -S "$UBUNTU_APT_SNAPSHOT" update \
-    && apt-get -S "$UBUNTU_APT_SNAPSHOT" install -y --no-install-recommends softhsm2 \
+# Every fetch carries retry/timeout hardening: the snapshot service is
+# occasionally slow, and one failed fetch must not fail the build.
+RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends ca-certificates \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -y --no-install-recommends softhsm2 \
     && rm -rf /var/lib/apt/lists/*
 ENV SOFTHSM2_CONF=/matrix/softhsm2.conf
 RUN mkdir -p /matrix/tokens \

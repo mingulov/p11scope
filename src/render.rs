@@ -2453,6 +2453,36 @@ fn ordered_module_gaps(skipped: &[SkippedOut]) -> Vec<&SkippedOut> {
     ordered
 }
 
+/// Display rows for the module gap lists: severity order, with a
+/// same-path occurrence marker (`same-path file i of n`, in display
+/// order) whenever a path repeats in the full list. Numbering counts
+/// every row, so a shown subset still reads "1 of 3" beside
+/// "and 1 more". Unique paths print bare. The capture records no
+/// per-skipped file identity, so the marker distinguishes the rows,
+/// not the underlying files.
+fn display_module_gaps(skipped: &[SkippedOut]) -> Vec<(String, &SkippedOut)> {
+    let ordered = ordered_module_gaps(skipped);
+    let mut totals = std::collections::BTreeMap::<&str, usize>::new();
+    for row in &ordered {
+        *totals.entry(row.name.as_str()).or_insert(0) += 1;
+    }
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    ordered
+        .into_iter()
+        .map(|row| {
+            let occurrence = seen.entry(row.name.as_str()).or_insert(0);
+            *occurrence += 1;
+            let total = totals.get(row.name.as_str()).copied().unwrap_or(1);
+            let name = if total > 1 {
+                format!("{} (same-path file {occurrence} of {total})", row.name)
+            } else {
+                row.name.clone()
+            };
+            (name, row)
+        })
+        .collect()
+}
+
 /// The concise twin of [`module_gap_lines`]: the most decision-relevant
 /// one or two refused or partially covered providers with file, plain
 /// status and the `--module` remedy, so a concise PARTIAL names its
@@ -2464,13 +2494,13 @@ fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     }
     let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
     let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for skipped in ordered_module_gaps(&ev.discovery.modules_skipped)
+    for (name, skipped) in display_module_gaps(&ev.discovery.modules_skipped)
         .into_iter()
         .take(shown)
     {
         out.push_str(&format!(
             "  {}: {}\n",
-            escape_controls(&skipped.name),
+            escape_controls(&name),
             gap_line_body(ev, reports, skipped)
         ));
     }
@@ -2491,13 +2521,13 @@ fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     }
     let shown = total.min(MODULE_GAPS_SHOWN);
     let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for skipped in ordered_module_gaps(&ev.discovery.modules_skipped)
+    for (name, skipped) in display_module_gaps(&ev.discovery.modules_skipped)
         .into_iter()
         .take(shown)
     {
         out.push_str(&format!(
             "  {}: {}\n",
-            escape_controls(&skipped.name),
+            escape_controls(&name),
             gap_line_body(ev, reports, skipped)
         ));
     }
@@ -11625,6 +11655,66 @@ pub(crate) mod tests {
         let refused = text.find("/opt/refused.so").expect("refused row");
         let proxy = text.find("/opt/proxy.so").expect("proxy row");
         assert!(refused < proxy, "{text}");
+    }
+
+    /// Two physical files can share one path (two refused rows with the
+    /// same name and reason): each row then names its occurrence so the
+    /// reader can tell the lines apart.
+    #[test]
+    fn concise_module_gaps_number_same_path_files() {
+        let mut ev = evidence();
+        for _ in 0..2 {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8".into(),
+                reason: format!(
+                    "a proxy closure array in a detailed capture attaches only its published \
+                     tables, and none of its 67 lookalike function tables is published yet, so \
+                     calls through it are not counted {}",
+                    crate::plan::CLOSURE_ARRAY_NOTE_DETAILED,
+                ),
+            });
+        }
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "system",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(text.contains("Module gaps (showing 2 of 2):"), "{text}");
+        assert!(
+            text.contains("libp11-kit.so.0.4.8 (same-path file 1 of 2):"),
+            "{text}"
+        );
+        assert!(
+            text.contains("libp11-kit.so.0.4.8 (same-path file 2 of 2):"),
+            "{text}"
+        );
+    }
+
+    /// Occurrence numbers count against the full list, not the shown
+    /// subset: with three same-path rows concise shows "1 of 3" and
+    /// "2 of 3" plus "and 1 more".
+    #[test]
+    fn concise_same_path_numbers_count_every_row() {
+        let mut ev = evidence();
+        for _ in 0..3 {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: "/opt/dup.so".into(),
+                reason: "module needs 68 more; only 512 attach slots are available".into(),
+            });
+        }
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "system",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(text.contains("Module gaps (showing 2 of 3):"), "{text}");
+        assert!(text.contains("/opt/dup.so (same-path file 1 of 3):"), "{text}");
+        assert!(text.contains("/opt/dup.so (same-path file 2 of 3):"), "{text}");
+        assert!(text.contains("and 1 more"), "{text}");
     }
 
     #[test]

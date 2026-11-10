@@ -2406,6 +2406,39 @@ fn is_unreachable_process_reason(reason: &str) -> bool {
 /// and file counts and `--json` lists each.
 const REPLACED_FAMILY_FOLD_FILES: usize = 2;
 
+/// File names of modules that are or were admitted as providers:
+/// a replaced-file row matching one keeps its own named concise row
+/// instead of folding into the family's count, so a replaced
+/// provider never hides in "N files replaced". Matching is by file
+/// name only: the running copy's directory may differ from the
+/// admitted path (an update relocates `libsoftokn3.so`), and a
+/// same-name collision names an extra row — more disclosure, never
+/// less.
+fn admitted_provider_file_names(modules: &[ModuleView]) -> std::collections::BTreeSet<String> {
+    modules
+        .iter()
+        .filter(|module| {
+            module.admission == AdmissionState::Admitted
+                || module.admission_history.iter().any(|change| {
+                    change.from == AdmissionState::Admitted || change.to == AdmissionState::Admitted
+                })
+        })
+        .flat_map(|module| module.paths.iter())
+        .filter_map(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The file name a replaced-file gap subject names: the final path
+/// component without the maps ` (deleted)` suffix a replaced running
+/// copy carries. A subject with no path (a device/inode reading)
+/// yields itself and never matches a provider name.
+fn replaced_subject_file_name(subject: &str) -> &str {
+    let base = subject.rsplit('/').next().unwrap_or(subject);
+    base.strip_suffix(" (deleted)").unwrap_or(base)
+}
+
 /// One replaced-files family's concise display: exact distinct-file
 /// count; rows (the counted prefix) and processes stay in JSON.
 fn replaced_fold_display(group: &[&GapView]) -> (String, String) {
@@ -2431,13 +2464,16 @@ fn maps_attribution_object_count(subject: &str, reason: &str) -> Option<u64> {
     count.parse().ok()
 }
 
-/// One maps-attribution family's concise display: exact distinct
-/// process and summed shared-object counts. Rows without a pid
-/// drop the process count rather than counting zero.
+/// One maps-attribution family's concise display: the exact
+/// distinct-process count and the per-process-per-pass mapping counts
+/// summed over passes. Never a distinct-object count: the same
+/// objects recur across passes and are shared across processes, so
+/// the sum is stated as summed mappings. Rows without a pid drop
+/// the process count rather than counting zero.
 fn maps_fold_display(group: &[&GapView]) -> (String, String) {
     let mut processes = std::collections::BTreeSet::new();
     let mut unnamed = 0usize;
-    let mut objects = 0u64;
+    let mut mappings = 0u64;
     for gap in group {
         match gap.pid {
             Some(pid) => {
@@ -2445,17 +2481,17 @@ fn maps_fold_display(group: &[&GapView]) -> (String, String) {
             }
             None => unnamed += 1,
         }
-        objects += maps_attribution_object_count(&gap.subject, &gap.reason).unwrap_or(0);
+        mappings += maps_attribution_object_count(&gap.subject, &gap.reason).unwrap_or(0);
     }
-    let object_plural = if objects == 1 { "" } else { "s" };
+    let mapping_plural = if mappings == 1 { "" } else { "s" };
     let reason = if unnamed == 0 {
         let processes = processes.len();
         let plural = if processes == 1 { "" } else { "es" };
         format!(
-            "{processes} process{plural} map {objects} unexamined shared object{object_plural} (--json lists each)"
+            "{processes} process{plural}; {mappings} mapping{mapping_plural} summed over passes (--json lists each)"
         )
     } else {
-        format!("{objects} unexamined shared object{object_plural} (--json lists each)")
+        format!("{mappings} mapping{mapping_plural} summed over passes (--json lists each)")
     };
     ("maps attribution".to_string(), reason)
 }
@@ -2638,9 +2674,12 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// ESRCH opens under a foreign root fold across roots into one
 /// unreachable-process family line (exact object and process
 /// counts); replaced-file floods and maps-attribution rows fold
-/// the same way (exact row, file/process and object counts);
-/// verbose and JSON keep every row.
-fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
+/// the same way (exact row counts with file/process counts; maps
+/// mappings are summed over passes, never distinct objects).
+/// A replaced row naming an admitted (or was-admitted) provider file
+/// never folds: it keeps its own named row. Verbose and JSON keep
+/// every row.
+fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
     // Deferred-attach fold: the stop-time summaries append while the
@@ -2704,9 +2743,22 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
             rest.push(gap);
         }
     }
-    // Small families keep their named rows: the replaced fold serves
-    // floods (more distinct files than the threshold), and a lone
-    // maps row keeps its own reason.
+    // A replaced provider file never folds into the family's count:
+    // rows matching an admitted (or was-admitted) provider file name
+    // keep their named rows however large the flood; the rest fold
+    // past the threshold as before. Small families keep their named
+    // rows: the replaced fold serves floods (more distinct files
+    // than the threshold), and a lone maps row keeps its own reason.
+    let providers = admitted_provider_file_names(modules);
+    let mut folded: Vec<&GapView> = Vec::with_capacity(replaced.len());
+    for gap in replaced {
+        if providers.contains(replaced_subject_file_name(gap.subject.as_str())) {
+            rest.push(gap);
+        } else {
+            folded.push(gap);
+        }
+    }
+    let mut replaced = folded;
     let replaced_files: std::collections::BTreeSet<&str> =
         replaced.iter().map(|gap| gap.subject.as_str()).collect();
     if replaced_files.len() <= REPLACED_FAMILY_FOLD_FILES {
@@ -4047,7 +4099,7 @@ fn render_snapshot_inner(
     }
     if verbosity == crate::cli::TextVerbosity::Concise {
         render_limits_line(&mut out, budgets, &presentation.edges);
-        for line in concise_gap_summary_block(&presentation.gaps) {
+        for line in concise_gap_summary_block(&presentation.gaps, &presentation.modules) {
             let _ = writeln!(out, "{line}");
         }
         if let Some(line) = concise_short_lived_pointer(&presentation.gaps) {

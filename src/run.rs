@@ -9079,6 +9079,7 @@ fn capture_profile(
             );
             render::apply_counter_snapshot(&mut ev, &snapshot);
             render::apply_legacy_gaps(&mut ev, &snapshot);
+            render::apply_snapshot_failure(&mut ev, &snapshot);
             let frame = render::live_snapshot_scoped(
                 &snapshot,
                 &ev,
@@ -9897,6 +9898,7 @@ fn capture_profile(
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
         render::apply_legacy_gaps(&mut ev, &snapshot);
+        render::apply_snapshot_failure(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
         let mut frame = render::live_snapshot_scoped(
             &snapshot,
@@ -9943,6 +9945,7 @@ fn capture_profile(
         );
         render::apply_counter_snapshot(&mut ev, &snapshot);
         render::apply_legacy_gaps(&mut ev, &snapshot);
+        render::apply_snapshot_failure(&mut ev, &snapshot);
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
         emit_timing_summaries(&ev.scheduling, &summaries);
@@ -10008,6 +10011,12 @@ fn capture_profile(
             // still exits nonzero with the snapshot failure.
             return Err(error
                 .context("terminal snapshot failed; report sealed from the last good snapshot"));
+        }
+        // A degraded terminal snapshot publishes first, then fails: the
+        // report names the read that never landed, and the run still
+        // exits nonzero with the read error.
+        if let Some(error) = snapshot.terminal_error() {
+            return Err(anyhow::Error::msg(error.to_string()));
         }
         Ok(ev)
     }
@@ -12738,6 +12747,9 @@ pub(crate) fn evidence_for(
         pause_unavailable: pause.unavailable,
         pause_engine_incomplete_retirements,
         pause_refused: pause_refusal.map(PauseRefusal::name),
+        // Set only by `apply_snapshot_failure` from the terminal
+        // snapshot: `evidence_for` never sees a degraded read.
+        snapshot_failure: None,
         child_still_running,
         // Run-only like the child flag beside it: `Some` exactly when an
         // owned context exists, carrying the measured survivor count.

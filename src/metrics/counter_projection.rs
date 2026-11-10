@@ -185,10 +185,15 @@ enum CaptureData {
 
 /// Protected measurement plus an internal proof of acquisition in this call.
 /// Cached clones preserve the measured status/window but cannot settle capture.
+/// A degraded terminal snapshot carries no rows: `snapshot_failure` names
+/// the read that never landed, and `terminal_error` keeps the read error
+/// for the nonzero exit after the report publishes.
 #[derive(Debug)]
 pub(crate) struct CaptureSnapshot {
     data: CaptureData,
     new_acquisition: bool,
+    snapshot_failure: Option<&'static str>,
+    terminal_error: Option<String>,
 }
 
 impl Clone for CaptureSnapshot {
@@ -196,6 +201,8 @@ impl Clone for CaptureSnapshot {
         Self {
             data: self.data.clone(),
             new_acquisition: false,
+            snapshot_failure: self.snapshot_failure,
+            terminal_error: self.terminal_error.clone(),
         }
     }
 }
@@ -213,7 +220,67 @@ impl CaptureSnapshot {
         Ok(Self {
             new_acquisition: snapshot.is_fresh(),
             data: CaptureData::Counter(snapshot),
+            snapshot_failure: None,
+            terminal_error: None,
         })
+    }
+
+    /// The failed read's finite name, when the terminal published
+    /// without any aggregate snapshot.
+    pub(crate) fn snapshot_failure(&self) -> Option<&'static str> {
+        self.snapshot_failure
+    }
+
+    /// The terminal read error, kept so the run still fails after the
+    /// degraded report publishes.
+    pub(crate) fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
+    }
+
+    /// A counter terminal snapshot with no aggregate rows behind it: the
+    /// failed read's finite name rides `snapshot_failure`, never a mode
+    /// or generation the capture never established.
+    pub(crate) fn degraded_counter(
+        failure: &'static str,
+        kernel: KernelEvidence,
+        error: String,
+    ) -> Self {
+        Self {
+            data: CaptureData::Counter(CounterSnapshot {
+                data: None,
+                failure: None,
+                attempted_kernel: Some(kernel),
+                discontinuity: false,
+                bank_gaps: CounterGaps::default(),
+            }),
+            new_acquisition: false,
+            snapshot_failure: Some(failure),
+            terminal_error: Some(error),
+        }
+    }
+
+    /// A legacy terminal snapshot with no read behind it: no rows, every
+    /// kernel cell unknown, the return-value table failed.
+    pub(crate) fn degraded_legacy(failure: &'static str, error: String) -> Self {
+        Self {
+            data: CaptureData::Legacy(
+                Vec::new(),
+                KernelEvidence {
+                    unknown_cells: super::LEGACY_UNKNOWN_ALL,
+                    ..Default::default()
+                },
+                LegacyReadGaps {
+                    slots: super::LegacySlotGaps {
+                        unread_stats: 0,
+                        rv_failed: true,
+                    },
+                    unknown_evidence: super::LEGACY_UNKNOWN_ALL,
+                },
+            ),
+            new_acquisition: false,
+            snapshot_failure: Some(failure),
+            terminal_error: Some(error),
+        }
     }
 
     fn counter(&self) -> Option<&CounterSnapshot> {
@@ -240,9 +307,13 @@ impl CaptureSnapshot {
     }
 
     pub(crate) fn has_counter_gap(&self) -> bool {
-        self.counter().is_some_and(|snapshot| {
-            !snapshot.is_fresh() || snapshot.discontinuity() || !snapshot.bank_gaps().is_clean()
-        })
+        // A degraded snapshot carries no accepted read, so there is no
+        // `counter_collection` object to describe; the `snapshot_failure`
+        // cause supersedes this one.
+        self.snapshot_failure.is_none()
+            && self.counter().is_some_and(|snapshot| {
+                !snapshot.is_fresh() || snapshot.discontinuity() || !snapshot.bank_gaps().is_clean()
+            })
     }
 
     fn legacy_gaps(&self) -> Option<&LegacyReadGaps> {
@@ -333,6 +404,13 @@ impl CaptureSnapshot {
 /// The one collection owner shared by live snapshots and final publication.
 pub(crate) struct CaptureCollection {
     counter: Option<CounterCapture>,
+    /// Successful snapshot acquisitions this capture, both paths. The
+    /// terminal degrades only from zero: a failed terminal read behind
+    /// acquired snapshots keeps failing the report.
+    acquired: u64,
+    /// The latest counter attempt, kept so a failed terminal read with
+    /// no snapshot behind it still names its failure.
+    last_counter: Option<CounterSnapshot>,
 }
 
 impl CaptureCollection {
@@ -340,6 +418,8 @@ impl CaptureCollection {
         Self {
             counter: inputs
                 .map(|inputs| CounterCapture::new(inputs.mode, inputs.limits, inputs.reserve)),
+            acquired: 0,
+            last_counter: None,
         }
     }
 
@@ -375,17 +455,23 @@ impl CaptureCollection {
         let binding = session.counter_reader_binding();
         let legacy = || -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)> {
             // Preserve the existing order of ordinary live/terminal reads.
+            // Each step tags its failure for the zero-snapshot terminal
+            // report; the messages stay the read errors'.
             if terminal {
-                let (reports, slots) = super::read_with_gaps(session, plan)?;
-                let kernel = super::kernel_evidence_with_gaps(session)?;
+                let (reports, slots) =
+                    super::read_with_gaps(session, plan).map_err(LegacyReadFailure::slots)?;
+                let kernel =
+                    super::kernel_evidence_with_gaps(session).map_err(LegacyReadFailure::kernel)?;
                 let gaps = LegacyReadGaps {
                     slots,
                     unknown_evidence: kernel.unknown_cells,
                 };
                 Ok((reports, kernel, gaps))
             } else {
-                let kernel = super::kernel_evidence_with_gaps(session)?;
-                let (reports, slots) = super::read_with_gaps(session, plan)?;
+                let kernel =
+                    super::kernel_evidence_with_gaps(session).map_err(LegacyReadFailure::kernel)?;
+                let (reports, slots) =
+                    super::read_with_gaps(session, plan).map_err(LegacyReadFailure::slots)?;
                 let gaps = LegacyReadGaps {
                     slots,
                     unknown_evidence: kernel.unknown_cells,
@@ -423,6 +509,35 @@ impl CaptureCollection {
     // session's collection generation and a kernel-evidence source feed
     // the zero-endpoint bypass, which publishes no bank rows but must
     // still report measured kernel evidence under the real generation.
+    /// Seals a terminal read failure with no snapshot behind it as a
+    /// degraded snapshot: no aggregate rows, the failed read's finite
+    /// name, and the read error kept for the nonzero exit after the
+    /// report publishes.
+    fn degraded_terminal(
+        &self,
+        error: anyhow::Error,
+        kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
+    ) -> CaptureSnapshot {
+        let message = format!("{error:#}");
+        if let Some(legacy) = error.downcast_ref::<LegacyReadFailure>() {
+            return CaptureSnapshot::degraded_legacy(legacy.name(), message);
+        }
+        let (failure, attempted) = self
+            .last_counter
+            .clone()
+            .map(|failed| {
+                (
+                    failed.failure().map_or("unavailable", CounterFailure::name),
+                    failed.kernel_evidence(),
+                )
+            })
+            .unwrap_or(("unavailable", None));
+        let kernel = attempted
+            .or_else(|| kernel().ok())
+            .unwrap_or_else(all_unknown_kernel_evidence);
+        CaptureSnapshot::degraded_counter(failure, kernel, message)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fresh_with<B>(
         &mut self,
@@ -452,9 +567,12 @@ impl CaptureCollection {
                     kernel.unknown_cells &= !super::LEGACY_UNKNOWN_RING_LOSS;
                     gaps.unknown_evidence = kernel.unknown_cells;
                 }
+                self.acquired += 1;
                 Ok(CaptureSnapshot {
                     data: CaptureData::Legacy(reports, kernel, gaps),
                     new_acquisition: true,
+                    snapshot_failure: None,
+                    terminal_error: None,
                 })
             }
             binding => {
@@ -517,7 +635,12 @@ impl CaptureCollection {
                         discontinuity,
                         bank_gaps: CounterGaps::default(),
                     };
-                    return CaptureSnapshot::from_counter(snapshot);
+                    self.last_counter = Some(snapshot.clone());
+                    let snapshot = CaptureSnapshot::from_counter(snapshot);
+                    if snapshot.is_ok() {
+                        self.acquired += 1;
+                    }
+                    return snapshot;
                 }
                 let counter = self.counter.as_mut().expect("owner inputs checked above");
                 let snapshot =
@@ -529,7 +652,12 @@ impl CaptureCollection {
                         Err(_) => Err(ReadStage::BankRouting),
                         Ok(None) => unreachable!("ordinary binding was handled above"),
                     });
-                CaptureSnapshot::from_counter(snapshot)
+                self.last_counter = Some(snapshot.clone());
+                let snapshot = CaptureSnapshot::from_counter(snapshot);
+                if snapshot.is_ok() {
+                    self.acquired += 1;
+                }
+                snapshot
             }
         }
     }
@@ -550,14 +678,27 @@ impl CaptureCollection {
         ) -> Result<CounterRead, ReadStage>,
         legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)>,
         generation: NonZeroU64,
-        kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
+        kernel: impl FnOnce() -> anyhow::Result<KernelEvidence> + Clone,
     ) -> anyhow::Result<CaptureSnapshot> {
         // Always acquire, observe and project again. A failed terminal read
         // publishes the last good snapshot as stale with its failure name;
-        // only a capture that never acquired a snapshot fails.
-        self.fresh_with(
+        // a failed terminal read with no snapshot behind it seals a
+        // degraded report naming the failed read instead of failing the
+        // run's report.
+        let kernel_fallback = kernel.clone();
+        let snapshot = self.fresh_with(
             plan, pins, profile, binding, acquire, legacy, generation, kernel,
-        )
+        );
+        match snapshot {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                if self.acquired == 0 {
+                    Ok(self.degraded_terminal(error, kernel_fallback))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
@@ -790,10 +931,71 @@ fn stage_projection(
     Ok((crate::metrics::merge_slot_reports(reports), storage))
 }
 
+/// Kernel evidence for a read that never landed: every cell unknown.
+fn all_unknown_kernel_evidence() -> KernelEvidence {
+    KernelEvidence {
+        unknown_cells: super::LEGACY_UNKNOWN_ALL,
+        ..Default::default()
+    }
+}
+
+/// Which legacy aggregate read failed, for the zero-snapshot terminal
+/// report's finite name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyReadStep {
+    Slots,
+    Kernel,
+}
+
+/// Tags a legacy aggregate-read failure with the step that failed.
+/// Transparent: the message and chain are the wrapped read error's,
+/// unchanged.
+#[derive(Debug)]
+struct LegacyReadFailure {
+    step: LegacyReadStep,
+    source: anyhow::Error,
+}
+
+impl LegacyReadFailure {
+    fn slots(source: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            step: LegacyReadStep::Slots,
+            source,
+        })
+    }
+
+    fn kernel(source: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            step: LegacyReadStep::Kernel,
+            source,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        match self.step {
+            LegacyReadStep::Slots => "legacy_slots",
+            LegacyReadStep::Kernel => "legacy_kernel",
+        }
+    }
+}
+
+impl std::fmt::Display for LegacyReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for LegacyReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.chain().next()
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::{
         CaptureCollection, CaptureSnapshot, CounterCapture, CounterCaptureInputs, CounterFailure,
+        LegacyReadFailure,
     };
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
@@ -1939,7 +2141,8 @@ pub(super) mod tests {
             )
             .unwrap()
         };
-        // Empty with a quarantined binding still errors (no masking).
+        // Empty with a quarantined binding seals degraded naming the
+        // refusal: the failure stays visible, nothing is fabricated.
         {
             let plan = empty_plan();
             let pins = PinnedObjects::empty();
@@ -1950,22 +2153,26 @@ pub(super) mod tests {
                 LIMITS.rv_keys,
                 pool.reserver(),
             )));
-            assert!(
-                collection
-                    .terminal_with(
-                        &plan,
-                        &pins,
-                        false,
-                        Err::<Option<()>, _>(BankRefusal::Quarantined),
-                        |(), _, _, _, _| panic!("quarantined must not read"),
-                        || panic!("quarantined must not use legacy"),
-                        std::num::NonZeroU64::new(1).unwrap(),
-                        || Ok(KernelEvidence::default()),
-                    )
-                    .is_err()
+            let degraded = collection
+                .terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Err::<Option<()>, _>(BankRefusal::Quarantined),
+                    |(), _, _, _, _| panic!("quarantined must not read"),
+                    || panic!("quarantined must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
+                )
+                .expect("a quarantined terminal seals degraded");
+            assert!(degraded.reports().is_empty());
+            assert_eq!(degraded.snapshot_failure(), Some("bank_quarantined"));
+            assert_eq!(
+                degraded.terminal_error(),
+                Some("counter collection unavailable (bank_quarantined)"),
             );
         }
-        // Non-empty with bank routing still errors (no fabrication).
+        // Non-empty with bank routing seals degraded naming the refusal.
         {
             let (_file, plan, pins) = fixture();
             assert!(!plan.slots.is_empty());
@@ -1976,22 +2183,27 @@ pub(super) mod tests {
                 LIMITS.rv_keys,
                 pool.reserver(),
             )));
-            assert!(
-                collection
-                    .terminal_with(
-                        &plan,
-                        &pins,
-                        false,
-                        Ok(Some(())),
-                        |(), _, _, _, _| Err(ReadStage::BankRouting),
-                        || panic!("counter must not use legacy"),
-                        std::num::NonZeroU64::new(1).unwrap(),
-                        || Ok(KernelEvidence::default()),
-                    )
-                    .is_err()
+            let degraded = collection
+                .terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(Some(())),
+                    |(), _, _, _, _| Err(ReadStage::BankRouting),
+                    || panic!("counter must not use legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
+                )
+                .expect("a rerouted terminal seals degraded");
+            assert!(degraded.reports().is_empty());
+            assert_eq!(degraded.snapshot_failure(), Some("bank_routing"));
+            assert_eq!(
+                degraded.terminal_error(),
+                Some("counter collection unavailable (bank_routing)"),
             );
         }
-        // Empty with a legacy binding and counter inputs still errors.
+        // Empty with a legacy binding and counter inputs seals degraded
+        // without a finite read name; the setup error stays chained.
         {
             let plan = empty_plan();
             let pins = PinnedObjects::empty();
@@ -2002,19 +2214,23 @@ pub(super) mod tests {
                 LIMITS.rv_keys,
                 pool.reserver(),
             )));
-            assert!(
-                collection
-                    .terminal_with(
-                        &plan,
-                        &pins,
-                        false,
-                        Ok(None::<()>),
-                        |(), _, _, _, _| panic!("absent binding must not read"),
-                        || panic!("counter capture cannot switch to legacy"),
-                        std::num::NonZeroU64::new(1).unwrap(),
-                        || Ok(KernelEvidence::default()),
-                    )
-                    .is_err()
+            let degraded = collection
+                .terminal_with(
+                    &plan,
+                    &pins,
+                    false,
+                    Ok(None::<()>),
+                    |(), _, _, _, _| panic!("absent binding must not read"),
+                    || panic!("counter capture cannot switch to legacy"),
+                    std::num::NonZeroU64::new(1).unwrap(),
+                    || Ok(KernelEvidence::default()),
+                )
+                .expect("an unbound terminal seals degraded");
+            assert!(degraded.reports().is_empty());
+            assert_eq!(degraded.snapshot_failure(), Some("unavailable"));
+            assert_eq!(
+                degraded.terminal_error(),
+                Some("counter collection requires its prepared Session binding"),
             );
         }
     }
@@ -2099,22 +2315,168 @@ pub(super) mod tests {
             degraded.reports().is_empty(),
             "a degraded snapshot carries no aggregate rows"
         );
+        assert_eq!(degraded.snapshot_failure(), Some("read_rvs"));
+        assert!(
+            !degraded.has_counter_gap(),
+            "no counter_collection cause without an accepted read"
+        );
+        assert!(degraded.counter_collection().is_none());
+        assert_eq!(
+            degraded.kernel_evidence(),
+            KernelEvidence::default(),
+            "the kernel read still lands behind a failed aggregate read"
+        );
+        assert_eq!(
+            degraded.terminal_error(),
+            Some("counter collection unavailable (read_rvs)"),
+            "the read error is kept for the nonzero exit"
+        );
+        assert_eq!(fresh.collection.acquired, 0);
+    }
+
+    /// The legacy path degrades the same way: no rows, the failed step's
+    /// finite name, every kernel cell unknown with the return-value table
+    /// failed.
+    #[test]
+    fn terminal_without_any_legacy_snapshot_seals_a_degraded_report() {
+        let (_file, plan, pins) = fixture();
+        let generation = std::num::NonZeroU64::new(7).unwrap();
+        for (tag, name) in [
+            (
+                LegacyReadFailure::slots as fn(anyhow::Error) -> anyhow::Error,
+                "legacy_slots",
+            ),
+            (
+                LegacyReadFailure::kernel as fn(anyhow::Error) -> anyhow::Error,
+                "legacy_kernel",
+            ),
+        ] {
+            let mut collection = CaptureCollection::new(None);
+            let legacy = || -> anyhow::Result<(
+                Vec<crate::metrics::SlotReport>,
+                KernelEvidence,
+                LegacyReadGaps,
+            )> { Err(tag(anyhow::anyhow!("map gone"))) };
+            let degraded = collection
+                .terminal_with(
+                    &plan,
+                    &pins,
+                    true,
+                    Ok::<Option<()>, _>(None),
+                    |_, _, _, _, _| unreachable!("the legacy path reads no banks"),
+                    legacy,
+                    generation,
+                    || Ok(KernelEvidence::default()),
+                )
+                .expect("a legacy terminal without any snapshot seals degraded");
+            assert!(
+                degraded.reports().is_empty(),
+                "a degraded snapshot carries no aggregate rows"
+            );
+            assert_eq!(degraded.snapshot_failure(), Some(name));
+            assert!(degraded.has_legacy_gap());
+            let gaps = degraded
+                .legacy_collection()
+                .expect("the legacy gap object renders");
+            assert_eq!(gaps["unread_stats"], 0);
+            assert_eq!(gaps["rv_failed"], true);
+            assert_eq!(
+                gaps["unknown_evidence"].as_array().expect("names").len(),
+                crate::metrics::LEGACY_UNKNOWN_CELLS.len(),
+                "every kernel cell unknown"
+            );
+            assert_eq!(
+                degraded.kernel_evidence().unknown_cells,
+                crate::metrics::LEGACY_UNKNOWN_ALL
+            );
+            assert_eq!(collection.acquired, 0);
+        }
+    }
+
+    /// The degraded seal is a zero-snapshot rule only: a terminal read
+    /// failure behind acquired snapshots keeps failing the report.
+    #[test]
+    fn terminal_failure_after_acquired_snapshots_still_fails() {
+        let (_file, plan, pins) = fixture();
+        let generation = std::num::NonZeroU64::new(7).unwrap();
+        let mut collection = CaptureCollection::new(None);
+        let good = || {
+            Ok((
+                Vec::new(),
+                KernelEvidence::default(),
+                LegacyReadGaps {
+                    slots: crate::metrics::LegacySlotGaps {
+                        unread_stats: 0,
+                        rv_failed: false,
+                    },
+                    unknown_evidence: 0,
+                },
+            ))
+        };
+        collection
+            .fresh_with(
+                &plan,
+                &pins,
+                true,
+                Ok::<Option<()>, _>(None),
+                |_, _, _, _, _| unreachable!("the legacy path reads no banks"),
+                good,
+                generation,
+                || Ok(KernelEvidence::default()),
+            )
+            .expect("the first legacy read lands");
+        assert_eq!(collection.acquired, 1);
+        let legacy = || -> anyhow::Result<(
+            Vec<crate::metrics::SlotReport>,
+            KernelEvidence,
+            LegacyReadGaps,
+        )> { Err(LegacyReadFailure::slots(anyhow::anyhow!("map gone"))) };
+        collection
+            .terminal_with(
+                &plan,
+                &pins,
+                true,
+                Ok::<Option<()>, _>(None),
+                |_, _, _, _, _| unreachable!("the legacy path reads no banks"),
+                legacy,
+                generation,
+                || Ok(KernelEvidence::default()),
+            )
+            .expect_err("a terminal behind acquired snapshots still fails");
+    }
+
+    /// The legacy tag names its step, leaves the read error's message
+    /// untouched, and keeps the read error chained underneath.
+    #[test]
+    fn legacy_read_failures_tag_their_step_transparently() {
+        for (tagged, name, message) in [
+            (
+                LegacyReadFailure::slots(anyhow::anyhow!("STATS map gone")),
+                "legacy_slots",
+                "STATS map gone",
+            ),
+            (
+                LegacyReadFailure::kernel(anyhow::anyhow!("kernel map gone")),
+                "legacy_kernel",
+                "kernel map gone",
+            ),
+        ] {
+            assert_eq!(format!("{tagged}"), message);
+            let failure = tagged
+                .downcast_ref::<LegacyReadFailure>()
+                .expect("the step tag survives");
+            assert_eq!(failure.name(), name);
+            let source = std::error::Error::source(failure).expect("the read error stays chained");
+            assert_eq!(format!("{source}"), message);
+        }
     }
 
     #[test]
     fn terminal_failure_publishes_last_good_stale_with_gap() {
         use p11scope_ebpf_common::CounterMode;
-        // Never-acquired terminal still fails: no snapshot exists to publish.
-        {
-            let mut fresh = ConsumerFixture::new();
-            let error = fresh
-                .terminal(CounterMode::Counts, 1, 5, Some(ConsumerFault::ReadRvs))
-                .expect_err("a terminal without any prior snapshot must fail");
-            assert!(
-                format!("{error:#}").contains("counter collection unavailable"),
-                "{error:#}"
-            );
-        }
+        // The never-acquired terminal no longer fails: it seals a degraded
+        // report naming the failed read (see
+        // terminal_without_any_snapshot_still_seals_a_degraded_report).
         // A terminal read failure after a good snapshot publishes the last
         // good rows as stale with a named failure and a PARTIAL gap.
         let mut fixture = ConsumerFixture::new();
@@ -2179,9 +2541,10 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn counter_empty_capture_fails_when_kernel_evidence_is_unavailable() {
+    fn counter_empty_capture_keeps_kernel_evidence_failures_visible() {
         // A kernel-evidence read error fails the bypass with its own
-        // name instead of publishing default evidence, on both paths.
+        // name instead of publishing default evidence. The live path
+        // still fails; the terminal seals degraded keeping the error.
         for terminal in [false, true] {
             let plan = AttachPlan::from_slots_with_policy(
                 vec![],
@@ -2219,11 +2582,22 @@ pub(super) mod tests {
                     || anyhow::bail!("test EVIDENCE read failed"),
                 )
             };
-            let error = result.expect_err("a kernel-evidence failure must fail");
-            assert!(
-                format!("{error:#}").contains("counter collection unavailable (kernel_evidence)"),
-                "{error:#}"
-            );
+            if terminal {
+                let degraded = result.expect("the terminal seals degraded");
+                assert!(degraded.reports().is_empty());
+                assert_eq!(degraded.snapshot_failure(), Some("unavailable"));
+                assert_eq!(
+                    degraded.terminal_error(),
+                    Some("counter collection unavailable (kernel_evidence)"),
+                );
+            } else {
+                let error = result.expect_err("a kernel-evidence failure must fail");
+                assert!(
+                    format!("{error:#}")
+                        .contains("counter collection unavailable (kernel_evidence)"),
+                    "{error:#}"
+                );
+            }
         }
     }
 }

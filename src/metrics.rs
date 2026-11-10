@@ -151,6 +151,20 @@ pub(crate) const LEGACY_UNKNOWN_OWNER: u64 = 1 << 9;
 pub(crate) const LEGACY_UNKNOWN_COOKIE: u64 = 1 << 10;
 pub(crate) const LEGACY_UNKNOWN_ROOT: u64 = 1 << 11;
 
+/// Every unknown bit set: a kernel-evidence read that never landed.
+pub(crate) const LEGACY_UNKNOWN_ALL: u64 = LEGACY_UNKNOWN_RING_LOSS
+    | LEGACY_UNKNOWN_START_INSERT
+    | LEGACY_UNKNOWN_UNMATCHED_RETURNS
+    | LEGACY_UNKNOWN_RV_UPDATES
+    | LEGACY_UNKNOWN_CGROUP_SCOPE
+    | LEGACY_UNKNOWN_SEMANTIC_CAPTURE
+    | LEGACY_UNKNOWN_TEMPLATE_TAIL
+    | LEGACY_UNKNOWN_UNREGISTERED_MECHANISMS
+    | LEGACY_UNKNOWN_ABI_REFUSALS
+    | LEGACY_UNKNOWN_OWNER
+    | LEGACY_UNKNOWN_COOKIE
+    | LEGACY_UNKNOWN_ROOT;
+
 /// Finite cell names for the unknown bitmask, in bit order.
 pub(crate) const LEGACY_UNKNOWN_CELLS: &[(&str, u64)] = &[
     ("ring_loss", LEGACY_UNKNOWN_RING_LOSS),

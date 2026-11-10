@@ -1225,6 +1225,11 @@ pub struct Evidence {
     /// lattice, never a member of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause_refused: Option<&'static str>,
+    /// The aggregate read that never landed, when the terminal published
+    /// without any snapshot. Absent, never null, otherwise; aggregate
+    /// zeros are unknown, not measured, whenever it is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_failure: Option<&'static str>,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3173,6 +3178,26 @@ pub(crate) fn apply_legacy_gaps(ev: &mut Evidence, snapshot: &crate::metrics::Ca
     }
 }
 
+/// Derive the zero-snapshot terminal gap from the degraded snapshot,
+/// mirroring the collection gap above. A terminal read failure with no
+/// snapshot behind it still seals the report: no aggregate rows, the
+/// failed read's finite name, PARTIAL with a concrete gap.
+pub(crate) fn apply_snapshot_failure(
+    ev: &mut Evidence,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) {
+    if let Some(failure) = snapshot.snapshot_failure() {
+        ev.snapshot_failure = Some(failure);
+        let observation = &mut ev.gap_classes.observation;
+        if !observation.causes.contains(&"snapshot_failure") {
+            observation.causes.push("snapshot_failure");
+        }
+        observation.status = "lossy";
+        ev.completeness = "PARTIAL";
+        ev.verdict_detail = VERDICT_CONCRETE_GAP;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_snapshot_scoped(
     snapshot: &crate::metrics::CaptureSnapshot,
@@ -3746,6 +3771,10 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             "trace_truncated" => "trace truncated at its event cap".to_string(),
             "counter_collection" => "final counter read incomplete".to_string(),
             "legacy_collection" => "legacy collection incomplete".to_string(),
+            "snapshot_failure" => format!(
+                "aggregate snapshot unavailable ({}): function counts unknown",
+                ev.snapshot_failure.unwrap_or("unavailable")
+            ),
             "proc_namespace_mismatch" => {
                 "process numbering is foreign: kernel PIDs unresolvable".to_string()
             }
@@ -5397,6 +5426,7 @@ pub(crate) mod tests {
             pause_unavailable: 0,
             pause_engine_incomplete_retirements: 0,
             pause_refused: None,
+            snapshot_failure: None,
             child_still_running: None,
             run_tree_handed_back: None,
             discovery_ring_loss: 0,
@@ -8788,6 +8818,45 @@ pub(crate) mod tests {
             TextVerbosity::Concise,
         );
         assert!(!out.contains("pause refused:"), "{out}");
+    }
+
+    /// A zero-snapshot terminal names the failed read in coverage and in
+    /// JSON: PARTIAL with the `snapshot_failure` cause beside the field.
+    #[test]
+    fn snapshot_failure_names_the_failed_read_in_text_and_json() {
+        let degraded = crate::metrics::CaptureSnapshot::degraded_counter(
+            "read_rvs",
+            crate::metrics::KernelEvidence::default(),
+            "counter collection unavailable (read_rvs)".to_string(),
+        );
+        let mut ev = evidence();
+        apply_snapshot_failure(&mut ev, &degraded);
+        assert_eq!(ev.snapshot_failure, Some("read_rvs"));
+        assert_eq!(ev.completeness, "PARTIAL");
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains("aggregate snapshot unavailable (read_rvs): function counts unknown"),
+            "{out}"
+        );
+        let document = json(&reports_fixture(), &ev, &capture_fixture());
+        assert_eq!(document["evidence"]["snapshot_failure"], "read_rvs");
+        let causes = document["evidence"]["gap_classes"]["observation"]["causes"]
+            .as_array()
+            .expect("observation causes");
+        assert!(
+            causes.iter().any(|cause| cause == "snapshot_failure"),
+            "{causes:?}"
+        );
     }
 
     /// CLI text: the function table names each row's provider file, so

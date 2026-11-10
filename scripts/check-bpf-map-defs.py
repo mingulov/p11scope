@@ -2533,7 +2533,7 @@ def validate_policy_inventory(safe, unsafe):
 
 
 def self_test():
-    assert SAFE_MAPS["DISCOVERY"] == map_def(27, 0, 0, 65_536)
+    assert SAFE_MAPS["DISCOVERY"] == map_def(27, 0, 0, 2 * 1024 * 1024)
     assert SAFE_MAPS["DISCOVERY_STATE"] == map_def(1, 24, 24, 64)
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)

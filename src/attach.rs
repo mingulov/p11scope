@@ -20644,6 +20644,16 @@ mod tests {
         );
     }
 
+    /// A named process loads the same 2 MiB DISCOVERY ring as a shared
+    /// scope: one 920-byte record plus the 8-byte ring header per exec or
+    /// leader exit, about 2,260 records, so pid scope gets the RB-2 margin
+    /// too. The small-ring feature build keeps its 4 KiB compiled ring.
+    #[cfg(not(p11scope_small_discovery_ring))]
+    #[test]
+    fn pid_scope_discovery_ring_is_two_mebibytes() {
+        assert_eq!(discovery_ring_bytes(&Scope::Pid(7)), 2 * 1024 * 1024);
+    }
+
     fn discovery_items(first: u64, count: u64) -> Vec<events::DiscoveryItem> {
         (first..first + count)
             .map(|ts| {

@@ -298,7 +298,7 @@ fn embedded_discovery_sizes_pin_each_flavor() {
     #[cfg(p11scope_small_discovery_ring)]
     let detailed = 4_096;
     #[cfg(not(p11scope_small_discovery_ring))]
-    let detailed = 65_536;
+    let detailed = 2 * 1024 * 1024;
     for (flavor, bytes, expected) in [
         ("detailed", crate::EBPF_OBJECT, detailed),
         (

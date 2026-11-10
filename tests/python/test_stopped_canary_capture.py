@@ -2128,7 +2128,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     item['max_entries'] = 1
             return maps
 
-        self.assertEqual(capture.definitions.SAFE_MAPS['DISCOVERY']['max_entries'], 65_536)
+        self.assertEqual(capture.definitions.SAFE_MAPS['DISCOVERY']['max_entries'], 2_097_152)
         self.assertEqual(capture.OWNED_DISCOVERY_MAX_ENTRIES, owned_discovery)
         capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'owned')
         capture.validate_inventory(owned_inventory('allowlisted'), 'default', 'allowlisted', 'owned')

@@ -3976,7 +3976,7 @@ mod tests {
     #[test]
     fn discovery_ring_feature_changes_only_discovery() {
         #[cfg(not(feature = "small-discovery-ring"))]
-        assert_eq!(DISCOVERY_BYTES, 65_536);
+        assert_eq!(DISCOVERY_BYTES, 2 * 1024 * 1024);
         #[cfg(feature = "small-discovery-ring")]
         {
             assert_eq!(DISCOVERY_BYTES, 4_096);

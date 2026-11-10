@@ -2786,8 +2786,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             reason_text = folded;
         }
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
-        let reason =
-            escape_controls(gap_plain_reason(&gap.subject, reason_text)).into_owned();
+        let reason = escape_controls(gap_plain_reason(&gap.subject, reason_text)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += 1;
@@ -2811,7 +2810,9 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         // rows, so a fresh key reads as a scope group.
         let mut total = 0u64;
         for gap in &kthreads {
-            if let Some(count) = kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason)) {
+            if let Some(count) =
+                kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason))
+            {
                 total = total.saturating_add(count.saturating_mul(gap.repeats));
             }
         }

@@ -1188,7 +1188,7 @@ fn synthetic_bootstrap_gap_matcher_rejects_near_misses() {
         !is_synthetic_bootstrap_gap(&other_subject),
         "the same reason under another subject is a retained row"
     );
-    }
+}
 
 /// A deferred Joint birth already names the silent bootstrap: no
 /// synthetic `joint_birth_unoffered` on top. The deferred subject

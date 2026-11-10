@@ -3294,6 +3294,96 @@ fn demotion_retirement_round4_first_shared_or_unknown_cannot_keep_initial_checkp
 }
 
 #[test]
+fn demotion_retirement_revision_skew_unknown_keeps_ordinary_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(ownership.register_pair(scene.caller, object));
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    assert_eq!(ownership.ordinary_sequence(scene.caller, object), original);
+    // A new endpoint on another object bumps the attach count revision, so
+    // the membership index rebuilds under a revision the active scan does
+    // not carry: the summary can only finish an unproven Unknown (the
+    // revision-skew classification the joint lane hits during attach drain).
+    let grown = fx::lower_named(
+        &[fx::module_with_targets(
+            &scene.pins,
+            &scene.b,
+            &[(&scene.a, 0x1000), (&scene.b, 0x2000)],
+        )],
+        &scene.pins,
+        crate::plan::AdmissionPolicy::Inventory(
+            scene.native.scene.coordinator.attach_set.budget(),
+        ),
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .attach_set
+        .absorb(&grown, &scene.pins);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(
+        matches!(
+            ownership.candidates(scene.caller, object),
+            CurrentCandidates::Unknown
+        ),
+        "the stale-revision scan serves no current candidate"
+    );
+    assert_eq!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "an unproven revision-skew Unknown must not revoke ordinary continuity"
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_eq!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "the returning same-carrier Sole resumes on the original checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_proven_absence_revokes_ordinary_checkpoint() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(ownership.register_pair(scene.caller, object));
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    // A complete observation whose modules intersect no member of the
+    // object proves the carrier absent: continuity must still revoke.
+    round4_queue_ownership(&mut ownership, &scene, Vec::new(), 300);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_ne!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "a proven absence must revoke ordinary continuity"
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across a proven absence needs a new fence, not the old checkpoint"
+    );
+}
+
+#[test]
 fn demotion_retirement_round4_failed_caller_source_survives_lagging_summary() {
     let scene = round4_placed_with_known_b();
     let object = scene.native.scene.delta.endpoints[0].object.index();

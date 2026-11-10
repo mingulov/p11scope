@@ -55,6 +55,9 @@ pub(crate) struct CurrentPartitionReceipt {
         JournalBirthCut,
         crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
     )>,
+    /// The birth rides a continued observation of a key sighted `New`
+    /// with no admitted call yet (not a `New` or `AdmittedFirst` mint).
+    birth_retry: bool,
 }
 impl CurrentPartitionReceipt {
     /// Tests-only receipt: merge tests script receipt plumbing (order,
@@ -86,6 +89,7 @@ impl CurrentPartitionReceipt {
             deadline,
             ids,
             birth: None,
+            birth_retry: false,
         }
     }
 
@@ -132,6 +136,13 @@ impl CurrentPartitionReceipt {
         &self,
     ) -> Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity> {
         self.birth.as_ref().map(|(_, _, quantum)| *quantum)
+    }
+
+    /// Whether this receipt's birth is a sighting retry: a pass without
+    /// the key's admission repeats a condition its `New` already
+    /// disclosed, so it adds no refusal of its own.
+    pub(crate) fn birth_retry(&self) -> bool {
+        self.birth_retry && self.birth.is_some()
     }
 
     fn matches_admitted_partition(
@@ -1530,6 +1541,15 @@ impl TerminalTaskProof {
 pub(crate) struct SemanticCapture {
     identity: u64,
     router: InstanceRouter,
+    /// (image cookie, exec, file) -> the quantum whose birth this key's
+    /// receipt last carried. A sighting retry fires at most once per
+    /// quantum: a second observation of the key in the same quantum
+    /// must not offer a second birth for the same partition. Bounded
+    /// by the observed-keys cap (entries for unarmed keys go first).
+    birth_quanta: BTreeMap<
+        (u64, u64, u32),
+        crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    >,
     limits: TickLimits,
     next_token: u64,
     awaiting: BTreeMap<u64, Awaiting>,
@@ -1662,6 +1682,7 @@ impl SemanticCapture {
         Ok(Self {
             identity,
             router: InstanceRouter::new(domain, RouterLimits::default()),
+            birth_quanta: BTreeMap::new(),
             limits,
             next_token: 1,
             awaiting: BTreeMap::new(),
@@ -2047,7 +2068,7 @@ impl SemanticCapture {
 
     #[allow(clippy::too_many_arguments)]
     fn finish_birth(
-        &self,
+        &mut self,
         mut candidate: H0BirthCandidate,
         absence: Option<CommittedAbsenceBirth>,
         admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
@@ -2058,6 +2079,13 @@ impl SemanticCapture {
         rows: &mut impl crate::attach::BirthRowReader,
     ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
+        // A consumed candidate ends the key's sighting retry, whatever
+        // its outcome: one native birth attempt per key, as before the
+        // retry existed, and a quiet key never renews H0 novelty.
+        self.router.end_birth_retry(
+            candidate.receipt.image,
+            candidate.receipt.endpoint.file_slot,
+        );
         let (native, image, router, _) = admitted.journal_binding();
         if native != candidate.receipt.domain
             || image != candidate.receipt.image
@@ -3645,6 +3673,25 @@ impl SemanticCapture {
             ) && let Some(watched) = watched
                 && watched.check_unchanged() == Ok(true)
             {
+                let birth_key = (
+                    job.image.task_cookie,
+                    job.image.exec_id,
+                    job.endpoint.file_slot,
+                );
+                let birth_quantum = job.birth_cut.as_ref().map(|(_, quantum)| *quantum);
+                let birth_retry = outcome == ObserveOutcome::Continued
+                    && birth_quantum.is_some()
+                    && self.birth_quanta.get(&birth_key).copied() != birth_quantum
+                    && self
+                        .router
+                        .birth_retry_armed(job.image, job.endpoint.file_slot);
+                if (outcome == ObserveOutcome::New
+                    || outcome == ObserveOutcome::AdmittedFirst
+                    || birth_retry)
+                    && let Some(quantum) = birth_quantum
+                {
+                    self.note_birth_quantum(birth_key, quantum);
+                }
                 report.current.push(CurrentPartitionReceipt {
                     domain: self.router.domain(),
                     image: job.image,
@@ -3658,6 +3705,7 @@ impl SemanticCapture {
                     ids,
                     birth: if outcome == ObserveOutcome::New
                         || outcome == ObserveOutcome::AdmittedFirst
+                        || birth_retry
                     {
                         job.birth_cut
                             .clone()
@@ -3665,6 +3713,7 @@ impl SemanticCapture {
                     } else {
                         None
                     },
+                    birth_retry,
                 });
                 // The admitted mint installed: later admissions for this
                 // key stay plain continuations, so at most one birth per
@@ -3690,6 +3739,30 @@ impl SemanticCapture {
             self.resolve(resolved, report);
         }
     }
+    /// Remember which quantum last offered a birth for this key.
+    fn note_birth_quantum(
+        &mut self,
+        key: (u64, u64, u32),
+        quantum: crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+    ) {
+        let cap = crate::discovery::instances::MAX_OBSERVED_KEYS;
+        if !self.birth_quanta.contains_key(&key) && self.birth_quanta.len() >= cap {
+            let router = &self.router;
+            self.birth_quanta.retain(|(cookie, exec, file), _| {
+                router.birth_retry_armed(
+                    ImageIdentity {
+                        task_cookie: *cookie,
+                        exec_id: *exec,
+                    },
+                    *file,
+                )
+            });
+        }
+        if self.birth_quanta.contains_key(&key) || self.birth_quanta.len() < cap {
+            self.birth_quanta.insert(key, quantum);
+        }
+    }
+
     fn tick_with(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
         let mut report = self.tick_with_inner(io, None)?;
         self.stamp_disposition(&mut report);

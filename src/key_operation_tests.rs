@@ -1131,6 +1131,32 @@ fn key_operation_single_feed_exactly_once() {
         Err(StagingRefusal::NotJoint)
     );
 
+    // --- An untouched S1Only feed may select Joint once, late. The
+    // birth cut (journal consumption, 41) never fences the H0
+    // position space: the first call at H0 position 1 stages. ---
+    let mut late = JointStaging::select_s1_only();
+    let late_receipt = BootstrapReceipt::scripted(
+        scene.proof,
+        BirthKind::ExecMarker,
+        41,
+        scene.fixture.attachment().generation(),
+    );
+    assert!(late.upgrade_eligible());
+    assert!(late.upgrade_to_joint(&late_receipt));
+    assert_eq!(late.mode(), FeedMode::Joint);
+    assert!(!late.upgrade_to_joint(&late_receipt), "one-shot");
+    let late_facts = SemanticCall {
+        function: "C_Sign".into(),
+        ..SemanticCall::default()
+    };
+    let late_origin = EffectOrigin::from(&late_facts);
+    assert_eq!(
+        late.stage(late_facts, late_origin, 1, scene.adapter.ledger_mut()),
+        Ok(()),
+        "H0 position 1 stages below a journal-scale cut"
+    );
+    assert!(!JointStaging::select_joint(Some(&late_receipt)).upgrade_eligible());
+
     // --- An already-reduced call is never replayed. ---
     let mut scene2 = JointScene::new();
     let bootstrap2 = scene2.bootstrap();

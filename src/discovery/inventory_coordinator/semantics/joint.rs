@@ -618,7 +618,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 pub(crate) type PreparedClaim = (u64, Result<JournalDomainProof, AttestationRefusal>);
 
 /// Completion counters only; the registry retains every actual grant and
-/// missing/refused births remain permanent S1 at the original registration.
+/// missing/refused births remain S1 (an instance registered untouched by
+/// its sighting may still select Joint on its first call's birth).
 pub(crate) struct PreparedBirthDisposition {
     pub(crate) installed: usize,
 }
@@ -1278,6 +1279,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             let Some(entry) = entry else {
                 let receipt = &batch.current[current];
+                // A sighting retry without its admission: the key's New
+                // already disclosed this, and nothing was missed (the
+                // caller made no call in this pass).
+                if receipt.birth_retry() {
+                    continue;
+                }
                 association[first].refusal = Some((
                     self.semantic_bindings
                         .find_by_image(batch.domain, receipt.image())
@@ -1292,8 +1299,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let caller = Some(input.journal_binding().3);
             let proof = match batch.entries[entry].claim {
                 Some(Ok(proof)) => proof,
-                // The FIRST actual same-key original governs permanent feed
-                // selection. A later Ok cannot replace a refused claim.
+                // The FIRST actual same-key original governs this batch's
+                // feed selection. A later Ok cannot replace a refused claim.
                 claim => {
                     association[first].refusal =
                         Some((caller, BirthRefusal::Claim(claim.and_then(Result::err))));

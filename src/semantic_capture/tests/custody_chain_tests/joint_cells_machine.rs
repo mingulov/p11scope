@@ -4574,10 +4574,9 @@ fn joint_machine_first_call_after_unadmitted_sighting_still_births_joint() {
     }
     let quiet = birth_refusals(&scene);
     assert!(
-        quiet
-            .iter()
-            .any(|(caller, reason)| *caller == Some(browser)
-                && reason == "joint_birth_no_admission"),
+        quiet.iter().any(
+            |(caller, reason)| *caller == Some(browser) && reason == "joint_birth_no_admission"
+        ),
         "precondition: the browser's sighting birth had no admission: refusals={quiet:?} births={:?}",
         scene.native.birth_outcomes
     );
@@ -4633,13 +4632,7 @@ fn joint_machine_first_call_after_unadmitted_sighting_still_births_joint() {
         "the browser's first registration selects Joint, with no pre-birth call: refusals={refusals:?}"
     );
     assert_eq!(
-        scene
-            .scene
-            .real
-            .scene
-            .coordinator
-            .registry()
-            .joint_feeds(),
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
         2
     );
     // Quiet retries add no repeated no-admission disclosure, and the

@@ -590,6 +590,52 @@ mod full_image {
             "the admitted mint happens once"
         );
     }
+
+    /// A key sighted `New` keeps its birth armed across quiet passes
+    /// until its first admission, so the pass holding its first call
+    /// can still birth it; the outcome itself stays `Continued`. The
+    /// first admission and retirement each end the retry.
+    #[test]
+    fn sighted_key_keeps_its_birth_armed_until_first_admission() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert!(!r.birth_retry_armed(identity, FILE), "unseen key");
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        for pass in 0..3 {
+            assert!(r.birth_retry_armed(identity, FILE), "quiet pass {pass}");
+            assert_eq!(
+                r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+                ObserveOutcome::Continued
+            );
+        }
+        assert!(!r.birth_retry_armed(identity, 7), "another file is unarmed");
+        r.mark_admitted(identity, FILE);
+        assert!(
+            !r.birth_retry_armed(identity, FILE),
+            "the first admission ends the retry"
+        );
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::AdmittedFirst,
+            "the admitted mark keeps its existing one-shot path"
+        );
+        assert!(!r.birth_retry_armed(identity, FILE));
+
+        let other = image(COOKIE + 1, 10);
+        assert_eq!(
+            r.observe(seal(domain(), other, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert!(r.birth_retry_armed(other, FILE));
+        r.retire_image(other);
+        assert!(
+            !r.birth_retry_armed(other, FILE),
+            "retirement ends the retry"
+        );
+    }
 }
 
 #[test]

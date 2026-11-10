@@ -215,7 +215,10 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
-        if !row.fits {
+        // An untouched registered row holds its slot already: its
+        // first call's birth selects Joint in place instead of
+        // minting, so the fits gate admits it without new capacity.
+        if !row.fits && !self.registry.joint_upgrade_eligible(&input.key) {
             self.registry.latch_birth_capacity("fits");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
@@ -308,7 +311,12 @@ impl JointReceiptReservation<'_> {
         }
         // The exclusive borrow prevents registration/removal while native I/O
         // runs, but keep these actual state checks at the final mutation too.
-        if self.registry.instance_state.by_key.contains_key(&input.key) {
+        // An untouched registered key still accepts its first call's
+        // grant (the drain selects Joint in place); every other
+        // re-install refuses.
+        if self.registry.instance_state.by_key.contains_key(&input.key)
+            && !self.registry.joint_upgrade_eligible(&input.key)
+        {
             return Err((self, JointReceiptInstallRefusal::AlreadySelected));
         }
         if self.registry.joint_grants.contains_key(&input.key) {
@@ -1369,9 +1377,10 @@ pub(crate) struct InstanceSemanticRecord {
     pub(crate) lossy: bool,
     pub(crate) semantics: Option<EdgeSemantics>,
     authority_exhausted: bool,
-    /// The instance's H9 feed, selected once at registration from an
-    /// installed Joint receipt (S1Only without one — the production
-    /// default, since no live grants exist).
+    /// The instance's H9 feed, selected at registration from an
+    /// installed Joint receipt (S1Only without one). An untouched
+    /// never-Joint feed (no call yet) may still select Joint once on a
+    /// later birth's valid grant; every other feed keeps its mode.
     pub(crate) feed: JointStaging,
 }
 
@@ -1896,6 +1905,52 @@ impl CallerRegistry {
         registry.reserve_joint_receipt_at(input, position)
     }
 
+    /// Whether a later birth's grant may still select Joint for an
+    /// already-registered key: the record is an observed,
+    /// non-exhausted, bound instance with no blocking negative that
+    /// never returned a call, and its feed is untouched never-Joint.
+    /// A sighting's coverage registers the instance S1Only when that
+    /// pass holds none of its calls (no birth candidate); the birth
+    /// that arrives with its first call must still select Joint, or
+    /// the key stays S1Only for the run.
+    fn joint_upgrade_eligible(&self, key: &InstanceKey) -> bool {
+        let Some(id) = self.instance_state.by_key.get(key).copied() else {
+            return false;
+        };
+        let Some(record) = self.instance_state.records.get(&id) else {
+            return false;
+        };
+        if record.state != InstanceLifecycle::Observed {
+            return false;
+        }
+        if self.retired.contains_key(&record.caller) {
+            return false;
+        }
+        let Some(semantics) = self.instance_state.semantics.get(&id) else {
+            return false;
+        };
+        if semantics.authority_exhausted {
+            return false;
+        }
+        // Untouched: the instance never returned a call, so no call
+        // predates the birth and no S1Only original was disposed
+        // against its journal key.
+        if semantics.api_returns.is_some()
+            || semantics.historical_only_returns != 0
+            || semantics.last_reduced.is_some()
+        {
+            return false;
+        }
+        for negative in &self.instance_state.negatives {
+            if negative.matches(key, semantics.module)
+                && (negative.authority_exhausted || negative.retirement.is_some())
+            {
+                return false;
+            }
+        }
+        semantics.feed.upgrade_eligible()
+    }
+
     fn reserve_joint_receipt_at(
         &mut self,
         input: &AdmittedInstanceCall,
@@ -1905,7 +1960,9 @@ impl CallerRegistry {
             .collected_origin()
             .filter(|origin| origin.position() == input.h0_ordinal())
             .ok_or(JointReceiptInstallRefusal::SubjectMismatch)?;
-        if self.instance_state.by_key.contains_key(&input.key) {
+        if self.instance_state.by_key.contains_key(&input.key)
+            && !self.joint_upgrade_eligible(&input.key)
+        {
             return Err(JointReceiptInstallRefusal::AlreadySelected);
         }
         if self.joint_grants.contains_key(&input.key) {
@@ -1922,7 +1979,10 @@ impl CallerRegistry {
             self.latch_birth_capacity("reserve_identity");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
-        if self.instance_state.records.len() >= self.instance_state.limit {
+        // A registered untouched row already holds its record slot.
+        if self.instance_state.records.len() >= self.instance_state.limit
+            && !self.joint_upgrade_eligible(&input.key)
+        {
             self.latch_birth_capacity("reserve_records");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
@@ -2012,6 +2072,12 @@ impl CallerRegistry {
                 },
             };
             if !valid {
+                #[cfg(test)]
+                eprintln!(
+                    "FFBG-DIAG validate drop at={at} registration={:?} original={}",
+                    grant.registration,
+                    original.is_some()
+                );
                 self.joint_grants.remove(key);
             }
         }
@@ -2260,6 +2326,16 @@ impl CallerRegistry {
             .semantics
             .get(&id)
             .map(|record| record.feed.mode())
+    }
+
+    /// Tests-only replay-frontier read: a late Joint selection must
+    /// leave it alone (it counts H0 positions, not journal cuts).
+    #[cfg(test)]
+    pub(crate) fn feed_frontier_for_test(&self, id: RegistryInstanceId) -> Option<u64> {
+        self.instance_state
+            .semantics
+            .get(&id)
+            .map(|record| record.feed.frontier_for_test())
     }
 
     /// Inspect accounting without granting publication authority.
@@ -2639,6 +2715,17 @@ impl CallerRegistry {
         staged_position: Option<usize>,
         mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
+        #[cfg(test)]
+        if let Some(grant) = self.joint_grants.get(&input.key) {
+            eprintln!(
+                "FFBG-DIAG apply staged={staged_position:?} grant.registration={:?} application={:?}",
+                grant.registration,
+                grant
+                    .application
+                    .as_ref()
+                    .map(|a| (a.registration, a.original.is_some()))
+            );
+        }
         let installed = self
             .joint_grants
             .remove(&input.key)
@@ -2722,6 +2809,49 @@ impl CallerRegistry {
                 return;
             }
             let last_seen_ns = record.last_seen_ns.max(input.observed_ns);
+            #[cfg(test)]
+            eprintln!(
+                "FFBG-DIAG existing staged={staged_position:?} installed={} eligible={} mode={:?} linked={}",
+                installed.is_some(),
+                self.joint_upgrade_eligible(&input.key),
+                self.instance_state.semantics[&id].feed.mode(),
+                self.journal_linked()
+            );
+            if let Some(grant) = installed.as_ref() {
+                // A later birth's validated grant selects Joint for an
+                // untouched S1Only feed. Unlinked attachments route
+                // through the backstop exactly as at first
+                // registration; a touched S1Only feed keeps its mode
+                // and names the refused birth; a Joint feed ignores it.
+                if !self.journal_linked() {
+                    self.instance_state.joint_backstop_routed =
+                        self.instance_state.joint_backstop_routed.saturating_add(1);
+                    self.disclose_joint_journal_unavailable_once();
+                } else if self.joint_upgrade_eligible(&input.key)
+                    && self
+                        .instance_state
+                        .semantics
+                        .get_mut(&id)
+                        .expect("retained edge")
+                        .feed
+                        .upgrade_to_joint(&grant.receipt)
+                {
+                    self.joint_feeds = self.joint_feeds.saturating_add(1);
+                    self.joint_accounting = true;
+                } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
+                    // The validated birth arrived after the instance was
+                    // touched: it keeps S1Only, and the refused birth is
+                    // named instead of dropped silently.
+                    self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                        caller: Some(input.caller),
+                        module: Some(module),
+                        pid: None,
+                        subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+                        reason: "joint_birth_after_calls".into(),
+                        budget: None,
+                    });
+                }
+            }
             self.instance_state
                 .records
                 .get_mut(&id)
@@ -4471,6 +4601,12 @@ mod journal_unavailable_tests {
     /// One attested birth receipt, minted like the Joint scenes: real
     /// fixture admission, real key attestation, scripted receipt.
     fn birth_receipt() -> BootstrapReceipt {
+        birth_receipt_with_cut(0)
+    }
+
+    /// Same, with a scripted birth cut (a journal consumption
+    /// ordinal, never an H0 position).
+    fn birth_receipt_with_cut(cut: u64) -> BootstrapReceipt {
         let mut fixture = AttestationFixture::new(ImageIdentity {
             task_cookie: 71,
             exec_id: 0,
@@ -4483,7 +4619,7 @@ mod journal_unavailable_tests {
         BootstrapReceipt::scripted(
             proof,
             BirthKind::ExecMarker,
-            0,
+            cut,
             fixture.attachment().generation(),
         )
     }
@@ -5131,6 +5267,316 @@ mod journal_unavailable_tests {
             // flavor leaves only mintable rows as records.
             assert_eq!(records, expected_records, "{name}: drain fate");
         }
+    }
+
+    /// A sighting's coverage registered the instance with no birth
+    /// (S1Only, untouched); the birth that arrives with its first call
+    /// selects Joint. The replay frontier stays in the H0 position
+    /// space: a journal-scale cut (41) beside small H0 positions must
+    /// not refuse the next call, which stages exactly once.
+    #[test]
+    fn untouched_s1only_registration_selects_joint_on_later_valid_grant() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "registration without a birth stays S1Only"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the first-call birth's grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::Joint),
+            "the untouched feed selects Joint"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 1);
+        assert_eq!(
+            scene.registry.feed_frontier_for_test(id),
+            Some(0),
+            "the frontier is not fenced with a journal cut"
+        );
+        let fallback_before = scene.registry.joint_direct_fallback();
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.joint_direct_fallback(),
+            fallback_before,
+            "the post-birth call is not refused and dropped"
+        );
+        let target = scene
+            .registry
+            .joint_feed_targets()
+            .find(|target| target.id() == id)
+            .expect("the selected feed is a Joint target");
+        assert_eq!(
+            scene.registry.joint_staged_count(&target),
+            Some(1),
+            "the post-birth call stages once"
+        );
+    }
+
+    /// Proof safety twin: once the instance returned a call S1-direct,
+    /// a later birth must not select Joint (that call predates it and
+    /// was never journaled under a Joint feed). The feed stays S1Only,
+    /// the call stays counted once as not attributed, and the refused
+    /// birth is named.
+    #[test]
+    fn touched_s1only_registration_refuses_later_grant_with_named_gap() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        let unattributed_before = scene.registry.joint_observations(1).unattributed;
+        assert!(
+            unattributed_before
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 1),
+            "the pre-birth call counts once: {unattributed_before:?}"
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the late grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "a touched feed never selects Joint late"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        scene.registry.publish();
+        assert!(
+            scene.registry.gaps().iter().any(|gap| gap.subject
+                == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                && gap.reason == "joint_birth_after_calls"),
+            "the refused late birth is named: {:?}",
+            scene.registry.gaps()
+        );
+        let unattributed_after = scene.registry.joint_observations(2).unattributed;
+        assert!(
+            unattributed_after
+                .iter()
+                .any(|row| row.reason == "started_before_attach" && row.count == 1),
+            "the pre-birth call still counts exactly once: {unattributed_after:?}"
+        );
+    }
+
+    /// The upgrade needs a linked journal: on an unlinked lane the
+    /// retry grant routes through the backstop, discloses once, and
+    /// the feed stays S1Only.
+    #[test]
+    fn retry_upgrade_refused_on_unlinked_attachment() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the retry grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "no upgrade without a linked journal"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+        assert_eq!(scene.registry.joint_backstop_routed(), 1);
+    }
+
+    /// A retry grant against an already-Joint feed changes nothing:
+    /// no second feed is counted and the mode never flaps.
+    #[test]
+    fn retry_grant_against_joint_feed_changes_nothing() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(7)),
+            "the first grant installs"
+        );
+        let (_, id) = scene.register(1);
+        assert_eq!(scene.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+        assert_eq!(scene.registry.joint_feeds(), 1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the retry grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::Joint),
+            "a Joint feed never reflaps"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 1, "no second feed counted");
+        assert_eq!(
+            scene.registry.feed_frontier_for_test(id),
+            Some(0),
+            "the first birth keeps its frontier"
+        );
+    }
+
+    /// A watchdog-tripped feed never upgrades: the lane is held for
+    /// exit and no seal will settle again.
+    #[test]
+    fn retry_upgrade_refused_after_watchdog_trip() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        let (_, id) = scene.register(1);
+        scene.registry.note_joint_watchdog_trip();
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(key.clone(), birth_receipt_with_cut(41)),
+            "the retry grant installs"
+        );
+        scene.registry.publish();
+        assert_eq!(
+            scene.registry.feed_mode_for_test(id),
+            Some(FeedMode::S1Only),
+            "a tripped feed never upgrades"
+        );
+        assert_eq!(scene.registry.joint_feeds(), 0);
+    }
+
+    /// The fits gate admits a birth retry for a pristine registered
+    /// key: the row consumes no new slot (its record already holds
+    /// one), so the retry path reaches the installer instead of
+    /// refusing Capacity.
+    #[test]
+    fn birth_retry_for_pristine_registered_key_passes_fits() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        scene.register(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            plan.position(&input, &window).is_ok(),
+            "a pristine registered row fits its retry"
+        );
+    }
+
+    /// ...and a registered key that already returned a call refuses
+    /// at the fits gate: its late birth could never select Joint.
+    #[test]
+    fn birth_retry_for_touched_registered_key_stays_capacity() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        scene.register(1);
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            2,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            matches!(
+                plan.position(&input, &window),
+                Err(JointReceiptInstallRefusal::Capacity)
+            ),
+            "a touched row still refuses Capacity"
+        );
+    }
+
+    /// ...while a watchdog-tripped registered key still refuses at
+    /// the fits gate: no grant is reserved for a feed that can
+    /// never consume it.
+    #[test]
+    fn birth_retry_for_tripped_registered_key_stays_capacity() {
+        let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(true);
+        let key = scene.key(1);
+        scene.register(1);
+        scene.registry.note_joint_watchdog_trip();
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            matches!(
+                plan.position(&input, &window),
+                Err(JointReceiptInstallRefusal::Capacity)
+            ),
+            "a tripped row still refuses Capacity"
+        );
     }
 }
 

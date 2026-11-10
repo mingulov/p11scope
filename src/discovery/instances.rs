@@ -741,6 +741,16 @@ pub(crate) struct InstanceRouter {
     /// ready-domain binary search. Marks for these keys are refused;
     /// only retirement clears them.
     admitted_minted: BTreeSet<(ImageKey, u32)>,
+    /// (image, file) keys sighted `New` that have had no admitted call
+    /// yet. Every later continued observation of such a key carries
+    /// that pass's birth quantum, so the pass holding the key's first
+    /// call can birth it (the cut precedes the image's first record,
+    /// as for a same-pass `New`). The admitted mark arrives a pass too
+    /// late for that: by then the image's own records are consumed.
+    /// Cleared by the key's first admission mark or by retirement;
+    /// capped by the observed-keys cap, where an unarmed key fails
+    /// closed to the old behavior.
+    birth_retry: BTreeSet<(ImageKey, u32)>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -878,6 +888,7 @@ impl InstanceRouter {
             observed: BTreeMap::new(),
             admitted_pending: BTreeSet::new(),
             admitted_minted: BTreeSet::new(),
+            birth_retry: BTreeSet::new(),
             absent: BTreeSet::new(),
             absence_overflowed: false,
             faulted: BTreeSet::new(),
@@ -924,6 +935,9 @@ impl InstanceRouter {
     pub(crate) fn mark_admitted(&mut self, image: ImageIdentity, file: u32) {
         self.counters.marks_attempted = self.counters.marks_attempted.saturating_add(1);
         let key = (ImageKey::from(image), file);
+        // The first admission ends the sighting's birth retry: this
+        // pass's observation already carried it.
+        self.birth_retry.remove(&key);
         if self.admitted_minted.contains(&key) || self.admitted_pending.contains(&key) {
             self.counters.marks_refused_dup = self.counters.marks_refused_dup.saturating_add(1);
             return;
@@ -941,6 +955,35 @@ impl InstanceRouter {
     pub(crate) fn note_admission_binding_misses(&mut self, misses: u64) {
         self.counters.admission_binding_miss =
             self.counters.admission_binding_miss.saturating_add(misses);
+    }
+
+    /// Whether this key's continued observation still carries a birth:
+    /// it was sighted `New` and has had no admitted call since.
+    pub(crate) fn birth_retry_armed(&self, image: ImageIdentity, file: u32) -> bool {
+        let key = (ImageKey::from(image), file);
+        self.birth_retry.contains(&key) && self.observed.contains_key(&key)
+    }
+
+    /// End a key's sighting retry: its birth candidate was consumed.
+    pub(crate) fn end_birth_retry(&mut self, image: ImageIdentity, file: u32) {
+        self.birth_retry.remove(&(ImageKey::from(image), file));
+    }
+
+    /// Arm the birth retry for a key just sighted `New`. At the cap,
+    /// entries whose observations were evicted go first; a still-full
+    /// set leaves the key unarmed (the old behavior).
+    fn arm_birth_retry(&mut self, key: (ImageKey, u32)) {
+        if self.birth_retry.contains(&key) {
+            return;
+        }
+        if self.birth_retry.len() >= self.limits.observed_keys {
+            let observed = &self.observed;
+            self.birth_retry
+                .retain(|retained| observed.contains_key(retained));
+        }
+        if self.birth_retry.len() < self.limits.observed_keys {
+            self.birth_retry.insert(key);
+        }
     }
 
     /// Record a successful admitted mint: later admissions for the
@@ -1397,6 +1440,7 @@ impl InstanceRouter {
         self.absent.retain(|(owner, _)| *owner != key);
         self.admitted_pending.retain(|(owner, _)| *owner != key);
         self.admitted_minted.retain(|(owner, _)| *owner != key);
+        self.birth_retry.retain(|(owner, _)| *owner != key);
         self.debug_check_absent_subset();
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
@@ -1433,6 +1477,7 @@ impl InstanceRouter {
             .retain(|(owner, _)| owner.cookie != cookie);
         self.admitted_minted
             .retain(|(owner, _)| owner.cookie != cookie);
+        self.birth_retry.retain(|(owner, _)| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,
@@ -1831,6 +1876,7 @@ impl InstanceRouter {
                             self.ranges -= old.ranges.len();
                         }
                     }
+                    self.arm_birth_retry(key);
                     ObserveOutcome::New
                 }
             }

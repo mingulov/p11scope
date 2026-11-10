@@ -363,7 +363,9 @@ impl std::fmt::Debug for JointStaging {
 
 impl JointStaging {
     /// Select S1Only at registration: no receipt, no staging, no
-    /// bootstrap-wait queue. Permanent.
+    /// bootstrap-wait queue. Permanent once the instance has returned
+    /// a call; an untouched feed may still select Joint once
+    /// ([`Self::upgrade_to_joint`]).
     pub(crate) fn select_s1_only() -> Self {
         Self {
             mode: FeedMode::S1Only,
@@ -392,9 +394,12 @@ impl JointStaging {
 
     /// Select Joint at registration: only with the current H8
     /// birth/closure receipt already present. Without it, S1Only
-    /// immediately — never a bootstrap-wait queue, never a later
-    /// upgrade. The receipt evidences selection only; every seal
-    /// still verifies birth independently.
+    /// immediately — never a bootstrap-wait queue. A pristine
+    /// never-Joint feed may still upgrade once on a retry birth's
+    /// valid receipt ([`Self::upgrade_to_joint`]); refused, fallen
+    /// back, degraded and tripped feeds never do. The receipt
+    /// evidences selection only; every seal still verifies birth
+    /// independently.
     pub(crate) fn select_joint(receipt: Option<&BootstrapReceipt>) -> Self {
         let mut staging = Self::select_s1_only();
         if let Some(receipt) = receipt {
@@ -424,6 +429,12 @@ impl JointStaging {
         self.mode
     }
 
+    /// Consumed-H0-position frontier for replay tests.
+    #[cfg(test)]
+    pub(crate) fn frontier_for_test(&self) -> u64 {
+        self.frontier
+    }
+
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,
@@ -449,6 +460,42 @@ impl JointStaging {
         } else {
             false
         }
+    }
+
+    /// Whether a later birth may still select Joint for this feed: it
+    /// was registered S1Only only because its sighting pass carried no
+    /// birth, and nothing has touched it since (no selection, segment,
+    /// fallback, loss or trip history, nothing staged, nothing
+    /// reduced, no pre-birth direct call). The registry also requires
+    /// that the instance never returned a call.
+    pub(crate) fn upgrade_eligible(&self) -> bool {
+        self.mode == FeedMode::S1Only
+            && self.selected_receipt.is_none()
+            && !self.fell_back
+            && !self.degraded_loss
+            && !self.watchdog_tripped
+            && self.staged.is_empty()
+            && self.reduced == 0
+            && self.pre_attach_direct == 0
+    }
+
+    /// Select Joint late for an untouched S1Only feed, exactly as
+    /// [`Self::select_joint`] would have at registration: the replay
+    /// frontier is left alone (it counts H0 positions; a birth cut
+    /// counts journal consumption and is verified by every seal).
+    /// There is no pre-birth call to fence: the feed never saw one.
+    /// One-shot: the retained receipt makes a second upgrade refuse.
+    /// Returns whether the mode changed.
+    pub(crate) fn upgrade_to_joint(
+        &mut self,
+        receipt: &crate::semantics_objects::journal::BootstrapReceipt,
+    ) -> bool {
+        if !self.upgrade_eligible() {
+            return false;
+        }
+        self.mode = FeedMode::Joint;
+        self.selected_receipt = Some(*receipt);
+        true
     }
 
     /// Calls replayed through the one reducer (seal or fallback).

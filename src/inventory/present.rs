@@ -2399,6 +2399,67 @@ fn is_unreachable_process_reason(reason: &str) -> bool {
         && !reason.contains("(host-root fallback:")
 }
 
+/// Distinct replaced files at which the concise block folds the
+/// family into one counted line. At or below it each running copy
+/// keeps its named per-file line; above it (a busy host after a
+/// package upgrade leaves dozens) one line carries the exact row
+/// and file counts and `--json` lists each.
+const REPLACED_FAMILY_FOLD_FILES: usize = 2;
+
+/// One replaced-files family's concise display: exact distinct-file
+/// count; rows (the counted prefix) and processes stay in JSON.
+fn replaced_fold_display(group: &[&GapView]) -> (String, String) {
+    let files: std::collections::BTreeSet<&str> =
+        group.iter().map(|gap| gap.subject.as_str()).collect();
+    let files = files.len();
+    let plural = if files == 1 { "" } else { "s" };
+    (
+        "replaced files not examined".to_string(),
+        format!("{files} file{plural} replaced while running (--json lists each)"),
+    )
+}
+
+/// The shared-object count one maps-attribution reason names, when
+/// it parses as the producer's `maps N shared object…` shape. Any
+/// other maps-attribution reason stays out of the family.
+fn maps_attribution_object_count(subject: &str, reason: &str) -> Option<u64> {
+    if subject != "maps attribution" {
+        return None;
+    }
+    let rest = reason.strip_prefix("maps ")?;
+    let (count, _) = rest.split_once(" shared object")?;
+    count.parse().ok()
+}
+
+/// One maps-attribution family's concise display: exact distinct
+/// process and summed shared-object counts. Rows without a pid
+/// drop the process count rather than counting zero.
+fn maps_fold_display(group: &[&GapView]) -> (String, String) {
+    let mut processes = std::collections::BTreeSet::new();
+    let mut unnamed = 0usize;
+    let mut objects = 0u64;
+    for gap in group {
+        match gap.pid {
+            Some(pid) => {
+                processes.insert(pid);
+            }
+            None => unnamed += 1,
+        }
+        objects += maps_attribution_object_count(&gap.subject, &gap.reason).unwrap_or(0);
+    }
+    let object_plural = if objects == 1 { "" } else { "s" };
+    let reason = if unnamed == 0 {
+        let processes = processes.len();
+        let plural = if processes == 1 { "" } else { "es" };
+        format!(
+            "{processes} process{plural} map {objects} unexamined shared object{object_plural} (--json lists each)"
+        )
+    } else {
+        format!("{objects} unexamined shared object{object_plural} (--json lists each)")
+    };
+    ("maps attribution".to_string(), reason)
+}
+
 /// One unreachable-process family's concise display: a single counted
 /// line naming the outcome with exact object and process counts.
 /// Rows without a pid read as unreachable objects rather than
@@ -2576,7 +2637,9 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// keeps every row.
 /// ESRCH opens under a foreign root fold across roots into one
 /// unreachable-process family line (exact object and process
-/// counts); verbose and JSON keep every row.
+/// counts); replaced-file floods and maps-attribution rows fold
+/// the same way (exact row, file/process and object counts);
+/// verbose and JSON keep every row.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
@@ -2615,6 +2678,8 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     // fold into one counted line with the summed total below. Only
     // exact producer wordings fold; anything else groups verbatim.
     let mut kthreads: Vec<&GapView> = Vec::new();
+    let mut replaced: Vec<&GapView> = Vec::new();
+    let mut maps: Vec<&GapView> = Vec::new();
     let mut rest: Vec<&GapView> = Vec::new();
     for gap in gaps.iter() {
         if is_concise_redundant_per_key_off_gap(gap) {
@@ -2631,9 +2696,24 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
             unreachable.push(gap);
         } else if is_foreign_root_reason(&gap.reason) {
             foreign.entry(gap.reason.as_str()).or_default().push(gap);
+        } else if is_replaced_file_gap(&gap.reason) {
+            replaced.push(gap);
+        } else if maps_attribution_object_count(&gap.subject, &gap.reason).is_some() {
+            maps.push(gap);
         } else {
             rest.push(gap);
         }
+    }
+    // Small families keep their named rows: the replaced fold serves
+    // floods (more distinct files than the threshold), and a lone
+    // maps row keeps its own reason.
+    let replaced_files: std::collections::BTreeSet<&str> =
+        replaced.iter().map(|gap| gap.subject.as_str()).collect();
+    if replaced_files.len() <= REPLACED_FAMILY_FOLD_FILES {
+        rest.append(&mut replaced);
+    }
+    if maps.len() <= 1 {
+        rest.append(&mut maps);
     }
     for gap in rest {
         let mut reason_text = gap.reason.as_str();
@@ -2687,6 +2767,26 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         // is never a scope group.
         let entry = groups.entry((subject, reason)).or_insert((0, false));
         entry.0 += unreachable.len();
+        entry.1 = false;
+    }
+    if !replaced.is_empty() {
+        let (subject, reason) = replaced_fold_display(&replaced);
+        let subject = escape_controls(&subject).into_owned();
+        let reason = escape_controls(&reason).into_owned();
+        // Replaced-file rows always name an object, so the family is
+        // never a scope group.
+        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        entry.0 += replaced.len();
+        entry.1 = false;
+    }
+    if !maps.is_empty() {
+        let (subject, reason) = maps_fold_display(&maps);
+        let subject = escape_controls(&subject).into_owned();
+        let reason = escape_controls(&reason).into_owned();
+        // Maps-attribution rows always name a process, so the family
+        // is never a scope group.
+        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        entry.0 += maps.len();
         entry.1 = false;
     }
     if groups.is_empty() {

@@ -15812,6 +15812,192 @@ pub(crate) mod tests {
         );
     }
 
+    /// One-module deferral fixture for the stop-summary outcome twins:
+    /// `offsets` endpoints under one published module, capture begun.
+    fn deferral_outcome_fixture(
+        offsets: u64,
+    ) -> (
+        tempfile::TempDir,
+        InventoryCoordinator<OsProcessSource>,
+        Vec<crate::discovery::inventory_attach_set::AttachEndpoint>,
+    ) {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(offsets))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoints = absorbed.delta.endpoints.clone();
+        (dir, coordinator, endpoints)
+    }
+
+    fn deferral_outcome_receipt(
+        attached: &[crate::discovery::inventory_attach_set::AttachEndpoint],
+        failed: &[crate::discovery::inventory_attach_set::AttachEndpoint],
+        deferred: &[crate::discovery::inventory_attach_set::AttachEndpoint],
+    ) -> crate::attach::capture::ExtendReceipt {
+        use crate::attach::capture::{AttachedEndpoint, EndpointFailure, ExtendReceipt};
+        ExtendReceipt {
+            attached: attached
+                .iter()
+                .map(|target| AttachedEndpoint {
+                    id: target.id,
+                    object: target.object,
+                    at_ns: 200,
+                })
+                .collect(),
+            failed: failed
+                .iter()
+                .map(|target| EndpointFailure {
+                    id: target.id,
+                    object: target.object,
+                    reason: "kernel refused".into(),
+                    link_retained: false,
+                })
+                .collect(),
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: deferred.to_vec(),
+                objects: deferred.iter().map(|target| target.object).collect(),
+            },
+            ..ExtendReceipt::default()
+        }
+    }
+
+    fn deferral_summaries(coordinator: &InventoryCoordinator<OsProcessSource>) -> Vec<String> {
+        coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == DEFERRED_ATTACH_SUBJECT && is_deferral_folded_reason(&gap.reason)
+            })
+            .map(|gap| gap.reason.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_deferred_endpoint_that_later_fails_is_named_failed_in_the_summary() {
+        // Deferral summary, retry-then-fail twin: an endpoint deferred
+        // in one pass and failed when retried never attached, so the
+        // stop summary names it as failed (not attached, not still
+        // deferred) and never reads "all attached by stop". The
+        // failure gap stays exactly as staged.
+        let (_dir, mut coordinator, endpoints) = deferral_outcome_fixture(4);
+        coordinator.note_extend_receipt(&deferral_outcome_receipt(
+            &[endpoints[2], endpoints[3]],
+            &[],
+            &[endpoints[0], endpoints[1]],
+        ));
+        coordinator.note_extend_receipt(&deferral_outcome_receipt(
+            &[endpoints[1]],
+            &[endpoints[0]],
+            &[],
+        ));
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            deferral_summaries(&coordinator),
+            vec![
+                "attach unfinished at stop: 2 endpoint(s) deferred over 1 pass \
+                 (1 attached by stop; 1 failed to attach); counted uses are lower bounds"
+                    .to_string()
+            ],
+            "{:?}",
+            coordinator.registry.gaps()
+        );
+        let failures: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert_eq!(
+            failures,
+            vec![
+                "1 of 4 endpoints failed to attach (sticky, never retried); \
+                 counted uses are lower bounds"
+            ],
+            "the failure gap stands as staged: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| !gap.reason.contains("all attached by stop")),
+            "never 'all attached by stop' while a deferred endpoint failed: {:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
+    #[test]
+    fn mixed_deferral_outcomes_count_each_endpoint_once() {
+        // Deferral summary, mixed-outcome twin: of five deferred
+        // endpoints, two attach later, one fails when retried and two
+        // are still deferred at stop (re-deferred in the second pass).
+        // Each lands in exactly one bucket; the buckets sum to the
+        // distinct total.
+        let (_dir, mut coordinator, endpoints) = deferral_outcome_fixture(6);
+        coordinator.note_extend_receipt(&deferral_outcome_receipt(
+            &[endpoints[5]],
+            &[],
+            &endpoints[0..5],
+        ));
+        coordinator.note_extend_receipt(&deferral_outcome_receipt(
+            &[endpoints[0], endpoints[1]],
+            &[endpoints[2]],
+            &[endpoints[3], endpoints[4]],
+        ));
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            deferral_summaries(&coordinator),
+            vec![
+                "attach unfinished at stop: 5 endpoint(s) deferred over 2 passes \
+                 (2 attached by stop; 1 failed to attach; 2 still deferred at stop); \
+                 counted uses are lower bounds"
+                    .to_string()
+            ],
+            "{:?}",
+            coordinator.registry.gaps()
+        );
+        assert!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| !gap.reason.contains("all attached by stop")),
+            "{:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
     #[test]
     fn deferrals_outstanding_at_stop_fold_with_the_remainder_named() {
         // Deferred-gap fold, still-deferred twin: endpoints that never

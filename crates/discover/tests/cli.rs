@@ -1472,6 +1472,13 @@ const SELECTION_SETFLAGS_TAG: &str = "selection";
 struct SetflagsTwinDir {
     path: std::path::PathBuf,
     fallback: bool,
+    /// In-process probe outcome per twin candidate tried while selecting
+    /// this dir (rejected candidates with their reason, then the winner
+    /// with its `probe ok` row), so a later trusted-child failure can
+    /// report what the probes saw beside what the child saw. Guards
+    /// created while advancing past a child-rejected candidate carry no
+    /// rows; the caller keeps the seeded rows for the whole chain.
+    probe_attempts: Vec<String>,
 }
 
 impl SetflagsTwinDir {
@@ -1481,6 +1488,10 @@ impl SetflagsTwinDir {
 
     fn is_fallback(&self) -> bool {
         self.fallback
+    }
+
+    fn probe_attempts(&self) -> &[String] {
+        &self.probe_attempts
     }
 }
 
@@ -1522,6 +1533,7 @@ fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
                     return SetflagsTwinDir {
                         path: dir,
                         fallback: true,
+                        probe_attempts: Vec::new(),
                     };
                 }
                 Err(reason) => {
@@ -1542,6 +1554,7 @@ fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
     SetflagsTwinDir {
         path: scratch.to_path_buf(),
         fallback: false,
+        probe_attempts: Vec::new(),
     }
 }
 
@@ -1622,17 +1635,81 @@ fn setflags_next_twin_dir(
                 return Some(SetflagsTwinDir {
                     path: made,
                     fallback: true,
+                    probe_attempts: Vec::new(),
                 });
             }
             None => {
                 return Some(SetflagsTwinDir {
                     path: dir,
                     fallback: false,
+                    probe_attempts: Vec::new(),
                 });
             }
         }
     }
     None
+}
+
+/// Trusted-child qualification of the N2 twin directory: the twin
+/// files live on the first candidate whose in-process probe passed,
+/// and the trusted child must set the flag there before the fence
+/// assertions run. A child EOPNOTSUPP advances to the next twin
+/// candidate; any other child outcome fails loud. `bin` is the helper
+/// under test as a path so the precondition-table test can drive the
+/// chain with a fake child without touching the real helper. `provider`
+/// is the isolation probe fixture every trusted child loads. Returns
+/// the selected twin dir guard with the trusted and isolated paths.
+fn qualify_setflags_twins(
+    bin: &Path,
+    dir: &Path,
+    tag: &str,
+    provider: &Path,
+) -> (SetflagsTwinDir, std::path::PathBuf, std::path::PathBuf) {
+    const FS_NODUMP_FL: i32 = 0x40;
+    let mut attempts: Vec<String> = Vec::new();
+    let mut twins = setflags_twin_dir(dir, tag);
+    loop {
+        let trusted_target = twins.path().join("setflags-trusted.tmp");
+        let isolated_target = twins.path().join("setflags-isolated.tmp");
+        std::fs::write(&trusted_target, b"setflags probe").unwrap();
+        std::fs::write(&isolated_target, b"setflags probe").unwrap();
+        assert_eq!(
+            inode_flags(&trusted_target) & FS_NODUMP_FL,
+            0,
+            "fresh files must start without NODUMP"
+        );
+        let trusted = Command::new(bin)
+            .args(["--module"])
+            .arg(&provider)
+            .env("ISOLATION_SETFLAGS_PATH", &trusted_target)
+            .output()
+            .unwrap();
+        assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+        let stderr = String::from_utf8_lossy(&trusted.stderr);
+        match classify_trusted_setflags(&stderr) {
+            TrustedSetflags::Allowed => break (twins, trusted_target, isolated_target),
+            TrustedSetflags::FsUnsupported => {
+                attempts.push(format!(
+                    "{} [{}]: trusted child ISOLATION_SETFLAGS=denied(errno={})",
+                    twins.path().display(),
+                    dir_fstype_name(twins.path()),
+                    libc::EOPNOTSUPP
+                ));
+                match setflags_next_twin_dir(twins.path(), dir, tag, &mut attempts) {
+                    Some(next) => {
+                        twins = next;
+                    }
+                    None => panic!(
+                        "SETFLAGS_TWIN_PRECONDITION_FAILED: no twin directory takes FS_IOC_SETFLAGS for the child: {}",
+                        attempts.join("; ")
+                    ),
+                }
+            }
+            TrustedSetflags::HardError => {
+                panic!("trusted must set the flag: {stderr}");
+            }
+        }
+    }
 }
 
 /// N2: inode-attribute change outside -o is denied. The constructor's
@@ -1650,50 +1727,8 @@ fn isolation_setflags_outside_the_output_is_denied() {
     const FS_NODUMP_FL: i32 = 0x40;
     let dir = scratch("isolation-setflags");
     let provider = build_isolation_probe(&dir);
-    let mut attempts: Vec<String> = Vec::new();
-    let mut twins = setflags_twin_dir(&dir, N2_SETFLAGS_TAG);
-    let (trusted_target, isolated_target) = loop {
-        let trusted_target = twins.path().join("setflags-trusted.tmp");
-        let isolated_target = twins.path().join("setflags-isolated.tmp");
-        std::fs::write(&trusted_target, b"setflags probe").unwrap();
-        std::fs::write(&isolated_target, b"setflags probe").unwrap();
-        assert_eq!(
-            inode_flags(&trusted_target) & FS_NODUMP_FL,
-            0,
-            "fresh files must start without NODUMP"
-        );
-        let trusted = Command::new(BIN)
-            .args(["--module"])
-            .arg(&provider)
-            .env("ISOLATION_SETFLAGS_PATH", &trusted_target)
-            .output()
-            .unwrap();
-        assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
-        let stderr = String::from_utf8_lossy(&trusted.stderr);
-        match classify_trusted_setflags(&stderr) {
-            TrustedSetflags::Allowed => break (trusted_target, isolated_target),
-            TrustedSetflags::FsUnsupported => {
-                attempts.push(format!(
-                    "{} [{}]: trusted child ISOLATION_SETFLAGS=denied(errno={})",
-                    twins.path().display(),
-                    dir_fstype_name(twins.path()),
-                    libc::EOPNOTSUPP
-                ));
-                match setflags_next_twin_dir(twins.path(), &dir, N2_SETFLAGS_TAG, &mut attempts) {
-                    Some(next) => {
-                        twins = next;
-                    }
-                    None => panic!(
-                        "SETFLAGS_TWIN_PRECONDITION_FAILED: no twin directory takes FS_IOC_SETFLAGS for the child: {}",
-                        attempts.join("; ")
-                    ),
-                }
-            }
-            TrustedSetflags::HardError => {
-                panic!("trusted must set the flag: {stderr}");
-            }
-        }
-    };
+    let (twins, trusted_target, isolated_target) =
+        qualify_setflags_twins(Path::new(BIN), &dir, N2_SETFLAGS_TAG, &provider);
     assert_ne!(
         inode_flags(&trusted_target) & FS_NODUMP_FL,
         0,
@@ -1723,6 +1758,49 @@ fn isolation_setflags_outside_the_output_is_denied() {
     );
     if twins.is_fallback() {
         std::fs::remove_dir_all(twins.path()).unwrap();
+    }
+}
+
+/// The N2 precondition report names every twin candidate with its
+/// in-process probe outcome beside the trusted child's verdict: a fake
+/// child that always reports EOPNOTSUPP walks the whole chain, and the
+/// loud failure must still show that the probes passed (the hosted
+/// divergence shape: probe ok, child refused). The fake binary exits 0
+/// so the run reaches the classifier exactly like a real child the
+/// filesystem refused, and it uses its own caller tag so its fallback
+/// dirs never collide with the concurrently running N2 twins.
+#[test]
+fn setflags_precondition_names_probe_and_child_outcomes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const TAG: &str = "neg-table";
+    let dir = scratch("isolation-setflags-neg-table");
+    let fake = dir.join("fake-discover-95.sh");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'ISOLATION_SETFLAGS=denied(errno=95)' >&2\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = build_isolation_probe(&dir);
+    let message = match std::panic::catch_unwind(|| {
+        qualify_setflags_twins(&fake, &dir, TAG, &provider)
+    }) {
+        Ok(_) => panic!("a child that always reports EOPNOTSUPP must exhaust the chain"),
+        Err(payload) => match payload.downcast_ref::<String>() {
+            Some(message) => message.clone(),
+            None => panic!("the precondition failure must carry a message"),
+        },
+    };
+    for pinned in [
+        "SETFLAGS_TWIN_PRECONDITION_FAILED",
+        "probe ok",
+        "trusted child",
+        "errno=95",
+    ] {
+        assert!(
+            message.contains(pinned),
+            "the report must name {pinned}: {message}"
+        );
     }
 }
 
@@ -1826,6 +1904,22 @@ fn setflags_twins_fall_back_when_the_primary_is_unusable() {
         setflags_probe(twins.path()).is_ok(),
         "the fallback must take the flag: {}",
         twins.path().display()
+    );
+    let probe_attempts = twins.probe_attempts();
+    assert!(
+        !probe_attempts.is_empty(),
+        "selecting a fallback must record the probe history"
+    );
+    assert!(
+        probe_attempts.iter().any(|row| row.contains("probe ok")),
+        "the selected fallback must have passed the probe: {probe_attempts:?}"
+    );
+    let missing_text = missing.to_string_lossy();
+    assert!(
+        probe_attempts
+            .iter()
+            .any(|row| row.contains(missing_text.as_ref())),
+        "the history must name the rejected primary: {probe_attempts:?}"
     );
     std::fs::remove_dir_all(twins.path()).unwrap();
 }

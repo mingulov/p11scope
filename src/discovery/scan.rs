@@ -4141,7 +4141,9 @@ struct OpenedMappedObject {
 /// cannot see (`ENOENT` under a foreign root — a chrooted daemon whose
 /// foreign mount namespace correctly refuses the host fallback, not an
 /// exit either). `ENOENT` under the observer's own root is a genuinely
-/// missing file and never retries.
+/// missing file and never retries. In a same-namespace chroot the host
+/// fallback runs first; when it fails the target errno is preserved, so
+/// `map_files` attempts second and the gap stacks both annotations.
 fn map_files_fallback_triggered(failure: &MappedOpenError) -> bool {
     failure.errno == Some(libc::ESRCH)
         || (failure.errno == Some(libc::ENOENT) && failure.foreign_target_root.is_some())
@@ -19028,6 +19030,68 @@ mod tests {
                 .iter()
                 .all(|line| !line.starts_with("map_files")),
             "the same-root failure must not touch map_files, got {:?}",
+            fixture.log.borrow()
+        );
+    }
+
+    /// Stacked-fallback twin: in a same-namespace chroot the host
+    /// fallback runs first and, when it fails, the preserved target
+    /// errno still triggers `map_files` second. The stacked gap keeps
+    /// both annotations in order, then the foreign suffix.
+    #[test]
+    fn map_files_fallback_stacks_after_a_failed_host_fallback_in_a_shared_namespace() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MappedOpenError {
+            reason: "opening object within retained target root: No such file or directory \
+                     (os error 2) (host-root fallback: open failed: No such file or directory \
+                     (os error 2))"
+                .into(),
+            foreign_target_root: Some("/proc/12345/root".into()),
+            errno: Some(libc::ENOENT),
+        });
+        fixture.map_files = MapFilesScript::Fail(libc::EPERM);
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the unopenable object must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        let host = skip
+            .reason
+            .find("(host-root fallback:")
+            .unwrap_or_else(|| panic!("the host attempt stays recorded, got {:?}", skip.reason));
+        let map_files = skip
+            .reason
+            .find("(map_files fallback:")
+            .unwrap_or_else(|| {
+                panic!("the second attempt stays recorded, got {:?}", skip.reason)
+            });
+        assert!(
+            host < map_files,
+            "the host attempt precedes the map_files attempt, got {:?}",
+            skip.reason
+        );
+        assert!(
+            skip.reason
+                .contains("(target root /proc/12345/root differs from the observer root)"),
+            "the foreign root keeps its suffix, got {:?}",
+            skip.reason
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the fallback must open the group's VMA range, got {:?}",
             fixture.log.borrow()
         );
     }

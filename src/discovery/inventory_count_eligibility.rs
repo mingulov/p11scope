@@ -440,11 +440,20 @@ pub(super) struct OrdinaryView<'a> {
     pub(super) revocation_cause: RevocationCause,
     pub(super) last_cause: RevocationCause,
     pub(super) raw_sequence: u64,
+    initial_fresh: bool,
     origin_after: Option<u64>,
 }
 impl OrdinaryView<'_> {
     pub(super) fn checkpoint(&self, original_pre: u64) -> u64 {
-        if self.startup || self.origin_after.is_some_and(|post| original_pre > post) {
+        // A fresh summary has no completed classification, so no earlier
+        // result can be contradicted and every later invalidation still
+        // revokes through the sequence: the accepted-scan POST guard
+        // below exists for finished summaries, whose old reads must not
+        // borrow the current sequence retroactively.
+        if self.startup
+            || self.initial_fresh
+            || self.origin_after.is_some_and(|post| original_pre > post)
+        {
             self.sequence
         } else {
             0
@@ -728,6 +737,7 @@ impl CountOwnership {
             revocation_cause: RevocationCause::None,
             last_cause: RevocationCause::None,
             raw_sequence: 0,
+            initial_fresh: false,
             origin_after: None,
         };
         let Some(summary) = self.summaries.get(&(caller, object)) else {
@@ -796,6 +806,7 @@ impl CountOwnership {
             })
         {
             view.sequence = 1;
+            view.initial_fresh = true;
             view.origin_after = slot.map(|slot| slot.newest_accepted_post);
             return view;
         }

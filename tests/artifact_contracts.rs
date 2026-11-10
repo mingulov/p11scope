@@ -12787,6 +12787,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pause_partial: 0,
         pause_unavailable: 0,
         pause_engine_incomplete_retirements: 0,
+        pause_refused: None,
+        snapshot_failure: None,
         child_still_running: None,
         run_tree_handed_back: None,
         discovery_ring_loss: 0,
@@ -13050,6 +13052,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "pause_partial: pause.partial",
         "pause_unavailable: pause.unavailable",
         "pause_engine_incomplete_retirements,",
+        "pause_refused: pause_refusal.map(PauseRefusal::name),",
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
@@ -13090,6 +13093,10 @@ fn the_capture_loop_consumer_map_is_frozen() {
             assert!(
                 args.contains("owned.coordinator.engine_incomplete_retirements()"),
                 "{mode} coordinator retirement source"
+            );
+            assert!(
+                args.contains("owned.coordinator.refusal()"),
+                "{mode} coordinator refusal source"
             );
             // Live frames read the owned disposition directly; the sealed
             // terminal evidence withholds it while settlement is unknown.

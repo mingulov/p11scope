@@ -64,6 +64,8 @@ fn evidence() -> Evidence {
         pause_partial: 0,
         pause_unavailable: 0,
         pause_engine_incomplete_retirements: 0,
+        pause_refused: None,
+        snapshot_failure: None,
         child_still_running: None,
         run_tree_handed_back: None,
         discovery_ring_loss: 0,

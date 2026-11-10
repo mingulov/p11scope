@@ -18087,12 +18087,15 @@ mod tests {
         /// marker: the group keeps its key while its path reads
         /// `<path> (deleted)`.
         fn render_deleted_maps(&mut self) {
+            self.render_deleted_maps_with(&self.path.display().to_string());
+        }
+
+        /// The marker shape under an arbitrary displayed path (a memfd
+        /// rendering keeps the fixture key).
+        fn render_deleted_maps_with(&mut self, display: &str) {
             let identity = format!(
                 "{:x}:{:x} {} {}",
-                self.key.device.major,
-                self.key.device.minor,
-                self.key.inode,
-                self.path.display()
+                self.key.device.major, self.key.device.minor, self.key.inode, display
             );
             self.maps = format!(
                 "1000-2000 r-xp 00000000 {identity} (deleted)\n\
@@ -18570,6 +18573,43 @@ mod tests {
         assert_eq!(
             skip.reason, REPLACED_PROVIDER_REASON,
             "the replaced gap keeps its exact wording"
+        );
+    }
+
+    /// Scope twin: a memfd mapping (`/memfd:name (deleted)`) is
+    /// anonymous memory, never a replaced disk file — no `map_files`
+    /// attempt even when the route would serve, and the replaced gap
+    /// stays verbatim.
+    #[test]
+    fn map_files_deleted_ignores_memfd_mappings() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.render_deleted_maps_with("/memfd:libfixture");
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the memfd mapping must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == "/memfd:libfixture (deleted)")
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert_eq!(
+            skip.reason, REPLACED_PROVIDER_REASON,
+            "the memfd gap keeps the replaced wording"
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .all(|line| !line.starts_with("map_files")),
+            "the memfd mapping must not touch map_files, got {:?}",
+            fixture.log.borrow()
         );
     }
 

@@ -16,6 +16,8 @@
 //! clean result. These diagnostics do not change the capture verdict or
 //! report schema.
 
+use p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT;
+
 /// Historical forced-sweep maximum (`31r-esys4`, measured 2026-09-20).
 /// This is a diagnostic threshold, not a latency guarantee; see
 /// `docs/qualification/first-use-contract.md` for its interpretation.
@@ -30,10 +32,6 @@ pub const FINDING_EARLY_EVENT_LOSS: &str = "early_event_loss";
 pub const FINDING_EARLY_DISCOVERY_LOSS: &str = "early_discovery_loss";
 pub const FINDING_IDENTITY_BUDGET_EXHAUSTED: &str = "identity_budget_exhausted";
 pub const FINDING_NEWCOMER_QUEUE_STALLED: &str = "newcomer_queue_stalled";
-
-/// The lifetime identity budget the kernel hands out (COOKIE_CTL limit).
-/// Named here so the exhaustion finding states the bound it spent.
-pub const IDENTITY_BUDGET_TICKETS: u64 = 16_384;
 
 /// A newcomer still waiting past this age at loop end never got
 /// admitted: admission normally completes within a scan, so this is
@@ -311,7 +309,7 @@ impl LongRunDetector {
         if self.identity_budget_exhausted || self.identity_unavailable > 0 {
             let detail = if self.identity_budget_exhausted {
                 format!(
-                    "lifetime budget of {IDENTITY_BUDGET_TICKETS} identities spent; {} refused",
+                    "lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent; {} refused",
                     self.identity_unavailable
                 )
             } else {

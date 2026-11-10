@@ -10891,7 +10891,9 @@ fn capture_trace(
                 // Trace `-o` is a live stream, not a sealed report:
                 // quiesce-error publication stays profile-only until a
                 // trace abandon contract asks for its own terminal line.
-                |_| Ok(()),
+                // A degraded stdout still joins the union, like every
+                // other terminal, so the run names it and exits nonzero.
+                |_| combine_deferred_failure(Ok(()), stdout_error.take()),
                 |context| {
                     let result = context.1.detach_producers_driven(
                         || {

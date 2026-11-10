@@ -103,6 +103,7 @@ fn evidence() -> Evidence {
         pid_namespace: p11scope::pidns::PidNamespaceEvidence::of(
             &p11scope::pidns::PidNumbering::agreeing(),
         ),
+        container_only_view: false,
         p11scope_env: vec![],
         completeness: "UNKNOWN",
     }

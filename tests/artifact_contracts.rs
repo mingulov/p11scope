@@ -12845,6 +12845,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pid_namespace: p11scope::pidns::PidNamespaceEvidence::of(
             &p11scope::pidns::PidNumbering::agreeing(),
         ),
+        container_only_view: false,
         p11scope_env: vec![],
         completeness: "UNKNOWN",
     };

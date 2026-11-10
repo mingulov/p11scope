@@ -10123,6 +10123,8 @@ mod tests {
     ///   then settlement) before any reap or detach;
     /// - pre-arm failures (`combine_setup_failure`, the preflight closure)
     ///   reap before `Owned` exists, when no entry was ever armed;
+    /// - the staged duration commit (`commit_staged_duration_handoff`)
+    ///   reaps a post-seal exit only after `run_loop` returned;
     /// - `OwnedChild::drop` reaps only what that funnel left behind.
     #[test]
     fn owned_reap_follows_pause_cleanup_before_settlement() {
@@ -10178,6 +10180,14 @@ mod tests {
             2,
             "commit_staged_observer_handoff must keep its definition plus the one settle call"
         );
+        // The staged duration commit reaps a child that exited after the
+        // report sealed. It runs once, after the run loop's finish (pause
+        // cleanup and settlement), from the owned run only.
+        assert_eq!(
+            offsets_of(production, "commit_staged_duration_handoff(").len(),
+            2,
+            "commit_staged_duration_handoff must keep its definition plus the one owned-run call"
+        );
         // No new direct reaps: every production terminate_and_reap call
         // stays in its audited function.
         let mut reapers = std::collections::BTreeSet::new();
@@ -10204,6 +10214,7 @@ mod tests {
             std::collections::BTreeSet::from([
                 "abort_pending_handoff".to_string(),
                 "combine_setup_failure".to_string(),
+                "commit_staged_duration_handoff".to_string(),
                 "commit_staged_observer_handoff".to_string(),
                 "run_owned_inner_with_host".to_string(),
                 "settle_observer_end_without_kill".to_string(),

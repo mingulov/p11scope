@@ -2424,9 +2424,22 @@ fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     if total == 0 {
         return String::new();
     }
+    // Whole capacity refusals first, partials second, awaiting-publication
+    // proxy lines last — stable, so JSON order is untouched and ties keep
+    // discovery order. A concise reader sees the real gaps without `-v`.
+    let mut ranked: Vec<&SkippedOut> = ev.discovery.modules_skipped.iter().collect();
+    ranked.sort_by_key(|skipped| {
+        if crate::plan::is_closure_awaiting_publication(&skipped.reason) {
+            2
+        } else if crate::plan::is_partial_coverage(&skipped.reason) {
+            1
+        } else {
+            0
+        }
+    });
     let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
     let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+    for skipped in ranked.into_iter().take(shown) {
         out.push_str(&format!(
             "  {}: {}\n",
             escape_controls(&skipped.name),

@@ -11446,6 +11446,31 @@ fn module_refusal_diagnostics_escape_target_controls() {
 }
 
 #[test]
+fn capacity_refusal_summary_names_up_to_three_providers_once() {
+    assert_eq!(format_capacity_refusal_summary(&[]), None);
+    assert_eq!(
+        format_capacity_refusal_summary(&["/opt/trust.so"]),
+        Some(
+            "p11scope: 1 provider file(s) not watched (attach slots): /opt/trust.so — see Module gaps in the report"
+                .into()
+        )
+    );
+    assert_eq!(
+        format_capacity_refusal_summary(&[
+            "/opt/a.so",
+            "/opt/b\u{1b}[2Jevil\r.so",
+            "/opt/c.so",
+            "/opt/d.so",
+            "/opt/e.so"
+        ]),
+        Some(
+            r"p11scope: 5 provider file(s) not watched (attach slots): /opt/a.so, /opt/b\u{1b}[2Jevil\r.so, /opt/c.so and 2 more — see Module gaps in the report"
+                .into()
+        )
+    );
+}
+
+#[test]
 fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
     // The terminal stderr verdict must agree with the report: a
     // prefix-admitted (or growth-omitted) module is partially

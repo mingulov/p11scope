@@ -7556,6 +7556,19 @@ fn discover_plan(
             );
         }
     }
+    // Default verbosity still names whole capacity refusals once,
+    // aggregated by merge-time kind (never by wording).
+    {
+        let refused: Vec<&str> = discovered
+            .plan
+            .refused_modules_typed()
+            .filter(|(_, _, kind)| matches!(kind, plan::RefusalKind::CapacityWhole))
+            .map(|(_, skipped, _)| skipped.subject.as_str())
+            .collect();
+        if let Some(line) = format_capacity_refusal_summary(&refused) {
+            eprintln!("{line}");
+        }
+    }
     discovered.counters.report(&discovered.plan);
     Ok(discovered)
 }
@@ -8210,6 +8223,30 @@ fn format_module_refusal(subject: &str, reason: &str) -> String {
         render::escape_controls(subject),
         render::escape_controls(reason)
     )
+}
+
+/// The default-verbosity aggregate for whole capacity refusals: one line
+/// naming the provider files no slot watched, so a reader without `-v`
+/// still sees the real gaps. `None` when nothing was refused whole.
+fn format_capacity_refusal_summary(refused: &[&str]) -> Option<String> {
+    if refused.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = refused
+        .iter()
+        .take(3)
+        .map(|name| render::escape_controls(name).into_owned())
+        .collect();
+    let mut line = format!(
+        "p11scope: {} provider file(s) not watched (attach slots): {}",
+        refused.len(),
+        names.join(", ")
+    );
+    if refused.len() > 3 {
+        line.push_str(&format!(" and {} more", refused.len() - 3));
+    }
+    line.push_str(" — see Module gaps in the report");
+    Some(line)
 }
 
 /// One member of the scope discovery could not read. `None` when the

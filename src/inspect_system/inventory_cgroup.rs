@@ -274,6 +274,11 @@ pub(crate) struct CgroupCollectRequest {
     /// through the real collect path. Always empty in production.
     #[cfg(test)]
     pub(crate) scripted_member_gaps: Vec<String>,
+    /// Test seam: when set, the scripted gaps above attach only to
+    /// this member, so a call-site test can hold one gapped member
+    /// beside a healthy one. Always `None` in production.
+    #[cfg(test)]
+    pub(crate) scripted_member_gaps_only: Option<u32>,
 }
 
 /// Registry gap subject for a pass-0 collection an operator stop cut
@@ -1023,7 +1028,14 @@ pub(crate) fn collect_with(
             )
         });
         #[cfg(test)]
-        let member = with_scripted_gaps(member, &request.scripted_member_gaps);
+        let member = if request
+            .scripted_member_gaps_only
+            .is_none_or(|only| only == *pid)
+        {
+            with_scripted_gaps(member, &request.scripted_member_gaps)
+        } else {
+            member
+        };
         members.push(member);
     }
     noise.report();
@@ -1546,6 +1558,7 @@ mod tests {
             count_manifests: Vec::new(),
             prearm_prior: (0, 0),
             scripted_member_gaps: Vec::new(),
+            scripted_member_gaps_only: None,
         }
     }
     fn fixture(pid: u32) -> (tempfile::TempDir, Arc<File>) {
@@ -2056,6 +2069,20 @@ mod tests {
     }
 
     #[test]
+    fn replaced_member_gap_degrades_per_caller_without_incompleting_transaction() {
+        // Twin of the unproven test above: a member running a file
+        // replaced on disk was scanned to completion; its
+        // replaced-file gap stays on the member instead of marking
+        // the shared transaction incomplete (which would suspend
+        // every other member's tracking behind one upgraded
+        // library). Reverting the exemption turns this RED.
+        assert!(
+            !member_gap_truncates_transaction(crate::discovery::scan::REPLACED_PROVIDER_REASON),
+            "replaced-file gap must not truncate its transaction"
+        );
+    }
+
+    #[test]
     fn cut_short_member_gaps_still_incomplete_their_transaction() {
         use crate::discovery::overlay_witness::{
             GAP_ANCHOR_BINDING_FAILED, GAP_BUDGET_EXHAUSTED, GAP_WITNESS_REFUSED,
@@ -2149,6 +2176,68 @@ mod tests {
         assert_eq!(
             collection.outcome(),
             ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete)
+        );
+    }
+
+    #[test]
+    fn scripted_replaced_member_gap_keeps_transaction_complete() {
+        use crate::discovery::scan::REPLACED_PROVIDER_REASON;
+        // Call-site test through the real collect path: one member
+        // with the replaced-file gap beside a healthy member gives
+        // a Complete transaction, the healthy member still
+        // activates, and the gap stays on its own member.
+        // Reverting the REPLACED exemption turns the outcome RED.
+        let gapped_child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let healthy_child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let gapped = gapped_child.id();
+        let healthy = healthy_child.id();
+        let two = tempfile::tempdir().unwrap();
+        std::fs::write(
+            two.path().join("cgroup.procs"),
+            format!("{gapped}\n{healthy}\n"),
+        )
+        .unwrap();
+        let Scope::Cgroup { dir, .. } = crate::scope::cgroup(two.path()).unwrap() else {
+            unreachable!()
+        };
+        let mut req = request(dir);
+        req.scripted_member_gaps = vec![REPLACED_PROVIDER_REASON.into()];
+        req.scripted_member_gaps_only = Some(gapped);
+        let collection = collect(req, &[], &HookRegistry::default(), policy());
+        let mut pids = collection.member_pids().collect::<Vec<_>>();
+        pids.sort_unstable();
+        let mut want = vec![gapped, healthy];
+        want.sort_unstable();
+        assert_eq!(pids, want);
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+        assert!(
+            collection.preparation(healthy).is_some(),
+            "the healthy member still activates"
+        );
+        let members = &collection
+            .collection
+            .as_ref()
+            .expect("a collected transaction keeps its members")
+            .members;
+        let reasons = |pid: u32| {
+            members
+                .iter()
+                .find(|member| member.pid == pid)
+                .expect("both members were scanned")
+                .gaps
+                .iter()
+                .map(|gap| gap.reason.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            reasons(gapped).contains(&REPLACED_PROVIDER_REASON),
+            "the gap stays on its own member"
+        );
+        assert!(
+            !reasons(healthy).contains(&REPLACED_PROVIDER_REASON),
+            "the gap never leaks to the healthy member"
         );
     }
 }

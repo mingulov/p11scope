@@ -4353,6 +4353,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             prearm_prior: self.prearm_prior,
             #[cfg(test)]
             scripted_member_gaps: Vec::new(),
+            #[cfg(test)]
+            scripted_member_gaps_only: None,
         };
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
@@ -14844,6 +14846,149 @@ pub(crate) mod tests {
             ),
             "{:?}",
             coverage_of(&coordinator, &a)
+        );
+    }
+
+    #[test]
+    fn gapped_rescan_keeps_edge_uncertain_without_absence_authority() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        // I3: a provider replaced mid-capture rescans Scanned but with
+        // a truncating gap, so it carries no complete-scan receipt.
+        // The projection must keep the collected edge (uncertain,
+        // never ended), must not call the module unloaded, and must
+        // name the gap on the caller. Treating Scanned alone as
+        // complete turns every assertion below RED.
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let modules = [fx::module(&pins, &a, &fx::offsets(3))];
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let plan = fx::lower_named(&modules, &pins, policy);
+        let absorbed = coordinator.attach_set.absorb(&plan, &pins);
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        // The generation collection reads for this (live) process.
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let edge_of = |coordinator: &InventoryCoordinator<_>| {
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the projected edge is retained");
+            let module = coordinator
+                .registry
+                .module(edge.module)
+                .expect("the projected module is retained");
+            (edge.mapping, edge.mapping_reason.clone(), module.lifecycle)
+        };
+        let catalog = capture_catalog(&pins, &[&a], pid, generation.clone());
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let (mapping, _, _) = edge_of(&coordinator);
+        assert_eq!(
+            mapping,
+            MappingState::Mapped,
+            "the first pass maps the edge"
+        );
+        // The replacement rescans Scanned with a truncating gap: no
+        // receipt, and the running copy is no longer shown.
+        let rescan = capture_catalog(&pins, &[], pid, generation);
+        assert!(rescan.processes[0].complete_scan.is_none());
+        coordinator.project_catalog(&rescan, &verdicts, 70);
+        coordinator.registry.publish();
+        let (mapping, reason, lifecycle) = edge_of(&coordinator);
+        assert_eq!(
+            mapping,
+            MappingState::Uncertain,
+            "a gapped rescan never ends the collected edge"
+        );
+        assert!(
+            reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("incomplete scan")),
+            "the edge names the incomplete rescan: {reason:?}"
+        );
+        assert_eq!(
+            lifecycle,
+            crate::discovery::caller_registry::ModuleLifecycle::Unknown,
+            "a gapped rescan never reports the module unloaded"
+        );
+        assert!(
+            coordinator.tail_uncertain.contains(&caller),
+            "the caller carries the named gap"
+        );
+        assert!(
+            !coordinator.complete_scanned.contains(&caller),
+            "a gapped rescan proves no absence authority"
+        );
+    }
+
+    #[test]
+    fn complete_rescan_still_ends_a_gone_edge() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        // Healthy twin: a genuinely complete rescan that no longer
+        // shows the module still ends the edge with absence
+        // authority. The gapped-rescan fix must not over-correct
+        // into never ending edges.
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let modules = [fx::module(&pins, &a, &fx::offsets(3))];
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let plan = fx::lower_named(&modules, &pins, policy);
+        let absorbed = coordinator.attach_set.absorb(&plan, &pins);
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        // The generation collection reads for this (live) process.
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation.clone());
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let receipt = crate::inspect_system::CompleteMemberScan::scripted(
+            generation
+                .clone()
+                .expect("the live process has a generation"),
+            65,
+            66,
+        );
+        let mut rescan = capture_catalog(&pins, &[], pid, generation);
+        rescan.processes[0].complete_scan = Some(receipt);
+        coordinator.project_catalog(&rescan, &verdicts, 70);
+        coordinator.registry.publish();
+        let edge = coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the projected edge is retained");
+        assert_eq!(
+            edge.mapping,
+            MappingState::Ended,
+            "a complete rescan ends a gone edge"
+        );
+        let module = coordinator
+            .registry
+            .module(edge.module)
+            .expect("the projected module is retained");
+        assert_eq!(
+            module.lifecycle,
+            crate::discovery::caller_registry::ModuleLifecycle::Unloaded,
+            "a complete rescan reports the module unloaded"
         );
     }
 

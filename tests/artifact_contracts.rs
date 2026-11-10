@@ -13110,13 +13110,20 @@ fn the_capture_loop_consumer_map_is_frozen() {
         !run.contains("fn module_label("),
         "the active-topology heading must not survive"
     );
-    // Two headings exist at all: the profile loop's live frame and its
-    // terminal frame. The trace loop prints no heading, and its terminal
-    // evidence line is rendered from the same `Evidence` the JSON uses.
+    // Three headings exist at all: the profile loop's live frame, its
+    // terminal frame and the owned-handoff profile seal's frame. The trace
+    // loop prints no heading, and its terminal evidence line is rendered
+    // from the same `Evidence` the JSON uses.
     assert_eq!(
         run.matches(".heading()").count(),
-        2,
+        3,
         "every live and terminal heading must come from capture facts"
+    );
+    let handoff_seal = between(&run, "fn seal_owned_handoff_profile(", "\nfn ");
+    assert!(
+        handoff_seal.contains("let facts = context.engine.capture_facts();")
+            && handoff_seal.matches(".heading()").count() == 1,
+        "the handoff seal's one heading comes from capture facts"
     );
 
     // Semantic attachment decisions still read the active topology.

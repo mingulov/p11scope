@@ -109,14 +109,17 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Corrections
 
-- The v0.6.0 claim of exact per-key rows at 6,250 calls/s for 60 s
-  does not reproduce on the reference host: re-measured 2026-11-10
+- In v0.6.0, keys created during the capture that never got a
+  label were summarised instead of listed: re-measured 2026-11-10
   on fedora.local (5 vCPU, kernel 7.2.9, SoftHSM 2.7.0-rc1), the
   published v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250
-  calls/s for 60 s. <!-- keyops-fix-pending -->
-  Under sustained high call rates on small VMs, the key-operations
-  view may show the instance as uncertain with no per-key rows;
-  plain-path counts stay exact. <!-- keyops-fix-pending -->
+  calls/s for 60 s. v0.7.0 lists such keys as per-key rows labelled
+  `unknown`: on the development host at 6,250 calls/s for 60 s the
+  cell shows one row with 187,499 started / 187,499 completed. The
+  fedora and sm1 reruns are pending.
+  On small VMs where hook events are missed, the affected key stays
+  unattributable for the rest of the capture with a named gap;
+  plain-path counts stay exact.
   See [Key-tracking rate ceiling](docs/known-limitations.md#key-tracking-rate-ceiling).
 
 ### Known limitations

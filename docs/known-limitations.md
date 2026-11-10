@@ -230,14 +230,46 @@ the end-of-capture executable is 0.7.x work.
 
 ### Key-tracking rate ceiling
 
-The v0.6.0 ceiling of exact per-key rows at 6,250 calls/s for 60 s
-does not reproduce: re-measured 2026-11-10 on fedora.local (5 vCPU,
-kernel 7.2.9, SoftHSM 2.7.0-rc1), the published v0.6.0, rc-5 and rc-8
-all show 0 per-key rows at 6,250 calls/s for 60 s in the
-joint-10k-single cell. <!-- keyops-fix-pending -->
-Under sustained high call rates on small VMs, the key-operations
-view shows no per-key rows and the instance reads `uncertain` with
-reason `semantic_loss`; plain-path counts stay exact. <!-- keyops-fix-pending -->
+In v0.6.0, keys created during the capture that never got a
+label were summarised instead of listed: re-measured 2026-11-10 on
+fedora.local (5 vCPU, kernel 7.2.9, SoftHSM 2.7.0-rc1), the published
+v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250 calls/s for
+60 s in the joint-10k-single cell. v0.7.0 lists such keys as per-key
+rows labelled `unknown`: on the development host at 6,250 calls/s
+for 60 s the cell shows one row with 187,499 started / 187,499
+completed. The fedora and sm1 reruns are pending. On small VMs
+where hook events are missed, the affected key stays unattributable
+for the rest of the capture with a named gap (see [Missed hook
+events leave one key unattributable](#missed-hook-events-leave-one-key-unattributable));
+plain-path counts stay exact.
+
+### Missed hook events leave one key unattributable
+
+On small VMs the kernel can skip runs of the mapping hooks under
+load. Each skip sheds the calls across it with exact counts and a
+named cause. If the skipped window covers a key the observer was
+proving, that key stays unattributable for the rest of the capture:
+its later calls are counted in named `not attributed` reasons with
+a named gap, while exact per-key rows continue for the rest. Carrying
+a proved key across such a skip is future work.
+
+### Key operations above 7,500 calls/s settle late and can lose events
+
+At 7,500 or more key operations per second, joining calls to their
+keys can lag by seconds (5-12 s seen on rc-8), and the event ring
+can then overflow. Overflowed records are counted and named as
+event loss; the affected calls are not silently dropped. Sustained
+rates above 6,250 key operations per second are future work.
+
+### `trace --system` and `profile` rate ceilings on a small VM
+
+On a 3-vCPU VM (sm1, fedora guest, rc-8 build), `trace --system`
+keeps every event up to about 10,000 calls/s with no loss; at
+25,000 calls/s the observer is CPU-bound and the loss is named
+(3,059,017 records lost at that rate). `profile --pid` and
+`profile --cgroup` stayed exact with no loss at 10,000, 25,000,
+50,000 and 100,000 calls/s; `profile --system` stayed exact with no
+loss up to 50,000 calls/s (448,750 records lost at 100,000/s).
 
 ### Browser after a background caller: per-key tracking may not start
 
@@ -294,7 +326,9 @@ names the source SHA behind each check the release rounds re-measured.
   gap. 10,000 calls/s with key operations
   is not yet sustained. Re-measured 2026-11-10 on the reference host,
   v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250 calls/s for
-  60 s; see [Key-tracking rate ceiling](#key-tracking-rate-ceiling). <!-- keyops-fix-pending -->
+  60 s; the cause (keys created during the capture that never got a
+  label were summarised instead of listed) is fixed in v0.7.0, which
+  lists them; see [Key-tracking rate ceiling](#key-tracking-rate-ceiling).
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
   qualified 60 s runs), against the 1.5 s target; under host load it
@@ -944,8 +978,10 @@ With `--key-operations`, the v0.6.0 measurements in
 [Known limitations in 0.6.0](#known-limitations-in-060) supersede the
 older lane numbers: key operations sustain 6,250 calls/s for 60 s with
 exact rows, and key-operation rows lag their calls by about 1.6-1.9 s
-p99 in quiet runs. (That 6,250 calls/s ceiling did not reproduce on
-re-measurement; see [Key-tracking rate ceiling](#key-tracking-rate-ceiling).) <!-- keyops-fix-pending -->
+p99 in quiet runs. (That 6,250 calls/s ceiling was measured with
+the v0.6.0 bucketing bug: keys created during the capture that never
+got a label were summarised instead of listed. v0.7.0 lists them; see
+[Key-tracking rate ceiling](#key-tracking-rate-ceiling).)
 The older 1,000 calls/s ceiling describes the pre-integration
 lane, not this release. The `authority_lost` reason is still live: it
 latches after a watchdog trip or disposed staged history and renders

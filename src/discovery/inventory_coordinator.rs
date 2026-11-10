@@ -20043,6 +20043,68 @@ exit 0
         );
     }
 
+    #[test]
+    fn stop_reprojects_coverage_for_endpoints_attached_after_the_last_projection() {
+        // Projection lag: the last apply projects coverage before the
+        // final extend attaches its endpoints. An edge that extend fully
+        // attaches must read watched after stop, never `not_attached`.
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(8, 510);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(8, 510));
+        scene.project(8, 120);
+        scene.attach_all(150, ScopeCustody::PidHeld);
+        let mut clean = witness_batch();
+        clean.health_read_ns = 200;
+        scene.coordinator.note_witness_batch(&clean);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 150,
+                until_ns: Some(200),
+            }
+        );
+    }
+
+    #[test]
+    fn stop_keeps_coverage_already_projected_before_the_final_extend() {
+        // Healthy twin: the endpoints attach before the last projection,
+        // so the edge already reads watched; the stop re-projection keeps
+        // that interval instead of disturbing it.
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(8, 510);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(8, 510));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(8, 120);
+        let mut clean = witness_batch();
+        clean.health_read_ns = 200;
+        scene.coordinator.note_witness_batch(&clean);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: Some(200),
+            }
+        );
+    }
+
     /// A scene with one caller watched since 100 and a clean read at 200.
     fn watched_scene(pid: u32, start: u64) -> (CaptureScene, CallerId) {
         let mut scene = CaptureScene::new(1);

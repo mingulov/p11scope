@@ -2675,6 +2675,32 @@ fn links_cover_slot(links: &[RegisteredLink], slot: u32) -> bool {
     links.iter().any(|link| link.slots().contains(&slot))
 }
 
+/// Retired slots whose probes are provably gone: `blocked` folds the
+/// Multi-only, native-retirement and group-deferral gates (see
+/// [`Session::revival_detached`]); the survivors need no covering link
+/// and no retained static target.
+fn revival_detached_from(
+    links: &[RegisteredLink],
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    _quarantine: &BTreeSet<DetachQuarantine>,
+    blocked: bool,
+    retired: &BTreeSet<usize>,
+) -> BTreeSet<u32> {
+    if blocked {
+        return BTreeSet::new();
+    }
+    retired
+        .iter()
+        .filter_map(|position| {
+            let slot = u32::try_from(*position).ok()?;
+            if links_cover_slot(links, slot) || retained.contains_key(&slot) {
+                return None;
+            }
+            Some(slot)
+        })
+        .collect()
+}
+
 /// Whether any START row names `slot`. Map or iteration failures read
 /// as a match: finality needs proof, not absence of evidence.
 fn start_rows_name_slot(ebpf: &Ebpf, slot: u32) -> bool {
@@ -10273,22 +10299,16 @@ impl Session {
     /// uncertain. Singles never clears: it retires logically and closes
     /// links only at the terminal detach.
     pub(crate) fn revival_detached(&self, retired: &BTreeSet<usize>) -> BTreeSet<u32> {
-        if self.backend != AttachBackend::Multi
+        let blocked = self.backend != AttachBackend::Multi
             || self.native_retirement.blocking()
-            || !self.deferred_group_slots.is_empty()
-        {
-            return BTreeSet::new();
-        }
-        retired
-            .iter()
-            .filter_map(|position| {
-                let slot = u32::try_from(*position).ok()?;
-                if links_cover_slot(&self.links, slot) || self.retained_static.contains_key(&slot) {
-                    return None;
-                }
-                Some(slot)
-            })
-            .collect()
+            || !self.deferred_group_slots.is_empty();
+        revival_detached_from(
+            &self.links,
+            &self.retained_static,
+            &self.detach_quarantine,
+            blocked,
+            retired,
+        )
     }
 
     /// Whether a detached slot's counts are final and nothing is in
@@ -15480,6 +15500,89 @@ mod tests {
             DetachQuarantine::of_link(&link),
             vec![DetachQuarantine::Slot(7)]
         );
+    }
+
+    #[test]
+    fn revival_detached_from_clears_a_healthy_slot() {
+        let retired: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0, 1]);
+        let cleared = revival_detached_from(
+            &[],
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+            false,
+            &retired,
+        );
+        assert_eq!(cleared, std::collections::BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn revival_detached_from_skips_a_quarantined_slot() {
+        // A Multi detach failure quarantines the slot: revival must not
+        // re-clear it every tick (fail closed to a fresh slot).
+        let retired: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0, 1]);
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            std::collections::BTreeSet::from([DetachQuarantine::Slot(0)]);
+        let cleared = revival_detached_from(
+            &[],
+            &std::collections::BTreeMap::new(),
+            &quarantine,
+            false,
+            &retired,
+        );
+        assert_eq!(cleared, std::collections::BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn revival_detached_from_global_quarantine_clears_nothing() {
+        let retired: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0, 1]);
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            std::collections::BTreeSet::from([DetachQuarantine::Global]);
+        let cleared = revival_detached_from(
+            &[],
+            &std::collections::BTreeMap::new(),
+            &quarantine,
+            false,
+            &retired,
+        );
+        assert!(
+            cleared.is_empty(),
+            "global quarantine clears nothing: {cleared:?}"
+        );
+    }
+
+    #[test]
+    fn revival_detached_from_blocked_clears_nothing() {
+        // Singles, a blocking native retirement, or a group deferral:
+        // the wrapper folds these into `blocked`.
+        let retired: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0]);
+        let cleared = revival_detached_from(
+            &[],
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+            true,
+            &retired,
+        );
+        assert!(cleared.is_empty());
+    }
+
+    #[test]
+    fn revival_detached_from_skips_a_covered_slot() {
+        // The extraction keeps the existing link-coverage gate.
+        let link = RegisteredLink::UProbe {
+            program: "p11_return",
+            slot: 0,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        };
+        let retired: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0, 1]);
+        let cleared = revival_detached_from(
+            std::slice::from_ref(&link),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+            false,
+            &retired,
+        );
+        assert_eq!(cleared, std::collections::BTreeSet::from([1]));
     }
 
     #[test]

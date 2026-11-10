@@ -4386,6 +4386,119 @@ fn key_operation_unknown_key_and_requested_only() {
     );
 }
 
+/// Data always: a key GENERATED in the observed window whose type
+/// has no label family (a generic-secret HMAC key, the
+/// joint-throughput workload) and whose attributes are never read
+/// back still keeps its per-key row with exact counts under the
+/// honest `unknown` metadata label. The requested template never
+/// labels and no type or size is guessed. The conflicted twin keeps
+/// the strict guard: a key whose metadata conflicts never rows and
+/// counts `metadata_conflicting` instead.
+#[test]
+fn key_operation_generated_generic_secret_key_rows_with_unknown_metadata() {
+    const GENERIC_SECRET_KEY_GEN: u64 = 0x0350;
+    const SHA256_HMAC: u64 = 0x0251;
+    for conflicted in [false, true] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        // CKO_SECRET_KEY, CKK_GENERIC_SECRET, CKA_VALUE_LEN 32:
+        // requested only, exactly the workload's template.
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x10u16), (4u8, 1u8, 32u16)],
+                ..ShapedS1::shaped("C_GenerateKey", CkRv::OK.0, GENERIC_SECRET_KEY_GEN, 0)
+            },
+        );
+        if conflicted {
+            for value in [3u16, 4u16] {
+                drive_quantum(
+                    &mut scene,
+                    &mut staging,
+                    &mut joint,
+                    &mut keyuse,
+                    &mut sink,
+                    &ShapedS1 {
+                        getattr_cells: vec![(1u8, 1u8, value)],
+                        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+                    },
+                );
+            }
+        }
+        for _ in 0..3 {
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1::shaped("C_SignInit", CkRv::OK.0, SHA256_HMAC, init_capture()),
+            );
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+            );
+        }
+        // One generate_key plus three signs complete in S1.
+        assert_eq!((joint.started(), joint.completed()), (4, 4), "{conflicted}");
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(committed.status, ObsStatus::Populated);
+        let object = committed
+            .objects
+            .iter()
+            .find(|row| row.creation == Some("generate"))
+            .expect("the generated key stands");
+        assert_eq!(object.origin, "created");
+        assert_eq!(object.label, None, "no label family for generic secret");
+        assert_eq!(object.successful_key_references, 3);
+        if conflicted {
+            assert!(
+                committed.key_operations.is_empty(),
+                "a conflicted key never rows"
+            );
+            let row = committed
+                .unknown_key_operations
+                .iter()
+                .find(|row| row.category == "sign" && row.reason == "metadata_conflicting")
+                .expect("the conflicted uses count conflicting");
+            assert_eq!(row.completed, 3);
+        } else {
+            assert_eq!(committed.key_operations.len(), 1, "one per-key row");
+            let row = &committed.key_operations[0];
+            assert_eq!(row.object, object.object, "the row names the generated key");
+            assert_eq!(row.category, "sign");
+            assert_eq!(row.role, "key");
+            assert_eq!(row.metadata_at_use, "unknown", "no guessed type or size");
+            assert_eq!(
+                (row.started, row.completed, row.failed, row.active),
+                (3, 3, 0, 0)
+            );
+            assert!(
+                committed
+                    .unknown_key_operations
+                    .iter()
+                    .all(|row| row.category != "sign"),
+                "the signs are not counted twice"
+            );
+            let json = crate::key_operation_projection::object_observations_json(&committed);
+            assert_eq!(json["version"], 4, "unknown metadata rows stamp v4");
+            assert_eq!(json["key_operations"][0]["metadata_at_use"], "unknown");
+        }
+    }
+}
+
 /// DEMO-4 late attach: a key first observed through FIND (its lookup
 /// and any session/login happened before attach) that signs after
 /// attach must keep a per-key row even though its type/size were

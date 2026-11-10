@@ -104,6 +104,7 @@ fn capture_args(
         quiet: false,
         duration: None,
         out: None,
+        out_is_stdout: false,
         max_events: None,
         max_scan_pids: None,
         ring_bytes: None,

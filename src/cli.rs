@@ -126,6 +126,9 @@ pub struct CaptureArgs {
     pub select_endpoint: Option<String>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
+    /// `-o -` on a trace: stdout takes the file's role as the complete
+    /// sink, so the terminal EVIDENCE stays on stdout at default.
+    pub out_is_stdout: bool,
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
@@ -188,6 +191,9 @@ pub struct RunArgs {
     pub select_endpoint: Option<String>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
+    /// `-o -` on a `--trace` run: stdout takes the file's role as the
+    /// complete sink, so the terminal EVIDENCE stays on stdout at default.
+    pub out_is_stdout: bool,
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
@@ -2362,6 +2368,7 @@ pub fn parse_capture(
         select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
+        out_is_stdout: false,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2472,6 +2479,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
+        out_is_stdout: false,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2794,6 +2802,39 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn dash_output_marks_stdout_as_the_complete_trace_sink() {
+        // `-o -` keeps out=None (no file) but records that stdout takes
+        // the file's role, so the terminal EVIDENCE stays on stdout.
+        let Command::Trace(t) = parse(args(&["trace", "--pid", "42", "-o", "-"])).unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.out, None);
+        assert!(t.out_is_stdout, "-o - must mark stdout as the sink");
+        let Command::Run(r) =
+            parse(args(&["run", "--trace", "-o", "-", "--", "/bin/true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(r.out, None);
+        assert!(r.out_is_stdout, "-o - must mark stdout as the sink");
+        // Plain omission and a real file stay unmarked.
+        let Command::Trace(plain) = parse(args(&["trace", "--pid", "42"])).unwrap() else {
+            panic!("expected trace")
+        };
+        assert!(!plain.out_is_stdout);
+        let Command::Trace(filed) = parse(args(&["trace", "--pid", "42", "-o", "t.log"])).unwrap()
+        else {
+            panic!("expected trace")
+        };
+        assert!(!filed.out_is_stdout);
+        let Command::Run(run_plain) = parse(args(&["run", "--trace", "--", "/bin/true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert!(!run_plain.out_is_stdout);
     }
 
     #[test]

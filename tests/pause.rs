@@ -44,6 +44,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         select_endpoint: None,
         duration: None,
         out: None,
+        out_is_stdout: false,
         max_events: None,
         max_scan_pids: None,
         ring_bytes: None,

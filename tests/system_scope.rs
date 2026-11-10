@@ -112,6 +112,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         select_endpoint: None,
         duration: None,
         out: None,
+        out_is_stdout: false,
         max_events: None,
         max_scan_pids,
         ring_bytes: None,

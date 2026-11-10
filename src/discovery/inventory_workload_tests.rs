@@ -1073,6 +1073,7 @@ fn system_sweep_releases_its_pins() {
         select_endpoint: None,
         duration: None,
         out: None,
+        out_is_stdout: false,
         max_events: None,
         // Under-cap: the sweep admits every live process, both sleepers
         // included, with headroom for processes born meanwhile.

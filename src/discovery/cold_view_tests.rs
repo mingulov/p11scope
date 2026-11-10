@@ -131,6 +131,7 @@ fn cold_group_discovery_keeps_tgid_scope_and_actual_callback_target() {
             select_endpoint: None,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,

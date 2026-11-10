@@ -6405,6 +6405,7 @@ fn run_owned_inner_with_host(
         select_endpoint: args.select_endpoint.clone(),
         duration: args.duration,
         out: args.out.clone(),
+        out_is_stdout: args.out_is_stdout,
         max_events: args.max_events,
         max_scan_pids: args.max_scan_pids,
         ring_bytes: args.ring_bytes,
@@ -21941,6 +21942,7 @@ int main(int argc, char **argv) {
                 quiet: false,
                 duration: None,
                 out: None,
+                out_is_stdout: false,
                 max_events: None,
                 max_scan_pids: None,
                 ring_bytes: None,
@@ -22182,6 +22184,7 @@ int main(int argc, char **argv) {
             quiet: false,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,
@@ -22281,6 +22284,7 @@ int main(int argc, char **argv) {
             quiet: false,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,
@@ -22373,6 +22377,7 @@ int main(int argc, char **argv) {
             quiet: false,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,
@@ -22455,6 +22460,7 @@ int main(int argc, char **argv) {
             select_endpoint: None,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,
@@ -22512,6 +22518,7 @@ int main(int argc, char **argv) {
             select_endpoint: None,
             duration: None,
             out: None,
+            out_is_stdout: false,
             max_events: None,
             max_scan_pids: None,
             ring_bytes: None,
@@ -26327,6 +26334,7 @@ int main(int argc, char **argv) {
     fn terminal_stdout_and_file(
         verbosity: crate::cli::TextVerbosity,
         with_file: bool,
+        _stdout_is_file: bool,
     ) -> (String, Option<Vec<u8>>) {
         let file = tempfile::tempfile().unwrap();
         let mut probe = file.try_clone().unwrap();
@@ -26365,7 +26373,8 @@ int main(int argc, char **argv) {
     /// human tail still print there.
     #[test]
     fn terminal_trace_concise_stdout_omits_evidence() {
-        let (stdout, file) = terminal_stdout_and_file(crate::cli::TextVerbosity::Concise, true);
+        let (stdout, file) =
+            terminal_stdout_and_file(crate::cli::TextVerbosity::Concise, true, false);
         let lines: Vec<&str> = stdout.lines().collect();
         assert!(
             lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
@@ -26383,10 +26392,31 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Plain default (`-o` omitted entirely) stays display-only: concise
+    /// stdout without a file and without `-o -` omits the blob too. The
+    /// `-o -` twin below is the only concise shape that keeps it.
+    #[test]
+    fn terminal_trace_concise_plain_stdout_omits_evidence() {
+        let (stdout, file) =
+            terminal_stdout_and_file(crate::cli::TextVerbosity::Concise, false, false);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
+            "{stdout}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("EVIDENCE ")),
+            "plain concise stdout must not carry the blob: {stdout}"
+        );
+        assert!(stdout.contains("0 completed calls"), "{stdout}");
+        assert!(file.is_none(), "no -o file in the plain shape");
+    }
+
     /// `-v` restores the EVIDENCE record on stdout for piped consumers.
     #[test]
     fn terminal_trace_verbose_stdout_keeps_evidence() {
-        let (stdout, _) = terminal_stdout_and_file(crate::cli::TextVerbosity::Verbose, false);
+        let (stdout, _) =
+            terminal_stdout_and_file(crate::cli::TextVerbosity::Verbose, false, false);
         let lines: Vec<&str> = stdout.lines().collect();
         assert!(
             lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
@@ -26396,6 +26426,25 @@ int main(int argc, char **argv) {
             lines.iter().any(|line| line.starts_with("EVIDENCE ")),
             "{stdout}"
         );
+    }
+
+    /// `-o -` makes stdout the complete sink: concise keeps the EVIDENCE
+    /// record there, since no file takes it. Plain concise without `-o`
+    /// stays display-only (the plain twin above pins the omission).
+    #[test]
+    fn terminal_trace_concise_stdout_is_file_keeps_evidence() {
+        let (stdout, file) =
+            terminal_stdout_and_file(crate::cli::TextVerbosity::Concise, false, true);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("COUNT_EVIDENCE ")),
+            "{stdout}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("EVIDENCE ")),
+            "stdout-is-file stdout must carry the record: {stdout}"
+        );
+        assert!(file.is_none(), "no -o file in the stdout-is-file shape");
     }
 
     /// F3: the file's EVIDENCE record accounts every terminal drop,

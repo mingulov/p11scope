@@ -12487,6 +12487,54 @@ mod tests {
             hooks: &hooks,
         };
         let mut budget = CaptureWorkBudget::default();
+        // Trigger premise, mirrored from the same-namespace twin: the
+        // child really is chrooted into the empty fixture dir with a
+        // foreign mount namespace, the raw target-root open fails, and
+        // the gated open still fails — without a host attempt — with
+        // the foreign ENOENT the `map_files` trigger needs. Without
+        // this block a successful forbidden host fallback would be
+        // invisible below (it examines with no record at all).
+        let exe = std::env::current_exe().unwrap();
+        let canonical = subject.dir.path().canonicalize().unwrap();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{pid}/root")).unwrap(),
+            canonical,
+            "the foreign-root child must be chrooted into the fixture dir"
+        );
+        assert_ne!(
+            std::fs::read_link(format!("/proc/{pid}/ns/mnt")).unwrap(),
+            std::fs::read_link("/proc/self/ns/mnt").unwrap(),
+            "the foreign-root child must run in another mount namespace"
+        );
+        view.with_filesystem(&mut budget, |filesystem, _| {
+            let error = filesystem
+                .open_rooted_detailed(&exe)
+                .expect_err("target-root open must fail inside the chroot")
+                .reason;
+            assert!(
+                error.contains("opening object within retained target root"),
+                "unexpected primitive error: {error}"
+            );
+            let gated = filesystem
+                .open_mapped_object(&exe)
+                .expect_err("the gated open must refuse the foreign namespace");
+            assert!(
+                gated.reason.contains("opening object within retained target root"),
+                "unexpected gated error: {}",
+                gated.reason
+            );
+            assert!(
+                !gated.reason.contains("(host-root fallback:"),
+                "the gated open must not attempt the host fallback: {}",
+                gated.reason
+            );
+            assert!(
+                map_files_fallback_triggered(&gated),
+                "the gated failure must trigger the map_files fallback: {gated:?}"
+            );
+            Ok::<(), String>(())
+        })
+        .unwrap();
         let (outcome, examined, _) = scan_process_view_examined(&request, &view, &mut budget)
             .expect("scan foreign-root child");
         assert!(view.still_the_same());

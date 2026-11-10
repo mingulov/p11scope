@@ -2082,7 +2082,7 @@ fn empty_churn_reuses_the_committed_candidate() {
     engine.fail_full_candidate_rebuild_for_test = true;
     let removed: BTreeSet<ProcessViewId> =
         [ProcessViewId(0), ProcessViewId(1)].into_iter().collect();
-    let refreshed: Vec<(ProcessViewId, Vec<ScannedModule>, PinnedObjects)> = [2u64, 3]
+    let refreshed: Vec<(ProcessViewId, Vec<ScannedModule>, PinnedObjects)> = [2, 3]
         .into_iter()
         .map(|id| (ProcessViewId(id), Vec::new(), PinnedObjects::empty()))
         .collect();
@@ -2096,7 +2096,13 @@ fn empty_churn_reuses_the_committed_candidate() {
         })
         .collect();
     let candidate = engine
-        .inventory_candidate(&removed, &refreshed, &new_views, Vec::new(), &BTreeSet::new())
+        .inventory_candidate(
+            &removed,
+            &refreshed,
+            &new_views,
+            Vec::new(),
+            &BTreeSet::new(),
+        )
         .expect("empty churn reuses the committed candidate");
     assert!(
         candidate.delta.new.is_empty()

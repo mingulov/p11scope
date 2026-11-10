@@ -1837,7 +1837,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
             "DISCOVER_BTRFS_SUBVOL_TESTS=1",
-            "INTEGRATION_TESTS=21",
+            "INTEGRATION_TESTS=22",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -1970,14 +1970,17 @@ class IgnoredTestsTests(unittest.TestCase):
                  "privileged_run_tree_double_fork_shows_reparented_calls",
                  "privileged_run_tree_outliving_child_is_disclosed",
                  "privileged_run_tree_many_children_land_exact"])
+            write_fake_integration_binary(
+                deps, "trace_pid_target",
+                ["privileged_trace_pid_names_target_on_stderr"])
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (21)", result.stdout)
+        self.assertIn("integration (22)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (21 entries)", result.stdout)
+                      "test per entry (22 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

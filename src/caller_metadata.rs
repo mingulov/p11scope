@@ -1683,4 +1683,38 @@ mod tests {
             "{path}"
         );
     }
+
+    #[test]
+    fn workload_label_ignores_repeated_id_in_trailing_unit() {
+        // Repeated-ID twin: a trailing non-container unit reusing the
+        // outer Docker id must not move the shared position past the
+        // inner Podman scope.
+        let outer = workload_id('a');
+        let inner = workload_id('b');
+        let prefix = format!("system.slice/docker-{outer}.scope/libpod-{inner}.scope");
+        assert_eq!(
+            workload_label_for_cgroup_path(&prefix),
+            format!("container {inner} (podman)"),
+            "{prefix}"
+        );
+        let path = format!("{prefix}/job-{outer}.service");
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("container {inner} (podman)"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn workload_label_prefers_inner_podman_for_shared_container_id() {
+        // Same-ID twin: docker outer and libpod inner share one id;
+        // the innermost runtime component (libpod) wins.
+        let id = workload_id('a');
+        let path = format!("system.slice/docker-{id}.scope/libpod-{id}.scope/container");
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("container {id} (podman)"),
+            "{path}"
+        );
+    }
 }

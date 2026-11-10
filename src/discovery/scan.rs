@@ -18580,6 +18580,8 @@ mod tests {
             proven,
         ));
         fixture.mountinfo_empty = Some(false);
+        // Match the maps key so a stuck-true exemption would examine and fail.
+        fixture.restated = Some(fixture.key);
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),

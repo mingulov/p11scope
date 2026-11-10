@@ -176,6 +176,39 @@ const DEADLINE_DEFERRED: &str = "inventory scan deadline passed; the scan defers
 /// Pinned verbatim: the oracle matches this subject.
 const PARTIAL_ATTACH_SUBJECT: &str = "native endpoint attach failed";
 
+/// O1 endpoint evidence: deferred endpoints make their module undercount
+/// exactly like failed ones, but a deferral is not a failure — the
+/// endpoint attaches on a later pass — so deferrals stage under their
+/// own subject, never the failure one. Pinned verbatim: the oracle
+/// matches this subject for the attach drain and COUNT-EXACT.
+const DEFERRED_ATTACH_SUBJECT: &str = "native endpoint attach deferred";
+
+/// One stop-time deferral fold input: how many receipts deferred for the
+/// key, the peak per-receipt deferral, and every endpoint id ever
+/// deferred for it. The fold subtracts attached and failed ids and
+/// reattributes the remainder by fold-time membership, so an endpoint
+/// evicted after its deferral surfaces under "no recorded module"
+/// instead of vanishing.
+#[derive(Debug, Default)]
+struct DeferralFold {
+    passes: u32,
+    max_deferred: usize,
+    deferred_ids: BTreeSet<EndpointId>,
+}
+
+/// The caller-registry key for an attach-set module key (O1 gap
+/// attribution, mid-run and folded alike): one spelling, so the folded
+/// gap can only attribute where the per-receipt gaps did.
+fn attach_module_registry_key(key: &AttachModuleKey) -> ModuleKey {
+    ModuleKey::physical(
+        key.object.device.major,
+        key.object.device.minor,
+        key.object.inode,
+        Some(key.sha256.clone()),
+        "",
+    )
+}
+
 /// Bound on distinct never-admitted EXEC pids awaiting reconcile against
 /// scan enumerations. A quiet host holds tens across two passes and a
 /// tight fork loop hundreds; 4096 (one per retainable caller) absorbs
@@ -508,6 +541,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// What the capture facade's receipts say per endpoint, once native
     /// capture runs (Task 6 C3); `None` in the scan lane.
     capture: Option<CaptureCoverage>,
+    /// Per-module attach-deferral fold inputs (`None`: endpoints no
+    /// module claims), accumulated as receipts stage deferral gaps and
+    /// consumed once by the stop-time fold. Bounded: one entry per
+    /// module with a deferral, one id per deferred endpoint.
+    deferral_folds: BTreeMap<Option<AttachModuleKey>, DeferralFold>,
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
@@ -1081,6 +1119,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             last_pass_decisions: DecisionLog::default(),
             pending_targets: TargetDelta::default(),
             capture: None,
+            deferral_folds: BTreeMap::new(),
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
@@ -3378,17 +3417,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// O1 endpoint evidence: one gap per module with new failures or
-    /// deferrals in this receipt. Failed endpoints are sticky (never
-    /// retried — bounded: every failed endpoint lands in exactly one
-    /// receipt); deferred endpoints are retried, but the deferral
-    /// window's calls never come back, so the gap is sticky too even
-    /// when a later receipt attaches the endpoint. Failed or deferred
-    /// members make the module undercount, so its counted uses are
-    /// lower bounds; the oracle withholds COUNT-EXACT over it
-    /// (explicitly nonqualifying). Endpoints no module claims (evicted
-    /// before the receipt) report run-wide. The subject and reason
-    /// shapes are pinned verbatim: the oracle matches them.
+    /// O1 endpoint evidence: one gap per cause per module with new
+    /// failures or deferrals in this receipt. Failed endpoints are
+    /// sticky (never retried — bounded: every failed endpoint lands in
+    /// exactly one receipt) and keep the failure subject; deferred
+    /// endpoints are retried, but the deferral window's calls never
+    /// come back, so the gap is sticky too even when a later receipt
+    /// attaches the endpoint — under the deferral subject, never the
+    /// failure one. Failed or deferred members make the module
+    /// undercount, so its counted uses are lower bounds; the oracle
+    /// withholds COUNT-EXACT over it (explicitly nonqualifying).
+    /// Endpoints no module claims (evicted before the receipt) report
+    /// run-wide. The subject and reason shapes are pinned verbatim:
+    /// the oracle matches them. The stop-time fold collapses each
+    /// module's per-receipt deferral gaps to one.
     fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
         // Deferred endpoints dedupe: a receipt may carry the same
         // endpoint twice across its defer calls.
@@ -3404,8 +3446,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        let mut by_module: BTreeMap<AttachModuleKey, (usize, usize)> = BTreeMap::new();
-        let mut unclaimed = (0usize, 0usize);
+        let mut by_module: BTreeMap<AttachModuleKey, (usize, BTreeSet<EndpointId>)> =
+            BTreeMap::new();
+        let mut unclaimed = (0usize, BTreeSet::new());
         for failed in &receipt.failed {
             let owners: Vec<AttachModuleKey> = self
                 .attach_set
@@ -3424,10 +3467,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let owners: Vec<AttachModuleKey> =
                 self.attach_set.modules_with_member(*id).cloned().collect();
             if owners.is_empty() {
-                unclaimed.1 += 1;
+                unclaimed.1.insert(*id);
             } else {
                 for key in owners {
-                    by_module.entry(key).or_default().1 += 1;
+                    by_module.entry(key).or_default().1.insert(*id);
                 }
             }
         }
@@ -3444,15 +3487,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // the reason carries this receipt's new failures.
                 _ => (0, failed_here),
             };
-            let registry_key = ModuleKey::physical(
-                key.object.device.major,
-                key.object.device.minor,
-                key.object.inode,
-                Some(key.sha256.clone()),
-                "",
-            );
-            let mut parts = Vec::new();
+            let registry_key = attach_module_registry_key(&key);
             if failed_total > 0 {
+                let mut parts = Vec::new();
                 if total > 0 {
                     parts.push(format!(
                         "{failed_total} of {total} endpoints failed to attach (sticky, never retried)"
@@ -3462,50 +3499,136 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         "{failed_total} endpoints failed to attach (sticky, never retried)"
                     ));
                 }
+                parts.push("counted uses are lower bounds".to_string());
+                // Keyed (F3-04): the module may be staged-but-uncommitted
+                // (first-discovered this pass — receipts run pre-commit),
+                // so the ID resolves at publication, after its mapping
+                // commits, instead of reporting run-wide.
+                self.registry.record_gap_for_key(
+                    None,
+                    registry_key.clone(),
+                    None,
+                    PARTIAL_ATTACH_SUBJECT.into(),
+                    parts.join("; "),
+                    None,
+                );
             }
-            if deferred_here > 0 {
-                parts.push(format!(
-                    "{deferred_here} endpoint(s) still deferred when the receipt closed"
-                ));
+            if !deferred_here.is_empty() {
+                let deferred_here_count = deferred_here.len();
+                self.registry.record_gap_for_key(
+                    None,
+                    registry_key,
+                    None,
+                    DEFERRED_ATTACH_SUBJECT.into(),
+                    format!(
+                        "{deferred_here_count} endpoint(s) still deferred when the receipt closed; \
+                         counted uses are lower bounds"
+                    ),
+                    None,
+                );
+                let fold = self.deferral_folds.entry(Some(key)).or_default();
+                fold.passes += 1;
+                fold.max_deferred = fold.max_deferred.max(deferred_here_count);
+                fold.deferred_ids.extend(deferred_here);
             }
-            parts.push("counted uses are lower bounds".to_string());
-            // Keyed (F3-04): the module may be staged-but-uncommitted
-            // (first-discovered this pass — receipts run pre-commit),
-            // so the ID resolves at publication, after its mapping
-            // commits, instead of reporting run-wide.
-            self.registry.record_gap_for_key(
-                None,
-                registry_key,
-                None,
-                PARTIAL_ATTACH_SUBJECT.into(),
-                parts.join("; "),
-                None,
-            );
         }
-        if unclaimed.0 > 0 || unclaimed.1 > 0 {
-            let mut parts = Vec::new();
-            if unclaimed.0 > 0 {
-                parts.push(format!(
-                    "{} endpoint(s) with no recorded module failed to attach (sticky, never retried)",
-                    unclaimed.0
-                ));
-            }
-            if unclaimed.1 > 0 {
-                parts.push(format!(
-                    "{} endpoint(s) with no recorded module still deferred when the receipt closed",
-                    unclaimed.1
-                ));
-            }
-            parts.push("counted uses are lower bounds".to_string());
+        let (unclaimed_failed, unclaimed_deferred) = unclaimed;
+        if unclaimed_failed > 0 {
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
                 pid: None,
                 subject: PARTIAL_ATTACH_SUBJECT.into(),
-                reason: parts.join("; "),
+                reason: format!(
+                    "{unclaimed_failed} endpoint(s) with no recorded module failed to attach \
+                     (sticky, never retried); counted uses are lower bounds"
+                ),
                 budget: None,
             });
         }
+        if !unclaimed_deferred.is_empty() {
+            let unclaimed_deferred_count = unclaimed_deferred.len();
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: DEFERRED_ATTACH_SUBJECT.into(),
+                reason: format!(
+                    "{unclaimed_deferred_count} endpoint(s) with no recorded module still deferred \
+                     when the receipt closed; counted uses are lower bounds"
+                ),
+                budget: None,
+            });
+            let fold = self.deferral_folds.entry(None).or_default();
+            fold.passes += 1;
+            fold.max_deferred = fold.max_deferred.max(unclaimed_deferred_count);
+            fold.deferred_ids.extend(unclaimed_deferred);
+        }
+    }
+
+    /// Stop-time deferral fold: the per-receipt deferral gaps collapse to
+    /// one gap per module (plus one run-wide gap for endpoints no module
+    /// claims), carrying the peak deferral, the pass count and the stop
+    /// outcome. Outstanding ids reattribute by fold-time membership, so
+    /// an endpoint evicted after its deferral counts under "no recorded
+    /// module". Silent when no receipt ever deferred. True when anything
+    /// staged, so the tail can publish it. Runs once, from
+    /// [`Self::end_capture_coverage`].
+    fn fold_deferred_attach_gaps(&mut self) -> bool {
+        if self.deferral_folds.is_empty() {
+            return false;
+        }
+        let folds = std::mem::take(&mut self.deferral_folds);
+        let Some(capture) = self.capture.as_ref() else {
+            return false;
+        };
+        let mut outstanding: BTreeMap<Option<AttachModuleKey>, usize> = BTreeMap::new();
+        for fold in folds.values() {
+            for id in &fold.deferred_ids {
+                if capture.attached_at.contains_key(id) || capture.failed.contains(id) {
+                    continue;
+                }
+                let owners: Vec<AttachModuleKey> =
+                    self.attach_set.modules_with_member(*id).cloned().collect();
+                if owners.is_empty() {
+                    *outstanding.entry(None).or_default() += 1;
+                } else {
+                    for key in owners {
+                        *outstanding.entry(Some(key)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut folded = Vec::with_capacity(folds.len());
+        for (key, fold) in &folds {
+            let still = outstanding.get(key).copied().unwrap_or(0);
+            let scope = if key.is_some() {
+                String::new()
+            } else {
+                " with no recorded module".to_string()
+            };
+            let passes = if fold.passes == 1 {
+                "1 pass".to_string()
+            } else {
+                format!("{} passes", fold.passes)
+            };
+            let reason = if still == 0 {
+                format!(
+                    "attach finished late: up to {} endpoint(s){scope} deferred over {passes} \
+                     (all attached by stop); counted uses are lower bounds",
+                    fold.max_deferred,
+                )
+            } else {
+                format!(
+                    "attach unfinished at stop: up to {} endpoint(s){scope} deferred over {passes} \
+                     ({still} still deferred at stop); counted uses are lower bounds",
+                    fold.max_deferred,
+                )
+            };
+            folded.push((key.as_ref().map(attach_module_registry_key), reason));
+        }
+        self.registry
+            .fold_deferral_gaps(DEFERRED_ATTACH_SUBJECT, folded)
     }
 
     /// Absorbs the capture's scope custody (`InventoryCapture::custody`,
@@ -3883,6 +4006,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             "native capture stopped before a clean health read proved the watch",
             until,
         );
+        // The per-receipt deferral gaps collapse now that no receipt can
+        // stage another: one gap per module with the peak, the pass
+        // count and the stop outcome. Runs once: a second call returns
+        // at the stopped check above.
+        self.fold_deferred_attach_gaps();
     }
 
     /// Whether `caller` (at `pid`) is the capture's scope incarnation.
@@ -15451,7 +15579,8 @@ pub(crate) mod tests {
                 })
                 .count();
         assert_eq!(
-            failed_deferrals, 0,
+            failed_deferrals,
+            0,
             "deferrals stage under the deferral subject, never failed: {:?} {:?}",
             coordinator.registry.gaps(),
             coordinator.registry.staged_gaps_for_test(),
@@ -15774,9 +15903,7 @@ pub(crate) mod tests {
         // and no "failed" line names a deferral.
         use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
         use crate::discovery::inventory_attach_set::tests as fx;
-        use crate::inventory_present::{
-            Presentation, render_snapshot_with_verbosity,
-        };
+        use crate::inventory_present::{Presentation, render_snapshot_with_verbosity};
         let dir = tempfile::tempdir().unwrap();
         let a = fx::provider(&dir, "a.so", "provider-a");
         let pins = fx::pass_pins(&[(&a, "sha-a")]);
@@ -15836,8 +15963,7 @@ pub(crate) mod tests {
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
         let presentation = Presentation::capture(&coordinator, "workload", 50, 100, 1);
-        let out =
-            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
         assert!(
             out.contains("coverage: partial"),
             "the folded deferral keeps the report PARTIAL: {out}"
@@ -15852,14 +15978,21 @@ pub(crate) mod tests {
             "one concise line for the folded deferral: {out}"
         );
         assert!(
-            deferred_lines[0].contains("up to 4")
-                && deferred_lines[0].contains("over 2 passes")
-                && deferred_lines[0].contains("all attached by stop"),
-            "the line carries the folded counts: {out}"
+            deferred_lines[0].contains("up to 4"),
+            "the line carries the folded peak (the tail truncates by design): {out}"
         );
         assert!(
             !out.contains("native endpoint attach failed"),
             "no failed line names a deferral: {out}"
+        );
+        let verbose =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains(
+                "attach finished late: up to 4 endpoint(s) deferred over 2 passes \
+                 (all attached by stop); counted uses are lower bounds"
+            ),
+            "verbose carries the full folded reason: {verbose}"
         );
     }
 

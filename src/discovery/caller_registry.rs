@@ -4950,6 +4950,61 @@ impl CallerRegistry {
         });
     }
 
+    /// Stop-time deferral fold: drop every staged gap and remove every
+    /// applied gap with `subject`, then stage one folded gap per entry —
+    /// keyed entries resolve their module at apply (F3-04), unkeyed ones
+    /// report run-wide. The per-receipt rows go first: the folded gaps
+    /// share the subject, so staging before removing would drop them.
+    /// Suppression accounting stands: a suppressed per-receipt row stays
+    /// counted as suppressed. Returns true when anything staged, so the
+    /// tail can publish it.
+    pub(crate) fn fold_deferral_gaps(
+        &mut self,
+        subject: &str,
+        folded: Vec<(Option<ModuleKey>, String)>,
+    ) -> bool {
+        self.staged.retain(|mutation| match mutation {
+            Mutation::RecordGap { gap, .. } => gap.subject.as_str() != subject,
+            Mutation::RecordKeyedGap {
+                subject: staged, ..
+            } => staged.as_str() != subject,
+            _ => true,
+        });
+        if self.gaps.iter().any(|gap| gap.subject == subject) {
+            let mut kept = Vec::with_capacity(self.gaps.len());
+            let mut kept_repeats = Vec::with_capacity(self.gaps.len());
+            for (gap, repeats) in self.gaps.drain(..).zip(self.gap_repeats.drain(..)) {
+                if gap.subject != subject {
+                    kept.push(gap);
+                    kept_repeats.push(repeats);
+                }
+            }
+            self.gaps = kept;
+            self.gap_repeats = kept_repeats;
+            self.gap_index.clear();
+            for (index, gap) in self.gaps.iter().enumerate() {
+                self.gap_index.insert(gap.clone(), index);
+            }
+        }
+        let staged = !folded.is_empty();
+        for (key, reason) in folded {
+            match key {
+                Some(key) => {
+                    self.record_gap_for_key(None, key, None, subject.to_string(), reason, None)
+                }
+                None => self.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: subject.to_string(),
+                    reason,
+                    budget: None,
+                }),
+            }
+        }
+        staged
+    }
+
     /// Apply every staged mutation in order and publish the snapshot.
     /// Returns the number of applied mutations. Ledger-less: Joint
     /// feeds reduce S1Only-direct and key-use opens charge the

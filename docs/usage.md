@@ -1778,8 +1778,14 @@ Limits that matter in pods:
   (`selection`, `mechanism` `uprobe-multi` or `per-offset`, `fallback`,
   `scope_filter`), and the start and stop lines name the mechanism. The
   stop's wait budget is 5 s plus 150 ms per per-offset link, or 100 ms
-  per uprobe-multi link plus 10 ms per entry in it, at most 10 s.
-  `native`
+  per uprobe-multi link plus 10 ms per entry in it, at most 10 s. The
+  lane attaches in batches across passes, so a large module's entries
+  may still be deferred when a pass's receipt closes: calls through
+  them in that window are never counted, and the report stays
+  `PARTIAL` with the cause `native endpoint attach deferred` — one
+  gap per module naming the peak deferral, the pass count and whether
+  every endpoint had attached by stop. Endpoints that failed to attach
+  keep their own `native endpoint attach failed` gap. `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
   start and, for `--pid`, otherwise falls back to `scan` with the gap

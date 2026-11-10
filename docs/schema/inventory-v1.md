@@ -88,6 +88,22 @@ A native document adds to `observation`:
     loss itself stays: the `native capture lifecycle evidence lost` gap
     and its demotion apply for the rest of the capture.
 
+The native lane attaches in batches across passes: every pass whose
+extend receipt still holds deferred endpoints stages one gap with
+`subject` `native endpoint attach deferred` per affected module (and
+one run-wide gap for deferred endpoints no module claims), with the
+pass's still-deferred count in `reason`. Calls made through an
+endpoint while it is deferred are never counted, so the module's
+counted uses are lower bounds. At stop the per-pass gaps fold to one
+gap per module (plus the run-wide one when it applies): `reason`
+reads `attach finished late: up to {max} endpoint(s) deferred over
+{passes} passes (all attached by stop); counted uses are lower
+bounds`, or `attach unfinished at stop: ... ({still} still deferred
+at stop); counted uses are lower bounds` when some never attached.
+Endpoints that failed to attach (sticky, never retried) keep their
+own gap with `subject` `native endpoint attach failed`. Any of these
+gaps forces a `PARTIAL` verdict.
+
 In the native lane an admitted edge no coverage note reached reads
 `not_attached`, never `scan_only`. When the observer's `/proc` numbering is
 not the kernel's (`pid_namespace`), native `--system` still binds witnesses

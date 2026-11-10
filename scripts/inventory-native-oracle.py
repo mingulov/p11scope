@@ -103,7 +103,10 @@ AUTHORITY_DISCLOSURE_SUBJECT = "exact image authority unavailable"
 # src/discovery/inventory_coordinator.rs) — counted uses are lower
 # bounds, so COUNT-EXACT over the module is explicitly nonqualifying
 # and the COUNT-WINDOW lower bound is clamped (saturation-shaped).
-PARTIAL_ATTACH = re.compile(r"endpoint attach fail", re.I)
+# Deferred endpoints undercount the same way under their own subject
+# (DEFERRED_ATTACH_SUBJECT); the old subject stays matched for
+# recorded streams that predate the fold.
+PARTIAL_ATTACH = re.compile(r"endpoint attach (fail|defer)", re.I)
 # Demoted edge (fix round 4, R4-N2): a demoted placement marks its edge
 # (DEMOTED_COUNT_PLACED in src/discovery/caller_registry.rs) — the
 # count is segment-relative growth from the base read, so the window
@@ -7040,12 +7043,15 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
     return manifest
 
 
-# The attach receipt's backlog marker (PARTIAL_ATTACH_SUBJECT in
+# The attach receipt's backlog marker (DEFERRED_ATTACH_SUBJECT in
 # src/discovery/inventory_coordinator.rs): a pass that records or repeats no
 # gap with this subject and a "still deferred" reason drained its kernel
 # attach backlog. Sticky "failed to attach" gaps never drain; they are
 # terminal and must not block the gate (the COUNT judgment prices them).
-ATTACH_DEFERRED_SUBJECT = "native endpoint attach failed"
+# The old failure subject stays matched for recorded streams that
+# predate the fold.
+ATTACH_DEFERRED_SUBJECTS = ("native endpoint attach failed",
+                            "native endpoint attach deferred")
 ATTACH_DEFERRED_MARKER = "still deferred"
 
 
@@ -7070,7 +7076,7 @@ def capacity_attach_drained(rows):
             continue
         event = row.get("event") or {}
         if row.get("kind") == "gap_recorded":
-            if event.get("subject") == ATTACH_DEFERRED_SUBJECT \
+            if event.get("subject") in ATTACH_DEFERRED_SUBJECTS \
                     and ATTACH_DEFERRED_MARKER in (event.get("reason") or ""):
                 deferred_indexes.add(event.get("index"))
                 last_deferred_ns = at_ns

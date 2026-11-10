@@ -843,25 +843,47 @@ fn trusted_scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// True when a pending-coverage gap reason names `pid` in its bounded
+/// `(pids N, M, ...)` list. Exact token match, never substring: pid 12
+/// must not match 123, and a truncated `and N more` tail names nobody.
+fn gap_reason_names_pid(reason: &str, pid: u32) -> bool {
+    let want = pid.to_string();
+    let Some(list) = reason.split("(pids ").nth(1) else {
+        return false;
+    };
+    let list = list.split(')').next().unwrap_or("");
+    list.split(", ").any(|token| {
+        let token = token.strip_prefix("and ").unwrap_or(token);
+        !token.contains(' ') && token == want
+    })
+}
+
 /// Condition driver for the churn test: tails the observer's `--event-log`
-/// while it runs and kills the anchor plus churn-A once churn-A's
-/// admission publishes. No fixed sleeps: the kill lands between two
-/// passes (right after the admitting pass publishes, about a second
-/// before the next pass enumerates), whatever the host's pass cadence.
-/// Infallible by construction: a missed signal surfaces as a loud
-/// document assertion below, never as a pump panic.
+/// while it runs, births churn-C when the first pass publishes, and kills
+/// the anchor plus churn-A once churn-A's admission publishes. No fixed
+/// sleeps: the birth and the kill land right after the publishing pass,
+/// whatever the host's pass cadence (under overrun the next pass is due
+/// at once, and the deaths are observed either as absent-from-enumeration
+/// or dead-at-scan-time). Infallible by construction: a missed signal
+/// surfaces as a loud document assertion below, never as a pump panic.
 struct ChurnCondition {
     ready: PathBuf,
     events: PathBuf,
+    birth_fifo: PathBuf,
     driver_exe: String,
     offset: u64,
     pending: String,
     anchor: Option<u32>,
     churn_a: Option<u32>,
     churn_b: Option<u32>,
+    spawner: Option<u32>,
+    churn_c: Option<u32>,
     admitted: BTreeSet<u32>,
     exited: BTreeSet<u32>,
     killed: bool,
+    birth_fired: bool,
+    last_pass: Option<u64>,
+    kill_admitting_pass: Option<u64>,
 }
 
 impl ChurnCondition {
@@ -879,6 +901,17 @@ impl ChurnCondition {
             self.anchor = anchor;
             self.churn_a = churn_a;
             self.churn_b = churn_b;
+        }
+        // The spawner pid file is pre-exec too, but it gates nothing:
+        // churn-C's own pid covers the guard once born, and a missing
+        // file fails loudly below instead of stalling the baseline.
+        if self.spawner.is_none() {
+            self.spawner = try_ready_pid(&self.ready.join("spawner.pid"));
+        }
+        // Churn-C is born mid-run, after the first published pass, so
+        // its ready file appears on a later tick; a torn read retries.
+        if self.churn_c.is_none() {
+            self.churn_c = try_ready_pid(&self.ready.join("churn-c.ready"));
         }
         let mut file = match std::fs::File::open(&self.events) {
             Ok(file) => file,
@@ -905,6 +938,15 @@ impl ChurnCondition {
             // signalled on a later tick, and the document assertions
             // below stay loud about the missed kill.
             self.killed = true;
+            // Admitted events precede their pass marker in the commit
+            // batch, so the admitting pass is one past the last marker
+            // seen (pass 0 when none seen yet); the kill-cadence assert
+            // below needs a later pass observing the deaths.
+            self.kill_admitting_pass = Some(
+                self.last_pass
+                    .map(|pass| pass.saturating_add(1))
+                    .unwrap_or(0),
+            );
             if let (Some(churn_a), Some(anchor)) = (self.churn_a, self.anchor)
                 && pid_is_driver(churn_a, &self.driver_exe)
                 && pid_is_driver(anchor, &self.driver_exe)
@@ -917,11 +959,39 @@ impl ChurnCondition {
         }
     }
 
+    fn handle_pass_marker(&mut self, payload: &Value) {
+        // The mid-run birth trigger: the first published pass, whatever
+        // its number, wakes the FIFO-blocked spawner exactly once. The
+        // FIFO opens O_RDWR so it never blocks; a failed write still
+        // latches, and the churn-C asserts below stay loud about it.
+        if !self.birth_fired {
+            self.birth_fired = true;
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.birth_fifo)
+                .and_then(|mut fifo| {
+                    use std::io::Write as _;
+                    fifo.write_all(b"x\n")
+                });
+        }
+        // Only real passes count for the kill-cadence guard: the stop
+        // commit's marker reuses the last pass number and scans nothing.
+        let terminal = payload.get("final").and_then(Value::as_bool) == Some(true);
+        if !terminal && let Some(pass) = payload.get("pass").and_then(Value::as_u64) {
+            self.last_pass = Some(self.last_pass.map_or(pass, |last| last.max(pass)));
+        }
+    }
+
     fn handle_event_line(&mut self, line: &str) {
         let event: Value = match serde_json::from_str(line) {
             Ok(event) => event,
             Err(_) => return,
         };
+        if event["kind"] == "pass_committed" {
+            self.handle_pass_marker(&event["event"]);
+            return;
+        }
         if event["kind"] != "caller_event" {
             return;
         }
@@ -989,25 +1059,37 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let mut condition = ChurnCondition {
         ready: ready.clone(),
         events: events.clone(),
+        birth_fifo: ready.join("birth.fifo"),
         driver_exe: driver.to_string_lossy().into_owned(),
         offset: 0,
         pending: String::new(),
         anchor: None,
         churn_a: None,
         churn_b: None,
+        spawner: None,
+        churn_c: None,
         admitted: BTreeSet::new(),
         exited: BTreeSet::new(),
         killed: false,
+        birth_fired: false,
+        last_pass: None,
+        kill_admitting_pass: None,
     };
     let (output, peak) = spawn_with_peak_pumping(&mut cmd, &stderr_log, &mut || condition.pump());
     // Final tail: the last pass may have published between the final
     // pump tick and the child's exit.
     condition.pump();
     let guard = FixtureGuard {
-        pids: [condition.anchor, condition.churn_a, condition.churn_b]
-            .into_iter()
-            .flatten()
-            .collect(),
+        pids: [
+            condition.anchor,
+            condition.churn_a,
+            condition.churn_b,
+            condition.churn_c,
+            condition.spawner,
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     };
     let stderr = std::fs::read_to_string(&stderr_log).unwrap();
     assert!(
@@ -1020,6 +1102,12 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let anchor_pid = condition.anchor.expect("helper readied the anchor");
     let churn_a_pid = condition.churn_a.expect("helper readied churn-A");
     let churn_b_pid = condition.churn_b.expect("helper readied churn-B");
+    let churn_c_pid = condition
+        .churn_c
+        .expect("helper birthed churn-C after the first pass");
+    let _spawner_pid = condition
+        .spawner
+        .expect("helper recorded the mid-run spawner");
     assert!(
         peak < OBSERVER_RSS_BOUND_BYTES,
         "observer peak RSS {peak} stays within {OBSERVER_RSS_BOUND_BYTES}"
@@ -1034,8 +1122,21 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         passes >= 2,
         "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes in 14s"
     );
-    // The conditions fired mid-run: every fixture admitted, the two
-    // conditioned kills observed dead, the survivor never exited.
+    // Kill-cadence guard: the conditioned kill needs a pass AFTER the
+    // admitting pass observing the deaths. `passes >= 2` alone does
+    // not prove that when the kill fires on the final pass's publish.
+    if let Some(admitting) = condition.kill_admitting_pass {
+        let last = condition
+            .last_pass
+            .expect("pass markers published for completed passes");
+        assert!(
+            last > admitting,
+            "conditioned kill landed on pass {admitting}'s publish but no later pass published (last pass {last}); the mid-run deaths need a pass after the admitting pass"
+        );
+    }
+    // The conditions fired mid-run: every baseline fixture admitted,
+    // the two conditioned kills observed dead, the survivor never
+    // exited. Churn-C (the mid-run birth) is asserted separately below.
     for (pid, name) in [
         (anchor_pid, "anchor"),
         (churn_a_pid, "churn-A"),
@@ -1082,12 +1183,64 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let churn_b = incarnations(churn_b_pid)[0];
     assert_eq!(churn_b["lifecycle"], "mapped");
     assert_eq!(churn_b["retired"], false);
+    // The mid-run birth: churn-C is forked after the first published
+    // pass and lives to run end, so it is admitted mid-run and settled
+    // mapped — or, when it died first, settled dead when admitted, else
+    // counted in its named gap. Every leg is exact; no leg passes
+    // vacuously. (A SIGKILLed harness orphans the FIFO-blocked spawner
+    // the same way it orphans sleepers; every other exit path kills it
+    // through the guard above, including assert panics.)
+    let churn_c_incarnations = incarnations(churn_c_pid);
+    if pid_is_driver(churn_c_pid, &condition.driver_exe) {
+        assert!(
+            condition.admitted.contains(&churn_c_pid),
+            "churn-C (pid {churn_c_pid}) born mid-run admitted"
+        );
+        assert!(
+            !condition.exited.contains(&churn_c_pid),
+            "churn-C (pid {churn_c_pid}) stays alive to run end"
+        );
+        assert_eq!(churn_c_incarnations.len(), 1, "one churn-C incarnation");
+        let churn_c = churn_c_incarnations[0];
+        assert_eq!(churn_c["lifecycle"], "mapped");
+        assert_eq!(churn_c["retired"], false);
+    } else if condition.admitted.contains(&churn_c_pid) {
+        // Died after admission: settled dead, never silently dropped.
+        assert_eq!(churn_c_incarnations.len(), 1, "one churn-C incarnation");
+        let churn_c = churn_c_incarnations[0];
+        assert_eq!(churn_c["lifecycle"], "exited");
+        assert_eq!(churn_c["retired"], true);
+        assert!(churn_c["lifecycle_reason"].is_string());
+    } else {
+        // Died before admission: never a caller row, counted in its
+        // named gap — the short-lived aggregate once two passes miss
+        // it, else the pending-coverage gap naming its pid. (Scan-only
+        // capture has no exec hooks, so an unadmitted death there fails
+        // loudly here instead of passing silently.)
+        assert!(
+            churn_c_incarnations.is_empty(),
+            "churn-C (pid {churn_c_pid}) died unadmitted and must leave no caller row"
+        );
+        let gaps = doc["gaps"].as_array().unwrap();
+        let counted = gaps.iter().any(|gap| {
+            gap["subject"] == "short-lived processes never scanned"
+                || (gap["subject"] == "discovery coverage ended before stop"
+                    && gap["reason"]
+                        .as_str()
+                        .is_some_and(|reason| gap_reason_names_pid(reason, churn_c_pid)))
+        });
+        assert!(
+            counted,
+            "churn-C (pid {churn_c_pid}) died before admission and must be counted in its named gap"
+        );
+    }
     // Every observed caller is live or retired-with-reason, every owned
     // edge resolves.
-    let our_pids: std::collections::HashSet<u64> = [anchor_pid, churn_a_pid, churn_b_pid]
-        .into_iter()
-        .map(u64::from)
-        .collect();
+    let our_pids: std::collections::HashSet<u64> =
+        [anchor_pid, churn_a_pid, churn_b_pid, churn_c_pid]
+            .into_iter()
+            .map(u64::from)
+            .collect();
     for caller in doc["callers"].as_array().unwrap() {
         if !our_pids.contains(&caller["pid"].as_u64().unwrap()) {
             continue;

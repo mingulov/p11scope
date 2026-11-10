@@ -32652,15 +32652,28 @@ impl Engine {
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
-    ) -> Option<anyhow::Error> {
+    ) -> (Option<anyhow::Error>, InitialArmCounts) {
+        let views = self.views.len() as u64;
+        let mut stale = 0u64;
+        let mut attached = 0u64;
+        let arms_before = self.loader_arms;
         for position in 0..self.views.len() {
             if !self.views[position].still_the_same() {
+                stale = stale.saturating_add(1);
                 continue;
             }
-            if let Err(error) =
-                self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
-            {
-                return Some(error);
+            match self.arm_loader_or_partial(position, session, additions_allowed, pending_views) {
+                Err(error) => {
+                    return (
+                        Some(error),
+                        self.initial_arm_counts(views, stale, arms_before, attached),
+                    );
+                }
+                Ok(changed) => {
+                    if changed {
+                        attached = attached.saturating_add(1);
+                    }
+                }
             }
             // Staged plus Engine-held never exceeds the shared allowance;
             // whatever does not fit waits in the ring for the next staging
@@ -32668,10 +32681,36 @@ impl Engine {
             // ring overflow meanwhile).
             let held = self.discovery_held_len();
             if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
-                return Some(error);
+                return (
+                    Some(error),
+                    self.initial_arm_counts(views, stale, arms_before, attached),
+                );
             }
         }
-        None
+        (
+            None,
+            self.initial_arm_counts(views, stale, arms_before, attached),
+        )
+    }
+
+    /// Aggregate the initial-arm counts: attempted arms are the
+    /// `loader_arms` delta (gated views never increment it), so gated
+    /// views are the remainder after stale and attempted ones.
+    fn initial_arm_counts(
+        &self,
+        views: u64,
+        stale: u64,
+        arms_before: u64,
+        attached: u64,
+    ) -> InitialArmCounts {
+        let attempted = self.loader_arms.saturating_sub(arms_before);
+        let gated = views.saturating_sub(stale).saturating_sub(attempted);
+        InitialArmCounts {
+            views,
+            gated,
+            attempted,
+            attached,
+        }
     }
 
     /// Counter spec for this start: `None` for every non-counter policy,
@@ -32886,19 +32925,28 @@ impl Engine {
     /// `p11scope: timing: startup …` marker lines (startup T1): one
     /// `-v`-only line per initial-start segment, so the silent middle is
     /// named. Missing clock samples render as `n/a`, never zero.
-    fn startup_segment_line(_segment: &'static str, _elapsed_ms: Option<u64>) -> String {
-        String::new()
+    fn startup_segment_line(segment: &'static str, elapsed_ms: Option<u64>) -> String {
+        match elapsed_ms {
+            Some(ms) => format!("p11scope: timing: startup {segment}={ms}ms"),
+            None => format!("p11scope: timing: startup {segment}=n/a"),
+        }
     }
 
     /// The loader-arming marker with per-arm aggregate counts.
     fn startup_arming_line(
-        _elapsed_ms: Option<u64>,
-        _views: u64,
-        _gated: u64,
-        _attempted: u64,
-        _attached: u64,
+        elapsed_ms: Option<u64>,
+        views: u64,
+        gated: u64,
+        attempted: u64,
+        attached: u64,
     ) -> String {
-        String::new()
+        let ms = match elapsed_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "n/a".to_string(),
+        };
+        format!(
+            "p11scope: timing: startup loader_arming={ms} views={views} gated={gated} attempted={attempted} attached={attached}"
+        )
     }
 
     fn start_session_with(
@@ -32951,6 +32999,13 @@ impl Engine {
         // was armed. Hoisted: the closure below cannot borrow `self`
         // while `start_retained_with` holds it.
         let track_short_lived = self.extensive.enabled() && policy.allows_track_short_lived();
+        // Startup markers (T1): one clock-difference closure for the
+        // segment lines below; missing samples render as `n/a` there.
+        let ms = |start: Option<u64>, end: Option<u64>| match (start, end) {
+            (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+            _ => None,
+        };
+        let session_start_ns = crate::attach::monotonic_ns();
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
                 Session::start_for_capture(
@@ -32972,6 +33027,12 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "session_start",
+            session_start_ns,
+            crate::attach::monotonic_ns(),
+        );
         if let Some(budget) = counter_budget
             && let Err(error) = self.restore_counters_policy_after_retain(budget)
         {
@@ -32984,7 +33045,17 @@ impl Engine {
             // before the per-view phases add more (RB-2), within the
             // shared allowance the Engine still holds nothing of.
             let held = self.discovery_held_len();
+            let initial_stage_start = crate::attach::monotonic_ns();
             session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "{}",
+                    Self::startup_segment_line(
+                        "initial_stage",
+                        ms(initial_stage_start, crate::attach::monotonic_ns())
+                    )
+                );
+            }
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
@@ -32992,6 +33063,8 @@ impl Engine {
             let mut fatal = None;
             let owned_generation = owned_child.map(OwnedChild::generation);
             let mut owned_prearmed = false;
+            let arming_start = crate::attach::monotonic_ns();
+            let arming_counts: InitialArmCounts;
             if let Some(child) = owned_child {
                 owned_prearmed = matches!(
                     self.arm_owned_loader_before_release(
@@ -33015,11 +33088,31 @@ impl Engine {
                 // `loader_discovery.initial_set_capture`: publishing it as a
                 // "discovery unavailable" skip too counted one fact twice and
                 // named nothing that was unavailable.
+                arming_counts = InitialArmCounts {
+                    views: 1,
+                    gated: 0,
+                    attempted: 1,
+                    attached: u64::from(owned_prearmed),
+                };
             } else {
-                fatal = self.arm_initial_views(
+                let (fatal_outcome, counts) = self.arm_initial_views(
                     &mut session,
                     &mut additions_allowed,
                     &mut pending_views,
+                );
+                fatal = fatal_outcome;
+                arming_counts = counts;
+            }
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "{}",
+                    Self::startup_arming_line(
+                        ms(arming_start, crate::attach::monotonic_ns()),
+                        arming_counts.views,
+                        arming_counts.gated,
+                        arming_counts.attempted,
+                        arming_counts.attached
+                    )
                 );
             }
             #[cfg(test)]
@@ -33028,6 +33121,7 @@ impl Engine {
                 &session,
             );
             if fatal.is_none() {
+                let exports_start = crate::attach::monotonic_ns();
                 self.attach_initial_exports(
                     &mut session,
                     &mut additions_allowed,
@@ -33048,6 +33142,17 @@ impl Engine {
                 if owned_prearmed && let Some(generation) = owned_generation {
                     self.mark_owned_selection_pending(generation);
                 }
+                // No stage span here: the export attach records its own
+                // Attach spans inside, and stages never overlap.
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!(
+                        "{}",
+                        Self::startup_segment_line(
+                            "initial_exports",
+                            ms(exports_start, crate::attach::monotonic_ns())
+                        )
+                    );
+                }
             }
             #[cfg(test)]
             crate::first_use_probe::discovery_loss(
@@ -33059,6 +33164,7 @@ impl Engine {
             let nested_budget = Cell::new(self.shared_allowance_remaining(&session, records.len()));
             let mut collect =
                 |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+            let backlog_start = crate::attach::monotonic_ns();
             let cleanup = self.process_discovery_records(
                 &mut session,
                 &mut records,
@@ -33077,6 +33183,17 @@ impl Engine {
                 &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
             );
             self.publish_current_capture_facts()?;
+            // No stage span here: the batch records its own spans inside,
+            // and stages never overlap.
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "{}",
+                    Self::startup_segment_line(
+                        "initial_backlog",
+                        ms(backlog_start, crate::attach::monotonic_ns())
+                    )
+                );
+            }
             Ok(session)
         })();
         let session = match self.finish_start_capture_attempt(snapshot, result) {
@@ -33090,7 +33207,17 @@ impl Engine {
         };
         // P-C phase 2 (§6.2): finalize after attach, before the return
         // (hence before the ready line). Owned `run` drops it inert.
+        let finalize_start = crate::attach::monotonic_ns();
         self.finalize_prearm_witness(owned_child.is_some());
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "{}",
+                Self::startup_segment_line(
+                    "finalize_prearm",
+                    ms(finalize_start, crate::attach::monotonic_ns())
+                )
+            );
+        }
         Ok(session)
     }
 }
@@ -34036,6 +34163,14 @@ pub(crate) mod session_fixture {
             Ok(None)
         }
     }
+}
+
+/// Per-arm aggregate counts for the startup `loader_arming` marker.
+struct InitialArmCounts {
+    views: u64,
+    gated: u64,
+    attempted: u64,
+    attached: u64,
 }
 
 /// Real-lifecycle setup and observation for the crate's terminal-authority

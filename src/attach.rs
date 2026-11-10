@@ -7419,13 +7419,23 @@ impl Session {
             .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// `p11scope: timing: startup …` load/attach split (startup T1):
     /// `-v`-only. Counter sessions skip the static attach (`n/a`).
-    fn startup_session_split_line(_load_ms: Option<u64>, _static_attach_ms: Option<u64>) -> String {
-        String::new()
+    fn startup_session_split_line(load_ms: Option<u64>, static_attach_ms: Option<u64>) -> String {
+        fn ms(value: Option<u64>) -> String {
+            match value {
+                Some(ms) => format!("{ms}ms"),
+                None => "n/a".to_string(),
+            }
+        }
+        format!(
+            "p11scope: timing: startup session_load={} static_attach={}",
+            ms(load_ms),
+            ms(static_attach_ms)
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_on_backend(
         plan: &AttachPlan,
         scope: &Scope,
@@ -7449,6 +7459,11 @@ impl Session {
         // The loaded STATS map follows the plan's sized Detailed ceiling,
         // so admission and the kernel table cannot disagree.
         let stats_slots = stats_map_slots(plan.admission_policy(), counter.is_some());
+        let ms = |start: Option<u64>, end: Option<u64>| match (start, end) {
+            (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+            _ => None,
+        };
+        let load_start = monotonic_ns();
         let mut session = Self::start_inner(
             scope,
             policy,
@@ -7469,6 +7484,7 @@ impl Session {
                 unsupported_environment_context(error)
             }
         })?;
+        let load_end = monotonic_ns();
         session.return_probe_admission = Some(admission.clone());
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
@@ -7477,13 +7493,23 @@ impl Session {
         );
         // Counter sessions stage banks through the Engine after start; the
         // bank guard refuses Detailed slot attach once banks exist.
-        if policy.counter_mode().is_none() {
+        let static_attach_ms = if policy.counter_mode().is_none() {
+            let attach_start = monotonic_ns();
             session
                 // Watches cannot have ended before the initial attach (ends
                 // happen at capture end or on detected change, both after
                 // start), so the start path enforces an empty ended set.
                 .attach_plan(plan, objects, &BTreeSet::new())
                 .map_err(unsupported_environment_context)?;
+            ms(attach_start, monotonic_ns())
+        } else {
+            None
+        };
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "{}",
+                Self::startup_session_split_line(ms(load_start, load_end), static_attach_ms)
+            );
         }
         // The lifecycle producers ran through the whole static attach: stage
         // what they produced before the Engine's per-view phases (RB-2).

@@ -71746,19 +71746,25 @@ fn start_session_with_brackets_every_startup_segment_with_a_marker() {
         .split_once("pub(crate) mod session_fixture")
         .expect("session fixture bounds the start path")
         .0;
+    // The marker call and its segment name are separate markers: rustfmt
+    // may split the call across lines.
     let markers = [
         "start_retained_with(self",
         "\"session_start\"",
         "session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;",
-        "startup_segment_line(\"initial_stage\"",
+        "startup_segment_line(",
+        "\"initial_stage\"",
         "arm_initial_views(",
         "startup_arming_line(",
         "attach_initial_exports(",
-        "startup_segment_line(\"initial_exports\"",
+        "startup_segment_line(",
+        "\"initial_exports\"",
         "publish_current_capture_facts()?",
-        "startup_segment_line(\"initial_backlog\"",
+        "startup_segment_line(",
+        "\"initial_backlog\"",
         "finalize_prearm_witness(",
-        "startup_segment_line(\"finalize_prearm\"",
+        "startup_segment_line(",
+        "\"finalize_prearm\"",
     ];
     let mut pos = 0;
     for marker in markers {

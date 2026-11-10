@@ -8398,8 +8398,11 @@ fn loader_readiness_line(active_hooks: usize) -> String {
 }
 
 /// `p11scope: timing: startup …` hook-recount cost (startup T1): `-v`-only.
-fn startup_hook_recount_line(_elapsed_ms: Option<u64>) -> String {
-    String::new()
+fn startup_hook_recount_line(elapsed_ms: Option<u64>) -> String {
+    match elapsed_ms {
+        Some(ms) => format!("p11scope: timing: startup hook_recount={ms}ms"),
+        None => "p11scope: timing: startup hook_recount=n/a".to_string(),
+    }
 }
 
 /// Inserts a report line before the trailing `-v` hint of a concise
@@ -9109,7 +9112,12 @@ fn capture_profile(
         crate::first_use_probe::DiscoveryStage::BeforeLoop,
         session,
     );
+    let hook_recount_start = crate::attach::monotonic_ns();
     let active_loader_hooks = engine.active_loader_hook_count(session);
+    let hook_recount_ms = match (hook_recount_start, crate::attach::monotonic_ns()) {
+        (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+        _ => None,
+    };
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -9119,6 +9127,7 @@ fn capture_profile(
     }
     if capture_diagnostics_on() {
         emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+        emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
     }
     // The pid-scope target, resolved once probes are attached (usually
     // alive; an exit between attach and the read is named via the exit
@@ -10625,7 +10634,12 @@ fn capture_trace(
         ));
     }
     let clock = Instant::now();
+    let hook_recount_start = crate::attach::monotonic_ns();
     let active_loader_hooks = engine.active_loader_hook_count(session);
+    let hook_recount_ms = match (hook_recount_start, crate::attach::monotonic_ns()) {
+        (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+        _ => None,
+    };
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -10635,6 +10649,7 @@ fn capture_trace(
     }
     if capture_diagnostics_on() {
         emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+        emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
     }
     // The pid-scope target, resolved once probes are attached (usually
     // alive; an exit between attach and the read is named via the exit

@@ -599,13 +599,17 @@ impl InventoryAttachSet {
             })
     }
 
-    /// Drain order for one extend window: smallest-module-first
-    /// (shortest-job-first), endpoint-ID tiebreak. Endpoints no admitted
-    /// module claims drain last. This decides only the attempt order
-    /// within one window, never what attaches: the backlog merges ahead
-    /// of the fresh delta as sort input, and the sort then interleaves
-    /// both by (size, id), so a fresh small module sorts ahead of an old
-    /// giant tail.
+    /// Drain order for one extend window: most-mapped object first
+    /// (provider importance: what applications actually map), then
+    /// smallest-module-first (shortest-job-first), endpoint-ID tiebreak.
+    /// Endpoints no admitted module claims drain last. Mapper counts come
+    /// from the latest whole-system pass; a scope-limited view or a pass
+    /// that has not reported counts every object at zero, so those keep
+    /// smallest-module-first. This decides only the attempt order within
+    /// one window, never what attaches: the backlog merges ahead of the
+    /// fresh delta as sort input, and the sort then interleaves both by
+    /// (mappers, size, id), so a fresh small module still sorts ahead of
+    /// an old giant tail when both map equally many processes.
     pub(crate) fn sort_drain_order(&self, endpoints: &mut [AttachEndpoint]) {
         endpoints.sort_by_key(|endpoint| {
             let hinted = self
@@ -620,7 +624,11 @@ impl InventoryAttachSet {
                         .min()
                 })
                 .unwrap_or(usize::MAX);
-            (size, endpoint.id.0)
+            let mappers = match self.mappers(endpoint.object) {
+                MapperEstimate::System(count) => count,
+                MapperEstimate::ScopeLimited | MapperEstimate::Unknown => 0,
+            };
+            (std::cmp::Reverse(mappers), size, endpoint.id.0)
         });
     }
 }

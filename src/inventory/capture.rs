@@ -71,9 +71,15 @@ use std::time::{Duration, Instant};
 /// and M5 measurements re-ratify them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LaneWindows {
-    /// Attach attempts per pass, and the pass's attach budget.
+    /// Attach attempts per pass, and the pass's attach budget, on the
+    /// Singles backend (old kernels: this quantum is unchanged).
     pub extend_entries: usize,
     pub extend_budget: Duration,
+    /// The same quantum on the Multi backend: one pass carries a whole
+    /// provider's endpoints (p11-kit admits 6734) instead of 512 of them,
+    /// so the most-mapped provider attaches within a 30 s system run.
+    pub multi_extend_entries: usize,
+    pub multi_extend_budget: Duration,
     /// CALLER_USE rows per witness read, and its budget.
     pub witness_rows: usize,
     pub witness_budget: Duration,
@@ -137,6 +143,8 @@ impl LaneWindows {
     pub(crate) const PROVISIONAL: Self = Self {
         extend_entries: 512,
         extend_budget: Duration::from_millis(250),
+        multi_extend_entries: 8192,
+        multi_extend_budget: Duration::from_secs(4),
         witness_rows: 8192,
         witness_budget: Duration::from_millis(100),
         discovery_records: 256,
@@ -183,8 +191,16 @@ impl LaneWindows {
             .min(self.retirement_cap)
     }
 
-    fn extend(&self) -> ExtendWindow {
-        ExtendWindow::new(self.extend_entries, Instant::now() + self.extend_budget)
+    /// One pass's attach window on `backend`: the Singles quantum is
+    /// the provisional 512 entries / 250 ms; the Multi quantum carries a
+    /// whole provider per pass (8192 entries / 4 s), so a busy desktop's
+    /// most-mapped provider attaches inside a 30 s run.
+    fn extend_for(&self, backend: AttachBackend) -> ExtendWindow {
+        let (entries, budget) = match backend {
+            AttachBackend::Multi => (self.multi_extend_entries, self.multi_extend_budget),
+            AttachBackend::Singles => (self.extend_entries, self.extend_budget),
+        };
+        ExtendWindow::new(entries, Instant::now() + budget)
             .expect("the provisional extend window is positive")
     }
 
@@ -475,8 +491,9 @@ pub(crate) trait LaneHost<Pin> {
     }
     /// Order one extend window's endpoints before the lane sends them:
     /// the deferred backlog plus the fresh delta, merged. Defaults to
-    /// the merged (ID) order; the coordinator sorts smallest-module-first
-    /// so a late small provider is not stuck behind a huge plan.
+    /// the merged (ID) order; the coordinator sorts most-mapped-first
+    /// (smallest-module tiebreak) so the providers applications actually
+    /// map attach before a cut-short run ends.
     fn order_drain_targets(&self, _endpoints: &mut [AttachEndpoint]) {}
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(
@@ -725,7 +742,11 @@ impl<L> NativeLane<L> {
             TargetDelta::default()
         };
         host.order_drain_targets(&mut delta.endpoints);
-        let receipt = capture.extend(delta, host.capture_targets(), windows.extend());
+        let receipt = capture.extend(
+            delta,
+            host.capture_targets(),
+            windows.extend_for(capture.backend().backend),
+        );
         if let Some(reason) = receipt.refused.clone() {
             host.abandon_capture_coverage();
             return Err((capture, reason));
@@ -826,9 +847,11 @@ impl<L> NativeLane<L> {
         let mut delta = std::mem::take(&mut self.backlog);
         delta.append(host.take_target_delta());
         host.order_drain_targets(&mut delta.endpoints);
-        let receipt = self
-            .capture
-            .extend(delta, host.capture_targets(), self.windows.extend());
+        let receipt = self.capture.extend(
+            delta,
+            host.capture_targets(),
+            self.windows.extend_for(self.capture.backend().backend),
+        );
         host.note_extend_receipt(&receipt);
         self.attached += receipt.attached.len();
         self.failed += receipt.failed.len();

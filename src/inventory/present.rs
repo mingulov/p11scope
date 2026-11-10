@@ -2624,16 +2624,20 @@ fn gap_plain_reason(reason: &str) -> &str {
     // fallback names a live process whose object missed (or was refused)
     // under both roots — never an exit race, even when the target half
     // reads ENOENT. Name the fallback; verbose keeps the machine error
-    // beside the plain words, JSON verbatim.
-    if reason.contains("(host-root fallback:") {
+    // beside the plain words, JSON verbatim. The retained-root prefix is
+    // required: marker text in an unrelated reason stays verbatim.
+    if reason.starts_with("opening object within retained target root:")
+        && reason.contains("(host-root fallback:")
+    {
         return "object unavailable from the process's root or the host-root fallback";
     }
     // A foreign-root open failure names its target root (the chroot or
     // container it missed under) — never an exit race, even when the
     // target half reads ENOENT. Concise folds these per distinct reason
     // with the root; verbose keeps the machine error beside the words,
-    // JSON verbatim.
-    if reason.contains("(target root ") {
+    // JSON verbatim. Only a full foreign-root reason matches, as in
+    // `is_foreign_root_reason`; marker text elsewhere stays verbatim.
+    if is_foreign_root_reason(reason) {
         return "object unavailable in foreign target root";
     }
     // Exited-process races surface as file errors on present system

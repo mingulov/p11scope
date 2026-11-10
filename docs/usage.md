@@ -244,7 +244,8 @@ directory when you are done, then `unset SOFTHSM2_CONF`. `sudo` resets
 the environment first, hence
 `--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
 
-The 4-step command reference follows; read the concepts after it as needed:
+The 4-step command reference follows; read the concepts after it as needed
+(`12345` below is a placeholder PID):
 
 ```bash
 # 1. What can this host do, and what does the target map? (sudo: reading
@@ -1839,8 +1840,9 @@ Limits that matter in pods:
   a copyright line and a license line, and exit 0. The first line stays
   exactly `p11scope <semver>` so scripts parsing it are unaffected.
   Takes no scope or subcommand; anything after it is a usage error.
-  `p11scope-discover --version` prints the helper's version
-  (`p11scope-discover <semver>`, the same release version) the same way.
+  `p11scope-discover --version` prints only the helper's version line
+  (`p11scope-discover <semver>`, the same release version) and exits 0;
+  anything after it is a usage error, like the observer's.
 - `--attach-backend auto|multi|singles` — the static probe backend. The
   decision comes from a functional probe, never from the kernel version.
   - `auto` (the default) uses one multi-uprobe link per attach group wherever
@@ -2455,8 +2457,8 @@ Either mismatch is treated alike, fail-closed. The second direction
 host `/proc` would in fact name the kernel's PIDs: the refusal costs
 availability, never honesty. Then p11scope:
 
-- **refuses every PID-scoped capture** — `profile`/`trace`/`metrics --pid`,
-  `run`, and `inventory --pid` — before anything is scanned or attached,
+- **refuses every PID-scoped capture** — `profile --pid` (either mode),
+  `trace --pid`, `run`, and `inventory --pid` — before anything is scanned or attached,
   with an error that starts `pid-namespace-mismatch:`. Without this the
   kernel-side PID filter would never match and the capture would read zero
   calls while claiming exact observation;

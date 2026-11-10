@@ -884,13 +884,14 @@ captured, whether the stop was a signal, the command's own exit or
   (the terminal counts are stale as of that snapshot); p11scope then exits
   nonzero with the error on stderr. A run that never acquired a snapshot
   still seals its report: the function table is empty,
-  `evidence.snapshot_failure` names the failed read, and p11scope still
-  exits nonzero.
+  `evidence.snapshot_failure` names the failed read, coverage is never
+  complete, and p11scope still exits nonzero.
 - In `trace` mode, failed aggregate reads seal the terminal EVIDENCE with
   unknown aggregate counts (empty reports, defaulted kernel evidence) plus
   a named gap, and EVIDENCE is always written for these reads; the per-call
-  lines already streamed stay exact. p11scope then exits nonzero with the
-  error on stderr.
+  lines already streamed stay exact. A failed terminal loss report degrades
+  the same way with unknown loss accounting. p11scope then exits nonzero
+  with the error on stderr.
 - A failed terminal pinned-object revalidation or watch-health read seals
   the report the same way, with its own named gap, instead of discarding
   it; p11scope then exits nonzero with the error on stderr.

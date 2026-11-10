@@ -1038,10 +1038,18 @@ inventory keeps the program's collected edge as uncertain at the next
 pass ("absent from an incomplete scan") with the gap named, instead of
 ending the edge and reporting the module "unloaded"; coverage stays
 PARTIAL. Calls made after the replacement stay unattributed
-(`rejected demoted count` ranges) until a fresh capture. `profile`
-counts through the same replacement with PARTIAL coverage and a
-"provider file changed during capture" gap. Re-run an inventory
-capture after the upgrade settles.
+(`rejected demoted count` ranges) until the program is restarted and
+a new capture starts. Other programs in the same scope keep their
+edges. `profile` counts through the same replacement with
+PARTIAL coverage and a "provider file changed during capture" gap.
+After the upgrade settles, restart the program and re-run an inventory
+capture.
+
+With `--module`, inventory never ends an edge from a missing module:
+the hinted scan does not examine every mapping, so a provider a
+program unloads (`dlclose`) during the capture reads as uncertain
+("absent from an incomplete scan") instead of ended and "unloaded".
+Run without `--module` to see unloads ended.
 
 ## Planned for later versions
 

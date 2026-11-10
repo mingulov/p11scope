@@ -6041,6 +6041,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .any(|object| object.admission.feeds_watch());
         let mut retained: BTreeSet<u32> = BTreeSet::new();
         let mut retained_edges: usize = 0;
+        // Members whose own scan a truncating gap cut short. The
+        // catalog's `skipped` list holds exactly the truncating gaps
+        // (scan vocabulary), each member gap with its pid.
+        let cut_short: BTreeSet<u32> = catalog
+            .skipped
+            .iter()
+            .filter(|gap| {
+                !crate::discovery::overlay_witness::witness_unavailable_refusal(&gap.reason)
+            })
+            .filter_map(|gap| gap.pid)
+            .collect();
         for process in &catalog.processes {
             let Some(caller) = self.adapter.live_id(process.pid) else {
                 continue;
@@ -6122,16 +6133,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     verdict,
                 );
             }
+            let scanned = matches!(process.status, MemberStatus::Scanned);
             // Only a complete deep scan makes absence authoritative: a
             // maps match decoded nothing, so its absences read uncertain.
             // Scanned alone is not enough: a scan cut short by a
             // truncating gap (a provider replaced mid-capture mints
-            // none) carries no receipt, and ending edges from it
-            // would report collected data unloaded. The receipt is
-            // the absence-authority token.
-            let complete =
-                matches!(process.status, MemberStatus::Scanned) && process.complete_scan.is_some();
-            if complete && deep_scanned {
+            // none) or narrowed by `--module` hints carries no receipt,
+            // and ending edges from it would report collected data
+            // unloaded. The receipt is the absence-authority token, and
+            // it gates absence only.
+            let complete = scanned && process.complete_scan.is_some();
+            // Member proof is separate from absence authority: a hinted
+            // deep scan that ran to completion still proves the member,
+            // so its edges never read "not scanned". A member cut short
+            // by a truncating gap of its own (the replaced-file skip
+            // among them) proves nothing; a diagnosed witness-unavailable
+            // refusal cut nothing short and stays a per-caller note.
+            if scanned && deep_scanned && !cut_short.contains(&process.pid) {
                 // Complete same-custody caller/provider/full-image proof:
                 // the generation join held above, the member image
                 // scanned completely, and provider mappings re-observed.
@@ -14904,9 +14922,35 @@ pub(crate) mod tests {
             MappingState::Mapped,
             "the first pass maps the edge"
         );
+        // Member proof is separate from absence authority: a deep scan
+        // without a receipt (a `--module` hinted scan mints none)
+        // still proves the member.
+        assert!(
+            coordinator.complete_scanned.contains(&caller),
+            "a receipt-less complete deep scan proves the member"
+        );
+        // A commit clears the per-pass proof set.
+        coordinator.complete_scanned.clear();
+        let replaced_gap = crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "/opt/a.so (deleted)".into(),
+            reason: crate::discovery::scan::REPLACED_PROVIDER_REASON.into(),
+            generic: false,
+        };
+        // A member cut short by its own truncating gap proves nothing,
+        // even where the rest of its scan re-observed a provider.
+        let mut cut_short = capture_catalog(&pins, &[&a], pid, generation.clone());
+        cut_short.skipped.push(replaced_gap.clone());
+        coordinator.project_catalog(&cut_short, &verdicts, 65);
+        coordinator.registry.publish();
+        assert!(
+            !coordinator.complete_scanned.contains(&caller),
+            "a member cut short by a replaced-file gap is not proven"
+        );
         // The replacement rescans Scanned with a truncating gap: no
         // receipt, and the running copy is no longer shown.
-        let rescan = capture_catalog(&pins, &[], pid, generation);
+        let mut rescan = capture_catalog(&pins, &[], pid, generation);
+        rescan.skipped.push(replaced_gap);
         assert!(rescan.processes[0].complete_scan.is_none());
         coordinator.project_catalog(&rescan, &verdicts, 70);
         coordinator.registry.publish();
@@ -17583,6 +17627,159 @@ exit 0
         assert_ne!(
             coordinator.take_cgroup_completion().unwrap().outcome,
             ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn hinted_cgroup_rescan_keeps_healthy_members_proven_beside_a_replaced_member() {
+        use crate::discovery::scan::REPLACED_PROVIDER_REASON;
+        // A `--module` (hinted) cgroup scan never mints a complete-scan
+        // receipt. Its healthy members are still deep-scanned to
+        // completion, so a second pass must keep their edges Mapped
+        // (never "member was not scanned this pass"), while a member
+        // whose provider file was replaced on disk beside them stays
+        // unproven and carries the replaced-file gap on its own caller.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("crates/discover/tests/fixture/version_matrix.c");
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &source,
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        // A distinct build so the replaced module never shares an
+        // identity with the healthy members' provider.
+        let replaced = gcc(
+            dir.path(),
+            "replaced-provider.so",
+            &source,
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=41"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let healthy_a = spawn_cgroup_provider_child(dir.path(), &provider, "ready-a");
+        let healthy_b = spawn_cgroup_provider_child(dir.path(), &provider, "ready-b");
+        let gapped = spawn_cgroup_provider_child(dir.path(), &replaced, "ready-c");
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("{}\n{}\n{}\n", healthy_a.id(), healthy_b.id(), gapped.id()),
+        )
+        .unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![provider.clone(), replaced.clone()],
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        let first = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator.apply_cgroup_collection(first, 1_000).unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert_eq!(completion.admitted, 3);
+        let id = |coordinator: &InventoryCoordinator<OsProcessSource>, pid: u32| {
+            coordinator
+                .adapter
+                .live_id(pid)
+                .expect("every member was admitted")
+        };
+        let ids = [
+            id(&coordinator, healthy_a.id()),
+            id(&coordinator, healthy_b.id()),
+            id(&coordinator, gapped.id()),
+        ];
+        let edges = |coordinator: &InventoryCoordinator<OsProcessSource>, caller: CallerId| {
+            coordinator
+                .registry
+                .edges_of(caller)
+                .map(|edge| (edge.mapping, edge.mapping_reason.clone()))
+                .collect::<Vec<_>>()
+        };
+        for caller in ids {
+            let found = edges(&coordinator, caller);
+            assert!(!found.is_empty(), "the first pass maps {caller:?}");
+            assert!(
+                found
+                    .iter()
+                    .all(|(mapping, _)| *mapping == MappingState::Mapped),
+                "the first pass maps {caller:?}: {found:?}"
+            );
+        }
+        // Replace the gapped member's provider on disk while it runs:
+        // its mapping now reads `(deleted)` with executable code.
+        let staged = dir.path().join("replaced-provider.so.new");
+        std::fs::copy(&replaced, &staged).unwrap();
+        std::fs::rename(&staged, &replaced).unwrap();
+        let second = coordinator
+            .cgroup_collector(
+                completion.state,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator.apply_cgroup_collection(second, 2_000).unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete,
+            "the replaced-file gap stays on its member"
+        );
+        for caller in &ids[..2] {
+            let found = edges(&coordinator, *caller);
+            assert!(!found.is_empty(), "the healthy caller keeps its edges");
+            for (mapping, reason) in &found {
+                assert_eq!(
+                    *mapping,
+                    MappingState::Mapped,
+                    "a healthy hinted member stays proven: {found:?}"
+                );
+                assert!(
+                    !reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("not scanned")),
+                    "no false unscanned reason on a healthy member: {reason:?}"
+                );
+            }
+        }
+        let gapped_edges = edges(&coordinator, ids[2]);
+        assert!(
+            !gapped_edges.is_empty()
+                && gapped_edges
+                    .iter()
+                    .all(|(mapping, _)| *mapping == MappingState::Uncertain),
+            "the replaced member is not proven: {gapped_edges:?}"
+        );
+        let replaced_gaps = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.reason == REPLACED_PROVIDER_REASON)
+            .map(|gap| gap.caller)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replaced_gaps,
+            vec![Some(ids[2])],
+            "the replaced-file gap carries only the replaced member's caller"
         );
     }
 

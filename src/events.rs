@@ -812,8 +812,8 @@ impl<S: BoundedRecordSource> EventDrain<StagedEvents<S>> {
 
 pub(crate) const ROOT_TAIL_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Decode budget the root tail adds per KiB of its snapshot, on top of
-/// [`ROOT_TAIL_FENCE_TIMEOUT`]: about 47 us per 376 B record, roughly 35x
-/// the measured drain cost, so a full 32 MiB ring gets about 4.2 s more and
+/// [`ROOT_TAIL_FENCE_TIMEOUT`]: about 47 us per 376 B record, about 9-10x
+/// the cost measured live (about 5 us a record for a full 32 MiB ring), so a full 32 MiB ring gets about 4.2 s more and
 /// a full 64 MiB ring about 8.4 s. The fixed timeout alone did not scale
 /// with the ring: a full ring at the child's exit could miss it.
 pub(crate) const ROOT_TAIL_DECODE_BUDGET_PER_KIB: std::time::Duration =
@@ -5846,6 +5846,12 @@ pub(crate) mod root_fence_tests {
             Some((RootTailAbandon::Deadline, 0))
         );
         assert!(tail.abandonment(false, None).is_err());
+        // The full-ring-at-exit case: the deadline alone, no signal pending.
+        let mut tail = tail_with_deadline(EventsDomain::test_standin(107), Instant::now());
+        assert_eq!(
+            tail.abandonment(false, Some(Instant::now())).unwrap(),
+            Some((RootTailAbandon::Deadline, 0))
+        );
         let domain = EventsDomain::test_standin(106);
         let mut tail = tail_with_deadline(domain, Instant::now() + Duration::from_secs(3600));
         assert_eq!(

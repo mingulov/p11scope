@@ -1250,6 +1250,14 @@ fn root_cancel_keeps_real_write_and_settlement_failures() {
 /// hard error and the report was dropped.
 #[test]
 fn root_tail_deadline_publishes_the_report_with_a_named_diagnostic() {
+    // Without a signal is the real full-ring-at-exit case; with one, the
+    // deadline still wins and is never relabeled as a cancellation.
+    for signal_pending in [false, true] {
+        root_tail_deadline_case(signal_pending);
+    }
+}
+
+fn root_tail_deadline_case(signal_pending: bool) {
     let domain = crate::events::EventsDomain::test_standin(1);
     let tail = crate::events::OwnedRootTail::new(
         OriginalRootExit::test_reaped(domain.clone()),
@@ -1260,7 +1268,9 @@ fn root_tail_deadline_publishes_the_report_with_a_named_diagnostic() {
         domain,
     );
     let signals = SignalState::new();
-    signals.observe(libc::SIGINT);
+    if signal_pending {
+        signals.observe(libc::SIGINT);
+    }
     let root = drain_original_root_events_from(&mut drain, tail, &signals, |_, _| {
         panic!("an expired tail reduced a record")
     });

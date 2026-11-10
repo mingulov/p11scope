@@ -51,6 +51,14 @@ versioned separately and are opaque, exact dispatch keys.
   the per-call modes.
   `--ring-bytes` still accepts 4K to 64M, and `--help` now states the
   default.
+- When a run's command exits with a full ring, the final drain of its
+  remaining events gets more time (it now grows with the ring's
+  contents), and if it still runs out of time the report is published
+  with a stderr line `root_tail_incomplete: deadline; remaining=N`
+  instead of the run failing without a report. The remaining events are
+  still counted.
+- The Kubernetes DaemonSet's memory request is now 128Mi (was 64Mi):
+  each concurrent capture holds about 34 MB of ring memory.
 - `p11scope run` now pauses by default (`--pause auto`): a first run
   holds the child at loader hits until its probes attach, so early
   calls are counted instead of missed. `--pause never` stays available

@@ -26196,6 +26196,36 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The `capture_profile` disclosure stays on the loader's resolver: a
+    /// return to `resolve_ring_bytes` would disclose 32 MiB while a metrics
+    /// capture loads 4 MiB. The loader call is pinned by
+    /// `the_self_probe_and_the_capture_share_one_object_loader`.
+    #[test]
+    fn capture_profile_discloses_the_loader_ring_resolver() {
+        let source = include_str!("run.rs");
+        let disclosure = concat!(
+            "ring_bytes: resolve_capture_",
+            "ring_bytes(policy, false, ring_bytes),"
+        );
+        assert_eq!(source.matches(disclosure).count(), 1, "one disclosure");
+        assert_eq!(
+            source
+                .matches(concat!("ring_bytes: resolve_", "ring_bytes("))
+                .count(),
+            0,
+            "no disclosure through the per-call default"
+        );
+        let start = source
+            .find(concat!("\nfn capture_", "profile("))
+            .expect("capture_profile");
+        let end = start + 1 + source[start + 1..].find("\nfn ").expect("next item");
+        let at = source.find(disclosure).unwrap();
+        assert!(
+            (start..end).contains(&at),
+            "the disclosure sits in capture_profile"
+        );
+    }
+
     /// DR-CLASSIC-PID0: an `auto` fallback is disclosed on stderr before the
     /// readiness line (which stays byte-identical); none without one.
     #[test]

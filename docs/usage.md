@@ -520,8 +520,9 @@ produced it.
   locked kernel memory). `--mode metrics`, with or without `--counter-mode`,
   writes no per-call records and keeps a 4M default. The observer maps the
   ring twice into its own address space, so reported RSS (`ps`, and
-  `scheduling.resource.max_rss_kb`) grows by about twice the ring size
-  (about 64 MiB at 32M) without using that much more memory: the ring's
+  `scheduling.resource.max_rss_kb`) includes about twice the ring size
+  (about 64 MiB at 32M, about 56 MiB more than the earlier 4M default)
+  without using that much memory: the ring's
   pages are charged once, as the locked kernel memory above. A larger ring absorbs call bursts without loss; a
   smaller ring overflows sooner. Overflow never corrupts counts — the
   aggregate maps are the count authority — but it is disclosed as `event_loss`
@@ -2212,8 +2213,8 @@ There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 Ring memory: BPF ring buffers are locked kernel memory, charged to the
 capturing process's memory cgroup. An `inventory` capture holds an 8 MiB
 lifecycle ring. A capture whose Joint key-operations lane is active loads a
-32 MiB EVENTS ring, the same size as the default every other capture
-keeps; `--ring-bytes` still names an explicit size. While a pass collects
+32 MiB EVENTS ring, the same size as the default every per-call capture
+keeps (`--mode metrics` keeps 4 MiB); `--ring-bytes` still names an explicit size. While a pass collects
 or the semantic lane starts, the lifecycle lane may also hold up to 32,768
 drained records in user memory (about 29 MiB, allocated only as records
 arrive) plus up to 65,536 empty batch shells (about 6.6 MiB).

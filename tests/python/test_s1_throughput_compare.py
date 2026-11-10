@@ -1207,6 +1207,13 @@ class ConservationGate(unittest.TestCase):
             self.run_mutation(mutate)
         self.assertIn("entries.count 20 != issued 25", str(ctx.exception))
 
+    def test_s1_pass_verdict_carries_no_joint_shed_key(self):
+        # The joint-only shed term never leaks into S1 verdicts: the S1
+        # contract stays byte-stable while joint records the term.
+        result = self.run_mutation(lambda inventory: None)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertNotIn("shed_unrouted", result["conservation"])
+
 
 def _demoted_range_reason_named(base, absolute, named):
     """Product retirement-gap reason with an explicit named count."""
@@ -3213,6 +3220,84 @@ class JointConservationGate(unittest.TestCase):
             self.assertEqual(result["conservation"]["entries"], 20002)
             self.assertEqual(result["conservation"]["shed_unrouted"], 4)
 
+    def test_driver_shed_gap_recorded_mirror_passes(self):
+        # The live shape: the product mirrors the conserved snapshot
+        # shed row as a gap_recorded event, so gate 3 exempts the
+        # mirrored payload exactly like the snapshot row.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-ev-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            edge = next(row for row in doc["edges"]
+                        if row["caller"] == "c1")
+            edge["entries"]["count"] -= 4
+            child = doc["semantic_edges"][0]
+            child["operations"]["calls"] -= 4
+            child["api_returns"]["count"] -= 4
+            reason = _shed_unrouted_reason(4, {"unobserved": 4})
+            doc["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "semantic calls unrouted",
+                 "reason": reason, "budget": None, "repeats": 1})
+            write_json(inventory, doc)
+            rewrite_joint_events_for_edge(
+                workdir, edge, joint_hot_last_t1(ledgers))
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            ended = rows[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "semantic calls unrouted",
+                                  "reason": reason, "budget": None})
+            rows.insert(-1, gap)
+            ended["seq"] += 1
+            write_jsonl(events, rows)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["shed_unrouted"], 4)
+
+    def test_event_only_shed_gap_recorded_stays_a_loss_gap(self):
+        # No snapshot gap conserved anything, so a conserved-shaped
+        # payload alone stays refused, exactly as the base oracle held
+        # it: the exemption matches snapshot rows, never shape alone.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-evonly-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            ended = rows[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "semantic calls unrouted",
+                                  "reason": _shed_unrouted_reason(
+                                      4, {"unobserved": 4}),
+                                  "budget": None})
+            rows.insert(-1, gap)
+            ended["seq"] += 1
+            write_jsonl(events, rows)
+            with self.assertRaisesRegex(s1.S1Error, "loss gap"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(events)], str(inventory),
+                           FULL_RATE, joint=True)
+
+    def test_joint_pass_verdict_records_zero_shed(self):
+        # The joint side of the conditional key: a shed-free joint run
+        # still records the term as zero beside the verdict.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-zero-") as tmp:
+            result = self.run_joint(Path(tmp))
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["shed_unrouted"], 0)
+
     def test_driver_shed_unrouted_shortfall_beyond_sheds_fails(self):
         # Named loss excuses only what it counts: a shortfall past the
         # sheds' exact sum still fails, naming entries, loss and issued.
@@ -3346,6 +3431,27 @@ class JointConservationGate(unittest.TestCase):
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         r"entries\.count 20002 != issued 20006"):
                 self.run_joint(Path(tmp), mutate)
+
+    def test_driver_module_shed_gap_conserves_like_the_unattributed_row(self):
+        # A shed row naming the driver's own module explicitly is the
+        # same pre-binding loss as the unattributed row, so it
+        # conserves entries, operations and api_returns alike.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-dm-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 4
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 4
+                child["api_returns"]["count"] -= 4
+                doc["gaps"].append(
+                    {"caller": None, "module": "m0", "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["shed_unrouted"], 4)
 
     def test_foreign_pid_shed_gap_does_not_conserve_joint_entries(self):
         with tempfile.TemporaryDirectory(prefix="joint-shed-fp-") as tmp:

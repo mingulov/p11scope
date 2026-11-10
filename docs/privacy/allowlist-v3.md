@@ -1499,8 +1499,9 @@ on Fedora (kind v0.33.0, node v1.37.0, containerd 2.3.4): 150 s
 `profile --system -v` with 2 steady pods plus 3 jobs deleted 33 s before
 the render — 5/5 `cgroups[]` rows labeled with kubectl-matched pod UIDs
 and container IDs (0 unlabeled), deleted-job rows resolving from retained
-paths (negative-controlled: their cgroups are absent on the node), and
-the `-v` frame `Cgroups (5):` section; see the lane report.** This
+paths (the jobs were API-deleted 33 s before the render; the
+filesystem-removal fallback itself is proven by the deterministic churn
+tests), and the `-v` frame `Cgroups (5):` section; see the lane report.** This
 subsection permits only the finite profile additions below. Every other
 section keeps its own status; v1/v2 bytes and exclusions are unchanged,
 and there is no global v3 activation.
@@ -1520,10 +1521,11 @@ unattributable, never grouped or estimated.
 
 The resolved path comes from the cgroup2 directory-inode walks the
 reporter already performs, retained per new cgroup id at first sighting
-while its processes are alive (at most one walk per new id; retained
-entries never exceed the cgroup row count, which shares the 16,384-key
-semantic-state budget) and resolved live-first, retained-fallback at
-report time. Path parsing is lexical only. No engine/CRI/Kubernetes API,
+within the row lifetime while its processes are alive (at most one walk
+per new id; retained entries never exceed the cgroup row count, which
+shares the 16,384-key semantic-state budget, and retire with the rows
+on purge) and resolved live-first, retained-fallback at report time.
+Path parsing is lexical only. No engine/CRI/Kubernetes API,
 network access, namespace entry, new BPF target read, or new
 target-memory read is authorized; no argv, cmdline, environ, credential,
 key-material, PIN, payload, or full-path publication beyond the existing

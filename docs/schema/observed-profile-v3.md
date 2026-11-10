@@ -816,11 +816,12 @@ for lone docker/podman/containerd/cri-o containers (`<runtime>` is
 `docker`/`podman`/`containerd`/`cri_o`/`unknown`), the systemd unit for unit
 paths, and the raw path verbatim for unknown shapes. It is `null` exactly
 when `label` is. `unadmitted` counts the row's calls whose process missed
-admission (a zero identity cookie, a full history registry, or a closed
-generation): a subset of the row's `calls`, grouped per pod/unit in `-v`
-text. Rows whose cgroup was removed before the report (exited pods under
-churn) resolve from the path retained at first sighting, while each
-process was alive; a live cgroup always resolves live. Like the
+admission (including a zero identity cookie, a zero pid, a stale exec
+generation, a full history registry, or a closed generation): a subset
+of the row's `calls`, grouped per pod/unit in `-v` text. Rows whose
+cgroup was removed before the report (exited pods under churn) resolve
+from the path retained at first sighting within the row lifetime, while
+each process was alive; a live cgroup always resolves live. Like the
 per-provider split above, this is a v3-additive disclosure that introduces
 no new schema revision: the `cgroups[]` item shape stays open. Historical
 v2 documents lack both keys. The `-v` final frame renders the same rows as

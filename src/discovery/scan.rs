@@ -1098,15 +1098,16 @@ impl CollectionWork {
 /// Capture-path (DetailedLegacy) retained file-cache ceilings. A long
 /// `--system` capture scans thousands of distinct files (build artifacts,
 /// browser components, churn binaries across mount namespaces) and must not
-/// retain every file's inspection facts and export list forever: that grew
-/// the observer hundreds of MiB over minutes on both allocators
-/// (v070-musl-rss). Sized above the inventory ceilings for capture's wider
-/// file population and longer horizons, still far below the observed leak
-/// scale; the hot rescan set (provider, loaders, system libraries — dozens
-/// of files, single-digit MiB) fits with wide margin, while the cold
-/// single-scan tail is refused. Callers ignore the refusal signal and
-/// proceed with the just-read value, so refusal only costs re-read I/O on
-/// a later miss, never coverage. The loader map shares the export ceiling.
+/// retain every file's inspection facts and export list forever: without
+/// these ceilings every distinct scanned file stayed cached without bound
+/// (failing tests admitted 4096 entries / ~206 MB of accounted cache before
+/// the ceilings refused). Sized above the inventory ceilings for capture's
+/// wider file population and longer horizons; the hot rescan set (provider,
+/// loaders, system libraries — dozens of files, single-digit MiB) fits with
+/// wide margin, while the cold single-scan tail is refused. Callers ignore
+/// the refusal signal and proceed with the just-read value, so refusal only
+/// costs re-read I/O on a later miss, never coverage. The loader map shares
+/// the export ceiling.
 pub(crate) const CAPTURE_INSPECTION_CACHE_ENTRIES: usize = 1024;
 pub(crate) const CAPTURE_EXPORT_CACHE_ENTRIES: usize = 1024;
 pub(crate) const CAPTURE_RETAINED_CACHE_BYTES: u64 = 64 << 20;
@@ -14601,7 +14602,7 @@ mod tests {
     /// Capture scans (DetailedLegacy) refuse inspection/export cache growth
     /// past the capture entry ceilings: a long `--system` capture scanning
     /// thousands of distinct files must not retain every file's facts
-    /// forever (v070-musl-rss release leak, hundreds of MiB over minutes).
+    /// forever (pre-fix, all 4096 synthetic admissions below were kept).
     #[test]
     fn capture_file_caches_refuse_past_entry_ceilings() {
         let mut budget = CaptureWorkBudget::new(ScanLimits::default());

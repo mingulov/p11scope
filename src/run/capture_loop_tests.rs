@@ -3489,8 +3489,10 @@ fn terminal_snapshot_failure_without_last_good_returns_the_error() {
 
 /// Data always, degraded terminal order: `run_terminal` publishes the `-o`
 /// report before failing with the terminal read error, so a degraded
-/// snapshot still seals its report and the run exits nonzero. Deleting the
-/// `terminal_error` return must fail this test, not silently succeed.
+/// snapshot still seals its report and the run exits nonzero. The degraded
+/// read error joins the stored seal union (never a second tail that a
+/// pinned failure would shadow), and that union's return follows the
+/// commit. Deleting the union member or the return must fail this test.
 #[test]
 fn degraded_terminal_publishes_before_failing_with_terminal_error() {
     let source = include_str!("../run.rs");
@@ -3503,25 +3505,95 @@ fn degraded_terminal_publishes_before_failing_with_terminal_error() {
         .unwrap()
         .0;
     assert_eq!(
-        terminal.matches("snapshot.terminal_error()").count(),
+        terminal
+            .matches("terminal_seal_errors(snapshot_error, &snapshot, pinned_error)")
+            .count(),
         1,
-        "run_terminal fails once on the degraded terminal error"
+        "run_terminal stores the degraded read error with the other seal errors"
     );
+    assert!(
+        !terminal.contains("snapshot.terminal_error()"),
+        "no separate degraded tail that a coincident pinned failure would shadow"
+    );
+    let union = terminal
+        .find("terminal_seal_errors(")
+        .expect("run_terminal builds the seal union");
     let commit = terminal
         .find("out_file.commit()")
         .expect("run_terminal publishes the -o report");
     let failure = terminal
-        .find("snapshot.terminal_error()")
-        .expect("run_terminal checks the degraded terminal error");
+        .rfind("if let Some(error) = terminal_error {\n            return Err(error);")
+        .expect("run_terminal fails with the stored seal errors");
     assert!(
-        commit < failure,
-        "the report commits before the terminal error fails the run"
+        union < commit && commit < failure,
+        "the union is stored before publication and fails the run after the commit"
     );
-    let tail = &terminal[failure..];
+    let helper = production
+        .split_once("fn terminal_seal_errors(")
+        .expect("the seal-union helper exists")
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
     assert!(
-        tail.contains("return Err(anyhow::Error::msg(error.to_string()))"),
-        "the degraded terminal error returns Err after publishing"
+        helper.contains("snapshot\n        .terminal_error()")
+            && helper.contains(
+                "combine_terminal_errors([snapshot_error, degraded_error, pinned_error])"
+            ),
+        "the helper folds the degraded read error between the fallback and pinned errors"
     );
+}
+
+/// F1 twin, coincident double fault: a degraded terminal snapshot (never
+/// acquired) and a failed pinned-identity check both survive in the
+/// returned chain, and a later publication failure keeps both too.
+#[test]
+fn degraded_snapshot_and_pinned_failure_both_survive_the_seal() {
+    let degraded = metrics::CaptureSnapshot::degraded_legacy(
+        "stats_unread",
+        "reading STATS map: map gone".into(),
+    );
+    let stored = terminal_seal_errors(
+        None,
+        &degraded,
+        Some(
+            anyhow::anyhow!("pinned provider fstat failed")
+                .context("revalidating pinned provider identity"),
+        ),
+    )
+    .expect("both failures are kept");
+    let message = format!("{stored:#}");
+    assert!(message.contains("reading STATS map: map gone"), "{message}");
+    assert!(
+        message.contains("pinned provider fstat failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("revalidating pinned provider identity"),
+        "{message}"
+    );
+    let published = terminal_publication_error(Some(stored), anyhow::anyhow!("writing -o failed"));
+    let message = format!("{published:#}");
+    assert!(message.contains("reading STATS map: map gone"), "{message}");
+    assert!(
+        message.contains("pinned provider fstat failed"),
+        "{message}"
+    );
+    assert!(message.contains("writing -o failed"), "{message}");
+}
+
+/// Healthy twin: a clean snapshot with no fallback and no pinned failure
+/// stores nothing, and a degraded snapshot alone is kept on its own.
+#[test]
+fn clean_terminal_stores_no_seal_error_and_degraded_alone_is_kept() {
+    let clean = metrics::CaptureSnapshot::empty();
+    assert!(terminal_seal_errors(None, &clean, None).is_none());
+    let degraded = metrics::CaptureSnapshot::degraded_legacy(
+        "stats_unread",
+        "reading STATS map: map gone".into(),
+    );
+    let alone = terminal_seal_errors(None, &degraded, None).expect("the read error is kept");
+    assert_eq!(format!("{alone:#}"), "reading STATS map: map gone");
 }
 
 /// The terminal-seal test context: a plan the discovery closure hands

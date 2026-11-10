@@ -6055,6 +6055,23 @@ fn combine_terminal_errors(
     combined
 }
 
+/// The profile terminal's stored seal errors, in step order: the
+/// snapshot read that fell back to the last good snapshot, the degraded
+/// snapshot's own read error (a terminal that never acquired one), then
+/// the pinned-identity check. A degraded snapshot coinciding with a
+/// pinned failure keeps both, and a later publication failure combines
+/// with all of them, so no failed step is dropped (data always).
+fn terminal_seal_errors(
+    snapshot_error: Option<anyhow::Error>,
+    snapshot: &metrics::CaptureSnapshot,
+    pinned_error: Option<anyhow::Error>,
+) -> Option<anyhow::Error> {
+    let degraded_error = snapshot
+        .terminal_error()
+        .map(|error| anyhow::Error::msg(error.to_string()));
+    combine_terminal_errors([snapshot_error, degraded_error, pinned_error])
+}
+
 /// Keeps the stored terminal seal errors alongside a later publication
 /// failure, instead of the `?` dropping the stored ones: the combined
 /// error names every failed step.
@@ -10102,7 +10119,7 @@ fn capture_profile(
             "terminal snapshot failed with no last good snapshot; report sealed with unknown aggregate counts"
         };
         let snapshot_error = snapshot_error.map(|error| error.context(snapshot_context));
-        let mut terminal_error = combine_terminal_errors([snapshot_error, pinned_error]);
+        let mut terminal_error = terminal_seal_errors(snapshot_error, &snapshot, pinned_error);
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
@@ -10216,14 +10233,12 @@ fn capture_profile(
         } else if let Some(error) = frame_error {
             return Err(terminal_publication_error(terminal_error.take(), error));
         }
+        // A degraded terminal snapshot publishes first, then fails: its
+        // read error rides `terminal_error` (see `terminal_seal_errors`),
+        // so the report names the read that never landed and the run
+        // still exits nonzero naming every failed step.
         if let Some(error) = terminal_error {
             return Err(error);
-        }
-        // A degraded terminal snapshot publishes first, then fails: the
-        // report names the read that never landed, and the run still
-        // exits nonzero with the read error.
-        if let Some(error) = snapshot.terminal_error() {
-            return Err(anyhow::Error::msg(error.to_string()));
         }
         Ok(ev)
     }

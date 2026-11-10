@@ -12,7 +12,7 @@ use crate::scope::inventory_cgroup::{
     MembershipOutcome, MembershipSamples, next_candidates, sample_members,
 };
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Private processing/custody ceilings, not a release qualification envelope.
@@ -117,6 +117,12 @@ pub(crate) struct SharedCollectionWork {
     control: CollectionControl,
     fence: CgroupJobFence,
     stopped: Arc<Mutex<Option<CollectionOutcome>>>,
+    /// Set where a pass-0 worker returned its collection: the stop state
+    /// recorded by then is final, and later work (apply, the end sample,
+    /// publication) checks `frozen`, which never stops, instead of the
+    /// worker's control. Budgets and the generation fence still apply.
+    returned: Arc<AtomicBool>,
+    frozen: CollectionControl,
 }
 impl SharedCollectionWork {
     fn new(limits: CgroupWalkLimits, control: CollectionControl, fence: CgroupJobFence) -> Self {
@@ -125,7 +131,21 @@ impl SharedCollectionWork {
             control,
             fence,
             stopped: Arc::new(Mutex::new(None)),
+            returned: Arc::new(AtomicBool::new(false)),
+            frozen: CollectionControl::new(None),
         }
+    }
+    fn control(&self) -> &CollectionControl {
+        if self.returned.load(Ordering::Acquire) {
+            &self.frozen
+        } else {
+            &self.control
+        }
+    }
+    /// Records any stop already visible, then freezes the stop state.
+    fn freeze_at_return(&self) {
+        let _ = self.stopped();
+        self.returned.store(true, Ordering::Release);
     }
     fn note_stop(&self, outcome: CollectionOutcome) {
         let mut stopped = self.stopped.lock().unwrap();
@@ -134,7 +154,7 @@ impl SharedCollectionWork {
         }
     }
     pub(crate) fn charge(&self, units: usize) -> bool {
-        if let Err(stop) = self.control.check() {
+        if let Err(stop) = self.control().check() {
             self.note_stop(CollectionOutcome::Cancelled(stop));
             return false;
         }
@@ -151,7 +171,7 @@ impl SharedCollectionWork {
             .budget
             .lock()
             .unwrap()
-            .charge_work(&self.control, units);
+            .charge_work(self.control(), units);
         if let Err(outcome) = result {
             self.note_stop(outcome);
             return false;
@@ -173,7 +193,7 @@ impl SharedCollectionWork {
             root,
             requests,
             &mut self.budget.lock().unwrap(),
-            &self.control,
+            self.control(),
         )
     }
     fn stopped(&self) -> Option<CollectionOutcome> {
@@ -276,6 +296,11 @@ pub(crate) struct CgroupCollection {
     observer: Option<crate::cgroup_stop_acceptance::Transaction>,
 }
 impl CgroupCollection {
+    /// Freezes this collection's stop state where its worker returned
+    /// (pass 0 only): a completed collection stays complete.
+    pub(crate) fn freeze_worker_return(&self) {
+        self.work.freeze_at_return();
+    }
     pub(crate) fn observe_worker_joined(&self) {
         if let Some(observer) = &self.observer {
             observer.joined();
@@ -403,7 +428,7 @@ impl CgroupCollection {
                             .get(&pid)
                             .is_some_and(|member| member.generation.start_time == Some(start_time))
                 },
-                &self.work.control,
+                self.work.control(),
             );
         }
         let end = self.work.sample(&self.root, &self.locators);

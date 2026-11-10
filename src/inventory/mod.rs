@@ -6395,7 +6395,8 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             // the deadline and still gates later passes; operator
             // stops still reach this same worker control through the
             // shared source and the loop's direct latch.
-            let control = if self.coordinator.passes() == 0 {
+            let forked = self.coordinator.passes() == 0;
+            let control = if forked {
                 cgroup.control.without_deadline()
             } else {
                 cgroup.control.clone()
@@ -6413,7 +6414,24 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                             self.max_scan_pids,
                             cgroup.observer.clone(),
                         )
-                        .map(|job| Box::new(job) as crate::inventory_capture::CgroupCollectJob)
+                        .map(|job| {
+                            if !forked {
+                                return Box::new(job) as crate::inventory_capture::CgroupCollectJob;
+                            }
+                            // Pass 0 freezes its outcome where the worker
+                            // returns, before anything wrapping the job
+                            // runs: a stop that lands later (operator or
+                            // tick) ends the run, never this completed
+                            // collection (owner ruling 2026-11-10).
+                            let returned = control.clone();
+                            Box::new(move || {
+                                let collection = job();
+                                collection.freeze_worker_return();
+                                returned.mark_worker_returned();
+                                collection
+                            })
+                                as crate::inventory_capture::CgroupCollectJob
+                        })
                         .map_err(|_| CgroupJobFailure::Preparation)
                 });
             return CollectJob::Cgroup { control, task };

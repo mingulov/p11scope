@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 const CHUNK: usize = 4096;
@@ -33,6 +33,11 @@ pub(crate) struct CollectionControl {
     stop: Arc<AtomicU8>,
     operator_stop_source: Option<Arc<AtomicUsize>>,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    /// Set once this control's worker job has returned its collection.
+    /// The loop's tick latch then leaves a forked worker control alone,
+    /// so a stop landing after the collection completed cannot cancel
+    /// it retroactively (operator-stop sources still apply).
+    worker_returned: Arc<AtomicBool>,
 }
 impl CollectionControl {
     pub(crate) fn new(deadline: Option<Instant>) -> Self {
@@ -47,6 +52,7 @@ impl CollectionControl {
             stop: Arc::new(AtomicU8::new(0)),
             operator_stop_source: None,
             clock: Arc::new(clock),
+            worker_returned: Arc::new(AtomicBool::new(false)),
         }
     }
     pub(crate) fn with_operator_stop_source(mut self, source: Arc<AtomicUsize>) -> Self {
@@ -65,7 +71,15 @@ impl CollectionControl {
             stop: Arc::new(AtomicU8::new(0)),
             operator_stop_source: self.operator_stop_source.clone(),
             clock: Arc::clone(&self.clock),
+            worker_returned: Arc::new(AtomicBool::new(false)),
         }
+    }
+    /// Records that the worker job owning this control has returned.
+    pub(crate) fn mark_worker_returned(&self) {
+        self.worker_returned.store(true, Ordering::Release);
+    }
+    pub(crate) fn worker_returned(&self) -> bool {
+        self.worker_returned.load(Ordering::Acquire)
     }
     pub(crate) fn cancel(&self) {
         let _ = self

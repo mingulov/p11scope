@@ -17,6 +17,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct OwnershipEpoch(pub(super) u64);
 
+/// Why ordinary continuity was last revoked (or, for `last_cause`, which
+/// leg the most recent classification finished on). Finite and free of
+/// any captured data: it names a code branch, nothing about the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RevocationCause {
+    None,
+    ProvenShared,
+    ProvenAbsence,
+    DifferentSole,
+    MembersFilter,
+    InvalidSlot,
+    InvalidEdge,
+    AuthorityFailure,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinishLeg {
+    InvalidSlot,
+    MembersFilter,
+    InvalidEdge,
+    Completed,
+}
+
 #[derive(Clone)]
 pub(super) enum CurrentCandidates {
     Unknown,
@@ -249,6 +272,10 @@ struct CandidateSummary {
     /// as a current candidate, but ordinary continuity survives it: only
     /// a proven classification or an unconsumed authority may revoke it.
     stale: bool,
+    /// Cause of the most recent ordinary-sequence revocation (sticky
+    /// across later non-revoking finishes) and of the latest finish.
+    revocation_cause: RevocationCause,
+    last_cause: RevocationCause,
 }
 impl CandidateSummary {
     fn new() -> Self {
@@ -265,6 +292,8 @@ impl CandidateSummary {
             result_caller_epoch: None,
             ordinary_sequence: 1,
             stale: false,
+            revocation_cause: RevocationCause::None,
+            last_cause: RevocationCause::None,
         }
     }
     fn restart(&mut self, caller_epoch: Option<u64>, revision: AttachRevision) {
@@ -321,10 +350,16 @@ impl CandidateSummary {
         caller_epoch: Option<u64>,
         caller_failure: u64,
         index_failure: u64,
-        proven: bool,
+        leg: FinishLeg,
     ) {
+        let leg_cause = match leg {
+            FinishLeg::InvalidSlot => RevocationCause::InvalidSlot,
+            FinishLeg::MembersFilter => RevocationCause::MembersFilter,
+            FinishLeg::InvalidEdge => RevocationCause::InvalidEdge,
+            FinishLeg::Completed => RevocationCause::None,
+        };
         if caller_epoch.is_some()
-            && !proven
+            && leg != FinishLeg::Completed
             && matches!(result, CurrentCandidates::Unknown)
             && matches!(self.result, CurrentCandidates::Sole { .. })
             && self.ordinary_sequence != 0
@@ -333,6 +368,7 @@ impl CandidateSummary {
             self.finished = true;
             self.result_caller_epoch = caller_epoch;
             self.stale = true;
+            self.last_cause = leg_cause;
             return;
         }
         let first_sole = self.result_caller_epoch.is_none()
@@ -355,13 +391,39 @@ impl CandidateSummary {
             }
             _ => false,
         };
+        let unconsumed = self.unconsumed_failure(caller_failure, index_failure);
+        let revoked = caller_epoch.is_none()
+            || self.ordinary_sequence != 0 && (unconsumed || !(same || first_sole));
         if caller_epoch.is_none() {
             self.ordinary_sequence = 0;
-        } else if self.ordinary_sequence != 0
-            && (self.unconsumed_failure(caller_failure, index_failure) || !(same || first_sole))
-        {
+        } else if self.ordinary_sequence != 0 && (unconsumed || !(same || first_sole)) {
             self.ordinary_sequence = self.ordinary_sequence.checked_add(1).unwrap_or(0);
         }
+        let mut cause = match leg {
+            FinishLeg::Completed => match &result {
+                CurrentCandidates::Shared => RevocationCause::ProvenShared,
+                CurrentCandidates::Unknown => RevocationCause::ProvenAbsence,
+                CurrentCandidates::Sole { .. } => {
+                    if same || first_sole {
+                        RevocationCause::None
+                    } else {
+                        RevocationCause::DifferentSole
+                    }
+                }
+            },
+            _ => leg_cause,
+        };
+        if revoked && unconsumed && (leg != FinishLeg::Completed || cause == RevocationCause::None)
+        {
+            // An unconsumed authority failure is what revoked continuity
+            // here; a proven Shared/absence/different-Sole classification
+            // is a sufficient cause on its own and keeps its name.
+            cause = RevocationCause::AuthorityFailure;
+        }
+        if revoked {
+            self.revocation_cause = cause;
+        }
+        self.last_cause = cause;
         self.finished = true;
         self.result = result;
         self.result_caller_epoch = caller_epoch;
@@ -375,6 +437,9 @@ pub(super) struct OrdinaryView<'a> {
     pub(super) sequence: u64,
     pub(super) startup: bool,
     pub(super) initial_metadata_refused: bool,
+    pub(super) revocation_cause: RevocationCause,
+    pub(super) last_cause: RevocationCause,
+    pub(super) raw_sequence: u64,
     origin_after: Option<u64>,
 }
 impl OrdinaryView<'_> {
@@ -660,11 +725,17 @@ impl CountOwnership {
             sequence: 0,
             startup: false,
             initial_metadata_refused: false,
+            revocation_cause: RevocationCause::None,
+            last_cause: RevocationCause::None,
+            raw_sequence: 0,
             origin_after: None,
         };
         let Some(summary) = self.summaries.get(&(caller, object)) else {
             return view;
         };
+        view.revocation_cause = summary.revocation_cause;
+        view.last_cause = summary.last_cause;
+        view.raw_sequence = summary.ordinary_sequence;
         let slot = self.callers.get(&caller);
         let index = self.index.as_ref();
         view.initial_metadata_refused = summary.ordinary_sequence == 1
@@ -1113,7 +1184,7 @@ impl CountOwnership {
                             caller_slot.and_then(|slot| slot.epoch),
                             caller_slot.map_or(u64::MAX, |slot| slot.last_authority_failure),
                             index.last_authority_failure,
-                            false,
+                            FinishLeg::InvalidSlot,
                         );
                     }
                 }
@@ -1148,7 +1219,7 @@ impl CountOwnership {
                     slot.epoch,
                     slot.last_authority_failure,
                     index.last_authority_failure,
-                    false,
+                    FinishLeg::MembersFilter,
                 );
                 continue;
             };
@@ -1179,7 +1250,7 @@ impl CountOwnership {
                                 slot.epoch,
                                 slot.last_authority_failure,
                                 index.last_authority_failure,
-                                false,
+                                FinishLeg::InvalidEdge,
                             );
                             continue;
                         }
@@ -1222,12 +1293,23 @@ impl CountOwnership {
                 slot.epoch,
                 slot.last_authority_failure,
                 index.last_authority_failure,
-                true,
+                FinishLeg::Completed,
             );
             summary.candidate = None;
         }
     }
 
+    pub(super) fn revocation_cause(&self, caller: CallerId, object: u32) -> RevocationCause {
+        self.summaries
+            .get(&(caller, object))
+            .map_or(RevocationCause::None, |summary| summary.revocation_cause)
+    }
+    #[cfg(test)]
+    pub(super) fn last_cause(&self, caller: CallerId, object: u32) -> RevocationCause {
+        self.summaries
+            .get(&(caller, object))
+            .map_or(RevocationCause::None, |summary| summary.last_cause)
+    }
     #[cfg(test)]
     pub(super) fn ordinary_sequence(&self, caller: CallerId, object: u32) -> u64 {
         self.summaries

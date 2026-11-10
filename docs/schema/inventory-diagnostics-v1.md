@@ -21,7 +21,10 @@ Data kinds are `count_observation`, `ownership_transition`, `count_decision`,
 `publication` and `capture_health`. Their finite optional fields include actual
 read origin (`initial`, `refresh`), absolute/base/staged counts, `after`/`through`
 range boundaries, prior/new eligibility, actual decision, resulting edge total,
-and predecessor observation/transition references. `staged` is a staging decision;
+predecessor observation/transition references, and, on ownership transitions, the
+pair's frozen ordinary `checkpoint` and current ordinary `sequence` (small
+continuity counters copied from the producer; a mismatch is what arms a fence).
+`staged` is a staging decision;
 `placed` confirms placement. A publication record reports the registry state
 after the recorded mutation; its edge total can include earlier observations
 and can change again later in the same batch. It does not by itself prove that
@@ -55,7 +58,12 @@ Reasons are finite: `sole_owner`, `shared_owner`, `ownership_unknown`,
 `ownership_transition`, `binding_unproven`, `identity_changed`, `scan_incomplete`,
 `awaiting_fence`, `stale_observation`, `pending_publication`, `stale_decision`,
 `not_admitted`, `count_invalid`, `budget_refused`, `capture_loss`, `capture_stopped`,
-`native_unavailable`, and `context_unavailable`. A reason names the branch the
+`native_unavailable`, `context_unavailable`, `proven_absence`, `different_sole_owner`,
+`members_filter`, `invalid_slot`, `invalid_edge`, and `authority_failure`. The last
+six name the leg that revoked ordinary continuity on an ownership transition: a
+completed classification with no candidate, a different sole carrier, an
+uncomputable membership filter, an invalid caller slot, an invalid caller edge,
+or an unconsumed authority failure. A reason names the branch the
 producer actually took; it adds no attribution predicate. Repeated refusal/stale
 checks may increment reason totals without producing another record.
 

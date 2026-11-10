@@ -83,7 +83,7 @@ use std::time::{Duration, Instant};
 mod count_eligibility;
 use count_eligibility::{
     CountOwnership, CurrentCandidates, OwnershipEpoch, OwnershipScan, ReceiptDisposition,
-    ReceiptView, ReceiptWork, RecoveryWorkBudget,
+    ReceiptView, ReceiptWork, RecoveryWorkBudget, RevocationCause,
 };
 
 #[path = "inventory_coordinator/leader_exit.rs"]
@@ -2339,6 +2339,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         key: PairKey,
         recovery: &mut PairRecovery,
         candidate: &CurrentCandidates,
+        revocation_cause: RevocationCause,
+        last_cause: RevocationCause,
+        raw_sequence: u64,
     ) {
         if self.diagnostics.is_none() {
             return;
@@ -2349,7 +2352,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 None,
                 None,
                 None,
-                DiagnosticReason::OwnershipUnknown,
+                diagnostic_revocation_reason(last_cause)
+                    .or_else(|| diagnostic_revocation_reason(revocation_cause))
+                    .unwrap_or(DiagnosticReason::OwnershipUnknown),
             ),
             CurrentCandidates::Shared => (
                 Eligibility::SharedOwner,
@@ -2367,10 +2372,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.registry.module_id_for(module),
                 Some(epoch.0),
                 Some((scan.started_ns(), scan.finished_ns())),
-                DiagnosticReason::SoleOwner,
+                if last_cause == RevocationCause::DifferentSole {
+                    DiagnosticReason::DifferentSoleOwner
+                } else {
+                    DiagnosticReason::SoleOwner
+                },
             ),
         };
-        let state = (eligibility, module, epoch);
+        let state = (eligibility, module, epoch, reason);
         if recovery.diagnostic.ownership == Some(state) {
             return;
         }
@@ -2383,6 +2392,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         record.new_eligibility = Some(eligibility);
         record.module = module.map(|module| module.0);
         record.base = Some(recovery.watermark);
+        record.checkpoint = Some(recovery.ordinary_checkpoint);
+        record.sequence = Some(raw_sequence);
         record.fence = recovery.fence.map(|read| read.count);
         if recovery.epoch.map(|epoch| epoch.0) != epoch {
             record.fence = None;
@@ -2427,7 +2438,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         record.reason = Some(if proven {
             DiagnosticReason::SoleOwner
         } else {
-            DiagnosticReason::OwnershipTransition
+            // Name what armed this fence: the revocation that broke
+            // ordinary continuity for this pair, when one is recorded.
+            diagnostic_revocation_reason(
+                self.count_ownership
+                    .revocation_cause(recovery.caller, key.object),
+            )
+            .unwrap_or(DiagnosticReason::OwnershipTransition)
         });
         record.prior_eligibility = recovery.diagnostic.selection.map(|state| {
             if state.2 {
@@ -8322,13 +8339,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Only a classified contiguous unknown prefix is disclosed here. Callers
     /// first resolve historical generic decisions and continuing ownership.
-    fn flush_withheld_prefix(&mut self, key: PairKey, recovery: &mut PairRecovery) {
+    fn flush_withheld_prefix(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        release: DiagnosticReason,
+    ) {
         self.diagnostic_withheld(
             key,
             recovery,
             recovery.watermark,
             recovery.withheld_through,
-            DiagnosticReason::OwnershipTransition,
+            release,
             None,
         );
         self.registry.note_retirement_count_gap(
@@ -8397,7 +8419,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             recovery.withheld_through = recovery.watermark.max(flushed);
             recovery.discarded_through = recovery.watermark;
-            self.flush_withheld_prefix(key, recovery);
+            self.flush_withheld_prefix(key, recovery, reason);
             self.suspend_recovery(key, recovery);
         }
     }
@@ -8440,7 +8462,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     && (recovery.epoch.is_none() || recovery.epoch_pending && continuing)
                     && recovery.ordinary_checkpoint != 0
                     && recovery.ordinary_checkpoint == ownership.sequence);
-            self.diagnostic_ownership(key, &mut recovery, &candidate);
+            self.diagnostic_ownership(
+                key,
+                &mut recovery,
+                &candidate,
+                ownership.revocation_cause,
+                ownership.last_cause,
+                ownership.raw_sequence,
+            );
             let mut work = ReceiptWork::new();
             work.spend(3); // ordinary source/checkpoint guards within the fixed reservation
             let was_refused = recovery.receipt_refused;
@@ -8671,7 +8700,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     recovery.withheld_through.max(recovery.discarded_through);
                 recovery.discarded_through = recovery.watermark;
             }
-            self.flush_withheld_prefix(key, &mut recovery);
+            self.flush_withheld_prefix(key, &mut recovery, DiagnosticReason::SoleOwner);
             let scan = recovery
                 .scan
                 .as_ref()
@@ -8756,7 +8785,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         && read.anchor_ns > scan.finished_ns()
                 })
             {
-                self.flush_withheld_prefix(key, &mut recovery);
+                self.flush_withheld_prefix(key, &mut recovery, DiagnosticReason::SoleOwner);
                 self.diagnostic_withheld(
                     key,
                     &recovery,
@@ -11336,7 +11365,7 @@ struct PendingDiagnostics {
 
 #[derive(Default)]
 struct RecoveryDiagnostics {
-    ownership: Option<(Eligibility, Option<ModuleId>, Option<u64>)>,
+    ownership: Option<(Eligibility, Option<ModuleId>, Option<u64>, DiagnosticReason)>,
     transition_ref: u64,
     wait: Option<(DiagnosticReason, DiagnosticDecision, u64, u64, u64)>,
     selection: Option<(Option<u64>, u64, bool)>,
@@ -11363,6 +11392,19 @@ fn record_recovery_refusal<Source: ProcessSource>(
     record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
     record.context_unavailable = true;
     recovery.diagnostic.transition_ref = recorder.record(record).unwrap_or(0);
+}
+
+fn diagnostic_revocation_reason(cause: RevocationCause) -> Option<DiagnosticReason> {
+    Some(match cause {
+        RevocationCause::None => return None,
+        RevocationCause::ProvenShared => DiagnosticReason::SharedOwner,
+        RevocationCause::ProvenAbsence => DiagnosticReason::ProvenAbsence,
+        RevocationCause::DifferentSole => DiagnosticReason::DifferentSoleOwner,
+        RevocationCause::MembersFilter => DiagnosticReason::MembersFilter,
+        RevocationCause::InvalidSlot => DiagnosticReason::InvalidSlot,
+        RevocationCause::InvalidEdge => DiagnosticReason::InvalidEdge,
+        RevocationCause::AuthorityFailure => DiagnosticReason::AuthorityFailure,
+    })
 }
 
 fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {

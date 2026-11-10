@@ -21,7 +21,7 @@ pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const FOOTER_RESERVE: u64 = 64 * 1024;
 const LABEL_BYTES: usize = 96;
 const KIND_COUNT: usize = 5;
-const REASON_COUNT: usize = 18;
+const REASON_COUNT: usize = 24;
 
 macro_rules! vocabulary {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
@@ -55,7 +55,13 @@ vocabulary!(DiagnosticReason {
     CaptureLoss,
     CaptureStopped,
     NativeUnavailable,
-    ContextUnavailable
+    ContextUnavailable,
+    ProvenAbsence,
+    DifferentSoleOwner,
+    MembersFilter,
+    InvalidSlot,
+    InvalidEdge,
+    AuthorityFailure
 });
 vocabulary!(ReadOrigin { Initial, Refresh });
 vocabulary!(Decision {
@@ -143,6 +149,8 @@ pub(crate) struct DiagnosticRecord {
     pub(crate) edge_total: Option<u64>,
     pub(crate) observation_ref: Option<u64>,
     pub(crate) transition_ref: Option<u64>,
+    pub(crate) checkpoint: Option<u64>,
+    pub(crate) sequence: Option<u64>,
     pub(crate) context_unavailable: bool,
 }
 impl DiagnosticRecord {
@@ -177,6 +185,8 @@ impl DiagnosticRecord {
             edge_total: None,
             observation_ref: None,
             transition_ref: None,
+            checkpoint: None,
+            sequence: None,
             context_unavailable: false,
         }
     }
@@ -978,6 +988,8 @@ struct DiagnosticLine<'a> {
     edge_total: Option<u64>,
     observation_ref: Option<Reference>,
     transition_ref: Option<Reference>,
+    checkpoint: Option<u64>,
+    sequence: Option<u64>,
     context_unavailable: bool,
     history_complete: bool,
 }
@@ -1035,6 +1047,8 @@ fn project<'a>(
         edge_total: record.edge_total,
         observation_ref,
         transition_ref,
+        checkpoint: record.checkpoint,
+        sequence: record.sequence,
         context_unavailable,
         history_complete: !context_unavailable,
     }

@@ -3339,6 +3339,16 @@ fn demotion_retirement_revision_skew_unknown_keeps_ordinary_checkpoint() {
         original,
         "an unproven revision-skew Unknown must not revoke ordinary continuity"
     );
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "the retained finish still names its leg for diagnostics"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::None,
+        "a retained finish records no revocation"
+    );
     round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
     round4_settle_ownership(&mut ownership, &scene);
     assert!(ownership.sole(scene.caller, object).is_some());
@@ -3370,6 +3380,11 @@ fn demotion_retirement_proven_absence_revokes_ordinary_checkpoint() {
         ownership.ordinary_sequence(scene.caller, object),
         original,
         "a proven absence must revoke ordinary continuity"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::ProvenAbsence,
+        "the revocation names the proven-absence leg for diagnostics"
     );
     round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
     round4_settle_ownership(&mut ownership, &scene);

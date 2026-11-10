@@ -51,6 +51,11 @@
 #             (default "-n -5"); empty skips nice and runs at the
 #             caller's priority for without-nice control cells. The
 #             S1 twin always runs unniced.
+#   DIAGNOSTICS
+#             =1 passes --diagnostics <cell>/diagnostics.jsonl to the
+#             joint cells' observer, so the cell keeps the bounded
+#             inventory diagnostics beside report.json/events.jsonl
+#             (default unset records nothing)
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -411,7 +416,19 @@ capture_bpf_evidence() {
 # the live event log and any rotated parts (rotation may leave a
 # part root-only). Returns nonzero when the chmod fails.
 take_evidence() {
-    sudo -n chmod 644 "$1/report.json" "$1"/events.jsonl*
+    sudo -n chmod 644 "$1/report.json" "$1"/events.jsonl* || return
+    if [ -f "$1/diagnostics.jsonl" ]; then
+        sudo -n chmod 644 "$1/diagnostics.jsonl"
+    fi
+}
+
+# --diagnostics argument for a joint cell, or nothing. DIAGNOSTICS=1
+# opts in; anything else prints nothing, so no unvalidated word ever
+# reaches the sudo line (the path is built here from the cell dir).
+diagnostics_args() {
+    if [ "${DIAGNOSTICS:-0}" = "1" ]; then
+        printf '%s\n' "--diagnostics $1/diagnostics.jsonl"
+    fi
 }
 
 # Record a flow failure: rc 2 plus a machine-readable oracle.json
@@ -688,15 +705,15 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=bad-nice" || return 1
         return 0
     fi
-    # shellcheck disable=SC2086 # observer_env is empty or one assignment per line.
+    # shellcheck disable=SC2086 # observer_env/diagnostics_args are empty or fixed words built here.
     if [ -n "$joint_nice_level" ]; then
         sudo -n env $(observer_env) nice -n "$joint_nice_level" "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
             $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
-            --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
+            $(diagnostics_args "$dir") --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     else
         sudo -n env $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
             $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
-            --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
+            $(diagnostics_args "$dir") --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     fi
     echo $! > "$dir/observer.pid"
     if ! wait_for_line "p11scope: pass 0:" "$dir/observer.out" 300; then

@@ -1111,30 +1111,52 @@ fn uprobe_multi_check(host: crate::attach::MultiHostVerdict) -> Check {
 /// *which* loader this is may reach the row (design §9.3, §10.1), so this
 /// deliberately returns three booleans and never an error string.
 fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
+    loader_facts_from(&loader_sample_exes(pid))
+}
+
+/// The executables plain `doctor` samples for the loader rows, in order.
+/// With no `--pid` the honest subject is this host as the observer sees
+/// it: its own executable first, then init's as the host representative
+/// when the observer's own offers no loader to assess (a statically
+/// linked observer, or an execute-only install its own open cannot read).
+/// An explicit `--pid` assesses exactly that target, static or not.
+fn loader_sample_exes(pid: Option<u32>) -> Vec<String> {
+    match pid {
+        Some(pid) => vec![format!("/proc/{pid}/exe")],
+        None => vec!["/proc/self/exe".to_string()],
+    }
+}
+
+/// The loader facts behind a sample list: the first sample that offers
+/// one. No sample is an unbound loader, as before.
+fn loader_facts_from(samples: &[String]) -> (bool, bool, bool) {
+    let first = samples.first().map(String::as_str).unwrap_or("/proc/self/exe");
+    loader_sample_at(first).unwrap_or((false, false, false))
+}
+
+/// One loader sample: the `(bound, hook, state)` triple for the
+/// executable at `exe`, or `None` when it offers no loader to assess.
+/// A dynamic executable whose loader cannot be bound is `Some` of the
+/// negative classification, never `None`.
+fn loader_sample_at(exe: &str) -> Option<(bool, bool, bool)> {
     let unbound = (false, false, false);
-    // With no `--pid` the honest subject is this host as the observer sees it:
-    // its own PT_INTERP is the build a capture on this host would bind.
-    let executable = match pid {
-        Some(pid) => format!("/proc/{pid}/exe"),
-        None => "/proc/self/exe".to_string(),
-    };
-    let Ok(file) = std::fs::File::open(&executable) else {
-        return unbound;
+    let Ok(file) = std::fs::File::open(exe) else {
+        return Some(unbound);
     };
     let Ok(snapshot) = p11scope_manifest::elf::ElfSnapshot::read(&file) else {
-        return unbound;
+        return Some(unbound);
     };
     let Some(interpreter) = snapshot.interpreter() else {
-        return unbound;
+        return Some(unbound);
     };
     let interpreter = PathBuf::from(std::ffi::OsString::from(
         String::from_utf8_lossy(interpreter).into_owned(),
     ));
     let Ok(loader) = std::fs::File::open(&interpreter) else {
-        return unbound;
+        return Some(unbound);
     };
     let Ok(loader) = p11scope_manifest::elf::ElfSnapshot::read(&loader) else {
-        return unbound;
+        return Some(unbound);
     };
     let hook = loader
         .defined_symbol("_dl_debug_state")
@@ -1150,7 +1172,7 @@ fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
         .ok()
         .flatten()
         .is_some();
-    (true, hook, state)
+    Some((true, hook, state))
 }
 
 /// The eight finite live-discovery classifications of design §10.1. Each
@@ -4368,6 +4390,107 @@ mod tests {
             status: Status::Fail("refused".into()),
         });
         assert_eq!(verdict_extra_strict(&failed), 1);
+    }
+
+    /// A minimal statically linked ELF64 executable: one `PT_LOAD`, no
+    /// `PT_INTERP`. File-only; parsed, never loaded or executed. Shaped
+    /// like the static musl release build, which has no interpreter.
+    fn static_exe_fixture(dir: &std::path::Path) -> PathBuf {
+        fn put16(bytes: &mut [u8], at: usize, value: u16) {
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put32(bytes: &mut [u8], at: usize, value: u32) {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put64(bytes: &mut [u8], at: usize, value: u64) {
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = vec![0u8; 0x110];
+        bytes[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\x00");
+        put16(&mut bytes, 16, 2);
+        put16(&mut bytes, 18, 62);
+        put32(&mut bytes, 20, 1);
+        put64(&mut bytes, 32, 64);
+        put16(&mut bytes, 52, 64);
+        put16(&mut bytes, 54, 56);
+        put16(&mut bytes, 56, 1);
+        put32(&mut bytes, 64, 1);
+        put32(&mut bytes, 68, 5);
+        for (at, value) in [
+            (72, 0u64),
+            (80, 0x400_000),
+            (88, 0x400_000),
+            (96, 0x110),
+            (104, 0x110),
+            (112, 0x1000),
+        ] {
+            put64(&mut bytes, at, value);
+        }
+        let path = dir.join("static-exe");
+        std::fs::write(&path, &bytes).expect("a static fixture");
+        path
+    }
+
+    /// A static executable offers no loader to assess: no `PT_INTERP`
+    /// means no sample, not an unbound loader. An unreadable path is no
+    /// sample either.
+    #[test]
+    fn a_static_executable_offers_no_loader_sample() {
+        let dir = tempfile::tempdir().expect("a fixture directory");
+        let fixture = static_exe_fixture(dir.path());
+        let file = std::fs::File::open(&fixture).expect("the fixture opens");
+        let snapshot =
+            p11scope_manifest::elf::ElfSnapshot::read(&file).expect("the fixture parses");
+        assert_eq!(snapshot.interpreter(), None);
+        assert_eq!(
+            loader_sample_at(&fixture.to_string_lossy()),
+            None,
+            "a static executable is no loader sample"
+        );
+        assert_eq!(loader_sample_at("/nonexistent-doctor-sample"), None);
+    }
+
+    /// Plain `doctor` samples its own executable first, then init's: a
+    /// static observer still reports the host's loader facts instead of
+    /// warning about its own missing interpreter. An explicit `--pid`
+    /// assesses exactly that target.
+    #[test]
+    fn plain_doctor_samples_self_then_init_while_pid_stays_exact() {
+        assert_eq!(
+            loader_sample_exes(None),
+            vec!["/proc/self/exe".to_string(), "/proc/1/exe".to_string()]
+        );
+        assert_eq!(
+            loader_sample_exes(Some(42)),
+            vec!["/proc/42/exe".to_string()]
+        );
+    }
+
+    /// The sample list resolves to the first sample that offers loader
+    /// facts: a static first sample falls through to a dynamic one, and
+    /// an all-static list stays unbound, as before.
+    #[test]
+    fn loader_facts_fall_through_a_static_sample_to_a_dynamic_one() {
+        use crate::fixture_guard::DieWithParent as _;
+
+        let dir = tempfile::tempdir().expect("a fixture directory");
+        let blocked = static_exe_fixture(dir.path()).to_string_lossy().into_owned();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .expect("a dynamic control process");
+        let dynamic = format!("/proc/{}/exe", child.id());
+        let expected =
+            loader_sample_at(&dynamic).expect("a dynamic executable offers a sample");
+        assert_eq!(loader_facts_from(&[blocked.clone(), dynamic]), expected);
+        assert_eq!(
+            loader_facts_from(&[blocked.clone(), blocked]),
+            (false, false, false)
+        );
+        assert_eq!(loader_facts_from(&[]), (false, false, false));
+        child.kill().expect("the control process dies");
+        child.wait().expect("the control process is reaped");
     }
 
     /// HIGH-5: a restrictive sysctl is only a limit for a process that

@@ -12655,10 +12655,23 @@ fn joint_birth_full_registration_table_discloses_retained_s1() {
         )
         .unwrap();
     assert_eq!(result.installed, 0);
+    // Controller ruling (transient capacity re-offer): this
+    // Capacity refusal installed no grant, so it defers for a
+    // bounded re-offer instead of landing as a permanent
+    // refusal. The deferred gap names the delay exactly once.
+    assert_eq!(result.reoffers.len(), 1);
+    assert!(staged_birth_refusals(coordinator).is_empty());
+    let deferred: Vec<String> = coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "Joint birth deferred; retained S1 until re-offer")
+        .map(|(_, reason)| reason)
+        .collect();
     assert_eq!(
-        staged_birth_refusals(coordinator),
-        ["joint_birth_registration_Capacity"],
-        "the refused registration is disclosed exactly once"
+        deferred,
+        ["joint_birth_deferred_registration_Capacity"],
+        "the deferred registration is disclosed exactly once"
     );
     while coordinator
         .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)

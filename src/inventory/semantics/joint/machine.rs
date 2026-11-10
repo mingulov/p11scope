@@ -3517,7 +3517,7 @@ impl LiveJointMachine {
                 base,
             } => {
                 budget.spend(1);
-                retain_on_refusal!(
+                let disposition = retain_on_refusal!(
                     Phase::Births {
                         original,
                         identity,
@@ -3537,6 +3537,16 @@ impl LiveJointMachine {
                         },
                     )
                 );
+                // Bounded re-offer of transiently refused births:
+                // evict each named key's router observation so a
+                // fresh instance can carry a new birth; a key the
+                // lane cannot re-offer lands its original refusal
+                // as final, exactly once.
+                for reoffer in &disposition.reoffers {
+                    if !lane.reoffer_birth_for(reoffer.image, reoffer.file) {
+                        coordinator.disclose_birth_reoffer_exhausted(reoffer);
+                    }
+                }
                 (
                     Phase::Staging {
                         original,

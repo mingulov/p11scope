@@ -2156,6 +2156,17 @@ impl AttestedSemanticLane {
         }
     }
 
+    /// Re-offer one transiently refused Joint birth for (image,
+    /// file) on the live capture's router. Only the Joint machine
+    /// calls this, for the coordinator's deferred dispositions.
+    /// A shell lane has no capture to re-mint on and refuses, so
+    /// the coordinator's refusal stays final there.
+    pub(crate) fn reoffer_birth_for(&mut self, image: ImageIdentity, file: u32) -> bool {
+        self.live
+            .as_mut()
+            .is_some_and(|live| live.capture.reoffer_birth_for(image, file))
+    }
+
     /// Count coordinator admissions that found no binding for their
     /// image. A shell lane stages without a capture and notes
     /// nothing.

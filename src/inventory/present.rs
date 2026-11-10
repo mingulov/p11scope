@@ -1903,6 +1903,13 @@ pub(crate) fn is_synthetic_bootstrap_gap(gap: &GapView) -> bool {
         && gap.reason == JOINT_BIRTH_UNOFFERED_REASON
 }
 
+/// The subject a transiently refused Joint birth discloses
+/// under while its bounded re-offer is pending
+/// (`disclose_s1_birth_deferred`): a counted delay, not a
+/// permanent refusal.
+pub(crate) const JOINT_BIRTH_DEFERRED_SUBJECT: &str =
+    "Joint birth deferred; retained S1 until re-offer";
+
 /// A linked lane with registered instances that neither published a
 /// Joint feed nor disclosed why reads `bootstrap_unavailable` with no
 /// cause anywhere in the document. Name that once, at presentation:
@@ -1916,9 +1923,10 @@ pub(crate) fn silent_bootstrap_gap(
 ) -> Option<GapView> {
     (observations.reason == "bootstrap_unavailable"
         && semantic_edges > 0
-        && !gaps
-            .iter()
-            .any(|gap| gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT))
+        && !gaps.iter().any(|gap| {
+            gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                || gap.subject == JOINT_BIRTH_DEFERRED_SUBJECT
+        }))
     .then(|| GapView {
         caller: None,
         module: None,
@@ -2982,6 +2990,9 @@ fn gap_plain_subject(subject: &str) -> &str {
     match subject {
         "Joint key operations unavailable; retained S1" | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
             "Per-key tracking did not start for this process; function counts above are unaffected"
+        }
+        JOINT_BIRTH_DEFERRED_SUBJECT => {
+            "Per-key tracking started late for this process; earlier calls keep plain counts"
         }
         "per-key tracking is off; this capture keeps S1 mechanisms and API results" => {
             "per-key tracking is off; function and mechanism counts are unaffected"

@@ -1789,6 +1789,15 @@ impl SemanticCapture {
         self.router.mark_admitted(image, file);
     }
 
+    /// Re-offer one transiently refused Joint birth for (image,
+    /// file): the router evicts the key's observation so the next
+    /// scan re-mints. Only the Joint machine calls this, for the
+    /// coordinator's deferred dispositions. False leaves the
+    /// refusal final (the coordinator discloses it as such).
+    pub(crate) fn reoffer_birth_for(&mut self, image: ImageIdentity, file: u32) -> bool {
+        self.router.evict_for_birth_reoffer(image, file)
+    }
+
     /// Count coordinator admissions that found no binding for their
     /// image (diagnostic-only funnel beside the mark counts).
     pub(crate) fn note_admission_binding_misses_for(&mut self, misses: u64) {

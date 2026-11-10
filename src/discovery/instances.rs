@@ -764,6 +764,13 @@ pub(crate) struct InstanceRouter {
     /// capped by the observed-keys cap, where an unarmed key fails
     /// closed to the old behavior.
     birth_retry: BTreeMap<(ImageKey, u32), BirthRetry>,
+    /// Bounded re-offer budget per (image, file) key: how many
+    /// times a transiently refused Joint birth already evicted
+    /// this key's observation for a fresh mint. Entries are
+    /// created only by [`Self::evict_for_birth_reoffer`] and the
+    /// table refuses past the observed-keys cap, so a long run
+    /// cannot grow it without bound.
+    birth_reoffers: BTreeMap<(ImageKey, u32), u8>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -902,6 +909,7 @@ impl InstanceRouter {
             admitted_pending: BTreeSet::new(),
             admitted_minted: BTreeSet::new(),
             birth_retry: BTreeMap::new(),
+            birth_reoffers: BTreeMap::new(),
             absent: BTreeSet::new(),
             absence_overflowed: false,
             faulted: BTreeSet::new(),
@@ -1069,6 +1077,63 @@ impl InstanceRouter {
     /// exceeds the cap by more than the in-flight note.
     pub(crate) fn note_minted(&mut self, image: ImageIdentity, file: u32) {
         self.admitted_minted.insert((ImageKey::from(image), file));
+    }
+
+    /// Re-offer a transiently refused Joint birth: evict the
+    /// key's current observation (the same disclosed loss as a
+    /// capacity eviction) and clear its minted mark, so the next
+    /// scan mints a fresh instance whose registration can carry
+    /// a new birth. Only the birth coordinator calls this, and
+    /// only for refusals that installed no grant and reached no
+    /// seal, so at most one birth per key still reaches the seal:
+    /// the evicted instance's feed was selected S1Only (or never
+    /// registered) and the fresh instance is a distinct key.
+    /// Bounded per key; a refused re-offer (unknown, retired,
+    /// faulted, or budget spent) changes nothing.
+    pub(crate) fn evict_for_birth_reoffer(&mut self, image: ImageIdentity, file: u32) -> bool {
+        /// Re-offers per (image, file) key before the refusal is
+        /// final. Small: each re-offer splits the instance row.
+        const MAX_BIRTH_REOFFERS_PER_KEY: u8 = 3;
+        let key = (ImageKey::from(image), file);
+        if RetirementLedger::index(key.0.cookie).is_none()
+            || file >= instance::FILE_SLOTS
+            || self.image_retired(key.0)
+            || self.faulted.contains(&key)
+            || !self.observed.contains_key(&key)
+        {
+            return false;
+        }
+        let spent = self.birth_reoffers.get(&key).copied().unwrap_or(0);
+        if spent >= MAX_BIRTH_REOFFERS_PER_KEY
+            || (spent == 0 && self.birth_reoffers.len() >= self.limits.observed_keys)
+        {
+            return false;
+        }
+        self.birth_reoffers.insert(key, spent + 1);
+        let evicted = self
+            .observed
+            .remove(&key)
+            .expect("observed presence checked");
+        let ids: Vec<_> = evicted
+            .back()
+            .into_iter()
+            .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
+            .collect();
+        if !ids.is_empty() {
+            self.observation_losses.push(ObservationLoss {
+                image,
+                file_slot: file,
+                ids,
+            });
+        }
+        self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
+        self.absent.remove(&key);
+        self.drop_carry(&key);
+        self.admitted_minted.remove(&key);
+        self.admitted_pending.remove(&key);
+        self.counters.observed_evictions = self.counters.observed_evictions.saturating_add(1);
+        self.debug_check_absent_subset();
+        true
     }
 
     /// A continued observation for a marked key reports

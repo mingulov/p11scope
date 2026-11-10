@@ -617,11 +617,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
 pub(crate) type PreparedClaim = (u64, Result<JournalDomainProof, AttestationRefusal>);
 
-/// Completion counters only; the registry retains every actual grant and
-/// missing/refused births remain S1 (an instance registered untouched by
-/// its sighting may still select Joint on its first call's birth).
+/// Completion counters plus the transiently refused births the
+/// machine may re-offer; the registry retains every actual grant.
+/// A birth with no re-offer (or an exhausted one) remains S1 at its
+/// original registration, though an instance registered untouched by
+/// its sighting may still select Joint on its first call's birth.
 pub(crate) struct PreparedBirthDisposition {
     pub(crate) installed: usize,
+    pub(crate) reoffers: Vec<BirthReoffer>,
+}
+
+/// One birth refused only for transient capacity, named for a
+/// bounded re-offer: the machine evicts the key's router
+/// observation so a fresh instance (a distinct registration)
+/// can carry a new birth. `reason` is the original refusal,
+/// disclosed as final only if the re-offer cannot run.
+pub(crate) struct BirthReoffer {
+    pub(crate) caller: Option<CallerId>,
+    pub(crate) image: p11scope_ebpf_common::ImageIdentity,
+    pub(crate) file: u32,
+    reason: String,
 }
 
 struct BirthAssociation {
@@ -632,6 +647,9 @@ struct BirthAssociation {
     // Only the group's first link holds its finite refusal. Publish it
     // after the registration plan releases the original staging index.
     refusal: Option<(Option<CallerId>, BirthRefusal)>,
+    // The (image, file) key for a transient refusal's re-offer,
+    // captured while its receipt still sits at `current`.
+    deferred: Option<(p11scope_ebpf_common::ImageIdentity, u32)>,
 }
 
 /// Why one observed New candidate retained S1. Keep the paid association
@@ -651,6 +669,29 @@ enum BirthRefusal {
 }
 
 impl BirthRefusal {
+    /// Only capacity-class refusals that installed no grant and
+    /// consumed no birth witness are transient: the registration
+    /// reservation and the retained-birth slot both refuse before
+    /// the original New moves into native observation, so a
+    /// re-offered birth is the first one that can reach the seal.
+    fn transient(self) -> bool {
+        use crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal as R;
+        matches!(
+            self,
+            Self::Resource | Self::Registration(R::Capacity | R::Storage)
+        )
+    }
+
+    fn deferred_reason(self) -> String {
+        match self {
+            Self::Resource => "joint_birth_deferred_resource_capacity".into(),
+            Self::Registration(refusal) => {
+                format!("joint_birth_deferred_registration_{refusal:?}")
+            }
+            _ => self.reason(),
+        }
+    }
+
     fn reason(self) -> String {
         match self {
             Self::NoAdmission => "joint_birth_no_admission".into(),
@@ -683,6 +724,63 @@ fn disclose_s1_birth_refusal(
     });
 }
 
+/// A transiently refused birth disclosed as a delay, not a
+/// permanent refusal: if the re-offered birth later installs,
+/// this counted row is the exact record of the late start.
+fn disclose_s1_birth_deferred(
+    registry: &mut CallerRegistry,
+    caller: Option<CallerId>,
+    reason: String,
+) {
+    registry.record_gap(RegistryGap {
+        caller,
+        module: None,
+        pid: None,
+        subject: crate::inventory_present::JOINT_BIRTH_DEFERRED_SUBJECT.into(),
+        reason,
+        budget: None,
+    });
+}
+
+/// Every (image, file) key holding a birth receipt in this
+/// batch, deduplicated: the re-offer set for a batch-wide
+/// transient refusal.
+fn birth_reoffer_keys(
+    batch: &PreparedSemanticBatch,
+) -> Vec<(p11scope_ebpf_common::ImageIdentity, u32)> {
+    let mut keys: Vec<_> = batch
+        .current
+        .iter()
+        .filter(|receipt| receipt.birth_quantum().is_some())
+        .map(|receipt| (receipt.image(), receipt.endpoint().file_slot))
+        .collect();
+    keys.sort_by_key(|(image, file)| (image.task_cookie, image.exec_id, *file));
+    keys.dedup();
+    keys
+}
+
+fn deferred_disposition(
+    registry: &mut CallerRegistry,
+    batch: &PreparedSemanticBatch,
+    deferred_reason: String,
+    original_reason: String,
+) -> PreparedBirthDisposition {
+    let reoffers = birth_reoffer_keys(batch)
+        .into_iter()
+        .map(|(image, file)| BirthReoffer {
+            caller: None,
+            image,
+            file,
+            reason: original_reason.clone(),
+        })
+        .collect();
+    disclose_s1_birth_deferred(registry, None, deferred_reason);
+    PreparedBirthDisposition {
+        installed: 0,
+        reoffers,
+    }
+}
+
 /// OD33/R-50 wedge guard: latch the lane's journal linkage from its
 /// drain producers, and bar the whole birth path when unlinked. A
 /// Joint feed fed only bare CALL rows (no journal BEGIN/END) wedges
@@ -699,7 +797,7 @@ fn refuse_unlinked_joint_births(
         return None;
     }
     registry.disclose_joint_journal_unavailable_once();
-    Some(PreparedBirthDisposition { installed: 0 })
+    Some(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() })
 }
 
 /// The existing single pending slot changes phase; preparation adds no queue.
@@ -1128,7 +1226,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         if batch.births_decided {
-            return Ok(PreparedBirthDisposition { installed: 0 });
+            return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
         }
         if batch.claim_cursor != batch.entries.len() || batch.stage_cursor != 0 {
             return Err(RawQuantumRefusal::Admission);
@@ -1167,29 +1265,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .ok_or(RawQuantumRefusal::Capacity)?;
         if count == 0 {
             batch.births_decided = true;
-            return Ok(PreparedBirthDisposition { installed: 0 });
+            return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
         }
         let reserve = self.registry.semantic_storage_reserver();
         let bytes =
             allocation_bytes::<BirthAssociation>(count).ok_or(RawQuantumRefusal::Capacity)?;
         let Ok(_association_storage) = reserve.reserve(bytes) else {
             batch.births_decided = true;
-            disclose_s1_birth_refusal(
+            return Ok(deferred_disposition(
                 &mut self.registry,
-                None,
+                batch,
+                "joint_birth_deferred_resource_capacity".into(),
                 "semantic_resource_capacity".into(),
-            );
-            return Ok(PreparedBirthDisposition { installed: 0 });
+            ));
         };
         let mut association = Vec::<BirthAssociation>::new();
         if association.try_reserve_exact(count).is_err() {
             batch.births_decided = true;
-            disclose_s1_birth_refusal(
+            return Ok(deferred_disposition(
                 &mut self.registry,
-                None,
+                batch,
+                "joint_birth_deferred_association_capacity".into(),
                 "joint_birth_association_capacity".into(),
-            );
-            return Ok(PreparedBirthDisposition { installed: 0 });
+            ));
         }
         assert!(
             association.capacity() <= count,
@@ -1209,6 +1307,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     current,
                     entry: None,
                     refusal: None,
+                    deferred: None,
                 });
             }
         }
@@ -1256,12 +1355,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             Ok(registrations) => registrations,
             Err(refusal) => {
                 batch.births_decided = true;
-                disclose_s1_birth_refusal(
-                    &mut self.registry,
-                    None,
-                    BirthRefusal::Registration(refusal).reason(),
-                );
-                return Ok(PreparedBirthDisposition { installed: 0 });
+                let refusal = BirthRefusal::Registration(refusal);
+                if refusal.transient() {
+                    return Ok(deferred_disposition(
+                        &mut self.registry,
+                        batch,
+                        refusal.deferred_reason(),
+                        refusal.reason(),
+                    ));
+                }
+                disclose_s1_birth_refusal(&mut self.registry, None, refusal.reason());
+                return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
             }
         };
         batch.births_decided = true;
@@ -1315,15 +1419,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 association[first].refusal = Some((caller, BirthRefusal::AdmissionMismatch));
                 continue;
             }
+            // Captured while the receipt sits at `current`: the
+            // re-offer key if a capacity arm below refuses.
+            let reoffer_key = (receipt.image(), receipt.endpoint().file_slot);
             let Ok(mut slot) = births.reserve_for_current(&reserve, receipt) else {
                 association[first].refusal = Some((caller, BirthRefusal::Resource));
+                association[first].deferred = Some(reoffer_key);
                 continue;
             };
             let reservation = match registrations.reserve(input, &batch.registrations) {
                 Ok(reservation) => reservation,
                 Err(refusal) => {
-                    association[first].refusal =
-                        Some((caller, BirthRefusal::Registration(refusal)));
+                    let refusal = BirthRefusal::Registration(refusal);
+                    if refusal.transient() {
+                        association[first].deferred = Some(reoffer_key);
+                    }
+                    association[first].refusal = Some((caller, refusal));
                     continue;
                 }
             };
@@ -1361,13 +1472,51 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             installed += 1;
         }
         drop(registrations);
+        let mut reoffers = Vec::new();
         for link in &association {
             if let Some((caller, refusal)) = link.refusal {
-                disclose_s1_birth_refusal(&mut self.registry, caller, refusal.reason());
+                match link.deferred {
+                    Some((image, file)) if refusal.transient() => {
+                        disclose_s1_birth_deferred(
+                            &mut self.registry,
+                            caller,
+                            refusal.deferred_reason(),
+                        );
+                        reoffers.push(BirthReoffer {
+                            caller,
+                            image,
+                            file,
+                            reason: refusal.reason(),
+                        });
+                    }
+                    _ => {
+                        disclose_s1_birth_refusal(
+                            &mut self.registry,
+                            caller,
+                            refusal.reason(),
+                        );
+                    }
+                }
             }
         }
         births.order_for_native_reads();
-        Ok(PreparedBirthDisposition { installed })
+        Ok(PreparedBirthDisposition {
+            installed,
+            reoffers,
+        })
+    }
+
+    /// A deferred birth whose re-offer could not run (budget
+    /// spent, or no live capture to re-mint on) lands its
+    /// original refusal here, exactly once, under the permanent
+    /// retained-S1 subject. Only the Joint machine calls this,
+    /// once per disposition re-offer it failed to arm.
+    pub(crate) fn disclose_birth_reoffer_exhausted(&mut self, reoffer: &BirthReoffer) {
+        disclose_s1_birth_refusal(
+            &mut self.registry,
+            reoffer.caller,
+            reoffer.reason.clone(),
+        );
     }
 
     /// The idle machine walks actual accepted image bindings and actual

@@ -5386,7 +5386,9 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             policy: context.policy,
             scope: context.scope.kind(),
             caller: target_caller,
-            ring_bytes: resolve_ring_bytes(context.ring_bytes),
+            // The loader's own resolver: an owned run takes no journal, so the
+            // disclosure is the ring that was loaded (4 MiB for metrics).
+            ring_bytes: resolve_capture_ring_bytes(context.policy, false, context.ring_bytes),
             drain_interval_ms: context.drain.as_millis() as u64,
         };
         let j = if profile {

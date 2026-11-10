@@ -17715,15 +17715,29 @@ impl Engine {
                 break;
             }
             let position = self.views.iter().position(|view| view.id() == key.view);
-            let Some(position) = position.filter(|position| {
-                self.views[*position].still_the_same()
-                    && !self
-                        .refresh_requested
-                        .contains_key(&self.views[*position].pid())
-            }) else {
+            let Some(position) = position else {
+                // The view retired: the retirement path owns the evidence.
                 self.pending_loader_arm_scans.remove(&key);
                 continue;
             };
+            let pid = self.views[position].pid();
+            if self.refresh_requested.contains_key(&pid) {
+                // Superseded: the owed refresh rescans this view whole.
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            }
+            if !self.views[position].still_the_same() {
+                // A provable exit is the ordinary end of a process and stays
+                // silent; an unreadable live view is loss with a named gap.
+                if !self.original_exited(key.view) {
+                    self.mark_partial(
+                        "post-arm provider discovery",
+                        "the one-shot loader-arm catch-up scan was skipped: the retained view was unreadable",
+                    );
+                }
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            }
             let authority = self.loader_arm_scan_authority(position, key);
             // No memory scan started: keep the exact key when preparation
             // alone spent this opportunity, without renewing its budget.
@@ -17735,9 +17749,26 @@ impl Engine {
                 complete = false;
                 break;
             }
-            let Ok(Some(authority)) = authority else {
-                self.pending_loader_arm_scans.remove(&key);
-                continue;
+            let authority = match authority {
+                Ok(Some(authority)) => authority,
+                // Obsolete identity (absent, tombstoned, mismatched,
+                // remapped): nothing to scan, silent as before.
+                Ok(None) => {
+                    self.pending_loader_arm_scans.remove(&key);
+                    continue;
+                }
+                // Re-proof failed (notably a transient interpreter open that
+                // exhausted its bounded retries): a named gap, never silence.
+                Err(error) => {
+                    self.mark_partial(
+                        "post-arm provider discovery",
+                        &format!(
+                            "the one-shot loader-arm catch-up scan was skipped during authority re-proof: {error:#}"
+                        ),
+                    );
+                    self.pending_loader_arm_scans.remove(&key);
+                    continue;
+                }
             };
             self.pending_loader_arm_scans.remove(&key);
             self.unpaused_loader_views.insert(key.view);

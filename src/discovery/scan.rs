@@ -16623,6 +16623,309 @@ mod tests {
         assert_eq!(io.prove_calls, 0, "only caller ranges consult the witness");
         assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
     }
+
+    /// Full-scan fixture for one overlay-held provider file: scripted
+    /// maps over a small real ELF (`/bin/true` copied under a `.so`
+    /// name), zeroed memory, an overlayfs held identity whose
+    /// `(dev, ino)` equals the maps key, and a witness that either
+    /// delegates to the production original-file proof (which
+    /// early-outs, kernel-free, under scoped collection) or serves a
+    /// scripted verdict.
+    struct OverlayPublishFixture {
+        maps: Vec<u8>,
+        held: MappedFile,
+        scripted: Option<WitnessOutcome>,
+    }
+
+    struct OverlayPublishMemory;
+
+    impl ScanMemory for OverlayPublishMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+            bytes.fill(0);
+            Ok(bytes.len())
+        }
+    }
+
+    impl ScanIo for OverlayPublishFixture {
+        type Memory = OverlayPublishMemory;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<OverlayPublishMemory> {
+            Ok(OverlayPublishMemory)
+        }
+
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+
+        fn held_identity(&mut self, _file: &File) -> Option<MappedFile> {
+            Some(self.held)
+        }
+
+        fn range_identity(
+            &mut self,
+            _: &ProcessView,
+            _: u64,
+            _: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            Ok(Ok(self.held.identity))
+        }
+
+        fn prove_original_file_diagnosed(
+            &mut self,
+            view: &ProcessView,
+            file: &File,
+            held: &MappedFile,
+            key: ObjectKey,
+            range: (u64, u64),
+            budget: &mut CaptureWorkBudget,
+        ) -> WitnessOutcome {
+            match self.scripted {
+                Some(outcome) => outcome,
+                None => {
+                    prove_original_file_diagnosed(view.pid(), file, held, key, &[range], budget)
+                }
+            }
+        }
+    }
+
+    /// Drive one full deep scan over the overlay fixture: `collection`
+    /// installs the cgroup scoped-collection hook (the production
+    /// witness then deactivates, kernel-free), `scripted` replaces the
+    /// witness verdict instead of delegating to production.
+    fn scan_overlay_provider(
+        dir: &tempfile::TempDir,
+        collection: bool,
+        scripted: Option<WitnessOutcome>,
+    ) -> (ScanOutcome, std::path::PathBuf) {
+        use std::os::unix::fs::MetadataExt as _;
+        let so_path = dir.path().join("libprov.so");
+        // A small real ELF under a `.so` name (the test image itself is
+        // hundreds of megabytes and trips the whole-size gate).
+        let exe = std::fs::read("/bin/true").expect("a small system ELF reads");
+        std::fs::write(&so_path, &exe).expect("the fixture provider writes");
+        // The maps key comes from the same production function the
+        // opened-file guard validates against (on btrfs the stat
+        // device differs from the mapped device).
+        let view = ProcessView::open(ProcessViewId(701), std::process::id())
+            .expect("the test process opens");
+        let key_file = std::fs::File::open(&so_path).expect("the fixture provider opens");
+        let mut mounts = MountTableCache::default();
+        let mut key_budget = CaptureWorkBudget::default();
+        let key = crate::discovery::identity::retained_object_key_cached(
+            &view,
+            &key_file,
+            &mut mounts,
+            &mut key_budget,
+        )
+        .expect("the fixture key resolves");
+        let (major, minor, ino) = (key.device.major, key.device.minor, key.inode);
+        let maps = format!(
+            "7f1000000000-7f1000001000 r-xp 00000000 {major:02x}:{minor:02x} {ino} {}\n\
+             7f1000001000-7f1000002000 r--p 00001000 {major:02x}:{minor:02x} {ino} {}\n\
+             7f1000002000-7f1000003000 rw-p 00002000 {major:02x}:{minor:02x} {ino} {}\n",
+            so_path.display(),
+            so_path.display(),
+            so_path.display(),
+        );
+        // The held identity is the file's own stat namespace (what
+        // `map_files` reports), distinct from the maps key above.
+        let meta = std::fs::metadata(&so_path).expect("the fixture provider stats");
+        let held = MappedFile {
+            identity: crate::discovery::identity::FileIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut fixture = OverlayPublishFixture {
+            maps: maps.into_bytes(),
+            held,
+            scripted,
+        };
+        let mut budget = CaptureWorkBudget::default();
+        if collection {
+            budget.set_collection_work(CollectionWork::new(|_| true));
+        }
+        let hooks = HookRegistry::builtin();
+        let (outcome, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&so_path),
+                hooks: &hooks,
+            },
+            &view,
+            &mut budget,
+            &mut fixture,
+            true,
+        )
+        .expect("the scan must complete, not error");
+        (outcome, so_path)
+    }
+
+    /// Cgroup inventory on an overlay rootfs: scoped collection
+    /// deactivates the kernel witness, so the overlay provider refuses
+    /// with the witness-unavailable gap — but the scan must still
+    /// publish the found module with that named gap (PARTIAL coverage
+    /// downstream), never an empty view. No proof is claimed: the
+    /// tables scan never finishes on the degraded module.
+    #[test]
+    fn cgroup_scoped_scan_publishes_overlay_module_with_unproven_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, so_path) = scan_overlay_provider(&dir, true, None);
+        let modules = outcome.modules();
+        assert_eq!(
+            modules.len(),
+            1,
+            "scoped collection publishes the found overlay module, got {modules:?} with skips {:?}",
+            outcome.skipped(),
+        );
+        assert_eq!(modules[0].path, so_path.display().to_string());
+        assert!(
+            !modules[0].tables_scan_finished,
+            "the degraded module claims no finished tables scan"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip.reason
+                == "original_file_unproven: kernel witness unavailable: \
+                    scoped collection deactivates the kernel proof"),
+            "the named unavailable gap stands, got {:?}",
+            outcome.skipped(),
+        );
+    }
+
+    /// Healthy twin: without scoped collection the witness proves the
+    /// fresh mapping and the module joins with no unproven gap (the
+    /// `--system`/`--pid` shape on overlayfs).
+    #[test]
+    fn unscoped_scan_with_proven_witness_joins_without_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, so_path) = scan_overlay_provider(
+            &dir,
+            false,
+            Some(WitnessOutcome {
+                verdict: WitnessVerdict::SameFile,
+                diagnosis: None,
+            }),
+        );
+        let modules = outcome.modules();
+        assert_eq!(
+            modules.len(),
+            1,
+            "a proven overlay module joins, got {modules:?} with skips {:?}",
+            outcome.skipped(),
+        );
+        assert_eq!(modules[0].path, so_path.display().to_string());
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("original_file_unproven")),
+            "a proven join carries no unproven gap, got {:?}",
+            outcome.skipped(),
+        );
+    }
+
+    /// Soundness twin: a proven-another-file verdict still refuses,
+    /// even under scoped collection — a stale lower mapping never
+    /// publishes the fresh upper file's facts.
+    #[test]
+    fn cgroup_scoped_scan_refuses_proven_stale_overlay_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, _) = scan_overlay_provider(
+            &dir,
+            true,
+            Some(WitnessOutcome {
+                verdict: WitnessVerdict::OtherFile,
+                diagnosis: None,
+            }),
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "a proven-stale mapping never publishes, got {:?}",
+            outcome.modules(),
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("original_file_unproven")),
+            "the stale refusal carries the finite gap, got {:?}",
+            outcome.skipped(),
+        );
+    }
+
+    /// Boundary twins: budget exhaustion and anchor failure keep
+    /// refusing under scoped collection — only the unavailable family
+    /// (the witness never ran) degrades to publish-with-gap.
+    #[test]
+    fn cgroup_scoped_scan_refuses_exhausted_and_anchor_failures() {
+        for verdict in [
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted),
+            WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (outcome, _) = scan_overlay_provider(
+                &dir,
+                true,
+                Some(WitnessOutcome {
+                    verdict,
+                    diagnosis: None,
+                }),
+            );
+            assert!(
+                outcome.modules().is_empty(),
+                "a {verdict:?} refusal never publishes, got {:?}",
+                outcome.modules(),
+            );
+        }
+    }
+
+    /// Scope twin: without scoped collection an unavailable witness
+    /// keeps refusing (the `--system`/`--pid` fail-closed shape where
+    /// the proof substrate itself is broken) — only the
+    /// userspace-only cgroup path degrades.
+    #[test]
+    fn unscoped_scan_with_unavailable_witness_keeps_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, _) = scan_overlay_provider(
+            &dir,
+            false,
+            Some(WitnessOutcome {
+                verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                diagnosis: None,
+            }),
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "an unscoped unavailable refusal never publishes, got {:?}",
+            outcome.modules(),
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason == GAP_WITNESS_UNAVAILABLE),
+            "the canonical unavailable gap stands, got {:?}",
+            outcome.skipped(),
+        );
+    }
 }
 
 #[cfg(test)]

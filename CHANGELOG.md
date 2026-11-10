@@ -124,6 +124,9 @@ versioned separately and are opaque, exact dispatch keys.
   the scan-found module as PARTIAL with its named gap when the
   file-identity witness is unavailable (was: the module was refused
   and the capture could show no countable endpoints).
+- Transient admission-deferral scan refusals settle when the endpoint
+  is admitted instead of staying refused (was: up to 2 endpoints
+  reported as refused at very high call rates).
 
 ### Corrections
 
@@ -165,9 +168,6 @@ The v0.7.0 limits live in
   arrive seconds late and part of a window shows as exact named
   counts instead of per-call rows. Exact per-call rows past 6,250/s
   wait for the 0.7.1 event reader.
-- At very high call rates with many short-lived endpoints, up to 2
-  endpoints can be reported as refused ("semantic admission
-  deferred"); their calls are still counted.
 
 ## [0.6.0] - 2026-11-06
 

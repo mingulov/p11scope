@@ -276,12 +276,6 @@ silently dropped. Sustained rates above 6,250 key operations per
 second with exact per-call rows need the independent event reader,
 planned for 0.7.1.
 
-### At very high call rates, up to 2 endpoints can be reported as refused
-
-At very high call rates with many short-lived endpoints, up to 2
-endpoints can be reported as refused ("semantic admission
-deferred"); their calls are still counted.
-
 ### `trace --system` and `profile` rate ceilings on a small VM
 
 On a 3-vCPU VM (sm1, fedora guest, rc-8 build), `trace --system`

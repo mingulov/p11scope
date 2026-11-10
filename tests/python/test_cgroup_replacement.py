@@ -55,7 +55,7 @@ def synthetic_inputs():
                    reuse_expected={}, requested_backend="singles", fresh_observer=True,
                    observer_argv=["/w/p11scope", "trace", "--cgroup", root["path"],
                                   "--module", provider["path"], "--attach-backend", "singles",
-                                  "--duration", "120s", "-o", "/w/trace.file.txt"],
+                                  "--duration", "120s", "-o", "/w/trace.file.txt", "-v"],
                    executable_pin=dict(path=image["path"], dev=8, ino=70, mtime_ns=88),
                    replacement=dict(original_identity=old_identity, original_image=old_image,
                        replacement_identity=identity, replacement_image=image,
@@ -541,9 +541,9 @@ class StandinIO:
         elif self.failure == "backend-refused":
             code, extra = "import sys; print('requested backend not supported',file=sys.stderr,flush=True); raise SystemExit(2)", []
         elif self.failure == "nonzero-stop":
-            code, extra = OBSERVER_CODE + "\nraise SystemExit(2)", [str(directory / "replacement.ledger.jsonl"), argv[-1], argv[7]]
+            code, extra = OBSERVER_CODE + "\nraise SystemExit(2)", [str(directory / "replacement.ledger.jsonl"), argv[argv.index("-o") + 1], argv[7]]
         else:
-            code, extra = OBSERVER_CODE, [str(directory / "replacement.ledger.jsonl"), argv[-1], argv[7], self.failure or ""]
+            code, extra = OBSERVER_CODE, [str(directory / "replacement.ledger.jsonl"), argv[argv.index("-o") + 1], argv[7], self.failure or ""]
         owner = H6["spawn_owned"](ctx.owners, [sys.executable, "-c", code, *extra], os.geteuid(),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True)

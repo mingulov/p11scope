@@ -257,10 +257,10 @@ def evaluate_replacement(trace, ledger, receipt, file_trace=None):
                 or proof["membership_after"] != "/" + str(Path(descendant["path"]).relative_to("/sys/fs/cgroup"))):
             errors.append("replacement lacks the original held cgroup root and selected descendant endpoints")
         argv = receipt["observer_argv"]
-        if (len(argv) != 12 or argv[1] != "trace" or argv[2] != "--cgroup"
+        if (len(argv) != 13 or argv[1] != "trace" or argv[2] != "--cgroup"
                 or argv[3] != root["path"] or argv[4] != "--module" or argv[5] != provider["path"]
                 or argv[6:8] != ["--attach-backend", receipt["requested_backend"]]
-                or argv[8:10] != ["--duration", "120s"] or argv[10] != "-o"
+                or argv[8:10] != ["--duration", "120s"] or argv[10] != "-o" or argv[12] != "-v"
                 or receipt["scope_kind"] != "cgroup"):
             errors.append("observer did not select the held cgroup and exact requested public backend")
         calls = [row for row in ledger if row.get("kind") == "call" and row.get("phase") == "measured"]
@@ -377,7 +377,8 @@ def run_replacement(ctx, directory, backend, env, image_pin, io=None):
     provider_before = H6["provider_receipt"](ctx.provider_pin)
     argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
             "--module", str(ctx.provider_pin.path), "--attach-backend", backend,
-            "--duration", "120s", "-o", str(directory / "trace.file.txt")]
+            "--duration", "120s", "-o", str(directory / "trace.file.txt"),
+            "-v"]  # parity needs EVIDENCE on stdout
     owned, capture, errors, started = io.spawn_observer(ctx, directory, argv, env)
     try:
         ready = H6["observer_ready"](owned, errors, backend, timeout=H6["remaining_seconds"](20))

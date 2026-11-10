@@ -8612,6 +8612,42 @@ pub(crate) mod tests {
         assert!(!out.contains("names withheld"), "{out}");
     }
 
+    /// F2: attribution-only text must state the same PARTIAL verdict as
+    /// JSON (`evidence.completeness: PARTIAL`, `attribution_only`), in
+    /// plain words: partial, with counts complete and names unconfirmed.
+    /// Never `coverage: counts complete` without the partial verdict.
+    #[test]
+    fn attribution_only_coverage_states_partial_with_counts_complete() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                verbosity,
+            );
+            assert!(
+                out.contains("coverage: partial"),
+                "{verbosity:?} states partial like JSON: {out}"
+            );
+            assert!(
+                out.contains("counts complete"),
+                "{verbosity:?} keeps counts complete: {out}"
+            );
+            assert!(
+                !out.contains("coverage: counts complete"),
+                "{verbosity:?} never contradicts JSON with a complete verdict: {out}"
+            );
+        }
+    }
+
     /// CLI text: the frame header states the scope once, and the
     /// privacy mode only under -v.
     #[test]

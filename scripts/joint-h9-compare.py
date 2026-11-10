@@ -16,7 +16,7 @@ Checked here (each names its output field below): per-feed operation
 order and phase scripts from ledger rows; key_row started/completed and
 the row equation per (instance, object, category, role); metadata_at_use
 equality with the ledger-declared established label (a null declaration
-must land in unknown_key_operations, never in a key row); role rows kept
+rows under "unknown" in a key row); role rows kept
 separate (a summed row fails the per-role match); unit agreement per
 category (message_* rows carry message_contexts); unknown rows
 partitioned by (category, reason) with no started field; S1Only feeds
@@ -594,16 +594,18 @@ def validate_snapshot(document):
 
 
 def _feed_key(feed):
+    """Key-row claim of one joint feed: null metadata rows as "unknown"."""
+    label = feed["metadata"] if feed["metadata"] is not None else "unknown"
     return (feed["instance"], feed["object"], feed["category"], feed["role"],
-            feed["metadata"])
+            label)
 
 
 def compare_pair(first, second, snapshot):
     """Compare two validated feeds against one validated snapshot.
 
-    Joint feeds with established metadata match exactly one key row each
-    (grouped when two feeds share one key); joint feeds without metadata
-    and S1Only feeds match unknown rows (metadata_unknown and unbound).
+    Joint feeds match exactly one key row each (grouped when two feeds
+    share one key; a feed without declared metadata rows under
+    "unknown"); S1Only feeds match unknown rows (unbound).
     Feeds observing equal handles in different scopes must sit on
     distinct objects; equal scope+handle must sit on one object. Every
     snapshot row must be claimed by a feed; nothing extra may ride along
@@ -637,12 +639,10 @@ def compare_pair(first, second, snapshot):
     objects = {row["object"] for row in snapshot["objects"]}
     keyed, unkeyed = {}, {}
     for feed in feeds:
-        if feed["path"] == "joint" and feed["metadata"] is not None:
+        if feed["path"] == "joint":
             keyed.setdefault(_feed_key(feed), []).append(feed)
         else:
-            reason = ("metadata_unknown"
-                      if feed["path"] == "joint" else "unbound")
-            unkeyed.setdefault((feed["category"], reason), []).append(feed)
+            unkeyed.setdefault((feed["category"], "unbound"), []).append(feed)
     claimed_known, claimed_unknown = set(), set()
     for key, group in keyed.items():
         label = ",".join(feed["feed"] for feed in group)
@@ -706,12 +706,10 @@ def compare_pair(first, second, snapshot):
 def _claim_of(feeds, bucket, key):
     if bucket == "known":
         return [feed for feed in feeds
-                if feed["path"] == "joint" and feed["metadata"] is not None
-                and _feed_key(feed) == key]
+                if feed["path"] == "joint" and _feed_key(feed) == key]
     return [feed for feed in feeds
-            if not (feed["path"] == "joint" and feed["metadata"] is not None)
-            and (feed["category"],
-                 "metadata_unknown" if feed["path"] == "joint" else "unbound") == key]
+            if feed["path"] != "joint"
+            and (feed["category"], "unbound") == key]
 
 
 def compare_stream(events, feeds, snapshot):

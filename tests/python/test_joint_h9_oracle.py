@@ -146,13 +146,14 @@ def healthy_snapshot(summaries):
     """Build the consistent section for validated feed summaries."""
     keyed, unkeyed = {}, {}
     for feed in summaries:
-        if feed["path"] == "joint" and feed["metadata"] is not None:
+        if feed["path"] == "joint":
+            label = feed["metadata"] if feed["metadata"] is not None \
+                else "unknown"
             key = (feed["instance"], feed["object"], feed["category"],
-                   feed["role"], feed["metadata"])
+                   feed["role"], label)
             keyed.setdefault(key, []).append(feed)
         else:
-            reason = "metadata_unknown" if feed["path"] == "joint" else "unbound"
-            keyed_unknown = (feed["category"], reason)
+            keyed_unknown = (feed["category"], "unbound")
             unkeyed.setdefault(keyed_unknown, []).append(feed)
     objects = sorted({feed["object"] for group in keyed.values() for feed in group})
     key_rows = []
@@ -179,21 +180,27 @@ def healthy_snapshot(summaries):
                              "active": sum(feed["pending"] for feed in group)})
     labels = {feed["object"]: feed["metadata"] for group in keyed.values()
               for feed in group}
-    return {"version": 1, "revision": 7, "status": "populated", "reason": "none",
-            "sessions": [{"session": 1, "origin": "opened", "status": "live"}],
-            "objects": [object_row(object_id, labels[object_id])
-                        for object_id in objects],
-            "key_operations": key_rows,
-            "unknown_key_operations": unknown_rows,
-            "gaps": {"rows": [], "suppressed": 0},
-            "budgets": {
-                "key_rows": {"limit": 65536, "occupied": len(key_rows),
-                             "refused": 0},
-                "object_rows": {"limit": 65536, "occupied": len(objects),
-                                "refused": 0},
-                "unknown_rows": {"occupied": len(unknown_rows)},
-                "encoded_bytes": 100, "allocation_refused": False,
-                "refusal_reason": "none"}}
+    document = {"version": 1, "revision": 7, "status": "populated",
+                "reason": "none",
+                "sessions": [{"session": 1, "origin": "opened",
+                              "status": "live"}],
+                "objects": [object_row(object_id, labels[object_id])
+                            for object_id in objects],
+                "key_operations": key_rows,
+                "unknown_key_operations": unknown_rows,
+                "gaps": {"rows": [], "suppressed": 0},
+                "budgets": {
+                    "key_rows": {"limit": 65536, "occupied": len(key_rows),
+                                 "refused": 0},
+                    "object_rows": {"limit": 65536, "occupied": len(objects),
+                                    "refused": 0},
+                    "unknown_rows": {"occupied": len(unknown_rows)},
+                    "encoded_bytes": 100, "allocation_refused": False,
+                    "refusal_reason": "none"}}
+    if any(row["metadata_at_use"] == "unknown" for row in key_rows):
+        document["version"] = 4
+        document["unattributed"] = []
+    return document
 
 
 def healthy_stream(summaries, snapshot):
@@ -225,16 +232,17 @@ def healthy_stream(summaries, snapshot):
     for terminal_t1, feed_name, op_id in completions:
         feed = next(item for item in summaries if item["feed"] == feed_name)
         revision += 1
-        if feed["path"] == "joint" and feed["metadata"] is not None:
+        if feed["path"] == "joint":
+            label = feed["metadata"] if feed["metadata"] is not None \
+                else "unknown"
             key = (feed["instance"], feed["object"], feed["category"],
-                   feed["role"], feed["metadata"])
+                   feed["role"], label)
             final = next(row for row in snapshot["key_operations"]
                          if (row["instance"], row["object"], row["category"],
                              row["role"], row["metadata_at_use"]) == key)
             bucket = "known"
         else:
-            reason = "metadata_unknown" if feed["path"] == "joint" else "unbound"
-            key = (feed["category"], reason)
+            key = (feed["category"], "unbound")
             final = next(row for row in snapshot["unknown_key_operations"]
                          if (row["category"], row["reason"]) == key)
             bucket = "unknown"
@@ -246,9 +254,10 @@ def healthy_stream(summaries, snapshot):
         else:
             total = (final["completed"] + final["failed"] + final["active"])
             row["active"] = total - rank[key] - final["failed"]
-        lines.append(envelope("key_operations_observed",
-                              {"revision": revision, "bucket": bucket,
-                               "row": row},
+        event = {"revision": revision, "bucket": bucket, "row": row}
+        if bucket == "known" and row["metadata_at_use"] == "unknown":
+            event["version"] = 4
+        lines.append(envelope("key_operations_observed", event,
                               terminal_t1 + 100))
     base = completions[-1][0] if completions else 800
     lines.append(envelope("pass_committed",
@@ -644,7 +653,7 @@ class CompareTwins(unittest.TestCase):
         stream = healthy_stream([first, second], snapshot)
         oracle.compare_stream(stream, [first, second], snapshot)
 
-    def test_healthy_null_metadata_feed_lands_unknown(self):
+    def test_healthy_null_metadata_feed_rows_unknown(self):
         oracle = require_oracle(self)
         cfg_b = dict(MODES["interleave"][1], metadata=None)
         rows_a = healthy_ledger(MODES["interleave"][0], ops=2)
@@ -652,10 +661,17 @@ class CompareTwins(unittest.TestCase):
         first = oracle.validate_ledger(rows_a, "ledger A")
         second = oracle.validate_ledger(rows_b, "ledger B")
         snapshot = healthy_snapshot([first, second])
-        self.assertEqual(len(snapshot["key_operations"]), 1)
-        self.assertEqual(snapshot["unknown_key_operations"][0]["reason"],
-                         "metadata_unknown")
+        self.assertEqual(len(snapshot["key_operations"]), 2)
+        unlabelled = next(row for row in snapshot["key_operations"]
+                          if row["object"] == 12)
+        self.assertEqual(unlabelled["metadata_at_use"], "unknown")
+        self.assertEqual((unlabelled["started"], unlabelled["completed"]),
+                         (2, 2))
+        self.assertEqual(snapshot["unknown_key_operations"], [])
+        self.assertEqual(snapshot["version"], 4)
         oracle.compare_pair(first, second, snapshot)
+        stream = healthy_stream([first, second], snapshot)
+        oracle.compare_stream(stream, [first, second], snapshot)
 
     def test_mutation_joined_equal_handles_rejected(self):
         oracle = require_oracle(self)
@@ -691,7 +707,7 @@ class CompareTwins(unittest.TestCase):
                                     " i3,11,sign,key,rsa_2048"):
             oracle.compare_pair(first, second, snapshot)
 
-    def test_mutation_null_metadata_feed_upgraded_rejected(self):
+    def test_mutation_null_metadata_feed_guessed_label_rejected(self):
         oracle = require_oracle(self)
         cfg_b = dict(MODES["interleave"][1], metadata=None)
         rows_a = healthy_ledger(MODES["interleave"][0], ops=2)
@@ -708,7 +724,20 @@ class CompareTwins(unittest.TestCase):
         snapshot["key_operations"].sort(
             key=lambda row: (row["instance"], row["object"], row["category"],
                              row["role"], row["metadata_at_use"]))
-        with self.assertRaisesRegex(oracle.LedgerError, "upgrade refused"):
+        with self.assertRaisesRegex(oracle.LedgerError, "unmatched key row"):
+            oracle.compare_pair(first, second, snapshot)
+        snapshot = healthy_snapshot([first, second])
+        snapshot["key_operations"] = [
+            row for row in snapshot["key_operations"]
+            if row["metadata_at_use"] != "unknown"]
+        snapshot["objects"] = [row for row in snapshot["objects"]
+                               if row["object"] != 12]
+        snapshot["unknown_key_operations"].append(
+            {"category": "message_sign", "reason": "metadata_unknown",
+             "unit": "message_contexts", "completed": 2, "failed": 0,
+             "cancelled": 0, "unknown": 0, "active": 0})
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "missing key row for feed B"):
             oracle.compare_pair(first, second, snapshot)
 
     def test_mutation_s1only_feed_upgraded_rejected(self):

@@ -246,23 +246,17 @@ def healthy_joint(oracle, collision):
     owned = oracle._owner_tally(owner, collision)
     chaled = oracle._challenger_tally(challenger, collision)
     objects, key_rows, unknown_rows = [], [], []
-    if owner["metadata"] is not None:
-        objects.append(object_row(owner["object"], owner["metadata"]))
-        key_rows.append({"instance": owner["instance"], "object": owner["object"],
-                         "category": "operation", "role": "key",
-                         "metadata_at_use": owner["metadata"],
-                         "unit": "operations", "started": owned["begun"],
-                         "completed": owned["completed"], "failed": owned["failed"],
-                         "cancelled": owned["cancelled"], "unknown": 0,
-                         "active": owned["pending"], "key_join_lost": 0})
+    owner_label = owner["metadata"] if owner["metadata"] is not None \
+        else "unknown"
+    objects.append(object_row(owner["object"], owner["metadata"]))
+    key_rows.append({"instance": owner["instance"], "object": owner["object"],
+                     "category": "operation", "role": "key",
+                     "metadata_at_use": owner_label,
+                     "unit": "operations", "started": owned["begun"],
+                     "completed": owned["completed"], "failed": owned["failed"],
+                     "cancelled": owned["cancelled"], "unknown": 0,
+                     "active": owned["pending"], "key_join_lost": 0})
     groups = {}
-    if owner["metadata"] is None:
-        groups.setdefault(("operation", "metadata_unknown"),
-                          {"completed": 0, "failed": 0, "cancelled": 0,
-                           "unknown": 0, "active": 0})
-        for name in ("completed", "failed", "cancelled"):
-            groups[("operation", "metadata_unknown")][name] += owned[name]
-        groups[("operation", "metadata_unknown")]["active"] += owned["pending"]
     reason = ("metadata_unknown" if challenger["metadata"] is None
               else "unbound")
     groups.setdefault(("operation", reason),
@@ -290,7 +284,11 @@ def healthy_joint(oracle, collision):
         gaps.append({"subject": "key_operation", "reason": fence,
                      "repeats": repeats})
     gaps.sort(key=lambda row: (row["subject"], row["reason"]))
-    return section(objects, key_rows, unknown_rows, gaps)
+    document = section(objects, key_rows, unknown_rows, gaps)
+    if owner["metadata"] is None:
+        document["version"] = 4
+        document["unattributed"] = []
+    return document
 
 
 def healthy_s1only(oracle, collision):
@@ -312,8 +310,10 @@ def completion_events(collision, snapshot):
     """Per-row completion stamps in global terminal order."""
     owner, challenger = collision["owner"], collision["challenger"]
     crowns = {}
+    owner_label = owner["metadata"] if owner["metadata"] is not None \
+        else "unknown"
     owner_key = ("known", (owner["instance"], owner["object"], "operation",
-                           "key", owner["metadata"]))
+                           "key", owner_label))
     chal_reason = ("metadata_unknown" if challenger["metadata"] is None
                    else "unbound")
     chal_key = ("unknown", ("operation", chal_reason))
@@ -329,10 +329,6 @@ def completion_events(collision, snapshot):
         if op["outcome"] == "completed":
             crowns.setdefault(chal_key, []).append(
                 (op["terminal_t1"], op["terminal_t0"]))
-    if owner["metadata"] is None:
-        moved = crowns.pop(owner_key, [])
-        target = ("unknown", ("operation", "metadata_unknown"))
-        crowns.setdefault(target, []).extend(moved)
     ordered = []
     for key, stamps in crowns.items():
         for end, start in stamps:
@@ -380,17 +376,20 @@ def healthy_stream(collision, snapshot):
             total = finals[key]["completed"] + finals[key]["failed"] \
                 + finals[key]["active"]
             row["active"] = total - rank[key] - finals[key]["failed"]
-        lines.append(envelope("key_operations_observed",
-                              {"revision": revision,
-                               "bucket": key[0], "row": row}, end + 100))
+        event = {"revision": revision, "bucket": key[0], "row": row}
+        if key[0] == "known" and row["metadata_at_use"] == "unknown":
+            event["version"] = 4
+        lines.append(envelope("key_operations_observed", event, end + 100))
     for row in snapshot["key_operations"]:
         key = ("known", (row["instance"], row["object"], row["category"],
                          row["role"], row["metadata_at_use"]))
         if key not in rank:
             revision += 1
-            lines.append(envelope("key_operations_observed",
-                                  {"revision": revision, "bucket": "known",
-                                   "row": copy.deepcopy(row)}, 750))
+            event = {"revision": revision, "bucket": "known",
+                     "row": copy.deepcopy(row)}
+            if row["metadata_at_use"] == "unknown":
+                event["version"] = 4
+            lines.append(envelope("key_operations_observed", event, 750))
     for row in snapshot["unknown_key_operations"]:
         key = ("unknown", (row["category"], row["reason"]))
         if key not in rank:
@@ -961,7 +960,7 @@ class PairedPathTwins(unittest.TestCase):
         with self.assertRaisesRegex(oracle.LedgerError, "joint gaps"):
             oracle.compare_joint(collision, joint)
 
-    def test_mutation_metadata_null_owner_lands_unknown(self):
+    def test_healthy_metadata_null_owner_rows_unknown(self):
         oracle = require_oracle(self)
         scen_a = dict(SCEN["owner_poll"], metadata=None)
         rows_a = build_ledger(scen_a, plan_poll_owner(2))
@@ -971,11 +970,16 @@ class PairedPathTwins(unittest.TestCase):
         second = oracle.validate_ledger(rows_b, "ledger B")
         collision = oracle.compare_collision(first, second)
         joint = healthy_joint(oracle, collision)
-        self.assertEqual(joint["key_operations"], [])
+        self.assertEqual(len(joint["key_operations"]), 1)
+        self.assertEqual(joint["key_operations"][0]["metadata_at_use"],
+                         "unknown")
+        self.assertEqual(joint["version"], 4)
         reasons = sorted(row["reason"]
                          for row in joint["unknown_key_operations"])
-        self.assertEqual(reasons, ["metadata_unknown", "unbound"])
+        self.assertEqual(reasons, ["unbound"])
         oracle.compare_joint(collision, joint)
+        stream = healthy_stream(collision, joint)
+        oracle.compare_stream(stream, collision, joint, "joint")
         joint["key_operations"].append(
             {"instance": "i3", "object": 11, "category": "operation",
              "role": "key", "metadata_at_use": "rsa_2048",
@@ -983,6 +987,16 @@ class PairedPathTwins(unittest.TestCase):
              "failed": 0, "cancelled": 0, "unknown": 0, "active": 0,
              "key_join_lost": 0})
         with self.assertRaisesRegex(oracle.LedgerError, "unmatched key row"):
+            oracle.compare_joint(collision, joint)
+        joint = healthy_joint(oracle, collision)
+        joint["key_operations"] = []
+        joint["objects"] = []
+        joint["unknown_key_operations"].append(
+            {"category": "operation", "reason": "metadata_unknown",
+             "unit": "operations", "completed": 2, "failed": 0,
+             "cancelled": 0, "unknown": 0, "active": 0})
+        with self.assertRaisesRegex(oracle.LedgerError,
+                                    "missing key row for owner"):
             oracle.compare_joint(collision, joint)
 
     def test_mutation_s1only_key_row_rejected(self):

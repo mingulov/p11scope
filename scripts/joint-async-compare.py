@@ -887,7 +887,7 @@ def _fence_gaps(owner, challenger):
 def compare_joint(collision, snapshot):
     """Compare the collision against the joint-path snapshot.
 
-    The owner's ops join (key row, or unknown metadata_unknown without
+    The owner's ops join a key row (under "unknown" without
     established metadata); the challenger's untransferred completions
     are refused joins (duplicate_completion gaps with S1 completion
     preserved in unknown rows); fenced ops gap by fence value with no
@@ -906,8 +906,10 @@ def compare_joint(collision, snapshot):
             raise LedgerError(f"challenger joined by key row"
                               f" {challenger['instance']},{challenger['object']}"
                               f",{CATEGORY},{ROLE}")
+    owner_label = owner["metadata"] if owner["metadata"] is not None \
+        else "unknown"
     owner_key = (owner["instance"], owner["object"], CATEGORY, ROLE,
-                 owner["metadata"])
+                 owner_label)
     owner_tally = _owner_tally(owner, collision)
     chal_tally = _challenger_tally(challenger, collision)
     known = {}
@@ -919,42 +921,26 @@ def compare_joint(collision, snapshot):
         unknown[_check_unknown_row(row, "joint snapshot unknown row")] = row
     objects = {row["object"] for row in snapshot["objects"]}
     claimed_known, claimed_unknown = set(), set()
-    if owner["metadata"] is not None:
-        _require(owner_key in known,
-                 f"missing key row for owner {owner_key[0]},{owner_key[1]}"
-                 f",{owner_key[2]},{owner_key[3]},{owner_key[4]}")
-        row = known[owner_key]
-        for name, want in (("started", owner_tally["begun"]),
-                           ("completed", owner_tally["completed"]),
-                           ("failed", owner_tally["failed"]),
-                           ("cancelled", owner_tally["cancelled"]),
-                           ("unknown", 0),
-                           ("active", owner_tally["pending"]),
-                           ("key_join_lost", 0)):
-            _require(row[name] == want,
-                     f"joint key row {name} {row[name]} disagrees with ledger"
-                     f" {want} for owner")
-        _require(owner["object"] in objects,
-                 f"joint missing object row {owner['object']} for owner")
-        claimed_known.add(owner_key)
-    else:
-        _require((CATEGORY, "metadata_unknown") in unknown,
-                 "joint missing unknown row for owner"
-                 f" {CATEGORY},metadata_unknown")
+    _require(owner_key in known,
+             f"missing key row for owner {owner_key[0]},{owner_key[1]}"
+             f",{owner_key[2]},{owner_key[3]},{owner_key[4]}")
+    row = known[owner_key]
+    for name, want in (("started", owner_tally["begun"]),
+                       ("completed", owner_tally["completed"]),
+                       ("failed", owner_tally["failed"]),
+                       ("cancelled", owner_tally["cancelled"]),
+                       ("unknown", 0),
+                       ("active", owner_tally["pending"]),
+                       ("key_join_lost", 0)):
+        _require(row[name] == want,
+                 f"joint key row {name} {row[name]} disagrees with ledger"
+                 f" {want} for owner")
+    _require(owner["object"] in objects,
+             f"joint missing object row {owner['object']} for owner")
+    claimed_known.add(owner_key)
     chal_reason = ("metadata_unknown" if challenger["metadata"] is None
                    else "unbound")
-    # Unknown rows are capture-wide: owner-without-metadata and the
-    # challenger may share one (category, reason) row; sum those groups.
     expected_unknown = {}
-    if owner["metadata"] is None:
-        key = (CATEGORY, "metadata_unknown")
-        group = expected_unknown.setdefault(
-            key, {"completed": 0, "failed": 0, "cancelled": 0, "unknown": 0,
-                  "active": 0})
-        group["completed"] += owner_tally["completed"]
-        group["failed"] += owner_tally["failed"]
-        group["cancelled"] += owner_tally["cancelled"]
-        group["active"] += owner_tally["pending"]
     key = (CATEGORY, chal_reason)
     group = expected_unknown.setdefault(
         key, {"completed": 0, "failed": 0, "cancelled": 0, "unknown": 0,
@@ -972,9 +958,6 @@ def compare_joint(collision, snapshot):
                      f"joint unknown row {name} {row[name]} disagrees with"
                      f" ledger {want[name]} for {key[0]},{key[1]}")
         claimed_unknown.add(key)
-    if owner["metadata"] is None:
-        _require(owner["object"] not in objects,
-                 f"joint object row {owner['object']} staged for unkeyed owner")
     _require(challenger["object"] not in objects,
              f"joint object row {challenger['object']} staged for challenger")
     expected_gaps = {("key_operation", "duplicate_completion"):
@@ -1079,33 +1062,24 @@ def _row_completions(collision, view, bucket, key):
     if bucket == "object" or view != "joint":
         return None
     owner, challenger = collision["owner"], collision["challenger"]
+    owner_label = owner["metadata"] if owner["metadata"] is not None \
+        else "unknown"
     owner_key = (owner["instance"], owner["object"], CATEGORY, ROLE,
-                 owner["metadata"])
+                 owner_label)
     chal_reason = ("metadata_unknown" if challenger["metadata"] is None
                    else "unbound")
-    shared_unknown = (owner["metadata"] is None
-                      and chal_reason == "metadata_unknown")
     stamps = None
-    if bucket == "known" and owner["metadata"] is not None and key == owner_key:
+    if bucket == "known" and key == owner_key:
         stamps = [(op["terminal_t0"], op["terminal_t1"])
                   for op in owner["ops"].values()
                   if op["outcome"] == "completed"]
         stamps += [(item["terminal_t0"], item["terminal_t1"])
                    for item in collision["transfers"]
                    if item["outcome"] == "completed"]
-    elif bucket == "unknown" and key == (CATEGORY, chal_reason) \
-            and not shared_unknown:
+    elif bucket == "unknown" and key == (CATEGORY, chal_reason):
         stamps = [(op["terminal_t0"], op["terminal_t1"])
                   for op in challenger["ops"].values()
                   if op["outcome"] == "completed"]
-    elif bucket == "unknown" and owner["metadata"] is None and key == (
-            CATEGORY, "metadata_unknown") and not shared_unknown:
-        stamps = [(op["terminal_t0"], op["terminal_t1"])
-                  for op in owner["ops"].values()
-                  if op["outcome"] == "completed"]
-        stamps += [(item["terminal_t0"], item["terminal_t1"])
-                   for item in collision["transfers"]
-                   if item["outcome"] == "completed"]
     if stamps is None:
         return None
     return sorted(stamps, key=lambda pair: pair[1])

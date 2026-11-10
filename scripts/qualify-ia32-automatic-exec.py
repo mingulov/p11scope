@@ -640,6 +640,9 @@ def run_leg(ctx, cell, backend, mode, directory):
     if mode != "trace":
         argv += ["--mode", mode]
     argv += ["-o", str(output)]
+    if mode == "trace":
+        # evaluate_ia32 parses EVIDENCE from observer stdout; only -v stdout carries it.
+        argv += ["-v"]
     ctx.observer_start = len(ctx.owners)
     try:
         owned, capture, errors, started = H6["spawn_observer"](

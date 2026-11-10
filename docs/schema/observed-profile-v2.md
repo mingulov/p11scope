@@ -406,9 +406,11 @@ concrete gap counter zero — that combination, not the `COMPLETE` string, is
 what the release lanes assert
 (`scripts/check-capture-evidence.py: terminal_capture_is_clean`).
 
-`trace` ends with `EVIDENCE {json}`. The JSON object is this same evidence
-contract, including its final `completeness` verdict; `LOST n events` remains
-an immediate human-readable notification when ring loss grows.
+`trace` ends its `-o` report with `EVIDENCE {json}` (and stdout under `-v`
+or `-o -`; plain default stdout ends with the human tail instead). The JSON
+object is this same evidence contract, including its final `completeness`
+verdict; `LOST n events` remains an immediate human-readable notification
+when ring loss grows.
 
 ## `functions[]`
 

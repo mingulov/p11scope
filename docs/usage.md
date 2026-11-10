@@ -893,7 +893,8 @@ captured, whether the stop was a signal, the command's own exit or
   complete, and p11scope still exits nonzero.
 - In `trace` mode, failed aggregate reads seal the terminal EVIDENCE with
   unknown aggregate counts (empty reports, defaulted kernel evidence) plus
-  a named gap, and EVIDENCE is always written for these reads; the per-call
+  a named gap, and EVIDENCE is written to the `-o` report when one is
+  requested, and to stdout under `-v` (or `-o -`); the per-call
   lines already streamed stay exact. A failed terminal loss report degrades
   the same way with unknown loss accounting. p11scope then exits nonzero
   with the error on stderr.
@@ -1123,7 +1124,9 @@ namespace, which `evidence.pid_namespace` states (see
 Every trace report ends with the same machine-readable evidence object used by
 profile output. The `-o` file always carries it; default stdout omits the
 multi-kilobyte `EVIDENCE` blob and keeps the stream concise, while `-v`
-restores it there. If the ring buffer drops events, trace also emits an explicit
+restores it there. With `-o -` stdout is the report, so it keeps the
+record at default verbosity too. If the ring buffer drops events, trace
+also emits an explicit
 `LOST n events` line rather than silently under-reporting — see
 [Overhead](#overhead-measured) for when that actually happens.
 Immediately before `EVIDENCE`, trace emits one aggregate-only
@@ -1257,7 +1260,8 @@ Limits that matter in pods:
   To keep no report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
   already stream to stdout when `-o` is omitted. Default stdout omits the
-  `EVIDENCE` record (`-v` restores it); the `-o` file always carries it.
+  `EVIDENCE` record (`-v` restores it); the `-o` file always carries it,
+  and `-o -` keeps it on stdout.
   When stdout is a slow
   pipe, trace output that cannot be delivered within the bounded wait is
   dropped and counted as dropped bytes

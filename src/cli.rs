@@ -692,7 +692,7 @@ fn trace_cap_line() -> String {
 
 const TRACE_HELP_TAIL: &str = "-o copies the trace to a file; -o - uses stdout only.
 Ctrl-C or SIGTERM ends capture cleanly.
-Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing).
+Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing) and restores the EVIDENCE record on stdout.
 exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
 ";
 

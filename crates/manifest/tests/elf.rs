@@ -271,8 +271,9 @@ fn only_registry_exports_are_reported_with_usable_offsets() {
 
 #[test]
 fn entry_offset_is_the_custom_entry_symbol_in_both_linkages() {
-    // The doctor's static-build fallback anchors its self-probe here; the
-    // entry symbol route (symtab) and the entry header route must agree.
+    // The ELF entry-offset helper (formerly the doctor's static anchor
+    // site; still covered for the manifest contract): the entry symbol
+    // route (symtab) and the entry header route must agree.
     for (case, extra) in [("dynamic", &[] as &[&str]), ("static", &["-static"])] {
         let d = tmp(&format!("elf-entry-{case}"));
         let exe = cc_entry_exe(&d, "anchored", extra);

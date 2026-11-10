@@ -216,22 +216,15 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
-        // A drained registration names AlreadySelected exactly, never
-        // as capacity — unless its first call's birth can still
-        // select Joint in place (an untouched row holds its slot
-        // already, so the fits gate admits it without new capacity).
-        if self.registry.instance_state.by_key.contains_key(&input.key)
-            && !self.registry.joint_upgrade_eligible(&input.key)
-        {
-            // The registration already drained and selected its
-            // feed: name that exactly, never as capacity. (The
-            // fits loop leaves such rows fits=false because they
-            // need no slot, which used to misname this case.)
-            return Err(JointReceiptInstallRefusal::AlreadySelected);
-        }
         // An untouched registered row holds its slot already: its
         // first call's birth selects Joint in place instead of
         // minting, so the fits gate admits it without new capacity.
+        // A drained row that can no longer upgrade (a call already
+        // returned through it, a trip, a selected feed) refuses
+        // Capacity here: no grant is reserved for a feed that can
+        // never consume it. The AlreadySelected naming for drained
+        // registrations survives at reserve/install, which restate it
+        // defensively for re-installs.
         if !row.fits && !self.registry.joint_upgrade_eligible(&input.key) {
             self.registry.latch_birth_capacity("fits");
             return Err(JointReceiptInstallRefusal::Capacity);
@@ -6058,15 +6051,21 @@ mod journal_unavailable_tests {
         }
     }
 
-    /// A birth offered for a key whose registration already
-    /// drained (feed already selected) is named AlreadySelected,
-    /// never Capacity: the fits loop leaves held keys fits=false
-    /// because they need no slot, which must not misname the
-    /// refusal the coordinator acts on.
+    /// A birth offered for a touched key whose registration already
+    /// drained refuses Capacity at the fits gate: its late birth
+    /// could never select Joint, so no grant is reserved for it.
+    /// (An untouched held key instead passes the gate: its first
+    /// call's birth selects Joint in place. The AlreadySelected
+    /// naming for drained registrations survives at
+    /// reserve/install, which restate it defensively for
+    /// re-installs.) No journal link:
+    /// linkage must not change the fits verdict for a held key.
     #[test]
-    fn held_key_birth_position_names_already_selected() {
+    fn held_touched_key_birth_position_refuses_capacity() {
         let mut scene = UnlinkedScene::new();
         let (key, _) = scene.register(0);
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
         scene
             .registry
             .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
@@ -6087,9 +6086,9 @@ mod journal_unavailable_tests {
         assert!(
             matches!(
                 plan.position(&input, &window),
-                Err(JointReceiptInstallRefusal::AlreadySelected)
+                Err(JointReceiptInstallRefusal::Capacity)
             ),
-            "a held key names its drained registration, not capacity"
+            "a touched held key refuses capacity, never selects late"
         );
     }
 

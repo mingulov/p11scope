@@ -1193,8 +1193,10 @@ fn synthetic_bootstrap_gap_matcher_rejects_near_misses() {
 /// A deferred Joint birth already names the silent bootstrap: no
 /// synthetic `joint_birth_unoffered` on top. The deferred subject
 /// renders the late-start wording with its machine token beside
-/// it; the deferred reason has no plain mapping and surfaces
-/// verbatim.
+/// it; the deferred reason renders the deferred-capacity words
+/// with its machine token beside it in verbose, never the
+/// refusal fallback (a deferral is a counted delay, not a
+/// refusal).
 #[test]
 fn silent_bootstrap_deferred_birth_is_named_once() {
     let silent = ObjectObservations::unavailable(7, "bootstrap_unavailable");
@@ -1224,10 +1226,58 @@ fn silent_bootstrap_deferred_birth_is_named_once() {
         "{verbose}"
     );
     assert!(
-        verbose.contains("joint_birth_deferred_registration_Capacity")
-            && !verbose.contains("(joint_birth_deferred_registration_Capacity)"),
+        verbose.contains("per-key tracking for this process was deferred (capacity)"),
         "{verbose}"
     );
+    assert!(
+        verbose.contains("(joint_birth_deferred_registration_Capacity)"),
+        "{verbose}"
+    );
+    assert!(
+        !verbose.contains("per-key tracking refused this process"),
+        "{verbose}"
+    );
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("per-key tracking for this process was deferred (capacity)"),
+        "{concise}"
+    );
+    assert!(
+        !concise.contains("joint_birth_deferred_registration_Capacity"),
+        "{concise}"
+    );
+    assert!(
+        !concise.contains("per-key tracking refused this process"),
+        "{concise}"
+    );
+    // Every other producible deferred token renders the same deferred
+    // words, never the refusal fallback.
+    for token in [
+        "joint_birth_deferred_resource_capacity",
+        "joint_birth_deferred_association_capacity",
+        "joint_birth_deferred_registration_Storage",
+    ] {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+        presentation
+            .gaps
+            .push(named_gap(JOINT_BIRTH_DEFERRED_SUBJECT, token));
+        let verbose =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains("per-key tracking for this process was deferred (capacity)"),
+            "{token}: {verbose}"
+        );
+        assert!(
+            verbose.contains(&format!("({token})")),
+            "{token}: {verbose}"
+        );
+        assert!(
+            !verbose.contains("per-key tracking refused this process"),
+            "{token}: {verbose}"
+        );
+    }
 }
 
 /// The wiring's twin: a linked capture without any observed semantic

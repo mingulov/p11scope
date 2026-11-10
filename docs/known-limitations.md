@@ -2093,7 +2093,7 @@ The old bounds are measurements, not a product startup SLA.
   "used by an unidentified caller image": their `CALLER_USE` rows are
   module-level `unbound_use`, never a caller edge. The concise summary
   counts them instead: `unidentified callers: at least N calls from M
-  caller processes never identified (exited or never scanned)`, with
+  caller processes not fully identified (exited or never scanned)`, with
   `modules[].unbound_use.images` per module and
   `observation.native_witnesses.unbound_images` run-wide in JSON
   (`images_saturated` / `unbound_images_saturated` mark lower bounds).

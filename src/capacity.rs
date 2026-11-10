@@ -2765,4 +2765,128 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<FirstTouchLedger>();
     }
+
+    const TWIN_GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn stats_budget_is_the_host_scaled_floor() {
+        assert_eq!(STATS_BUDGET_FLOOR_BYTES, 64 * 1024 * 1024);
+        // Below 6.4 GiB the 64 MiB floor binds; above it 1% of MemTotal binds.
+        assert_eq!(stats_budget_bytes(2 * TWIN_GIB), 64 * 1024 * 1024);
+        assert_eq!(stats_budget_bytes(16 * TWIN_GIB), 16 * TWIN_GIB / 100);
+        assert_eq!(stats_budget_bytes(256 * TWIN_GIB), 256 * TWIN_GIB / 100);
+        assert_eq!(stats_budget_bytes(u64::MAX), u64::MAX / 100);
+    }
+
+    #[test]
+    fn stats_cost_pins_the_abi_sizes_and_matches_detailed_accounting() {
+        assert_eq!(size_of::<SlotStats>(), 296);
+        assert_eq!(size_of::<RvKey>(), 16);
+        // 2,112 slots at 256 possible CPUs: ~160 MB STATS plus the RV hash
+        // (wide release profile pins the absolute total; other builds pin
+        // the same shape against their own RV budget).
+        let cost = stats_cost_bytes(2_112, 256).expect("twin cost must fit u64");
+        if cfg!(feature = "wide-detailed-2112") {
+            assert_eq!(cost, 176_947_200);
+        }
+        assert_eq!(
+            cost,
+            2_112 * 296 * 256
+                + u64::from(RV_ENTRIES) * 16
+                + u64::from(RV_ENTRIES) * 8 * 256
+        );
+        // One accounting: the gate cost equals the Detailed calculator's
+        // STATS plus RV payloads at the same geometry.
+        let detailed =
+            DetailedResources::new(2_112, u64::from(RV_ENTRIES), 256).expect("twin geometry");
+        assert_eq!(
+            stats_cost_bytes(2_112, 256).unwrap(),
+            detailed.resources.stats_values_bytes
+                + detailed.resources.rv_keys_bytes
+                + detailed.resources.rv_values_bytes
+        );
+        assert!(stats_cost_bytes(u32::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn sized_slots_hold_2112_where_the_budget_holds_and_trim_where_it_does_not() {
+        // Owner matrix: possible CPUs 2/12/64/256 against MemTotal 2/16/256
+        // GiB, injected (never the real host). Wide values below; the 512
+        // build pins its own row after.
+        let cases: &[(u64, u64, u32)] = if cfg!(feature = "wide-detailed-2112") {
+            &[
+                (2, 2 * TWIN_GIB, 2_112),
+                (2, 16 * TWIN_GIB, 2_112),
+                (2, 256 * TWIN_GIB, 2_112),
+                (12, 2 * TWIN_GIB, 2_112),
+                (12, 16 * TWIN_GIB, 2_112),
+                (12, 256 * TWIN_GIB, 2_112),
+                (64, 2 * TWIN_GIB, 2_112),
+                (64, 16 * TWIN_GIB, 2_112),
+                (64, 256 * TWIN_GIB, 2_112),
+                (256, 2 * TWIN_GIB, 662),
+                (256, 16 * TWIN_GIB, 2_044),
+                (256, 256 * TWIN_GIB, 2_112),
+            ]
+        } else {
+            &[
+                (2, 2 * TWIN_GIB, 512),
+                (2, 16 * TWIN_GIB, 512),
+                (2, 256 * TWIN_GIB, 512),
+                (12, 2 * TWIN_GIB, 512),
+                (12, 16 * TWIN_GIB, 512),
+                (12, 256 * TWIN_GIB, 512),
+                (64, 2 * TWIN_GIB, 512),
+                (64, 16 * TWIN_GIB, 512),
+                (64, 256 * TWIN_GIB, 512),
+                (256, 2 * TWIN_GIB, 512),
+                (256, 16 * TWIN_GIB, 512),
+                (256, 256 * TWIN_GIB, 512),
+            ]
+        };
+        for (cpus, mem, expected) in cases {
+            let sizing = size_detailed_slots(*cpus, *mem);
+            assert_eq!(sizing.requested_slots, MAX_SLOTS);
+            assert_eq!(sizing.effective_slots, *expected, "C={cpus} mem={mem}");
+            assert_eq!(sizing.possible_cpus, *cpus);
+            assert_eq!(sizing.mem_total_bytes, *mem);
+            assert_eq!(sizing.downsized(), *expected != MAX_SLOTS);
+            // The sized cost fits the budget whenever the floor allows it;
+            // the next slot up does not (exact fit, no silent slack).
+            if sizing.downsized() && *expected > MIN_SIZED_SLOTS {
+                let budget = stats_budget_bytes(*mem);
+                assert!(sizing.stats_bytes <= budget);
+                let next = stats_cost_bytes(expected + 1, *cpus).unwrap();
+                assert!(next > budget, "C={cpus} mem={mem}");
+            }
+        }
+    }
+
+    #[test]
+    fn sized_slots_never_drop_below_512() {
+        assert_eq!(MIN_SIZED_SLOTS, 512);
+        // Absurd geometry (thousands of CPUs, 1 GiB): the floor binds and
+        // the capture still loads 512 rather than refusing.
+        let sizing = size_detailed_slots(4_096, TWIN_GIB);
+        assert_eq!(sizing.effective_slots, 512);
+        assert!(sizing.downsized() || MAX_SLOTS == 512);
+        let budget = DetailedBudget::sized(511);
+        assert_eq!(budget.slots(), 512);
+        let budget = DetailedBudget::sized(u32::MAX);
+        assert_eq!(budget.slots(), MAX_SLOTS);
+        assert_eq!(DetailedBudget::compiled().slots(), MAX_SLOTS);
+    }
+
+    #[test]
+    fn meminfo_parser_reads_memtotal_kilobytes_only() {
+        let text = "MemTotal:       16384000 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(
+            mem_total_bytes_from_meminfo(text).unwrap(),
+            16_384_000 * 1024
+        );
+        assert!(mem_total_bytes_from_meminfo("MemFree: 1 kB\n").is_err());
+        assert!(mem_total_bytes_from_meminfo("MemTotal: lots kB\n").is_err());
+        assert!(mem_total_bytes_from_meminfo("MemTotal: 1 MB\n").is_err());
+        assert!(mem_total_bytes_from_meminfo("MemTotal: 18446744073709551615 kB\n").is_err());
+    }
 }

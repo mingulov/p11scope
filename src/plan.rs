@@ -10077,6 +10077,29 @@ mod tests {
         assert!(error.contains("2113") && error.contains("2112"), "{error}");
     }
 
+    #[test]
+    fn sized_detailed_policy_caps_admission_at_the_host_budget() {
+        // A 256-CPU, 2 GiB host sizes the Detailed ceiling to 662: the
+        // 662nd endpoint fits and the 663rd is refused naming 662.
+        let sized = 662u32;
+        let policy = AdmissionPolicy::detailed_sized(sized);
+        let object = PinnedObjectId(11);
+        let slots: Vec<_> = (0..663)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![]))
+            .collect();
+        let admitted = AttachPlan::from_slots_with_policy(slots[..662].to_vec(), policy)
+            .expect("662 endpoints must fit the sized ceiling");
+        assert_eq!(admitted.slots.len(), 662);
+        let error = AttachPlan::from_slots_with_policy(slots, policy)
+            .expect_err("endpoint 663 must be refused at the sized ceiling");
+        assert!(error.contains("663") && error.contains("662"), "{error}");
+        // The default stays the compiled ceiling.
+        assert_eq!(
+            AdmissionPolicy::detailed(),
+            AdmissionPolicy::Detailed(crate::capacity::DetailedBudget::compiled())
+        );
+    }
+
     fn provisional_plan(object: PinnedObjectId) -> AttachPlan {
         exact_plan(vec![], vec![exact_module(0, object)])
     }

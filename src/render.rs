@@ -11192,6 +11192,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn slot_sizing_json_reports_the_downsize_or_stays_absent() {
+        // The 512 build never downsizes, so it renders a synthetic
+        // downsized sizing; wide renders the real one.
+        #[cfg(feature = "wide-detailed-2112")]
+        let sizing = crate::capacity::size_detailed_slots(256, 2 * 1024 * 1024 * 1024);
+        #[cfg(not(feature = "wide-detailed-2112"))]
+        let sizing = crate::capacity::SlotSizing {
+            requested_slots: 2_112,
+            effective_slots: 662,
+            possible_cpus: 256,
+            mem_total_bytes: 2 * 1024 * 1024 * 1024,
+            budget_bytes: 64 * 1024 * 1024,
+            stats_bytes: 67_072_000,
+        };
+        let mut sized = evidence();
+        sized.discovery.slot_sizing = Some(sizing);
+        let json = serde_json::to_value(&sized).unwrap();
+        assert_eq!(json["slot_sizing"]["requested_slots"], 2112);
+        assert_eq!(json["slot_sizing"]["effective_slots"], 662);
+        assert_eq!(json["slot_sizing"]["possible_cpus"], 256);
+        assert_eq!(json["slot_sizing"]["mem_total_bytes"], 2 * 1024 * 1024 * 1024);
+        assert_eq!(json["slot_sizing"]["budget_bytes"], 64 * 1024 * 1024);
+        let mut plain = evidence();
+        plain.discovery.slot_sizing = None;
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("slot_sizing").is_none());
+    }
+
+    #[test]
     fn aggregate_excluded_groups_by_file_and_names_unmatched_inputs() {
         use crate::discovery::scan::ExcludedRecord;
         use std::path::PathBuf;

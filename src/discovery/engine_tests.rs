@@ -11471,6 +11471,34 @@ fn capacity_refusal_summary_names_up_to_three_providers_once() {
 }
 
 #[test]
+fn slot_sizing_summary_speaks_only_when_downsized() {
+    let unchanged = crate::capacity::size_detailed_slots(12, 16 * 1024 * 1024 * 1024);
+    assert!(!unchanged.downsized());
+    assert_eq!(format_slot_sizing_summary(&unchanged), None);
+    // The 512 build never downsizes (its ceiling is the floor), so it
+    // renders a synthetic downsized sizing; wide renders the real one.
+    #[cfg(feature = "wide-detailed-2112")]
+    let sizing = crate::capacity::size_detailed_slots(256, 2 * 1024 * 1024 * 1024);
+    #[cfg(not(feature = "wide-detailed-2112"))]
+    let sizing = crate::capacity::SlotSizing {
+        requested_slots: 2_112,
+        effective_slots: 662,
+        possible_cpus: 256,
+        mem_total_bytes: 2 * 1024 * 1024 * 1024,
+        budget_bytes: 64 * 1024 * 1024,
+        stats_bytes: 67_072_000,
+    };
+    assert!(sizing.downsized());
+    assert_eq!(
+        format_slot_sizing_summary(&sizing),
+        Some(
+            "p11scope: attach slots sized to 662 of 2112 (STATS budget 64 MiB at 256 possible CPUs, 2 GiB RAM)"
+                .to_string()
+        )
+    );
+}
+
+#[test]
 fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
     // The terminal stderr verdict must agree with the report: a
     // prefix-admitted (or growth-omitted) module is partially

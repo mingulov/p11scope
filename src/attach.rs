@@ -11719,6 +11719,33 @@ mod tests {
     use crate::attach::capture::NativeDomainId;
     use crate::fixture_guard::DieWithParent as _;
     use crate::inventory_semantics::SemanticRefusal;
+
+    #[test]
+    fn stats_map_slots_follow_the_detailed_plan_and_skip_counter_objects() {
+        use crate::plan::AdmissionPolicy;
+        // Detailed sessions load STATS at the plan's sized ceiling, even
+        // when it equals the compiled default (a no-op override).
+        assert_eq!(
+            super::stats_map_slots(AdmissionPolicy::detailed(), false),
+            Some(p11scope_ebpf_common::MAX_SLOTS)
+        );
+        assert_eq!(
+            super::stats_map_slots(AdmissionPolicy::detailed_sized(662), false),
+            Some(662)
+        );
+        // Counter sessions keep their own fixed STATS: no resize.
+        let budget = crate::capacity::CounterBudget::new(512).unwrap();
+        assert_eq!(
+            super::stats_map_slots(AdmissionPolicy::Counters(budget), true),
+            None
+        );
+        // Inventory plans never reach the Detailed loader either.
+        let budget = crate::capacity::inventory_endpoint_budget(Some(64)).unwrap();
+        assert_eq!(
+            super::stats_map_slots(AdmissionPolicy::Inventory(budget), false),
+            None
+        );
+    }
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, ObjectDescriptorWire, none_object_wire,
         publish_object_descriptors,

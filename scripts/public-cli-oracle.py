@@ -605,10 +605,11 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # system-scope cell and on cgroup scope (a tick-quantum deferral
     # with the refresh retained and served later: no exit, zero loss,
     # exact owned counts). The quiet half qualifies strict scope-wide,
-    # with exactly one named skip and gaps pinned at zero (cgroup
-    # evidence carries no gaps key, which reads as zero); owned counts
-    # stay exact (checked below), owned loss stays zero (checked
-    # above) and any other class still fails.
+    # with exactly one named skip and gaps pinned at zero (metrics
+    # evidence carries no gaps keys, which read as zero;
+    # profile-cgroup/run cells carry them and must read 0); owned
+    # counts stay exact (checked below), owned loss stays zero
+    # (checked above) and any other class still fails.
     ok_quiet = (
         scope in ("system", "cgroup")
         and observation.get("status") == "lossy"
@@ -628,7 +629,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             and all(skip == DISCLOSABLE_DISCOVERY_SKIP or
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
-        require(ok_exact or ok_noise or ok_skip_family or ok_ambient,
+        require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
@@ -653,8 +654,9 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
     # ok_ambient or ok_quiet: any other cause set failed already, so the
-    # flags (not re-spelled causes) decide the qualification. Cgroup
-    # evidence carries no gaps key, which reads as zero below.
+    # flags (not re-spelled causes) decide the qualification. Metrics
+    # evidence carries no gaps keys, which read as zero below;
+    # profile-cgroup/run cells carry them and must read 0.
     ambient = (not relaxed and (ok_ambient or ok_quiet))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already

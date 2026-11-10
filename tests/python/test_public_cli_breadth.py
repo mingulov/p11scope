@@ -327,7 +327,7 @@ def trace_stream_mt(*, calls_per_function=8, lost=0, event_loss=0, semantic_fail
 
 class BreadthTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell, want=0, report_text=None,
-                 allow_66_discovery_gap=False):
+                 allow_66_discovery_gap=False, allow_pid_descendant_gaps=False):
         metrics = cell in {"metrics-pid", "metrics-cgroup"} or cell.startswith("counter-") or cell.startswith("select-endpoint-")
         scope = "system" if cell.endswith("-system") or cell == "system" else ("cgroup" if "cgroup" in cell else "pid")
         # Run-tree (v0.7.0): owned runs capture at cgroup scope; sigint
@@ -403,6 +403,8 @@ class BreadthTests(unittest.TestCase):
                                          for key, path in paths.items()), [])]
             if allow_66_discovery_gap:
                 args.append("--allow-66-discovery-gap")
+            if allow_pid_descendant_gaps:
+                args.append("--allow-pid-descendant-gaps")
             proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
@@ -1623,6 +1625,21 @@ class SystemAmbientGapTests(unittest.TestCase):
         self.assertIn("pid_descendant_gaps=0", result["detail"])
         self.assertIn("discovery_skips=1", result["detail"])
 
+    def test_quiet_lone_skip_passes_relaxed_system_cell(self):
+        # Ambient-skip r2 (review finding 1): relaxed must not be
+        # stricter than strict -- the quiet lone named skip that
+        # passes strict on `system` also passes with
+        # --allow-pid-descendant-gaps, keeping the runner-noise
+        # qualification (ambient is False under relaxed).
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=1)
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("disclosed runner noise", result["detail"])
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
     def test_quiet_lone_skip_fails_on_pid_cell(self):
         def mutate(d, l, r):
             self.disclose(d, gaps=0, skips=1)
@@ -1656,8 +1673,9 @@ class SystemAmbientGapTests(unittest.TestCase):
 
     def test_quiet_lone_skip_passes_strict_metrics_cgroup(self):
         # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows
-        # the lone named skip on metrics-cgroup. Production cgroup
-        # evidence carries no pid_descendant_gaps key at all, so the
+        # the lone named skip on metrics-cgroup. Production metrics
+        # evidence carries no pid_descendant_gaps key at all (only
+        # profile-cgroup/run cells carry gaps keys), so the
         # synthetic shape drops it too.
         def mutate(d, l, r):
             self.disclose(d, gaps=0, skips=1)

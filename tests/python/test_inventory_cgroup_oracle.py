@@ -166,6 +166,67 @@ class AcceptTests(unittest.TestCase):
         self.assertIn("unproven=0 gaps=3", out)
 
 
+def healthy_report_with_unbound():
+    """The healthy-leg shape (host ext4/btrfs evidence, local pids).
+
+    The kernel witness is available (no per-caller unproven gaps, no
+    scan-pinned fallback), the owned module is admitted with inside
+    edges from both callers, and the fork-after-attach child's first
+    witness row arrived before any member scan admitted it — so the
+    report carries exactly the named module-level unidentified-caller
+    positive (fail-safe R-C51-1: the late edge reads
+    use_before_admission). The race is independent of the witness
+    substrate, so the healthy leg accepts the same named shape the
+    degraded leg does.
+    """
+    return {
+        "schema": "p11scope/inventory/v1",
+        "scope": "cgroup",
+        "modules": [{"id": "m0",
+                     "identity": {"device": {"major": 0, "minor": 46},
+                                  "inode": 153887, "sha256": PIN["sha256"]},
+                     "admission": {"state": "admitted", "endpoints": 68},
+                     "lifecycle": "mapped",
+                     "paths": [MODPATH]}],
+        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        "edges": [{"caller": "c0", "module": "m0"},
+                  {"caller": "c1", "module": "m0"}],
+        "gaps": [
+            {"caller": None, "module": "m0", "pid": None,
+             "reason": unbound_reason(), "subject": UNBOUND_SUBJECT,
+             "repeats": 1},
+        ],
+    }
+
+
+class HealthyLegTests(unittest.TestCase):
+    def test_healthy_leg_accepts_named_unbound_gap(self):
+        rc, out = run_oracle(healthy_report_with_unbound(), modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("inside=100 child=101 "
+                      "outside=102 excluded module=m0 admission=admitted "
+                      "unproven=0 gaps=1", out)
+
+    def test_healthy_leg_refuses_unnamed_owned_gap(self):
+        report = healthy_report_with_unbound()
+        report["gaps"].append(
+            {"caller": None, "module": "m0", "pid": None,
+             "reason": "something new about the owned module",
+             "subject": "novel owned trouble", "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inventory gaps about owned module", out)
+
+    def test_healthy_leg_refuses_misframed_unbound_gap(self):
+        # The subject alone does not name the gap on the healthy leg
+        # either: the reason must carry the producer framing.
+        report = healthy_report_with_unbound()
+        report["gaps"][0]["reason"] = "native witness rows, truncated"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inventory gaps about owned module", out)
+
+
 class RefuseTests(unittest.TestCase):
     def test_missing_module_still_fails(self):
         report = decided_report()

@@ -10249,6 +10249,9 @@ mod tests {
         assert_eq!(
             waiters,
             std::collections::BTreeSet::from([
+                // The terminal pre-seal probe: it only sees a child that
+                // `settle_owned_child` already staged, so after cleanup.
+                "reap_exited_staged_handoff_before_seal".to_string(),
                 "settle_after_signal_with_grace_and".to_string(),
                 "stage_handoff".to_string(),
             ]),

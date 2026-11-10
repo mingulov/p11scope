@@ -31485,6 +31485,36 @@ int main(void) {
         );
     }
 
+    /// Unidentified callers read as not fully identified (the executable
+    /// line below may name the program), and the unattributed-use line
+    /// above uses the same numbers with the same nouns (calls, caller
+    /// processes).
+    #[test]
+    fn unidentified_callers_read_as_not_fully_identified_with_matching_units() {
+        let (mut native, _) = NativeScene::new();
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let (text, _) = slice_one_views(&native);
+        assert!(
+            text.contains("unattributed use: at least 1 call from 1 caller process never bound"),
+            "units match: {text}"
+        );
+        assert!(
+            text.contains(
+                "unidentified callers: at least 1 call from 1 caller process not fully identified"
+            ),
+            "no overclaim: {text}"
+        );
+        assert!(
+            !text.contains("never identified"),
+            "never identified overstates: {text}"
+        );
+        assert!(
+            !text.contains("entries in 1 witness row"),
+            "units mismatch: {text}"
+        );
+    }
+
     /// Slice 1: one tgid, two task cookies — two caller processes.
     #[test]
     fn one_tgid_two_cookies_counts_two_unidentified_callers() {

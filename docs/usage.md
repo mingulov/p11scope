@@ -1792,7 +1792,10 @@ Limits that matter in pods:
   endpoint had attached by stop (otherwise how many attached, failed
   or were still deferred at stop), while `--json` keeps every per-pass
   row plus the appended summary. Endpoints that failed to attach
-  keep their own `native endpoint attach failed` gap. `native`
+  keep their own `native endpoint attach failed` gap. A stop
+  (or a second SIGINT) that lands during a Multi attach extend waits for
+  that extend first, up to 4 s plus one in-flight group attach.
+  `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
   start and, for `--pid`, otherwise falls back to `scan` with the gap

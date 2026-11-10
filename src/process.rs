@@ -1518,7 +1518,7 @@ fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
 }
 
 /// Bounded retries across transient kernel refusals of a fail-fast probe
-/// (a pidfd poll, a rooted open, a generation read). `EAGAIN`/`EINTR` are
+/// (a pidfd poll, a rooted open). `EAGAIN`/`EINTR` are
 /// "try again" signals and `ENOMEM` clears when transient pressure passes;
 /// anything else — including a genuinely missing process — reports at once.
 /// The bound keeps a persistently refusing kernel fail-fast.
@@ -1546,8 +1546,9 @@ fn pidfd_poll_retry_with(
     mut poll: impl FnMut(i32) -> io::Result<bool>,
 ) -> io::Result<bool> {
     // Interruption retries unbounded (a signal is always safe to ride
-    // through); allocation pressure retries bounded (spinning forever
-    // during a real outage would hang liveness itself).
+    // through); pressure retries are defensive-only (a single-pidfd poll
+    // cannot return ENOMEM) and bounded, so a persistently refusing
+    // kernel stays fail-fast instead of hanging liveness itself.
     let mut transient_retries = 0;
     if timeout_ms <= 0 {
         loop {

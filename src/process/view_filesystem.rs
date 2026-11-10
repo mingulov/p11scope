@@ -426,10 +426,13 @@ impl ColdFilesystem<'_> {
 }
 
 /// Runs one fail-fast open across transient kernel refusals. A refused
-/// `EAGAIN`/`EINTR`/`ENOMEM` is pressure or a signal, not a verdict about
-/// the path, so the identical confined open repeats; the bound keeps a
-/// persistently refusing kernel fail-fast and the final error reports
-/// exactly as a single attempt would.
+/// `EAGAIN` is the kernel's scoped-lookup escape-race check (a concurrent
+/// mount or rename moved a `..` step mid-walk, notably through the
+/// `/lib64` symlink chain), `EINTR`/`ENOMEM` a signal or transient
+/// pressure — never a verdict about the path. The identical confined open
+/// repeats; never replace a refusal with an unconfined fallback. The bound
+/// keeps a persistently refusing kernel fail-fast and the final error
+/// reports exactly as a single attempt would.
 fn retry_transient_open<R>(
     mut open: impl FnMut() -> Result<R, std::io::Error>,
 ) -> Result<R, std::io::Error> {

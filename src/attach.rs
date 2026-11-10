@@ -7619,9 +7619,10 @@ impl Session {
                 .as_ref()
                 .map_or(crate::EBPF_OBJECT, |prepared| prepared.object),
         };
-        // A journal (Joint) capture holds a larger EVENTS ring: its START
-        // and END records cost about 0.86 KiB a call, and the ring is read
-        // only between seals. Every other capture keeps the default.
+        // A journal (Joint) capture holds the joint-sized EVENTS ring
+        // (currently equal to the default, never smaller): its START and
+        // END records cost about 0.86 KiB a call, and the ring is read only
+        // between seals. Every other capture keeps the default.
         let events_bytes = if journal.is_some() {
             crate::run::resolve_journal_ring_bytes(ring_bytes)
         } else {

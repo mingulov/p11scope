@@ -247,9 +247,11 @@ names the source SHA behind each check the release rounds re-measured.
   counts stay exact at 10,000 calls/s for 60 s without
   `--key-operations`. With key operations on, a lossy run's call
   counts can fall short; every lost record is counted and named
-  (one call writes up to two records). Above 6,250 calls/s the
-  16 MiB event ring can overflow between reads and key-operation
-  tracking ends with a named gap. 10,000 calls/s with key operations
+  (one call writes up to two records). Above 6,250 calls/s (measured
+  with the earlier 16 MiB ring; the 32 MiB ring since v0.7.0 has not
+  been re-measured and can only overflow later) the event ring can
+  overflow between reads and key-operation tracking ends with a named
+  gap. 10,000 calls/s with key operations
   is not yet sustained.
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two

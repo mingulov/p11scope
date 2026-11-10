@@ -7120,8 +7120,9 @@ pub(crate) fn resolve_ring_bytes(ring_bytes: Option<u32>) -> u32 {
     ring_bytes.unwrap_or(p11scope_ebpf_common::RING_BYTES)
 }
 
-/// A journal (Joint key-operations) capture loads the larger EVENTS ring
-/// unless `--ring-bytes` names a size; every other capture keeps
+/// A journal (Joint key-operations) capture loads the joint-sized EVENTS
+/// ring (currently equal to the default, never smaller) unless
+/// `--ring-bytes` names a size; every other capture keeps
 /// [`resolve_ring_bytes`].
 pub(crate) fn resolve_journal_ring_bytes(ring_bytes: Option<u32>) -> u32 {
     ring_bytes.unwrap_or(p11scope_ebpf_common::JOINT_RING_BYTES)
@@ -8749,6 +8750,8 @@ fn capture_profile(
                 policy,
                 scope: scope.kind(),
                 caller: target_caller.clone(),
+                // Equal to the journal ring default while the two agree;
+                // pinned by `disclosed_ring_bytes_default_matches_the_journal_ring`.
                 ring_bytes: resolve_ring_bytes(ring_bytes),
                 drain_interval_ms: drain.as_millis() as u64,
             };
@@ -25824,6 +25827,21 @@ int main(int argc, char **argv) {
             p11scope_ebpf_common::JOINT_RING_BYTES
         );
         assert_eq!(resolve_journal_ring_bytes(Some(1 << 20)), 1 << 20);
+    }
+
+    /// Every `capture.ring_bytes` disclosure (`capture_profile`'s
+    /// `CaptureMeta`, the render and metrics defaults) is built from
+    /// `resolve_ring_bytes` / `RING_BYTES`, while a journal capture sizes
+    /// its ring with `resolve_journal_ring_bytes`. The disclosure is right
+    /// for a journal capture only while both defaults agree, so a future
+    /// divergence must fail here instead of misreporting the ring size.
+    #[test]
+    fn disclosed_ring_bytes_default_matches_the_journal_ring() {
+        assert_eq!(resolve_ring_bytes(None), resolve_journal_ring_bytes(None));
+        assert_eq!(
+            p11scope_ebpf_common::RING_BYTES,
+            p11scope_ebpf_common::JOINT_RING_BYTES
+        );
     }
 
     /// DR-CLASSIC-PID0: an `auto` fallback is disclosed on stderr before the

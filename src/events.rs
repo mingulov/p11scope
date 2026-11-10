@@ -1975,7 +1975,7 @@ impl BoundedRecordSource for ScriptedRecords {
             consumer: self.taken * 8,
             producer: (self.taken + self.queue.len()) * 8,
             // Test-only wire: 8,192 records, so saturation tests can
-            // stage multi-quantum backlogs (production EVENTS is 16 MiB).
+            // stage multi-quantum backlogs (production EVENTS is 32 MiB).
             capacity: 65536,
         }
     }

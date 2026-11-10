@@ -192,7 +192,7 @@ impl JointScene {
             producers,
             // Test-only wire: 8,192 records, so saturation tests can
             // stage multi-quantum backlogs (matches the ScriptedRecords
-            // ring window; production EVENTS is 16 MiB).
+            // ring window; production EVENTS is 32 MiB).
             drain: EventDrain::over_domain(ScriptedRecords::records([], 8192), events),
             attached,
         }

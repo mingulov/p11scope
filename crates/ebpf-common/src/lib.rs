@@ -2659,7 +2659,8 @@ mod tests {
         assert_eq!(RING_BYTES, 32 * 1024 * 1024);
     }
 
-    /// Only a journal (Joint) capture loads the larger EVENTS ring.
+    /// Only a journal (Joint) capture loads the joint-sized EVENTS ring
+    /// (currently equal to the default).
     #[test]
     fn joint_ring_bytes_is_32mib() {
         assert_eq!(JOINT_RING_BYTES, 32 * 1024 * 1024);

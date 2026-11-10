@@ -296,6 +296,28 @@ fn host_fallback_allowed(
     target_root != observer_root && target_mount_ns == observer_mount_ns
 }
 
+/// Whether a target-root open failure may retry on the host: only a
+/// resolution failure (a path missing under a chroot) in a chroot-like
+/// view (foreign root, shared mount namespace). A precondition, size,
+/// type or reopen refusal never retries, whatever the view; a foreign
+/// mount namespace (containers) never retries, whatever the failure;
+/// an unstated identity fails closed.
+fn fallback_allowed(
+    failure: &RootedOpenFailure,
+    target_root: Option<(u64, u64)>,
+    observer_root: Option<(u64, u64)>,
+    target_mount_ns: MountNamespaceId,
+    observer_mount_ns: Option<MountNamespaceId>,
+) -> bool {
+    failure.resolution_errno.is_some_and(is_resolution_errno)
+        && match (target_root, observer_root, observer_mount_ns) {
+            (Some(target), Some(observer), Some(namespace)) => {
+                host_fallback_allowed(target, observer, target_mount_ns, namespace)
+            }
+            _ => false,
+        }
+}
+
 /// A target-root open failure with its resolution errno when the
 /// failure came from the `openat2` resolution itself. Only a
 /// resolution errno can authorize the host fallback; a precondition,
@@ -739,14 +761,7 @@ impl<'a> ViewFilesystem<'a> {
             }
             _ => None,
         };
-        let retryable = failure.resolution_errno.is_some_and(is_resolution_errno);
-        let allowed = retryable
-            && match (target, observer, observer_ns) {
-                (Some(target), Some(observer), Some(namespace)) => {
-                    host_fallback_allowed(target, observer, self.namespace, namespace)
-                }
-                _ => false,
-            };
+        let allowed = fallback_allowed(&failure, target, observer, self.namespace, observer_ns);
         if !allowed {
             return Err(MappedOpenError {
                 reason: failure.reason,
@@ -974,6 +989,101 @@ mod tests {
         let root = observer_root_identity().unwrap();
         let namespace = observer_mount_namespace().unwrap();
         assert!(!host_fallback_allowed(root, root, namespace, namespace));
+    }
+
+    /// The extracted fallback decision: a resolution failure in a gated
+    /// view retries; a non-resolution failure in the same gated view never
+    /// does (the errno half of the gate), nor does any failure in an
+    /// ungated view or with an unstated identity.
+    #[test]
+    fn fallback_allowed_needs_a_resolution_failure_in_a_gated_view() {
+        let home = (1u64, 2u64);
+        let away = (3u64, 4u64);
+        let ns_a = MountNamespaceId {
+            device: 5,
+            inode: 6,
+        };
+        let ns_b = MountNamespaceId {
+            device: 7,
+            inode: 8,
+        };
+        let resolution = RootedOpenFailure {
+            reason:
+                "opening object within retained target root: No such file or directory (os error 2)"
+                    .into(),
+            resolution_errno: Some(libc::ENOENT),
+        };
+        let refused = RootedOpenFailure {
+            reason: "target-root object is not a regular file".into(),
+            resolution_errno: None,
+        };
+        let denied = RootedOpenFailure {
+            reason: "opening object within retained target root: Permission denied (os error 13)"
+                .into(),
+            resolution_errno: Some(libc::EACCES),
+        };
+        // Healthy: a resolution failure in a gated view retries.
+        assert!(fallback_allowed(
+            &resolution,
+            Some(away),
+            Some(home),
+            ns_a,
+            Some(ns_a)
+        ));
+        // The errno half: neither a refusal without errno nor a
+        // non-resolution errno retries in the same gated view.
+        assert!(!fallback_allowed(
+            &refused,
+            Some(away),
+            Some(home),
+            ns_a,
+            Some(ns_a)
+        ));
+        assert!(!fallback_allowed(
+            &denied,
+            Some(away),
+            Some(home),
+            ns_a,
+            Some(ns_a)
+        ));
+        // The view half: a resolution failure never retries under the
+        // observer's own root, in a foreign mount namespace, or with an
+        // unstated identity.
+        assert!(!fallback_allowed(
+            &resolution,
+            Some(home),
+            Some(home),
+            ns_a,
+            Some(ns_a)
+        ));
+        assert!(!fallback_allowed(
+            &resolution,
+            Some(away),
+            Some(home),
+            ns_a,
+            Some(ns_b)
+        ));
+        assert!(!fallback_allowed(
+            &resolution,
+            None,
+            Some(home),
+            ns_a,
+            Some(ns_a)
+        ));
+        assert!(!fallback_allowed(
+            &resolution,
+            Some(away),
+            None,
+            ns_a,
+            Some(ns_a)
+        ));
+        assert!(!fallback_allowed(
+            &resolution,
+            Some(away),
+            Some(home),
+            ns_a,
+            None
+        ));
     }
 
     #[test]

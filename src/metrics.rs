@@ -1094,6 +1094,40 @@ mod tests {
         assert_eq!(budget.completeness, "COMPLETE");
     }
 
+    // Identity budget (RED): the first-sighting notice names the
+    // refusal count and the spent budget.
+    #[test]
+    fn identity_notice_line_names_counts_and_budget() {
+        let line = identity_notice_line(&KernelControl {
+            identity_unavailable: 168_027,
+            identity_budget_exhausted: true,
+            ..KernelControl::default()
+        })
+        .expect("notice line");
+        assert!(line.contains("168027"), "{line}");
+        assert!(line.contains("16384"), "{line}");
+        assert!(line.contains("PARTIAL"), "{line}");
+    }
+
+    // Identity budget (RED): refusals without a spent budget name
+    // the count and stay silent about the budget.
+    #[test]
+    fn identity_notice_line_without_spent_budget_names_counts_only() {
+        let line = identity_notice_line(&KernelControl {
+            identity_unavailable: 3,
+            ..KernelControl::default()
+        })
+        .expect("notice line");
+        assert!(line.contains('3'), "{line}");
+        assert!(!line.contains("16384"), "{line}");
+    }
+
+    // Identity budget (RED twin): no refusals, no notice.
+    #[test]
+    fn identity_notice_line_quiet_twin_is_silent() {
+        assert_eq!(identity_notice_line(&KernelControl::default()), None);
+    }
+
     #[test]
     fn owner_poison_names_match_the_native_header_bits() {
         // The published names are keyed by the native bits: every #define in

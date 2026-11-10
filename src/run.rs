@@ -13416,6 +13416,26 @@ mod tests {
         );
     }
 
+    // Newcomer stall (RED): a queue line for a stalled queue (pending
+    // past the stall bound, nothing dropped) is a real warning and
+    // stays on default stderr; a pending-but-young queue keeps the
+    // all-clear gate.
+    #[test]
+    fn timing_summaries_keep_stalled_newcomer_queue_at_default() {
+        let summaries = vec![
+            "p11scope: timing: stages: scan 6ms".to_string(),
+            "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 66 (oldest 6916817ms), dropped 0 (max age -)".to_string(),
+        ];
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, false, 0, true),
+            vec![&summaries[1]],
+        );
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, false, 0, false),
+            Vec::<&String>::new(),
+        );
+    }
+
     /// CLI text: the newcomer-queue line names unknown drops beside
     /// known ones, so a line the gate keeps for unknown drops alone
     /// never reads "dropped 0". With no unknown drops the shape is
@@ -24410,6 +24430,52 @@ int main(int argc, char **argv) {
                 over
             );
         }
+    }
+
+    // Identity budget (RED): a synced spent budget plus a stalled
+    // newcomer queue warn on default stderr with counts, never clean.
+    #[test]
+    fn accumulator_identity_and_newcomer_sync_warn_with_counts() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl {
+            identity_unavailable: 7,
+            identity_budget_exhausted: true,
+            ..Default::default()
+        });
+        let mut stats = crate::timing::NewcomerStats::new();
+        stats.pending = 66;
+        stats.oldest_pending_age_ms = Some(6_916_817);
+        acc.note_newcomer_stats(stats);
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_has_findings(true));
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{line}"
+        );
+        assert!(
+            line.contains(crate::longrun::FINDING_NEWCOMER_QUEUE_STALLED),
+            "{line}"
+        );
+        assert!(line.contains('7'), "{line}");
+        assert!(line.contains("66"), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity budget (RED twin): healthy synced identity and
+    // newcomer state keep the detector quiet.
+    #[test]
+    fn accumulator_healthy_identity_and_newcomer_stay_quiet() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl::default());
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(!acc.longrun_has_findings(true));
+        assert!(acc.longrun_line(true).contains("clean"));
     }
 
     /// CLI text: only a detector with findings warns on default

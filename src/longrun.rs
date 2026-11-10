@@ -496,6 +496,144 @@ mod tests {
         assert!(line.contains("max tick 2010ms"), "{line}");
     }
 
+    // Identity budget (RED): a spent lifetime budget is a finding
+    // with counts, never a clean line. The 66-pending/115-minute stall
+    // below is the observed long-run shape.
+    #[test]
+    fn identity_budget_exhaustion_is_a_finding_with_counts() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(true, 168_027);
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == FINDING_IDENTITY_BUDGET_EXHAUSTED)
+            .expect("identity_budget_exhausted finding");
+        assert_eq!(finding.at_tick, None);
+        assert!(
+            finding.detail.contains("168027"),
+            "unexpected detail: {}",
+            finding.detail
+        );
+        assert!(
+            finding.detail.contains("16384"),
+            "unexpected detail: {}",
+            finding.detail
+        );
+        let line = report.report_line();
+        assert!(line.contains(FINDING_IDENTITY_BUDGET_EXHAUSTED), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity budget (RED): refusals without a spent budget (a bad
+    // cell, a failed create) still thinned capture, so they are a
+    // finding too.
+    #[test]
+    fn identity_refusals_without_spent_budget_are_a_finding() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(false, 3);
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == FINDING_IDENTITY_BUDGET_EXHAUSTED)
+            .expect("identity_budget_exhausted finding");
+        assert!(
+            finding.detail.contains('3'),
+            "unexpected detail: {}",
+            finding.detail
+        );
+    }
+
+    // Identity budget (RED): a budget spent with nothing refused yet
+    // lost nothing, but the next process goes unseen, so the line
+    // names the spent budget instead of reporting clean.
+    #[test]
+    fn spent_budget_without_refusals_is_named() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(true, 0);
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{report:?}"
+        );
+    }
+
+    // Identity budget (RED twin): healthy identity and newcomer
+    // inputs keep the clean line.
+    #[test]
+    fn identity_health_quiet_twin_stays_clean() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(false, 0);
+        detector.note_newcomer(0, None);
+        let report = detector.finish(0, 0);
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    // Newcomer stall (RED): newcomers still waiting past the stall
+    // bound at loop end never got admitted, so they are a finding
+    // with counts, never a clean line.
+    #[test]
+    fn newcomer_stall_is_a_finding_with_counts() {
+        let mut detector = ordinary_detector();
+        detector.note_newcomer(66, Some(6_916_817));
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == FINDING_NEWCOMER_QUEUE_STALLED)
+            .expect("newcomer_queue_stalled finding");
+        assert_eq!(finding.at_tick, None);
+        assert!(
+            finding.detail.contains("66"),
+            "unexpected detail: {}",
+            finding.detail
+        );
+        assert!(
+            finding.detail.contains("6916817"),
+            "unexpected detail: {}",
+            finding.detail
+        );
+        let line = report.report_line();
+        assert!(line.contains(FINDING_NEWCOMER_QUEUE_STALLED), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Newcomer stall (RED twins): an empty queue, young pending
+    // newcomers and an age exactly at the bound are not a stall.
+    #[test]
+    fn newcomer_quiet_twins_stay_clean() {
+        for (pending, oldest) in [
+            (0, None),
+            (0, Some(9_999_999)),
+            (3, None),
+            (3, Some(500)),
+            (5, Some(NEWCOMER_STALL_AGE_MS)),
+        ] {
+            let mut detector = ordinary_detector();
+            detector.note_newcomer(pending, oldest);
+            let report = detector.finish(0, 0);
+            assert!(report.is_clean(), "pending={pending} oldest={oldest:?}: {report:?}");
+        }
+    }
+
+    // Newcomer stall (RED): the stall predicate bounds are strict.
+    #[test]
+    fn newcomer_stall_predicate_bounds() {
+        assert!(newcomer_stalled(1, Some(NEWCOMER_STALL_AGE_MS + 1)));
+        assert!(!newcomer_stalled(1, Some(NEWCOMER_STALL_AGE_MS)));
+        assert!(!newcomer_stalled(0, Some(NEWCOMER_STALL_AGE_MS + 1)));
+        assert!(!newcomer_stalled(1, None));
+        assert!(!newcomer_stalled(0, None));
+    }
+
     // T2 (RED): thresholds come from the config, not the constants.
     #[test]
     fn custom_config_moves_thresholds() {

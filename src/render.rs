@@ -15746,6 +15746,66 @@ pub(crate) mod tests {
         assert_eq!(json["kernel_control"]["identity_budget_exhausted"], true);
     }
 
+    // Identity budget (RED): the concise coverage line names the
+    // spent budget with the refusal count in plain words; verbose
+    // pairs the machine cause name beside it.
+    #[test]
+    fn coverage_line_names_spent_identity_budget_with_counts() {
+        let mut ev = evidence();
+        ev.kernel_control.identity_unavailable = 7;
+        ev.kernel_control.identity_budget_exhausted = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("7 processes refused an identity"), "{line}");
+        assert!(line.contains("16384"), "{line}");
+        assert!(!line.contains("other gap"), "{line}");
+        let verbose = coverage_line(&ev, true);
+        assert!(verbose.contains("kernel_control"), "{verbose}");
+        assert!(verbose.contains("16384"), "{verbose}");
+    }
+
+    // Identity budget (RED): refusals without a spent budget name
+    // the count and stay silent about the budget.
+    #[test]
+    fn coverage_line_names_identity_refusals_without_spent_budget() {
+        let mut ev = evidence();
+        ev.kernel_control.identity_unavailable = 3;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("3 processes refused an identity"), "{line}");
+        assert!(!line.contains("16384"), "{line}");
+    }
+
+    // Identity budget (RED): a halted kernel and root-affiliation
+    // failures surface by name beside the identity fragment.
+    #[test]
+    fn coverage_line_names_kernel_halt_and_root_failures() {
+        let mut ev = evidence();
+        ev.kernel_control.capture_halted = true;
+        ev.kernel_control.owner_poison = vec!["bad_control"];
+        ev.kernel_control.owner_admission_failures = 2;
+        ev.kernel_control.root_affiliation_failures = vec!["capacity"];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("halted"), "{line}");
+        assert!(line.contains("bad_control"), "{line}");
+        assert!(line.contains("capacity"), "{line}");
+        assert!(line.contains('2'), "{line}");
+    }
+
+    // Identity budget (RED twin): a complete kernel control keeps
+    // the coverage line silent about identity.
+    #[test]
+    fn coverage_line_kernel_control_quiet_twin() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(coverage_line(&ev, false), "coverage: complete");
+        assert!(!coverage_line(&ev, false).contains("identity"));
+    }
+
     /// OD34/E1: the 256 process-view limit is named in the user's report.
     /// The exact view-capacity skip projects to a finite named reason (not
     /// the redacted pair), forces PARTIAL with the `skipped` cause, and the

@@ -4863,29 +4863,6 @@ fn finish_capture_error(
     combine_capture_failure(error, finish, detach)
 }
 
-/// Combines an owned-handoff failure with the settlement, publication and
-/// detach outcomes behind it, in that order. Mirrors
-/// `combine_quiesce_failure`: the handoff error stays the outer error, so
-/// the run still exits nonzero with the failed step named.
-fn combine_handoff_report_failure(
-    handoff: anyhow::Error,
-    finish: Result<()>,
-    published: Option<Result<()>>,
-    detach: Result<()>,
-) -> anyhow::Error {
-    let mut capture = handoff;
-    if let Err(error) = finish {
-        capture = also_failed(capture, error, "owned cleanup/settlement");
-    }
-    if let Some(Err(error)) = published {
-        capture = also_failed(capture, error, "terminal publication");
-    }
-    if let Err(error) = detach {
-        capture = also_failed(capture, error, "detaching capture producers");
-    }
-    capture
-}
-
 /// Settles an owned-handoff failure (exec barrier release, post-release
 /// pause revalidation, pause arm) the way a capture-loop failure settles:
 /// the owned child still gets pause cleanup and policy settlement,
@@ -4894,10 +4871,10 @@ fn combine_handoff_report_failure(
 /// tests drive the real combiner without an attach session.
 ///
 /// The handoff error stays the outer error; a partial report seals from
-/// whatever was captured before the failure, naming the failed step.
+/// whatever was captured before the failure, naming the failed step. The
+/// failed step rides in the report context, not in this combiner.
 fn finish_handoff_error_with<C>(
     error: anyhow::Error,
-    _step: &'static str,
     context: &mut C,
     note_gap: impl FnOnce(&mut C),
     settle: impl FnOnce(&mut C) -> Result<()>,
@@ -4915,7 +4892,10 @@ fn finish_handoff_error_with<C>(
         Err(_) => None,
     };
     let detach = detach(context);
-    combine_handoff_report_failure(error, finish, published, detach)
+    // A handoff failure combines exactly like a quiesce failure: the
+    // first error stays outer, settlement, publication and detach append
+    // behind it in that order.
+    combine_quiesce_failure(error, finish, published, detach)
 }
 
 /// Drives one owned-handoff step with its report: the fault hook `handoff`
@@ -4925,10 +4905,8 @@ fn finish_handoff_error_with<C>(
 /// `finish_handoff_error_with`; the healthy arm proceeds to the capture
 /// loop, which seals the full report there. Test seam only.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 fn drive_owned_handoff_with<C>(
     context: &mut C,
-    step: &'static str,
     handoff: impl FnOnce(&mut C) -> Result<()>,
     note_gap: impl FnOnce(&mut C),
     settle: impl FnOnce(&mut C) -> Result<()>,
@@ -4943,7 +4921,6 @@ fn drive_owned_handoff_with<C>(
         }
         Err(error) => Err(finish_handoff_error_with(
             error,
-            step,
             context,
             note_gap,
             settle,
@@ -5009,6 +4986,7 @@ struct HandoffReportContext<'a> {
     uretprobe_override: Option<render::UretprobeOverride>,
     owned_command: Option<&'a str>,
     resource_start: crate::timing::ResourceSample,
+    wall_start: SystemTime,
     step: &'static str,
 }
 
@@ -5037,6 +5015,7 @@ fn finish_owned_handoff_error(
     uretprobe_override: Option<render::UretprobeOverride>,
     owned_command: Option<&str>,
     resource_start: crate::timing::ResourceSample,
+    wall_start: SystemTime,
 ) -> anyhow::Error {
     let mut context = HandoffReportContext {
         engine,
@@ -5053,13 +5032,13 @@ fn finish_owned_handoff_error(
         uretprobe_override,
         owned_command,
         resource_start,
+        wall_start,
         step,
     };
     let error = finish_handoff_error_with(
         error,
-        step,
         &mut context,
-        |context| context.engine.note_capture_loop_failure(),
+        |context| context.engine.note_handoff_failure(context.step),
         |context| {
             let settled = context.owned.finish(
                 &mut *context.engine,
@@ -5147,9 +5126,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             crate::render::escape_controls(&error),
         ));
         handoff_gaps.push(render::SkippedOut {
-            name: "provider identity".to_string(),
-            reason: "the terminal identity recheck failed; provider sameness is unproven"
-                .to_string(),
+            name: HANDOFF_GAP_PROVIDER_IDENTITY.to_string(),
+            reason: HANDOFF_REASON_IDENTITY.to_string(),
         });
     }
     if profile {
@@ -5173,10 +5151,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                         crate::render::escape_controls(&format!("{error:#}")),
                     ));
                     handoff_gaps.push(render::SkippedOut {
-                        name: "original root tail".to_string(),
-                        reason: "the reaped child's tail could not be retired; its events may \
-                                 be missing or double-counted"
-                            .to_string(),
+                        name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                        reason: HANDOFF_REASON_TAIL_RETIRE.to_string(),
                     });
                 }
             }
@@ -5189,10 +5165,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                     "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
                 ));
                 handoff_gaps.push(render::SkippedOut {
-                    name: "original root tail".to_string(),
-                    reason: "the reaped child's tail drain was cancelled; its events are \
-                             unproven"
-                        .to_string(),
+                    name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                    reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
                 });
             }
             Err(error) => {
@@ -5202,9 +5176,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                     crate::render::escape_controls(&format!("{error:#}")),
                 ));
                 handoff_gaps.push(render::SkippedOut {
-                    name: "original root tail".to_string(),
-                    reason: "the reaped child's tail drain failed; its events are unproven"
-                        .to_string(),
+                    name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                    reason: HANDOFF_REASON_TAIL_DRAIN.to_string(),
                 });
             }
         }
@@ -5228,10 +5201,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                             crate::render::escape_controls(&format!("{error:#}")),
                         ));
                         handoff_gaps.push(render::SkippedOut {
-                            name: "events drain".to_string(),
-                            reason: "the terminal event drain failed; calls past the failure \
-                                     are unproven"
-                                .to_string(),
+                            name: HANDOFF_GAP_EVENTS_DRAIN.to_string(),
+                            reason: HANDOFF_REASON_EVENTS_DRAIN.to_string(),
                         });
                     }
                 }
@@ -5243,8 +5214,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                     crate::render::escape_controls(&format!("{error:#}")),
                 ));
                 handoff_gaps.push(render::SkippedOut {
-                    name: "events drain".to_string(),
-                    reason: "the EVENTS reader could not be opened; calls are unproven".to_string(),
+                    name: HANDOFF_GAP_EVENTS_DRAIN.to_string(),
+                    reason: HANDOFF_REASON_EVENTS_OPEN.to_string(),
                 });
             }
         }
@@ -5271,8 +5242,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
             handoff_gaps.push(render::SkippedOut {
-                name: "counter collection".to_string(),
-                reason: "the terminal counter read failed; counts are unproven".to_string(),
+                name: HANDOFF_GAP_COUNTER_COLLECTION.to_string(),
+                reason: HANDOFF_REASON_COUNTER.to_string(),
             });
             (Vec::new(), metrics::KernelEvidence::default())
         }
@@ -5340,9 +5311,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     // rides beside it, so the verdict stays a concrete gap.
     ev.skipped.push(render::SkippedOut {
         name: context.step.to_string(),
-        reason: "the owned startup step failed before the capture loop; the report holds \
-                 what was captured up to the failure"
-            .to_string(),
+        reason: HANDOFF_REASON_STEP_PROFILE.to_string(),
     });
     ev.skipped.extend(handoff_gaps);
     // No stop gate ran: quiescence is unproven, never reached.
@@ -5360,7 +5329,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let frame = render::live_scoped(
         &reports,
         &ev,
-        Duration::ZERO,
+        context.wall_start.elapsed().unwrap_or(Duration::ZERO),
         &facts.heading(),
         mode,
         context.policy,
@@ -5392,10 +5361,11 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             .unwrap_or_default()
             .trim()
             .to_string();
-        let now = fmt_rfc3339(SystemTime::now());
+        let started = fmt_rfc3339(context.wall_start);
+        let ended = fmt_rfc3339(SystemTime::now());
         let capture = render::CaptureMeta {
-            started: &now,
-            ended: &now,
+            started: &started,
+            ended: &ended,
             kernel: &kernel,
             policy: context.policy,
             scope: context.scope.kind(),
@@ -5522,8 +5492,89 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             crate::render::escape_controls(&format!("{error:#}")),
         ));
         handoff_gaps.push(render::SkippedOut {
-            name: "ring loss report".to_string(),
-            reason: "the ring-loss line could not be emitted; loss is unproven".to_string(),
+            name: HANDOFF_GAP_RING_LOSS.to_string(),
+            reason: HANDOFF_REASON_RING_LOSS.to_string(),
+        });
+    }
+    // The reaped child's tail drains here, exactly as the profile handoff
+    // and the terminal trace drain it: tail events stream through the
+    // trace reducer, a completed tail retires, and every other outcome
+    // files its named gap instead of losing the tail silently.
+    let mut root_write_error = None;
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    let reexec_diagnostic = context.session.reexec_diagnostic();
+    match drain_original_root_events(
+        &mut *context.session,
+        Some(&mut *context.owned),
+        context.signals,
+        |domain, event| {
+            reduce_trace_event_with_identities(
+                domain,
+                (
+                    &mut remaining,
+                    &mut state,
+                    &mut tracker,
+                    context.scope,
+                    &mut tracer,
+                ),
+                None,
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                reexec_diagnostic.as_ref(),
+                (&mut stdout_sink, &mut stdout_open, &mut out_file),
+                &mut root_write_error,
+                event,
+            )
+        },
+    ) {
+        Ok(OriginalRootDrain::Absent) => {}
+        Ok(OriginalRootDrain::Completed { malformed, tail }) => {
+            malformed_records = malformed_records.saturating_add(malformed);
+            if let Err(error) = apply_original_root_retirement(&mut tracker, &mut state, *tail) {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: original-root retirement failed; sealing the handoff trace from \
+                     partial state: {}",
+                    crate::render::escape_controls(&format!("{error:#}")),
+                ));
+                handoff_gaps.push(render::SkippedOut {
+                    name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                    reason: HANDOFF_REASON_TAIL_RETIRE.to_string(),
+                });
+            }
+        }
+        Ok(OriginalRootDrain::Cancelled {
+            malformed,
+            remaining,
+        }) => {
+            malformed_records = malformed_records.saturating_add(malformed);
+            let _ = crate::sink::try_stderr_line(&format!(
+                "p11scope: root_tail_incomplete: cancelled; remaining={remaining}"
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                reason: HANDOFF_REASON_TAIL_CANCELLED.to_string(),
+            });
+        }
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: original-root drain failed; sealing the handoff trace from partial \
+                 state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            handoff_gaps.push(render::SkippedOut {
+                name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+                reason: HANDOFF_REASON_TAIL_DRAIN.to_string(),
+            });
+        }
+    }
+    if let Some(error) = root_write_error {
+        emit_capture_diagnostic(&format!(
+            "p11scope: original-root tail lines could not be emitted; sealing the handoff \
+             trace from partial state: {}",
+            crate::render::escape_controls(&format!("{error:#}")),
+        ));
+        handoff_gaps.push(render::SkippedOut {
+            name: HANDOFF_GAP_ORIGINAL_ROOT_TAIL.to_string(),
+            reason: HANDOFF_REASON_TAIL_DRAIN.to_string(),
         });
     }
     match drain_trace_events(
@@ -5551,10 +5602,8 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
             handoff_gaps.push(render::SkippedOut {
-                name: "events drain".to_string(),
-                reason: "the terminal event drain failed; calls past the failure are \
-                         unproven"
-                    .to_string(),
+                name: HANDOFF_GAP_EVENTS_DRAIN.to_string(),
+                reason: HANDOFF_REASON_EVENTS_DRAIN.to_string(),
             });
         }
     }
@@ -5566,9 +5615,8 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             crate::render::escape_controls(&error),
         ));
         handoff_gaps.push(render::SkippedOut {
-            name: "provider identity".to_string(),
-            reason: "the terminal identity recheck failed; provider sameness is unproven"
-                .to_string(),
+            name: HANDOFF_GAP_PROVIDER_IDENTITY.to_string(),
+            reason: HANDOFF_REASON_IDENTITY.to_string(),
         });
     }
     let reports = match metrics::read(context.session, context.engine.plan()) {
@@ -5580,8 +5628,8 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
             handoff_gaps.push(render::SkippedOut {
-                name: "counter collection".to_string(),
-                reason: "the terminal counter read failed; counts are unproven".to_string(),
+                name: HANDOFF_GAP_COUNTER_COLLECTION.to_string(),
+                reason: HANDOFF_REASON_COUNTER.to_string(),
             });
             Vec::new()
         }
@@ -5595,8 +5643,8 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
                 crate::render::escape_controls(&format!("{error:#}")),
             ));
             handoff_gaps.push(render::SkippedOut {
-                name: "kernel evidence".to_string(),
-                reason: "the terminal kernel evidence read failed; loss is unproven".to_string(),
+                name: HANDOFF_GAP_KERNEL_EVIDENCE.to_string(),
+                reason: HANDOFF_REASON_KERNEL.to_string(),
             });
             metrics::KernelEvidence::default()
         }
@@ -5663,9 +5711,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     ev.trace_truncated = remaining == Some(0);
     ev.skipped.push(render::SkippedOut {
         name: context.step.to_string(),
-        reason: "the owned startup step failed before the capture loop; the trace holds \
-                 what was captured up to the failure"
-            .to_string(),
+        reason: HANDOFF_REASON_STEP_TRACE.to_string(),
     });
     ev.skipped.extend(handoff_gaps);
     ev.apply_stop_quiescence(render::StopQuiescence {
@@ -6169,6 +6215,10 @@ fn run_owned_inner_with_host(
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
     let resource_start = crate::timing::read_resource_sample();
+    // A handoff failure seals its report from here, before any loop starts:
+    // this stamp is the report's capture start, as the loop's own stamp is
+    // on the terminal path.
+    let wall_start = SystemTime::now();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
     // On the run-tree scope discovery opens its own member views: the
@@ -6313,6 +6363,7 @@ fn run_owned_inner_with_host(
                     uretprobe_override.clone(),
                     Some(&owned_command),
                     resource_start,
+                    wall_start,
                 ));
             }
             let always = error.required();
@@ -6334,6 +6385,7 @@ fn run_owned_inner_with_host(
                     uretprobe_override.clone(),
                     Some(&owned_command),
                     resource_start,
+                    wall_start,
                 )
             })?;
             if always {
@@ -6368,6 +6420,7 @@ fn run_owned_inner_with_host(
             uretprobe_override.clone(),
             Some(&owned_command),
             resource_start,
+            wall_start,
         ));
     }
     owned.prearm_release_ns = owned.child.as_ref().and_then(|child| child.release_ns());
@@ -6398,6 +6451,7 @@ fn run_owned_inner_with_host(
                 uretprobe_override.clone(),
                 Some(&owned_command),
                 resource_start,
+                wall_start,
             ));
         }
     }
@@ -18360,7 +18414,6 @@ int main(int argc, char **argv) {
         let full = std::cell::Cell::new(false);
         let outcome = drive_owned_handoff_with(
             &mut (),
-            "exec handoff",
             |_| Ok(()),
             |_| panic!("a healthy handoff files no gap"),
             |_| panic!("a healthy handoff settles in the capture loop, not here"),
@@ -18387,7 +18440,6 @@ int main(int argc, char **argv) {
         let detached = std::cell::Cell::new(false);
         let outcome = drive_owned_handoff_with(
             &mut (),
-            "exec handoff",
             |_| Err(anyhow::anyhow!("run: exec handoff cancelled")),
             |_| gap.set(true),
             |_| {
@@ -18520,7 +18572,6 @@ int main(int argc, char **argv) {
         let detached = std::cell::Cell::new(false);
         let outcome = drive_owned_handoff_with(
             &mut (),
-            "exec handoff",
             |_| Err(anyhow::anyhow!("run: exec handoff cancelled")),
             |_| gap.set(true),
             |_| {

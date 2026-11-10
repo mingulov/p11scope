@@ -30837,6 +30837,17 @@ impl Engine {
         );
     }
 
+    /// Names an owned startup step that failed after probes attached: no
+    /// capture loop ever ran, so the loss records the failed step and the
+    /// partial report still seals what was captured, with no causal claim
+    /// spanning the failure.
+    pub(crate) fn note_handoff_failure(&mut self, step: &'static str) {
+        self.mark_live_loss(
+            step,
+            "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
+        );
+    }
+
     /// A terminal discovery drain that failed at any stop files
     /// unfinished work and keeps the committed plan: the seal proceeds
     /// from partial state instead of suppressing the report.

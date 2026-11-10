@@ -10551,6 +10551,28 @@ fn capture_trace(
     if capture_diagnostics_on() {
         emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
     }
+    // The pid-scope target, resolved once probes are attached (usually
+    // alive; an exit between attach and the read is named via the exit
+    // reason): stderr names it beside the readiness line. Trace publishes
+    // no JSON report, so unlike profile nothing reuses the value; the read
+    // is still bound to the target's retained pin — the owned child's pin
+    // when it names this pid, else the named view's — so a recycled pid
+    // never misattaches an unrelated program's exe.
+    let _target_caller = match scope {
+        Scope::Pid(pid) => {
+            let owned_pin = owned
+                .as_ref()
+                .and_then(|owned| owned.child.as_ref())
+                .filter(|child| child.pid() == *pid)
+                .map(|child| child.pin());
+            let engine_pin = engine.pid_target_pin(*pid);
+            let pin = owned_pin.or(engine_pin.as_deref());
+            let caller = resolve_pid_caller(*pid, pin);
+            emit_capture_diagnostic(&target_caller_line(*pid, &caller));
+            Some(caller)
+        }
+        Scope::Cgroup { .. } | Scope::System => None,
+    };
     emit_capture_diagnostic(&capture_ready_line(
         session.attached_probes(),
         owned.is_some(),

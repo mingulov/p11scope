@@ -3275,7 +3275,9 @@ pub(crate) fn apply_snapshot_failure(
 }
 
 /// Snapshot frame plus the pid-scope caller line, so profile stdout
-/// names the caller program. `None` caller renders no line.
+/// names the caller program. `None` caller renders no line. Carries
+/// capture-wide session/login counts; see
+/// [`live_scoped_with_verbosity_and_sessions`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_snapshot_scoped(
     snapshot: &crate::metrics::CaptureSnapshot,
@@ -3287,6 +3289,8 @@ pub(crate) fn live_snapshot_scoped(
     scope: &str,
     mechanisms: &BTreeMap<u64, MechStat>,
     caller: Option<&CaptureCaller>,
+    sessions: &crate::semantics::SessionStats,
+    logins: &BTreeMap<u32, u64>,
 ) -> String {
     let mut frame = live_scoped_with_caller(
         snapshot.reports(),
@@ -3299,6 +3303,8 @@ pub(crate) fn live_snapshot_scoped(
         mechanisms,
         caller,
         crate::cli::text_verbosity(),
+        sessions,
+        logins,
     );
     if let Some(summary) = snapshot.counter_summary() {
         // Concise frames end with the `-v` hint: the counter block reads
@@ -3360,9 +3366,9 @@ pub fn caller_text_line(caller: Option<&CaptureCaller>) -> Option<String> {
     }
 }
 
-/// [`live_scoped_with_verbosity`] plus the pid-scope caller line after
-/// the header, so profile stdout names the caller program like JSON
-/// `capture.caller` does. `None` caller renders no line.
+/// [`live_scoped_with_verbosity_and_sessions`] plus the pid-scope caller
+/// line after the header, so profile stdout names the caller program
+/// like JSON `capture.caller` does. `None` caller renders no line.
 #[allow(clippy::too_many_arguments)]
 pub fn live_scoped_with_caller(
     reports: &[SlotReport],
@@ -3375,9 +3381,12 @@ pub fn live_scoped_with_caller(
     mechanisms: &BTreeMap<u64, MechStat>,
     caller: Option<&CaptureCaller>,
     verbosity: crate::cli::TextVerbosity,
+    sessions: &crate::semantics::SessionStats,
+    logins: &BTreeMap<u32, u64>,
 ) -> String {
-    let frame = live_scoped_with_verbosity(
+    let frame = live_scoped_with_verbosity_and_sessions(
         reports, ev, elapsed, module, mode, policy, scope, mechanisms, verbosity,
+        sessions, logins,
     );
     let Some(line) = caller_text_line(caller) else {
         return frame;
@@ -3408,7 +3417,9 @@ fn pause_refusal_line(ev: &Evidence) -> Option<String> {
 /// the full frame with Evidence and machine reason names; quiet keeps
 /// the header, totals and coverage only. The function table renders
 /// only when some row has activity; the header carries the privacy
-/// mode under verbose only.
+/// mode under verbose only. Sessions/logins render empty here; the
+/// profile lane passes real counts through
+/// [`live_scoped_with_verbosity_and_sessions`].
 #[allow(clippy::too_many_arguments)]
 pub fn live_scoped_with_verbosity(
     reports: &[SlotReport],
@@ -3420,6 +3431,107 @@ pub fn live_scoped_with_verbosity(
     scope: &str,
     mechanisms: &BTreeMap<u64, MechStat>,
     verbosity: crate::cli::TextVerbosity,
+) -> String {
+    live_scoped_with_verbosity_and_sessions(
+        reports,
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        scope,
+        mechanisms,
+        verbosity,
+        &crate::semantics::SessionStats::default(),
+        &BTreeMap::new(),
+    )
+}
+
+/// The `C_Login` user-type number as a plain word: PKCS#11
+/// CKU_SO/CKU_USER/CKU_CONTEXT_SPECIFIC. A vendor-extended type
+/// renders numerically, never guessed.
+fn login_user_type_name(user_type: u32) -> String {
+    match user_type {
+        0 => "SO".to_string(),
+        1 => "user".to_string(),
+        2 => "context-specific".to_string(),
+        other => format!("type {other}"),
+    }
+}
+
+/// The capture-wide sessions/logins line for the profile text, from
+/// the reducer state the JSON `sessions`/`logins` already carry — no
+/// new capture, no schema change. `None` when no session was opened
+/// or inherited and no login was seen. The counts are event-derived;
+/// under a PARTIAL verdict the coverage line governs them, which is
+/// why this rides beside the mechanism section rather than the
+/// header totals. Verbose adds the inherited/closed accounting.
+fn session_login_line(
+    sessions: &crate::semantics::SessionStats,
+    logins: &BTreeMap<u32, u64>,
+    verbose: bool,
+) -> Option<String> {
+    if sessions.opened == 0 && sessions.inherited == 0 && logins.is_empty() {
+        return None;
+    }
+    let balance = sessions
+        .opened
+        .saturating_add(sessions.inherited)
+        .saturating_sub(sessions.closed);
+    let mut line = if sessions.opened > 0 {
+        let mut head = format!("sessions: {} opened", sessions.opened);
+        if verbose && sessions.async_opened > 0 {
+            head.push_str(&format!(" ({} async)", sessions.async_opened));
+        }
+        if verbose {
+            head.push_str(&format!(
+                ", {} inherited, {} closed",
+                sessions.inherited, sessions.closed
+            ));
+        }
+        head.push_str(&format!(
+            ", peak {} at once, {balance} still open",
+            sessions.peak_concurrent
+        ));
+        head
+    } else if sessions.inherited > 0 {
+        let mut head = format!("sessions: {} inherited", sessions.inherited);
+        if verbose {
+            head.push_str(&format!(", {} closed", sessions.closed));
+        }
+        head.push_str(&format!(
+            ", peak {} at once, {balance} still open",
+            sessions.peak_concurrent
+        ));
+        head
+    } else {
+        "sessions: none opened".to_string()
+    };
+    if !logins.is_empty() {
+        let parts: Vec<String> = logins
+            .iter()
+            .map(|(user_type, n)| format!("{} ×{n}", login_user_type_name(*user_type)))
+            .collect();
+        line.push_str(&format!("; logins: {}", parts.join(", ")));
+    }
+    Some(line)
+}
+
+/// [`live_scoped_with_verbosity`] with capture-wide session/login
+/// counts for the profile text. See [`session_login_line`].
+#[allow(clippy::too_many_arguments)]
+pub fn live_scoped_with_verbosity_and_sessions(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+    verbosity: crate::cli::TextVerbosity,
+    sessions: &crate::semantics::SessionStats,
+    logins: &BTreeMap<u32, u64>,
 ) -> String {
     let mut s = String::new();
     // Concise states the scope once, in the header; the privacy mode
@@ -3574,6 +3686,17 @@ pub fn live_scoped_with_verbosity(
         } else {
             s.push_str("Mechanisms: none recorded for the observed calls.\n");
         }
+    }
+    // Capture-wide sessions/logins beside the mechanism section, in
+    // concise and verbose (quiet returned above with the header,
+    // totals and coverage only). Absent without sessions or logins.
+    if let Some(line) = session_login_line(
+        sessions,
+        logins,
+        verbosity == crate::cli::TextVerbosity::Verbose,
+    ) {
+        s.push_str(&line);
+        s.push('\n');
     }
     if verbosity == crate::cli::TextVerbosity::Verbose {
         let mut evidence_line = format!(
@@ -5360,7 +5483,9 @@ pub(crate) mod tests {
                     capture.policy,
                     "pid",
                     &BTreeMap::new(),
-                    None
+                    None,
+                    &crate::semantics::SessionStats::default(),
+                    &BTreeMap::new()
                 ),
                 live_scoped(
                     snapshot.reports(),
@@ -5484,6 +5609,8 @@ pub(crate) mod tests {
                 "pid",
                 &BTreeMap::new(),
                 None,
+                &crate::semantics::SessionStats::default(),
+                &BTreeMap::new(),
             );
             assert!(frame.contains("last read stale"), "{frame}");
             assert!(frame.contains("coverage: partial"), "{frame}");
@@ -8154,6 +8281,67 @@ pub(crate) mod tests {
     /// F-13: the evidence line names why a verdict is PARTIAL, from the
     /// same classes the verdict uses — including gates that used to have no
     /// fragment (an unprotected live window) and the terminal seal alone.
+    /// The default profile text names capture-wide sessions and
+    /// logins from the reducer state the JSON already carries (no new
+    /// capture): one concise line beside the mechanisms section, fuller
+    /// accounting under `-v`, nothing when no session was opened,
+    /// inherited, or logged in.
+    #[test]
+    fn profile_text_names_sessions_and_logins() {
+        use crate::semantics::SessionStats;
+        let sessions = SessionStats {
+            opened: 3,
+            inherited: 0,
+            closed: 1,
+            async_opened: 0,
+            peak_concurrent: 2,
+        };
+        let logins = BTreeMap::from([(1u32, 1u64)]);
+        let frame = |verbosity| {
+            live_scoped_with_verbosity_and_sessions(
+                &[],
+                &evidence(),
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                verbosity,
+                &sessions,
+                &logins,
+            )
+        };
+        let concise = frame(crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("sessions: 3 opened, peak 2 at once, 2 still open; logins: user ×1"),
+            "{concise}"
+        );
+        let verbose = frame(crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains(
+                "sessions: 3 opened, 0 inherited, 1 closed, peak 2 at once, 2 still open; \
+                 logins: user ×1"
+            ),
+            "{verbose}"
+        );
+        // Control: no sessions, no logins — no line.
+        let quiet = live_scoped_with_verbosity_and_sessions(
+            &[],
+            &evidence(),
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+            &SessionStats::default(),
+            &BTreeMap::new(),
+        );
+        assert!(!quiet.contains("sessions:"), "{quiet}");
+    }
+
     #[test]
     fn live_view_names_why_the_verdict_is_partial() {
         let frame = |mutate: fn(&mut Evidence), seal: bool| {
@@ -9617,6 +9805,8 @@ pub(crate) mod tests {
             "pid",
             &BTreeMap::new(),
             None,
+            &crate::semantics::SessionStats::default(),
+            &BTreeMap::new(),
         );
         let hint = crate::cli::VERBOSE_HINT;
         assert!(frame.contains("Counter collection:"), "{frame}");
@@ -13630,6 +13820,8 @@ pub(crate) mod tests {
                 &BTreeMap::new(),
                 Some(&caller),
                 verbosity,
+                &crate::semantics::SessionStats::default(),
+                &BTreeMap::new(),
             );
             assert!(
                 out.contains("caller: /usr/bin/python3.14"),
@@ -13656,6 +13848,8 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             Some(&unknown),
             crate::cli::TextVerbosity::Concise,
+            &crate::semantics::SessionStats::default(),
+            &BTreeMap::new(),
         );
         assert!(
             out.contains("caller unknown: exe_unreadable"),
@@ -13673,6 +13867,8 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             None,
             crate::cli::TextVerbosity::Concise,
+            &crate::semantics::SessionStats::default(),
+            &BTreeMap::new(),
         );
         assert!(
             !out.contains("caller:"),

@@ -5380,6 +5380,8 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         state.mechanisms(),
         target_caller.as_ref(),
         crate::cli::text_verbosity(),
+        &state.sessions(),
+        state.logins(),
     );
     // The `-o` file is the report when one was given; the stdout frame is
     // display only then. Without `-o` the frame is the report, so its
@@ -9352,6 +9354,8 @@ fn capture_profile(
                 scope.kind(),
                 state.mechanisms(),
                 target_caller.as_ref(),
+                &state.sessions(),
+                state.logins(),
             );
             if let Some(bytes) = live_display.frame_bytes(&frame, false) {
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
@@ -10184,6 +10188,8 @@ fn capture_profile(
             scope.kind(),
             consumers.state.mechanisms(),
             target_caller.as_ref(),
+            &consumers.state.sessions(),
+            consumers.state.logins(),
         );
         // A cleanly closed --select-endpoint window names itself in the
         // report, before the hint: refused and voided selections already

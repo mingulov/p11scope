@@ -2736,7 +2736,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             && gap.module.is_none()
             && gap.pid.is_none()
             && gap_plain_subject(&gap.subject) == "kernel threads"
-            && kernel_thread_absence_count(gap_plain_reason(&gap.reason)).is_some()
+            && kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason)).is_some()
         {
             kthreads.push(gap);
         } else if is_unreachable_process_reason(&gap.reason) {
@@ -2786,7 +2786,8 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             reason_text = folded;
         }
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
-        let reason = escape_controls(gap_plain_reason(reason_text)).into_owned();
+        let reason =
+            escape_controls(gap_plain_reason(&gap.subject, reason_text)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += 1;
@@ -2810,7 +2811,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         // rows, so a fresh key reads as a scope group.
         let mut total = 0u64;
         for gap in &kthreads {
-            if let Some(count) = kernel_thread_absence_count(gap_plain_reason(&gap.reason)) {
+            if let Some(count) = kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason)) {
                 total = total.saturating_add(count.saturating_mul(gap.repeats));
             }
         }
@@ -3006,8 +3007,10 @@ fn gap_plain_subject(subject: &str) -> &str {
 
 /// One gap reason in plain words (text only; JSON keeps the stored
 /// reason). Unknown reasons pass through verbatim so a new gap lane
-/// always surfaces.
-fn gap_plain_reason(reason: &str) -> &str {
+/// always surfaces. The subject disambiguates causes a bare reason
+/// cannot name (a replaced file's unlinked path is never an exit).
+fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
+    let _ = subject;
     if let Some(_suffix) = reason.strip_prefix("joint_seal_") {
         return "per-key tracking ended early";
     }
@@ -4420,7 +4423,7 @@ fn render_snapshot_inner(
         // Known machine subjects/reasons render in plain words with the
         // machine token beside them (JSON keeps the stored strings).
         let plain_subject = gap_plain_subject(&gap.subject);
-        let plain_reason = gap_plain_reason(&gap.reason);
+        let plain_reason = gap_plain_reason(&gap.subject, &gap.reason);
         let mut subject = escape_controls(plain_subject).into_owned();
         if plain_subject != gap.subject {
             subject = format!("{subject} ({})", escape_controls(&gap.subject));

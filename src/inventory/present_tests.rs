@@ -4098,17 +4098,19 @@ fn gap_plain_reason_keeps_unprefixed_marker_text_verbatim() {
         "lane noted (target root /etc/avahi) mid-text",
         "lane noted (host-root fallback: refused) mid-text",
     ] {
-        assert_eq!(gap_plain_reason(reason), reason);
+        assert_eq!(gap_plain_reason("/lib/live.so", reason), reason);
     }
     // Healthy halves: the real foreign forms keep their plain words.
     assert_eq!(
         gap_plain_reason(
+            "/lib/live.so",
             "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)"
         ),
         "object unavailable in foreign target root"
     );
     assert_eq!(
         gap_plain_reason(
+            "/lib/live.so",
             "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2)) (target root /etc/avahi differs from the observer root)"
         ),
         "object unavailable from the process's root or the host-root fallback"
@@ -4122,14 +4124,40 @@ fn gap_plain_reason_keeps_unprefixed_marker_text_verbatim() {
 #[test]
 fn gap_plain_reason_names_the_map_files_fallback_attempt() {
     assert_eq!(
-        gap_plain_reason("lane noted (map_files fallback: refused) mid-text"),
+        gap_plain_reason(
+            "/lib/live.so",
+            "lane noted (map_files fallback: refused) mid-text"
+        ),
         "lane noted (map_files fallback: refused) mid-text"
     );
     assert_eq!(
         gap_plain_reason(
+            "/lib/live.so",
             "opening object within retained target root: No such process (os error 3) (map_files fallback: Operation not permitted (os error 1)) (target root /proc/99999/fdinfo differs from the observer root)"
         ),
         "object unavailable from the process's root or the map_files fallback"
+    );
+}
+
+/// A replaced file's pin failure names its unlinked path: the plain
+/// words name the replaced cause with the uncounted consequence —
+/// never the exit race, which would blame a live process.
+#[test]
+fn gap_plain_reason_names_replaced_pinning_failure_for_deleted_subject() {
+    assert_eq!(
+        gap_plain_reason(
+            "/usr/lib/libreplaced.so (deleted)",
+            "opening object within retained target root: No such file or directory (os error 2)"
+        ),
+        "replaced file unavailable for pinning; calls not counted"
+    );
+    // The exit race keeps its words for a live path.
+    assert_eq!(
+        gap_plain_reason(
+            "/usr/lib/liblive.so",
+            "opening object within retained target root: No such file or directory (os error 2)"
+        ),
+        "process exited during scan (file gone before it could be read)"
     );
 }
 

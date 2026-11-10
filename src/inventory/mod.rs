@@ -14848,6 +14848,139 @@ mod tests {
         assert_eq!(markers[5]["event"]["edge_events"], 0);
     }
 
+    fn stream_gap_fixture_row(subject: &str, reason: &str) -> crate::inventory_present::GapView {
+        crate::inventory_present::GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        }
+    }
+
+    fn stream_gap_boot_synth() -> crate::inventory_present::GapView {
+        stream_gap_fixture_row(
+            crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT,
+            "joint_birth_unoffered",
+        )
+    }
+
+    fn stream_gap_records(records: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| record["kind"] == "gap_recorded")
+            .map(|record| &record["event"])
+            .collect()
+    }
+
+    // Catches a presentation-synthesized gap row corrupting the streamed
+    // gap index space: the bootstrap `joint_birth_unoffered` row is
+    // synthesized per pass while no Joint-birth refusal is recorded, then
+    // vanishes once the real refusal lands. The positional gap emitter
+    // then swallows the real cause row (fedora kc13 never streamed its
+    // Capacity row) and misaddresses every later index.
+    #[test]
+    fn stream_synthetic_bootstrap_gap_never_shifts_gap_indexes() {
+        let (mut view, _) = stream_identity_fixture(1);
+        let report = stream_identity_report(Vec::new());
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_boot_synth(),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 2).unwrap();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_fixture_row("retained row", "second"),
+            stream_gap_boot_synth(),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 3).unwrap();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_fixture_row("retained row", "second"),
+            stream_gap_fixture_row(
+                crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT,
+                "joint_birth_registration_Capacity",
+            ),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 4).unwrap();
+        let records = stream_sink_records(&mut reader);
+        let gaps = stream_gap_records(&records);
+        assert!(
+            gaps.iter().all(|gap| gap["reason"] != "joint_birth_unoffered"),
+            "the synthetic row must never stream mid-run: {gaps:?}"
+        );
+        let reasons: Vec<&str> = gaps
+            .iter()
+            .map(|gap| gap["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "first",
+                "second",
+                "joint_birth_registration_Capacity",
+            ],
+            "the real cause row must stream at its retained index"
+        );
+        for (position, gap) in gaps.iter().enumerate() {
+            assert_eq!(
+                gap["index"].as_u64().unwrap(),
+                position as u64,
+                "stream indexes must match the final gaps[] order"
+            );
+        }
+        let fresh: Vec<u64> = records
+            .iter()
+            .filter(|record| record["kind"] == "pass_committed")
+            .map(|record| record["event"]["new_gaps"].as_u64().unwrap())
+            .collect();
+        assert_eq!(fresh, [1, 1, 1]);
+    }
+
+    // The still-silent shape: when no Joint-birth refusal ever lands, the
+    // final flush carries the synthesized row once, at the retained tail
+    // index, so the replayed stream still equals the snapshot.
+    #[test]
+    fn stream_synthetic_bootstrap_gap_flushes_at_end_when_still_silent() {
+        let (mut view, _) = stream_identity_fixture(1);
+        let report = stream_identity_report(Vec::new());
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_boot_synth(),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 2).unwrap();
+        view.gaps = vec![
+            stream_gap_fixture_row("retained row", "first"),
+            stream_gap_fixture_row("retained row", "second"),
+            stream_gap_boot_synth(),
+        ];
+        emit_commit(&mut writer, &mut state, &report, &view, false, 3).unwrap();
+        state
+            .gaps
+            .emit(&mut writer, &view.gaps, true, 4)
+            .unwrap();
+        let records = stream_sink_records(&mut reader);
+        let gaps = stream_gap_records(&records);
+        let reasons: Vec<&str> = gaps
+            .iter()
+            .map(|gap| gap["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["first", "second", "joint_birth_unoffered"]);
+        for (position, gap) in gaps.iter().enumerate() {
+            assert_eq!(
+                gap["index"].as_u64().unwrap(),
+                position as u64,
+                "stream indexes must match the final gaps[] order"
+            );
+        }
+    }
+
     // Catches turnover contexts read from a later live PID instead of the
     // exact old/new publication records, and a contextless native stop path.
     #[test]

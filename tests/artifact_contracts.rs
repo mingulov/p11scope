@@ -12360,14 +12360,14 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
         .ok_or("missing legacy live reads")?;
     require_before(
         terminal,
-        "super::read_with_gaps(session, plan)?",
-        "super::kernel_evidence_with_gaps(session)?",
+        "super::read_with_gaps(session, plan).map_err(LegacyReadFailure::slots)?",
+        "super::kernel_evidence_with_gaps(session).map_err(LegacyReadFailure::kernel)?",
         "legacy terminal read order",
     )?;
     require_before(
         live,
-        "super::kernel_evidence_with_gaps(session)?",
-        "super::read_with_gaps(session, plan)?",
+        "super::kernel_evidence_with_gaps(session).map_err(LegacyReadFailure::kernel)?",
+        "super::read_with_gaps(session, plan).map_err(LegacyReadFailure::slots)?",
         "legacy live read order",
     )?;
     let fresh = contract_section(

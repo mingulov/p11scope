@@ -2066,6 +2066,54 @@ fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
     );
 }
 
+/// Empty-churn fast path: removals, refreshes and admissions that carry no
+/// modules (old or new) cannot change the plan, so the tick reuses the
+/// committed candidate instead of running the full O(retained) rebuild that
+/// starves the EVENTS drain for hundreds of ms on system scope. With the full
+/// rebuild forced to fail, the empty tick still succeeds and carries the new
+/// view IDs for the apply path.
+#[test]
+fn empty_churn_reuses_the_committed_candidate() {
+    let retained: Vec<ProcessView> = (0..10)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(retained);
+    engine.plan_rebuild_stable = true;
+    engine.fail_full_candidate_rebuild_for_test = true;
+    let removed: BTreeSet<ProcessViewId> =
+        [ProcessViewId(0), ProcessViewId(1)].into_iter().collect();
+    let refreshed: Vec<(ProcessViewId, Vec<ScannedModule>, PinnedObjects)> = [2u64, 3]
+        .into_iter()
+        .map(|id| (ProcessViewId(id), Vec::new(), PinnedObjects::empty()))
+        .collect();
+    let new_views: Vec<(ProcessView, Vec<ScannedModule>, PinnedObjects)> = (10..15)
+        .map(|id| {
+            (
+                ProcessView::open(ProcessViewId(id), std::process::id()).unwrap(),
+                Vec::new(),
+                PinnedObjects::empty(),
+            )
+        })
+        .collect();
+    let candidate = engine
+        .inventory_candidate(&removed, &refreshed, &new_views, Vec::new(), &BTreeSet::new())
+        .expect("empty churn reuses the committed candidate");
+    assert!(
+        candidate.delta.new.is_empty()
+            && candidate.delta.replace.is_empty()
+            && candidate.delta.retire.is_empty(),
+        "no plan change: {:?}",
+        candidate.delta
+    );
+    for (view, _, _) in &new_views {
+        assert!(
+            candidate.views.contains(&view.id()),
+            "new view IDs ride along for the apply path: {:?}",
+            candidate.views
+        );
+    }
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

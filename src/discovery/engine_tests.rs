@@ -47121,8 +47121,10 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
         "the deferred refresh request stays queued"
     );
     let stalled = engine.loader_registry.ids_for_view(view);
+    // The starved drain retires the old context without arming a
+    // replacement, so the stalled view holds no arm at all.
     assert!(
-        stalled.is_empty() || stalled == [context],
+        stalled.is_empty(),
         "no new arm while the rescan defers: {stalled:?}"
     );
     assert!(
@@ -53006,13 +53008,55 @@ fn automatic_exec_loader_arm_catchup_authority_failure_records_a_named_skip() {
     assert!(engine.pending_loader_arm_scans.is_empty());
     assert_eq!(engine.loader_memory_scan_attempts, before);
     assert!(
-        engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.reason.contains("authority re-proof")),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "post-arm provider discovery"
+                && skip.reason.contains("authority re-proof")
+        }),
         "an authority failure records a named skip, not a silent drop: {:?}",
         engine.counters.object_skips
+    );
+}
+
+/// A catch-up whose retained view is unreadable without proven exit (the
+/// view changed generation but the exit probe withholds proof) records a
+/// named skip instead of silently dropping the scan. Twin of the
+/// authority-failure skip above, covering the `!still_the_same()` branch.
+#[test]
+fn automatic_exec_loader_arm_catchup_unreadable_view_records_a_named_skip() {
+    let (mut fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let before = engine.loader_memory_scan_attempts;
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == key.view)
+        .unwrap();
+    assert!(
+        !engine.views[position].still_the_same(),
+        "precondition: the reaped child reads stale"
+    );
+    // Exit unproven: the unreadable branch must record loss, never silence.
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::Exited(Ok(false))]);
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(outcome.required_complete());
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, before);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "post-arm provider discovery"
+                && skip.reason.contains("retained view was unreadable")
+        }),
+        "an unreadable view records a named skip, not a silent drop: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the unreadable branch consumed its scripted exit probe: {:?}",
+        engine.pin_probe_script.borrow()
     );
 }
 

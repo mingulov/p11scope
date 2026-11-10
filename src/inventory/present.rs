@@ -3451,13 +3451,30 @@ fn render_snapshot_inner(
             }
         }
         if entries > 0 {
-            let _ = writeln!(
-                out,
-                "unattributed use: at least {} entries in {} witness row{} never bound to a caller",
-                entries,
-                rows,
-                if rows == 1 { "" } else { "s" }
-            );
+            // When distinct caller images are known, name them with the
+            // same numbers and nouns as the unidentified-callers line
+            // below (calls, caller processes); otherwise name the
+            // witness rows (no second line to match, JSON keeps both).
+            if presentation.unbound_images > 0 {
+                let images = presentation.unbound_images;
+                let _ = writeln!(
+                    out,
+                    "unattributed use: at least {} call{} from {} caller process{} never bound to a caller",
+                    entries,
+                    if entries == 1 { "" } else { "s" },
+                    images,
+                    if images == 1 { "" } else { "es" }
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "unattributed use: at least {} call{} in {} witness row{} never bound to a caller",
+                    entries,
+                    if entries == 1 { "" } else { "s" },
+                    rows,
+                    if rows == 1 { "" } else { "s" }
+                );
+            }
         }
         // Slice 1: distinct unidentified caller images, run-wide. M
         // is informative even when N is 0 (callers touched the
@@ -3496,7 +3513,7 @@ fn render_snapshot_inner(
             };
             let _ = writeln!(
                 out,
-                "unidentified callers: at least {} call{} from {} caller process{} never identified (exited or never scanned){}{}",
+                "unidentified callers: at least {} call{} from {} caller process{} not fully identified (exited or never scanned){}{}",
                 entries,
                 if entries == 1 { "" } else { "s" },
                 presentation.unbound_images,

@@ -819,6 +819,92 @@ mod full_image {
             "the retained instance survives budget exhaustion"
         );
     }
+
+    /// Retirement frees the birth re-offer budget: `retire_image`
+    /// drops its image's spent counts and cooldowns, and task
+    /// retirement drops every exec of its cookie, so new keys
+    /// keep re-offering instead of wedging on dead entries.
+    #[test]
+    fn retirement_frees_birth_reoffer_budget_for_new_keys() {
+        let mut r = InstanceRouter::new(
+            domain(),
+            RouterLimits {
+                observed_keys: 4,
+                ..RouterLimits::default()
+            },
+        );
+        // Fill the budget table: four keys observed and re-offered once each.
+        for (cookie, exec) in [(1, 0), (2, 0), (2, 1), (3, 0)] {
+            let key = image(cookie, exec);
+            let outcome = if exec == 0 {
+                r.observe_legacy(observation_for(cookie, 2, load(BASE_A))).0
+            } else {
+                r.observe(seal(domain(), key, 2, 0, 0)).0
+            };
+            assert_eq!(outcome, ObserveOutcome::New);
+            assert!(
+                r.evict_for_birth_reoffer(key, FILE),
+                "the first re-offer arms"
+            );
+        }
+        let stuck = image(4, 0);
+        assert_eq!(
+            r.observe_legacy(observation_for(4, 2, load(BASE_A))).0,
+            ObserveOutcome::New
+        );
+        assert!(
+            !r.evict_for_birth_reoffer(stuck, FILE),
+            "a full budget table refuses the new key"
+        );
+        assert!(
+            !r.take_birth_reoffer_cooldown(stuck, FILE),
+            "the refused re-offer arms no cooldown"
+        );
+        assert_eq!(
+            r.observe_legacy(observation_for(4, 2, load(BASE_A))).0,
+            ObserveOutcome::Continued,
+            "the refused re-offer evicts nothing"
+        );
+        // Site 1: retiring the image frees exactly its key.
+        r.retire_image(image(1, 0));
+        assert!(
+            !r.take_birth_reoffer_cooldown(image(1, 0), FILE),
+            "retirement drops the dead cooldown"
+        );
+        assert!(
+            r.evict_for_birth_reoffer(stuck, FILE),
+            "the freed slot re-offers the new key"
+        );
+        // Site 2: retiring the task frees every exec of its cookie.
+        let next = image(5, 0);
+        assert_eq!(
+            r.observe_legacy(observation_for(5, 2, load(BASE_A))).0,
+            ObserveOutcome::New
+        );
+        assert!(
+            !r.evict_for_birth_reoffer(next, FILE),
+            "the table is full again"
+        );
+        r.retire_process(2);
+        assert!(
+            !r.take_birth_reoffer_cooldown(image(2, 0), FILE)
+                && !r.take_birth_reoffer_cooldown(image(2, 1), FILE),
+            "task retirement drops every exec cooldown"
+        );
+        assert!(
+            r.evict_for_birth_reoffer(next, FILE),
+            "task retirement frees the budget for the new key"
+        );
+        let last = image(6, 0);
+        assert_eq!(
+            r.observe_legacy(observation_for(6, 2, load(BASE_A))).0,
+            ObserveOutcome::New
+        );
+        assert!(
+            r.evict_for_birth_reoffer(last, FILE),
+            "the second exec's slot frees too"
+        );
+    }
 }
 
 #[test]

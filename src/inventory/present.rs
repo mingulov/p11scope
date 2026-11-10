@@ -3080,6 +3080,18 @@ fn gap_plain_reason(reason: &str) -> &str {
     {
         return "object unavailable from the process's root or the host-root fallback";
     }
+    // A sandboxed-target failure that attempted the `map_files` fallback
+    // names a live process whose object missed under its unreachable root
+    // and through the VMA link — never an exit race, even when the
+    // target half reads ESRCH. Name the fallback, exactly like the
+    // host-root one above; verbose keeps the machine error beside the
+    // plain words, JSON verbatim. The retained-root prefix is required:
+    // marker text in an unrelated reason stays verbatim.
+    if reason.starts_with("opening object within retained target root:")
+        && reason.contains("(map_files fallback:")
+    {
+        return "object unavailable from the process's root or the map_files fallback";
+    }
     // A foreign-root open failure names its target root (the chroot or
     // container it missed under) — never an exit race, even when the
     // target half reads ENOENT. Concise folds these per distinct reason

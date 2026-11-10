@@ -4115,6 +4115,24 @@ fn gap_plain_reason_keeps_unprefixed_marker_text_verbatim() {
     );
 }
 
+/// Twin of `gap_plain_reason_keeps_unprefixed_marker_text_verbatim` for
+/// the `map_files` fallback: marker text without the retained-root
+/// prefix stays verbatim, while a real annotated foreign reason names
+/// both attempts in plain words.
+#[test]
+fn gap_plain_reason_names_the_map_files_fallback_attempt() {
+    assert_eq!(
+        gap_plain_reason("lane noted (map_files fallback: refused) mid-text"),
+        "lane noted (map_files fallback: refused) mid-text"
+    );
+    assert_eq!(
+        gap_plain_reason(
+            "opening object within retained target root: No such process (os error 3) (map_files fallback: Operation not permitted (os error 1)) (target root /proc/99999/fdinfo differs from the observer root)"
+        ),
+        "object unavailable from the process's root or the map_files fallback"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback gaps, never the raw `S1` / `joint_*` tokens. The
 /// journal gap reads on the key-operations line instead of here, so

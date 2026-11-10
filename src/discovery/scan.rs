@@ -4124,6 +4124,130 @@ fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
         .collect()
 }
 
+/// Open a mapped object whose target-root open failed only because the
+/// root is unreachable (`ESRCH` under a live generation pin — a sandboxed
+/// process jailed in a dead helper's `/proc/<pid>/fdinfo`, not an exit):
+/// read the VMA's own file through `/proc/<pid>/map_files/<start>-<end>`
+/// instead, and prove it like-for-like (the served fd's self-mapped
+/// `vm_file` against the range's `map_files` stat — kernel identities on
+/// both sides, never `fstat` vs maps). The served file then runs the
+/// ordinary opened-file and `mapped_file_guard` checks, so a same-key
+/// different file still refuses.
+///
+/// The group's first range names the VMA. Any other errno keeps the
+/// original failure untouched — only an unreachable root retries, and
+/// only once. Every fallback outcome is recorded: a served file joins
+/// the ordinary scan body, while a failed or unproven attempt keeps the
+/// original failure counted and named, with the attempt beside it in the
+/// established `(host-root fallback: …)` style. Only a proven different
+/// file refuses with its own reason.
+fn open_object_with_map_files_fallback(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    failure: MappedOpenError,
+    key: ObjectKey,
+    group: &[&MapEntry],
+    budget: &mut CaptureWorkBudget,
+) -> Result<File, MappedOpenError> {
+    if failure.errno != Some(libc::ESRCH) {
+        return Err(failure);
+    }
+    let Some(first) = group.first() else {
+        return Err(failure);
+    };
+    let (start, end) = (first.start, first.end);
+    let file = match io.open_map_files(view, start, end, budget) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(MappedOpenError {
+                reason: format!("{} (map_files fallback: {error})", failure.reason),
+                foreign_target_root: failure.foreign_target_root,
+                errno: failure.errno,
+            });
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(MappedOpenError {
+                reason: format!("{} (map_files fallback: {error})", failure.reason),
+                foreign_target_root: failure.foreign_target_root,
+                errno: failure.errno,
+            });
+        }
+    };
+    if !metadata.is_file() {
+        return Err(MappedOpenError {
+            reason: format!("map_files range {start:x}-{end:x} is not a regular file; refused"),
+            foreign_target_root: None,
+            errno: None,
+        });
+    }
+    // The shared object size cap applies to the served file exactly as
+    // to a root-opened one: same limit, same wording, never lowered.
+    let size = metadata.len();
+    let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+    if size > limit {
+        return Err(MappedOpenError {
+            reason: format!("object is {size} bytes; limit is {limit}"),
+            foreign_target_root: None,
+            errno: None,
+        });
+    }
+    // The like-for-like proof, read fresh on both sides: the served
+    // fd's self-mapped `vm_file` against this range's `map_files`
+    // stat. Only a proven same file joins; anything else keeps a
+    // named gap, never an examination.
+    let held = budget
+        .retained_mapped_identity(&file)
+        .or_else(|| io.held_identity(&file))
+        .map(|held| held.identity);
+    let ranged = io.range_identity(view, start, end, budget);
+    match (held, ranged) {
+        (Some(held), Ok(Ok(ranged))) if held == ranged => Ok(file),
+        (Some(held), Ok(Ok(ranged))) => Err(MappedOpenError {
+            reason: format!(
+                "map_files range {start:x}-{end:x} is another file (st_dev {} st_ino {}) than the \
+                 opened VMA file (st_dev {} st_ino {}): maps key {}:{} inode {} was refused \
+                 without a proven file",
+                ranged.dev,
+                ranged.ino,
+                held.dev,
+                held.ino,
+                key.device.major,
+                key.device.minor,
+                key.inode
+            ),
+            foreign_target_root: None,
+            errno: None,
+        }),
+        (None, _) => Err(MappedOpenError {
+            reason: format!(
+                "{} (map_files fallback: the opened file has no readable vm_file identity)",
+                failure.reason
+            ),
+            foreign_target_root: failure.foreign_target_root,
+            errno: failure.errno,
+        }),
+        (Some(_), Err(reason)) => Err(MappedOpenError {
+            reason: format!(
+                "{} (map_files fallback: VMA identity unreadable: {reason})",
+                failure.reason
+            ),
+            foreign_target_root: failure.foreign_target_root,
+            errno: failure.errno,
+        }),
+        (Some(_), Ok(Err(error))) => Err(MappedOpenError {
+            reason: format!(
+                "{} (map_files fallback: VMA identity unreadable: {error})",
+                failure.reason
+            ),
+            foreign_target_root: failure.foreign_target_root,
+            errno: failure.errno,
+        }),
+    }
+}
+
 /// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
 /// `None` whenever the hint names a path that does not exist here — which is the normal
 /// case for a containerized target, whose module lives only under `/proc/<pid>/root`.
@@ -5679,10 +5803,7 @@ pub(crate) trait ScanIo {
         _budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<File> {
         match view.run_while_same(|| {
-            std::fs::File::open(format!(
-                "/proc/{}/map_files/{start:x}-{end:x}",
-                view.pid()
-            ))
+            std::fs::File::open(format!("/proc/{}/map_files/{start:x}-{end:x}", view.pid()))
         }) {
             Ok(opened) => opened,
             Err(reason) => Err(std::io::Error::other(reason)),
@@ -6807,20 +6928,25 @@ fn scan_view_examined_mode(
         let file = match io.open_mapped_object(view, &path, budget) {
             Ok(file) => file,
             Err(failure) => {
-                if !narrowed_out {
-                    match failure.foreign_target_root {
-                        Some(root) => foreign_failures.push(ForeignOpenFailure {
-                            subject,
-                            reason: failure.reason,
-                            root,
-                        }),
-                        None => skipped.push(Skipped {
-                            subject,
-                            reason: failure.reason,
-                        }),
+                match open_object_with_map_files_fallback(io, view, failure, key, &group, budget) {
+                    Ok(file) => file,
+                    Err(failure) => {
+                        if !narrowed_out {
+                            match failure.foreign_target_root {
+                                Some(root) => foreign_failures.push(ForeignOpenFailure {
+                                    subject,
+                                    reason: failure.reason,
+                                    root,
+                                }),
+                                None => skipped.push(Skipped {
+                                    subject,
+                                    reason: failure.reason,
+                                }),
+                            }
+                        }
+                        continue;
                     }
                 }
-                continue;
             }
         };
         if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
@@ -17691,10 +17817,9 @@ mod tests {
             end: u64,
             _budget: &mut CaptureWorkBudget,
         ) -> std::io::Result<File> {
-            self.log.borrow_mut().push(format!(
-                "map_files {start:x}-{end:x} pid {}",
-                view.pid()
-            ));
+            self.log
+                .borrow_mut()
+                .push(format!("map_files {start:x}-{end:x} pid {}", view.pid()));
             match &self.map_files {
                 MapFilesScript::Serve(file) => file.try_clone(),
                 MapFilesScript::Fail(errno) => Err(std::io::Error::from_raw_os_error(*errno)),
@@ -17824,8 +17949,7 @@ mod tests {
         let mut fixture = MapFilesFallbackFixture::new();
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
-        fixture.map_files =
-            MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((identity, identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
@@ -17835,10 +17959,7 @@ mod tests {
             outcome.skipped()
         );
         assert!(
-            outcome
-                .skipped()
-                .iter()
-                .all(|skip| skip.subject != subject),
+            outcome.skipped().iter().all(|skip| skip.subject != subject),
             "no gap may remain for the examined object, got {:?}",
             outcome.skipped()
         );
@@ -17892,8 +18013,7 @@ mod tests {
         use crate::discovery::identity::FileIdentity;
         let mut fixture = MapFilesFallbackFixture::new();
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
-        fixture.map_files =
-            MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((
             FileIdentity { dev: 37, ino: 9 },
             FileIdentity { dev: 37, ino: 10 },
@@ -17959,6 +18079,67 @@ mod tests {
                 .contains("(target root /proc/99999/fdinfo differs from the observer root)"),
             "the foreign root keeps its suffix, got {:?}",
             skip.reason
+        );
+    }
+
+    /// A served non-regular file is never scanned: the `map_files`
+    /// entry of a file-backed VMA is its regular file, so anything
+    /// else refuses with its own named reason.
+    #[test]
+    fn map_files_fallback_refuses_a_served_non_regular_file() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files =
+            MapFilesScript::Serve(File::open(fixture.path.parent().unwrap()).unwrap());
+        fixture.mapped = Some((identity, identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the non-regular serve must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == subject
+                    && skip.reason.contains("map_files")
+                    && skip.reason.contains("not a regular file")
+            }),
+            "the non-regular serve must refuse by name, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// The shared object size cap applies to the served file exactly as
+    /// to a root-opened one: same limit, same wording, its own record.
+    #[test]
+    fn map_files_fallback_applies_the_object_size_cap() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        let big = fixture.path.parent().unwrap().join("big.so");
+        let file = File::create(&big).unwrap();
+        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+        file.set_len(limit + 1).unwrap();
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(&big).unwrap());
+        fixture.mapped = Some((identity, identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the over-limit serve must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert_eq!(
+            skip.reason,
+            format!("object is {} bytes; limit is {limit}", limit + 1),
+            "the size cap keeps its exact wording"
         );
     }
 

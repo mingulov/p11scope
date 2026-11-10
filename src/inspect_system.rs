@@ -784,6 +784,19 @@ fn collect_members_identity(
         progress!("{summary}");
     }
     timings.span(StageKind::Scan, "deep_scan", deep_start, monotonic_ns());
+    if crate::discovery::scan::substage::enabled() {
+        let [maps, open, guard, facts, snapshots, tables] =
+            crate::discovery::scan::substage::take();
+        let _ = crate::sink::try_stderr_line(&format!(
+            "p11scope: deep-scan sub-stages: maps {:.1}ms, open+key {:.1}ms, held+range {:.1}ms, facts {:.1}ms, snapshots {:.1}ms, tables {:.1}ms",
+            maps as f64 / 1e6,
+            open as f64 / 1e6,
+            guard as f64 / 1e6,
+            facts as f64 / 1e6,
+            snapshots as f64 / 1e6,
+            tables as f64 / 1e6,
+        ));
+    }
     noise.report();
     (
         Collection {

@@ -3444,6 +3444,13 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             }
         }
     }
+    // Anchor addresses span the provider's executable mappings: a
+    // word outside that span cannot be an anchor, so the per-word
+    // tree lookup below only runs inside it.
+    let anchor_span = match (anchors.keys().next(), anchors.keys().next_back()) {
+        (Some(low), Some(high)) => Some((*low, *high)),
+        _ => None,
+    };
     // At most one current width for each accepted offset; decoded-table
     // budgets bound both this map and the existing result collection.
     let mut seen = BTreeMap::<usize, usize>::new();
@@ -3470,6 +3477,33 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             break;
         }
         let value = read_word_le(snapshot, layout, offset).expect("one complete word");
+        // Zero words are never a version header (major >= 2) or an
+        // anchor address, and provider data pages are mostly zero
+        // (BSS): bulk-charge the run and skip it in one step. The
+        // charge total and the 4096-word deadline cadence are
+        // unchanged; no candidate can start inside the run.
+        if value == 0 {
+            let mut run = 0usize;
+            while run < 4095 {
+                let next = offset + width * (run + 1);
+                if next + width > snapshot.len()
+                    || read_word_le(snapshot, layout, next).expect("one complete word") != 0
+                {
+                    break;
+                }
+                run += 1;
+            }
+            if run > 0 {
+                if !budget.charge(run as u64) {
+                    if let Some(reason) = budget.take_scan_stop_reason() {
+                        skipped.push(reason.into());
+                    }
+                    break;
+                }
+                offset += width * (run + 1);
+                continue;
+            }
+        }
         // A plausible header inside this object's proven ELF metadata is
         // not an independent table witness. In particular, a GNU property
         // word followed by padding and init/fini pointers must not acquire
@@ -3527,20 +3561,24 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         // partial recovery. Merely being in a provider mapping (or being
         // all-zero data) is not such a witness. This is a single pass over
         // pointer words, rather than rewalking 104 words at every offset.
-        if let Some(ordinals) = anchors.get(&value).filter(|_| {
-            if excluded_anchor_ranges.is_empty() {
-                return true;
-            }
-            let Some(exports) = export_evidence else {
-                return true;
-            };
-            let Some(address) = base_address.checked_add(offset as u64) else {
-                return false;
-            };
-            !matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
+        if let Some(ordinals) = anchor_span
+            .filter(|(low, high)| value >= *low && value <= *high)
+            .and_then(|_| anchors.get(&value))
+            .filter(|_| {
+                if excluded_anchor_ranges.is_empty() {
+                    return true;
+                }
+                let Some(exports) = export_evidence else {
+                    return true;
+                };
+                let Some(address) = base_address.checked_add(offset as u64) else {
+                    return false;
+                };
+                !matches!(maps.resolve(address), Resolved::File { device, inode, file_offset, .. }
                 if (ObjectKey { device, inode }) == exports.object
                     && raw_anchor_overlaps_metadata(excluded_anchor_ranges, file_offset, width))
-        }) {
+            })
+        {
             for &ordinal in ordinals {
                 if !budget.charge(1) {
                     if let Some(reason) = budget.take_scan_stop_reason() {
@@ -3730,6 +3768,28 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 skipped.push(reason.into());
             }
             break;
+        }
+        // A zero function-list word anchors no triple (a decoded
+        // table's address is never zero), and provider data pages
+        // are mostly zero: bulk-charge the run of such offsets and
+        // skip it. The charge total and deadline cadence match the
+        // per-word walk; no triple can start inside the run.
+        if word_at(offset + interface.function_list_offset) == Some(0) {
+            let mut run = 1usize;
+            while run <= 4095
+                && word_at(offset + run * layout.word_bytes() + interface.function_list_offset)
+                    == Some(0)
+            {
+                run += 1;
+            }
+            if !budget.charge(run as u64) {
+                if let Some(reason) = budget.take_scan_stop_reason() {
+                    skipped.push(reason.into());
+                }
+                break;
+            }
+            offset += run * layout.word_bytes();
+            continue;
         }
         // No cardinality pre-check: only the repeat-aware admission below
         // can tell a free repeat from a new interface, so a saturated cap
@@ -4343,8 +4403,14 @@ pub(crate) fn mapped_file_guard(
     };
     let expected = held.identity;
     let mut unproven: Option<(u64, u64)> = None;
-    for entry in group {
-        let mapped = io.range_identity(view, entry.start, entry.end, budget)?;
+    // One batched read for the group: production holds a single
+    // filesystem proof across it instead of re-proving the view
+    // (namespace stat + exit poll, twice) around every range — on a
+    // busy host that per-range proof, not the range stat itself,
+    // dominates deep-scan time. The verdicts below are unchanged.
+    let ranges: Vec<(u64, u64)> = group.iter().map(|entry| (entry.start, entry.end)).collect();
+    let identities = io.range_identities(view, &ranges, budget)?;
+    for (entry, mapped) in group.iter().zip(identities) {
         match mapped {
             Ok(identity) if identity == expected => {
                 if unproven.is_none()
@@ -5814,6 +5880,44 @@ impl ScanIo for ProcScanIo {
         })
     }
 
+    fn range_identities(
+        &mut self,
+        view: &ProcessView,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<Vec<std::io::Result<crate::discovery::identity::FileIdentity>>, String> {
+        // The cold survivor re-proves membership per range; zombie
+        // scans are rare, so they keep the sequential reads.
+        if self.cold_member_for(view.pid()).is_some() {
+            return ranges
+                .iter()
+                .map(|&(start, end)| self.range_identity(view, start, end, budget))
+                .collect();
+        }
+        // One filesystem proof brackets the whole group: `with_filesystem`
+        // validates the pinned generation and mount namespace before
+        // and after the batch, where the per-range path re-validated
+        // around every range. The pidfd pin makes exit one-way, so a
+        // mid-batch exit still fails the after-check; each range's
+        // own stat and error are unchanged.
+        view.with_filesystem(budget, |filesystem, budget| {
+            Ok(ranges
+                .iter()
+                .map(|&(start, end)| {
+                    filesystem
+                        .mapped_file_metadata(start, end, budget)
+                        .map(|metadata| {
+                            use std::os::unix::fs::MetadataExt;
+                            crate::discovery::identity::FileIdentity {
+                                dev: metadata.dev(),
+                                ino: metadata.ino(),
+                            }
+                        })
+                })
+                .collect())
+        })
+    }
+
     fn prove_original_file(
         &mut self,
         view: &ProcessView,
@@ -6380,6 +6484,47 @@ fn stripped_deleted_hint_matches(raw_path: &[u8], hints: &[PathBuf]) -> Vec<usiz
         .collect()
 }
 
+/// Sub-stage wall time inside one member scan, accumulated per
+/// thread only while `P11SCOPE_STAGE_TIMINGS` is set (the same gate
+/// as the stage readout): [maps, open+key guard, held+range guard,
+/// provider facts, snapshot reads, table/interface detection].
+/// Busy-host diagnosis only; never rendered in any document.
+pub(crate) mod substage {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    thread_local! {
+        static TOTALS: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
+        static ENABLED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn enabled() -> bool {
+        ENABLED.with(|flag| {
+            flag.get().unwrap_or_else(|| {
+                let on = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some();
+                flag.set(Some(on));
+                on
+            })
+        })
+    }
+
+    pub(crate) fn add(bucket: usize, start: Instant) {
+        if !enabled() {
+            return;
+        }
+        TOTALS.with(|totals| {
+            let mut values = totals.get();
+            values[bucket] = values[bucket]
+                .saturating_add(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            totals.set(values);
+        });
+    }
+
+    pub(crate) fn take() -> [u64; 6] {
+        TOTALS.with(|totals| totals.replace([0; 6]))
+    }
+}
+
 fn scan_view_examined_mode(
     request: &ScanRequest<'_>,
     view: &ProcessView,
@@ -6414,6 +6559,7 @@ fn scan_view_examined_mode(
             false,
         )
     };
+    let sub_maps = Instant::now();
     let maps = match acquire_scan_maps(view, budget, io) {
         Ok(maps) => maps,
         Err(error) if error.empty_snapshot => match classify_empty_maps_snapshot(view, io) {
@@ -6444,6 +6590,7 @@ fn scan_view_examined_mode(
         Ok(index) => index,
         Err(reason) => return Ok(refused_initial(reason)),
     };
+    substage::add(0, sub_maps);
     let mut modules = Vec::new();
     let mut examined: Vec<ExaminedObject> = Vec::new();
     let mut dependencies = BTreeMap::new();
@@ -6614,7 +6761,7 @@ fn scan_view_examined_mode(
             continue;
         };
         let path = usable.display().to_string();
-
+        let sub_open = Instant::now();
         let file = match open_in_target(view, &path, budget) {
             Ok(file) => file,
             Err(failure) => {
@@ -6640,6 +6787,8 @@ fn scan_view_examined_mode(
             }
             continue;
         }
+        substage::add(1, sub_open);
+        let sub_guard = Instant::now();
         let held = budget
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
@@ -6653,6 +6802,7 @@ fn scan_view_examined_mode(
                 continue;
             }
         };
+        substage::add(2, sub_guard);
         // The attributed hint is also the operator-named signal the
         // planner reads; naming follows the narrowing exactly.
         let (mut named_hint, attributable, refusal) =
@@ -6686,6 +6836,7 @@ fn scan_view_examined_mode(
         }
         // The key's (device, inode) is the maps identity the guard
         // above validated against the opened file.
+        let sub_facts = Instant::now();
         let mut facts = match provider_facts_for(&file, key, &wanted, budget) {
             Ok(facts) => facts,
             Err(reason) => {
@@ -6693,6 +6844,7 @@ fn scan_view_examined_mode(
                 continue;
             }
         };
+        substage::add(3, sub_facts);
         let mut hook_exports: Vec<String> = facts
             .exports
             .iter()
@@ -6908,6 +7060,7 @@ fn scan_view_examined_mode(
             modules.push(module);
             continue;
         }
+        let sub_tables = Instant::now();
         let mut snapshots = Vec::with_capacity(data.len());
         let mut operation_bytes = 0u64;
         let mut io_exhausted = false;
@@ -6924,6 +7077,8 @@ fn scan_view_examined_mode(
                 break;
             }
         }
+        substage::add(4, sub_tables);
+        let sub_tables = Instant::now();
         for (base, snapshot) in &snapshots {
             let evidence = ObjectExports {
                 object: key,
@@ -6983,6 +7138,7 @@ fn scan_view_examined_mode(
                 break;
             }
         }
+        substage::add(5, sub_tables);
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
             interface.index = index;
         }
@@ -9397,6 +9553,48 @@ mod tests {
         assert_eq!(table.entries[0].name, function_name(103).unwrap());
         assert_eq!(table.decoded_slot_count(), 104);
         assert_eq!(table.null_entries.len(), 103);
+    }
+
+    /// Busy-host guard twin for the zero-run skip: a version table
+    /// and an export anchor after a long zero run (the BSS shape of
+    /// real provider data pages) still decode exactly, with no
+    /// skipped evidence lost or invented.
+    #[test]
+    fn tables_after_a_long_zero_run_still_decode() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_Initialize".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let gap_words = 20_000usize;
+        let mut snapshot = vec![0u8; (gap_words + 105) * 8];
+        let at = gap_words * 8;
+        snapshot[at..at + 8].copy_from_slice(&0x2802u64.to_le_bytes());
+        snapshot[at + 8..at + 16].copy_from_slice(&0x1500u64.to_le_bytes());
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut CaptureWorkBudget::default(),
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "no evidence invented: {skipped:?}");
+        let table = tables
+            .iter()
+            .find(|table| table.address == 0x7000 + at as u64)
+            .expect("the table after the zero run still decodes");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.entries[0].name, "C_Initialize");
     }
 
     #[test]

@@ -653,7 +653,7 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
         vec![
             "gaps: 1",
             "  1 × native usage feed unavailable — live capture refused (missing capabilities); run \
-             'p11scope do…",
+             'p11scope…",
         ],
         "the concise gaps block:\n{concise}"
     );

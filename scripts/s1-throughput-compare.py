@@ -832,6 +832,15 @@ def _is_prebinding(gap):
                 is not None))
 
 
+def _is_module_only_foreign(gap, selected):
+    """A gap naming only another module: no caller, no pid, and a set
+    module different from the cell's. It references neither the
+    cell's caller nor its pid, so it is that module's disclosure:
+    foreign, counted never gated."""
+    return (gap.get("caller") is None and gap.get("pid") is None
+            and gap.get("module") not in (None, selected["edge"]["module"]))
+
+
 def _gap_loss_reason(subject, reason):
     if subject in LOSS_GAP_SUBJECTS or reason in LOSS_GAP_REASONS:
         return "loss gap: published capture loss or retirement"
@@ -848,7 +857,10 @@ def check_loss(selected, doc, events, joint=False):
     --joint mode the capture-wide refused/continuity counts are
     recorded, never gated (they count foreign admissions on a
     --system capture), and foreign-scoped gaps are counted, never
-    gated; driver and caller-less gaps stay strict. The proven
+    gated: a gap is in scope only when it references the cell's
+    module, caller or pid, so a module-only gap naming a different
+    module, with no caller and no pid, is foreign; driver gaps and
+    gaps that do reference the cell stay strict. The proven
     rotation count is recorded as stream_rotations.
     """
     observation = selected["observation"]
@@ -922,6 +934,9 @@ def check_loss(selected, doc, events, joint=False):
             if not scoped:
                 foreign_gaps += 1
                 continue
+            if _is_module_only_foreign(gap, selected):
+                foreign_gaps += 1
+                continue
             _require(gap.get("module") in (None, selected["edge"]["module"]),
                      "gap references another caller/module/PID")
         else:
@@ -950,6 +965,9 @@ def check_loss(selected, doc, events, joint=False):
             scoped = (payload.get("caller") in (None, selected["edge"]["caller"])
                       and (pid is None or pid == selected["pid"]))
             if not scoped:
+                foreign_gaps += 1
+                continue
+            if _is_module_only_foreign(payload, selected):
                 foreign_gaps += 1
                 continue
         hit = _gap_loss_reason(subject, reason)

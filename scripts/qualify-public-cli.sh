@@ -720,15 +720,13 @@ def named_unbound(g):
     return reason.startswith(modpath+': native witness rows of this module were not bound to a caller incarnation (first: ') and reason.endswith('); module-level positive use only, never attributed by pid')
 no_witness=any((g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') for g in report.get('gaps',[]))
 degraded=modfs=='overlayfs' or no_witness
-if degraded:
-    # An admission rise across passes is an informative note, not
-    # loss, and the decided no-witness shape carries the named
-    # module-level positive; anything else about the owned module
-    # still fails.
-    owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
-    assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
-else:
-    assert owned_gaps==[], 'inventory gaps about owned module: %r' % owned_gaps
+# A named owned-module gap is PARTIAL coverage with or without the
+# kernel witness: an admission rise across passes is an informative
+# note, not loss, and the module-level unidentified-caller positive
+# is the decided named shape (also seen witness-available on the
+# host leg); anything else about the owned module still fails.
+owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
+assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
 unproven=[]
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the

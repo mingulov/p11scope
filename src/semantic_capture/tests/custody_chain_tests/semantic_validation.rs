@@ -244,6 +244,11 @@ impl HeldProviders {
 
 /// The same substituted map I/O as the existing H0 tests, with endpoint
 /// offsets and held attachment files taken from the real attested subset.
+/// Second load base offset for a double-mapped scripted file, relative
+/// to its scan-input base. Well inside the per-file base spacing, so the
+/// second mapping never overlaps a sibling file's ranges.
+const DOUBLE_MAP_STRIDE: u64 = 0x10_0000;
+
 struct HeldIo {
     script: ScriptIo,
     endpoints: Vec<(u32, String, Endpoint)>,
@@ -256,6 +261,11 @@ struct HeldIo {
     /// global-only churn (the live shape) apart from local moves.
     scan_inputs: HashMap<u32, (u64, u32, u32)>,
     absent_files: BTreeSet<u32>,
+    /// Files scripted as double-mapped: their scan proof carries the
+    /// same file bytes at a second load base, so the observation
+    /// mints one partition per mapping. Empty by default, so existing
+    /// tests keep single-partition observations.
+    double_mapped: BTreeSet<u32>,
     /// Scripted `INSTANCE_COUNT.storage_null` for the Q1(b) gate test.
     storage_null: u64,
     /// The outcome of every fake scan-leaf call, in issue order (`Ok`
@@ -306,6 +316,7 @@ impl HeldIo {
             targets: HashMap::new(),
             scan_inputs: HashMap::new(),
             absent_files: BTreeSet::new(),
+            double_mapped: BTreeSet::new(),
             storage_null: 0,
             scan_results: Vec::new(),
             scan_cost: Duration::ZERO,
@@ -402,6 +413,20 @@ impl HeldIo {
         }
         let page = endpoint.offset & !0xfff;
         let (base, local, global) = self.scan_input(endpoint.file_slot);
+        let mut ranges = vec![
+            MapRange::new(base, base + page, 0, false),
+            MapRange::new(base + page, base + page + 0x1000, page, true),
+        ];
+        if self.double_mapped.contains(&endpoint.file_slot) {
+            let second = base + DOUBLE_MAP_STRIDE;
+            ranges.push(MapRange::new(second, second + page, 0, false));
+            ranges.push(MapRange::new(
+                second + page,
+                second + page + 0x1000,
+                page,
+                true,
+            ));
+        }
         acquire_test_scan(
             self.script.domain,
             image,
@@ -413,10 +438,7 @@ impl HeldIo {
                 sticky: self.script.last_health.sticky,
                 record_flags: 0,
             },
-            vec![
-                MapRange::new(base, base + page, 0, false),
-                MapRange::new(base + page, base + page + 0x1000, page, true),
-            ],
+            ranges,
             fence,
         )
     }

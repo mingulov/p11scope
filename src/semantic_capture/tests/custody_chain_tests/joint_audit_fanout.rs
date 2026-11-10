@@ -12870,6 +12870,181 @@ fn joint_birth_batch_deferral_skips_healthy_joint_feeds() {
     }
 }
 
+/// Batch-wide transient deferral re-offers a mixed multi-partition
+/// receipt: file 0 is double-mapped, so one birth-bearing receipt
+/// names two partitions, but only the first partition's key holds
+/// a healthy Joint feed. The healthy duplicate must not swallow
+/// the fresh partition's birth: the batch re-offers (image, file)
+/// exactly once — deduplicated, with the counted delay gap — and
+/// stages no permanent refusal.
+#[test]
+fn joint_birth_batch_deferral_reoffers_mixed_partition_receipt() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstance;
+    use crate::inventory_semantics::RetainedJointBirths;
+    use crate::semantics_objects::journal::BirthKind;
+    use crate::semantics_objects::journal::tests::{ENTRY_NS, end_bytes};
+    use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let mut scene = JointScene::from_held(held, Some(attached));
+    scene.real.h0.0.borrow_mut().io.script.local = 1;
+    scene.real.h0.0.borrow_mut().io.double_mapped.insert(0);
+    let pid = std::process::id();
+    let caller = scene.real.bind(
+        pid,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        0,
+    );
+    scene.push(pid, 0, "C_CreateObject", 1);
+    // The second call joins the second mapping: its entry IP moves
+    // to the double-mapped base before its END is built, exactly as
+    // `encoded` shapes a `C_CreateObject` pair.
+    let (mut begin, _) = scene.encoded(pid, 0, "C_CreateObject", 2);
+    let second_ip = {
+        let held = scene.real.h0.0.borrow();
+        let (base, _, _) = held.io.scan_input(0);
+        let slot = held.io.slot(0, "C_CreateObject");
+        let endpoint = held.io.endpoint(slot).expect("create slot resolves");
+        base + DOUBLE_MAP_STRIDE + endpoint.offset
+    };
+    begin[56..64].copy_from_slice(&second_ip.to_le_bytes());
+    let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 10);
+    scene.drain.source_mut().push_record(begin.to_vec());
+    scene.drain.source_mut().push_record(end.to_vec());
+    let raw = scene.collect_with_fault(&BirthFault);
+    scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = scene.real.tick();
+    scene.admit_providers(pid, caller, &[0]);
+    scene.prepare_batch(batch, 2);
+    let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+    let (ingested, _, _) = scene.ingest_with_grant(raw);
+    let mut count = 0;
+    while let Some((_, claim)) = scene
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&scene.producers, &ingested)
+        .unwrap()
+    {
+        count += 1;
+        assert!(claim.is_ok(), "both originals claim");
+    }
+    assert_eq!(count, 2);
+    let attached = attachment(&mut scene);
+    assert!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .install_closure_grant(&SessionClosureGrant::observe(&attached))
+    );
+    let coordinator = &mut scene.real.scene.coordinator;
+    let inputs: Vec<_> = coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .cloned()
+        .collect();
+    assert_eq!(inputs.len(), 2, "both calls admitted");
+    let routers: Vec<_> = inputs
+        .iter()
+        .map(|input| input.journal_binding().2)
+        .collect();
+    assert_ne!(routers[0], routers[1], "the calls join distinct partitions");
+    {
+        let batch = coordinator.prepared_semantic_batch().unwrap();
+        let receipts = batch.current_receipts();
+        assert_eq!(receipts.len(), 1, "one observation carries both partitions");
+        let ids = receipts[0].instances();
+        assert_eq!(ids.len(), 2, "the receipt names both partitions");
+        assert!(
+            ids.contains(&routers[0]) && ids.contains(&routers[1]),
+            "the receipt names both admitted partitions"
+        );
+        assert!(
+            receipts[0].birth_quantum().is_some(),
+            "the receipt carries a birth"
+        );
+    }
+    let (key, caller) = (
+        inputs[0].instance_key_for_test(),
+        inputs[0].journal_binding().3,
+    );
+    let proof = {
+        let proofs: Vec<_> = coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .claims()
+            .map(|(_, result)| *result)
+            .collect();
+        assert_eq!(proofs.len(), 2, "both admissions claimed");
+        proofs[0].expect("first claim ok")
+    };
+    let receipt =
+        BootstrapReceipt::scripted(proof, BirthKind::ExecMarker, 0, attached.generation());
+    assert!(
+        coordinator
+            .registry_mut()
+            .install_joint_receipt(key.clone(), receipt),
+        "the grant installs"
+    );
+    coordinator
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(key, caller));
+    coordinator.registry_mut().publish();
+    assert_eq!(
+        coordinator.registry().joint_feeds(),
+        1,
+        "only the first partition's feed is installed Joint"
+    );
+    coordinator
+        .registry()
+        .clamp_semantic_resource_room_for_test(0);
+    let mut births = RetainedJointBirths::new();
+    let result = coordinator
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("batch-wide deferral decides before any consume"),
+        )
+        .unwrap();
+    assert_eq!(result.installed, 0);
+    assert_eq!(
+        result.reoffers.len(),
+        1,
+        "the mixed receipt still re-offers its fresh birth"
+    );
+    let reoffer = &result.reoffers[0];
+    assert!(
+        reoffer.caller.is_none(),
+        "batch-wide re-offers name no caller"
+    );
+    assert_eq!(reoffer.image.task_cookie, 71);
+    assert_eq!(reoffer.file, 0);
+    assert!(
+        staged_birth_refusals(coordinator).is_empty(),
+        "no permanent refusal for a deferred birth"
+    );
+    let deferred: Vec<String> = coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "Joint birth deferred; retained S1 until re-offer")
+        .map(|(_, reason)| reason)
+        .collect();
+    assert_eq!(
+        deferred,
+        ["joint_birth_deferred_resource_capacity"],
+        "the association-storage delay is a counted gap"
+    );
+}
+
 #[test]
 fn joint_birth_queued_registrations_preserve_actual_first_slot() {
     use crate::inventory_semantics::RetainedJointBirths;

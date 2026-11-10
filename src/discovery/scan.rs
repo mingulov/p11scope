@@ -4225,6 +4225,29 @@ fn map_files_open_proven(
             // table, or a table that reads anything at all, keeps the
             // guard — a failed resolution there still refuses.
             let mountinfo_empty = io.target_mountinfo_is_empty(view, mounts, budget);
+            if mountinfo_empty {
+                // The exemption skips the mount-table guard — the only
+                // fd-key-vs-maps-key check — so bind the proven file to
+                // the maps key here instead: re-stat the served fd and
+                // compare what the kernel renders for it against the maps
+                // key (never raw fstat vs maps: a btrfs subvolume file
+                // stats its anonymous device while maps renders the
+                // filesystem device). A VMA that raced between the maps
+                // read and the proof — the proof bound the current file
+                // while the record keeps the stale key — refuses by name
+                // instead of examining under the wrong key.
+                let fd_key = match io.restated_fd_key(&file) {
+                    Ok(fd_key) => fd_key,
+                    Err(error) => {
+                        return Err(MapFilesRefusal::Unproven(format!(
+                            "the proven file could not be re-stated for the maps-key check: {error}"
+                        )));
+                    }
+                };
+                if let Err(reason) = check_unresolved_key(&file, fd_key, key, budget) {
+                    return Err(MapFilesRefusal::Refused(reason));
+                }
+            }
             Ok(OpenedMappedObject {
                 file,
                 guard_exempt: mountinfo_empty,
@@ -5987,7 +6010,6 @@ pub(crate) trait ScanIo {
     /// the proven file is bound to the maps key here instead — a fresh
     /// read, never a reused identity). The default stats the live fd;
     /// scripted IOs override it to script the racing-VMA shape.
-    #[allow(dead_code)] // The exempt-path key check calls it; the call lands with the fix.
     fn restated_fd_key(&mut self, file: &File) -> std::io::Result<ObjectKey> {
         file.metadata().map(|metadata| ObjectKey {
             device: Device {

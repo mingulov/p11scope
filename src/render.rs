@@ -11712,8 +11712,14 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
         );
         assert!(text.contains("Module gaps (showing 2 of 3):"), "{text}");
-        assert!(text.contains("/opt/dup.so (same-path file 1 of 3):"), "{text}");
-        assert!(text.contains("/opt/dup.so (same-path file 2 of 3):"), "{text}");
+        assert!(
+            text.contains("/opt/dup.so (same-path file 1 of 3):"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/opt/dup.so (same-path file 2 of 3):"),
+            "{text}"
+        );
         assert!(text.contains("and 1 more"), "{text}");
     }
 

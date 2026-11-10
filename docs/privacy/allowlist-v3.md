@@ -1492,6 +1492,52 @@ original custody and reservations until it actually returns and joins.
 
 Concise inventory text (never `--quiet`) shows one scope line per labeled caller with edges, naming the executable basename and PID (both new to concise text), the caller's logical entry total with forwarding-layer observations excluded, and the scope label: `container <12-hex> (<runtime>, cgroup hint)` for a lone container — `<runtime>` is the canonical `docker`/`containerd`/`cri_o`/`unknown` label, omitted when the parser claims no runtime — or `pod <8-hex> / container <12-hex> (cgroup hint)` for a pod pair, or `pod <8-hex> (cgroup hint)` for a lone pod. Stale rows append `, stale` and retired rows `, exited` (the concise display word for JSON `historical`) inside the parentheses; verbose caller lines carry the same markers. At most eight scope lines print, then `and M more labeled callers (-v or --json)` (`and 1 more labeled caller` when singular); a `caller context:` line counts labeled, unknown and pending callers with edges (nonzero parts only) with a `(-v for details)` suffix. Sampled rows that matched no container pattern — including Podman/libpod paths, which the parser leaves unrecognized like host cgroups — stay silent in that count even when stale or historical, as long as they carry a sample; only never-sampled or refused rows count as unknown. Verbose text and JSON carry the full canonical IDs. The prefixes and status words are a display projection of the allowlisted IDs and statuses above, not new captured fields; no separate derived row is needed.
 
+## Profile cgroup workload labels (2026-11-10)
+
+**Status: implementation contract; qualified 2026-11-10 in a kind cell
+on Fedora (kind v0.33.0, node v1.37.0, containerd 2.3.4): 150 s
+`profile --system -v` with 2 steady pods plus 3 jobs deleted 33 s before
+the render — 5/5 `cgroups[]` rows labeled with kubectl-matched pod UIDs
+and container IDs (0 unlabeled), deleted-job rows resolving from retained
+paths (negative-controlled: their cgroups are absent on the node), and
+the `-v` frame `Cgroups (5):` section; see the lane report.** This
+subsection permits only the finite profile additions below. Every other
+section keeps its own status; v1/v2 bytes and exclusions are unchanged,
+and there is no global v3 activation.
+
+Profile `cgroups[]` rows carry two additive fields derived from
+already-captured facts with no new capture: `workload`, the plain label
+parsed from the row's resolved cgroup path only (`pod <uid> /
+container <id>` for Kubernetes pods under the systemd and cgroupfs
+drivers, `container <id> (<runtime>)` for lone docker/podman/containerd/cri-o
+containers, the systemd unit for unit paths, the raw path verbatim for
+unknown shapes, `null` exactly when `label` is), and `unadmitted`, the
+count of the row's calls whose process missed admission (a subset of the
+row's `calls`). The `-v` final profile frame renders the same rows as a
+`Cgroups (N):` section with per-row counts; unknown paths degrade to
+their numeric id and kernel-dropped completions are named as
+unattributable, never grouped or estimated.
+
+The resolved path comes from the cgroup2 directory-inode walks the
+reporter already performs, retained per new cgroup id at first sighting
+while its processes are alive (at most one walk per new id; retained
+entries never exceed the cgroup row count, which shares the 16,384-key
+semantic-state budget) and resolved live-first, retained-fallback at
+report time. Path parsing is lexical only. No engine/CRI/Kubernetes API,
+network access, namespace entry, new BPF target read, or new
+target-memory read is authorized; no argv, cmdline, environ, credential,
+key-material, PIN, payload, or full-path publication beyond the existing
+`label` field. Metrics, trace and inventory gain nothing through these
+fields.
+
+Lexical workload labels carry the same hint-only standing as the DR04
+container/pod hints: they never prove orchestrator ownership, never
+authorize admission, scope, provider identity or counts, and never join
+callers across captures. A cgroup id reused after removal may label
+merged generations with one path; a live cgroup always resolves live,
+so the retained path only names cgroups that are gone. Missing or
+refused observations remain explicitly unknown/null, never silent.
+
 ## Extensive-mode executable dependency hints (6.14 Option B, D-transitive)
 
 **Status: APPROVED (owner ratification 2026-10-29, batch item 5,

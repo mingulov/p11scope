@@ -805,6 +805,30 @@ forwarding-layer split above, this is a v3-additive disclosure that
 introduces no new schema revision: the `mechanisms[]` item shape stays
 open.
 
+## Cgroup workload labels and missed grouping
+
+Every `cgroups[]` row carries `workload` (string or null) and `unadmitted`
+(u64), derived from two already-captured facts — the row's resolved cgroup
+path and its counted calls — with no new capture. `workload` is the plain
+label parsed from the resolved path only: `pod <uid> / container <id>` for
+Kubernetes pods (systemd and cgroupfs drivers), `container <id> (<runtime>)`
+for lone docker/podman/containerd/cri-o containers (`<runtime>` is
+`docker`/`podman`/`containerd`/`cri_o`/`unknown`), the systemd unit for unit
+paths, and the raw path verbatim for unknown shapes. It is `null` exactly
+when `label` is. `unadmitted` counts the row's calls whose process missed
+admission (a zero identity cookie, a full history registry, or a closed
+generation): a subset of the row's `calls`, grouped per pod/unit in `-v`
+text. Rows whose cgroup was removed before the report (exited pods under
+churn) resolve from the path retained at first sighting, while each
+process was alive; a live cgroup always resolves live. Like the
+per-provider split above, this is a v3-additive disclosure that introduces
+no new schema revision: the `cgroups[]` item shape stays open. Historical
+v2 documents lack both keys. The `-v` final frame renders the same rows as
+a `Cgroups (N):` section; unknown paths degrade to `cgroup <id> (unknown)`
+and kernel-dropped completions are named as unattributable, never grouped.
+Workload labels are lexical cgroup-path hints, never orchestrator proof;
+see the allowlist-v3 workload-label row.
+
 ## Kernel control evidence
 
 `kernel_control` is always present in every v3 profile, v3-metrics, and

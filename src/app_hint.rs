@@ -133,8 +133,11 @@ fn capture_dotted_ident(token: &[u8]) -> Option<String> {
 /// CPython option walker over complete tokens (argv[0] already skipped).
 /// `-c` aborts (program text is never captured); `-m` captures the
 /// module; `-W`/`-X` consume their value; unknown shapes bail.
+/// `-V`/`-h`/`-?` print and exit, so any bundle holding one bails —
+/// the trailing token never runs. `-v` is verbose mode and runs the
+/// script, so it stays skippable.
 fn python_token(tokens: &[&[u8]]) -> Option<String> {
-    const NO_ARG: &[u8] = b"Bb?dEhiIOPRqsSuvVx";
+    const NO_ARG: &[u8] = b"BbdEiIOPRqsSuvx";
     let mut index = 0;
     loop {
         let token = *tokens.get(index)?;
@@ -218,7 +221,20 @@ const JAVA_VALUE_FLAGS: &[&[u8]] = &[
     b"--patch-module",
 ];
 
+/// Exit-without-running `java` flags, matched exactly: the launcher
+/// prints and exits, so a trailing token never runs and never labels.
+/// Bare `-X` prints the `-X` help and exits; every longer `-X...`
+/// form continues and stays in the skip table below.
+fn java_exits(token: &[u8]) -> bool {
+    matches!(
+        token,
+        b"-version" | b"-fullversion" | b"-help" | b"-?" | b"-X"
+    )
+}
+
 /// Attached (self-contained) single-dash `java` flags: skipped whole.
+/// `-showversion` prints and continues, so the main class still runs
+/// and still labels; it stays here, not in the exit set above.
 fn java_attached(token: &[u8]) -> bool {
     const PREFIXES: &[&[u8]] = &[
         b"-D",
@@ -234,9 +250,6 @@ fn java_attached(token: &[u8]) -> bool {
         b"-server",
         b"-client",
         b"-showversion",
-        b"-version",
-        b"-help",
-        b"-?",
     ];
     PREFIXES.iter().any(|prefix| token.starts_with(prefix))
 }
@@ -267,7 +280,8 @@ const JAVA_EQ_FLAGS: &[&[u8]] = &[
 ];
 
 /// `java` walker: `-jar` captures the jar basename; otherwise the first
-/// non-flag token must be a dotted main class. Unknown flags bail.
+/// non-flag token must be a dotted main class. Exit-without-running
+/// flags bail; unknown flags bail.
 fn java_token(tokens: &[&[u8]]) -> Option<String> {
     let mut index = 0;
     loop {
@@ -295,6 +309,9 @@ fn java_token(tokens: &[&[u8]]) -> Option<String> {
             return None;
         }
         if token.first() == Some(&b'-') {
+            if java_exits(token) {
+                return None;
+            }
             if token.len() > 1 && java_attached(token) {
                 index = index.checked_add(1)?;
                 continue;
@@ -429,7 +446,7 @@ fn node_scriptish(token: &[u8]) -> bool {
 }
 
 /// `node` walker. `-e`/`--eval`/`-p`/`--print` abort: evaluated text is
-/// never captured.
+/// never captured. `-h`/`-v` print and exit, so they bail too.
 fn node_token(tokens: &[&[u8]]) -> Option<String> {
     let mut index = 0;
     loop {
@@ -475,7 +492,13 @@ fn node_token(tokens: &[&[u8]]) -> Option<String> {
             return None;
         }
         if token[0] == b'-' && token.len() > 1 {
-            if matches!(token, b"-c" | b"-h" | b"-v" | b"-i") {
+            // `-h`/`-v` print and exit: the trailing token never runs.
+            // `-c` names the checked file and `-i` runs the script
+            // before the REPL, so both keep the hint.
+            if matches!(token, b"-h" | b"-v") {
+                return None;
+            }
+            if matches!(token, b"-c" | b"-i") {
                 index = index.checked_add(1)?;
                 continue;
             }

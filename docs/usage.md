@@ -1785,7 +1785,8 @@ Limits that matter in pods:
   `PARTIAL` with the cause `native endpoint attach deferred` — one
   concise line per module naming the distinct deferred total, the pass
   count (and the per-pass peak when it differs) and whether every
-  endpoint had attached by stop, while `--json` keeps every per-pass
+  endpoint had attached by stop (otherwise how many attached, failed
+  or were still deferred at stop), while `--json` keeps every per-pass
   row plus the appended summary. Endpoints that failed to attach
   keep their own `native endpoint attach failed` gap. `native`
   without the privileges, kernel support or BTF it needs is an error

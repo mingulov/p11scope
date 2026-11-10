@@ -202,9 +202,9 @@ pub(crate) fn is_deferral_folded_reason(reason: &str) -> bool {
 
 /// One stop-time deferral summary input: how many receipts deferred
 /// for the key, the peak per-receipt deferral, and every endpoint id
-/// ever deferred for it. The summary counts the key's own ids minus
-/// attached and failed, so each deferred endpoint counts exactly
-/// once under the module it deferred for.
+/// ever deferred for it. The summary splits the key's own ids into
+/// attached, failed and still deferred, so each deferred endpoint
+/// counts exactly once under the module it deferred for.
 #[derive(Debug, Default)]
 struct DeferralFold {
     passes: u32,
@@ -3587,10 +3587,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// deferrals (one per module, plus one run-wide gap for endpoints
     /// no module claims), carrying the distinct deferred total, the
     /// pass count and the stop outcome. Each summary attributes where
-    /// its receipts did: `still` is the fold's own deferred ids minus
-    /// attached and failed, never reattributed by fold-time
-    /// membership, so every deferred endpoint counts exactly once
-    /// under the module it deferred for. The per-receipt rows stay:
+    /// its receipts did: the fold's own deferred ids split into
+    /// attached, failed (sticky) and still deferred, never
+    /// reattributed by fold-time membership, so every deferred
+    /// endpoint counts exactly once under the module it deferred
+    /// for, and "all attached by stop" reads only when none failed
+    /// and none is still deferred. The per-receipt rows stay:
     /// gaps and the event stream stay append-only, and concise folds
     /// each module's rows under its summary at render time. Silent
     /// when no receipt ever deferred. True when anything staged, so
@@ -3606,11 +3608,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let mut staged = false;
         for (key, fold) in &folds {
-            let still = fold
-                .deferred_ids
-                .iter()
-                .filter(|id| !capture.attached_at.contains_key(id) && !capture.failed.contains(id))
-                .count();
+            // Each deferred endpoint lands in exactly one outcome:
+            // failed (sticky, so it wins over any stale attach stamp),
+            // else attached, else still deferred at stop.
+            let (mut attached, mut failed, mut still) = (0usize, 0usize, 0usize);
+            for id in &fold.deferred_ids {
+                if capture.failed.contains(id) {
+                    failed += 1;
+                } else if capture.attached_at.contains_key(id) {
+                    attached += 1;
+                } else {
+                    still += 1;
+                }
+            }
             let total = fold.deferred_ids.len();
             let scope = if key.is_some() {
                 String::new()
@@ -3625,32 +3635,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // The distinct total is exact; the per-pass peak rides
             // beside it only when it differs (non-nested patterns),
             // so the line stays truthful either way.
-            let peak = fold.max_deferred != total;
-            let reason = if still == 0 {
-                if peak {
-                    format!(
-                        "attach finished late: {total} endpoint(s){scope} deferred over {passes} \
-                         (peak {} in one pass; all attached by stop); counted uses are lower bounds",
-                        fold.max_deferred,
-                    )
-                } else {
-                    format!(
-                        "attach finished late: {total} endpoint(s){scope} deferred over {passes} \
-                         (all attached by stop); counted uses are lower bounds"
-                    )
-                }
-            } else if peak {
-                format!(
-                    "attach unfinished at stop: {total} endpoint(s){scope} deferred over {passes} \
-                     (peak {} in one pass; {still} still deferred at stop); counted uses are lower bounds",
-                    fold.max_deferred,
-                )
+            let mut outcome = Vec::new();
+            if fold.max_deferred != total {
+                outcome.push(format!("peak {} in one pass", fold.max_deferred));
+            }
+            let finished = failed == 0 && still == 0;
+            if finished {
+                outcome.push("all attached by stop".to_string());
             } else {
-                format!(
-                    "attach unfinished at stop: {total} endpoint(s){scope} deferred over {passes} \
-                     ({still} still deferred at stop); counted uses are lower bounds"
-                )
+                // Only the non-zero outcomes are named; they sum to
+                // the distinct total.
+                if attached > 0 {
+                    outcome.push(format!("{attached} attached by stop"));
+                }
+                if failed > 0 {
+                    outcome.push(format!("{failed} failed to attach"));
+                }
+                if still > 0 {
+                    outcome.push(format!("{still} still deferred at stop"));
+                }
+            }
+            let head = if finished {
+                "attach finished late"
+            } else {
+                "attach unfinished at stop"
             };
+            let reason = format!(
+                "{head}: {total} endpoint(s){scope} deferred over {passes} ({}); \
+                 counted uses are lower bounds",
+                outcome.join("; "),
+            );
             match key.as_ref().map(attach_module_registry_key) {
                 Some(registry_key) => self.registry.record_gap_for_key(
                     None,
@@ -16080,7 +16094,7 @@ pub(crate) mod tests {
         assert_eq!(
             folded[0].reason,
             "attach unfinished at stop: 4 endpoint(s) deferred over 1 pass \
-             (3 still deferred at stop); counted uses are lower bounds"
+             (1 attached by stop; 3 still deferred at stop); counted uses are lower bounds"
         );
         assert!(
             folded[0].module.is_some(),
@@ -16507,7 +16521,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn deferral_fold_keeps_the_live_stream_index_equal_to_the_snapshot() {
+    fn deferral_summary_keeps_the_live_stream_index_equal_to_the_snapshot() {
         // Deferred-gap fold, wire twin: the fold appends its summaries
         // and never removes or reorders rows, so every live
         // `gap_recorded` index equals its final snapshot `gaps[]`
@@ -16625,7 +16639,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn non_nested_deferrals_fold_to_the_distinct_total_with_its_peak() {
+    fn non_nested_deferrals_summarize_to_the_distinct_total_with_its_peak() {
         // Deferred-gap fold, scenario D: passes deferring {0, 1} then
         // {2, 3} fold to the 4 distinct endpoints — the union — with
         // the per-pass peak beside it, never "up to 2" as if the peak
@@ -16713,7 +16727,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn two_deferring_modules_fold_to_separate_gaps() {
+    fn two_deferring_modules_gain_separate_summaries() {
         // Deferred-gap fold, separation twin: two deferring modules
         // fold to exactly two summaries with per-module counts — never
         // merged across modules.

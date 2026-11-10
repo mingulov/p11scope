@@ -101,10 +101,14 @@ equal indices; concise text folds each module's rows under its
 summary to one line. The summary `reason` reads `attach finished
 late: {total} endpoint(s) deferred over {passes} pass(es) (all
 attached by stop); counted uses are lower bounds`, or `attach
-unfinished at stop: ... ({still} still deferred at stop); counted
-uses are lower bounds` when some never attached, where `{total}` is
-the distinct deferred endpoint count; when it exceeds the per-pass
-peak the parenthesis also names it (`peak {max} in one pass`). Each
+unfinished at stop: ... ({attached} attached by stop; {failed} failed
+to attach; {still} still deferred at stop); counted uses are lower
+bounds` when some never attached, naming only the non-zero outcomes,
+where `{total}` is the distinct deferred endpoint count and each
+deferred endpoint lands in exactly one outcome (a deferred endpoint
+that later failed counts as failed); when the total exceeds the
+per-pass peak the parenthesis also names it (`peak {max} in one
+pass`). Each
 summary attributes where its receipts did. Endpoints that failed to
 attach (sticky, never retried) keep their own gap with `subject`
 `native endpoint attach failed`. Any of these gaps forces a `PARTIAL`

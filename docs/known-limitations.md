@@ -75,6 +75,26 @@ never admitted, or discovery deferred by racing exits), not noise.
 Owned-provider counts stay exact with zero loss counters; exact
 observation needs a quiescent scope.
 
+### Observer memory grows under heavy process churn
+
+A long `--system` capture on a host that starts and ends many processes
+uses more memory over time: about 35 to 50 KB of peak memory per
+short-lived process once the observer's process-identity budget is
+spent. The growth levels off. On a 5-vCPU, 10 GB test VM with about
+700 new processes a minute, the observer's peak (VmHWM) was:
+
+| Capture, 61 min | Peak during capture | Flat from |
+| --- | --- | --- |
+| `profile --system` | 906 MB | minute 55 |
+| `trace --system` | 977 MB | minute 55 |
+
+`trace` rises to about 1.13 GB once more at the end, while it writes
+its output. Twenty-minute captures on a 3-vCPU VM reached 650 to
+720 MB. v0.6.0 behaves the same way; this is not new in v0.7.0. Plan
+for about 1.2 GB of observer memory for an hour-long system-wide
+capture on a busy host; `--pid`, cgroup and `run` captures of a
+quiet scope stay far below that. Reducing the growth is 0.7.x work.
+
 ### Short-lived processes never scanned
 
 Processes that exit before any scan examines them still count only in

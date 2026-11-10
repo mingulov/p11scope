@@ -749,6 +749,16 @@ pub struct Engine {
     /// exited, with their pid and known exit hook time, so capture end can
     /// still judge them. At most one entry per counted view.
     exited_removed_leader_exit_views: BTreeMap<ProcessViewId, (u32, u64)>,
+    /// Removal proofs `(pid, exit_ns)` of counted views whose ids went
+    /// back to the free list. Not keyed by id, so a later process on a
+    /// reused id can never borrow or withdraw them. Capped at the
+    /// process-view capacity; past the cap the count simply stays.
+    released_leader_exit_proofs: Vec<(u32, u64)>,
+    /// Whether every dispatching session so far attached its static probes
+    /// process-wide (`None`: no batch yet). A pid-bound session (`--pid`,
+    /// `run`, a selected endpoint) cannot see surviving threads, so no
+    /// leader-exit loss may be withdrawn in it. Sticky once false.
+    static_probes_process_wide: Option<bool>,
     /// Views with a matched EXEC whose PID-bound static links may be dead
     /// while still recorded as attached. At most one marker per retained
     /// view: the next refresh rearms even an unchanged plan, ordinary-delta
@@ -3206,6 +3216,12 @@ pub(crate) trait EngineSession {
     fn instance_hooks_refused(&self) -> bool {
         true
     }
+    /// Whether the session's static probes fire for every process in
+    /// scope, rather than being bound to one pid's task. Fail-closed
+    /// default: unknown sessions are treated as pid-bound.
+    fn static_probes_process_wide(&self) -> bool {
+        false
+    }
     fn bind_exec(
         &self,
         _: &ProcessView,
@@ -3474,6 +3490,9 @@ impl EngineSession for Session {
     }
     fn instance_hooks_refused(&self) -> bool {
         Session::instance_tracking(self).refused().is_some()
+    }
+    fn static_probes_process_wide(&self) -> bool {
+        Session::scope_filter(self).is_none()
     }
     fn bind_exec(
         &self,
@@ -11223,6 +11242,8 @@ impl Engine {
             leader_exit_hook_ns: BTreeMap::new(),
             group_last_record_ns: BTreeMap::new(),
             exited_removed_leader_exit_views: BTreeMap::new(),
+            released_leader_exit_proofs: Vec::new(),
+            static_probes_process_wide: None,
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
             run_tree_handed_back: 0,
@@ -12989,6 +13010,7 @@ impl Engine {
         if self.collected_finish_actions.is_some() {
             return;
         }
+        self.detach_leader_exit_state_for_reuse(id);
         // Skip-if-present: a duplicate retired entry would mint one ID to
         // two live views, so a double release is a silent no-op rather than
         // a debug-only abort.
@@ -20961,27 +20983,59 @@ impl Engine {
             }
         }
         self.exited_removed_leader_exit_views.clear();
+        // Each released proof stands for exactly one count its own process
+        // added before its id was freed.
+        let released = std::mem::take(&mut self.released_leader_exit_proofs);
+        for (pid, exit_ns) in released {
+            if self.leader_exit_withdrawal_allowed() && self.group_quiet_since(pid, exit_ns) {
+                self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_sub(1);
+            }
+        }
     }
 
-    /// True only when the view is still retained, its leader-exit hook
-    /// time is known, no record from its thread group is stamped at or
-    /// after that time, and its original generation provably exited
-    /// (retained pidfd poll). Missing views, unknown order, post-exit
-    /// activity and poll errors stay fail-closed.
+    /// Whether any leader-exit loss may be withdrawn at all. Only when the
+    /// static probes cover every process (system or cgroup scope, and every
+    /// session attached process-wide) can a surviving thread leave a record
+    /// the gate sees; and only when no discovery record was lost, malformed,
+    /// truncated or left unprocessed can "no later record" mean anything.
+    fn leader_exit_withdrawal_allowed(&self) -> bool {
+        matches!(self.scope, Scope::System | Scope::Cgroup { .. })
+            && self.static_probes_process_wide == Some(true)
+            && self.counter_snapshot.ring_loss == 0
+            && self.malformed_discovery == 0
+            && self.discovery_truncated == 0
+            && self.pending_discovery_records.is_empty()
+            && self.terminal_batch.is_none()
+            && self.terminal_journal.is_none()
+    }
+
+    /// No record from `pid`'s thread group is stamped at or after `exit_ns`.
+    fn group_quiet_since(&self, pid: u32, exit_ns: u64) -> bool {
+        self.group_last_record_ns
+            .get(&pid)
+            .is_none_or(|last| *last < exit_ns)
+    }
+
     /// The removed-view twin of `leader_exit_withdrawable`: the group was
     /// proven fully exited when its view was dropped, and no record from
     /// its pid is stamped at or after the exit hook since.
     fn removed_leader_exit_withdrawable(&self, view: ProcessViewId) -> bool {
-        self.exited_removed_leader_exit_views
-            .get(&view)
-            .is_some_and(|(pid, exit_ns)| {
-                self.group_last_record_ns
-                    .get(pid)
-                    .is_none_or(|last| *last < *exit_ns)
-            })
+        self.leader_exit_withdrawal_allowed()
+            && self
+                .exited_removed_leader_exit_views
+                .get(&view)
+                .is_some_and(|(pid, exit_ns)| self.group_quiet_since(*pid, *exit_ns))
     }
 
+    /// True only when withdrawal is allowed, the view is still retained,
+    /// its leader-exit hook time is known, no record from its thread group
+    /// is stamped at or after that time, and its original generation
+    /// provably exited (retained pidfd poll). Missing views, unknown order,
+    /// post-exit activity and poll errors stay fail-closed.
     fn leader_exit_withdrawable(&self, view: ProcessViewId) -> bool {
+        if !self.leader_exit_withdrawal_allowed() {
+            return false;
+        }
         let Some(Some(exit_ns)) = self.leader_exit_hook_ns.get(&view).copied() else {
             return false;
         };
@@ -20989,9 +21043,7 @@ impl Engine {
             .iter()
             .find(|candidate| candidate.id() == view)
             .is_some_and(|retained| {
-                self.group_last_record_ns
-                    .get(&retained.pid())
-                    .is_none_or(|last| *last < exit_ns)
+                self.group_quiet_since(retained.pid(), exit_ns)
                     && retained.original_exited() == Ok(true)
             })
     }
@@ -22796,7 +22848,6 @@ impl Engine {
         for view in removed {
             if self.counted_leader_exit_views.contains(&view) {
                 self.note_counted_leader_exit_removal(view);
-                continue;
             }
             if !self.pending_leader_exit_views.contains(&view) {
                 continue;
@@ -22822,10 +22873,6 @@ impl Engine {
         }
     }
 
-    /// A counted view is about to be dropped. When its group provably fully
-    /// exited and its exit hook time is known, keep just enough to judge
-    /// the loss at capture end; records stamped later from the same pid
-    /// (even after removal) still keep it.
     /// Keeps observation stamps only for retained pids and for the pids
     /// of removed exited views still awaiting capture-end judgment.
     fn prune_group_last_records(&mut self, retained_pids: &BTreeSet<u32>) {
@@ -22833,12 +22880,46 @@ impl Engine {
             .exited_removed_leader_exit_views
             .values()
             .map(|(pid, _)| *pid)
+            .chain(self.released_leader_exit_proofs.iter().map(|(pid, _)| *pid))
             .collect();
         self.group_last_record_ns
             .retain(|pid, _| retained_pids.contains(pid) || awaiting.contains(pid));
     }
 
+    /// Folds one dispatching session's probe scope into the sticky
+    /// capture-wide answer read by `leader_exit_withdrawal_allowed`.
+    fn note_session_probe_scope(&mut self, session: &dyn EngineSession) {
+        let wide = session.static_probes_process_wide();
+        self.static_probes_process_wide =
+            Some(self.static_probes_process_wide.unwrap_or(true) && wide);
+    }
+
+    /// The id returns to the free list, so the next process on it must not
+    /// inherit this generation's leader-exit state. A still-pending
+    /// assessment is written off now, as capture end would; a counted view
+    /// leaves the id-keyed set with its count kept, and its removal proof,
+    /// if any, moves to the id-free list judged at capture end.
+    fn detach_leader_exit_state_for_reuse(&mut self, id: ProcessViewId) {
+        if self.pending_leader_exit_views.remove(&id) && self.counted_leader_exit_views.insert(id) {
+            self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_add(1);
+        }
+        let proof = self.exited_removed_leader_exit_views.remove(&id);
+        if self.counted_leader_exit_views.remove(&id)
+            && let Some(proof) = proof
+            && self.released_leader_exit_proofs.len() < self.max_scan_pids
+        {
+            self.released_leader_exit_proofs.push(proof);
+        }
+    }
+
+    /// A counted view is about to be dropped. When withdrawal is possible,
+    /// its group provably fully exited and its exit hook time is known,
+    /// keep just enough to judge the loss at capture end; records stamped
+    /// later from the same pid (even after removal) still keep it.
     fn note_counted_leader_exit_removal(&mut self, view: ProcessViewId) {
+        if !matches!(self.scope, Scope::System | Scope::Cgroup { .. }) {
+            return;
+        }
         let Some(Some(exit_ns)) = self.leader_exit_hook_ns.get(&view).copied() else {
             return;
         };
@@ -22872,9 +22953,6 @@ impl Engine {
 
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
         let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
-        // A reused view id starts a new generation's assessment: a removal
-        // proof left by an earlier generation can no longer withdraw it.
-        self.exited_removed_leader_exit_views.remove(&view);
         let newly_pending = self.pending_leader_exit_views.insert(view);
         if newly_pending {
             // A new assessment dirties the current lap and restarts the
@@ -30861,6 +30939,7 @@ impl Engine {
         };
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
         self.prune_group_last_records(&retained_pids);
+        self.note_session_probe_scope(session);
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             deferred_exits.extend(queued.extract_if(.., |queued| {
@@ -31082,6 +31161,7 @@ impl Engine {
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
         self.prune_group_last_records(&retained_pids);
+        self.note_session_probe_scope(session);
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             // Move-only: the deferred exits move out in encounter order;
@@ -32619,6 +32699,7 @@ pub(crate) mod session_fixture {
         #[cfg(feature = "h6-reexec-diagnostic")]
         pub(crate) diagnostic_at_preflight: Cell<Option<crate::attach::reexec_diagnostic::Record>>,
         pub(crate) capture_policy: Option<CapturePolicy>,
+        pub(crate) probes_process_wide: bool,
         pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
         pub(crate) global_retirement: Option<RefCell<crate::attach::RetirementFixture>>,
         /// T4b seam: fail every `prepare_collected_static_retirement` call
@@ -32913,6 +32994,9 @@ pub(crate) mod session_fixture {
         #[cfg(feature = "h6-reexec-diagnostic")]
         fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
             self.reexec_diagnostic.clone()
+        }
+        fn static_probes_process_wide(&self) -> bool {
+            self.probes_process_wide
         }
         fn has_slot_link(&self, slot: u32) -> bool {
             self.scripted_links.contains(&slot)

@@ -219,16 +219,21 @@ recorded. The fix is planned for 0.7.1.
 
 ### Main thread exits first: a later library load can go unreported
 
-When a program's main thread ends on its own (`pthread_exit`) while
-its other threads keep running, p11scope stops seeing that program's
-library loads. This is counted as a lost load link
-(`task_uprobe_link_losses`). The count is withdrawn at capture end
-when the whole program has exited by then and none of its threads was
-observed after the main thread ended, because an ordinary exit looks
-the same. So a provider loaded in that window, by threads that then
-did nothing else p11scope watches, can go unreported. Calls to providers
-p11scope already watches are still counted. Seeing those later loads
-needs a kernel-side witness and is 0.7.x work.
+p11scope watches library loads per process. When a program's main
+thread ends on its own (`pthread_exit`) while its other threads keep
+running, p11scope can stop seeing that program's later library loads
+and counts a lost load link (`task_uprobe_link_losses`). In `--system`
+and `--cgroup` captures the count is withdrawn at capture end if the
+whole program has exited by then and p11scope recorded no
+library-load, function-list or exec event from any of its threads
+after the main thread ended, because an ordinary exit looks the same.
+PKCS#11 calls do not count as such an event. So a provider first loaded
+in that window can go unreported, even if the threads kept calling
+providers p11scope already watches; those calls are still counted.
+`--pid` and `run` captures keep the count, and so does any capture that
+lost discovery records. The count can still over-report in a few cases
+(a thread's record racing the exit, an unknown exit order). Seeing
+those later loads needs a kernel-side witness and is 0.7.x work.
 
 ### Test-only: overlay-witness flake
 

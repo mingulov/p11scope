@@ -378,12 +378,15 @@ names the source SHA behind each check the release rounds re-measured.
   client every 3 seconds that is about 14 hours of capture.
 - The ledger that settles transient admission-deferral scan refusals
   when an endpoint is later admitted likewise holds 16,448
-  endpoints; entries are forgotten as their tasks retire. Past the
-  cap (or for a caller whose process start time could not be read,
-  so its generation is unprovable), deferral refusals stay counted
-  and named per reason in `refused_endpoints` even if the endpoint
-  later admits with complete data: the run over-reports refused
-  endpoints rather than risk hiding one.
+  endpoints; entries for admitted tasks are forgotten as their tasks
+  retire, while entries for tasks that never admitted stay until the
+  cap. Past the cap (or for a caller whose process start time could
+  not be read, so its generation is unprovable), deferral refusals
+  stay counted and named per reason in `refused_endpoints` even if
+  the endpoint later admits with complete data: the run over-reports
+  refused endpoints rather than risk hiding one. A run that hit the
+  cap says so on its stop scan-refusal gap ("N not settled: ledger
+  full").
 - About 0.5% of `run` captures on overloaded hosts miss startup
   entirely: the kernel delivers neither loader nor lifecycle records
   for the whole run, so the child runs unwatched. Those runs report

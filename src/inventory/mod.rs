@@ -3163,6 +3163,7 @@ impl WarnSink<'_> {
 /// payloads.
 struct SemanticStopCounts {
     refusals: [u64; 12],
+    overflow_refusals: u64,
     collected: u64,
     joined: u64,
     shed: u64,
@@ -3186,6 +3187,7 @@ impl SemanticStopCounts {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Self {
         let refusals = lane.scan_refusal_counts();
+        let overflow_refusals = lane.admission_overflow_refusals();
         let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
         let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
@@ -3195,6 +3197,7 @@ impl SemanticStopCounts {
             lane.admitted_mark_funnel_counts();
         Self {
             refusals,
+            overflow_refusals,
             collected,
             joined,
             shed,
@@ -3224,7 +3227,7 @@ fn disclose_semantic_stop(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     warn: &mut WarnSink<'_>,
 ) {
-    coordinator.record_scan_refusals_gap(&counts.refusals);
+    coordinator.record_scan_refusals_gap_with_overflow(&counts.refusals, counts.overflow_refusals);
     warn.emit(&crate::inventory_semantics::semantic_stop_line(
         counts.collected,
         counts.joined,
@@ -24749,6 +24752,7 @@ mod promotion_driver_tests {
             collected_calls: 68,
             joined_calls: 5,
             scan_refusals: 12,
+            overflow_refusals: 0,
         }
     }
 
@@ -25396,6 +25400,7 @@ mod promotion_driver_tests {
             collected_calls: 11,
             joined_calls: 3,
             scan_refusals: 5,
+            overflow_refusals: 0,
         }
     }
 
@@ -26034,6 +26039,7 @@ mod promotion_driver_tests {
         };
         let counts = SemanticStopCounts {
             refusals: [0; 12],
+            overflow_refusals: 0,
             collected: 5,
             joined: 5,
             shed: 0,

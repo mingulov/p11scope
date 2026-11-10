@@ -2423,12 +2423,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
-    /// One aggregate gap for lifetime semantic scan/refresh refusals,
-    /// with per-reason finite labels and counts. Nothing is recorded
-    /// when no scan ever refused. Counts only; no pids, paths or
-    /// payloads.
+    /// Tests-only shorthand for
+    /// [`Self::record_scan_refusals_gap_with_overflow`] with zero
+    /// overflow. Production always routes through the shared entry so
+    /// the cap note cannot be dropped by a stale call site.
+    #[cfg(test)]
     pub(crate) fn record_scan_refusals_gap(&mut self, counts: &[u64; 12]) {
-        let Some(reason) = crate::inventory_semantics::scan_refusals_gap_reason(counts) else {
+        self.record_scan_refusals_gap_with_overflow(counts, 0);
+    }
+
+    /// One aggregate gap for lifetime semantic scan/refresh refusals,
+    /// with per-reason finite labels and counts, plus an `(N not
+    /// settled: ledger full)` note when `overflow` refusals counted
+    /// past the settle-ledger cap. Nothing is recorded when no scan
+    /// ever refused. Counts only; no pids, paths or payloads.
+    pub(crate) fn record_scan_refusals_gap_with_overflow(
+        &mut self,
+        counts: &[u64; 12],
+        overflow: u64,
+    ) {
+        let Some(reason) =
+            crate::inventory_semantics::scan_refusals_gap_reason_with_overflow(counts, overflow)
+        else {
             return;
         };
         self.registry.record_gap(RegistryGap {

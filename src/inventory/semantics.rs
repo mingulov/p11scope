@@ -1530,11 +1530,12 @@ pub(crate) const MAX_UNSETTLED_ADMISSION_ENDPOINTS: usize = 16_448;
 /// that admits the endpoint with complete data reports no refused
 /// endpoint for it. An endpoint that is never admitted keeps its
 /// refusals counted (and named through the per-reason gap). Entries
-/// are forgotten when their task retires (`forget_task`, driven by
-/// tick invalidations) and the map is capped, so churned tasks cannot
-/// grow it over a long run. The live admission site counts through
-/// this ledger; tick scans keep counting directly, as they are not
-/// admission deferrals.
+/// for admitted tasks are forgotten when their task retires
+/// (`forget_task`, driven by tick invalidations); entries for tasks
+/// that never admitted stay until the cap, so only the cap bounds
+/// churned tasks over a long run. The live admission site counts
+/// through this ledger; tick scans keep counting directly, as they
+/// are not admission deferrals.
 #[derive(Default)]
 pub(crate) struct AdmissionRefusalLedger {
     unsettled: BTreeMap<(u32, u64, u32), [u64; 12]>,
@@ -1561,7 +1562,8 @@ impl AdmissionRefusalLedger {
     }
 
     /// Refusals that counted but could not be tracked past the cap.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The stop scan-refusal gap names this share, so hitting the cap
+    /// stays visible on the run.
     pub(crate) fn overflow_refusals(&self) -> u64 {
         self.overflow_refusals
     }
@@ -1701,10 +1703,24 @@ pub(crate) fn count_scan_refusals(into: &mut [u64; 12], refusals: &[ImageQueryRe
     }
 }
 
-/// Aggregate gap reason for per-reason scan-refusal counts: the total
-/// plus sorted `label=count` pairs. `None` when nothing was refused.
-/// Counts only; no pids, paths or payloads.
+/// Tests-only shorthand for [`scan_refusals_gap_reason_with_overflow`]
+/// with zero overflow: the historical reason, byte for byte.
+/// Production always routes through the shared entry so the cap
+/// note cannot be dropped by a stale call site.
+#[cfg(test)]
 pub(crate) fn scan_refusals_gap_reason(counts: &[u64; 12]) -> Option<String> {
+    scan_refusals_gap_reason_with_overflow(counts, 0)
+}
+
+/// Aggregate gap reason for per-reason scan-refusal counts: the total
+/// plus sorted `label=count` pairs, plus an `(N not settled: ledger
+/// full)` note when `overflow` refusals counted past the
+/// settle-ledger cap. `None` when nothing was refused. Counts only;
+/// no pids, paths or payloads.
+pub(crate) fn scan_refusals_gap_reason_with_overflow(
+    counts: &[u64; 12],
+    overflow: u64,
+) -> Option<String> {
     let total: u64 = counts.iter().sum();
     if total == 0 {
         return None;
@@ -1716,7 +1732,11 @@ pub(crate) fn scan_refusals_gap_reason(counts: &[u64; 12]) -> Option<String> {
         .map(|(index, count)| format!("{}={count}", SCAN_REFUSAL_LABELS[index]))
         .collect();
     parts.sort();
-    Some(format!("{total} scan refusals ({})", parts.join(" ")))
+    let mut reason = format!("{total} scan refusals ({})", parts.join(" "));
+    if overflow > 0 {
+        reason.push_str(&format!(" ({overflow} not settled: ledger full)"));
+    }
+    Some(reason)
 }
 
 /// One stderr stop line for the semantic lane: lifetime collected,
@@ -1959,6 +1979,9 @@ pub(crate) struct ScriptedStopCounts {
     pub(crate) collected_calls: u64,
     pub(crate) joined_calls: u64,
     pub(crate) scan_refusals: u64,
+    /// Settle-ledger overflow refusals behind the stop gap's
+    /// "not settled" note.
+    pub(crate) overflow_refusals: u64,
 }
 
 /// Tests-only Joint drive state: lane live/gated/finished/ticks plus the
@@ -2543,6 +2566,18 @@ impl AttestedSemanticLane {
         self.live
             .as_ref()
             .map_or([0; 12], |live| live.refusal_counts)
+    }
+
+    /// Lifetime settle-ledger overflow refusals (zero without a live
+    /// lane), for the stop gap's "not settled" note. Counts only.
+    pub(crate) fn admission_overflow_refusals(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted_stop_counts {
+            return scripted.overflow_refusals;
+        }
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.admission_refusals.overflow_refusals())
     }
 
     pub(crate) fn mark_collected_finish_requested(&mut self) {

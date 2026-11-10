@@ -4387,6 +4387,60 @@ fn a_later_provider_prefix_replaces_the_earlier_whole_refusal() {
     );
 }
 
+/// Revival refresh: a retired slot clears for revival only after the
+/// session reports it physically detached on two consecutive refreshes
+/// and proves its counts final — the drain barrier, scripted.
+#[test]
+fn revival_refresh_clears_detached_finalized_slots_after_two_observations() {
+    let slots: Vec<plan::Slot> = (0..2u32)
+        .map(|index| plan::Slot {
+            index,
+            descriptor_index: 0,
+            object: PinnedObjectId(43),
+            object_path: "/opt/revive.so".into(),
+            file_offset: u64::from(index) * 8,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![plan::ModuleId(0)],
+        })
+        .collect();
+    let mut engine = Engine::empty();
+    engine.plan = plan::AttachPlan::from_slots(slots);
+    engine.plan.deactivate(0);
+    engine.plan.deactivate(1);
+    let key = |position: usize| plan::AttachKey::of(&engine.plan.slots[position]);
+    let (key0, key1) = (key(0), key(1));
+    let mut session = ScriptedSession::default();
+    session.scripted_revival_detached = BTreeSet::from([0, 1]);
+    session.scripted_revival_finalized = BTreeSet::from([0]);
+    // First observation: nothing clears yet.
+    engine.refresh_revivable(&session);
+    assert!(
+        engine.plan.revivable().is_empty(),
+        "one observation is not a barrier"
+    );
+    // Second observation: the detached and finalized slot clears; the
+    // detached-but-unfinalized one stays out.
+    engine.refresh_revivable(&session);
+    assert_eq!(
+        engine.plan.revivable().get(&key0),
+        Some(&0),
+        "detached twice plus finalized clears"
+    );
+    assert!(
+        !engine.plan.revivable().contains_key(&key1),
+        "unfinalized counts never clear"
+    );
+    // Finalizing the second slot clears it on the next refresh.
+    session.scripted_revival_finalized.insert(1);
+    engine.refresh_revivable(&session);
+    assert_eq!(engine.plan.revivable().len(), 2);
+}
+
 /// An awaiting-publication gap ranks below a counted capacity refusal in the
 /// engine history the report renders. A closure that starts unpublished
 /// records "nothing published yet"; when it later publishes tables but the

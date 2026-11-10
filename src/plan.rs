@@ -995,6 +995,17 @@ pub struct AttachPlan {
     // exact reappearance gets a fresh monotonic slot rather than reviving a
     // historical cookie.
     slot_by_key: BTreeMap<AttachKey, usize>,
+    // Exact target -> retired position, for absence-retired slots only.
+    // Remembers where a target was so a later reappearance can revive it
+    // once the engine proves its links are gone and its counts final
+    // (see `revivable`); never populated for descriptor-replaced slots.
+    retired_keys: BTreeMap<AttachKey, usize>,
+    // Absence-retired exact targets the engine cleared for same-target
+    // revival this rebuild: their links are physically detached, a drain
+    // barrier passed since, and no call is in flight. Recomputed before
+    // every live rebuild; merge budgets them free and extend reoccupies
+    // their positions when descriptor and names still match.
+    revivable: BTreeMap<AttachKey, usize>,
     // Exact bootstrap targets which have not yet acquired table authority.
     provisional_get_function_list: BTreeMap<AttachKey, PinnedObjectId>,
     // Every table ordinal that reached an exact target this capture. Keyed
@@ -1409,6 +1420,8 @@ impl AttachPlan {
                 .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
                 .count(),
             slot_by_key,
+            retired_keys: BTreeMap::new(),
+            revivable: BTreeMap::new(),
             provisional_get_function_list: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
@@ -1680,6 +1693,7 @@ impl AttachPlan {
             ExistingAllocation {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
+                revivable: &self.revivable,
                 owned: &owned,
                 first_plan: Some(&self.first_plan_objects),
                 first_plan_had_provider: self.first_plan_had_provider,
@@ -1913,6 +1927,39 @@ impl AttachPlan {
     pub fn is_active(&self, slot: u32) -> bool {
         let position = slot as usize;
         position < self.slots.len() && !self.retired_slots.contains(&position)
+    }
+
+    /// Retired slot positions, for the engine's revival refresh.
+    pub(crate) fn retired_slots(&self) -> &BTreeSet<usize> {
+        &self.retired_slots
+    }
+
+    /// Absence-retired exact targets by retired position, for the
+    /// engine's revival refresh.
+    pub(crate) fn retired_keys(&self) -> &BTreeMap<AttachKey, usize> {
+        &self.retired_keys
+    }
+
+    /// Retired targets cleared for same-target revival this rebuild.
+    pub(crate) fn revivable(&self) -> &BTreeMap<AttachKey, usize> {
+        &self.revivable
+    }
+
+    /// Replaces the revival clearance wholesale; the engine recomputes
+    /// it after every candidate application.
+    pub(crate) fn set_revivable(&mut self, revivable: BTreeMap<AttachKey, usize>) {
+        self.mutations.bump();
+        self.revivable = revivable;
+    }
+
+    /// The retired position a reappearing exact target may reoccupy, or
+    /// `None` when it must take a fresh slot: Detailed policy only, the
+    /// key cleared revivable for this rebuild, still retired at its
+    /// remembered position, and the rebuilt slot carrying the same
+    /// descriptor and names (the same function, so counts continue).
+    /// STUB: never revives until the revival implementation lands.
+    fn revival_target(&self, _key: &AttachKey, _rebuilt: &Slot) -> Option<usize> {
+        None
     }
 
     /// The slot index for one exact attach target, if this plan holds it
@@ -4136,6 +4183,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            revivable: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -4327,6 +4375,7 @@ pub(crate) fn build_from_sources_scan_authorized(
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            revivable: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -4554,6 +4603,7 @@ fn build_from_sources_with_policy(
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            revivable: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -4573,6 +4623,10 @@ fn build_from_sources_with_policy(
 struct ExistingAllocation<'a> {
     slots: usize,
     active: &'a BTreeMap<AttachKey, usize>,
+    /// Absence-retired targets cleared for same-target revival this
+    /// rebuild (see [`AttachPlan::revivable`): they reoccupy their old
+    /// positions at extend, so merge charges them no new slot.
+    revivable: &'a BTreeMap<AttachKey, usize>,
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
@@ -4671,6 +4725,7 @@ fn build_from_test_sources_with_policy(
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            revivable: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5027,6 +5082,7 @@ fn build(m: &Manifest) -> AttachPlan {
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
+            revivable: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -8851,6 +8907,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -8988,6 +9045,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -9034,6 +9092,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -12034,6 +12093,7 @@ mod tests {
             ExistingAllocation {
                 slots: plan.slots.len(),
                 active: &plan.slot_by_key,
+                revivable: &plan.revivable,
                 owned: &plan.active_keys_by_owner(),
                 first_plan: Some(&plan.first_plan_objects),
                 first_plan_had_provider: plan.first_plan_had_provider,
@@ -13275,6 +13335,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -13316,6 +13377,7 @@ mod tests {
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
+                revivable: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -14440,6 +14502,243 @@ mod tests {
             Some(68),
             "the complete fresh demand: {}",
             refusal.reason
+        );
+    }
+
+    /// Same-target revival: a provider that leaves and returns while its
+    /// retired slots are cleared reoccupies its old indices — the slot
+    /// count does not grow, so churn stops burning the lifetime budget.
+    /// The retired keys are remembered at retirement (no manual setup).
+    #[test]
+    fn revived_target_keeps_its_slot_index() {
+        let provider = provider_with_tables(91, "/opt/churn-pkcs11.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.retire.len(), 68, "absence retires every target");
+        assert_eq!(
+            plan.retired_keys.len(),
+            68,
+            "retirement remembers every retired key"
+        );
+        // The engine cleared every retired slot (links gone, counts final).
+        plan.revivable.clone_from(&plan.retired_keys);
+        let rebuilt = plan.rebuild_from_sources(&[provider], &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "revival costs no new slot: {:?}",
+            rebuilt.modules_skipped
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.slots.len(), 68, "no fresh slot minted");
+        assert!(plan.retired_slots.is_empty(), "nothing stays retired");
+        assert!(
+            plan.retired_keys.is_empty(),
+            "revived keys leave the memory"
+        );
+        assert!(plan.revivable.is_empty(), "revival consumes its clearance");
+        let revived: Vec<u32> = delta.new.iter().map(|slot| slot.index).collect();
+        assert_eq!(
+            revived,
+            (0..68).collect::<Vec<_>>(),
+            "delta.new reoccupies the old indices"
+        );
+    }
+
+    /// Revival needs the same names: a reappearance whose rebuilt slots
+    /// carry changed names takes fresh slots, never the retired indices
+    /// — counts from a different function must not continue. (Scan slots
+    /// without authorized names all read `unknown`, so the change is
+    /// applied to the rebuilt slots directly, as changed evidence
+    /// would produce.)
+    #[test]
+    fn revival_refused_when_names_change() {
+        let module = provider_with_tables(92, "/opt/renamed-pkcs11.so", 1, 4, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&module), AdmissionScope::Shared);
+        let retired_names = plan.slots[0].names.clone();
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        for slot in &mut rebuilt.slots {
+            slot.names = vec!["C_Encrypt".into()];
+        }
+        assert_ne!(
+            rebuilt.slots[0].names, retired_names,
+            "the rebuilt names changed"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.slots.len(), 8, "renamed targets take fresh slots");
+        assert!(
+            delta.new.iter().all(|slot| slot.index >= 4),
+            "no retired index is reoccupied"
+        );
+    }
+
+    /// The revival gate decides by identity: the same descriptor and
+    /// names revive, anything else takes a fresh slot.
+    #[test]
+    fn revival_target_requires_same_descriptor_and_names() {
+        let provider = provider_with_tables(97, "/opt/gate-pkcs11.so", 1, 1, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
+        plan.deactivate(0);
+        let key = AttachKey::of(&plan.slots[0]);
+        plan.revivable.insert(key.clone(), 0);
+        let same = plan.slots[0].clone();
+        assert_eq!(
+            plan.revival_target(&key, &same),
+            Some(0),
+            "the same identity revives"
+        );
+        let mut renamed = same.clone();
+        renamed.names = vec!["C_Encrypt".into()];
+        assert_eq!(
+            plan.revival_target(&key, &renamed),
+            None,
+            "renamed targets never revive"
+        );
+        let mut redescribed = same.clone();
+        redescribed.descriptor_index += 1;
+        assert_eq!(
+            plan.revival_target(&key, &redescribed),
+            None,
+            "redescribed targets never revive"
+        );
+        let unknown = AttachKey {
+            object: key.object,
+            file_offset: key.file_offset + 0x1000,
+        };
+        assert_eq!(
+            plan.revival_target(&unknown, &same),
+            None,
+            "unknown keys never revive"
+        );
+    }
+
+    /// Revival needs engine clearance: a retired target that reappears
+    /// without it takes a fresh slot — an unfinalized retired slot is
+    /// never reused, even when the budget has room.
+    #[test]
+    fn unfinalized_retired_slot_is_never_reused() {
+        let provider = provider_with_tables(93, "/opt/return-pkcs11.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert!(plan.revivable.is_empty(), "no clearance without the engine");
+        let rebuilt = plan.rebuild_from_sources(&[provider], &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.slots.len(), 136, "fresh slots beside the retired ones");
+        assert!(
+            delta.new.iter().all(|slot| slot.index >= 68),
+            "no retired index is reoccupied"
+        );
+    }
+
+    /// Counters publish by position, so retired slots never revive there:
+    /// under a tight budget the reappearance is refused (charged fresh),
+    /// and under room it takes fresh indices.
+    #[test]
+    fn counters_policy_never_revives_retired_slots() {
+        for (budget, refused) in [(100usize, true), (200usize, false)] {
+            let policy = AdmissionPolicy::counters(
+                crate::capacity::CounterBudget::new(budget as u64).unwrap(),
+            );
+            let provider = provider_with_tables(94, "/opt/counter-pkcs11.so", 1, 68, true);
+            let first = build_from_sources_for_policy(
+                std::slice::from_ref(&provider),
+                &[],
+                &PinnedObjects::empty(),
+                policy,
+            );
+            assert_eq!(first.slots.len(), 68);
+            let mut plan = first;
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            plan.revivable.clone_from(&plan.retired_keys);
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&provider),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            if refused {
+                assert_eq!(
+                    slots_of(&rebuilt, 94),
+                    0,
+                    "a tight counter budget charges the reappearance fresh"
+                );
+                assert!(
+                    !rebuilt.modules_skipped.is_empty(),
+                    "and refuses it honestly"
+                );
+            } else {
+                let delta = plan.extend_exact(rebuilt).unwrap();
+                assert_eq!(plan.slots.len(), 136, "fresh slots beside the retired ones");
+                assert!(
+                    delta.new.iter().all(|slot| slot.index >= 68),
+                    "no retired index is reoccupied under Counters"
+                );
+            }
+        }
+    }
+
+    /// Plan-level retirement remembers the key: `deactivate` records the
+    /// retired position beside the key it drops from the attach index.
+    #[test]
+    fn deactivate_remembers_the_retired_key() {
+        let provider = provider_with_tables(95, "/opt/gone-pkcs11.so", 1, 2, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
+        plan.deactivate(1);
+        assert_eq!(plan.retired_keys.len(), 1);
+        let key = AttachKey::of(&plan.slots[1]);
+        assert_eq!(plan.retired_keys.get(&key), Some(&1));
+        assert!(!plan.slot_by_key.contains_key(&key));
+    }
+
+    /// Tail withdrawal keeps the revival memory consistent: withdrawn
+    /// cells leave it, surviving cells keep their positions, and excised
+    /// cells remap theirs.
+    #[test]
+    fn tail_withdrawal_keeps_revival_bookkeeping_consistent() {
+        let provider = provider_with_tables(96, "/opt/tail-pkcs11.so", 1, 4, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Shared);
+        plan.deactivate(1);
+        plan.deactivate(3);
+        let key_of = |plan: &AttachPlan, position: usize| AttachKey::of(&plan.slots[position]);
+        let key1 = key_of(&plan, 1);
+        let key3 = key_of(&plan, 3);
+        plan.revivable.insert(key1.clone(), 1);
+        plan.revivable.insert(key3.clone(), 3);
+        // A wholly inactive tail is withdrawn with its memories.
+        plan.withdraw_unlinked_additions(3);
+        assert_eq!(plan.slots.len(), 3);
+        assert!(
+            !plan.retired_keys.contains_key(&key3),
+            "withdrawn cells leave memory"
+        );
+        assert!(
+            !plan.revivable.contains_key(&key3),
+            "withdrawn cells leave revivable"
+        );
+        assert_eq!(plan.retired_keys.get(&key1), Some(&1), "survivors stay");
+        assert_eq!(
+            plan.revivable.get(&key1),
+            Some(&1),
+            "survivors stay revivable"
+        );
+        // Excising an inactive tail cell remaps the survivors after it.
+        plan.deactivate(2);
+        let key2 = key_of(&plan, 2);
+        plan.revivable.insert(key2.clone(), 2);
+        let map = plan.excise_unlinked_tail_cells(1, &BTreeSet::from([1]));
+        assert_eq!(map[1], u32::MAX, "the excised cell is gone");
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.retired_keys.get(&key2), Some(&1), "remapped down");
+        assert_eq!(plan.revivable.get(&key2), Some(&1), "remapped down");
+        assert!(
+            !plan.retired_keys.contains_key(&key1),
+            "excised leaves memory"
         );
     }
 

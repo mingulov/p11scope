@@ -10183,6 +10183,21 @@ impl Session {
         links_cover_slot(&self.links, slot)
     }
 
+    /// Retired slots whose probes are provably gone: the Multi backend,
+    /// no owned link covers them, no retained static target or group
+    /// deferral names them, and no native retirement is pending or
+    /// uncertain. STUB: empty until the revival implementation lands.
+    pub(crate) fn revival_detached(&self, _retired: &BTreeSet<usize>) -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
+
+    /// Whether a detached slot's counts are final and nothing is in
+    /// flight: its STATS entered equals returned on every CPU and no
+    /// START or OBJECT_START row names it. STUB: false until revival lands.
+    pub(crate) fn revival_finalized(&self, _slot: u32) -> bool {
+        false
+    }
+
     /// The retained attach-complete instant for one slot, if it ever
     /// attached in this session (packet 6.13: per-provider evidence reads
     /// these, never the once-only session stamp).
@@ -22132,6 +22147,168 @@ mod tests {
         anyhow::ensure!(session.producers_detached);
         session.mint_native_completion()?;
         eprintln!("retirement-cell multi: terminal detach minted");
+        Ok(())
+    }
+
+    /// Revival probe on a live Multi session: an attached slot never
+    /// clears; after a live detach it clears detached, and finalized
+    /// while no call is in flight. A planted START or OBJECT_START row
+    /// for the slot unfinalizes it (removed again right after), and the
+    /// detached slot re-attaches at the same index — the revival
+    /// mechanics, with counts continuing in place.
+    #[ignore = "privileged: real Detailed Session revival probe"]
+    #[test]
+    fn revival_probe_clears_a_live_detached_slot_lp64() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::collections::BTreeSet as Set;
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let retired: Set<usize> = Set::from([0]);
+        anyhow::ensure!(
+            session.revival_detached(&retired).is_empty(),
+            "live links never clear"
+        );
+        anyhow::ensure!(
+            session.revival_finalized(0),
+            "no call yet: entered equals returned, no START row"
+        );
+        // A planted in-flight row unfinalizes the slot; removing it
+        // finalizes again. Value bytes are opaque to the scan.
+        let fake = p11scope_ebpf_common::StartKey {
+            pid_tgid: u64::MAX,
+            slot: 0,
+            _pad: 0,
+        };
+        {
+            let mut starts: aya::maps::HashMap<
+                _,
+                p11scope_ebpf_common::StartKey,
+                p11scope_ebpf_common::CallStart,
+            > = aya::maps::HashMap::try_from(session.ebpf.map_mut("START").context("START map")?)?;
+            starts.insert(&fake, &p11scope_ebpf_common::CallStart::default(), 0)?;
+        }
+        anyhow::ensure!(
+            !session.revival_finalized(0),
+            "an in-flight START row blocks finality"
+        );
+        {
+            let mut starts: aya::maps::HashMap<
+                _,
+                p11scope_ebpf_common::StartKey,
+                p11scope_ebpf_common::CallStart,
+            > = aya::maps::HashMap::try_from(session.ebpf.map_mut("START").context("START map")?)?;
+            starts.remove(&fake)?;
+        }
+        {
+            let mut object_starts: aya::maps::HashMap<
+                _,
+                p11scope_ebpf_common::StartKey,
+                [u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
+            > = aya::maps::HashMap::try_from(
+                session
+                    .ebpf
+                    .map_mut("OBJECT_START")
+                    .context("OBJECT_START map")?,
+            )?;
+            object_starts.insert(
+                &fake,
+                &[0u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
+                0,
+            )?;
+        }
+        anyhow::ensure!(
+            !session.revival_finalized(0),
+            "an in-flight OBJECT_START row blocks finality"
+        );
+        {
+            let mut object_starts: aya::maps::HashMap<
+                _,
+                p11scope_ebpf_common::StartKey,
+                [u8; size_of::<p11scope_ebpf_common::object_wire::ObjectStart>()],
+            > = aya::maps::HashMap::try_from(
+                session
+                    .ebpf
+                    .map_mut("OBJECT_START")
+                    .context("OBJECT_START map")?,
+            )?;
+            object_starts.remove(&fake)?;
+        }
+        anyhow::ensure!(
+            session.revival_finalized(0),
+            "finalized again once no row names the slot"
+        );
+        // A live detach clears the slot; it re-attaches at the same index.
+        session.detach_slots(&plan.slots)?;
+        anyhow::ensure!(!session.has_slot_link(0), "the live detach closed it");
+        anyhow::ensure!(
+            session.revival_detached(&retired) == Set::from([0]),
+            "a live-detached Multi slot clears"
+        );
+        anyhow::ensure!(session.revival_finalized(0));
+        session.attach_targets(&plan.slots, &pins, &Set::new())?;
+        anyhow::ensure!(session.has_slot_link(0), "revival re-attaches it");
+        anyhow::ensure!(
+            session.revival_detached(&retired).is_empty(),
+            "re-attached links never clear"
+        );
+        eprintln!("retirement-cell multi: revival probe cleared and re-attached slot 0");
+        Ok(())
+    }
+
+    /// Revival probe on Singles: slots never clear — Singles retires
+    /// logically and closes links only at the terminal detach, so reuse
+    /// would re-cookie a live link.
+    #[ignore = "privileged: real Detailed Session revival probe"]
+    #[test]
+    fn revival_probe_never_clears_a_singles_slot_lp64() -> anyhow::Result<()> {
+        use std::collections::BTreeSet as Set;
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Singles,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let retired: Set<usize> = Set::from([0]);
+        anyhow::ensure!(
+            session.revival_detached(&retired).is_empty(),
+            "live Singles links never clear"
+        );
+        session.detach_slots(&plan.slots)?;
+        anyhow::ensure!(
+            session.revival_detached(&retired).is_empty(),
+            "Singles never clears, even past a logical detach"
+        );
+        eprintln!("retirement-cell singles: revival probe stayed empty");
         Ok(())
     }
 

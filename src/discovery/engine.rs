@@ -569,6 +569,15 @@ pub struct Engine {
     /// native retirement settles. It grants no admission authority.
     immediate_exec_recovery_frame: bool,
     pending_global_retirement: Option<RetirementTicket>,
+    /// Retired slots the last revival refresh observed physically
+    /// detached. A slot clears for revival only when observed detached
+    /// on two consecutive refreshes, so reuse is always decided after
+    /// the tick that observed completion (the drain barrier).
+    revival_observed_detached: BTreeSet<u32>,
+    /// Detached slots whose counts the session proved final (entered
+    /// equals returned, no START row). Stable while detached: entries
+    /// leave when their slot does (revived or withdrawn).
+    revival_finalized: BTreeSet<u32>,
     global_retirement_frame_owed: bool,
     /// Terminal-drain quanta that stopped at the shared allowance with
     /// terminal work unfinished. Sticky evidence, like quiescence
@@ -3197,6 +3206,19 @@ pub(crate) trait EngineSession {
     fn has_slot_link(&self, _: u32) -> bool {
         false
     }
+    /// Retired slots whose probes are provably gone: the Multi backend,
+    /// no owned link covers them, no retained static target or group
+    /// deferral names them, and no native retirement is pending or
+    /// uncertain. Fail-closed default: unknown sessions detach nothing.
+    fn revival_detached(&self, _: &BTreeSet<usize>) -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
+    /// Whether a detached slot's counts are final and nothing is in
+    /// flight: its STATS entered equals returned on every CPU and no
+    /// START or OBJECT_START row names it. Fail-closed default.
+    fn revival_finalized(&self, _: u32) -> bool {
+        false
+    }
     /// The session's retained attach-complete instant for one slot, if it
     /// ever attached (packet 6.13, R2-D1-5). Scripted sessions override.
     fn slot_attached_at(&self, _: u32) -> Option<u64> {
@@ -3478,6 +3500,12 @@ impl EngineSession for Session {
     }
     fn has_slot_link(&self, slot: u32) -> bool {
         Session::has_slot_link(self, slot)
+    }
+    fn revival_detached(&self, retired: &BTreeSet<usize>) -> BTreeSet<u32> {
+        Session::revival_detached(self, retired)
+    }
+    fn revival_finalized(&self, slot: u32) -> bool {
+        Session::revival_finalized(self, slot)
     }
     fn slot_attached_at(&self, slot: u32) -> Option<u64> {
         Session::slot_attached_at(self, slot)
@@ -11181,6 +11209,8 @@ impl Engine {
             frame_fresh_blocked: false,
             immediate_exec_recovery_frame: false,
             pending_global_retirement: None,
+            revival_observed_detached: BTreeSet::new(),
+            revival_finalized: BTreeSet::new(),
             global_retirement_frame_owed: false,
             terminal_capacity_backlog: 0,
             discovery_held_high_water: 0,
@@ -23085,6 +23115,14 @@ impl Engine {
         ))
     }
 
+    /// Recomputes which retired targets the next rebuild may revive onto
+    /// their old indices: Detailed policy only, no pending retirement,
+    /// observed physically detached on two consecutive refreshes, and
+    /// counts proved final. Runs after every candidate application, so
+    /// the merge it feeds always reads fresh session truth.
+    /// STUB: clears nothing and clears no target until revival lands.
+    fn refresh_revivable(&mut self, _session: &dyn EngineSession) {}
+
     /// Keep recovery work owed by a later matched EXEC. This only retains an
     /// existing request; it grants no continuity or attachment authority. The
     /// ordinary next tick still scans, admits and validates every mutation.
@@ -32908,6 +32946,11 @@ pub(crate) mod session_fixture {
         /// sets them; production `Session` supplies the real ones.
         pub(crate) scripted_links: BTreeSet<u32>,
         pub(crate) scripted_stamps: BTreeMap<u32, u64>,
+        /// Scripted revival probe: retired slots reported physically
+        /// detached, and detached slots reported counts-final. Empty
+        /// unless a test sets them (fail-closed like the trait).
+        pub(crate) scripted_revival_detached: BTreeSet<u32>,
+        pub(crate) scripted_revival_finalized: BTreeSet<u32>,
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
         counter_script: RefCell<VecDeque<bool>>,
@@ -33193,6 +33236,16 @@ pub(crate) mod session_fixture {
         }
         fn slot_attached_at(&self, slot: u32) -> Option<u64> {
             self.scripted_stamps.get(&slot).copied()
+        }
+        fn revival_detached(&self, retired: &BTreeSet<usize>) -> BTreeSet<u32> {
+            self.scripted_revival_detached
+                .iter()
+                .copied()
+                .filter(|slot| retired.contains(&(*slot as usize)))
+                .collect()
+        }
+        fn revival_finalized(&self, slot: u32) -> bool {
+            self.scripted_revival_finalized.contains(&slot)
         }
         fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
             self.pid_continuity

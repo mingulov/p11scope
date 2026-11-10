@@ -8405,6 +8405,16 @@ fn startup_hook_recount_line(elapsed_ms: Option<u64>) -> String {
     }
 }
 
+/// Gate the loader-hook recount (startup T2): the recount closure runs
+/// only when diagnostics are on, so the off path provably never touches
+/// the engine.
+fn loader_readiness_hooks(
+    _diagnostics_on: bool,
+    _recount: impl FnOnce() -> usize,
+) -> Option<usize> {
+    None
+}
+
 /// Inserts a report line before the trailing `-v` hint of a concise
 /// frame, or appends it to a frame without one (quiet, verbose).
 /// Matched on the shared hint constant, never a copy of its text.
@@ -26402,6 +26412,54 @@ int main(int argc, char **argv) {
                 .find(marker)
                 .expect("recount marker after the call");
             pos += at + marker.len();
+        }
+    }
+
+    /// Startup T2: the recount gate returns the count only when
+    /// diagnostics are on; the off path never runs the recount.
+    #[test]
+    fn loader_readiness_hooks_gates_the_recount_on_diagnostics() {
+        assert_eq!(
+            loader_readiness_hooks(false, || panic!("the off path must not recount")),
+            None
+        );
+        assert_eq!(loader_readiness_hooks(true, || 7), Some(7));
+    }
+
+    /// Startup T2: both capture loops emit the ready line before the
+    /// gated loader-readiness line. The loops need a live session, so
+    /// the order is pinned statically.
+    #[test]
+    fn both_capture_loops_emit_readiness_after_the_ready_line() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let profile = production
+            .split_once("fn capture_profile(")
+            .expect("profile loop")
+            .1
+            .split_once("fn capture_trace(")
+            .expect("trace loop bounds the profile loop")
+            .0;
+        let trace = production
+            .split_once("fn capture_trace(")
+            .expect("trace loop")
+            .1
+            .split_once("fn terminal_trace_count_line(")
+            .expect("terminal line bounds the trace loop")
+            .0;
+        for (name, body) in [("profile", profile), ("trace", trace)] {
+            let mut pos = 0;
+            for marker in [
+                "capture_ready_line(",
+                "loader_readiness_hooks(",
+                "loader_readiness_line(",
+                "startup_hook_recount_line(",
+            ] {
+                let at = body[pos..]
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("{name} loop lacks {marker}"));
+                pos += at + marker.len();
+            }
         }
     }
 

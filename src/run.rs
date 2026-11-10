@@ -7229,7 +7229,7 @@ fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> 
 /// Gives unsafe rendering the same diagnostic shape expectations that
 /// `Session::start` published to `MECH_SHAPE`.
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
-    let registry = crate::vendor_mechanisms::load_registry()
+    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
     // Render may only claim a published shape for ids the publication
     // actually fit: approved-but-unpublished ids read "no diagnostic
@@ -13154,6 +13154,7 @@ pub(crate) fn evidence_for(
         async_evictions: semantic.async_evictions,
         fork_state_ambiguities: semantic.fork_state_ambiguities,
         semantic_state_drops: semantic.semantic_state_drops,
+        mechanism_id_overflow: semantic.mechanism_id_overflow,
         semantic_history_drops: semantic.semantic_history_drops,
         pending_at_end: state.pending_at_end(),
         malformed_records,

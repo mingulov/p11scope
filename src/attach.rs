@@ -7870,11 +7870,14 @@ impl Session {
                     publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
                 }
                 SessionPreparation::PublishShapes => {
-                    // Embedded defaults plus the p11scope vendor overlay: this
-                    // binary ships statically and has no config-file plumbing
-                    // yet. A future task can thread a path through here
-                    // without touching the publish-before-attach placement.
-                    let registry = crate::vendor_mechanisms::load_registry()
+                    // Embedded defaults; there are no vendor name tables
+                    // (owner, 2026-11-10): every vendor's ids publish by
+                    // number through the generic unregistered path, never by
+                    // a per-vendor list. This binary ships statically and has
+                    // no config-file plumbing yet. A future task can thread a
+                    // path through here without touching the
+                    // publish-before-attach placement.
+                    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
                         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
                     let publication = crate::shapes::publish(&mut ebpf, &registry)
                         .context("publishing MECH_SHAPE")?;

@@ -94,12 +94,19 @@ codes, latency and admitted lifecycle observations. Key creation, derivation
 and destruction are shown the same way: calls such as `C_CreateObject`,
 `C_GenerateKey`, `C_GenerateKeyPair`, `C_DeriveKey`, `C_UnwrapKey`,
 `C_CopyObject` and `C_DestroyObject` appear as function rows with their
-mechanism id and call count, including named vendor key-generation
-mechanisms (for example NSS `CKM_NSS_*` ids); parameters and key material
-are never decoded. Mechanism ids outside the registry are shown as bare
-hex numbers with their call/error counts, marked unregistered
-(`registered: false` in JSON), instead of only a total. Ids above
-`0xFFFFFFFF` count in the total only. Profile, trace
+mechanism id and call count; parameters and key material
+are never decoded. Every observed mechanism id is shown with its
+call/error counts: standard ids keep their `CKM_*` name, ids at or
+above `CKM_VENDOR_DEFINED` (`0x80000000`) show as `vendor-defined 0x…`
+with the exact number, and other unknown ids show as `unknown 0x…`.
+There are no vendor name tables: every vendor's ids (NSS, CloudHSM,
+Thales, YubiHSM, any other) publish the same way, by number. Ids
+outside the registry are marked unregistered (`registered: false` in
+JSON) instead of only a total. Ids above `0xFFFFFFFF` count in the
+total only. The per-id table holds 256 distinct ids per capture;
+further observations shed into the named
+`evidence.mechanism_id_overflow` count and force `PARTIAL`, never
+silently. Profile, trace
 and metrics publish no object handles
 or object attribute facts. `evidence.object_capture`
 reports build availability, not an observed attribute. The unsafe diagnostic

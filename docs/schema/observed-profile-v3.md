@@ -210,6 +210,17 @@ revision; historical v2 documents list registered ids only and lack
 the `registered` key. `cgroups[].mechanisms[]` rows carry the same
 `registered` flag with the same meaning.
 
+Every `mechanisms[]` and `cgroups[].mechanisms[]` row also carries
+`name`: the `CKM_*` name when the id is a known standard mechanism,
+else null, never guessed. There are no vendor name tables, so every
+vendor-range id carries null and its number. Profile text shows
+`vendor-defined 0x…` (ids at or above `0x80000000`) or `unknown 0x…`
+(other unknown ids) with counts; the JSON rows carry the numeric id
+(`mechanism`) beside the name. Like `registered`, `name` is a
+v3-additive disclosure with no new schema revision. The per-id table
+holds 256 distinct ids per capture; shed observations count in
+`evidence.mechanism_id_overflow` and force `PARTIAL`.
+
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten
 pre-initialization `C_GetInterface` calls. Selection evidence is therefore a

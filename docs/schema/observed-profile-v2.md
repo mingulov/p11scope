@@ -350,6 +350,7 @@ Process and semantic uncertainty:
 | `async_evictions` | Async state evicted at its bounded capacity. |
 | `fork_state_ambiguities` | A child used state that was not proven fork-safe. |
 | `semantic_state_drops` | New semantic keys refused after the bounded per-capture state budget was exhausted. Aggregate kernel counts remain authoritative. |
+| `mechanism_id_overflow` | v3 only: mechanism observations shed because the per-id table already held 256 distinct ids, one count per shed observation. Forces `PARTIAL`. Absent from historical v2 documents. |
 | `semantic_history_drops` | Closed or unauthenticated history records omitted from semantic totals: a rejected admission is counted here and gates `completeness`, never dropped silently. Forces `PARTIAL`. |
 | `pending_at_end` | Pending or detached async records remaining at shutdown. |
 | `orphan_ops` | Operational calls without a captured active init. Informational because attach may start mid-operation. |
@@ -487,6 +488,7 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 | Field | Meaning |
 | --- | --- |
 | `mechanism`, `mechanism_hex` | 64-bit mechanism id. Registered ids are admitted by the capture policy (finite published registry membership); v3 documents additionally list unregistered ids as bare numbers with counts (see `registered`). Historical v2 documents list registered ids only. |
+| `name` | v3 only: the `CKM_*` name when the id is a known standard mechanism, else null, never guessed. There are no vendor name tables. Absent from historical v2 documents. |
 | `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded, never named). Absent from historical v2 documents. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
@@ -540,8 +542,8 @@ Each item has numeric `cgroup_id`, best-effort `label`, calls, errors, and a
 per-mechanism breakdown. A missing label is `null`; the resolver never guesses.
 Each per-mechanism row carries the numeric id (`mechanism`,
 `mechanism_hex`), calls and errors; v3 documents additionally carry
-`registered` with the same meaning as `mechanisms[]` `registered`
-(absent from historical v2 documents).
+`name` and `registered` with the same meaning as the `mechanisms[]`
+fields (absent from historical v2 documents).
 
 ## v1.4 → v2 migration
 

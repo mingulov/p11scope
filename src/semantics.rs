@@ -74,8 +74,8 @@ mod corrective_tests {
     use super::*;
     use crate::plan::{AttachPlan, Slot};
 
-    /// Unassigned NSS vendor gap, the codebase's unknown-vendor
-    /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
+    /// Unassigned vendor-block gap, the codebase's unknown-vendor
+    /// sentinel: exact registry membership never admits it.
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
     #[test]
@@ -157,11 +157,38 @@ mod corrective_tests {
         for i in 0..300u64 {
             state.observe(&mechanism(&p, "C_SignInit", 7, 0x1_0000 + i, 0));
         }
+        assert_eq!(state.mechanisms().len(), MAX_MECHANISMS);
+        // One overflow count per shed observation: 300 distinct ids, the
+        // first 256 admitted, the remaining 44 shed.
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 44);
         assert!(
-            state.mechanisms().len() <= 256,
-            "table holds {} ids",
-            state.mechanisms().len()
+            state.mechanisms().contains_key(&0x1_0000),
+            "first admitted id stays"
         );
+        assert!(
+            !state.mechanisms().contains_key(&(0x1_0000 + 299)),
+            "last shed id keeps no row"
+        );
+    }
+
+    #[test]
+    fn mechanism_overflow_counts_repeat_sheds_without_new_rows() {
+        // Repeat observations on admitted ids accumulate calls; repeat
+        // observations on a shed id shed again — the count tracks shed
+        // observations, not shed ids.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        for i in 0..256u64 {
+            state.observe(&mechanism(&p, "C_SignInit", 7, 0x1_0000 + i, 0));
+        }
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 0);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1_0000, 0));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x2_0000, 0));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x2_0000, 0));
+        assert_eq!(state.mechanisms()[&0x1_0000].calls, 2);
+        assert_eq!(state.mechanisms().len(), MAX_MECHANISMS);
+        assert!(!state.mechanisms().contains_key(&0x2_0000));
+        assert_eq!(state.semantic_evidence().mechanism_id_overflow, 2);
     }
 
     /// Two providers sharing one process: slots 0/2 (`C_SignInit`/`C_Sign`)
@@ -2165,6 +2192,12 @@ pub struct SemanticEvidence {
     /// New semantic keys refused after the bounded per-capture budget was
     /// exhausted. Aggregate kernel counts remain authoritative.
     pub semantic_state_drops: u64,
+    /// Mechanism observations shed because the per-id table already held
+    /// [`MAX_MECHANISMS`] distinct ids: one count per shed observation,
+    /// saturating, never silent. The shed id keeps no row and no
+    /// cgroup/module cell; row calls plus this count account for every
+    /// mechanism-bearing observation the budget admitted.
+    pub mechanism_id_overflow: u64,
     /// Closed or unauthenticated history records omitted from semantic totals.
     pub semantic_history_drops: u64,
 }
@@ -2337,6 +2370,12 @@ pub(crate) const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_DECAPSULATE;
 pub(crate) const MAX_PENDING: usize = 16_384;
 pub(crate) const MAX_STATE_KEYS: usize = 16_384;
+/// Distinct mechanism ids the capture-wide per-id table holds: the same
+/// 256 as the per-edge reducer's [`crate::semantics_edge::MAX_EDGE_MECHANISMS`].
+/// A new id past the cap sheds its observation into
+/// [`SemanticEvidence::mechanism_id_overflow`] (row, cgroup cell and
+/// module cell all skipped), never silently and never by growing the table.
+pub(crate) const MAX_MECHANISMS: usize = 256;
 
 fn pid_of(ev: &Event) -> u32 {
     (ev.pid_tgid >> 32) as u32
@@ -2863,6 +2902,15 @@ impl State {
         let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
             return;
         };
+        // The per-id table cap precedes the shared budget: a new id past
+        // 256 sheds here with its own named count, keeping no row and no
+        // cgroup/module cell, instead of falling through to the generic
+        // budget refusal below.
+        if !self.mechanisms.contains_key(&mechanism) && self.mechanisms.len() >= MAX_MECHANISMS {
+            self.evidence.mechanism_id_overflow =
+                self.evidence.mechanism_id_overflow.saturating_add(1);
+            return;
+        }
         // E19: fuse the admission probe and the insert into one entry lookup.
         // Admission still precedes insertion; the `contains_key` decides the
         // budget before `entry` materializes the cell.
@@ -2969,6 +3017,16 @@ impl State {
             }
         }
         for (mechanism, unregistered) in mechanisms {
+            // The per-id table cap precedes the shared budget here too: a
+            // new id past 256 sheds entirely (no cgroup cell either —
+            // unlike a budget refusal, which still records cgroup
+            // attribution) with its own named count.
+            if !self.mechanisms.contains_key(&mechanism) && self.mechanisms.len() >= MAX_MECHANISMS
+            {
+                self.evidence.mechanism_id_overflow =
+                    self.evidence.mechanism_id_overflow.saturating_add(1);
+                continue;
+            }
             // E19: same fused admission-before-insertion as
             // `record_requested_mechanism`: one probe plus one entry. A
             // refused mechanism cell still records cgroup attribution,

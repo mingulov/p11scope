@@ -46,6 +46,7 @@
         "handoff_child_pid", "in_flight_at_end", "interface_list",
         "kernel_control",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
+        "mechanism_id_overflow",
         "module_ambiguous", "module_unresolved_slots", "modules_skipped", "object_capture",
         "operation_state_imports",
         "orphan_ops", "p11scope_env", "pause", "pause_attempts", "pid_namespace",
@@ -313,6 +314,7 @@
             }
           }
         },
+        "mechanism_id_overflow": {"type": "integer", "minimum": 0},
         "module_ambiguous": {"type": "integer", "minimum": 0},
         "modules_skipped": {
           "type": "array",

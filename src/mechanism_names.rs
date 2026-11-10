@@ -7,17 +7,14 @@
 //! (`crates/types/src/mechanism_official.rs` at the pinned rev):
 //! every official id maps to its header name, sorted by id. No
 //! hand-written literals: re-run the generator (see the S1 report)
-//! when the pin moves. Named vendor ids from the p11scope overlay
-//! (`vendor_mechanisms::VENDOR_MECHANISMS`, NSS `CKM_NSS_*`
-//! key-creation/derivation ids from `pkcs11n.h`) resolve through the
-//! fallthrough below. Every other id outside those two lists —
-//! vendor ids (`>= 0x8000_0000`) and unregistered ids — has no name
-//! and renders verbatim as `0x…`, never guessed.
+//! when the pin moves. There are no vendor name tables (owner,
+//! 2026-11-10): every vendor's ids publish by number, so an id
+//! outside the official list has no name and renders with its exact
+//! number (see [`mechanism_label`]), never guessed.
 
-/// Official `CKM_*` name for a registered mechanism id, falling back
-/// to the p11scope vendor overlay for named `CKM_NSS_*` ids, or `None`
-/// when the id is otherwise vendor-defined or unregistered. The
-/// caller renders `None` as the verbatim hex id.
+/// Official `CKM_*` name for a standard mechanism id, or `None` when
+/// the id is vendor-defined or otherwise unknown. The caller renders
+/// `None` through [`mechanism_label`], never by guessing a name.
 pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
     match id {
         0x00000000 => Some("CKM_RSA_PKCS_KEY_PAIR_GEN"),
@@ -483,7 +480,24 @@ pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
         0x00004038 => Some("CKM_ECDH_X_AES_KEY_WRAP"),
         0x00004039 => Some("CKM_ECDH_COF_AES_KEY_WRAP"),
         0x0000403A => Some("CKM_PUB_KEY_FROM_PRIV_KEY"),
-        _ => crate::vendor_mechanisms::vendor_mechanism_name(id),
+        _ => None,
+    }
+}
+
+/// Table label for any observed mechanism id: the `CKM_*` name when
+/// the id is a known standard mechanism, `vendor-defined 0x…` for ids
+/// at or above `CKM_VENDOR_DEFINED` (`0x8000_0000`), and `unknown 0x…`
+/// for any other id. The hex is the exact id (`0x{id:x}`, the same
+/// spelling as `mechanism_hex`); a label never guesses a vendor's
+/// name for its number.
+pub(crate) fn mechanism_label(id: u64) -> String {
+    if let Some(name) = mechanism_name(id) {
+        return name.to_string();
+    }
+    if id >= 0x8000_0000 {
+        format!("vendor-defined 0x{id:x}")
+    } else {
+        format!("unknown 0x{id:x}")
     }
 }
 
@@ -515,21 +529,20 @@ mod tests {
     }
 
     #[test]
-    fn nss_vendor_keygen_ids_are_named() {
-        // NSS `lib/util/pkcs11n.h` (`CKM_NSS` = `0xCE534350`): the TLS
-        // ephemeral keygen ids from the vendor overlay, not guesses.
+    fn labels_name_known_ids_and_number_the_rest() {
         assert_eq!(
-            mechanism_name(0xCE53_437F),
-            Some("CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN")
+            mechanism_label(pkcs11_types::CkMechanismType::AES_GCM.0),
+            "CKM_AES_GCM"
         );
-        assert_eq!(
-            mechanism_name(0xCE53_4380),
-            Some("CKM_NSS_ML_KEM_KEY_PAIR_GEN")
-        );
-        assert_eq!(
-            mechanism_name(0xCE53_437D),
-            Some("CKM_NSS_KYBER_KEY_PAIR_GEN")
-        );
+        assert_eq!(mechanism_label(0xCE53_4351), "vendor-defined 0xce534351");
+        assert_eq!(mechanism_label(0x0000_FFFF), "unknown 0xffff");
+    }
+
+    #[test]
+    fn label_boundary_is_the_vendor_defined_base() {
+        assert_eq!(mechanism_label(0x7FFF_FFFF), "unknown 0x7fffffff");
+        assert_eq!(mechanism_label(0x8000_0000), "vendor-defined 0x80000000");
+        assert_eq!(mechanism_label(0xFFFF_FFFF), "vendor-defined 0xffffffff");
     }
 
     #[test]

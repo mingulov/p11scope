@@ -38,6 +38,7 @@ COUNTERS = (
     "async_evictions",
     "fork_state_ambiguities",
     "semantic_state_drops",
+    "mechanism_id_overflow",
     "semantic_history_drops",
     "pending_at_end",
     "malformed_records",
@@ -74,6 +75,7 @@ HISTORICAL_COUNTERS = tuple(
         "task_uprobe_link_losses",
         "semantic_history_drops",
         "unpublished_mechanisms",
+        "mechanism_id_overflow",
     }
 )
 
@@ -2193,7 +2195,8 @@ def expected_gap_classes(evidence):
                 "session_cancel_unknown_flags", "operation_state_imports",
                 "auth_state_ambiguities", "async_target_failures", "async_orphans",
                 "async_duplicates", "async_evictions", "fork_state_ambiguities",
-                "semantic_state_drops", "semantic_history_drops", "pending_at_end",
+                "semantic_state_drops", "mechanism_id_overflow",
+                "semantic_history_drops", "pending_at_end",
             )
         ] + [
             ("templates_truncated", evidence["templates_truncated"] is True),
@@ -4595,6 +4598,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
             evidence.pop("unpublished_mechanisms", None)
+            evidence.pop("mechanism_id_overflow", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
             evidence.pop("kernel_control", None)
@@ -6640,6 +6644,7 @@ def self_test():
         ("in_flight_at_end", 1),
         ("aliased", ["C_Sign"]),
         ("semantic_state_drops", 1),
+        ("mechanism_id_overflow", 1),
         ("semantic_history_drops", 1),
         ("rv_update_failures", 1),
         ("abi_refusals", 1),

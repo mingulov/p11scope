@@ -9,7 +9,7 @@ use crate::discovery::elf_needed::{
 };
 use crate::discovery::scan::{ExcludedRecord, Skipped};
 use crate::kinds;
-use crate::mechanism_names::mechanism_name;
+use crate::mechanism_names::{mechanism_label, mechanism_name};
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
 use crate::semantic_capture::InstanceReloadNotExcluded;
@@ -1170,6 +1170,12 @@ pub struct Evidence {
     pub async_evictions: u64,
     pub fork_state_ambiguities: u64,
     pub semantic_state_drops: u64,
+    /// Mechanism observations shed because the per-id table already held
+    /// 256 distinct ids (`semantics::SemanticEvidence::mechanism_id_overflow`):
+    /// one count per shed observation. The shed ids keep no row anywhere,
+    /// so row calls plus this count account for every mechanism-bearing
+    /// observation. Forces `PARTIAL`, like every other shed observation.
+    pub mechanism_id_overflow: u64,
     pub semantic_history_drops: u64,
     pub pending_at_end: u64,
     /// Ring-buffer records rejected by the size check (`events::OwnedDrain`/`EventDrain`).
@@ -2258,6 +2264,7 @@ impl Evidence {
         cause(s, "async_evictions", self.async_evictions > 0);
         cause(s, "fork_state_ambiguities", self.fork_state_ambiguities > 0);
         cause(s, "semantic_state_drops", self.semantic_state_drops > 0);
+        cause(s, "mechanism_id_overflow", self.mechanism_id_overflow > 0);
         cause(s, "semantic_history_drops", self.semantic_history_drops > 0);
         cause(s, "pending_at_end", self.pending_at_end > 0);
         cause(s, "templates_truncated", self.templates_truncated);
@@ -3649,14 +3656,23 @@ pub fn live_scoped_with_verbosity_and_sessions(
         let mut rows: Vec<(&u64, &MechStat)> = mechanisms.iter().collect();
         rows.sort_by(|(a_id, a), (b_id, b)| b.calls.cmp(&a.calls).then(a_id.cmp(b_id)));
         for (id, stat) in rows {
-            let name = mechanism_name(*id)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("0x{id:x}"));
+            let name = mechanism_label(*id);
             s.push_str(&format!(
                 "{:<28} {:>8} {:>6}\n",
                 escape_controls(&name),
                 stat.calls,
                 stat.errors
+            ));
+        }
+        if ev.mechanism_id_overflow > 0 {
+            s.push_str(&format!(
+                "plus {} further mechanism observation{} beyond the 256-id table (see Coverage).\n",
+                ev.mechanism_id_overflow,
+                if ev.mechanism_id_overflow == 1 {
+                    ""
+                } else {
+                    "s"
+                },
             ));
         }
     } else if reports.iter().any(|r| r.calls > 0 || r.in_flight > 0) {
@@ -4175,6 +4191,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 ev.template_tail_failures,
                 "attribute-list read not recorded",
                 "attribute-list reads not recorded",
+            ),
+            "mechanism_id_overflow" => count(
+                ev.mechanism_id_overflow,
+                "mechanism observation beyond the 256-id table",
+                "mechanism observations beyond the 256-id table",
             ),
             "semantic_history_drops" => count(
                 ev.semantic_history_drops,
@@ -4810,6 +4831,10 @@ struct MechanismOut {
     /// Verbatim id — vendor ids survive unchanged, never renamed or dropped.
     mechanism: u64,
     mechanism_hex: String,
+    /// The `CKM_*` name when the id is a known standard mechanism, else
+    /// null — never guessed. There are no vendor name tables, so every
+    /// vendor-range id carries null here and its number above.
+    name: Option<&'static str>,
     /// The BPF return path found this id in `MECH_SHAPE` (registry
     /// membership, parameter shape published). `false` marks an
     /// unregistered publication: numeric id plus call/error counts
@@ -5014,6 +5039,9 @@ struct SessionsOut {
 struct CgroupMechOut {
     mechanism: u64,
     mechanism_hex: String,
+    /// The `CKM_*` name when the id is a known standard mechanism, else
+    /// null — never guessed. Same meaning as the top-level rows' `name`.
+    name: Option<&'static str>,
     /// The BPF return path found this id in `MECH_SHAPE` (registry
     /// membership). `false` marks an unregistered publication:
     /// numeric id plus call/error counts only, never decoded, never
@@ -5063,6 +5091,7 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
                 .map(|(&mechanism, m)| CgroupMechOut {
                     mechanism,
                     mechanism_hex: format!("0x{mechanism:x}"),
+                    name: mechanism_name(mechanism),
                     registered: !m.unregistered,
                     calls: m.calls,
                     errors: m.errors,
@@ -5209,6 +5238,7 @@ pub fn profile_json(
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
+                name: mechanism_name(*id),
                 registered: !m.unregistered,
                 ops: m.ops.iter().cloned().collect(),
                 calls: m.calls,
@@ -5678,6 +5708,7 @@ pub(crate) mod tests {
             async_evictions: 0,
             fork_state_ambiguities: 0,
             semantic_state_drops: 0,
+            mechanism_id_overflow: 0,
             semantic_history_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,
@@ -12314,6 +12345,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn live_view_notes_mechanism_table_overflow() {
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x250, mech_stat(8, 1))].into_iter().collect();
+        let render = |overflow: u64| {
+            let mut ev = evidence();
+            ev.mechanism_id_overflow = overflow;
+            ev.verdict();
+            live_scoped_with_verbosity(
+                &[report("C_Sign", 8, 1, false)],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &mechanisms,
+                crate::cli::TextVerbosity::Verbose,
+            )
+        };
+        let out = render(3);
+        assert!(
+            out.contains("plus 3 further mechanism observations beyond the 256-id table"),
+            "{out}"
+        );
+        let one = render(1);
+        assert!(
+            one.contains("plus 1 further mechanism observation beyond the 256-id table"),
+            "{one}"
+        );
+        let clean = render(0);
+        assert!(!clean.contains("beyond the 256-id table"), "{clean}");
+    }
+
+    #[test]
     fn live_view_without_mechanisms_shows_no_table() {
         let mut ev = evidence();
         ev.verdict();
@@ -13682,6 +13747,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn policy_output_mechanism_id_overflow_forces_partial_and_renders_live() {
+        let mut ev = evidence();
+        ev.mechanism_id_overflow = 2;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            crate::attach::CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("privacy=allowlisted"), "{out}");
+        assert!(
+            out.contains("2 mechanism observations beyond the 256-id table"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn policy_output_live_headers_use_every_selected_policy_label() {
         for (policy, label) in [
             (CapturePolicy::Allowlisted, "allowlisted"),
@@ -14093,9 +14183,10 @@ pub(crate) mod tests {
         assert_eq!(value["evidence"]["completeness"], "COMPLETE");
     }
 
-    /// Unassigned NSS vendor gap (`CKM_NSS` + 89), the codebase's
+    /// Unassigned vendor-block gap (`0xCE53_43A9`), the codebase's
     /// unknown-vendor sentinel: exact registry membership never admits
-    /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
+    /// it, and there are no vendor name tables (owner, 2026-11-10), so
+    /// it always publishes by number.
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
     fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {
@@ -14956,6 +15047,37 @@ pub(crate) mod tests {
             cg222["mechanisms"],
             serde_json::json!([]),
             "allowlisted capture must not attribute a rejected init as a mechanism request"
+        );
+    }
+
+    #[test]
+    fn profile_json_cgroup_mechanism_rows_carry_name() {
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut known = init_event(0, 0x0D, 0, 0, 0, 0);
+        known.cgroup_id = 111;
+        state.observe(&known);
+        let mut vendor = init_event(0, 0xCE53_4351, 0, 0, 0, 0);
+        vendor.cgroup_id = 111;
+        vendor.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&vendor);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+        let cg111 = v["cgroups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["cgroup_id"] == 111)
+            .expect("cgroup 111 present");
+        let rows = cg111["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let by_id = |id: u64| rows.iter().find(|row| row["mechanism"] == id).unwrap();
+        assert_eq!(by_id(0x0D)["name"], "CKM_RSA_PKCS_PSS");
+        assert_eq!(
+            by_id(0xCE53_4351).get("name"),
+            Some(&serde_json::Value::Null)
         );
     }
 

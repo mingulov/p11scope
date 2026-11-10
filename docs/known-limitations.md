@@ -2139,7 +2139,7 @@ The old bounds are measurements, not a product startup SLA.
   userspace-only path), so an unavailable witness there publishes
   the scanned row with the named gap (PARTIAL coverage, no proof
   claimed) instead of an empty view; a proven-another-file verdict
-  still never joins. The row's original edge reads `ended`, its
+  still never joins. A proven-another-file row's original edge reads `ended`, its
   later calls are not counted, and no new-module edge is emitted; a
   process that maps the upper copy is still attributed exactly. The
   sweep carries the same no-fallback rule: an overlay key (overlayfs

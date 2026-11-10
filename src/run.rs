@@ -4431,9 +4431,13 @@ fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
 }
 
 /// Commits a staged duration handoff after publication: a live child is
-/// handed back running (the stored note stays for the terminal print),
-/// while a child that exited between the stage and this commit keeps its
-/// natural exit, reaped here instead of failing an already-published run.
+/// handed back running (the stored note stays for the terminal print).
+/// A child that exited after the report sealed keeps the sealed
+/// handed-back disposition: this reaps the zombie but records nothing
+/// over the sealed claim, so the report and the exit agree, and names
+/// the raced exit with its status for the terminal print. A pre-seal
+/// exit never reaches here: the terminal refresh reaps it before the
+/// seal, so the report and the exit carry its natural status.
 fn commit_staged_duration_handoff(
     pending: &mut Option<OwnedChild>,
     handoff_note: &mut Option<String>,
@@ -4444,26 +4448,73 @@ fn commit_staged_duration_handoff(
         return Ok(());
     }
     if commit_handoff(pending).is_ok() {
+        *exit_code = None;
+        *still_running = true;
         return Ok(());
     }
-    // The child exited between the stage and the commit: reap the
-    // natural exit instead of failing an already-published run.
+    // The child exited after the report sealed: the sealed handed-back
+    // claim stands, so this records nothing — it reaps the zombie and
+    // names the raced exit with its status for the terminal print.
+    let pid = pending
+        .as_ref()
+        .map(|child| child.pid())
+        .context("owned child missing during settlement")?;
     let child = pending
         .as_mut()
         .context("owned child missing during settlement")?;
-    let settled = child
-        .terminate_and_reap()
-        .map(ChildOutcome::Exited)
-        .map_err(|error| anyhow!("run: reaping the owned child: {error}"));
+    let settled = child.terminate_and_reap();
     let reaped = child.is_reaped();
-    let outcome = record_settlement_result(child, settled, exit_code, still_running);
     if reaped {
-        // No survivor was handed back, so no handoff note may print;
-        // and the spent owner must not stay staged.
-        *handoff_note = None;
+        // The spent owner must not stay staged.
         drop(pending.take());
     }
-    outcome
+    match settled {
+        Ok(code) => {
+            *handoff_note = Some(format_handed_back_exit_note(pid, code));
+            Ok(())
+        }
+        Err(error) => {
+            if reaped {
+                // Dead, but its status is unnameable: drop the live
+                // note rather than print it for a reaped child. The
+                // returned error names the reaping failure instead.
+                *handoff_note = None;
+            }
+            Err(anyhow!("run: reaping the owned child: {error}"))
+        }
+    }
+}
+
+/// Reaps a staged duration handoff whose child already exited, before
+/// the terminal evidence seals: the sealed `child_still_running` /
+/// `handoff_child_pid` and the process exit then agree on the natural
+/// status. Mirrors the observer-side race arm (reap, record, clear the
+/// staging, no live-handoff note) but never hands a live child back:
+/// a live child — or a liveness probe that errors — stays staged for
+/// the outer commit, which names a post-seal exit plainly instead of
+/// recording it over the sealed claim. Infallible by design: failing
+/// the seal here would drop the report the run owes.
+fn reap_exited_staged_handoff_before_seal(
+    pending: &mut Option<OwnedChild>,
+    handoff_note: &mut Option<String>,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
+) {
+    let Some(child) = pending.as_mut() else {
+        return;
+    };
+    // A signal-free probe: a zero timeout with no kill never touches a
+    // live child; an exited child is reaped by this wait itself.
+    let Ok(outcome) = child.wait_for(Some(Duration::ZERO), false) else {
+        return;
+    };
+    let exited @ ChildOutcome::Exited(_) = outcome else {
+        return;
+    };
+    let _ = record_settlement_result(child, Ok(exited), exit_code, still_running);
+    debug_assert!(child.is_reaped());
+    *handoff_note = None;
+    drop(pending.take());
 }
 
 /// Commits a staged observer-side handoff: a live child is handed back
@@ -5982,6 +6033,16 @@ fn format_handoff_note(pid: u32) -> String {
     format!(
         "p11scope: duration expired without --kill-on-timeout; handed back live child \
          pid {pid} (handoff committed, still running outside this capture)"
+    )
+}
+
+/// The raced-exit terminal note: the handed-back child exited after the
+/// report sealed, so the sealed handed-back claim stands and this names
+/// the exit with its status instead of recording it over the seal.
+fn format_handed_back_exit_note(pid: u32, code: i32) -> String {
+    format!(
+        "p11scope: duration expired without --kill-on-timeout; child pid {pid} \
+         exited during hand-back with status {code} (the sealed report names it handed back)"
     )
 }
 
@@ -8764,6 +8825,17 @@ fn capture_profile(
             .scheduling
             .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
         consumers.scheduling.sync_tail_stats(context.0);
+        // A staged child that already exited is reaped before the seal,
+        // so the sealed disposition and the process exit agree on its
+        // natural status; a live child stays staged for the outer commit.
+        if let Some(owned) = context.2.as_deref_mut() {
+            reap_exited_staged_handoff_before_seal(
+                &mut owned.pending_handoff,
+                &mut owned.handoff_note,
+                &mut owned.exit_code,
+                &mut owned.still_running,
+            );
+        }
         let mut ev = evidence_for(
             context.0,
             context.0.capture_facts(),
@@ -9935,6 +10007,17 @@ fn capture_trace(
                         .scheduling
                         .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
                     consumers.scheduling.sync_tail_stats(context.0);
+                    // A staged child that already exited is reaped before the seal,
+                    // so the sealed disposition and the process exit agree on its
+                    // natural status; a live child stays staged for the outer commit.
+                    if let Some(owned) = context.2.as_deref_mut() {
+                        reap_exited_staged_handoff_before_seal(
+                            &mut owned.pending_handoff,
+                            &mut owned.handoff_note,
+                            &mut owned.exit_code,
+                            &mut owned.still_running,
+                        );
+                    }
                     // The frozen consumer map pins the single-line coordinator
                     // projections below; keep them byte-stable for the marker.
                     #[rustfmt::skip]
@@ -15668,6 +15751,96 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD),
             "the raced exit was not reaped"
+        );
+    }
+
+    /// A staged duration handoff whose child already exited is reaped
+    /// before the seal: the refresh records its natural status and
+    /// clears the staging, so the sealed report and the exit agree.
+    #[test]
+    fn staged_handoff_refresh_before_the_seal_reaps_an_exited_child() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        wait_until(
+            || !pending.as_ref().unwrap().still_running(),
+            "the staged child never reached its exit state",
+        );
+        let mut handoff_note = Some(format_handoff_note(pid));
+        let mut exit_code = None;
+        let mut still_running = true;
+        reap_exited_staged_handoff_before_seal(
+            &mut pending,
+            &mut handoff_note,
+            &mut exit_code,
+            &mut still_running,
+        );
+        assert_eq!(exit_code, Some(128 + libc::SIGKILL));
+        assert!(!still_running);
+        assert!(retained.is_none());
+        assert!(pending.is_none());
+        assert_eq!(
+            handoff_note, None,
+            "a reaped child must not keep a live-handoff note"
+        );
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the pre-seal exit was not reaped"
+        );
+    }
+
+    /// A staged duration handoff whose child is still live at the seal
+    /// is untouched by the refresh: it stays staged with its stored
+    /// note for the outer commit. Dirty sentinels prove the refresh
+    /// writes nothing on the live path.
+    #[test]
+    fn staged_handoff_refresh_before_the_seal_leaves_a_live_child_staged() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        let mut handoff_note = Some(format_handoff_note(pid));
+        let mut exit_code = Some(999);
+        let mut still_running = false;
+        reap_exited_staged_handoff_before_seal(
+            &mut pending,
+            &mut handoff_note,
+            &mut exit_code,
+            &mut still_running,
+        );
+        assert_eq!(exit_code, Some(999));
+        assert!(!still_running);
+        assert!(retained.is_none());
+        assert!(pending.is_some(), "a live child must stay staged");
+        assert_eq!(handoff_note, Some(format_handoff_note(pid)));
+        // Still our unreaped child, so kill(pid, 0) proves the refresh
+        // left it alone.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "the pre-seal refresh killed the observed program"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
         );
     }
 

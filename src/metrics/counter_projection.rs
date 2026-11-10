@@ -221,6 +221,10 @@ impl CaptureSnapshot {
                 LegacyReadGaps::default(),
             ),
             new_acquisition: false,
+            // The caller files the events-only gap and keeps the error;
+            // this seal names no degraded read of its own.
+            snapshot_failure: None,
+            terminal_error: None,
         }
     }
 

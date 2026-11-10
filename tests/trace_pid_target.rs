@@ -126,11 +126,13 @@ fn privileged_trace_pid_names_target_on_stderr() {
 
     let stderr_path = dir.path().join("stderr");
     let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let stdout_path = dir.path().join("stdout");
+    let stdout_file = std::fs::File::create(&stdout_path).unwrap();
     let mut observer = Owned(
         Command::new(bin())
             .args(["trace", "--pid", &pid, "--duration", "3"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(stdout_file)
             .stderr(stderr_file)
             .die_with_parent()
             .spawn()
@@ -154,9 +156,21 @@ fn privileged_trace_pid_names_target_on_stderr() {
         diagnostics.contains("p11scope: capturing:"),
         "observer never reached capture:\n{diagnostics}"
     );
+    // The 0-probe waiting line also says "capturing", so require the
+    // attached-probes readiness text (singular- and plural-safe) to prove a
+    // real BPF attach session.
+    assert!(
+        diagnostics.contains(" attached; stop with Ctrl-C"),
+        "observer never attached probes (the waiting line also says capturing):\n{diagnostics}"
+    );
     assert!(
         diagnostics.contains(&format!("p11scope: target: pid {pid} exe ")),
         "pid-scope trace must name its target beside the readiness line:\n{diagnostics}"
+    );
+    let stdout_text = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    assert!(
+        !stdout_text.contains("p11scope: target:"),
+        "target line must stay on stderr, never stdout:\n{stdout_text}"
     );
     drop(target);
 }

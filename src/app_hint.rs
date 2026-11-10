@@ -1744,6 +1744,95 @@ mod tests {
         std::fs::remove_file(&script).ok();
     }
 
+    /// Live python sleeper for the sampler twins: resolves `python3`
+    /// (a documented test prerequisite), runs a script that sleeps,
+    /// and waits for the script name in the child's cmdline so the
+    /// sample cannot race the exec. Returns the child, its pid, the
+    /// script path, and the script file name; the caller kills, waits,
+    /// and removes the script.
+    fn spawn_python_sleeper() -> (std::process::Child, u32, std::path::PathBuf, String) {
+        use std::process::{Command, Stdio};
+        let python = {
+            let out = Command::new("sh")
+                .args(["-c", "command -v python3"])
+                .output()
+                .expect("sh runs");
+            assert!(out.status.success(), "python3 is required for this test");
+            String::from_utf8(out.stdout)
+                .expect("utf8 path")
+                .trim()
+                .to_string()
+        };
+        assert!(python.starts_with('/'), "python3 path: {python}");
+        let script = std::env::temp_dir().join(format!(
+            "p11scope-app-hint-fallback-{}.py",
+            std::process::id()
+        ));
+        let script_name = script
+            .file_name()
+            .expect("script file name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&script, "import time\ntime.sleep(30)\n").expect("write script");
+        let child = Command::new(&python)
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python sleeper");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline
+                .windows(script_name.len())
+                .any(|window| window == script_name.as_bytes())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "python sleeper never execed its script"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (child, pid, script, script_name)
+    }
+
+    #[test]
+    fn sampler_refuses_a_hint_without_an_admission_pidfd() {
+        use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::{PidPin, process_start_time};
+        // The pidfd-held admission labels the live sleeper (control);
+        // the same pid with a fallback-shaped pin — pidfd missing,
+        // start time matching — gets no hint. The tick-granular
+        // start-time check cannot exclude a same-tick same-binary
+        // reuse, so fallback mode refuses the label outright.
+        let (mut child, pid, script, script_name) = spawn_python_sleeper();
+        let exe = read_exe_identity(pid).expect("child exe identity");
+        let admitted = process_start_time(pid).expect("child start time");
+        let pin = PidPin::open(pid).expect("child pin");
+        assert!(
+            pin.pidfd().is_ok(),
+            "this host must grant pidfds for the sampler twins"
+        );
+        let hint = sample_for_pid(pid, Some(&exe), Some(admitted), &pin)
+            .expect("the pidfd-held admission keeps its argv hint");
+        assert_eq!(hint.value, script_name);
+        assert_eq!(hint.source, AppHintSource::Argv);
+        let fallback = PidPin::test_pidfd_fallback(pid, Some(admitted));
+        assert_eq!(
+            sample_for_pid(pid, Some(&exe), Some(admitted), &fallback),
+            None,
+            "without an admission pidfd a same-tick reuse would pass \
+             the start-time check, so there is no hint"
+        );
+        child.kill().ok();
+        let _ = child.wait();
+        std::fs::remove_file(&script).ok();
+    }
+
     #[test]
     fn sampler_needs_an_exe_and_a_matching_identity() {
         use crate::discovery::caller_registry::read_exe_identity;

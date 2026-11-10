@@ -1356,6 +1356,20 @@ impl PidPin {
         }
     }
 
+    /// Tests-only pidfd-fallback-shaped pin: the admission pin with
+    /// its pidfd missing but the caller's admitted start time, so the
+    /// sampler's fallback-refusal twin refuses only for the missing
+    /// pidfd.
+    #[cfg(test)]
+    pub(crate) fn test_pidfd_fallback(pid: u32, start_time: Option<u64>) -> Self {
+        Self {
+            pid,
+            pidfd: None,
+            start_time,
+            shared_charge: None,
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

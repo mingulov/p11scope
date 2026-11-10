@@ -95,6 +95,47 @@ class SchemaOracleAgreement(unittest.TestCase):
         observation["causes"].append("legacy_collection")
         return document
 
+    def pause_refused_document(self, *, refused="interrupted"):
+        """A metrics document whose required pause did not hold: the
+        lattice reads one partial attempt and `pause_refused` names why.
+        The annotation adds no gap cause of its own; the partial does."""
+        document = self.metrics_document()
+        evidence = document["evidence"]
+        evidence["pause"] = "partial"
+        evidence["pause_attempts"] = 1
+        evidence["pause_confirmed"] = 0
+        evidence["pause_partial"] = 1
+        evidence["pause_unavailable"] = 0
+        evidence["pause_refused"] = refused
+        evidence["completeness"] = "PARTIAL"
+        evidence["verdict_detail"] = "concrete_gap"
+        observation = evidence["gap_classes"]["observation"]
+        observation["status"] = "lossy"
+        observation["causes"].append("pause_partial")
+        return document
+
+    def snapshot_failure_document(self, *, failure="read_rvs", legacy=False):
+        """A zero-snapshot terminal report: no aggregate rows, the failed
+        read's finite name, PARTIAL with the `snapshot_failure` cause.
+        The legacy path also carries its all-unknown gap object."""
+        document = self.metrics_document()
+        evidence = document["evidence"]
+        evidence["snapshot_failure"] = failure
+        document["functions"] = []
+        evidence["completeness"] = "PARTIAL"
+        evidence["verdict_detail"] = "concrete_gap"
+        observation = evidence["gap_classes"]["observation"]
+        observation["status"] = "lossy"
+        if legacy:
+            evidence["legacy_collection"] = {
+                "unread_stats": 0,
+                "rv_failed": True,
+                "unknown_evidence": list(CHECKER["LEGACY_UNKNOWN_CELLS"]),
+            }
+            observation["causes"].append("legacy_collection")
+        observation["causes"].append("snapshot_failure")
+        return document
+
     def selected_document(self, *, selection="resolved", events=(), mode="counts",
                           with_close_products=False):
         """A metrics document carrying the 6.15 selection envelope. The
@@ -447,6 +488,79 @@ class SchemaOracleAgreement(unittest.TestCase):
         names = legacy["properties"]["unknown_evidence"]["items"]["enum"]
         self.assertEqual(names, list(CHECKER["LEGACY_UNKNOWN_CELLS"]))
         self.assertTrue(legacy["properties"]["unknown_evidence"]["uniqueItems"])
+
+    def test_pause_refused_accepted_and_vocabulary_closed(self):
+        """A refused pause passes the gate with its finite reason beside
+        the partial lattice; anything outside the vocabulary is refused."""
+        clean = self.metrics_document()
+        self.assertNotIn("pause_refused", clean["evidence"])
+        CHECKER["exact_metrics_schema"](clean)
+        for refused in ("interrupted", "refused"):
+            with self.subTest(refused=refused):
+                CHECKER["exact_metrics_schema"](
+                    self.pause_refused_document(refused=refused))
+        for refused in ("cancelled", "FAILED", "", None, 0):
+            with self.subTest(refused=refused):
+                document = self.pause_refused_document()
+                document["evidence"]["pause_refused"] = refused
+                with self.assertRaisesRegex(AssertionError, "pause_refused[ :]"):
+                    CHECKER["exact_metrics_schema"](document)
+
+    def test_pause_refused_schema_matches_oracle_vocabulary(self):
+        refused = evidence_schema()["properties"]["pause_refused"]
+        self.assertEqual(set(refused["enum"]), set(CHECKER["PAUSE_REFUSALS"]))
+        self.assertNotIn("pause_refused", evidence_schema()["required"])
+
+    def test_snapshot_failure_accepted_and_requires_gap(self):
+        """Zero-snapshot terminal reports pass the gate: the named
+        failure, PARTIAL with the `snapshot_failure` cause, and no rows.
+        The legacy path adds its all-unknown gap object and cause."""
+        for failure in ("read_rvs", "bank_routing", "topology",
+                        "legacy_slots", "legacy_kernel", "unavailable"):
+            with self.subTest(failure=failure):
+                CHECKER["exact_metrics_schema"](
+                    self.snapshot_failure_document(failure=failure))
+        CHECKER["exact_metrics_schema"](
+            self.snapshot_failure_document(failure="legacy_slots", legacy=True))
+        gap = self.snapshot_failure_document()
+        for field, value in (("completeness", "COMPLETE"),
+                             ("verdict_detail", "clean_proven")):
+            invalid = copy.deepcopy(gap)
+            invalid["evidence"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        unflagged = copy.deepcopy(gap)
+        unflagged["evidence"]["gap_classes"]["observation"]["causes"].remove(
+            "snapshot_failure")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](unflagged)
+
+    def test_snapshot_failure_malformed_rejected(self):
+        """A snapshot failure is refused when its reason leaves the
+        vocabulary, when rows are claimed beside it, or when an accepted
+        read is described beside it."""
+        document = self.snapshot_failure_document()
+        document["evidence"]["snapshot_failure"] = "arbitrary"
+        with self.assertRaisesRegex(AssertionError, "snapshot_failure[ :]"):
+            CHECKER["exact_metrics_schema"](document)
+        rows = self.snapshot_failure_document()
+        rows["functions"] = [{"names": ["C_Initialize"]}]
+        with self.assertRaisesRegex(AssertionError, "aggregate rows"):
+            CHECKER["exact_metrics_schema"](rows)
+        described = self.snapshot_failure_document()
+        described["evidence"]["counter_collection"] = self.counter_document()[
+            "evidence"]["counter_collection"]
+        described["evidence"]["gap_classes"]["observation"]["causes"].append(
+            "counter_collection")
+        with self.assertRaisesRegex(AssertionError, "accepted read"):
+            CHECKER["exact_metrics_schema"](described)
+
+    def test_snapshot_failure_schema_matches_oracle_vocabulary(self):
+        failure = evidence_schema()["properties"]["snapshot_failure"]
+        self.assertEqual(
+            set(failure["enum"]), set(CHECKER["SNAPSHOT_FAILURES"]))
+        self.assertNotIn("snapshot_failure", evidence_schema()["required"])
 
     def test_counter_mode_agrees_with_function_timing_in_both_document_lanes(self):
         timestamp = {"approximate": False, "p50": None, "p95": None, "p99": None,
@@ -893,7 +1007,8 @@ class SchemaOracleAgreement(unittest.TestCase):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
         the optional additive envelopes (counter, selection, excludes,
-        forwarding, legacy, short-lived splits)."""
+        forwarding, legacy, short-lived splits) and the two additive
+        annotations (refused pause, snapshot failure)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
@@ -901,7 +1016,7 @@ class SchemaOracleAgreement(unittest.TestCase):
                "counter_collection", "selected_detail",
                "excluded_modules", "unmatched_excludes", "legacy_collection",
                "gap_exe_hints", "target_exec_hints", "gap_exit_mappings",
-               "unmatched_forwarding"}
+               "unmatched_forwarding", "pause_refused", "snapshot_failure"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 

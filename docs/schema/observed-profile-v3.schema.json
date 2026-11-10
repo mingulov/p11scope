@@ -368,6 +368,7 @@
         "pause_confirmed": {"type": "integer", "minimum": 0},
         "pause_engine_incomplete_retirements": {"type": "integer", "minimum": 0},
         "pause_partial": {"type": "integer", "minimum": 0},
+        "pause_refused": {"enum": ["interrupted", "refused"]},
         "pause_unavailable": {"type": "integer", "minimum": 0},
         "pending_at_end": {"type": "integer", "minimum": 0},
         "process_tracking_evictions": {"type": "integer", "minimum": 0},
@@ -579,6 +580,7 @@
           }
         },
         "slots": {"type": "integer", "minimum": 0},
+        "snapshot_failure": {"enum": ["read_shape", "read_budget", "read_stats", "read_rvs", "read_health", "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology", "mode", "generation_rollback", "limits", "saturated", "contended", "kernel_evidence", "fold_overflow", "regressed", "projection", "legacy_slots", "legacy_kernel", "unavailable"]},
         "start_insert_failures": {"type": "integer", "minimum": 0},
         "state_reconciliations": {"type": "integer", "minimum": 0},
         "surfaces": {

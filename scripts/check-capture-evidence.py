@@ -158,6 +158,10 @@ PAUSE_COUNTERS = (
     "pause_partial",
     "pause_unavailable",
 )
+# A refused pause names why it did not hold: an operator stop landed
+# while protection was active, or the protection could not be completed.
+# Annotation beside the lattice, never a member of it.
+PAUSE_REFUSALS = {"interrupted", "refused"}
 DISCOVERY_LOSS_COUNTERS = (
     "discovery_ring_loss",
     "discovery_state_failures",
@@ -319,6 +323,13 @@ COUNTER_COLLECTION_FAILURES = {
     "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
     "mode", "generation_rollback", "limits", "saturated", "contended",
     "kernel_evidence", "fold_overflow", "regressed", "projection",
+}
+# A zero-snapshot terminal report names the read that never landed: the
+# counter failure vocabulary, the two legacy read steps, or the
+# untyped-collection fallback. Present only with the `snapshot_failure`
+# observation cause and an empty `functions` array.
+SNAPSHOT_FAILURES = COUNTER_COLLECTION_FAILURES | {
+    "legacy_slots", "legacy_kernel", "unavailable",
 }
 # The additive per-bank gap object inside `counter_collection`: counts and
 # finite flags only. Present only when the acquisition was partial.
@@ -1162,6 +1173,29 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "legacy_collection" in evidence:
         wanted.add("legacy_collection")
         exact_legacy_collection(evidence["legacy_collection"])
+    # The refused-pause annotation, additive in every lane that renders
+    # it (owned runs only in practice; the key stays absent elsewhere).
+    if not historical and "pause_refused" in evidence:
+        wanted.add("pause_refused")
+        require(
+            evidence["pause_refused"] in PAUSE_REFUSALS,
+            f"invalid pause_refused: {evidence['pause_refused']!r}",
+        )
+    # The zero-snapshot terminal report: the failed read's finite name,
+    # with the observation cause and an empty function table. A degraded
+    # snapshot never established a mode or generation, so the
+    # `counter_collection` object cannot accompany it; the legacy gap
+    # object can and does (every cell unknown).
+    if not historical and "snapshot_failure" in evidence:
+        wanted.add("snapshot_failure")
+        require(
+            evidence["snapshot_failure"] in SNAPSHOT_FAILURES,
+            f"invalid snapshot_failure: {evidence['snapshot_failure']!r}",
+        )
+        require(
+            "counter_collection" not in evidence,
+            "a snapshot failure has no accepted read to describe",
+        )
     # 7.10b short-lived splits: additive in every lane that renders
     # them, including the terminal trace EVIDENCE object (which flows
     # through `versioned_evidence` like the profile lane).
@@ -1586,6 +1620,11 @@ def exact_selected_detail_bracket(fragment, *, detail):
 
 def exact_counter_function_timing(document):
     """Counter mode describes the accepted rows' existing timing capability."""
+    if document["evidence"].get("snapshot_failure") is not None:
+        require(
+            document["functions"] == [],
+            "a snapshot failure leaves no aggregate rows",
+        )
     collection = document["evidence"].get("counter_collection")
     if collection is None:
         return
@@ -2087,6 +2126,8 @@ def expected_gap_classes(evidence):
         ))
     if evidence.get("legacy_collection") is not None:
         gates["observation"].append(("legacy_collection", True))
+    if evidence.get("snapshot_failure") is not None:
+        gates["observation"].append(("snapshot_failure", True))
     causes = {name: [cause for cause, hit in gate if hit] for name, gate in gates.items()}
     if causes["semantics"]:
         semantics = "degraded"
@@ -2852,6 +2893,8 @@ PUBLISHED_LOADER_PAUSE_FIELDS = {
     "handoff_child_pid",
     *PAUSE_COUNTERS,
     "pause_engine_incomplete_retirements",
+    # The refused-pause annotation: why required protection did not hold.
+    "pause_refused",
 }
 
 

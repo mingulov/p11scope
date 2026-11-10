@@ -767,7 +767,8 @@ pub(crate) struct InstanceRouter {
     /// Bounded re-offer budget per (image, file) key: how many
     /// times a transiently refused Joint birth already evicted
     /// this key's observation for a fresh mint. Entries are
-    /// created only by [`Self::evict_for_birth_reoffer`] and the
+    /// created only by [`Self::evict_for_birth_reoffer`], dropped
+    /// at image/task retirement beside the sibling sets, and the
     /// table refuses past the observed-keys cap, so a long run
     /// cannot grow it without bound.
     birth_reoffers: BTreeMap<(ImageKey, u32), u8>,
@@ -1602,6 +1603,9 @@ impl InstanceRouter {
         self.admitted_pending.retain(|(owner, _)| *owner != key);
         self.admitted_minted.retain(|(owner, _)| *owner != key);
         self.birth_retry.retain(|(owner, _), _| *owner != key);
+        self.birth_reoffers.retain(|(owner, _), _| *owner != key);
+        self.birth_reoffer_cooldown
+            .retain(|(owner, _)| *owner != key);
         self.debug_check_absent_subset();
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
@@ -1640,6 +1644,10 @@ impl InstanceRouter {
             .retain(|(owner, _)| owner.cookie != cookie);
         self.birth_retry
             .retain(|(owner, _), _| owner.cookie != cookie);
+        self.birth_reoffers
+            .retain(|(owner, _), _| owner.cookie != cookie);
+        self.birth_reoffer_cooldown
+            .retain(|(owner, _)| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,

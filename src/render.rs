@@ -5074,9 +5074,18 @@ struct CgroupOut {
     /// removed by report time (container exited mid-capture). Absent is
     /// fine; this never guesses, so a present label is always trustworthy.
     label: Option<String>,
+    /// Plain workload label parsed from the resolved path
+    /// ([`crate::caller_metadata::workload_label_for_cgroup_path`]):
+    /// pod UID + container id, lone container id, systemd unit, or the
+    /// raw path for unknown shapes. `null` exactly when `label` is.
+    workload: Option<String>,
     /// Every event observed with this `cgroup_id`, regardless of kind.
     calls: u64,
     errors: u64,
+    /// Calls counted for events whose process missed admission (zero
+    /// identity cookie, full history registry, closed generation): a
+    /// subset of `calls` above, grouped per pod/unit in `-v` text.
+    unadmitted: u64,
     /// The subset of `calls` a mechanism could be attributed to.
     mechanisms: Vec<CgroupMechOut>,
 }
@@ -5089,8 +5098,12 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
         .map(|(&cgroup_id, c)| CgroupOut {
             cgroup_id,
             label: crate::scope::label(root, cgroup_id),
+            // RED stub: the workload derivation lands with the
+            // retained/live resolution.
+            workload: None,
             calls: c.calls,
             errors: c.errors,
+            unadmitted: c.unadmitted,
             mechanisms: c
                 .mechanisms
                 .iter()
@@ -5105,6 +5118,28 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
                 .collect(),
         })
         .collect()
+}
+
+/// [`cgroups_out`] against an explicit live root: the test seam. The
+/// live walk runs under `live_root`, so fixture cgroups resolve
+/// without touching the host's `/sys/fs/cgroup`.
+fn cgroups_out_with_live_root(
+    state: &crate::semantics::State,
+    live_root: &std::path::Path,
+) -> Vec<CgroupOut> {
+    // RED stub: ignores the seam root until the retained/live
+    // resolution lands.
+    let _ = live_root;
+    cgroups_out(state)
+}
+
+/// `-v` per-cgroup section for the final profile frame: one row per
+/// cgroup with its workload label and counts, unknown paths degraded
+/// to their numeric id, and kernel-dropped completions named as
+/// unattributable. Empty when the state holds no cgroup rows.
+pub(crate) fn cgroup_verbose_section(_state: &crate::semantics::State, _ev: &Evidence) -> String {
+    // RED stub: the section renders nothing until GREEN.
+    String::new()
 }
 
 /// `capture` section fields that aren't derived from `reports`/`ev`/`state`.
@@ -15205,6 +15240,143 @@ pub(crate) mod tests {
             .expect("registered cgroup row present");
         assert_eq!(reg["calls"], 1);
         assert_eq!(reg["registered"], true);
+    }
+
+    #[test]
+    fn profile_json_cgroup_rows_carry_workload_labels() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Churn twin at the JSON seam: the pod's cgroup existed at
+        // first sighting and was removed before the report; the row
+        // still names the pod UID and container ID.
+        let uid = "12345678-1234-abcd-9876-1234567890ab";
+        let systemd_uid = uid.replace('-', "_");
+        let id = "c".repeat(64);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root
+            .path()
+            .join("kubepods.slice")
+            .join("kubepods-burstable.slice")
+            .join(format!("kubepods-burstable-pod{systemd_uid}.slice"))
+            .join(format!("cri-containerd-{id}.scope"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cgroup = std::fs::metadata(&dir).unwrap().ino();
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        state.set_cgroup_label_root(root.path().to_path_buf());
+        let mut ev = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        ev.cgroup_id = cgroup;
+        state.observe(&ev);
+        std::fs::remove_dir_all(root.path().join("kubepods.slice")).unwrap();
+        let rows = cgroups_out_with_live_root(&state, root.path());
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["cgroup_id"], cgroup);
+        assert_eq!(row["workload"], format!("pod {uid} / container {id}"));
+    }
+
+    #[test]
+    fn profile_json_cgroup_rows_carry_unadmitted_counts() {
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        let mut missed = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        missed.event_type = p11scope_ebpf_common::event_type::CALL;
+        missed.cgroup_id = 9911;
+        state.reject_unadmitted(&missed);
+        let mut found = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        found.cgroup_id = 9912;
+        state.observe(&found);
+        let root = tempfile::tempdir().unwrap();
+        let rows = cgroups_out_with_live_root(&state, root.path());
+        assert_eq!(rows.len(), 2);
+        let by_id = |id: u64| {
+            serde_json::to_value(rows.iter().find(|row| row.cgroup_id == id).unwrap()).unwrap()
+        };
+        assert_eq!(by_id(9911)["calls"], 1);
+        assert_eq!(by_id(9911)["unadmitted"], 1);
+        assert_eq!(by_id(9912)["calls"], 1);
+        assert_eq!(by_id(9912)["unadmitted"], 0);
+    }
+
+    #[test]
+    fn profile_json_cgroup_live_label_wins_over_retained() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Rename twin: same inode, new path — the live path is
+        // current truth, the retained path is fallback only.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("system.slice").join("old.service");
+        std::fs::create_dir_all(&old).unwrap();
+        let cgroup = std::fs::metadata(&old).unwrap().ino();
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        state.set_cgroup_label_root(root.path().to_path_buf());
+        let mut ev = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        ev.cgroup_id = cgroup;
+        state.observe(&ev);
+        assert_eq!(
+            state.retained_cgroup_path(cgroup).as_deref(),
+            Some("system.slice/old.service")
+        );
+        std::fs::rename(&old, root.path().join("system.slice").join("new.service")).unwrap();
+        let rows = cgroups_out_with_live_root(&state, root.path());
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["label"], "system.slice/new.service");
+        assert_eq!(row["workload"], "new.service");
+    }
+
+    #[test]
+    fn cgroup_verbose_section_lists_labeled_rows_per_pod() {
+        use std::os::unix::fs::MetadataExt as _;
+        // -v text names each pod with its counts.
+        let uid = "12345678-1234-abcd-9876-1234567890ab";
+        let systemd_uid = uid.replace('-', "_");
+        let id = "d".repeat(64);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root
+            .path()
+            .join("kubepods.slice")
+            .join(format!("kubepods-pod{systemd_uid}.slice"))
+            .join(format!("crio-{id}.scope"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cgroup = std::fs::metadata(&dir).unwrap().ino();
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        state.set_cgroup_label_root(root.path().to_path_buf());
+        let mut ev = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        ev.cgroup_id = cgroup;
+        state.observe(&ev);
+        let text = cgroup_verbose_section(&state, &evidence());
+        assert!(
+            text.contains(&format!("pod {uid} / container {id}")),
+            "{text}"
+        );
+        assert!(text.contains("1 calls"), "{text}");
+    }
+
+    #[test]
+    fn cgroup_verbose_section_marks_unknown_paths_and_unadmitted() {
+        // Unknown cgroups degrade to their numeric id, never vanish;
+        // unadmitted calls show per row; kernel-dropped completions
+        // are named as unattributable, never grouped.
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        let mut missed = init_event(0, 0x0D, p11scope_ebpf_common::shape::NONE, 0, 0, 0);
+        missed.event_type = p11scope_ebpf_common::event_type::CALL;
+        missed.cgroup_id = 555121;
+        state.reject_unadmitted(&missed);
+        let mut ev = evidence();
+        ev.semantic_capture_failures = 862455;
+        let text = cgroup_verbose_section(&state, &ev);
+        assert!(text.contains("cgroup 555121"), "{text}");
+        assert!(text.contains("unadmitted"), "{text}");
+        assert!(text.contains("862455"), "{text}");
+    }
+
+    #[test]
+    fn cgroup_verbose_section_empty_without_rows() {
+        // Twin: no cgroup rows, no section — quiet stays quiet.
+        let state = crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        assert_eq!(cgroup_verbose_section(&state, &evidence()), "");
     }
 
     // ---- Slice 1b-2 public evidence contract (design §5.5–§5.7, §9) -------

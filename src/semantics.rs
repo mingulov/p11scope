@@ -2066,6 +2066,79 @@ mod corrective_tests {
         assert!(!line.contains("sess#"), "stale C pseudonym leaked: {line}");
         assert!(!state.has_process_state(process));
     }
+
+    #[test]
+    fn cgroup_label_root_retains_sighting_path_across_removal() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Churn twin: the cgroup exists at first sighting, then the pod
+        // exits and its cgroup is removed; the retained path must still
+        // name it at report time.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root
+            .path()
+            .join("kubepods.slice")
+            .join("kubepods-pod12345678_1234_abcd_9876_1234567890ab.slice")
+            .join(format!("cri-containerd-{}.scope", "c".repeat(64)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = std::fs::metadata(&dir).unwrap().ino();
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        state.set_cgroup_label_root(root.path().to_path_buf());
+        let mut ev = event(&p, "C_Sign", 7, CkRv::OK.0);
+        ev.cgroup_id = id;
+        state.observe(&ev);
+        // The pod exits; its cgroup is removed before the report.
+        std::fs::remove_dir_all(root.path().join("kubepods.slice")).unwrap();
+        assert_eq!(
+            state.retained_cgroup_path(id).as_deref(),
+            Some(dir.strip_prefix(root.path()).unwrap().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn cgroup_label_root_unset_retains_nothing() {
+        // Healthy twin: without a label root the state keeps no paths;
+        // report-time resolution behaves exactly as before.
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        let mut ev = event(&p, "C_Sign", 7, CkRv::OK.0);
+        ev.cgroup_id = 424242;
+        state.observe(&ev);
+        assert_eq!(state.retained_cgroup_path(424242), None);
+        assert!(state.cgroups().contains_key(&424242));
+    }
+
+    #[test]
+    fn reject_unadmitted_counts_calls_per_cgroup() {
+        // Events whose process missed admission still count their
+        // calls under their cgroup, marked unadmitted for the
+        // per-pod missed grouping.
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        let mut ev = event(&p, "C_Sign", 7, CkRv::OK.0);
+        ev.event_type = p11scope_ebpf_common::event_type::CALL;
+        ev.cgroup_id = 777;
+        state.reject_unadmitted(&ev);
+        state.reject_unadmitted(&ev);
+        let row = &state.cgroups()[&777];
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.unadmitted, 2);
+    }
+
+    #[test]
+    fn reject_history_leaves_unadmitted_at_zero() {
+        // Twin: the foreign-domain/non-CALL rejection path counts
+        // calls but never marks them unadmitted.
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        let mut ev = event(&p, "C_Sign", 7, CkRv::OK.0);
+        ev.event_type = p11scope_ebpf_common::event_type::CALL;
+        ev.cgroup_id = 778;
+        state.reject_history(&ev);
+        let row = &state.cgroups()[&778];
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.unadmitted, 0);
+    }
 }
 
 /// Aggregate stats for one template-bearing operation (`C_FindObjectsInit`,
@@ -2149,6 +2222,11 @@ pub struct CgroupStat {
     /// call, or a later operational call on a session with an active
     /// mechanism).
     pub mechanisms: BTreeMap<u64, MechCallStat>,
+    /// Calls counted for events whose process missed admission
+    /// ([`State::reject_unadmitted`]): a zero identity cookie, a full
+    /// history registry, or a closed generation. A subset of `calls`
+    /// above; the per-pod missed grouping renders from this.
+    pub unadmitted: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2526,6 +2604,17 @@ pub struct State {
     logins: BTreeMap<u32, u64>,
     sessions: SessionStats,
     cgroups: BTreeMap<u64, CgroupStat>,
+    /// Cgroup2 root for eager label retention (`/sys/fs/cgroup` in
+    /// production, a fixture root in tests). `None` keeps the
+    /// historical behavior: no paths retained, report-time
+    /// resolution only.
+    cgroup_label_root: Option<std::path::PathBuf>,
+    /// Raw relative path retained at each cgroup id's first sighting,
+    /// while its processes are alive. Bounded by the cgroup count,
+    /// which shares the state key budget. Report-time resolution
+    /// prefers the live path; this is the fallback for cgroups that
+    /// were removed before the report (exited pods under churn).
+    cgroup_retained_paths: BTreeMap<u64, String>,
     orphan_ops: u64,
     unmatched_closes: u64,
     evidence: SemanticEvidence,
@@ -2630,6 +2719,8 @@ impl State {
             logins: BTreeMap::new(),
             sessions: SessionStats::default(),
             cgroups: BTreeMap::new(),
+            cgroup_label_root: None,
+            cgroup_retained_paths: BTreeMap::new(),
             orphan_ops: 0,
             unmatched_closes: 0,
             evidence: SemanticEvidence::default(),
@@ -2822,6 +2913,7 @@ impl State {
                         calls: 1,
                         errors: u64::from(is_error),
                         mechanisms: BTreeMap::new(),
+                        unadmitted: 0,
                     },
                 );
             }
@@ -2831,6 +2923,33 @@ impl State {
                 cg.errors = cg.errors.saturating_add(1);
             }
         }
+    }
+
+    /// Cgroup2 root for eager label retention. Production passes
+    /// `/sys/fs/cgroup` once, before the capture loop; tests pass a
+    /// fixture root.
+    pub(crate) fn set_cgroup_label_root(&mut self, root: std::path::PathBuf) {
+        self.cgroup_label_root = Some(root);
+    }
+
+    /// Raw relative path retained at `cgroup_id`'s first sighting, if
+    /// a label root is set and the cgroup existed then. Report-time
+    /// resolution prefers the live path; this is the fallback for
+    /// cgroups removed before the report.
+    pub(crate) fn retained_cgroup_path(&self, cgroup_id: u64) -> Option<String> {
+        self.cgroup_label_root.as_ref()?;
+        self.cgroup_retained_paths.get(&cgroup_id).cloned()
+    }
+
+    /// Count-only CALL evidence for an event whose process missed
+    /// admission (a zero identity cookie, a full history registry, or
+    /// a closed generation): like [`State::reject_history`], plus the
+    /// row's `unadmitted` mark for the per-pod missed grouping.
+    /// Foreign-domain rejections keep using [`State::reject_history`];
+    /// they are not admission misses.
+    pub(crate) fn reject_unadmitted(&mut self, ev: &Event) {
+        // RED stub: plain rejection until the unadmitted mark lands.
+        self.reject_history(ev);
     }
 
     pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
@@ -2855,6 +2974,7 @@ impl State {
                         calls: 1,
                         errors: u64::from(is_error),
                         mechanisms: BTreeMap::new(),
+                        unadmitted: 0,
                     },
                 );
             }

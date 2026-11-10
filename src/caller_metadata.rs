@@ -665,6 +665,18 @@ fn parse_pod_uid(bytes: &[u8]) -> Option<PodUid> {
     Some(PodUid(uid))
 }
 
+/// Plain workload label for a cgroup path relative to the cgroup2 root
+/// (what [`crate::scope::label`] returns): `pod <uid> / container <id>`
+/// for Kubernetes pods, `container <id> (<runtime>)` for lone
+/// docker/podman/containerd/cri-o containers, the systemd unit for unit
+/// paths, and the raw path verbatim for unknown shapes. Path-only: no
+/// API calls, no I/O. A lexical hint, never orchestrator proof.
+pub(crate) fn workload_label_for_cgroup_path(_path: &str) -> String {
+    // RED stub: every workload-label test below fails until the
+    // implementation lands.
+    String::from("unstubbed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1377,5 +1389,170 @@ mod tests {
         // validation already caps components at 255 bytes.
         assert!(is_unit_name(&format!("{}.service", "a".repeat(247))));
         assert!(!is_unit_name(&format!("{}.service", "a".repeat(248))));
+    }
+
+    const WORKLOAD_POD_UID: &str = "12345678-1234-abcd-9876-1234567890ab";
+
+    fn workload_id(fill: char) -> String {
+        std::iter::repeat_n(fill, 64).collect()
+    }
+
+    #[test]
+    fn workload_label_names_k8s_systemd_pod_and_container_for_all_qos() {
+        let uid = WORKLOAD_POD_UID;
+        let systemd_uid = uid.replace('-', "_");
+        let id = workload_id('c');
+        let expected = format!("pod {uid} / container {id}");
+        for (qos_dir, pod_prefix) in [
+            ("", "kubepods-pod"),
+            ("kubepods-burstable.slice/", "kubepods-burstable-pod"),
+            ("kubepods-besteffort.slice/", "kubepods-besteffort-pod"),
+        ] {
+            for unit in [
+                format!("cri-containerd-{id}.scope"),
+                format!("docker-{id}.scope"),
+                format!("crio-{id}.scope"),
+            ] {
+                let path =
+                    format!("kubepods.slice/{qos_dir}{pod_prefix}{systemd_uid}.slice/{unit}");
+                assert_eq!(workload_label_for_cgroup_path(&path), expected, "{path}");
+            }
+        }
+        // Uppercase hex normalizes to canonical lowercase.
+        let upper = workload_id('C');
+        let path = format!(
+            "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{}.slice/cri-containerd-{upper}.scope",
+            systemd_uid.to_uppercase(),
+        );
+        assert_eq!(workload_label_for_cgroup_path(&path), expected, "{path}");
+    }
+
+    #[test]
+    fn workload_label_names_k8s_cgroupfs_pod_and_container_for_all_qos() {
+        let uid = WORKLOAD_POD_UID;
+        let id = workload_id('d');
+        let expected = format!("pod {uid} / container {id}");
+        for qos in ["", "burstable/", "besteffort/"] {
+            let path = format!("kubepods/{qos}pod{uid}/{id}");
+            assert_eq!(workload_label_for_cgroup_path(&path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn workload_label_names_kubelet_stem_pod_and_container() {
+        let uid = WORKLOAD_POD_UID;
+        let systemd_uid = uid.replace('-', "_");
+        let id = workload_id('b');
+        let path = format!(
+            "kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod{systemd_uid}.slice/cri-containerd-{id}.scope"
+        );
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("pod {uid} / container {id}"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn workload_label_binds_inner_pod_under_node_container_on_host() {
+        // Host view of a kind pod: the node container scope prefixes
+        // the in-node path; the inner pod/container pair wins.
+        let node = workload_id('a');
+        let id = workload_id('b');
+        let uid = WORKLOAD_POD_UID;
+        let systemd_uid = uid.replace('-', "_");
+        let path = format!(
+            "system.slice/docker-{node}.scope/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod{systemd_uid}.slice/cri-containerd-{id}.scope"
+        );
+        assert_eq!(
+            workload_label_for_cgroup_path(&path),
+            format!("pod {uid} / container {id}"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn workload_label_names_docker_cgroupfs_and_systemd_ids() {
+        let id = workload_id('a');
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("docker/{id}")),
+            format!("container {id} (docker)")
+        );
+        let upper = workload_id('B');
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("system.slice/docker-{upper}.scope")),
+            format!("container {} (docker)", upper.to_lowercase())
+        );
+    }
+
+    #[test]
+    fn workload_label_names_podman_systemd_and_cgroupfs_ids() {
+        let id = workload_id('e');
+        // systemd driver: the process cgroup sits below the scope unit.
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("machine.slice/libpod-{id}.scope/container")),
+            format!("container {id} (podman)")
+        );
+        // A process directly in the scope unit.
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("machine.slice/libpod-{id}.scope")),
+            format!("container {id} (podman)")
+        );
+        // cgroupfs driver pair.
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("libpod_parent/libpod-{id}")),
+            format!("container {id} (podman)")
+        );
+    }
+
+    #[test]
+    fn workload_label_names_systemd_unit_paths() {
+        assert_eq!(
+            workload_label_for_cgroup_path("system.slice/app.service"),
+            "app.service"
+        );
+        assert_eq!(
+            workload_label_for_cgroup_path("system.slice/docker.service"),
+            "docker.service"
+        );
+        assert_eq!(
+            workload_label_for_cgroup_path(
+                "user.slice/user-1000.slice/user@1000.service/app.service"
+            ),
+            "app.service"
+        );
+    }
+
+    #[test]
+    fn workload_label_prefers_container_over_unit_name() {
+        // A container unit is a valid systemd unit name too; the
+        // container reading wins.
+        let id = workload_id('f');
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!("system.slice/docker-{id}.scope")),
+            format!("container {id} (docker)")
+        );
+        let uid = WORKLOAD_POD_UID;
+        let systemd_uid = uid.replace('-', "_");
+        assert_eq!(
+            workload_label_for_cgroup_path(&format!(
+                "kubepods.slice/kubepods-pod{systemd_uid}.slice/crio-{id}.scope"
+            )),
+            format!("pod {uid} / container {id}")
+        );
+    }
+
+    #[test]
+    fn workload_label_keeps_unknown_shapes_verbatim() {
+        for path in [
+            "kubepods.slice/pod-123.slice",
+            "kubepods.slice/kubepods-burstable.slice",
+            "foo/bar/baz",
+            "p11scope-run-0123456789abcdef/workers/a",
+            "system.slice",
+            "",
+        ] {
+            assert_eq!(workload_label_for_cgroup_path(path), path, "{path:?}");
+        }
     }
 }

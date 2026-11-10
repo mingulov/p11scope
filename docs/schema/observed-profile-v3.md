@@ -228,6 +228,27 @@ document). The release oracle enforces the split (`exact_evidence_keys` with
 `profile=True/False`), the per-lane verdict scope, and the `lane`
 discriminator value.
 
+## Rescued stdout delivery
+
+When the `-o` report cannot be written (a full disk, a quota, a read-only
+remount), the already-rendered profile or metrics document is rescued to
+stdout instead of being lost: one compact JSON document on its own line
+(leading and trailing newline, no internal newlines), so a consumer
+holding stdout alone can still find it when stderr is lost. The rescued
+document carries an added top-level `delivery` object, absent — never
+null — on healthy `-o` files:
+
+- `rescued_after_output_failure` (string): the failed `-o` path as
+  displayed, naming which write the rescue replaces.
+- `output_error` (string): the `-o` failure as displayed
+  (`{error:#}`), so the cause survives when stderr is lost.
+
+Both keys are always present exactly when `delivery` is present. The
+object is publication metadata only: it never feeds shares, verdicts,
+`gap_classes`, or `completeness`, and the release oracle's exact
+evidence keys are unchanged (top-level stays open). Like the additive
+disclosures below, it introduces no new schema revision.
+
 ## Added `evidence` fields
 
 `interface_selection` is always present and has exactly these keys:

@@ -8906,11 +8906,41 @@ where
     }
 }
 
+/// Marks a rescued report inside the document itself, so a consumer
+/// holding stdout alone (stderr lost) can still tell it is a rescue and
+/// which `-o` write failed. No existing top-level `errors`/`notes`/
+/// `failure` field carries publication state — `functions[].errors`
+/// counts PKCS#11 call errors, evidence counters name capture loss — so
+/// the rescue adds a minimal top-level `delivery` object, absent on
+/// healthy `-o` files. Publication metadata only: it never feeds
+/// verdicts, shares, or completeness. See
+/// `docs/schema/observed-profile-v3.md`.
+fn with_rescue_delivery_mark(
+    json: &serde_json::Value,
+    failed_path: &Path,
+    out_error: &anyhow::Error,
+) -> serde_json::Value {
+    let mut rescued = json.clone();
+    if let Some(object) = rescued.as_object_mut() {
+        object.insert(
+            "delivery".into(),
+            serde_json::json!({
+                "rescued_after_output_failure": failed_path.display().to_string(),
+                "output_error": format!("{out_error:#}"),
+            }),
+        );
+    }
+    rescued
+}
+
 /// The `-o` write or commit failed, so the already-rendered JSON document
 /// goes to stdout instead of being lost, after a stderr line naming the
-/// failed path. Always returns the `-o` error (plus any rescue failure),
-/// so the run still exits nonzero. Skipped when stdout already closed
-/// (EPIPE): there is no second sink left to try.
+/// failed path: one compact JSON document on its own line, marked inside
+/// as a rescue (see [`with_rescue_delivery_mark`]), so it stays
+/// machine-separable even when stderr is lost. Always returns the `-o`
+/// error (plus any rescue failure), so the run still exits nonzero.
+/// Skipped when stdout already closed (EPIPE): there is no second sink
+/// left to try.
 fn fallback_profile_report_to_stdout(
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -8925,8 +8955,9 @@ fn fallback_profile_report_to_stdout(
         "p11scope: output {} failed: {out_error:#}; the JSON report follows on stdout",
         failed_path.display()
     ));
+    let rescued = with_rescue_delivery_mark(json, failed_path, &out_error);
     let mut bytes = vec![b'\n'];
-    if let Err(error) = serde_json::to_writer_pretty(&mut bytes, json) {
+    if let Err(error) = serde_json::to_writer(&mut bytes, &rescued) {
         return also_failed(
             out_error,
             anyhow::Error::msg(error),
@@ -27072,8 +27103,9 @@ int main(int argc, char **argv) {
         assert!(text.contains("writing stdout"), "{text}");
     }
 
-    /// A failed `-o` write rescues the rendered document to stdout
-    /// byte-identically, and still exits nonzero naming the `-o` error.
+    /// A failed `-o` write rescues the rendered document to stdout as one
+    /// compact JSON document on its own line, marked inside with the
+    /// failed path, and still exits nonzero naming the `-o` error.
     #[test]
     fn terminal_publish_rescues_the_rendered_report_to_stdout_when_output_fails() {
         let json = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
@@ -27090,16 +27122,40 @@ int main(int argc, char **argv) {
         .expect_err("the -o failure still exits nonzero");
         let text = format!("{error:#}");
         assert!(text.contains("simulated disk-full"), "{text}");
-        let mut expected = vec![b'\n'];
-        serde_json::to_writer_pretty(&mut expected, &json).unwrap();
-        expected.push(b'\n');
+        let mut expected = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
+        expected["delivery"] = serde_json::json!({
+            "rescued_after_output_failure": "/tmp/observed.json",
+            "output_error": "simulated disk-full on -o write",
+        });
+        let mut framed = vec![b'\n'];
+        serde_json::to_writer(&mut framed, &expected).unwrap();
+        framed.push(b'\n');
         assert_eq!(
-            sink, expected,
-            "the rendered document is rescued byte-identically"
+            sink, framed,
+            "the rendered document is rescued as one marked compact line"
         );
-        let start = sink.iter().position(|byte| *byte == b'{').unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&sink[start..]).unwrap();
-        assert_eq!(parsed, json);
+        // Machine-separable on stdout alone: exactly one JSON line.
+        assert_eq!(sink.first(), Some(&b'\n'));
+        assert_eq!(sink.last(), Some(&b'\n'));
+        let inner = &sink[1..sink.len() - 1];
+        assert!(
+            !inner.contains(&b'\n'),
+            "the rescued document is one line even without stderr"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(inner).unwrap();
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed["n"], 1, "the rendered payload survives the rescue");
+        assert_eq!(
+            parsed["delivery"]["rescued_after_output_failure"],
+            "/tmp/observed.json"
+        );
+        assert!(
+            parsed["delivery"]["output_error"]
+                .as_str()
+                .unwrap()
+                .contains("simulated disk-full"),
+            "the rescue names its -o cause inside the document: {parsed}"
+        );
     }
 
     /// A rescue shed by backpressure is drained and named: the terminal

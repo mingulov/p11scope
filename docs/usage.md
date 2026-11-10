@@ -1235,14 +1235,20 @@ Limits that matter in pods:
   readable without `sudo cat`; pre-existing files keep their owner,
   and anywhere else the files stay root-owned as before. A second run
   reuses and truncates an invoker-owned stream file it previously
-  refused. If the profile report cannot be written to `-o` (a full
-  disk, a quota, a read-only remount), the already-rendered JSON
-  document is rescued to stdout instead of being lost: one stderr
-  line names the failed path and says the report follows on stdout,
-  and the run still exits nonzero naming the `-o` error. Stdout
-  carries display frames only for profile, never the JSON report, so
-  the rescue is a new delivery, not a duplicate. A hard stdout error
-  on the live frame likewise never skips the `-o` write: the file is
+  refused. If the profile or metrics report cannot be written to
+  `-o` (a full disk, a quota, a read-only remount), the
+  already-rendered JSON document is rescued to stdout instead of
+  being lost: one stderr line names the failed path and says the
+  report follows on stdout, and the run still exits nonzero naming
+  the `-o` error (and, under stdout backpressure, any shed rescue
+  bytes). The rescue is one compact JSON document on its own line,
+  marked inside with a top-level `delivery` object naming the failed
+  path and error, so it stays machine-separable even when stderr is
+  lost; see the rescued-delivery section of
+  `docs/schema/observed-profile-v3.md`. Stdout carries display
+  frames only for profile and metrics, never the JSON report, so the
+  rescue is a new delivery, not a duplicate. A hard stdout error on
+  the live frame likewise never skips the `-o` write: the file is
   still attempted and any failures combine. The `-o` file itself
   stays atomic — a failed run never leaves a partial file.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture

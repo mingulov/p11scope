@@ -3217,6 +3217,19 @@ fn round4_settle_ownership(ownership: &mut CountOwnership, scene: &Scene) {
     }
 }
 
+fn round4_b_key(scene: &Scene) -> ModuleKey {
+    scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .modules()
+        .find(|module| module.paths.iter().any(|path| path.ends_with("b.so")))
+        .unwrap()
+        .key
+        .clone()
+}
+
 fn round4_a_key(scene: &Scene) -> ModuleKey {
     scene
         .native
@@ -3429,6 +3442,43 @@ fn demotion_retirement_fresh_summary_staging_after_accepted_scan_keeps_checkpoin
         ownership.revocation_cause(scene.caller, object),
         RevocationCause::None
     );
+}
+
+#[test]
+fn demotion_retirement_fresh_summary_after_replaced_scan_takes_no_checkpoint() {
+    let scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    // Before the pair registers, an accepted scan proving both carriers
+    // (Shared for this object) is replaced by an accepted Sole scan.
+    // The fresh summary will only ever classify the Sole scan; the
+    // replaced Shared scan is gone, so growth whose read predates it
+    // crosses a proven-transient Shared window and must fence into
+    // exact named gaps, not resume ordinary on the initial checkpoint.
+    round4_queue_ownership(
+        &mut ownership,
+        &scene,
+        vec![round4_a_key(&scene), round4_b_key(&scene)],
+        100,
+    );
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(scene.caller), 101);
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 200);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(ownership.newest_accepted_post(scene.caller), 201);
+    assert!(ownership.register_pair(scene.caller, object));
+    let view = ownership.ordinary_view(scene.caller, object);
+    assert_eq!(
+        view.checkpoint(50),
+        0,
+        "a replaced pre-registration scan cannot be skipped by the fresh-summary bypass"
+    );
+    assert_eq!(
+        view.checkpoint(250),
+        view.sequence,
+        "a read after the newest accepted POST still keeps the sequence"
+    );
+    assert_ne!(view.sequence, 0);
 }
 
 #[test]

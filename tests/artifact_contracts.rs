@@ -12582,10 +12582,10 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         ),
         (
             "let kernel_evidence = snapshot.kernel_evidence();",
-            "degraded_pinned_check(context.0.pinned())",
+            "context.0.pinned().check_unchanged()",
         ),
         (
-            "degraded_pinned_check(context.0.pinned())",
+            "context.0.pinned().check_unchanged()",
             "context.0.settle_terminal_drain();",
         ),
         (
@@ -12621,7 +12621,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
     }
     let trace_terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
     let checks: Vec<_> = trace_terminal
-        .match_indices("degraded_pinned_check(context.0.pinned())")
+        .match_indices("context.0.pinned().check_unchanged()")
         .map(|(i, _)| i)
         .collect();
     assert_eq!(

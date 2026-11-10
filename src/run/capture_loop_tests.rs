@@ -3937,8 +3937,9 @@ fn terminal_pinned_check_degrades_to_a_gap_in_profile() {
         .unwrap()
         .0;
     let terminal = profile.split_once("fn run_terminal(").unwrap().1;
-    assert!(
-        terminal.contains("degraded_pinned_check"),
+    assert_eq!(
+        terminal.matches("terminal_identity_or_gap(").count(),
+        1,
         "run_terminal must degrade the pinned check instead of an early `?`"
     );
     assert!(
@@ -3946,7 +3947,8 @@ fn terminal_pinned_check_degrades_to_a_gap_in_profile() {
         "run_terminal must keep the pinned failure for its gap and error"
     );
     assert!(
-        !terminal.contains(".check_unchanged()"),
+        !terminal.contains(".check_unchanged()?")
+            && !terminal.contains(".check_unchanged().map_err("),
         "run_terminal must not revalidate pins directly with an early return"
     );
 }
@@ -3967,7 +3969,7 @@ fn terminal_pinned_and_prearm_checks_degrade_to_gaps_in_trace() {
         .0;
     let terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
     assert_eq!(
-        terminal.matches("degraded_pinned_check").count(),
+        terminal.matches("terminal_identity_or_gap(").count(),
         2,
         "both trace pinned checks must degrade instead of an early `?`"
     );
@@ -3976,7 +3978,8 @@ fn terminal_pinned_and_prearm_checks_degrade_to_gaps_in_trace() {
         "the trace watch-kernel read must seal from a default with its error kept"
     );
     assert!(
-        !terminal.contains(".check_unchanged()"),
+        !terminal.contains(".check_unchanged()?")
+            && !terminal.contains(".check_unchanged().map_err("),
         "trace terminal must not revalidate pins directly with an early return"
     );
     assert!(
@@ -4157,25 +4160,35 @@ fn snapshot_fallback_seals_with_gap_and_partial() {
 /// v070r2: a terminal pinned-object revalidation still seals whether the
 /// pins are unchanged or changed: the bool stays discarded (the sticky
 /// `provider_changed` flag carries the evidence), only an I/O failure
-/// becomes a stored error for the caller's gap.
+/// becomes a stored error (and a latched gap) for the caller.
 #[test]
 fn terminal_pinned_check_still_seals_across_unchanged_and_changed_pins() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
+    let degraded = |pins: &crate::discovery::identity::PinnedObjects| {
+        let noted = std::cell::Cell::new(false);
+        let result = terminal_identity_or_gap(|| noted.set(true), pins.check_unchanged());
+        assert_eq!(
+            result.is_err(),
+            noted.get(),
+            "a gap is filed exactly on failure"
+        );
+        result.err()
+    };
     let empty = crate::discovery::identity::PinnedObjects::empty();
-    assert!(degraded_pinned_check(&empty).is_none());
+    assert!(degraded(&empty).is_none());
     assert!(!empty.provider_changed());
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("provider.so");
     std::fs::write(&path, b"original bytes").unwrap();
     let pins = real_scan_pin(&path, None, 1, &"ab".repeat(32));
-    assert!(degraded_pinned_check(&pins).is_none());
+    assert!(degraded(&pins).is_none());
     assert!(!pins.provider_changed());
 
     // A changed provider still seals (None): the report keeps the sealed
     // snapshot with a gap, and the sticky flag names the change.
     std::fs::write(&path, b"original bytes plus a mutation").unwrap();
-    assert!(degraded_pinned_check(&pins).is_none());
+    assert!(degraded(&pins).is_none());
     assert!(pins.provider_changed());
 }
 

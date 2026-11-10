@@ -3324,8 +3324,8 @@ where
                         if let Some(control) = &control {
                             latch_collection_stop(control, clock);
                         }
-                        // A returned worker's collection already
-                        // completed: a later stop ends the run, not
+                        // A returned worker's collection has its stop
+                        // state frozen: a later stop ends the run, not
                         // that collection.
                         if let Some(worker) = &worker_control
                             && !worker.worker_returned()

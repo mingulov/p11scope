@@ -6429,8 +6429,8 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                             // Pass 0 freezes its outcome where the worker
                             // returns, before anything wrapping the job
                             // runs: a stop that lands later (operator or
-                            // tick) ends the run, never this completed
-                            // collection (owner ruling 2026-11-10).
+                            // tick) ends the run, never this returned
+                            // collection (controller ruling 2026-11-10 05:05).
                             let returned = control.clone();
                             Box::new(move || {
                                 let collection = job();

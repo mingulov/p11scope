@@ -419,6 +419,9 @@ impl CgroupCollection {
         // Move the walker-owned locator allocation through the transaction;
         // no extra path copies escape the walker path budget.
         self.locators.retain(|pid, _| self.ready.contains(pid));
+        // A frozen pass 0 hands the stop-acceptance gate its never-stopping
+        // control, so the gate ignores SIGINT there; the harness never
+        // selects pass 0.
         if let Some(observer) = &self.observer {
             observer.final_pre_read(
                 |pid, start_time| {

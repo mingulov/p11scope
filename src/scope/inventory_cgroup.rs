@@ -35,8 +35,9 @@ pub(crate) struct CollectionControl {
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     /// Set once this control's worker job has returned its collection.
     /// The loop's tick latch then leaves a forked worker control alone,
-    /// so a stop landing after the collection completed cannot cancel
-    /// it retroactively (operator-stop sources still apply).
+    /// so a stop landing after the return cannot cancel that collection
+    /// retroactively. Operator-stop sources still latch this control
+    /// itself; the returned collection's frozen work no longer checks it.
     worker_returned: Arc<AtomicBool>,
 }
 impl CollectionControl {

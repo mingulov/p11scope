@@ -17041,6 +17041,10 @@ exit 0
         coordinator
             .apply_cgroup_collection(collection, 1_000)
             .unwrap();
+        // In production this holds for later passes only: a pass-0 worker
+        // that already returned has its stop state frozen, so a stop after
+        // the first collection finishes lets that pass publish (controller
+        // ruling 2026-11-10 05:05). This direct collection is never frozen.
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
         let read_counter = reads.clone();
         provider_read_test::observe(

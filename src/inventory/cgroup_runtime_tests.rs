@@ -736,6 +736,13 @@ fn cgroup_runtime_stop_after_return_survives_collection_ticks() {
             collection
         })
     }));
+    let window_ticks = Arc::new(AtomicUsize::new(0));
+    let (tick_stop, tick_count) = (stop.clone(), Arc::clone(&window_ticks));
+    driver.tick = Some(Box::new(move || {
+        if tick_stop.load(Ordering::SeqCst) {
+            tick_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
     let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
         &mut driver,
         None,
@@ -745,8 +752,38 @@ fn cgroup_runtime_stop_after_return_survives_collection_ticks() {
     );
     assert!(result.error.is_none());
     assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
+    assert!(
+        window_ticks.load(Ordering::SeqCst) > 0,
+        "collection ticks must run inside the return window"
+    );
     assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
+    assert_kept_completed_pass0(&mut driver);
+}
+
+/// The completed pass-0 collection published: its caller is present, no
+/// incomplete-transaction gap was recorded, and the stopped run never
+/// took the staged delta.
+fn assert_kept_completed_pass0(driver: &mut ObservedDriver<'_>) {
     assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+    assert!(
+        !driver
+            .inner
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "cgroup scope transaction incomplete"),
+        "a completed pass 0 records no incomplete-transaction gap"
+    );
+    assert!(
+        !driver
+            .inner
+            .coordinator
+            .take_target_delta()
+            .endpoints
+            .is_empty(),
+        "the completed commit stages its delta; the stopped run takes nothing"
+    );
 }
 
 /// Ctrl-C twin of the return window: the operator stop arrives through
@@ -769,6 +806,13 @@ fn cgroup_runtime_operator_stop_after_return_keeps_completed_pass0() {
             collection
         })
     }));
+    let window_ticks = Arc::new(AtomicUsize::new(0));
+    let (tick_source, tick_count) = (Arc::clone(&source), Arc::clone(&window_ticks));
+    driver.tick = Some(Box::new(move || {
+        if tick_source.load(Ordering::SeqCst) != 0 {
+            tick_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
     let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
         &mut driver,
         None,
@@ -778,8 +822,12 @@ fn cgroup_runtime_operator_stop_after_return_keeps_completed_pass0() {
     );
     assert!(result.error.is_none());
     assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
+    assert!(
+        window_ticks.load(Ordering::SeqCst) > 0,
+        "collection ticks must run inside the return window"
+    );
     assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
-    assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+    assert_kept_completed_pass0(&mut driver);
 }
 
 #[test]

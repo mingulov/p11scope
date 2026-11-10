@@ -5837,6 +5837,131 @@ mod journal_unavailable_tests {
         );
     }
 
+    /// Ordering twin for the staged-mapping priority: a staged-only
+    /// row blocked by a module-independent retained negative keeps
+    /// no priority. Domain/Task/Image match without the module id,
+    /// so the drain refuses the row and the mirror must sort it
+    /// with the churn; Module/Exact name a drained module id a
+    /// staged-only module cannot have yet (ids are never reused),
+    /// so they grant priority as before. Every kind asserts its
+    /// fits verdict and its drain fate.
+    #[test]
+    fn staged_only_row_with_module_independent_negative_keeps_no_priority() {
+        use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+        // (kind, cookie, exec, router, blocked): the Module/Exact
+        // negatives match on every field but the module id, so a
+        // fits verdict pins the module exclusion precisely.
+        for (kind, cookie, exec, router, blocked) in [
+            (NegativeKind::Domain, 0, 0, 0, true),
+            (NegativeKind::Task, 999, 0, 0, true),
+            (NegativeKind::Image, 999, 1, 0, true),
+            (NegativeKind::Module, 999, 1, 0, false),
+            (NegativeKind::Exact, 999, 1, 99999, false),
+        ] {
+            let mut scene = UnlinkedScene::new();
+            scene.registry.reference_instance_limit(1);
+            let module = scene
+                .registry
+                .scripted_module_edge(scene.module.clone(), scene.caller);
+            let junk = InstanceKey::scripted(
+                scene.domain,
+                ImageIdentity {
+                    task_cookie: 777,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(1000),
+                scene.module.clone(),
+            );
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(junk, CallerId(99)));
+            let genuine_caller = CallerId(8);
+            let genuine_module = ModuleKey::Physical {
+                dev_major: 9,
+                dev_minor: 9,
+                ino: 99,
+                sha256: None,
+            };
+            scene.registry.note_mapping(
+                genuine_caller,
+                4242,
+                ModuleInfo {
+                    path: "/genuine/driver.so".into(),
+                    key: genuine_module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: None,
+                    admission: AdmissionState::Admitted,
+                    admission_class: None,
+                    admission_endpoints: None,
+                    admission_reasons: Vec::new(),
+                },
+                1,
+            );
+            let genuine = InstanceKey::scripted(
+                scene.domain,
+                ImageIdentity {
+                    task_cookie: 999,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(99999),
+                genuine_module,
+            );
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(genuine.clone(), genuine_caller));
+            scene
+                .registry
+                .instance_state
+                .negatives
+                .push(NegativeRecord {
+                    domain: scene.domain,
+                    cookie,
+                    exec,
+                    router,
+                    module,
+                    barrier: 0,
+                    reasons: 0,
+                    kind,
+                    retirement: Some(InstanceReason::InstanceRetired),
+                    authority_exhausted: false,
+                });
+            let input = AdmittedInstanceCall::scripted(
+                genuine,
+                genuine_caller,
+                1,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            );
+            let mut plan = scene
+                .registry
+                .joint_registration_plan()
+                .expect("plan builds");
+            let window = JointRegistrationWindow {
+                start: 0,
+                end: plan.staged_len,
+            };
+            let fit = plan.position(&input, &window);
+            if blocked {
+                assert!(
+                    matches!(fit, Err(JointReceiptInstallRefusal::Capacity)),
+                    "{kind:?}: a negative-blocked staged-only row keeps no priority, got {fit:?}"
+                );
+            } else {
+                assert!(
+                    fit.is_ok(),
+                    "{kind:?}: a staged-only row no negative can name must fit, got {fit:?}"
+                );
+            }
+            drop(plan);
+            scene.registry.publish();
+            assert_eq!(
+                scene.registry.instance_state.records.len(),
+                usize::from(!blocked),
+                "{kind:?}: drain fate"
+            );
+        }
+    }
+
     /// A birth offered for a key whose registration already
     /// drained (feed already selected) is named AlreadySelected,
     /// never Capacity: the fits loop leaves held keys fits=false

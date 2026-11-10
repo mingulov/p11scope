@@ -2878,6 +2878,93 @@ class JointConservationGate(unittest.TestCase):
             self.assertEqual(result["verdict"], "pass")
             self.assertEqual(result["loss"]["foreign_gaps"], 1)
 
+    def test_module_only_foreign_gap_is_counted_never_gated(self):
+        # The live joint-10k-single shape: a module-only gap naming
+        # another module, with no caller and no pid, is that module's
+        # disclosure, not the cell's: counted as foreign, never gated.
+        with tempfile.TemporaryDirectory(prefix="joint-mfgap-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            doc["modules"].append(
+                {"id": "m1", "lifecycle": "mapped",
+                 "unloaded_observed": False,
+                 "admission": {"state": "admitted",
+                               "class": "closure_array",
+                               "endpoints": 6734, "reasons": []}})
+            doc["gaps"].append(
+                {"caller": None, "module": "m1", "pid": None,
+                 "subject": "native endpoint attach failed",
+                 "reason": "146 endpoint(s) still deferred when the "
+                           "receipt closed; counted uses are lower bounds",
+                 "budget": None, "repeats": 1})
+            write_json(inventory, doc)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["foreign_gaps"], 1)
+
+    def test_module_only_foreign_gap_event_is_counted_never_gated(self):
+        # Same rule on the event stream: a module-only foreign
+        # gap_recorded is counted as foreign, never silently dropped.
+        with tempfile.TemporaryDirectory(prefix="joint-mfgapev-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            ended = rows[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": "m1",
+                                  "pid": None,
+                                  "subject": "native endpoint attach failed",
+                                  "reason": "146 endpoint(s) still deferred "
+                                            "when the receipt closed; counted "
+                                            "uses are lower bounds",
+                                  "budget": None})
+            rows.insert(-1, gap)
+            ended["seq"] += 1
+            write_jsonl(events, rows)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["foreign_gaps"], 1)
+
+    def test_driver_module_loss_gap_still_fails(self):
+        # A gap naming the cell's own module stays in scope: a loss
+        # subject there still fails the cell.
+        with tempfile.TemporaryDirectory(prefix="joint-mscmod-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": "m0", "pid": None,
+                     "subject": "semantic admission refused",
+                     "reason": "semantic_unavailable:no_receipt",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_module_gap_with_driver_pid_still_fails(self):
+        # A different-module gap that carries the cell's pid references
+        # the cell, so it stays in scope and the module check fails it.
+        with tempfile.TemporaryDirectory(prefix="joint-mpid-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": "m1", "pid": PID,
+                     "subject": "native endpoint attach failed",
+                     "reason": "146 endpoint(s) still deferred when the "
+                               "receipt closed; counted uses are lower bounds",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    "gap references another caller/module/PID"):
+                self.run_joint(Path(tmp), mutate)
+
     def test_callerless_shed_gap_fails(self):
         with tempfile.TemporaryDirectory(prefix="joint-shed-") as tmp:
             def mutate(doc):

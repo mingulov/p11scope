@@ -11955,6 +11955,127 @@ fn loader_service_orders_freshest_first() {
     assert_eq!(order, vec![key(2), key(3), key(1)]);
 }
 
+/// Freshest-first ties keep key order: equal hook timestamps serve in the
+/// same order the old key-ordered loop served them.
+#[test]
+fn loader_service_orders_equal_timestamps_by_key() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    let key = |view: u32| PendingLoaderScanKey {
+        view: ProcessViewId(view),
+        context,
+    };
+    engine.pending_loader_scans.insert(key(3), (10, 1));
+    engine.pending_loader_scans.insert(key(1), (10, 1));
+    engine.pending_loader_scans.insert(key(2), (10, 1));
+    let due: BTreeSet<PendingLoaderScanKey> = engine.pending_loader_scans.keys().copied().collect();
+    let order = Engine::order_loader_scans_freshest_first(&engine.pending_loader_scans, &due);
+    assert_eq!(order, vec![key(1), key(2), key(3)]);
+}
+
+/// Stale `due` keys (absent from the ledger) sink below every known scan;
+/// the service loop skips them where they land.
+#[test]
+fn loader_service_sinks_stale_due_keys_last() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    let key = |view: u32| PendingLoaderScanKey {
+        view: ProcessViewId(view),
+        context,
+    };
+    engine.pending_loader_scans.insert(key(1), (10, 1));
+    engine.pending_loader_scans.insert(key(2), (30, 1));
+    let stale = key(9);
+    let due: BTreeSet<PendingLoaderScanKey> = [key(1), key(2), stale].into_iter().collect();
+    let order = Engine::order_loader_scans_freshest_first(&engine.pending_loader_scans, &due);
+    assert_eq!(order, vec![key(2), key(1), stale]);
+}
+
+/// A full ledger drops an arrival no newer than the stalest held entry:
+/// every held key survives, the arrival never enters, and the truncation
+/// carries the drop (not eviction) reason.
+#[test]
+fn loader_ledger_full_drops_older_arrival_unchanged() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    for index in 0..crate::discovery::loader::MAX_LOADER_CONTEXTS as u32 {
+        engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(index),
+                context,
+            },
+            100 + u64::from(index),
+            1,
+        );
+    }
+    let held: BTreeSet<PendingLoaderScanKey> =
+        engine.pending_loader_scans.keys().copied().collect();
+    engine.defer_loader_memory_scan(
+        PendingLoaderScanKey {
+            view: ProcessViewId(1000),
+            context,
+        },
+        50,
+        1,
+    );
+    assert_eq!(
+        engine
+            .pending_loader_scans
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        held,
+        "an older arrival must not disturb the held window"
+    );
+    assert_eq!(engine.discovery_truncated, 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("bounded loader-context ledger")
+                && !skip.reason.contains("evicted")
+        }),
+        "the drop names the bounded ledger without claiming an eviction: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Churn-eviction growth and overload-drop growth are distinguishable: the
+/// evicted-victim path records its own reason while counting the same
+/// bounded-ledger truncation as the dropped-arrival path.
+#[test]
+fn loader_ledger_eviction_records_its_own_loss_reason() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let context = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    for index in 0..crate::discovery::loader::MAX_LOADER_CONTEXTS as u32 {
+        engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(index),
+                context,
+            },
+            100 + u64::from(index),
+            1,
+        );
+    }
+    engine.defer_loader_memory_scan(
+        PendingLoaderScanKey {
+            view: ProcessViewId(1000),
+            context,
+        },
+        10_000,
+        1,
+    );
+    assert_eq!(engine.discovery_truncated, 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader memory discovery"
+                && skip.reason.contains("bounded loader-context ledger")
+                && skip.reason.contains("evicted")
+        }),
+        "the eviction names its victim as evicted, not dropped: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Churn regression (system-churn P0): three short-lived workers map the
 /// SAME provider file. Discovery proves the file once (one module, not
 /// one per worker); scripted calls from the two live workers count

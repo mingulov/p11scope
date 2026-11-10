@@ -1053,6 +1053,120 @@ fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
     assert!(case.session.attached_slots.is_empty());
 }
 
+/// Churn ledger and service, live: the ledger fills to its cap through the
+/// real deferral path with a real dead worker's scan as the stalest entry;
+/// a live newcomer's arrival evicts exactly that dead scan; and service
+/// through the real path serves the live view's freshest scan first (it
+/// hands off and parks the stale one), even though key order would serve
+/// the stale scan first. Live holders throughout; synchronous kill+wait —
+/// no timing.
+#[test]
+fn churn_ledger_evicts_dead_scan_and_serves_live_freshest_first() {
+    let mut case = Case::new();
+    let _scope = case.bounded_scope();
+    let mut peers = e06_spawn_sleeps(2);
+    let dead_view = ProcessView::open(ProcessViewId(4), peers[0].pid()).unwrap();
+    let dead_id = dead_view.id();
+    let live_view = ProcessView::open(ProcessViewId(5), peers[1].pid()).unwrap();
+    let live_id = live_view.id();
+    case.engine.views.push(dead_view);
+    case.engine.views.push(live_view);
+    let views0 = case.engine.views[0].id();
+    // The stale deferral is created first so its key sorts first: key order
+    // would serve (and hand off from) the stale scan, leaving the fresh one
+    // pending. Serving the fresh one first proves freshest-first.
+    let stale = case.scan_context(views0, None);
+    let fresh = case.scan_context(views0, None);
+    assert!(
+        stale < fresh,
+        "key order must prefer the stale scan for this proof"
+    );
+    let dead = case.scan_context(dead_id, None);
+    let newcomer = case.scan_context(live_id, None);
+    // Fill the ledger through the real deferral path: synthetic stale
+    // ballast standing in for dead churn, plus the three real deferrals
+    // with the dead worker's scan stalest of all.
+    let ballast = crate::discovery::loader::LoaderContextId::from_case_id(0);
+    for index in 0..(crate::discovery::loader::MAX_LOADER_CONTEXTS - 3) as u32 {
+        case.engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(100 + index),
+                context: ballast,
+            },
+            101 + u64::from(index),
+            1,
+        );
+    }
+    case.engine.defer_loader_memory_scan(dead, 5, 1);
+    case.engine.defer_loader_memory_scan(stale, 11, 1);
+    case.engine.defer_loader_memory_scan(fresh, 22, 1);
+    assert_eq!(
+        case.engine.pending_loader_scans.len(),
+        crate::discovery::loader::MAX_LOADER_CONTEXTS,
+        "the ledger must be full before the newcomer arrives"
+    );
+    // The dead worker exits before its scan resolves; the live newcomer's
+    // arrival evicts exactly that dead scan through the real path.
+    peers[0].reap().unwrap();
+    assert!(
+        case.engine.original_exited(dead_id),
+        "the evicted worker must be truly dead"
+    );
+    let truncated = case.engine.discovery_truncated;
+    case.engine.defer_loader_memory_scan(newcomer, 2000, 1);
+    assert_eq!(
+        case.engine.pending_loader_scans.len(),
+        crate::discovery::loader::MAX_LOADER_CONTEXTS,
+        "eviction keeps the ledger bounded"
+    );
+    assert!(
+        !case.engine.pending_loader_scans.contains_key(&dead),
+        "the dead worker's scan leaves for the live newcomer"
+    );
+    assert!(
+        case.engine.pending_loader_scans.contains_key(&newcomer),
+        "the live newcomer's arrival is admitted"
+    );
+    assert_eq!(
+        case.engine.discovery_truncated,
+        truncated + 1,
+        "the evicted scan counts its truncation"
+    );
+    // Service serves the live view's freshest scan first: it hands off and
+    // parks the stale one behind the handoff.
+    let scans = case.engine.deep_scans;
+    let outcome = case
+        .engine
+        .service_pending_loader_scans(
+            BTreeSet::from([stale, fresh]),
+            &mut case.session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(
+        case.engine.pending_global_retirement.is_some(),
+        "the first real scan handed off its original owned static pair"
+    );
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!outcome.required_complete());
+    assert_eq!(
+        case.engine.deep_scans,
+        scans + 1,
+        "only the freshest scan runs before the handoff parks the rest"
+    );
+    assert!(
+        !case.engine.pending_loader_scans.contains_key(&fresh),
+        "the freshest scan was served first"
+    );
+    assert_eq!(
+        case.engine.pending_loader_scans.get(&stale),
+        Some(&(11, 1)),
+        "the stale scan parks behind the handoff"
+    );
+    assert!(case.session.attached_slots.is_empty());
+}
+
 #[test]
 fn async_global_fix_round_nonpressure_backlog_handoff_keeps_fifo_over_one_quantum() {
     let mut case = Case::new();

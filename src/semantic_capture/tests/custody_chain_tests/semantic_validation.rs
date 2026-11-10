@@ -242,13 +242,13 @@ impl HeldProviders {
     }
 }
 
-/// The same substituted map I/O as the existing H0 tests, with endpoint
-/// offsets and held attachment files taken from the real attested subset.
 /// Second load base offset for a double-mapped scripted file, relative
 /// to its scan-input base. Well inside the per-file base spacing, so the
 /// second mapping never overlaps a sibling file's ranges.
 const DOUBLE_MAP_STRIDE: u64 = 0x10_0000;
 
+/// The same substituted map I/O as the existing H0 tests, with endpoint
+/// offsets and held attachment files taken from the real attested subset.
 struct HeldIo {
     script: ScriptIo,
     endpoints: Vec<(u32, String, Endpoint)>,

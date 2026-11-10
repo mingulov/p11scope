@@ -591,6 +591,63 @@ mod full_image {
         );
     }
 
+    /// The retry offers at most one birth per quantum and ends with the
+    /// quantum of the key's first routed call, whichever of that call
+    /// and the key's observation comes first in it.
+    #[test]
+    fn birth_retry_offers_once_per_quantum_until_the_first_call() {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumIdentity as Q;
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert!(
+            r.note_birth_offer(identity, FILE, Q::scripted(1)),
+            "the sighting offers"
+        );
+        assert!(
+            !r.note_birth_offer(identity, FILE, Q::scripted(1)),
+            "no second offer in the same quantum"
+        );
+        assert!(
+            r.note_birth_offer(identity, FILE, Q::scripted(2)),
+            "a quiet later quantum"
+        );
+        // Call first, then the observation, in quantum 3: one offer, then over.
+        r.note_routed_call(identity, FILE, Some(Q::scripted(3)));
+        assert!(r.birth_retry_armed(identity, FILE));
+        assert!(
+            r.note_birth_offer(identity, FILE, Q::scripted(3)),
+            "the first call's quantum"
+        );
+        assert!(!r.birth_retry_armed(identity, FILE), "the retry ends");
+        assert!(!r.note_birth_offer(identity, FILE, Q::scripted(4)));
+
+        // Observation first, then the call, in one quantum: over at the call.
+        let other = image(COOKIE + 2, 10);
+        r.observe(seal(domain(), other, 1, 0, r.fence()));
+        assert!(r.note_birth_offer(other, FILE, Q::scripted(5)));
+        r.note_routed_call(other, FILE, Some(Q::scripted(5)));
+        assert!(!r.birth_retry_armed(other, FILE));
+
+        // A first call with no later observation in its quantum: the
+        // next quantum is past its first record, so no offer.
+        let late = image(COOKIE + 3, 10);
+        r.observe(seal(domain(), late, 1, 0, r.fence()));
+        assert!(r.note_birth_offer(late, FILE, Q::scripted(6)));
+        r.note_routed_call(late, FILE, Some(Q::scripted(7)));
+        assert!(!r.note_birth_offer(late, FILE, Q::scripted(8)));
+        assert!(!r.birth_retry_armed(late, FILE));
+
+        // A call outside any collected quantum ends the retry.
+        let bare = image(COOKIE + 4, 10);
+        r.observe(seal(domain(), bare, 1, 0, r.fence()));
+        r.note_routed_call(bare, FILE, None);
+        assert!(!r.birth_retry_armed(bare, FILE));
+    }
+
     /// A key sighted `New` keeps its birth armed across quiet passes
     /// until its first admission, so the pass holding its first call
     /// can still birth it; the outcome itself stays `Continued`. The

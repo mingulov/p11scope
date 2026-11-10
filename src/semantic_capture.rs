@@ -1541,6 +1541,10 @@ impl TerminalTaskProof {
 pub(crate) struct SemanticCapture {
     identity: u64,
     router: InstanceRouter,
+    /// The collected quantum of the tick in progress (`None` outside
+    /// a collected tick): a routed call notes it for its key's birth
+    /// retry.
+    tick_quantum: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
     limits: TickLimits,
     next_token: u64,
     awaiting: BTreeMap<u64, Awaiting>,
@@ -1673,6 +1677,7 @@ impl SemanticCapture {
         Ok(Self {
             identity,
             router: InstanceRouter::new(domain, RouterLimits::default()),
+            tick_quantum: None,
             limits,
             next_token: 1,
             awaiting: BTreeMap::new(),
@@ -3168,6 +3173,7 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        self.tick_quantum = birth_cut.as_ref().map(|(_, quantum)| *quantum);
         // One storage_null snapshot per scan pass for the Q1(b) gate.
         self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();
@@ -3327,6 +3333,15 @@ impl SemanticCapture {
     fn resolve(&mut self, outcomes: Vec<(u64, Route)>, report: &mut TickReport) {
         for (token, route) in outcomes {
             if let Some(waiting) = self.awaiting.remove(&token) {
+                if matches!(route, Route::Joined(_))
+                    && let Some(endpoint) = waiting.endpoint
+                {
+                    self.router.note_routed_call(
+                        waiting.record.base.event.image,
+                        endpoint.file_slot,
+                        self.tick_quantum,
+                    );
+                }
                 self.emit(
                     Some(token),
                     waiting.record,
@@ -3832,6 +3847,7 @@ impl SemanticCapture {
                 (owned.records.as_slice(), owned.status, None, None, true)
             }
         };
+        self.tick_quantum = birth_cut.as_ref().map(|(_, quantum)| *quantum);
         let collection_failed =
             status != CollectionStatus::Complete || records.len() > self.limits.records;
         // Positions belong to first collection, including noncalls. Pending
@@ -3928,6 +3944,8 @@ impl SemanticCapture {
                 if matches!(route, Route::Joined(_)) {
                     let endpoint = endpoint.expect("checked owned endpoint");
                     let image = record.base.event.image;
+                    self.router
+                        .note_routed_call(image, endpoint.file_slot, self.tick_quantum);
                     let key = (image.task_cookie, image.exec_id, endpoint.file_slot);
                     joined_interests.entry(key).or_insert((
                         image,

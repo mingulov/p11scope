@@ -467,6 +467,17 @@ pub(crate) enum Route {
     Unknown(UnknownReason),
 }
 
+/// One sighted key's birth retry: the quantum it last offered a birth
+/// in, and the quantum of its first routed call. The retry exists only
+/// until the key's first call: that call's quantum may still offer
+/// one birth (whichever of the call and the observation comes first
+/// in it), and then the retry ends.
+#[derive(Clone, Copy, Default)]
+struct BirthRetry {
+    offered: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
+    first_call: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RouterLimits {
     pub(crate) instances: usize,
@@ -749,13 +760,10 @@ pub(crate) struct InstanceRouter {
     /// late for that: by then the image's own records are consumed.
     /// Cleared by the key's first admission mark or by retirement;
     /// capped by the observed-keys cap, where an unarmed key fails
-    /// closed to the old behavior. The value is the quantum whose
-    /// birth the key last offered: a retry fires at most once per
-    /// quantum, and the entry ends with the retry (nothing outlives it).
-    birth_retry: BTreeMap<
-        (ImageKey, u32),
-        Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
-    >,
+    /// closed to the old behavior. A retry fires at most once per
+    /// quantum and ends with the quantum of the key's first routed
+    /// call (see [`BirthRetry`]); nothing outlives it.
+    birth_retry: BTreeMap<(ImageKey, u32), BirthRetry>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -983,12 +991,47 @@ impl InstanceRouter {
         if !self.observed.contains_key(&key) {
             return false;
         }
-        match self.birth_retry.get_mut(&key) {
-            Some(last) if *last != Some(quantum) => {
-                *last = Some(quantum);
+        let Some(retry) = self.birth_retry.get_mut(&key) else {
+            return false;
+        };
+        if retry.offered == Some(quantum) {
+            return false;
+        }
+        match retry.first_call {
+            // The first call's quantum offers its one birth; any later
+            // quantum is past the first record: the retry ends.
+            Some(call) => {
+                self.birth_retry.remove(&key);
+                call == quantum
+            }
+            None => {
+                retry.offered = Some(quantum);
                 true
             }
-            _ => false,
+        }
+    }
+
+    /// Note a call routed to this key in `quantum` (`None`: no
+    /// collected quantum, so no birth can follow). A quantum that
+    /// already offered this key's birth ends the retry; otherwise the
+    /// first call's quantum is kept for its one offer.
+    pub(crate) fn note_routed_call(
+        &mut self,
+        image: ImageIdentity,
+        file: u32,
+        quantum: Option<crate::semantics_objects::journal::joint_driver::RawQuantumIdentity>,
+    ) {
+        let key = (ImageKey::from(image), file);
+        let Some(retry) = self.birth_retry.get_mut(&key) else {
+            return;
+        };
+        match quantum {
+            Some(quantum) if retry.offered != Some(quantum) => {
+                retry.first_call.get_or_insert(quantum);
+            }
+            _ => {
+                self.birth_retry.remove(&key);
+            }
         }
     }
 
@@ -1010,7 +1053,7 @@ impl InstanceRouter {
                 .retain(|retained, _| observed.contains_key(retained));
         }
         if self.birth_retry.len() < self.limits.observed_keys {
-            self.birth_retry.insert(key, None);
+            self.birth_retry.insert(key, BirthRetry::default());
         }
     }
 
@@ -1224,6 +1267,7 @@ impl InstanceRouter {
             let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
                 break;
             };
+            self.birth_retry.remove(&(owner, file_slot));
             let ids: Vec<_> = evicted
                 .back()
                 .into_iter()
@@ -1693,6 +1737,7 @@ impl InstanceRouter {
                     }
                     self.faulted.insert(key);
                     self.absent.remove(&key);
+                    self.birth_retry.remove(&key);
                     if let Some(list) = self.observed.remove(&key) {
                         self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
                     }

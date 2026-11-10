@@ -96,6 +96,14 @@ impl CollectedCallOrigin {
 }
 
 #[cfg(test)]
+impl RawQuantumIdentity {
+    /// A scripted quantum identity for router fixtures.
+    pub(crate) fn scripted(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+#[cfg(test)]
 impl CollectedCallOrigin {
     /// A scripted END origin at one H0 position, for journal algorithm
     /// fixtures that do not run the production collection driver.

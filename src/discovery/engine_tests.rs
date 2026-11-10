@@ -57339,10 +57339,10 @@ fn midfinal_residual_deferred_inventory_keeps_named_view_until_proven_exit() {
         engine.views.iter().any(|retained| retained.id() == view),
         "the deferred view stays retained"
     );
-    // Coverage, not multiplicity: every applied rebind appends a fresh
-    // module/entry pin layer without the inventory path's
-    // `reset_scan_pin_claims` (pre-existing, healthy ticks included), so
-    // pin multiplicity churns while the covered objects stay identical.
+    // Coverage, not multiplicity: every applied rebind restores the
+    // scan-owned pin layer and appends one fresh module/entry pin layer,
+    // so pin multiplicity stays stable while the covered objects stay
+    // identical.
     let claims_after = engine
         .pinned
         .view_claims(view)
@@ -57594,10 +57594,10 @@ fn midfinal_residual_deferred_inventory_keeps_system_view_until_proven_exit() {
         id_a,
         "the deferred view keeps its original view ID"
     );
-    // Coverage, not multiplicity: every applied rebind appends a fresh
-    // module/entry pin layer without the inventory path's
-    // `reset_scan_pin_claims` (pre-existing, healthy ticks included), so
-    // pin multiplicity churns while the covered objects stay identical.
+    // Coverage, not multiplicity: every applied rebind restores the
+    // scan-owned pin layer and appends one fresh module/entry pin layer,
+    // so pin multiplicity stays stable while the covered objects stay
+    // identical.
     let claims_after = engine
         .pinned
         .view_claims(id_a)

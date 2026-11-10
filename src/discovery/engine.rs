@@ -14776,6 +14776,10 @@ impl Engine {
                     .any(|entry| pinned.rejects(entry.object))
         });
         pinned.reset_derived_claims();
+        // Restore the scan-owned pin layer before the rebind below appends
+        // its module/entry pins; otherwise every tick stacks another pin
+        // layer onto the previous tick's and RSS grows without bound.
+        pinned.reset_scan_pin_claims();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "live_merge_head",

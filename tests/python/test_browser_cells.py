@@ -513,9 +513,20 @@ class BrowserCells(unittest.TestCase):
         with open(result.report_path, encoding="utf-8") as handle:
             report = json.load(handle)
         observations = report.get("object_observations") or {}
+        # Name the cause on failure: every Joint birth refusal (caller,
+        # reason, repeats) and the observation gaps, so a CI miss says
+        # whether a birth was refused or never offered.
+        birth_refusals = sorted(
+            (str(gap.get("caller")), str(gap.get("reason")),
+             gap.get("repeats", 1))
+            for gap in report.get("gaps") or []
+            if isinstance(gap, dict)
+            and gap.get("subject") == "Joint birth unavailable; retained S1")
         self.assertNotEqual(
             observations.get("reason"), "bootstrap_unavailable",
-            "late browser never covered (per-key tracking never started)")
+            "late browser never covered (per-key tracking never started); "
+            f"birth refusals={birth_refusals}; "
+            f"observation gaps={observations.get('gaps')}")
         rows = observations.get("key_operations") or []
         self.assertGreater(len(rows), 0, "no key-operation rows at all")
         completed_signs = sum(

@@ -2220,6 +2220,226 @@ fn module_churn_still_rebuilds() {
     }
 }
 
+/// Backing files for the pinned-churn fixture. Created once per test so two
+/// engines built from the same directory pin the same files with identical
+/// identities (rewriting would change ctime and thus the pin).
+fn pinned_churn_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "removed.so",
+        "refreshed.so",
+        "retained.so",
+        "refreshed-new.so",
+        "new-view.so",
+    ] {
+        overlay_backing_file(&dir, name);
+    }
+    dir
+}
+
+/// Committed state with pins on every churn arm: views 60 (removed) and 62
+/// (refreshed) hold pins but no modules, view 64 holds one committed module
+/// plus its pins, and fresh pins wait for the refreshed view (minor 66) and
+/// the admitted view 70 (minor 68). Every pin set is a distinct real file
+/// with scan-time ownership, so each remove/replace/absorb move changes the
+/// committed store.
+struct PinnedChurnEngine {
+    engine: Engine,
+    committed: PinnedObjects,
+    refresh_pins: PinnedObjects,
+    new_pins: PinnedObjects,
+}
+
+fn pinned_churn_engine(dir: &tempfile::TempDir) -> PinnedChurnEngine {
+    let views: Vec<ProcessView> = [60, 62, 64]
+        .into_iter()
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    let pin_set = |name: &str, minor: u64| {
+        let path = dir.path().join(name);
+        let key = overlay_key(minor);
+        let pins = overlay_real_scan_pin(&path, Some(key), 900 + minor, OVERLAY_SHA);
+        assert_eq!(pins.pinned().count(), 1, "{name} pins one object");
+        (path, key, pins)
+    };
+    for (view, name, minor) in [
+        (ProcessViewId(60), "removed.so", 60),
+        (ProcessViewId(62), "refreshed.so", 62),
+        (ProcessViewId(64), "retained.so", 64),
+    ] {
+        let (path, key, mut pins) = pin_set(name, minor);
+        record_scan_ownership(&mut pins, view, key, path.to_str().unwrap());
+        let skipped = engine.pinned.absorb(pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+    assert_eq!(engine.pinned.pinned().count(), 3);
+    let mut retained_module = overlay_module(overlay_key(64));
+    retained_module.path = dir.path().join("retained.so").display().to_string();
+    retained_module.tables[0].entries = overlay_entries(&retained_module, first_offsets(1));
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&retained_module), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 1, "the retained view commits one module");
+    engine.modules = modules;
+    engine.plan = plan::build_from_reconciled_modules(&engine.modules);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    engine.plan_rebuild_stable = true;
+    let committed = engine.pinned.clone();
+    let (refresh_path, refresh_key, mut refresh_pins) = pin_set("refreshed-new.so", 66);
+    record_scan_ownership(
+        &mut refresh_pins,
+        ProcessViewId(62),
+        refresh_key,
+        refresh_path.to_str().unwrap(),
+    );
+    let (new_path, new_key, mut new_pins) = pin_set("new-view.so", 68);
+    record_scan_ownership(
+        &mut new_pins,
+        ProcessViewId(70),
+        new_key,
+        new_path.to_str().unwrap(),
+    );
+    PinnedChurnEngine {
+        engine,
+        committed,
+        refresh_pins,
+        new_pins,
+    }
+}
+
+/// The single pin carrying `key`, matched by identity key rather than the
+/// store-local id so separately built engines compare exactly.
+fn pin_with_key(pins: &PinnedObjects, key: ObjectKey, role: &str) -> PinnedObjectId {
+    let mut found = None;
+    for pin in pins.pinned() {
+        if pin.key == key {
+            assert!(found.is_none(), "duplicate {role} pin for the key");
+            found = Some(pin.id);
+        }
+    }
+    found.expect("a pin for the expected key")
+}
+
+/// Pin-move exactness for the empty-churn fast path. The direct leg asserts
+/// the moved set exactly: the retained survivor keeps its identity and
+/// sources, the fresh refresh and admission pins arrive with theirs, and the
+/// removed and replaced pins are gone. The equivalence leg runs the same
+/// input through the full rebuild (kill switch) and compares pins pin by
+/// pin. Deleting the move loops leaves the stale pins in place and the
+/// fresh pins missing, failing both legs.
+#[test]
+fn empty_churn_moves_pins_exactly() {
+    let dir = pinned_churn_dir();
+    let mut fast = pinned_churn_engine(&dir);
+    let mut full = pinned_churn_engine(&dir);
+    full.engine.set_disable_empty_tick_fast_path_for_test(true);
+    fast.engine.fail_full_candidate_rebuild_for_test = true;
+    let removed: BTreeSet<ProcessViewId> = [ProcessViewId(60)].into_iter().collect();
+    let fast_before = loader_planning_operation_counts(&fast.engine);
+    let full_before = loader_planning_operation_counts(&full.engine);
+    let run = |built: &mut PinnedChurnEngine| {
+        let refreshed = vec![(ProcessViewId(62), Vec::new(), built.refresh_pins.clone())];
+        let new_views = vec![(
+            ProcessView::open(ProcessViewId(70), std::process::id()).unwrap(),
+            Vec::new(),
+            built.new_pins.clone(),
+        )];
+        built.engine.inventory_candidate(
+            &removed,
+            &refreshed,
+            &new_views,
+            Vec::new(),
+            &BTreeSet::new(),
+        )
+    };
+    let candidate = run(&mut fast).expect("empty churn with pins takes the fast path");
+    let rebuilt = run(&mut full).expect("the full path rebuilds identical input");
+    assert_eq!(
+        loader_planning_operation_counts(&fast.engine),
+        fast_before,
+        "the fast path rebuilds nothing"
+    );
+    assert_eq!(
+        loader_planning_operation_counts(&full.engine),
+        (full_before.0 + 1, full_before.1 + 1),
+        "the full path rebuilt once, pinning the kill switch"
+    );
+    assert_eq!(
+        candidate.pinned.pinned().count(),
+        3,
+        "removed and replaced pins leave, fresh pins arrive"
+    );
+    let expect_moved = |expected: &PinnedObjects, key: ObjectKey, role: &str| {
+        let from = pin_with_key(expected, key, role);
+        let into = pin_with_key(&candidate.pinned, key, role);
+        assert!(
+            expected.exactly_matches(from, &candidate.pinned, into),
+            "{role} pin keeps its identity"
+        );
+        assert_eq!(
+            expected.sources(from),
+            candidate.pinned.sources(into),
+            "{role} pin keeps its sources"
+        );
+    };
+    expect_moved(&fast.committed, overlay_key(64), "retained");
+    expect_moved(&fast.refresh_pins, overlay_key(66), "refreshed");
+    expect_moved(&fast.new_pins, overlay_key(68), "admitted");
+    assert!(
+        candidate
+            .pinned
+            .pinned()
+            .all(|pin| pin.key != overlay_key(60)),
+        "removed view pins leave"
+    );
+    assert!(
+        candidate
+            .pinned
+            .pinned()
+            .all(|pin| pin.key != overlay_key(62)),
+        "replaced view pins leave"
+    );
+    assert_eq!(
+        candidate.pinned.pinned().count(),
+        rebuilt.pinned.pinned().count(),
+        "both paths move the same pins"
+    );
+    for pin in candidate.pinned.pinned() {
+        let other = pin_with_key(&rebuilt.pinned, pin.key, "full-path twin");
+        assert!(
+            candidate
+                .pinned
+                .exactly_matches(pin.id, &rebuilt.pinned, other),
+            "the full path moves the same pin"
+        );
+        assert_eq!(
+            candidate.pinned.sources(pin.id),
+            rebuilt.pinned.sources(other),
+            "the full path keeps the same sources"
+        );
+    }
+    assert!(
+        candidate.delta.new.is_empty()
+            && candidate.delta.replace.is_empty()
+            && candidate.delta.retire.is_empty(),
+        "no plan change: {:?}",
+        candidate.delta
+    );
+    assert_eq!(
+        candidate.modules, fast.engine.modules,
+        "the committed modules ride along"
+    );
+    assert_eq!(
+        candidate.views, rebuilt.views,
+        "both paths report the same views"
+    );
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

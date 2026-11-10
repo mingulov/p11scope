@@ -82,6 +82,11 @@ impl LongRunReport {
 
     /// The stderr line attempted at loop end when samples are available.
     /// A soak must distinguish its absence from a delivered clean result.
+    /// "Clean" needs zero measured loss besides no findings: the line
+    /// prints the loss splits beside the verdict, so "clean" next to a
+    /// nonzero split would contradict the capture's own loss report.
+    /// Unmeasured splits (`None`) stay "clean": nothing observed, nothing
+    /// claimed.
     pub fn report_line(&self) -> String {
         let gap = self
             .max_gap_ms
@@ -95,6 +100,18 @@ impl LongRunReport {
             Self::fmt_split(self.early_discovery_loss, self.steady_discovery_loss),
         );
         if self.findings.is_empty() {
+            let measured = [
+                self.early_event_loss,
+                self.steady_event_loss,
+                self.early_discovery_loss,
+                self.steady_discovery_loss,
+            ];
+            if measured
+                .iter()
+                .any(|split| split.is_some_and(|loss| loss > 0))
+            {
+                return format!("p11scope: longrun: no long-run findings ({numbers})");
+            }
             format!("p11scope: longrun: clean ({numbers})")
         } else {
             let findings: Vec<String> = self
@@ -391,6 +408,31 @@ mod tests {
         assert!(report.is_clean(), "{report:?}");
         assert_eq!(report.steady_event_loss, Some(5));
         assert_eq!(report.steady_discovery_loss, Some(7));
+    }
+
+    #[test]
+    fn steady_discovery_loss_is_not_called_clean() {
+        // No long-run findings, but discovery loss was reported: the
+        // line must not say "clean" while the numbers show the loss.
+        // `is_clean` still holds (no findings), so default stderr
+        // stays quiet and only -v shows this line.
+        let report = ordinary_detector().finish(0, 12_742);
+        assert!(report.is_clean(), "{report:?}");
+        let line = report.report_line();
+        assert!(!line.contains("clean"), "{line}");
+        assert!(line.contains("no long-run findings"), "{line}");
+        assert!(line.contains("steady 12742"), "{line}");
+    }
+
+    #[test]
+    fn steady_event_loss_is_not_called_clean() {
+        // Symmetric twin: measured event loss likewise blocks "clean".
+        let report = ordinary_detector().finish(300, 0);
+        assert!(report.is_clean(), "{report:?}");
+        let line = report.report_line();
+        assert!(!line.contains("clean"), "{line}");
+        assert!(line.contains("no long-run findings"), "{line}");
+        assert!(line.contains("steady 300"), "{line}");
     }
 
     // T2 (RED): metrics mode leaves event loss unmeasured but still

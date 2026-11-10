@@ -879,8 +879,9 @@ captured, whether the stop was a signal, the command's own exit or
 - A failed final snapshot seals the report from the last good snapshot
   with a named gap for the failed read (the terminal counts are stale as
   of that snapshot); p11scope then exits nonzero with the error on stderr.
-  When no snapshot was ever acquired, there is no aggregate state to seal
-  from and the error names the failure without a report.
+  A run that never acquired a snapshot still seals its report: the
+  function table is empty, `evidence.snapshot_failure` names the failed
+  read, and p11scope still exits nonzero.
 
 In every case the error names every failed step.
 
@@ -929,7 +930,11 @@ named gap (the retirement count is
 `evidence.pause_engine_incomplete_retirements`). Under `--pause always`
 the run fails instead (exit nonzero with the pause error), but the calls
 already captured are still written to the `-o` report, which reads
-`PARTIAL` and never `pause: sigstop`; a `--duration` child is terminated
+`PARTIAL`; every counted shape reads `pause: partial`, never
+`pause: sigstop` — the one exception is a lifecycle failure that lands
+with no attempt open after an earlier cycle already confirmed (its
+counters keep the confirmed shape, but `evidence.pause_refused` still
+names the refusal). A `--duration` child is terminated
 rather than handed back. A
 signal that lands inside an active `auto` pause cycle (which has a 500 ms
 deadline) cancels that cycle instead: the child is resumed, the cancelled
@@ -938,7 +943,11 @@ rather than an error. Under `--pause always` the same stop still ends the
 run with a `pause coordination cancelled` error (exit nonzero): required
 pause protection that cannot complete refuses rather than passing as a
 paused capture. The report of what was captured is still written, reads
-`PARTIAL`, and does not claim a confirmed pause.
+`PARTIAL`, and does not claim a confirmed pause. The sealed report says
+the refusal explicitly: `evidence.pause_refused` names why the pause did
+not hold (`interrupted` when a stop landed while protection was active,
+`refused` when the protection could not be completed), and the text
+report carries one plain `pause refused: ...` line.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 256 members per pass, rarest providers first; past the cap the capture

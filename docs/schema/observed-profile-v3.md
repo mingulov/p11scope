@@ -71,7 +71,8 @@ or `bank_gaps` object adds `counter_collection` to the observation gap
 causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
 An unavailable initial read cannot produce zero measurements. A failed
 terminal read publishes the last good snapshot as stale with `PARTIAL`;
-only a capture that never acquired a snapshot fails. This metadata
+a capture that never acquired a snapshot seals a degraded report with
+`evidence.snapshot_failure` naming the failed read. This metadata
 does not select a backend or add capture fields.
 
 When a legacy (non-counter) aggregate read cannot read one slot's counters
@@ -930,6 +931,29 @@ engine-incomplete cycles. Each retirement is already one counted
 `pause_partial`; the count is a subset annotation (never above
 `pause_partial`), so JSON consumers can tell a retired chain from
 scattered partials.
+
+`evidence.pause_refused` (string, optional, absent unless a pause
+lifecycle failure ended the run) names why the pause did not hold:
+`interrupted` when an operator stop landed while protection was active,
+`refused` when the protection could not be completed. It is an
+annotation beside the pause lattice, never a member of it: it adds no
+gap cause of its own (the failed cycle already counts one
+`pause_partial`, and the failed loop adds the `capture loop` gap), and
+it never changes the `pause` label. A stop-cancelled `auto` cycle that
+hands back to a signal end is not a refusal and leaves the key absent.
+This is a v3-additive disclosure that introduces no new schema revision.
+
+`evidence.snapshot_failure` (string, optional, absent unless the
+terminal published without any aggregate snapshot) names the read that
+never landed, in the `counter_collection` failure vocabulary plus the
+two legacy read steps (`legacy_slots`, `legacy_kernel`) and the
+untyped-collection fallback (`unavailable`). The document then carries
+an empty `functions` array — aggregate zeros are unknown, not measured
+— and forces `PARTIAL` via the `snapshot_failure` gap cause with
+`verdict_detail: "concrete_gap"`; no `counter_collection` object
+accompanies it (no read was ever accepted), while the legacy path
+carries its all-unknown `legacy_collection` object. This is a
+v3-additive disclosure that introduces no new schema revision.
 
 ## Migration
 

@@ -2208,13 +2208,8 @@ fn module_churn_still_rebuilds() {
         engine.plan_rebuild_stable = true;
         engine.fail_full_candidate_rebuild_for_test = true;
         let removed: BTreeSet<ProcessViewId> = [module.view].into_iter().collect();
-        let err = match engine.inventory_candidate(
-            &removed,
-            &[],
-            &[],
-            Vec::new(),
-            &BTreeSet::new(),
-        ) {
+        let err = match engine.inventory_candidate(&removed, &[], &[], Vec::new(), &BTreeSet::new())
+        {
             Ok(_) => panic!("removing a view with committed modules must rebuild"),
             Err(err) => err,
         };

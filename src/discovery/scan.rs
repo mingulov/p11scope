@@ -1095,6 +1095,22 @@ impl CollectionWork {
     }
 }
 
+/// Capture-path (DetailedLegacy) retained file-cache ceilings. A long
+/// `--system` capture scans thousands of distinct files (build artifacts,
+/// browser components, churn binaries across mount namespaces) and must not
+/// retain every file's inspection facts and export list forever: that grew
+/// the observer hundreds of MiB over minutes on both allocators
+/// (v070-musl-rss). Sized above the inventory ceilings for capture's wider
+/// file population and longer horizons, still far below the observed leak
+/// scale; the hot rescan set (provider, loaders, system libraries — dozens
+/// of files, single-digit MiB) fits with wide margin, while the cold
+/// single-scan tail is refused. Callers ignore the refusal signal and
+/// proceed with the just-read value, so refusal only costs re-read I/O on
+/// a later miss, never coverage. The loader map shares the export ceiling.
+pub(crate) const CAPTURE_INSPECTION_CACHE_ENTRIES: usize = 1024;
+pub(crate) const CAPTURE_EXPORT_CACHE_ENTRIES: usize = 1024;
+pub(crate) const CAPTURE_RETAINED_CACHE_BYTES: u64 = 64 << 20;
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
@@ -1983,6 +1999,11 @@ impl CaptureWorkBudget {
             self.elf_export_facts.len(),
             self.retained_cache_bytes,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loader_cache_len(&self) -> usize {
+        self.loader_elf_facts.len()
     }
 
     fn table_exhaustion_reason(&mut self) -> Option<String> {
@@ -14566,6 +14587,112 @@ mod tests {
         assert!(budget.inspected_file(&key(1)).is_some());
         assert!(budget.elf_export_facts_for(&key(1)).is_some());
         budget.finish_window(next).unwrap();
+    }
+
+    /// Capture scans (DetailedLegacy) refuse inspection/export cache growth
+    /// past the capture entry ceilings: a long `--system` capture scanning
+    /// thousands of distinct files must not retain every file's facts
+    /// forever (v070-musl-rss release leak, hundreds of MiB over minutes).
+    #[test]
+    fn capture_file_caches_refuse_past_entry_ceilings() {
+        let mut budget = CaptureWorkBudget::new(ScanLimits::default());
+        let file = File::open("/bin/sh").unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let pin = pin_of(&file).unwrap();
+        let fd_dev = file.metadata().unwrap().dev();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        assert!(budget.note_inspected_file(key(0), inspected.clone()));
+        assert!(budget.note_elf_export_facts(key(0), facts.clone()));
+        for i in 1..4 * CAPTURE_INSPECTION_CACHE_ENTRIES {
+            let inode = i as u64;
+            budget.note_inspected_file(key(inode), inspected.clone());
+            budget.note_elf_export_facts(key(inode), facts.clone());
+        }
+        let (_, _, _, inspected_len, exports_len, _) = budget.retained_counts();
+        assert!(
+            inspected_len <= CAPTURE_INSPECTION_CACHE_ENTRIES,
+            "inspected cache grew past its ceiling: {inspected_len}"
+        );
+        assert!(
+            exports_len <= CAPTURE_EXPORT_CACHE_ENTRIES,
+            "export cache grew past its ceiling: {exports_len}"
+        );
+    }
+
+    /// Capture scans refuse file-cache growth past the capture byte ceiling:
+    /// a run of huge export lists (tens of thousands of symbols, as in big
+    /// test binaries) must not retain tens of MiB each without bound.
+    #[test]
+    fn capture_file_caches_refuse_past_byte_ceiling() {
+        let mut budget = CaptureWorkBudget::new(ScanLimits::default());
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let fd_dev = file.metadata().unwrap().dev();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev,
+        };
+        // ~1 MiB of export names per value: 200 values would retain ~200 MiB.
+        let exports: Vec<(String, u64)> = (0..20_000u64)
+            .map(|i| (format!("exported_symbol_{i:06}"), i))
+            .collect();
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports,
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        for i in 0..200 {
+            budget.note_elf_export_facts(key(i), facts.clone());
+        }
+        let (_, _, _, _, exports_len, bytes) = budget.retained_counts();
+        assert!(
+            bytes <= CAPTURE_RETAINED_CACHE_BYTES,
+            "export cache bytes grew past the ceiling: {bytes}"
+        );
+        assert!(
+            exports_len < 200,
+            "export cache admitted every huge value: {exports_len}"
+        );
+    }
+
+    /// Capture scans refuse loader-facts growth past the export entry
+    /// ceiling (the loader map shares it).
+    #[test]
+    fn capture_loader_cache_refuses_past_entry_ceiling() {
+        let mut budget = CaptureWorkBudget::new(ScanLimits::default());
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |device| LoaderFactsKey { device, pin };
+        let facts = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        assert!(budget.note_loader_elf_facts(key(0), facts.clone()));
+        for device in 1..4 * CAPTURE_EXPORT_CACHE_ENTRIES as u64 {
+            budget.note_loader_elf_facts(key(device), facts.clone());
+        }
+        assert!(
+            budget.loader_cache_len() <= CAPTURE_EXPORT_CACHE_ENTRIES,
+            "loader cache grew past its ceiling: {}",
+            budget.loader_cache_len()
+        );
     }
 
     /// Two different files in two Btrfs subvolumes render the same maps

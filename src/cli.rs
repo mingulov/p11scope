@@ -6705,4 +6705,88 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{words} must parse: {error:?}"));
         }
     }
+
+    #[test]
+    fn global_help_qualifies_json_routes() {
+        assert!(
+            USAGE.contains("--json on inspect/inventory"),
+            "global help must name which commands take --json: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("-o FILE on profile/trace/run/inventory"),
+            "global help must name the -o JSON route: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("trace takes -o -"),
+            "global help must name trace -o -: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("--event-log"),
+            "global help must name the inventory event stream: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("doctor is text-only"),
+            "global help must state doctor has no JSON: {USAGE}"
+        );
+        assert!(
+            !USAGE.contains("--json and -o are always complete"),
+            "global help must not claim --json is universal: {USAGE}"
+        );
+    }
+
+    #[test]
+    fn json_flag_refusal_points_to_the_commands_json_route() {
+        for (argv, route) in [
+            (vec!["profile", "--pid", "7", "--json"], "-o FILE"),
+            (vec!["trace", "--pid", "7", "--json"], "-o"),
+            (vec!["run", "--json", "--", "/bin/true"], "-o FILE"),
+            (vec!["doctor", "--json"], "text-only"),
+        ] {
+            let Err(CliError::Usage { message, .. }) = parse(args(&argv)) else {
+                panic!("{argv:?} must refuse --json");
+            };
+            assert!(
+                message.contains("unknown argument: --json"),
+                "{argv:?}: {message}"
+            );
+            assert!(message.contains(route), "{argv:?}: {message}");
+        }
+        parse(args(&["inspect", "--pid", "7", "--json"])).unwrap();
+        parse(args(&["inventory", "--pid", "7", "--json"])).unwrap();
+    }
+
+    #[test]
+    fn docs_qualify_json_routes() {
+        const README: &str = include_str!("../README.md");
+        const USAGE_MD: &str = include_str!("../docs/usage.md");
+        const OVERVIEW_MD: &str = include_str!("../docs/overview.md");
+        for (name, text) in [
+            ("README.md", README),
+            ("docs/usage.md", USAGE_MD),
+            ("docs/overview.md", OVERVIEW_MD),
+        ] {
+            // Backticks and line wraps are layout; the wording is the contract.
+            let flat = text.replace('`', "").replace('\n', " ");
+            assert!(
+                flat.contains("--json on inspect/inventory"),
+                "{name} must name which commands take --json"
+            );
+            assert!(
+                flat.contains("doctor is text-only"),
+                "{name} must state doctor has no JSON"
+            );
+        }
+        assert!(
+            !README.contains("--json` is always complete"),
+            "README must not claim --json is universal"
+        );
+        assert!(
+            !USAGE_MD.contains("`--json` and `-o` are always complete"),
+            "usage.md must not claim --json is universal"
+        );
+        assert!(
+            !OVERVIEW_MD.contains("`--json` and `-o` are always"),
+            "overview.md must not claim --json is universal"
+        );
+    }
 }

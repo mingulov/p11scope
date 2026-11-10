@@ -643,6 +643,23 @@ mod tests {
     }
 
     #[test]
+    fn nested_empty_refusal_names_nested_node_and_cgroup_remedy() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+            .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("--cgroup"), "{text}");
+        assert!(text.contains("workload pod"), "{text}");
+        assert!(text.contains("kind"), "{text}");
+        assert!(text.contains("hostPID"), "{text}");
+        assert!(text.contains("host processes are not visible"), "{text}");
+        assert!(!text.contains('\n'), "the refusal stays one line: {text}");
+    }
+
+    #[test]
     fn pid_scope_is_allowed_only_in_the_initial_namespace() {
         assert!(require_numbering_agrees(&with(ObserverPidNs::Initial), "--pid 7").is_ok());
         for observed in [

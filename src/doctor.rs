@@ -4863,6 +4863,50 @@ mod tests {
     }
 
     #[test]
+    fn nested_pid_scope_warn_suggests_cgroup_not_pid() {
+        let healthy = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "target loader build".into(),
+                status: Status::Warn("unbound".into()),
+            },
+        ];
+        let normal = next_line(&healthy, false, None);
+        assert!(normal.contains("--pid"), "{normal}");
+        assert!(normal.contains(ACTIONABLE_NEXT), "{normal}");
+        let nested_numbering = crate::pidns::PidNumbering {
+            observer: crate::pidns::ObserverPidNs::Nested,
+            proc_view: crate::pidns::ProcView::Own,
+        };
+        let nested_row = pid_namespace_check(&nested_numbering, false);
+        assert!(
+            matches!(&nested_row.status, Status::Warn(_)),
+            "{nested_row:?}"
+        );
+        let nested = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            nested_row,
+        ];
+        let text = next_line(&nested, false, None);
+        assert!(text.contains("--cgroup"), "{text}");
+        assert!(!text.contains("--pid"), "{text}");
+        let concise = render_concise(&nested);
+        assert!(concise.contains("PID scope unavailable"), "{concise}");
+        let next = concise
+            .lines()
+            .find(|line| line.starts_with("Next: "))
+            .unwrap();
+        assert!(next.contains("--cgroup"), "{concise}");
+        assert!(!next.contains("--pid"), "{concise}");
+    }
+
+    #[test]
     fn verbose_render_keeps_every_row_and_quiet_keeps_only_doctor() {
         let checks = concise_checks();
         let verbose = render(&checks);

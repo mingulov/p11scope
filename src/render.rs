@@ -3200,24 +3200,8 @@ pub(crate) fn apply_snapshot_failure(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn live_snapshot_scoped(
-    snapshot: &crate::metrics::CaptureSnapshot,
-    ev: &Evidence,
-    elapsed: Duration,
-    module: &str,
-    mode: &str,
-    policy: CapturePolicy,
-    scope: &str,
-    mechanisms: &BTreeMap<u64, MechStat>,
-) -> String {
-    live_snapshot_scoped_with_caller(
-        snapshot, ev, elapsed, module, mode, policy, scope, mechanisms, None,
-    )
-}
-
-/// [`live_snapshot_scoped`] plus the pid-scope caller line, so profile
-/// stdout names the caller program. `None` caller renders no line.
+/// Snapshot frame plus the pid-scope caller line, so profile stdout
+/// names the caller program. `None` caller renders no line.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_snapshot_scoped_with_caller(
     snapshot: &crate::metrics::CaptureSnapshot,
@@ -5281,7 +5265,7 @@ pub(crate) mod tests {
             };
             assert_eq!(with_counter_snapshot(document.clone(), &snapshot), document);
             assert_eq!(
-                live_snapshot_scoped(
+                live_snapshot_scoped_with_caller(
                     &snapshot,
                     &ev,
                     Duration::ZERO,
@@ -5289,7 +5273,8 @@ pub(crate) mod tests {
                     "profile",
                     capture.policy,
                     "pid",
-                    &BTreeMap::new()
+                    &BTreeMap::new(),
+                    None
                 ),
                 live_scoped(
                     snapshot.reports(),
@@ -5403,7 +5388,7 @@ pub(crate) mod tests {
             );
             assert_eq!(ev.gap_classes.attribution, attribution);
             assert_eq!(ev.gap_classes.semantics, semantics);
-            let frame = live_snapshot_scoped(
+            let frame = live_snapshot_scoped_with_caller(
                 &stale,
                 &ev,
                 Duration::ZERO,
@@ -5412,6 +5397,7 @@ pub(crate) mod tests {
                 CapturePolicy::AggregateOnly,
                 "pid",
                 &BTreeMap::new(),
+                None,
             );
             assert!(frame.contains("last read stale"), "{frame}");
             assert!(frame.contains("coverage: partial"), "{frame}");
@@ -9461,7 +9447,7 @@ pub(crate) mod tests {
         let snapshot = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
         let mut ev = evidence();
         ev.verdict();
-        let frame = live_snapshot_scoped(
+        let frame = live_snapshot_scoped_with_caller(
             &snapshot,
             &ev,
             Duration::ZERO,
@@ -9470,6 +9456,7 @@ pub(crate) mod tests {
             CapturePolicy::AggregateOnly,
             "pid",
             &BTreeMap::new(),
+            None,
         );
         let hint = crate::cli::VERBOSE_HINT;
         assert!(frame.contains("Counter collection:"), "{frame}");

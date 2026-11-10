@@ -1413,7 +1413,8 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
         Owned lanes load DISCOVERY at the shared-scope size; the
         diagnostic must bind those maps instead of degrading to
         'unknown', which would drop map facts from EVENTS-discard
-        refusal annotations on owned lanes.
+        refusal annotations on owned lanes. The owned size equals the
+        pinned size every scope loads, so external lanes bind it too.
         """
         maps, ordinary = self.continuity_fixture()
         next(row for row in maps if row['name'] == 'DISCOVERY')['max_entries'] = \
@@ -1422,7 +1423,7 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
             maps, ordinary, variant='default', privacy='allowlisted',
             workload_origin='owned'), 'map-facts-present')
         self.assertEqual(capture.continuity_map_category(
-            maps, ordinary, variant='default', privacy='allowlisted'), 'unknown')
+            maps, ordinary, variant='default', privacy='allowlisted'), 'map-facts-present')
 
     def test_continuity_context_cannot_override_ring_scope_or_spoof_fields(self):
         maps, ordinary = self.continuity_fixture()
@@ -2109,12 +2110,12 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
 
         Since the run-tree cgroup scope, `run` captures in Scope::Cgroup
         and discovery_ring_bytes (src/attach.rs) sizes DISCOVERY at
-        SHARED_SCOPE_DISCOVERY_BYTES (2 MiB) there instead of the 64 KiB
-        Pid-scope size. The pinned ELF policy still declares 64 KiB; the
-        live comparison expects exactly the loader's 2 MiB report on
-        owned lanes. Any other size, any other field drift, or any other
-        map's drift still fails, external lanes still require 64 KiB,
-        and an unknown origin fails closed.
+        SHARED_SCOPE_DISCOVERY_BYTES (2 MiB) there. The pinned ELF policy
+        declares the same compiled 2 MiB size every scope loads, so an
+        owned-sized report validates on external lanes as well: the
+        DISCOVERY origin distinction collapsed with the unification. Any
+        other size, any other field drift, or any other map's drift
+        still fails, and an unknown origin fails closed.
         """
         owned_discovery = 2_097_152
         singletons = {"IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"}
@@ -2132,15 +2133,10 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         self.assertEqual(capture.OWNED_DISCOVERY_MAX_ENTRIES, owned_discovery)
         capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'owned')
         capture.validate_inventory(owned_inventory('allowlisted'), 'default', 'allowlisted', 'owned')
-        with self.assertRaisesRegex(capture.CaptureError,
-                                    'map definition mismatch name=DISCOVERY'):
-            capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only')
-        with self.assertRaisesRegex(capture.CaptureError,
-                                    'map definition mismatch name=DISCOVERY'):
-            capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'external')
-        with self.assertRaisesRegex(capture.CaptureError,
-                                    'map definition mismatch name=DISCOVERY'):
-            capture.validate_inventory(self.live_inventory(), 'default', 'aggregate-only', 'owned')
+        # The owned size equals the pinned size every scope loads, so an
+        # owned-sized report also validates on external lanes now.
+        capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only')
+        capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'external')
         for size in (1, 65_536, 65_537, 4_194_304):
             with self.subTest(size=size):
                 maps = owned_inventory('aggregate-only')
@@ -2161,21 +2157,18 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError, 'unknown workload origin'):
             capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'cgroup')
 
-    def test_owned_discovery_pid_size_names_run_tree_degradation(self):
-        """A 64 KiB DISCOVERY report on an owned lane names the suspect.
+    def test_owned_discovery_stale_size_refused_without_degradation_guess(self):
+        """A stale DISCOVERY size on an owned lane is refused plainly.
 
-        `run` degrades an owned lane to Scope::Pid when the run cgroup is
-        not a usable scope (RUN_TREE_DEGRADED: only the started command is
-        observed); the loader then reports the 64 KiB Pid size instead of
-        the 2 MiB shared-scope size. The refusal must name that suspected
-        degradation so triage points at the cgroup, not the checker. Any
-        other size keeps the plain message; nothing is accepted.
+        Pid scope loads the same compiled 2 MiB ring as a shared scope,
+        so an owned lane reporting the pinned size is accepted, and a
+        stale 64 KiB report (or any other wrong size) is refused with
+        the plain mismatch message: size no longer names a run-tree
+        degradation (`run` reports RUN_TREE_DEGRADED itself through its
+        own gap channel). Nothing wrong is accepted.
         """
-        with self.assertRaisesRegex(
-                capture.CaptureError,
-                r"map definition mismatch name=DISCOVERY; suspected run-tree degradation"):
-            capture.validate_inventory(self.live_inventory(), 'default', 'allowlisted', 'owned')
-        for size in (1, 65_537, 4_194_304):
+        capture.validate_inventory(self.live_inventory(), 'default', 'allowlisted', 'owned')
+        for size in (1, 65_536, 65_537, 4_194_304):
             with self.subTest(size=size):
                 maps = self.live_inventory()
                 next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = size

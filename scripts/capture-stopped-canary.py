@@ -80,9 +80,10 @@ AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
 # Owned (`run`-tree) lanes capture in Scope::Cgroup, where
 # discovery_ring_bytes (src/attach.rs) sizes DISCOVERY at
-# SHARED_SCOPE_DISCOVERY_BYTES instead of the 64 KiB Pid-scope size the
-# pinned ELF policy declares. The live comparison below expects exactly
-# the loader's report on owned lanes. Change both together.
+# SHARED_SCOPE_DISCOVERY_BYTES. Pid scope loads the same compiled 2 MiB
+# ring, so the owned expectation equals the pinned size; a size mismatch
+# no longer names a run-tree degradation (run reports RUN_TREE_DEGRADED
+# itself through its own gap channel). Change both together.
 OWNED_DISCOVERY_MAX_ENTRIES = 2_097_152
 STOP_SECONDS = 30
 # Declared per-kernel canary readiness bounds: declared, measured and
@@ -677,13 +678,6 @@ def validate_inventory(maps, variant, privacy='allowlisted', workload_origin='ex
         live = (item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
         want = (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags)
         detail = f'map definition mismatch name={item["name"]}'
-        if (live != want and workload_origin == 'owned' and item['name'] == 'DISCOVERY'
-                and item['max_entries'] == wanted['max_entries']):
-            # `run` falls back to Scope::Pid when the run cgroup is not a
-            # usable scope; the loader then reports the pinned Pid size on
-            # an owned lane. Still refused, but the suspect is named.
-            detail += ('; suspected run-tree degradation to Pid scope'
-                       ' (only the started command is observed)')
         require(live == want, detail)
 
 

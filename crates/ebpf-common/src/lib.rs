@@ -640,8 +640,12 @@ const _: () = assert!(
         && PAIR_CALLS_SECOND_SLOT < PAIR_CALLS_ENTRIES
         && PAIR_CALLS_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
 );
+/// The Detailed flavors' lifecycle (DISCOVERY) ring: 2 MiB holds about
+/// 2,260 records of 920 B plus an 8 B header. Every scope loads this
+/// size; shared scopes already did (RB-2 load-time sizing), and pid
+/// scope joins them here. Locked kernel memory: 2 MiB per capture.
 #[cfg(not(feature = "small-discovery-ring"))]
-pub const DISCOVERY_BYTES: u32 = 65_536;
+pub const DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 #[cfg(feature = "small-discovery-ring")]
 pub const DISCOVERY_BYTES: u32 = 4_096;
 /// The Inventory flavors' lifecycle (DISCOVERY) ring: 8 MiB holds about
@@ -3985,7 +3989,7 @@ mod tests {
     }
 
     /// The Inventory flavors compile an 8 MiB lifecycle ring (4 KiB under
-    /// the small-ring feature); Detailed keeps its 64 KiB constant above.
+    /// the small-ring feature); Detailed keeps its 2 MiB constant above.
     #[test]
     fn inventory_lifecycle_ring_is_eight_mebibytes() {
         #[cfg(not(feature = "small-discovery-ring"))]

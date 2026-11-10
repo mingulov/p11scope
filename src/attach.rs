@@ -5630,10 +5630,9 @@ fn validate_runtime_map(
 
 /// DISCOVERY ring bytes for a cgroup or system capture (RB-2). Every exec
 /// and thread-group-leader exit in scope produces one 920-byte discovery
-/// record, and the compiled 64 KiB ring holds about 70 of them: a busy host
-/// overflowed it between drains and lost the events that admit new
-/// processes. 2 MiB holds about 2,260 records, a >30x margin, for 2 MiB of
-/// locked kernel memory per capture. A named process keeps the compiled size.
+/// record; 2 MiB holds about 2,260 of them, the margin a busy host needs
+/// between drains, for 2 MiB of locked kernel memory per capture. The
+/// compiled ring is the same size, so a named process loads it too.
 /// `--ring-bytes` still sizes only EVENTS.
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
@@ -20619,10 +20618,10 @@ mod tests {
 
     /// RB-2 capacity contract: every exec and leader exit in a cgroup or
     /// system scope costs one 920-byte record plus the 8-byte ring header,
-    /// and the compiled 64 KiB DISCOVERY ring held 70 — a busy host lost
-    /// records every frame. A shared scope loads a ring for at least 2,048;
-    /// a named process keeps the compiled ring. Ring sizes stay page-sized
-    /// powers of two, which the kernel requires.
+    /// and the compiled 2 MiB DISCOVERY ring holds about 2,260. A shared
+    /// scope loads a ring for at least 2,048; a named process keeps the
+    /// compiled ring. Ring sizes stay page-sized powers of two, which the
+    /// kernel requires.
     #[test]
     fn a_shared_scope_discovery_ring_holds_two_thousand_records() {
         let record = std::mem::size_of::<p11scope_ebpf_common::DiscoveryRecord>() + 8;

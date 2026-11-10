@@ -216,9 +216,9 @@ fn inventory_map_contract_refuses_missing_extra_unresized_and_opportunistic_smal
     }
     let mut changed = original;
     // A DISCOVERY size from another flavor never loads here: the small
-    // ring in a stock build, the stock ring in a small build.
+    // ring in a stock build, the stock Detailed ring in a small build.
     let other_flavor = if EXPECTED_INVENTORY_DISCOVERY_BYTES == 4_096 {
-        65_536
+        2 * 1024 * 1024
     } else {
         4_096
     };
@@ -291,7 +291,7 @@ fn expected_inventory_discovery_is_the_shared_constant() {
 
 /// A size pin per flavor over the embedded objects: both Inventory
 /// flavors compile this build's ring (8 MiB stock, 4 KiB small), while
-/// Detailed keeps 64 KiB (4 KiB when the small-ring feature shrank every
+/// Detailed keeps 2 MiB (4 KiB when the small-ring feature shrank every
 /// flavor's compiled ring, as today).
 #[test]
 fn embedded_discovery_sizes_pin_each_flavor() {

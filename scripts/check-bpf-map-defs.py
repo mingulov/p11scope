@@ -2241,7 +2241,10 @@ _DETAILED_BASE_MAPS = {
         "CGROUP_FILTER": (8, 4, 4, 1),
         "CONFIG": (2, 4, 8, 2, 128),
         "COUNTERS": (6, 4, 8, 5),
-        "DISCOVERY": (27, 0, 0, 65_536),
+        # 2 MiB since v0.7.0 (64 KiB before): pid scope joins the shared
+        # scopes' RB-2 size. Tracks ebpf-common DISCOVERY_BYTES; change both
+        # together.
+        "DISCOVERY": (27, 0, 0, 2 * 1024 * 1024),
         "DISCOVERY_STATE": (1, 24, 24, 64),
         # 32 MiB since v0.7.0 (4 MiB since the F1 repair, 262144 before):
         # the default ring must absorb drain gaps at fast-runner burst
@@ -2375,7 +2378,7 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
 )} | {
     # Inventory-only objects carry no journal words: 544 B, not 560 B.
     "THREAD_OWNER": map_def(29, 4, 544, 0, 1),
-    # The Inventory lifecycle ring is 8 MiB (Detailed keeps 64 KiB in
+    # The Inventory lifecycle ring is 8 MiB (Detailed keeps 2 MiB in
     # SAFE_MAPS); tracks ebpf-common INVENTORY_DISCOVERY_BYTES.
     "DISCOVERY": map_def(27, 0, 0, 8 * 1024 * 1024),
     "USAGE": map_def(2, 4, 8, 1),

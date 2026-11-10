@@ -8142,10 +8142,11 @@ const STALE_VIEW_REASON: &str = "accepted process generation changed during atta
 const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
 /// Records one live drain takes off the private discovery ring before it
 /// returns to a caller that checks duration, signal and pause deadline. The
-/// 64 KiB ring holds ~73 records, so a drain stopped here has emptied the
-/// ring several times over and leaves only what the producer wrote during the
-/// drain itself; that backlog is reported as an incomplete drain, never as an
-/// empty ring, and any overflow it causes is the producer's `ring_loss`.
+/// 2 MiB ring holds ~2,260 records, so one quantum covers about a ninth of
+/// a full ring; the every-tick staging (RB-2) and the 4,096-item staging
+/// FIFO absorb bursts between drains. What the producer wrote during the
+/// drain itself is reported as an incomplete drain, never as an empty ring,
+/// and any overflow it causes is the producer's `ring_loss`.
 pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
 
 /// Discovery quanta one live frame collects before it applies them (RB-2).

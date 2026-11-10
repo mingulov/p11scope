@@ -1532,7 +1532,7 @@ impl LaneHost<Pin> for ReverseOrderHost {
     fn note_native_lane(&mut self) {}
     fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
     fn note_refresh_loss(&mut self, _reason: String) {}
-    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint]) {
+    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint], _backend: AttachBackend) {
         endpoints.reverse();
     }
 }

@@ -490,11 +490,12 @@ pub(crate) trait LaneHost<Pin> {
         false
     }
     /// Order one extend window's endpoints before the lane sends them:
-    /// the deferred backlog plus the fresh delta, merged. Defaults to
+    /// the deferred backlog plus the fresh delta, merged. The lane passes
+    /// its attach backend so the order can differ per backend. Defaults to
     /// the merged (ID) order; the coordinator sorts most-mapped-first
     /// (smallest-module tiebreak) so the providers applications actually
     /// map attach before a cut-short run ends.
-    fn order_drain_targets(&self, _endpoints: &mut [AttachEndpoint]) {}
+    fn order_drain_targets(&self, _endpoints: &mut [AttachEndpoint], _backend: AttachBackend) {}
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(
         &mut self,
@@ -550,8 +551,8 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
         InventoryCoordinator::take_target_delta(self)
     }
 
-    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint]) {
-        self.attach_set().sort_drain_order(endpoints);
+    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint], backend: AttachBackend) {
+        self.attach_set().sort_drain_order(endpoints, backend);
     }
 
     fn has_pending_targets(&self) -> bool {
@@ -741,7 +742,7 @@ impl<L> NativeLane<L> {
         } else {
             TargetDelta::default()
         };
-        host.order_drain_targets(&mut delta.endpoints);
+        host.order_drain_targets(&mut delta.endpoints, capture.backend().backend);
         let receipt = capture.extend(
             delta,
             host.capture_targets(),
@@ -846,7 +847,7 @@ impl<L> NativeLane<L> {
     {
         let mut delta = std::mem::take(&mut self.backlog);
         delta.append(host.take_target_delta());
-        host.order_drain_targets(&mut delta.endpoints);
+        host.order_drain_targets(&mut delta.endpoints, self.capture.backend().backend);
         let receipt = self.capture.extend(
             delta,
             host.capture_targets(),

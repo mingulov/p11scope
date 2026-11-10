@@ -41,6 +41,7 @@
 //! bounded by the endpoint budget: at most that many endpoints, retained
 //! objects, alias keys, module records and refusal-gap memo entries.
 
+use crate::attach::AttachBackend;
 use crate::attach::capture::MapperEstimate;
 use crate::capacity::InventoryBudget;
 use crate::discovery::identity::{
@@ -609,8 +610,14 @@ impl InventoryAttachSet {
     /// one window, never what attaches: the backlog merges ahead of the
     /// fresh delta as sort input, and the sort then interleaves both by
     /// (mappers, size, id), so a fresh small module still sorts ahead of
-    /// an old giant tail when both map equally many processes.
-    pub(crate) fn sort_drain_order(&self, endpoints: &mut [AttachEndpoint]) {
+    /// an old giant tail when both map equally many processes. The lane
+    /// passes its attach backend so the order can differ per backend.
+    pub(crate) fn sort_drain_order(
+        &self,
+        endpoints: &mut [AttachEndpoint],
+        backend: AttachBackend,
+    ) {
+        let _ = backend;
         endpoints.sort_by_key(|endpoint| {
             let hinted = self
                 .drain_hint
@@ -2342,7 +2349,7 @@ pub(crate) mod tests {
             Some(0),
             "discovery order keeps the big module first"
         );
-        set.sort_drain_order(&mut endpoints);
+        set.sort_drain_order(&mut endpoints, AttachBackend::Singles);
         let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         let small_ids: Vec<u32> = (40..42).collect();
         let big_ids: Vec<u32> = (0..40).collect();
@@ -2375,7 +2382,7 @@ pub(crate) mod tests {
         let small_key = module_key(&small, "sha-small").object;
         set.note_mappers(true, [(&big_key, 35), (&small_key, 1)]);
         let mut endpoints = absorbed.delta.endpoints;
-        set.sort_drain_order(&mut endpoints);
+        set.sort_drain_order(&mut endpoints, AttachBackend::Multi);
         let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         let big_ids: Vec<u32> = (0..40).collect();
         let small_ids: Vec<u32> = (40..42).collect();
@@ -2383,6 +2390,115 @@ pub(crate) mod tests {
             ids,
             big_ids.into_iter().chain(small_ids).collect::<Vec<_>>(),
             "the most-mapped module drains first, ID order holds within each module"
+        );
+    }
+
+    #[test]
+    fn drain_order_small_modules_first_despite_a_heavily_mapped_giant() {
+        // A heavier desktop: p11-kit holds 6734 endpoints mapped by 200
+        // processes, so most-mapped-first would lead with its multi-pass
+        // tail and starve the token providers queued behind it. Discovery
+        // order still puts the giant first (low endpoint IDs); the drain
+        // must lead with the small providers, then the giant before the
+        // other large provider.
+        let dir = tempfile::tempdir().unwrap();
+        let kit = provider(&dir, "libp11-kit.so.0", "provider-p11kit");
+        let opensc = provider(&dir, "opensc.so", "provider-opensc");
+        let ykcs11 = provider(&dir, "ykcs11.so", "provider-ykcs11");
+        let other = provider(&dir, "other.so", "provider-other");
+        let mut set = InventoryAttachSet::new(budget(32768));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[
+            (&kit, "sha-kit"),
+            (&opensc, "sha-opensc"),
+            (&ykcs11, "sha-ykcs11"),
+            (&other, "sha-other"),
+        ]);
+        let modules = [
+            module(&pins, &kit, &offsets(6734)),
+            module(&pins, &opensc, &offsets(70)),
+            module(&pins, &ykcs11, &offsets(100)),
+            module(&pins, &other, &offsets(1000)),
+        ];
+        let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
+        assert_eq!(absorbed.delta.endpoints.len(), 6734 + 70 + 100 + 1000);
+        let kit_key = module_key(&kit, "sha-kit").object;
+        let opensc_key = module_key(&opensc, "sha-opensc").object;
+        let ykcs11_key = module_key(&ykcs11, "sha-ykcs11").object;
+        let other_key = module_key(&other, "sha-other").object;
+        set.note_mappers(
+            true,
+            [
+                (&kit_key, 200),
+                (&opensc_key, 1),
+                (&ykcs11_key, 6),
+                (&other_key, 10),
+            ],
+        );
+        let mut endpoints = absorbed.delta.endpoints;
+        set.sort_drain_order(&mut endpoints, AttachBackend::Multi);
+        let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
+        // Endpoint IDs follow discovery order: kit 0..6734, opensc
+        // 6734..6804, ykcs11 6804..6904, other 6904..7904.
+        let ykcs11_ids: Vec<u32> = (6804..6904).collect();
+        let opensc_ids: Vec<u32> = (6734..6804).collect();
+        let kit_ids: Vec<u32> = (0..6734).collect();
+        let other_ids: Vec<u32> = (6904..7904).collect();
+        assert_eq!(
+            ids,
+            ykcs11_ids
+                .into_iter()
+                .chain(opensc_ids)
+                .chain(kit_ids)
+                .chain(other_ids)
+                .collect::<Vec<_>>(),
+            "small providers drain first (most-mapped among them), then p11-kit before the other large provider"
+        );
+    }
+
+    #[test]
+    fn drain_order_applies_the_mapper_key_only_on_multi() {
+        // The Singles backend keeps the previous smallest-module-first
+        // order even when a system pass counted mappers: at 512 endpoints
+        // per pass the giant takes the whole run, so small providers must
+        // not wait behind it. Multi still leads with the most-mapped
+        // module on the same fixture.
+        let dir = tempfile::tempdir().unwrap();
+        let big = provider(&dir, "big.so", "provider-big");
+        let small = provider(&dir, "small.so", "provider-small");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[(&big, "sha-big"), (&small, "sha-small")]);
+        let modules = [
+            module(&pins, &big, &offsets(40)),
+            module(&pins, &small, &[0x2000, 0x2010]),
+        ];
+        let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
+        assert_eq!(absorbed.delta.endpoints.len(), 42);
+        let big_key = module_key(&big, "sha-big").object;
+        let small_key = module_key(&small, "sha-small").object;
+        set.note_mappers(true, [(&big_key, 35), (&small_key, 1)]);
+        let mut singles = absorbed.delta.endpoints.clone();
+        set.sort_drain_order(&mut singles, AttachBackend::Singles);
+        let singles_ids: Vec<u32> = singles.iter().map(|endpoint| endpoint.id.0).collect();
+        let small_ids: Vec<u32> = (40..42).collect();
+        let big_ids: Vec<u32> = (0..40).collect();
+        assert_eq!(
+            singles_ids,
+            small_ids
+                .into_iter()
+                .chain(big_ids.clone())
+                .collect::<Vec<_>>(),
+            "Singles keeps smallest-module-first despite the mapper counts"
+        );
+        let mut multi = absorbed.delta.endpoints;
+        set.sort_drain_order(&mut multi, AttachBackend::Multi);
+        let multi_ids: Vec<u32> = multi.iter().map(|endpoint| endpoint.id.0).collect();
+        let small_ids: Vec<u32> = (40..42).collect();
+        assert_eq!(
+            multi_ids,
+            big_ids.into_iter().chain(small_ids).collect::<Vec<_>>(),
+            "Multi still leads with the most-mapped module"
         );
     }
 
@@ -2407,7 +2523,7 @@ pub(crate) mod tests {
         let small_key = module_key(&small, "sha-small").object;
         set.note_mappers(false, [(&big_key, 35), (&small_key, 1)]);
         let mut endpoints = absorbed.delta.endpoints;
-        set.sort_drain_order(&mut endpoints);
+        set.sort_drain_order(&mut endpoints, AttachBackend::Singles);
         let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         let small_ids: Vec<u32> = (40..42).collect();
         let big_ids: Vec<u32> = (0..40).collect();
@@ -2462,7 +2578,7 @@ pub(crate) mod tests {
         );
         let mut endpoints = absorbed.delta.endpoints;
         assert_eq!(endpoints.len(), 9);
-        set.sort_drain_order(&mut endpoints);
+        set.sort_drain_order(&mut endpoints, AttachBackend::Singles);
         let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         assert_eq!(
             ids,

@@ -24280,6 +24280,55 @@ impl Engine {
             // A fold would change the pins: fall through to the full path,
             // which canonicalizes identically.
         }
+        // Empty churn: removals, refreshes and admissions that carry no
+        // modules (old or new) cannot change the plan, so the tick reuses
+        // the committed candidate instead of running the full O(retained)
+        // rebuild (hundreds of ms on system scope that starve the EVENTS
+        // drain). Pins still move exactly as the full path moves them
+        // (remove/replace/absorb on a clone); only the module merge, bind,
+        // plan and projection work is skipped. Declined views still rebuild.
+        // Pin skips stay local until the path commits, so a fold fallthrough
+        // never absorbs twice.
+        if declined.is_empty()
+            && self.plan_rebuild_stable
+            && !fast_path_disabled
+            && removed.iter().all(|view| {
+                !self
+                    .modules
+                    .iter()
+                    .any(|module| module.scanned.view == *view)
+            })
+            && refreshed.iter().all(|(view, modules, _)| {
+                modules.is_empty()
+                    && !self
+                        .modules
+                        .iter()
+                        .any(|module| module.scanned.view == *view)
+            })
+            && new_views.iter().all(|(_, modules, _)| modules.is_empty())
+        {
+            let mut candidate_pins = self.pinned.clone();
+            for view in removed {
+                candidate_pins.remove_view(*view);
+            }
+            let mut pin_skipped = Vec::new();
+            for (view, _, pins) in refreshed {
+                pin_skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
+            }
+            for (_, _, pins) in new_views {
+                pin_skipped.extend(candidate_pins.absorb(pins.clone()));
+            }
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            if folds == 0 && lost.is_empty() {
+                skipped.extend(pin_skipped);
+                let mut candidate = self.inventory_candidate_unchanged(candidate_pins, skipped)?;
+                candidate
+                    .views
+                    .extend(new_views.iter().map(|(view, _, _)| view.id()));
+                return Ok(candidate);
+            }
+            // A fold would change the pins: fall through to the full path.
+        }
         #[cfg(test)]
         if self.fail_full_candidate_rebuild_for_test {
             bail!("test-forced full rebuild failure");

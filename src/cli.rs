@@ -565,7 +565,7 @@ usage:
   p11scope help [command]
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--mode profile|metrics] [--duration <…>] [-o <out.json>] [-v] [--quiet]
   p11scope trace [--pid <n> | --cgroup <path> | --system] [--duration <…>] [--max-events <n>] [-o <out.file>] [-v] [--quiet]
-  p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [--user <name|uid>] [-v] [--quiet] -- CMD [ARGS...]
+  p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [--user <name|uid>] [-o <out>] [-v] [--quiet] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--json] [-v] [--quiet]
   p11scope inspect --system [--json] [-v] [--quiet]
   p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
@@ -579,7 +579,7 @@ usage:
 discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
 Live capture needs root; inspect, inventory diff, inventory cbom and inventory --capture scan do not.
 Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head.
-Complete JSON: --json on inspect/inventory (incl. diff, cbom); -o FILE on profile/trace/run/inventory; trace takes -o -; inventory streams --event-log; doctor is text-only.
+Complete output: --json on inspect/inventory (incl. inventory diff, cbom); -o FILE on profile/run/inventory; trace streams text to -o FILE or -o -; inventory streams --event-log; doctor is text-only.
 --help and --version also answer to -h and -V.
 Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
 
@@ -2425,7 +2425,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
             }
             "--json" => {
                 return Err(usage_err(
-                    "unknown argument: --json (run writes JSON with -o FILE; run --trace also takes -o -)",
+                    "unknown argument: --json (run writes JSON with -o FILE (with --trace it streams text and also takes -o -))",
                 ));
             }
             other => return Err(run_unknown_arg(other)),
@@ -5744,8 +5744,13 @@ mod tests {
         // split into the short text line plus the `Complete JSON:` route
         // line naming --json/-o/-o -/--event-log per command (+138); no
         // other drift.
-        assert_eq!(USAGE.len(), 3051);
-        assert_eq!(hash, 0x7e7075c0c7f701ba);
+        // 3089 / 0x3817fa600ead7f15 (trace-text reword): diff vs the
+        // 3051/0x7e7075c0c7f701ba pin is exactly ` [-o <out>]` on the run
+        // synopsis line (+11) plus the `Complete output:` route line
+        // reword separating the JSON routes from the trace text stream
+        // (+27); no other drift.
+        assert_eq!(USAGE.len(), 3089);
+        assert_eq!(hash, 0x3817fa600ead7f15);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

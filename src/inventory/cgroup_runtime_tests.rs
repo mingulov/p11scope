@@ -749,6 +749,39 @@ fn cgroup_runtime_stop_after_return_survives_collection_ticks() {
     assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
 }
 
+/// Ctrl-C twin of the return window: the operator stop arrives through
+/// the shared signal source (which reaches the forked worker control
+/// directly, without any tick) after pass 0's collection returned. The
+/// completed collection's outcome is frozen at return, so apply still
+/// publishes the scanned caller and the run still ends on the stop.
+#[test]
+fn cgroup_runtime_operator_stop_after_return_keeps_completed_pass0() {
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let source = Arc::new(AtomicUsize::new(0));
+    let control = CollectionControl::new(None).with_operator_stop_source(Arc::clone(&source));
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    let worker_source = Arc::clone(&source);
+    driver.wrapper = Some(Box::new(move |job| {
+        Box::new(move || {
+            let collection = job();
+            worker_source.store(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            collection
+        })
+    }));
+    let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+        &mut driver,
+        None,
+        &clock(&|| source.load(Ordering::SeqCst) != 0),
+        None,
+        &mut |_, _| Ok(()),
+    );
+    assert!(result.error.is_none());
+    assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
+    assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
+    assert_eq!(driver.inner.coordinator.registry().caller_count(), 1);
+}
+
 #[test]
 fn cgroup_runtime_spawn_failure_never_runs_collection_inline() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

@@ -12723,9 +12723,12 @@ fn joint_birth_transient_capacity_defers_for_reoffer() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
-            panic!("a capacity-refused registration refuses before New")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a capacity-refused registration refuses before New"),
+        )
         .unwrap();
     assert_eq!(result.installed, 0);
     assert_eq!(

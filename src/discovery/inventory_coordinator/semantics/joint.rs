@@ -797,7 +797,10 @@ fn refuse_unlinked_joint_births(
         return None;
     }
     registry.disclose_joint_journal_unavailable_once();
-    Some(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() })
+    Some(PreparedBirthDisposition {
+        installed: 0,
+        reoffers: Vec::new(),
+    })
 }
 
 /// The existing single pending slot changes phase; preparation adds no queue.
@@ -1226,7 +1229,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         if batch.births_decided {
-            return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
+            return Ok(PreparedBirthDisposition {
+                installed: 0,
+                reoffers: Vec::new(),
+            });
         }
         if batch.claim_cursor != batch.entries.len() || batch.stage_cursor != 0 {
             return Err(RawQuantumRefusal::Admission);
@@ -1265,7 +1271,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .ok_or(RawQuantumRefusal::Capacity)?;
         if count == 0 {
             batch.births_decided = true;
-            return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
+            return Ok(PreparedBirthDisposition {
+                installed: 0,
+                reoffers: Vec::new(),
+            });
         }
         let reserve = self.registry.semantic_storage_reserver();
         let bytes =
@@ -1365,7 +1374,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ));
                 }
                 disclose_s1_birth_refusal(&mut self.registry, None, refusal.reason());
-                return Ok(PreparedBirthDisposition { installed: 0, reoffers: Vec::new() });
+                return Ok(PreparedBirthDisposition {
+                    installed: 0,
+                    reoffers: Vec::new(),
+                });
             }
         };
         batch.births_decided = true;
@@ -1490,11 +1502,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         });
                     }
                     _ => {
-                        disclose_s1_birth_refusal(
-                            &mut self.registry,
-                            caller,
-                            refusal.reason(),
-                        );
+                        disclose_s1_birth_refusal(&mut self.registry, caller, refusal.reason());
                     }
                 }
             }
@@ -1512,11 +1520,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// retained-S1 subject. Only the Joint machine calls this,
     /// once per disposition re-offer it failed to arm.
     pub(crate) fn disclose_birth_reoffer_exhausted(&mut self, reoffer: &BirthReoffer) {
-        disclose_s1_birth_refusal(
-            &mut self.registry,
-            reoffer.caller,
-            reoffer.reason.clone(),
-        );
+        disclose_s1_birth_refusal(&mut self.registry, reoffer.caller, reoffer.reason.clone());
     }
 
     /// The idle machine walks actual accepted image bindings and actual

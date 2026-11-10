@@ -9673,8 +9673,9 @@ fn unknown_metadata_rows(
 
 /// Item 1: encapsulation binds its input role. One qualified
 /// Referenced effect (key_use, ordinal 0); the receipt carries the
-/// encapsulation role; the genuine ML-KEM input partitions
-/// metadata-unknown; the decapsulate ledger stays empty.
+/// encapsulation role; the genuine ML-KEM input rows under the
+/// honest `unknown` label (summaries stay empty); the decapsulate
+/// ledger stays empty.
 #[test]
 fn key_operation_kem_encapsulate_binds_input_role() {
     use crate::semantics_objects::ObjectEffect;
@@ -10543,11 +10544,12 @@ fn key_operation_kem_decapsulate_mints_output_object() {
 /// Item 5 (M2, as superseded by the approved F16 contract for labelled
 /// inputs): this scene establishes the ML-KEM key type with no
 /// parameter set, so no usable label can form and the genuine ML-KEM
-/// input completes into the unknown summary; no proved row appears
-/// for either KEM category. Labelled inputs do row proved — see
+/// input completes into its per-key row under the honest `unknown`
+/// label; no labelled row appears for either KEM category and the
+/// unknown summaries stay empty. Labelled inputs do row proved — see
 /// `key_operation_kem_labelled_input_rows_proved`.
 #[test]
-fn key_operation_kem_proved_row_needs_m1a() {
+fn key_operation_kem_labelled_row_needs_m1a() {
     for name in ["C_EncapsulateKey", "C_DecapsulateKey"] {
         let mut scene = JointScene::new();
         let bootstrap = scene.bootstrap();
@@ -10607,12 +10609,12 @@ fn key_operation_kem_proved_row_needs_m1a() {
     }
 }
 
-/// Item 6: the M2 positive. Each function completes one
-/// metadata_unknown summary and no proved KEM row; the conflict
-/// twin uses metadata_conflicting; the receipt-less twin retains
-/// role_unavailable.
+/// Item 6: the M2 positive. Each function completes one per-key row
+/// under the honest `unknown` label and no unknown summary; the
+/// conflict twin uses metadata_conflicting; the receipt-less twin
+/// retains role_unavailable.
 #[test]
-fn key_operation_kem_metadata_unknown_terminal() {
+fn key_operation_kem_unknown_row_terminal() {
     for (name, category, capture) in [
         ("C_EncapsulateKey", "encapsulate", kem_encap_capture()),
         ("C_DecapsulateKey", "decapsulate", kem_decap_capture()),
@@ -11715,7 +11717,7 @@ fn key_operation_kem_retired_input_stays_unavailable() {
 }
 
 /// Item 18: later qualification is forward-only. A KEM output's
-/// untyped summary never backfills; a later GET qualifies only
+/// `unknown` row never backfills; a later GET qualifies only
 /// later uses; an AES-established output qualifies its later use
 /// normally.
 #[test]
@@ -11792,7 +11794,7 @@ fn key_operation_kem_later_use_qualifies_forward_only() {
 /// Its first use stays unknown; a generic-secret GET keeps it
 /// unknown under M2; independently established AES metadata qualifies
 /// only a subsequent use of that same output. Earlier same-category
-/// summaries and receipt snapshots never change (no backfill). Each
+/// `unknown` rows and receipt snapshots never change (no backfill). Each
 /// establishment runs on its own output: sequential contradictory
 /// GETs would conflict on KeyType instead of qualifying.
 #[test]
@@ -23387,7 +23389,7 @@ fn key_operation_schema_v3_pins_unattributed_contract() {
 /// The v4 schema file mirrors the frozen contract tables: same
 /// section keys as v3 (unattributed required, possibly empty), the
 /// version constant 4, and the metadata enum extended by exactly
-/// the `unknown` first-observed label.
+/// the `unknown` label for label-less proved keys.
 #[test]
 fn key_operation_schema_v4_pins_unknown_metadata_contract() {
     use crate::key_operation_projection::contract::{
@@ -23450,7 +23452,7 @@ fn key_operation_schema_v4_pins_unknown_metadata_contract() {
 /// `CKR_BUFFER_TOO_SMALL`); the unreadable neighbor records
 /// Unavailable without poisoning the use, and the sign proves its
 /// `ml_dsa_65` row. The error twin (a failed GET) establishes nothing
-/// anywhere and the use partitions `metadata_unknown`. Wire kinds and
+/// anywhere and the use rows under the honest `unknown` label. Wire kinds and
 /// field indexes stay numeric (kind 7, field 6): no new-variant
 /// reference, so this compiles before GREEN and fails before GREEN
 /// at journal encode/decode of the kind-7 cells (`paired END
@@ -23558,8 +23560,8 @@ fn pqc_parameter_set_partial_error_preserves_neighbors() {
             committed.unknown_key_operations
         );
     }
-    // Error twin: a failed GET establishes nothing; the use partitions
-    // metadata_unknown exactly once.
+    // Error twin: a failed GET establishes nothing; the use rows under
+    // the honest `unknown` label exactly once.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -24074,7 +24076,7 @@ fn key_operation_pqc_label_constructor_refuses_invalid_pairs() {
 /// beside whatever key type the same view established — here RSA
 /// with code 2, a valid-code/wrong-family pair — while only a
 /// same-view PQC key type with a family-valid code labels. The use
-/// partitions `metadata_unknown`; the scalar is not withheld.
+/// rows under the honest `unknown` label; the scalar is not withheld.
 #[test]
 fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
     use crate::key_operation_projection::{

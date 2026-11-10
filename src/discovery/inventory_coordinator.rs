@@ -562,6 +562,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// consumed once by the stop-time fold. Bounded: one entry per
     /// module with a deferral, one id per deferred endpoint.
     deferral_folds: BTreeMap<Option<AttachModuleKey>, DeferralFold>,
+    /// The last coverage projection's inputs per edge, for the stop
+    /// replay: every [`Self::stage_capture_coverage`] call records its
+    /// edge here (last projection wins). The stop replays them with the
+    /// final receipt state before freezing watches — without that, an
+    /// edge the final extend fully attaches would read `not_attached`,
+    /// because the last apply projects before that extend runs.
+    /// Bounded by the edge count; drained at stop.
+    stop_reprojection: BTreeMap<(CallerId, ModuleKey), (AttachModuleKey, Option<AttachVerdict>)>,
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
@@ -1136,6 +1144,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             capture: None,
             deferral_folds: BTreeMap::new(),
+            stop_reprojection: BTreeMap::new(),
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
@@ -4041,12 +4050,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// not clean, so it never extends an interval.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 stops native capture.
     pub(crate) fn end_capture_coverage(&mut self, at_ns: u64) {
+        if self.capture.as_ref().is_none_or(|capture| capture.stopped) {
+            return;
+        }
+        // Projection lag: the last apply staged coverage before the final
+        // extend attached its endpoints, so re-run that projection with
+        // the final receipt state while the capture is still open.
+        // Modules the final extend completed read watched, new failures
+        // demote, and everything else recomputes identical (positives and
+        // frozen intervals are never overridden). The replayed notes stage
+        // ahead of the watch end below, so the freeze bounds them.
+        let pending = std::mem::take(&mut self.stop_reprojection);
+        for ((caller, key), (attach_key, verdict)) in pending {
+            let Some(pid) = self.adapter.record(caller).map(|record| record.pid) else {
+                continue;
+            };
+            self.stage_capture_coverage(caller, pid, &key, Some(&attach_key), verdict.as_ref());
+        }
+        self.stop_reprojection.clear();
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        if capture.stopped {
-            return;
-        }
         capture.stopped = true;
         // Freeze the pre-arm stop boundary (C1): the published watch
         // interval ends here, never at a later publication read past the
@@ -4216,6 +4240,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if self.capture.is_none() {
             return;
         }
+        // The stop replays this projection with the final receipt state.
+        self.stop_reprojection.insert(
+            (caller, key.clone()),
+            (attach_key.clone(), verdict.cloned()),
+        );
         let scope = self.capture_scope_verdict(caller, pid);
         if let Some(loss) = self.preadmission_holds(caller, pid, key) {
             self.downgrade(caller, Some(key.clone()), loss);

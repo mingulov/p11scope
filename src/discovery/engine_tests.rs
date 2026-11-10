@@ -51065,6 +51065,26 @@ fn capture_loop_failure_names_its_gap() {
     );
 }
 
+/// An owned startup step that failed after probes attached records the
+/// seal's sentence verbatim under the failed step: the caller owns the
+/// profile/trace wording, the engine only files it.
+#[test]
+fn handoff_failure_records_the_passed_sentence() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.note_handoff_failure(
+        "exec handoff",
+        "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure",
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "exec handoff"
+            && skip.reason
+                == "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure"),
+        "the failure publishes the seal's sentence verbatim: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// H5 combined-cap scenario: 4,096 live credits divided among the session
 /// FIFO (1,500 staged), engine pending (2,000 deferred), an active batch
 /// tail (500 pulled) and a nested collection (96), with the 4,097th raw

@@ -30840,12 +30840,10 @@ impl Engine {
     /// Names an owned startup step that failed after probes attached: no
     /// capture loop ever ran, so the loss records the failed step and the
     /// partial report still seals what was captured, with no causal claim
-    /// spanning the failure.
-    pub(crate) fn note_handoff_failure(&mut self, step: &'static str) {
-        self.mark_live_loss(
-            step,
-            "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
-        );
+    /// spanning the failure. The caller owns the sentence (profile and
+    /// trace seals word it differently); the engine files it verbatim.
+    pub(crate) fn note_handoff_failure(&mut self, step: &'static str, reason: &str) {
+        self.mark_live_loss(step, reason);
     }
 
     /// A terminal discovery drain that failed at any stop files

@@ -5042,7 +5042,13 @@ fn finish_owned_handoff_error(
     let error = finish_handoff_error_with(
         error,
         &mut context,
-        |context| context.engine.note_handoff_failure(context.step),
+        |context| {
+            let reason = match context.kind {
+                Kind::Profile => HANDOFF_REASON_STEP_PROFILE,
+                Kind::Trace => HANDOFF_REASON_STEP_TRACE,
+            };
+            context.engine.note_handoff_failure(context.step, reason)
+        },
         |context| {
             let settled = context.owned.finish(
                 &mut *context.engine,
@@ -18758,6 +18764,31 @@ int main(int argc, char **argv) {
         assert!(
             !seal.contains("note_capture_loop_failure()"),
             "no loop ever ran at handoff"
+        );
+    }
+
+    /// The engine loss for a handoff failure carries the seal's own
+    /// sentence: a profile handoff says the report holds the capture,
+    /// a trace handoff says the trace holds it. Swapping the match
+    /// arms reddens this test.
+    #[test]
+    fn owned_handoff_failure_passes_its_kind_sentence() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let seal = production
+            .split_once("fn finish_owned_handoff_error(")
+            .expect("handoff error seal")
+            .1
+            .split_once("fn seal_owned_handoff_partial(")
+            .expect("handoff error seal end")
+            .0;
+        assert!(
+            seal.contains("Kind::Profile => HANDOFF_REASON_STEP_PROFILE"),
+            "a profile handoff must record the report sentence"
+        );
+        assert!(
+            seal.contains("Kind::Trace => HANDOFF_REASON_STEP_TRACE"),
+            "a trace handoff must record the trace sentence"
         );
     }
 

@@ -147,12 +147,22 @@ EXPECTED_MUSL_APK_INFO = (
     "zstd-libs-1.5.7-r0",
 )
 PRODUCTION_CA_BOOTSTRAP = (
-    "apt-get update -q >/dev/null",
-    "apt-get install -qy --no-install-recommends ca-certificates >/dev/null",
+    "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update -q >/dev/null",
+    "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -qy --no-install-recommends ca-certificates >/dev/null",
 )
 MATRIX_CA_BOOTSTRAP = (
-    "apt-get update ",
-    "apt-get install -y --no-install-recommends ca-certificates ",
+    "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 update ",
+    "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends ca-certificates ",
+)
+# Pinned snapshot operations: the frozen selector plus the retry/timeout
+# hardening, so the hardening cannot silently regress to a bare fetch.
+PRODUCTION_SNAPSHOT_APT = (
+    'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null',
+    'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null',
+)
+MATRIX_SNAPSHOT_APT = (
+    'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update ',
+    'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -y --no-install-recommends softhsm2 ',
 )
 MATRIX_FROM = (
     "FROM ubuntu:noble-20260810@sha256:"
@@ -187,11 +197,14 @@ def check_container_pins(script, matrix):
     # ubuntu:noble carries no trust store at all, and -S rewrites the archive to
     # HTTPS snapshot.ubuntu.com, so exactly one bare apt pair is permitted per
     # source: fetch ca-certificates and nothing else. Every other apt operation
-    # must carry the snapshot selector. Each allowed line is stripped once, then
-    # any surviving bare apt-get is a live operation.
-    for label, text, allowed in (
-        ("driver", production, PRODUCTION_CA_BOOTSTRAP),
-        ("matrix", normalized_matrix, MATRIX_CA_BOOTSTRAP),
+    # must carry the snapshot selector. Each allowed line is stripped once, the
+    # pinned snapshot operations must each appear exactly once, then any
+    # surviving apt-get update/install without -S ahead of the subcommand is a
+    # live operation -- options (-o ...) between apt-get and the subcommand do
+    # not satisfy the selector.
+    for label, text, allowed, snapshot in (
+        ("driver", production, PRODUCTION_CA_BOOTSTRAP, PRODUCTION_SNAPSHOT_APT),
+        ("matrix", normalized_matrix, MATRIX_CA_BOOTSTRAP, MATRIX_SNAPSHOT_APT),
     ):
         remainder = text
         for line in allowed:
@@ -200,10 +213,18 @@ def check_container_pins(script, matrix):
                     f"{label} ca-certificates bootstrap is missing or duplicated: {line}"
                 )
             remainder = remainder.replace(line, "", 1)
-        if re.search(r"\bapt-get\s+(?:update|install)\b", remainder):
-            raise ValueError(
-                f"{label} live apt operation lacks an intervening snapshot selector"
-            )
+        for line in snapshot:
+            if remainder.count(line) != 1:
+                raise ValueError(
+                    f"{label} snapshot apt operation is missing or duplicated: {line}"
+                )
+        for apt_match in re.finditer(
+            r"\bapt-get\s+([^&;\n|]*?)\b(update|install)\b", remainder
+        ):
+            if not re.search(r"(?:^|\s)-S(?:\s|$)", apt_match.group(1)):
+                raise ValueError(
+                    f"{label} live apt operation lacks an intervening snapshot selector"
+                )
     if not re.search(
         r'--repositories-file\s+/dev/null\s+'
         r'--repository\s+"\$ALPINE_MAIN_REPOSITORY"\s+add\b',
@@ -288,7 +309,7 @@ pin_mutations = (
         "live apt",
         mutate_production(
             script_source,
-            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update',
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update',
             "apt-get update",
         ),
         matrix_source,
@@ -297,8 +318,44 @@ pin_mutations = (
         "live matrix apt",
         script_source,
         matrix_source.replace(
-            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update',
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update',
             "apt-get update",
+            1,
+        ),
+    ),
+    (
+        "snapshot apt without retries",
+        mutate_production(
+            script_source,
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null',
+            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update -q >/dev/null',
+        ),
+        matrix_source,
+    ),
+    (
+        "snapshot matrix apt without retries",
+        script_source,
+        matrix_source.replace(
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" update',
+            'apt-get -S "$UBUNTU_APT_SNAPSHOT" update',
+            1,
+        ),
+    ),
+    (
+        "added live apt with options",
+        mutate_production(
+            script_source,
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null',
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -qy gcc jq softhsm2 util-linux >/dev/null\n  apt-get -o Acquire::Retries=5 install -qy curl >/dev/null',
+        ),
+        matrix_source,
+    ),
+    (
+        "added live matrix apt with options",
+        script_source,
+        matrix_source.replace(
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -y --no-install-recommends softhsm2 \\\n',
+            'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 -S "$UBUNTU_APT_SNAPSHOT" install -y --no-install-recommends softhsm2 \\\n    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl \\\n',
             1,
         ),
     ),
@@ -353,8 +410,8 @@ pin_mutations = (
         "ca-certificates bootstrap widened to a second package",
         mutate_production(
             script_source,
-            "apt-get install -qy --no-install-recommends ca-certificates >/dev/null",
-            "apt-get install -qy --no-install-recommends ca-certificates curl >/dev/null",
+            "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -qy --no-install-recommends ca-certificates >/dev/null",
+            "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -qy --no-install-recommends ca-certificates curl >/dev/null",
         ),
         matrix_source,
     ),
@@ -362,7 +419,7 @@ pin_mutations = (
         "ca-certificates bootstrap removed from the matrix",
         script_source,
         matrix_source.replace(
-            "    && apt-get install -y --no-install-recommends ca-certificates \\\n",
+            "    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=300 -o Acquire::https::Timeout=300 install -y --no-install-recommends ca-certificates \\\n",
             "",
             1,
         ),

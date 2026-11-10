@@ -879,12 +879,25 @@ captured, whether the stop was a signal, the command's own exit or
 - A child whose final status cannot be settled seals the report with that
   status unknown (`child_still_running` absent in `run` documents, plus a
   named gap); p11scope then exits nonzero with the error on stderr.
-- A failed final snapshot seals the report from the last good snapshot
-  with a named gap for the failed read (the terminal counts are stale as
-  of that snapshot); p11scope then exits nonzero with the error on stderr.
-  A run that never acquired a snapshot still seals its report: the
-  function table is empty, `evidence.snapshot_failure` names the failed
-  read, and p11scope still exits nonzero.
+- In `profile` and `metrics` modes, a failed final snapshot seals the
+  report from the last good snapshot with a named gap for the failed read
+  (the terminal counts are stale as of that snapshot); p11scope then exits
+  nonzero with the error on stderr. A run that never acquired a snapshot
+  still seals its report: the function table is empty,
+  `evidence.snapshot_failure` names the failed read, and p11scope still
+  exits nonzero.
+- In `trace` mode, failed aggregate reads seal the terminal EVIDENCE with
+  unknown aggregate counts (empty reports, defaulted kernel evidence) plus
+  a named gap, and EVIDENCE is always written for these reads; the per-call
+  lines already streamed stay exact. p11scope then exits nonzero with the
+  error on stderr.
+- A failed terminal pinned-object revalidation or watch-health read seals
+  the report the same way, with its own named gap, instead of discarding
+  it; p11scope then exits nonzero with the error on stderr.
+
+The terminal gaps above use the existing generic `skipped` pair in JSON
+(`discovery subject` / `discovery unavailable`); the specific failed read
+is named on stderr and in the returned error.
 
 In every case the error names every failed step.
 

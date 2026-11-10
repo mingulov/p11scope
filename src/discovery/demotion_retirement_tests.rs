@@ -3373,6 +3373,110 @@ fn demotion_retirement_revision_skew_unknown_keeps_ordinary_checkpoint() {
 }
 
 #[test]
+fn demotion_retirement_module_change_across_skew_revokes_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    assert_eq!(ownership.ordinary_sequence(scene.caller, object), original);
+    // A second module sharing the counted object arrives, but its [A,B]
+    // scan is queued under a membership revision the attach set outgrows
+    // before classification runs: the [A,B] window is never classified,
+    // so the unproven members-filter finish must revoke instead of
+    // retaining the proven sole-owner checkpoint across a module-set
+    // change it never examined.
+    round4_queue_ownership(
+        &mut ownership,
+        &scene,
+        vec![round4_a_key(&scene), round4_b_key(&scene)],
+        300,
+    );
+    round4_grow_attach_revision(&mut scene);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(scene.caller),
+        301,
+        "the [A,B] observation is accepted and moves the caller epoch"
+    );
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "the [A,B] scan finishes on the revision-skew leg"
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across an unclassified module-set change needs a new fence, not the old checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_in_place_rewrite_unknown_revokes_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    assert_eq!(ownership.ordinary_sequence(scene.caller, object), original);
+    // The provider file is rewritten in place: same inode, new bytes and
+    // digest. The attach set marks the retained object changed, so its
+    // membership entry reads unknown — a proven revocation, never a
+    // retained checkpoint.
+    std::fs::write(&scene.a, "provider-a-v2-longer").unwrap();
+    let repinned = fx::pass_pins(&[(&scene.a, "sha-a2")]);
+    let rewritten = fx::lower_named(
+        std::slice::from_ref(&fx::module_with_targets(
+            &repinned,
+            &scene.a,
+            &[(&scene.a, 0x1000)],
+        )),
+        &repinned,
+        crate::plan::AdmissionPolicy::Inventory(
+            scene.native.scene.coordinator.attach_set.budget(),
+        ),
+    );
+    let outcome = scene
+        .native
+        .scene
+        .coordinator
+        .attach_set
+        .absorb(&rewritten, &repinned);
+    assert!(
+        outcome
+            .gaps
+            .iter()
+            .any(|gap| gap.subject == crate::discovery::inventory_attach_set::CHANGED_SUBJECT),
+        "the rewritten provider must mark its object changed: {:?}",
+        outcome.gaps
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "the unknown members entry finishes on the members-filter leg"
+    );
+    assert_eq!(
+        ownership.revocation_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "an unknown members entry revokes ordinary continuity"
+    );
+    assert_ne!(
+        ownership.ordinary_sequence(scene.caller, object),
+        original,
+        "growth across a changed provider file needs a new fence, not the old checkpoint"
+    );
+}
+
+#[test]
 fn demotion_retirement_proven_absence_revokes_ordinary_checkpoint() {
     let scene = round4_placed_with_known_b();
     let object = scene.native.scene.delta.endpoints[0].object.index();

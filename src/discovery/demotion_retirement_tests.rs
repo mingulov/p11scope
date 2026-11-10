@@ -3761,15 +3761,34 @@ fn demotion_retirement_fresh_summary_staging_after_accepted_scan_keeps_checkpoin
 
 #[test]
 fn demotion_retirement_fresh_summary_after_replaced_scan_takes_no_checkpoint() {
-    let scene = round4_placed_with_known_b();
+    let scene = Scene::shared();
     let object = scene.native.scene.delta.endpoints[0].object.index();
+    // Probe the premise on a twin slice: both modules target (A,0x1000)
+    // in this scene, so [A,B] is truly Shared for endpoints[0]. The
+    // replaced pre-registration scan below therefore stages a real
+    // transient-Shared window, not a Sole-to-Sole swap.
+    let mut probe = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(probe.register_pair(scene.caller, object));
+    round4_queue_ownership(
+        &mut probe,
+        &scene,
+        vec![round4_a_key(&scene), round4_b_key(&scene)],
+        100,
+    );
+    round4_settle_ownership(&mut probe, &scene);
+    assert_eq!(probe.newest_accepted_post(scene.caller), 101);
+    assert!(matches!(
+        probe.candidates(scene.caller, object),
+        CurrentCandidates::Shared
+    ));
     let mut ownership = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
     // Before the pair registers, an accepted scan proving both carriers
-    // (Shared for this object) is replaced by an accepted Sole scan.
-    // The fresh summary will only ever classify the Sole scan; the
-    // replaced Shared scan is gone, so growth whose read predates it
-    // crosses a proven-transient Shared window and must fence into
-    // exact named gaps, not resume ordinary on the initial checkpoint.
+    // (Shared for this object, pinned by the probe above) is replaced by
+    // an accepted Sole scan. The fresh summary will only ever classify
+    // the Sole scan; the replaced Shared scan is gone, so growth whose
+    // read predates it crosses a proven-transient Shared window and must
+    // fence into exact named gaps, not resume ordinary on the initial
+    // checkpoint.
     round4_queue_ownership(
         &mut ownership,
         &scene,

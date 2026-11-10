@@ -287,6 +287,30 @@ pub(crate) struct MappedOpenError {
     pub errno: Option<i32>,
 }
 
+impl MappedOpenError {
+    /// The stored gap reason for this open failure: only a retained-root
+    /// open failure gains the target-root suffix that names the foreign
+    /// root; a size-cap or precondition refusal keeps its exact wording
+    /// and its own record. The single owner of the suffix rule — the
+    /// scan's `foreign_root_skips` and the pin path both format through
+    /// here, and the renderers parse it back.
+    pub(crate) fn gap_reason(&self) -> String {
+        match &self.foreign_target_root {
+            Some(root)
+                if self
+                    .reason
+                    .starts_with("opening object within retained target root:") =>
+            {
+                format!(
+                    "{} (target root {} differs from the observer root)",
+                    self.reason, root
+                )
+            }
+            _ => self.reason.clone(),
+        }
+    }
+}
+
 /// Whether the observer may retry a mapping open in its own root: only a
 /// chroot-like view qualifies — the target root differs from the observer's,
 /// but both share one mount namespace, so the target's mount table resolves
@@ -1113,6 +1137,42 @@ mod tests {
             ns_a,
             None
         ));
+    }
+
+    /// The stored gap reason: only a retained-root open failure gains
+    /// the target-root suffix; size-cap, precondition and same-root
+    /// failures keep their exact wording.
+    #[test]
+    fn gap_reason_suffixes_only_retained_root_failures_under_a_foreign_root() {
+        let retained = "opening object within retained target root: No such process (os error 3)";
+        let foreign = MappedOpenError {
+            reason: retained.into(),
+            foreign_target_root: Some("/proc/99999/fdinfo".into()),
+            errno: Some(libc::ESRCH),
+        };
+        assert_eq!(
+            foreign.gap_reason(),
+            "opening object within retained target root: No such process (os error 3) \
+             (target root /proc/99999/fdinfo differs from the observer root)"
+        );
+        for (reason, root) in [
+            (
+                "object is 278755480 bytes; limit is 268435456",
+                Some("/proc/99999/fdinfo"),
+            ),
+            (
+                "target-root object requires an absolute path without parent traversal",
+                Some("/proc/99999/fdinfo"),
+            ),
+            (retained, None),
+        ] {
+            let failure = MappedOpenError {
+                reason: reason.into(),
+                foreign_target_root: root.map(str::to_string),
+                errno: None,
+            };
+            assert_eq!(failure.gap_reason(), reason);
+        }
     }
 
     #[test]

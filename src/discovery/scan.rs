@@ -4105,23 +4105,33 @@ fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
     failures
         .into_iter()
         .map(|failure| {
-            let reason = if failure
-                .reason
-                .starts_with("opening object within retained target root:")
-            {
-                format!(
-                    "{} (target root {} differs from the observer root)",
-                    failure.reason, failure.root
-                )
-            } else {
-                failure.reason
-            };
+            // The suffix rule lives on the error type, shared with the
+            // pin path; the errno plays no part in the wording.
+            let reason = MappedOpenError {
+                reason: failure.reason,
+                foreign_target_root: Some(failure.root),
+                errno: None,
+            }
+            .gap_reason();
             Skipped {
                 subject: failure.subject,
                 reason,
             }
         })
         .collect()
+}
+
+/// One mapped object the scan opened: the file, plus whether the
+/// mount-table guard below has nothing left to prove. Only the
+/// `map_files` route can exempt, and only once its like-for-like proof
+/// passed while the target mount table reads kernel-empty (a sandboxed
+/// target whose dangling root breaks table rendering, so resolution is
+/// impossible rather than failed): the VMA proof already bound this fd
+/// to the mapping, and `mapped_file_guard` plus the maps bracket still
+/// run. Every root open carries `false`.
+struct OpenedMappedObject {
+    file: File,
+    guard_exempt: bool,
 }
 
 /// Open a mapped object whose target-root open failed only because the
@@ -4132,7 +4142,8 @@ fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
 /// `vm_file` against the range's `map_files` stat — kernel identities on
 /// both sides, never `fstat` vs maps). The served file then runs the
 /// ordinary opened-file and `mapped_file_guard` checks, so a same-key
-/// different file still refuses.
+/// different file still refuses — except the mount-table guard, which is
+/// exempted only once the proof passed under a kernel-empty mount table.
 ///
 /// The group's first range names the VMA. Any other errno keeps the
 /// original failure untouched — only an unreachable root retries, and
@@ -4141,6 +4152,7 @@ fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
 /// original failure counted and named, with the attempt beside it in the
 /// established `(host-root fallback: …)` style. Only a proven different
 /// file refuses with its own reason.
+#[allow(clippy::too_many_arguments)]
 fn open_object_with_map_files_fallback(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4148,7 +4160,8 @@ fn open_object_with_map_files_fallback(
     key: ObjectKey,
     group: &[&MapEntry],
     budget: &mut CaptureWorkBudget,
-) -> Result<File, MappedOpenError> {
+    mounts: &mut crate::process::MountTableCache,
+) -> Result<OpenedMappedObject, MappedOpenError> {
     if failure.errno != Some(libc::ESRCH) {
         return Err(failure);
     }
@@ -4204,7 +4217,23 @@ fn open_object_with_map_files_fallback(
         .map(|held| held.identity);
     let ranged = io.range_identity(view, start, end, budget);
     match (held, ranged) {
-        (Some(held), Ok(Ok(ranged))) if held == ranged => Ok(file),
+        (Some(held), Ok(Ok(ranged))) if held == ranged => {
+            // The mount-table guard below resolves through the target's
+            // mount table; a sandboxed target's table reads kernel-empty
+            // (its dangling root breaks path rendering), so resolution
+            // is impossible rather than failed. Exempt only then: the
+            // proof above already bound this fd to the VMA. An unreadable
+            // table, or a table that reads anything at all, keeps the
+            // guard — a failed resolution there still refuses.
+            let mountinfo_empty = matches!(
+                view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
+                Ok(((), text)) if text.is_empty()
+            );
+            Ok(OpenedMappedObject {
+                file,
+                guard_exempt: mountinfo_empty,
+            })
+        }
         (Some(held), Ok(Ok(ranged))) => Err(MappedOpenError {
             reason: format!(
                 "map_files range {start:x}-{end:x} is another file (st_dev {} st_ino {}) than the \
@@ -6925,11 +6954,19 @@ fn scan_view_examined_mode(
         };
         let path = usable.display().to_string();
         let sub_open = Instant::now();
-        let file = match io.open_mapped_object(view, &path, budget) {
-            Ok(file) => file,
+        let (file, guard_exempt) = match io.open_mapped_object(view, &path, budget) {
+            Ok(file) => (file, false),
             Err(failure) => {
-                match open_object_with_map_files_fallback(io, view, failure, key, &group, budget) {
-                    Ok(file) => file,
+                match open_object_with_map_files_fallback(
+                    io,
+                    view,
+                    failure,
+                    key,
+                    &group,
+                    budget,
+                    &mut mounts,
+                ) {
+                    Ok(opened) => (opened.file, opened.guard_exempt),
                     Err(failure) => {
                         if !narrowed_out {
                             match failure.foreign_target_root {
@@ -6949,11 +6986,15 @@ fn scan_view_examined_mode(
                 }
             }
         };
-        if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
-            if !narrowed_out {
-                skipped.push(Skipped { subject, reason });
+        // Uncollapsed: the inner line is the pinned guard call.
+        #[allow(clippy::collapsible_if)]
+        if !guard_exempt {
+            if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
+                if !narrowed_out {
+                    skipped.push(Skipped { subject, reason });
+                }
+                continue;
             }
-            continue;
         }
         substage::add(1, sub_open);
         let sub_guard = Instant::now();
@@ -12418,11 +12459,43 @@ mod tests {
                     == "if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {"
             })
             .expect("the shared identity guard must run in the scan");
+        // The guard decision immediately follows every successful target
+        // open; only a map_files-proven file under a kernel-empty mount
+        // table skips the guard itself (the ruled sandbox-maps exemption,
+        // 2026-11-10: a sandboxed target's dangling root breaks table
+        // rendering, so resolution is impossible rather than failed — the
+        // VMA proof already bound that fd, and the range guard plus the
+        // maps bracket still run).
         assert_eq!(
             scan_lines[guard - 1],
-            "};",
-            "the identity guard must immediately follow every successful target open"
+            "if !guard_exempt {",
+            "only the proven map_files exemption skips the identity guard"
         );
+        assert_eq!(
+            scan_lines[guard - 2],
+            "#[allow(clippy::collapsible_if)]",
+            "the exemption keeps the guard call on its own pinnable line"
+        );
+        assert_eq!(
+            scan_lines[guard - 4],
+            "};",
+            "the guard decision must immediately follow every successful target open"
+        );
+        // The exemption's two halves stay narrow: root opens never exempt,
+        // and the fallback exempts only on a kernel-empty mount-table read
+        // (an unreadable or nonempty table keeps the guard). The fallback
+        // lives above the scan entry, so these pin against the whole file.
+        for exemption_line in [
+            "Ok(file) => (file, false),",
+            "guard_exempt: mountinfo_empty,",
+            "Ok(((), text)) if text.is_empty()",
+        ] {
+            include_str!("scan.rs")
+                .lines()
+                .map(str::trim)
+                .position(|line| line == exemption_line)
+                .expect("the map_files exemption keeps its narrow shape");
+        }
         // Narrowed-out mappings stay silent on pre-exclusion failures (the
         // exclusion-before-narrowing contract); only in-scope mismatches
         // record a skip.
@@ -17750,9 +17823,10 @@ mod tests {
         /// open (the healthy route).
         root_failure: Option<MappedOpenError>,
         map_files: MapFilesScript,
-        /// Scripted `vm_file` identities (held fd, target range).
+        /// Scripted `vm_file` identities (held fd with its filesystem
+        /// magic, target range).
         mapped: Option<(
-            crate::discovery::identity::FileIdentity,
+            crate::discovery::identity::MappedFile,
             crate::discovery::identity::FileIdentity,
         )>,
     }
@@ -17827,12 +17901,7 @@ mod tests {
         }
         fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
             match self.mapped {
-                // Scripted identities model an ordinary filesystem,
-                // like BracketFixture: the magic is explicit.
-                Some((held, _)) => Some(crate::discovery::identity::MappedFile {
-                    identity: held,
-                    fs_magic: Some(0xef53),
-                }),
+                Some((held, _)) => Some(held),
                 None => crate::discovery::identity::self_mapped_file(file).ok(),
             }
         }
@@ -17918,6 +17987,32 @@ mod tests {
             }
         }
 
+        /// Scripted held identities model an ordinary filesystem, like
+        /// BracketFixture: the magic is explicit.
+        fn scripted_held(
+            identity: crate::discovery::identity::FileIdentity,
+        ) -> crate::discovery::identity::MappedFile {
+            crate::discovery::identity::MappedFile {
+                identity,
+                fs_magic: Some(0xef53),
+            }
+        }
+
+        /// Re-render the maps under an arbitrary key the fixture file
+        /// cannot resolve to: the mount-table guard must refuse it,
+        /// proving the guard ran.
+        fn set_arbitrary_key(&mut self, major: u64, minor: u64, inode: u64, path: &str) {
+            self.key = ObjectKey {
+                device: Device { major, minor },
+                inode,
+            };
+            let identity = format!("{major:x}:{minor:x} {inode} {path}");
+            self.maps = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 7000-8000 r--p 00004000 {identity}\n"
+            );
+        }
+
         fn run(
             &mut self,
             budget: &mut CaptureWorkBudget,
@@ -17950,7 +18045,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
-        fixture.mapped = Some((identity, identity));
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
@@ -17982,7 +18077,7 @@ mod tests {
         let mut fixture = MapFilesFallbackFixture::new();
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.root_failure = None;
-        fixture.mapped = Some((identity, identity));
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
@@ -18015,7 +18110,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((
-            FileIdentity { dev: 37, ino: 9 },
+            MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
             FileIdentity { dev: 37, ino: 10 },
         ));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
@@ -18050,7 +18145,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Fail(libc::EPERM);
-        fixture.mapped = Some((identity, identity));
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
@@ -18082,6 +18177,44 @@ mod tests {
         );
     }
 
+    /// The exemption needs a kernel-empty mount table: with a readable
+    /// table (this fixture's own), the mount-table guard still runs for a
+    /// map_files-proven file — even one whose identities would prove the
+    /// key — and refuses the mismatch. The negative control that keeps the
+    /// live exemption honest: proof alone never skips the guard.
+    #[test]
+    fn map_files_fallback_runs_the_mount_table_guard_when_mountinfo_is_available() {
+        use crate::discovery::identity::{FileIdentity, MappedFile};
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_arbitrary_key(8, 1, 999, "/libfixture-arbitrary.so");
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        let proven = FileIdentity {
+            dev: libc::makedev(8, 1),
+            ino: 999,
+        };
+        fixture.mapped = Some((
+            MappedFile {
+                identity: proven,
+                fs_magic: Some(0xef53),
+            },
+            proven,
+        ));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the key-mismatched object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == "/libfixture-arbitrary.so"
+                    && skip.reason.contains("does not match mapped object")
+            }),
+            "the mount-table guard must refuse the mismatch, got {:?}",
+            outcome.skipped()
+        );
+    }
+
     /// A served non-regular file is never scanned: the `map_files`
     /// entry of a file-backed VMA is its regular file, so anything
     /// else refuses with its own named reason.
@@ -18093,7 +18226,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files =
             MapFilesScript::Serve(File::open(fixture.path.parent().unwrap()).unwrap());
-        fixture.mapped = Some((identity, identity));
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
@@ -18124,7 +18257,7 @@ mod tests {
         file.set_len(limit + 1).unwrap();
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Serve(File::open(&big).unwrap());
-        fixture.mapped = Some((identity, identity));
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(

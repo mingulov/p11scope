@@ -8411,7 +8411,7 @@ fn pin_scanned_object(
                 |filesystem| {
                     filesystem
                         .open_mapped_object(Path::new(&raw.path))
-                        .map_err(|failure| failure.reason)
+                        .map_err(|failure| failure.gap_reason())
                 },
                 mounts,
                 budget,

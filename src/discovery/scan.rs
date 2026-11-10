@@ -18032,6 +18032,9 @@ mod tests {
         /// Scripted re-stated key of the served file for the
         /// exempt-path maps-key check; `None` stats the live fd.
         restated: Option<ObjectKey>,
+        /// Scripted re-stat failure for the exempt-path maps-key
+        /// check; `Some` fails the re-stat instead of keying the fd.
+        restated_err: Option<String>,
     }
 
     struct MapFilesFallbackMemory {
@@ -18138,6 +18141,9 @@ mod tests {
             }
         }
         fn restated_fd_key(&mut self, file: &File) -> std::io::Result<ObjectKey> {
+            if let Some(reason) = &self.restated_err {
+                return Err(std::io::Error::other(reason.clone()));
+            }
             match self.restated {
                 Some(key) => Ok(key),
                 // The live re-stat, mirroring the default.
@@ -18209,6 +18215,7 @@ mod tests {
                 deleted_held: None,
                 mountinfo_empty: None,
                 restated: None,
+                restated_err: None,
             }
         }
 
@@ -18675,6 +18682,52 @@ mod tests {
             }),
             "the stale key must refuse by name, got {:?}",
             outcome.skipped()
+        );
+    }
+
+    /// Fail-closed twin: when the exempt-path re-stat itself fails,
+    /// the proven file stays unproven — the original failure keeps
+    /// its count and name, with the attempt beside it, never an
+    /// examination under an unchecked key.
+    #[test]
+    fn map_files_fallback_keeps_the_gap_when_the_exempt_restat_fails() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
+        fixture.mountinfo_empty = Some(true);
+        fixture.restated_err = Some("injected re-stat failure".into());
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the unrestated object must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert!(
+            skip.reason.starts_with(
+                "opening object within retained target root: No such process (os error 3)"
+            ),
+            "the original failure keeps its name, got {:?}",
+            skip.reason
+        );
+        assert!(
+            skip.reason.contains("(map_files fallback:")
+                && skip.reason.contains("could not be re-stated"),
+            "the failed re-stat stays recorded beside it, got {:?}",
+            skip.reason
+        );
+        assert!(
+            skip.reason
+                .contains("(target root /proc/99999/fdinfo differs from the observer root)"),
+            "the foreign root keeps its suffix, got {:?}",
+            skip.reason
         );
     }
 

@@ -18579,10 +18579,52 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// Each handoff seal files its own step sentence: the profile seal
+    /// says the report holds the capture, the trace seal says the trace
+    /// holds it. Swapping the two constants between the seals reddens
+    /// this test; the schema-membership pin above cannot see that swap.
+    #[test]
+    fn owned_handoff_step_reason_matches_its_seal() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let profile = production
+            .split_once("fn seal_owned_handoff_profile(")
+            .expect("profile handoff seal")
+            .1
+            .split_once("fn seal_owned_handoff_trace(")
+            .expect("profile handoff seal end")
+            .0;
+        let trace = production
+            .split_once("fn seal_owned_handoff_trace(")
+            .expect("trace handoff seal")
+            .1
+            .split_once("fn finish_capture_loop(")
+            .expect("trace handoff seal end")
+            .0;
+        assert!(
+            profile.contains("HANDOFF_REASON_STEP_PROFILE"),
+            "the profile seal must file the report sentence"
+        );
+        assert!(
+            !profile.contains("HANDOFF_REASON_STEP_TRACE"),
+            "the profile seal must not file the trace sentence"
+        );
+        assert!(
+            trace.contains("HANDOFF_REASON_STEP_TRACE"),
+            "the trace seal must file the trace sentence"
+        );
+        assert!(
+            !trace.contains("HANDOFF_REASON_STEP_PROFILE"),
+            "the trace seal must not file the report sentence"
+        );
+    }
+
     /// The trace handoff seal drains the reaped child's tail the way the
     /// profile seal does: tail events at handoff stream through the trace
-    /// reducer, and every non-absent outcome retires or files its named
-    /// gap — never silently lost.
+    /// reducer ahead of the EVENTS drain, a completed tail retires, and
+    /// every other outcome files its named gap — never silently lost.
+    /// Deleting any outcome arm, or draining the tail after EVENTS,
+    /// reddens this test.
     #[test]
     fn owned_handoff_trace_seal_drains_the_original_root_tail() {
         let source = include_str!("run.rs");

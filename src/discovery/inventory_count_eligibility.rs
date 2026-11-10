@@ -36,6 +36,7 @@ pub(super) enum RevocationCause {
 enum FinishLeg {
     InvalidSlot,
     MembersFilter,
+    MembersUnknown,
     InvalidEdge,
     Completed,
 }
@@ -347,8 +348,12 @@ impl CandidateSummary {
     /// revision skew, an unknown/refused index, an invalid slot or a
     /// not-yet-committed edge) is not evidence the owner changed, so it
     /// retains a proven Sole result and ordinary continuity instead of
-    /// revoking them. Proven classifications and unconsumed authority
-    /// failures still revoke exactly as before.
+    /// revoking them — but only over the same caller module list. A
+    /// different module list (a moved caller epoch) may hide a sharing
+    /// window the skipped classification never examined, so it revokes
+    /// as before, as does an unknown members entry (a changed object
+    /// file). Proven classifications and unconsumed authority failures
+    /// still revoke exactly as before.
     fn finish(
         &mut self,
         result: CurrentCandidates,
@@ -359,16 +364,17 @@ impl CandidateSummary {
     ) {
         let leg_cause = match leg {
             FinishLeg::InvalidSlot => RevocationCause::InvalidSlot,
-            FinishLeg::MembersFilter => RevocationCause::MembersFilter,
+            FinishLeg::MembersFilter | FinishLeg::MembersUnknown => RevocationCause::MembersFilter,
             FinishLeg::InvalidEdge => RevocationCause::InvalidEdge,
             FinishLeg::Completed => RevocationCause::None,
         };
         if caller_epoch.is_some()
-            && leg != FinishLeg::Completed
+            && !matches!(leg, FinishLeg::Completed | FinishLeg::MembersUnknown)
             && matches!(result, CurrentCandidates::Unknown)
             && matches!(self.result, CurrentCandidates::Sole { .. })
             && self.ordinary_sequence != 0
             && !self.unconsumed_failure(caller_failure, index_failure)
+            && self.result_caller_epoch == caller_epoch
         {
             self.finished = true;
             self.result_caller_epoch = caller_epoch;
@@ -1242,6 +1248,10 @@ impl CountOwnership {
             if summary.finished {
                 summary.restart(slot.epoch, index.revision);
             }
+            let members_unknown = index
+                .objects
+                .get(&object)
+                .is_some_and(|members| members.unknown);
             let Some(members) = index.objects.get(&object).filter(|members| {
                 !members.unknown
                     && !index.unknown
@@ -1251,12 +1261,21 @@ impl CountOwnership {
                         .as_ref()
                         .is_some_and(|active| active.scan.revision == index.revision)
             }) else {
+                // An unknown members entry means the provider file changed
+                // in place: the membership is unprovable, so this finishes
+                // as a proven revocation instead of retaining the proven
+                // checkpoint. It still reports the members-filter leg.
+                let leg = if members_unknown {
+                    FinishLeg::MembersUnknown
+                } else {
+                    FinishLeg::MembersFilter
+                };
                 summary.finish(
                     CurrentCandidates::Unknown,
                     slot.epoch,
                     slot.last_authority_failure,
                     index.last_authority_failure,
-                    FinishLeg::MembersFilter,
+                    leg,
                 );
                 continue;
             };

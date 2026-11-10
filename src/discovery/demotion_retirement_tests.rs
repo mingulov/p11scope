@@ -3439,9 +3439,7 @@ fn demotion_retirement_in_place_rewrite_unknown_revokes_checkpoint() {
             &[(&scene.a, 0x1000)],
         )),
         &repinned,
-        crate::plan::AdmissionPolicy::Inventory(
-            scene.native.scene.coordinator.attach_set.budget(),
-        ),
+        crate::plan::AdmissionPolicy::Inventory(scene.native.scene.coordinator.attach_set.budget()),
     );
     let outcome = scene
         .native

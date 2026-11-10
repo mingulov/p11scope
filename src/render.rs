@@ -3267,6 +3267,34 @@ pub fn live_scoped(
     )
 }
 
+/// The pid-scope caller line for profile stdout, without the PID number
+/// (allowlist v1: the pid is a stderr diagnostic only). `None` for
+/// aggregate scopes, which name no single caller.
+pub fn caller_text_line(_caller: Option<&CaptureCaller>) -> Option<String> {
+    None
+}
+
+/// [`live_scoped_with_verbosity`] plus the pid-scope caller line after
+/// the header, so profile stdout names the caller program like JSON
+/// `capture.caller` does. `None` caller renders no line.
+#[allow(clippy::too_many_arguments)]
+pub fn live_scoped_with_caller(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+    _caller: Option<&CaptureCaller>,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    live_scoped_with_verbosity(
+        reports, ev, elapsed, module, mode, policy, scope, mechanisms, verbosity,
+    )
+}
+
 /// One plain line naming a refused pause and why. `None` unless a
 /// lifecycle failure ended the run; an unrecognized reason still
 /// surfaces verbatim rather than vanishing.
@@ -13183,6 +13211,86 @@ pub(crate) mod tests {
                 document["capture"]
             );
         }
+    }
+
+    /// Pid-scope profile text names the caller program like JSON
+    /// `capture.caller` and the stderr target line do, so the demo
+    /// question answers on stdout. Aggregate scopes name none.
+    #[test]
+    fn pid_profile_text_names_the_caller_program() {
+        let mut ev = evidence();
+        ev.verdict();
+        let caller = CaptureCaller {
+            exe: Some("/usr/bin/python3.14".into()),
+            exe_unknown_reason: None,
+        };
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = live_scoped_with_caller(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &BTreeMap::new(),
+                Some(&caller),
+                verbosity,
+            );
+            assert!(
+                out.contains("caller: /usr/bin/python3.14"),
+                "{verbosity:?} names the caller program: {out}"
+            );
+            assert!(
+                !out.contains("pid 4242"),
+                "{verbosity:?} carries no PID number: {out}"
+            );
+        }
+        // Unknown exe names its reason, never a PID.
+        let unknown = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("exe_unreadable"),
+        };
+        let out = live_scoped_with_caller(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            Some(&unknown),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains("caller unknown: exe_unreadable"),
+            "unknown caller names its reason: {out}"
+        );
+        // No caller (aggregate scopes) renders no caller line.
+        let out = live_scoped_with_caller(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "system",
+            &BTreeMap::new(),
+            None,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            !out.contains("caller:"),
+            "aggregate scopes name no caller: {out}"
+        );
+        assert!(
+            !out.contains("caller unknown:"),
+            "aggregate scopes name no caller: {out}"
+        );
     }
 
     #[test]

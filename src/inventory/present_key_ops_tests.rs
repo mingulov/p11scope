@@ -1237,8 +1237,7 @@ fn silent_bootstrap_deferred_birth_is_named_once() {
         !verbose.contains("per-key tracking refused this process"),
         "{verbose}"
     );
-    let concise =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains("per-key tracking for this process was deferred (capacity)"),
         "{concise}"

@@ -112,6 +112,21 @@ def decided_report():
     }
 
 
+def witness_available_report():
+    """Host-leg shape (hosted public-cli host, 7.0.0-azure evidence).
+
+    The kernel witness ran on a non-overlay filesystem, so no
+    per-caller original_file_unproven gap exists; the producer kept
+    the named module-level unidentified-caller positive on the owned
+    module plus the per-caller scan-pinned fallback gaps.
+    """
+    report = decided_report()
+    report["gaps"] = [
+        g for g in report["gaps"]
+        if not (g.get("reason") or "").startswith("original_file_unproven")]
+    return report
+
+
 class AcceptTests(unittest.TestCase):
     def test_decided_overlay_shape_passes(self):
         rc, out = run_oracle(decided_report(), modfs="overlayfs")
@@ -137,6 +152,19 @@ class AcceptTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("unproven=2 gaps=5", out)
 
+    def test_witness_available_unbound_positive_passes_off_overlay(self):
+        # Host leg (7.0.0-azure): the witness ran, so no unproven gaps
+        # exist; the named counted positive on the owned module is
+        # PARTIAL coverage, not a failure. Gap order mirrors the CI
+        # row exactly (per-caller fallback, owned positive, fallback).
+        report = witness_available_report()
+        self.assertEqual(
+            [(g.get("caller"), g.get("module")) for g in report["gaps"]],
+            [("c0", None), (None, "m0"), ("c1", None)])
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=3", out)
+
 
 class RefuseTests(unittest.TestCase):
     def test_missing_module_still_fails(self):
@@ -156,6 +184,18 @@ class RefuseTests(unittest.TestCase):
              "reason": "something new about the owned module",
              "subject": "novel owned trouble", "repeats": 1})
         rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inventory gaps about owned module", out)
+
+    def test_unnamed_owned_gap_still_fails_off_overlay(self):
+        # The witness-available branch accepts only named owned-module
+        # gaps; an unnamed one still fails loudly.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": "m0", "pid": None,
+             "reason": "something new about the owned module",
+             "subject": "novel owned trouble", "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("inventory gaps about owned module", out)
 

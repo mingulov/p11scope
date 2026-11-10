@@ -7979,7 +7979,8 @@ impl Session {
                 last_counter_stage_check: None,
                 journal,
                 sealed_journal_linked: None,
-                counter_banks: counter.map(|prepared| prepared.banks),
+                counter_banks: counter
+                    .map(|prepared| prepared.banks.with_detail_child_ring_bytes(ring_bytes)),
             },
             prepared_instance.expect("preparation established image program load result"),
         ))

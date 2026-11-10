@@ -13,7 +13,7 @@ use aya::Ebpf;
 use aya::maps::{HashMap, HashOfMaps, Map, MapData, MapError, MapType};
 use aya::programs::UProbe;
 use p11scope_ebpf_common::{
-    CallStart, CounterMode, MAX_SLOTS, RING_BYTES, RV_ENTRIES, START_ENTRIES, SlotStats,
+    CallStart, CounterMode, MAX_SLOTS, RV_ENTRIES, START_ENTRIES, SlotStats,
 };
 use std::collections::BTreeSet;
 use std::mem::size_of;
@@ -2214,6 +2214,9 @@ pub(crate) struct CounterBanks {
     // Immutable geometry avoids reentering the Directory lock during stage.
     link_staging: Arc<AtomicU64>,
     terminal: Option<ResourceLease>,
+    /// EVENTS ring each detail-window child is charged (and must load):
+    /// `resolve_detail_child_ring_bytes` of the session's `--ring-bytes`.
+    detail_child_ring_bytes: u32,
 }
 
 pub(super) struct CounterPreparation<'a> {
@@ -2426,6 +2429,7 @@ impl<'a> CounterPreparation<'a> {
                 backend,
                 link_staging: Arc::new(AtomicU64::new(0)),
                 terminal: Some(terminal),
+                detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
             },
             _scratch: scratch,
         })
@@ -3785,6 +3789,18 @@ impl Session {
 }
 
 impl CounterBanks {
+    /// Sizes every detail-window child from the session's `--ring-bytes`
+    /// through [`crate::run::resolve_detail_child_ring_bytes`].
+    pub(super) fn with_detail_child_ring_bytes(mut self, ring_bytes: Option<u32>) -> Self {
+        self.detail_child_ring_bytes = crate::run::resolve_detail_child_ring_bytes(ring_bytes);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detail_child_ring_bytes(&self) -> u32 {
+        self.detail_child_ring_bytes
+    }
+
     pub(super) fn geometry_mode(&self) -> CounterMode {
         self.geometry.mode()
     }
@@ -4411,6 +4427,7 @@ pub(crate) fn detail_child_envelope(
     child_slots: &[Slot],
     objects: &PinnedObjects,
     cpus: usize,
+    ring_bytes: u32,
 ) -> Result<DetailChildEnvelope, DetailToggleRefusal> {
     let endpoints = child_slots.len();
     if endpoints == 0 || endpoints > MAX_SLOTS as usize {
@@ -4440,7 +4457,7 @@ pub(crate) fn detail_child_envelope(
     let mut bytes = stats
         .checked_add(start)
         .and_then(|sum| sum.checked_add(rv))
-        .and_then(|sum| sum.checked_add(RING_BYTES as usize))
+        .and_then(|sum| sum.checked_add(ring_bytes as usize))
         .and_then(|sum| sum.checked_add(DETAIL_CHILD_CONTROL_BYTES))
         .ok_or(DetailToggleRefusal::Budget)?;
     for slot in child_slots {
@@ -5012,7 +5029,8 @@ impl CounterBanks {
             }
         }
         let cpus = aya::util::nr_cpus().map_err(|_| DetailToggleRefusal::Budget)?;
-        let envelope = detail_child_envelope(child_slots, objects, cpus)?;
+        let envelope =
+            detail_child_envelope(child_slots, objects, cpus, self.detail_child_ring_bytes)?;
         // Retention for the bind-time re-validation: the child slot
         // keys, one retained live target per distinct child object
         // (never the whole pin store: retention stays bounded to the
@@ -7724,6 +7742,7 @@ pub(crate) mod tests {
             backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
             terminal: None,
+            detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
         };
         let targets = plan(2).slots;
         assert!(!banks.permits_link_stage(&targets));
@@ -8180,6 +8199,39 @@ pub(crate) mod tests {
         Ok(super::super::map_metadata(kind, key, value, entries, flags))
     }
 
+    /// Detail-window children keep the pre-v0.7.0 4 MiB ring unless the
+    /// session names `--ring-bytes`; the banks carry the one resolver's
+    /// value, and the loader sets it from the session's `ring_bytes`.
+    #[test]
+    fn detail_child_ring_follows_the_one_resolver() {
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        assert_eq!(
+            reader_banks(&pool).detail_child_ring_bytes(),
+            crate::run::DETAIL_CHILD_RING_BYTES
+        );
+        assert_eq!(crate::run::DETAIL_CHILD_RING_BYTES, 4 * 1024 * 1024);
+        assert_eq!(
+            reader_banks(&pool)
+                .with_detail_child_ring_bytes(None)
+                .detail_child_ring_bytes(),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            reader_banks(&pool)
+                .with_detail_child_ring_bytes(Some(1 << 26))
+                .detail_child_ring_bytes(),
+            1 << 26
+        );
+        let attach = include_str!("../attach.rs");
+        assert_eq!(
+            attach
+                .matches(concat!(".with_detail_child_", "ring_bytes(ring_bytes)"))
+                .count(),
+            1,
+            "the loader sizes detail children from the session's --ring-bytes"
+        );
+    }
+
     fn reader_banks(pool: &SemanticResourcePool) -> CounterBanks {
         CounterBanks {
             geometry: BankGeometry::legacy(),
@@ -8189,6 +8241,7 @@ pub(crate) mod tests {
             backend: super::super::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
             terminal: None,
+            detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
         }
     }
 
@@ -8316,6 +8369,7 @@ pub(crate) mod tests {
                 backend,
                 link_staging: Arc::new(AtomicU64::new(0)),
                 terminal: None,
+                detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
             },
             pool,
             digest,
@@ -9642,6 +9696,7 @@ pub(crate) mod tests {
                 geometry,
                 link_staging: Arc::new(AtomicU64::new(0)),
                 terminal: None,
+                detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
                 backend,
             };
             let foreign = if backend == AttachBackend::Singles {
@@ -11706,6 +11761,7 @@ pub(crate) mod tests {
             backend: crate::attach::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
             terminal: None,
+            detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
         };
         let mut io = GrowthIo::new(pool);
         io.target_store = Some(objects);
@@ -11768,9 +11824,15 @@ pub(crate) mod tests {
 
     #[test]
     fn detail_child_envelope_sizes_maps_fds_and_links() {
-        use p11scope_ebpf_common::{
-            CallStart, MAX_SLOTS, RING_BYTES, RV_ENTRIES, START_ENTRIES, SlotStats,
-        };
+        use p11scope_ebpf_common::{CallStart, MAX_SLOTS, RV_ENTRIES, START_ENTRIES, SlotStats};
+        // The detail child keeps the pre-v0.7.0 4 MiB ring by default.
+        const DETAIL: u32 = crate::run::DETAIL_CHILD_RING_BYTES;
+        assert_eq!(DETAIL, 4 * 1024 * 1024);
+        assert_eq!(crate::run::resolve_detail_child_ring_bytes(None), DETAIL);
+        assert_eq!(
+            crate::run::resolve_detail_child_ring_bytes(Some(1 << 26)),
+            1 << 26
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = toggle_provider(&dir, "provider.so", b"toggle child provider bytes");
         let objects = crate::discovery::identity::test_fixture::real_scan_pin(
@@ -11785,7 +11847,7 @@ pub(crate) mod tests {
             .retained_target_copy_allocation_charge(object)
             .unwrap();
         assert!(copy > 0, "a real provider copy charges nonzero bytes");
-        let envelope = super::detail_child_envelope(&slots, &objects, 2).unwrap();
+        let envelope = super::detail_child_envelope(&slots, &objects, 2, DETAIL).unwrap();
         let stats = MAX_SLOTS as usize * size_of::<SlotStats>() * 2;
         let start = START_ENTRIES as usize * (16 + size_of::<CallStart>());
         let rv = RV_ENTRIES as usize * (16 + 8 * 2);
@@ -11794,13 +11856,13 @@ pub(crate) mod tests {
         // except the copies, because the child loads the full shape.
         assert_eq!(
             envelope.bytes,
-            stats + start + rv + RING_BYTES as usize + 64 * 1024 + copy * 4
+            stats + start + rv + DETAIL as usize + 64 * 1024 + copy * 4
         );
         // Entry+return per endpoint plus map/pin/pidfd slack: the
         // worst case covers Singles exactly and Multi loosely.
         assert_eq!(envelope.file_descriptors, 2 + 64);
         let wide = toggle_object_plan(object, 512).slots;
-        let wide_envelope = super::detail_child_envelope(&wide, &objects, 2).unwrap();
+        let wide_envelope = super::detail_child_envelope(&wide, &objects, 2, DETAIL).unwrap();
         assert_eq!(
             wide_envelope.bytes - envelope.bytes,
             copy * 4 * 511,
@@ -11810,26 +11872,26 @@ pub(crate) mod tests {
         // Floors: no child without endpoints, no Detailed child past the
         // slot bound, no per-CPU sizing without CPUs, no unknown object.
         assert_eq!(
-            super::detail_child_envelope(&[], &objects, 2).unwrap_err(),
+            super::detail_child_envelope(&[], &objects, 2, DETAIL).unwrap_err(),
             super::DetailToggleRefusal::ChildShape
         );
         let over = toggle_object_plan(object, MAX_SLOTS + 1).slots;
         assert_eq!(
-            super::detail_child_envelope(&over, &objects, 2).unwrap_err(),
+            super::detail_child_envelope(&over, &objects, 2, DETAIL).unwrap_err(),
             super::DetailToggleRefusal::ChildShape
         );
         assert_eq!(
-            super::detail_child_envelope(&slots, &objects, 0).unwrap_err(),
+            super::detail_child_envelope(&slots, &objects, 0, DETAIL).unwrap_err(),
             super::DetailToggleRefusal::Budget
         );
         let mut foreign_slot = slots[0].clone();
         foreign_slot.object = PinnedObjectId(object.0 + 1000);
         assert_eq!(
-            super::detail_child_envelope(&[foreign_slot], &objects, 2).unwrap_err(),
+            super::detail_child_envelope(&[foreign_slot], &objects, 2, DETAIL).unwrap_err(),
             super::DetailToggleRefusal::Budget
         );
         assert_eq!(
-            super::detail_child_envelope(&slots, &objects, usize::MAX).unwrap_err(),
+            super::detail_child_envelope(&slots, &objects, usize::MAX, DETAIL).unwrap_err(),
             super::DetailToggleRefusal::Budget
         );
     }
@@ -11856,9 +11918,13 @@ pub(crate) mod tests {
         drop(custody);
         let generation = NonZeroU64::new(7).unwrap();
         let child_slots = history.slots[512..513].to_vec();
-        let expected =
-            super::detail_child_envelope(&child_slots, &objects, aya::util::nr_cpus().unwrap())
-                .unwrap();
+        let expected = super::detail_child_envelope(
+            &child_slots,
+            &objects,
+            aya::util::nr_cpus().unwrap(),
+            crate::run::DETAIL_CHILD_RING_BYTES,
+        )
+        .unwrap();
         // Reserve additionally retains the bind-time identity: the
         // child slot keys, one retained live target for the distinct
         // child object (never the whole pin store), and the broad
@@ -12212,7 +12278,13 @@ pub(crate) mod tests {
         // The FD headroom check behind the gate, over scripted
         // snapshots: exact headroom passes, a short soft limit names
         // file descriptors, unlimited always passes.
-        let envelope = super::detail_child_envelope(&child_slots, &objects, 2).unwrap();
+        let envelope = super::detail_child_envelope(
+            &child_slots,
+            &objects,
+            2,
+            crate::run::DETAIL_CHILD_RING_BYTES,
+        )
+        .unwrap();
         let fds = envelope.file_descriptors;
         assert!(
             super::admit_detail_child_fds(fds, || Ok(super::FdSnapshot::scripted(fds as u64, 0)))
@@ -12624,6 +12696,7 @@ pub(crate) mod tests {
             backend: crate::attach::AttachBackend::Singles,
             link_staging: Arc::new(AtomicU64::new(0)),
             terminal: None,
+            detail_child_ring_bytes: crate::run::resolve_detail_child_ring_bytes(None),
         };
         let mut history = toggle_object_plan(object, 513);
         let mut io = GrowthIo::new(&pool);

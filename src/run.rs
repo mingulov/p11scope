@@ -7198,6 +7198,22 @@ const _: () = assert!(
         && AGGREGATE_RING_BYTES <= p11scope_ebpf_common::RING_BYTES
 );
 
+/// Default EVENTS ring of a selected-detail or counter-detail window's
+/// child capture: the pre-v0.7.0 4 MiB. A window covers a selected subset
+/// for a bounded time, and every window's child is charged against the
+/// shared semantic pool, so the 32 MiB per-call default would lower how
+/// many windows fit (an effective limit). An explicit `--ring-bytes` still
+/// sizes it.
+pub(crate) const DETAIL_CHILD_RING_BYTES: u32 = 4 * 1024 * 1024;
+const _: () = assert!(DETAIL_CHILD_RING_BYTES.is_power_of_two());
+
+/// The one EVENTS ring size of a detail-window child capture: both the
+/// admission charge (`detail_child_envelope`) and the child's load must
+/// use it, so the estimate is the ring that is loaded.
+pub(crate) fn resolve_detail_child_ring_bytes(ring_bytes: Option<u32>) -> u32 {
+    ring_bytes.unwrap_or(DETAIL_CHILD_RING_BYTES)
+}
+
 /// The one EVENTS ring size a capture loads and discloses: an explicit
 /// `--ring-bytes` wins, then a journal capture takes the joint ring, then
 /// an aggregate policy takes [`AGGREGATE_RING_BYTES`], else the default.

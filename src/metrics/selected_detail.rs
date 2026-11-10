@@ -2861,6 +2861,7 @@ mod tests {
             proved.bundle.convert_subset().plan().slots.as_slice(),
             proved.bundle.convert_subset().pins(),
             aya::util::nr_cpus().unwrap(),
+            crate::run::DETAIL_CHILD_RING_BYTES,
         )
         .expect("child envelope sizes");
         assert!(

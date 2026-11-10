@@ -574,7 +574,7 @@ usage:
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
   p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
   p11scope doctor [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
-  p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
+  p11scope-discover --module <provider.so> [-o <manifest.json>] [--isolation trusted|isolated]   (offline helper; executes provider code)
 
 discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
 Live capture needs root; inspect, inventory diff, inventory cbom and inventory --capture scan do not.
@@ -645,7 +645,11 @@ const TRACE_HELP_HEAD: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
+                   [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
+                   [--unsafe-unvalidated-metadata]
+                   [--allow-uretprobe-on-confined-target]
                    [--track-short-lived]
+                   [--max-scan-pids <n>]
                    [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
@@ -688,8 +692,12 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace [--max-events <n>]] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
+                   [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
+                   [--unsafe-unvalidated-metadata]
+                   [--allow-uretprobe-on-confined-target]
+                   [--max-scan-pids <n>]
                    [--attach-backend auto|multi|singles]
                    [--track-short-lived]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
@@ -714,6 +722,7 @@ Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 CMD inherits the observer's environment unchanged, except SUDO_* and P11SCOPE_* (named on stderr under -v when withheld).
 Under sudo the child runs as the invoker with the invoker's groups and HOME/USER/LOGNAME/SHELL from the passwd entry (plus XDG_RUNTIME_DIR when /run/user/<uid> is the invoker's own); -v prints the restored identity.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
+--max-events <n> caps the streamed events with --trace (TRUNCATED names the effective cap); profile and metrics runs refuse it.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
 Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop helper support, on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
@@ -5894,11 +5903,7 @@ mod tests {
         fn edge(byte: Option<u8>, leading: bool) -> bool {
             match byte {
                 None => true,
-                Some(sep)
-                    if matches!(sep, b' ' | b'\n' | b'\t' | b'(' | b'[' | b',' | b'"' | b'/') =>
-                {
-                    true
-                }
+                Some(b' ' | b'\n' | b'\t' | b'(' | b'[' | b',' | b'"' | b'/') => true,
                 Some(sep) => {
                     !leading && matches!(sep, b')' | b']' | b'<' | b'=' | b'|' | b'.' | b':' | b';')
                 }
@@ -6097,8 +6102,12 @@ mod tests {
         // synopsis line (+11) plus the `Complete output:` route line
         // reword separating the JSON routes from the trace text stream
         // (+27); no other drift.
-        assert_eq!(USAGE.len(), 3089);
-        assert_eq!(hash, 0x3817fa600ead7f15);
+        // 3120 / 0x4fd7de9d62ec35ad (discover isolation): diff vs the
+        // 3089/0x3817fa600ead7f15 pin is exactly
+        // ` [--isolation trusted|isolated]` on the discover line (+31);
+        // no other drift.
+        assert_eq!(USAGE.len(), 3120);
+        assert_eq!(hash, 0x4fd7de9d62ec35ad);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

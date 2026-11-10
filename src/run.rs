@@ -8408,11 +8408,12 @@ fn startup_hook_recount_line(elapsed_ms: Option<u64>) -> String {
 /// Gate the loader-hook recount (startup T2): the recount closure runs
 /// only when diagnostics are on, so the off path provably never touches
 /// the engine.
-fn loader_readiness_hooks(
-    _diagnostics_on: bool,
-    _recount: impl FnOnce() -> usize,
-) -> Option<usize> {
-    None
+fn loader_readiness_hooks(diagnostics_on: bool, recount: impl FnOnce() -> usize) -> Option<usize> {
+    if diagnostics_on {
+        Some(recount())
+    } else {
+        None
+    }
 }
 
 /// Inserts a report line before the trailing `-v` hint of a concise
@@ -9122,22 +9123,12 @@ fn capture_profile(
         crate::first_use_probe::DiscoveryStage::BeforeLoop,
         session,
     );
-    let hook_recount_start = crate::attach::monotonic_ns();
-    let active_loader_hooks = engine.active_loader_hook_count(session);
-    let hook_recount_ms = match (hook_recount_start, crate::attach::monotonic_ns()) {
-        (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
-        _ => None,
-    };
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
-    }
-    if capture_diagnostics_on() {
-        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-        emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
     }
     // The pid-scope target, resolved once probes are attached (usually
     // alive; an exit between attach and the read is named via the exit
@@ -9167,6 +9158,26 @@ fn capture_profile(
         session.attached_probes(),
         owned.is_some(),
     ));
+    // The loader-hook recount is gated on diagnostics and deferred past
+    // the ready line (startup T2): the off path never touches the engine.
+    {
+        let diagnostics_on = capture_diagnostics_on();
+        let recount_start = if diagnostics_on {
+            crate::attach::monotonic_ns()
+        } else {
+            None
+        };
+        if let Some(active_loader_hooks) =
+            loader_readiness_hooks(diagnostics_on, || engine.active_loader_hook_count(session))
+        {
+            let hook_recount_ms = match (recount_start, crate::attach::monotonic_ns()) {
+                (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+                _ => None,
+            };
+            emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+            emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
+        }
+    }
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -10644,22 +10655,12 @@ fn capture_trace(
         ));
     }
     let clock = Instant::now();
-    let hook_recount_start = crate::attach::monotonic_ns();
-    let active_loader_hooks = engine.active_loader_hook_count(session);
-    let hook_recount_ms = match (hook_recount_start, crate::attach::monotonic_ns()) {
-        (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
-        _ => None,
-    };
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
-    }
-    if capture_diagnostics_on() {
-        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-        emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
     }
     // The pid-scope target, resolved once probes are attached (usually
     // alive; an exit between attach and the read is named via the exit
@@ -10687,6 +10688,26 @@ fn capture_trace(
         session.attached_probes(),
         owned.is_some(),
     ));
+    // The loader-hook recount is gated on diagnostics and deferred past
+    // the ready line (startup T2): the off path never touches the engine.
+    {
+        let diagnostics_on = capture_diagnostics_on();
+        let recount_start = if diagnostics_on {
+            crate::attach::monotonic_ns()
+        } else {
+            None
+        };
+        if let Some(active_loader_hooks) =
+            loader_readiness_hooks(diagnostics_on, || engine.active_loader_hook_count(session))
+        {
+            let hook_recount_ms = match (recount_start, crate::attach::monotonic_ns()) {
+                (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+                _ => None,
+            };
+            emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+            emit_capture_diagnostic(&startup_hook_recount_line(hook_recount_ms));
+        }
+    }
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {

@@ -2120,6 +2120,111 @@ fn empty_churn_reuses_the_committed_candidate() {
     }
 }
 
+/// Rejection side of the empty-churn fast path: churn that carries modules —
+/// incoming on a refreshed or admitted view, or committed on a removed view —
+/// must still run the full O(retained) rebuild. With the full rebuild forced
+/// to fail, every arm returns the forced-failure error; a weakened condition
+/// that accepts module churn takes the fast path instead and returns Ok.
+#[test]
+fn module_churn_still_rebuilds() {
+    let retained_views = || {
+        (0..10)
+            .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let admitted_views = || {
+        (10..15)
+            .map(|id| {
+                (
+                    ProcessView::open(ProcessViewId(id), std::process::id()).unwrap(),
+                    Vec::new(),
+                    PinnedObjects::empty(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Refreshed-with-modules arm: one incoming module on a refreshed view.
+    {
+        let mut engine = lifecycle_discovered(retained_views());
+        engine.plan_rebuild_stable = true;
+        engine.fail_full_candidate_rebuild_for_test = true;
+        let removed: BTreeSet<ProcessViewId> =
+            [ProcessViewId(0), ProcessViewId(1)].into_iter().collect();
+        let mut module = overlay_module(overlay_key(90));
+        module.view = ProcessViewId(2);
+        let refreshed: Vec<(ProcessViewId, Vec<ScannedModule>, PinnedObjects)> = vec![
+            (ProcessViewId(2), vec![module], PinnedObjects::empty()),
+            (ProcessViewId(3), Vec::new(), PinnedObjects::empty()),
+        ];
+        let err = match engine.inventory_candidate(
+            &removed,
+            &refreshed,
+            &admitted_views(),
+            Vec::new(),
+            &BTreeSet::new(),
+        ) {
+            Ok(_) => panic!("a module-carrying refresh must reach the full rebuild"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("test-forced full rebuild failure"),
+            "refreshed-with-modules arm takes the full path: {err:?}"
+        );
+    }
+    // New-view-with-modules arm: one incoming module on an admitted view.
+    {
+        let mut engine = lifecycle_discovered(retained_views());
+        engine.plan_rebuild_stable = true;
+        engine.fail_full_candidate_rebuild_for_test = true;
+        let removed: BTreeSet<ProcessViewId> =
+            [ProcessViewId(0), ProcessViewId(1)].into_iter().collect();
+        let refreshed: Vec<(ProcessViewId, Vec<ScannedModule>, PinnedObjects)> = [2, 3]
+            .into_iter()
+            .map(|id| (ProcessViewId(id), Vec::new(), PinnedObjects::empty()))
+            .collect();
+        let mut new_views = admitted_views();
+        let mut module = overlay_module(overlay_key(91));
+        module.view = ProcessViewId(10);
+        new_views[0].1.push(module);
+        let err = match engine.inventory_candidate(
+            &removed,
+            &refreshed,
+            &new_views,
+            Vec::new(),
+            &BTreeSet::new(),
+        ) {
+            Ok(_) => panic!("a module-carrying admission must reach the full rebuild"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("test-forced full rebuild failure"),
+            "new-view-with-modules arm takes the full path: {err:?}"
+        );
+    }
+    // Removed-with-committed-modules arm: the removed view has a committed
+    // module, so the old-module scan rejects the fast path.
+    {
+        let (mut engine, module, _, _) = engine_with_overlay(42);
+        engine.plan_rebuild_stable = true;
+        engine.fail_full_candidate_rebuild_for_test = true;
+        let removed: BTreeSet<ProcessViewId> = [module.view].into_iter().collect();
+        let err = match engine.inventory_candidate(
+            &removed,
+            &[],
+            &[],
+            Vec::new(),
+            &BTreeSet::new(),
+        ) {
+            Ok(_) => panic!("removing a view with committed modules must rebuild"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("test-forced full rebuild failure"),
+            "removed-with-committed-modules arm takes the full path: {err:?}"
+        );
+    }
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

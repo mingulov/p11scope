@@ -3010,7 +3010,17 @@ fn gap_plain_subject(subject: &str) -> &str {
 /// always surfaces. The subject disambiguates causes a bare reason
 /// cannot name (a replaced file's unlinked path is never an exit).
 fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
-    let _ = subject;
+    // A replaced file's open failure names its unlinked path: the file
+    // is gone because it was replaced on disk, never an exit race and
+    // never a foreign root, whatever the open half reads. Name the
+    // replaced cause with the uncounted consequence; verbose keeps the
+    // machine error beside the plain words, JSON verbatim. Only a full
+    // ` (deleted)` subject with the retained-root prefix matches.
+    if subject.ends_with(" (deleted)")
+        && reason.starts_with("opening object within retained target root:")
+    {
+        return "replaced file unavailable for pinning; calls not counted";
+    }
     if let Some(_suffix) = reason.strip_prefix("joint_seal_") {
         return "per-key tracking ended early";
     }

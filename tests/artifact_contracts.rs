@@ -12308,7 +12308,7 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
         .1;
     require_contract_marker(
         terminal,
-        "context\n                .6\n                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
+        "context\n            .6\n            .terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
         "profile terminal collection owner",
     )?;
 
@@ -13086,8 +13086,14 @@ fn the_capture_loop_consumer_map_is_frozen() {
                 args.contains("owned.coordinator.engine_incomplete_retirements()"),
                 "{mode} coordinator retirement source"
             );
+            // Live frames read the owned disposition directly; the sealed
+            // terminal evidence withholds it while settlement is unknown.
+            let compact: String = args.split_whitespace().collect();
             assert!(
-                args.contains(".as_deref().map(|owned| owned.still_running)"),
+                compact.contains(".as_deref().map(|owned|owned.still_running)")
+                    || compact.contains(
+                        ".as_deref().and_then(|owned|{ifowned.settlement_unknown{None}else{Some(owned.still_running)}})"
+                    ),
                 "{mode} owned disposition source"
             );
         }

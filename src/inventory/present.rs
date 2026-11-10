@@ -2411,6 +2411,10 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
     }
 }
 
+/// Scope key for the deferred-attach render fold: the (caller,
+/// module, pid) a per-receipt row shares with its summary.
+type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
 /// line per plain subject/reason group, up to [`GAP_GROUPS_SHOWN`]
 /// groups; beyond that one fold line names the remainder. Plain words
@@ -2423,9 +2427,32 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 /// groups (no caller, module or pid) read before per-object groups,
 /// so a single scope row is never buried under frequent object rows;
 /// within each tier the most frequent group still reads first.
+/// Deferred-attach per-receipt rows covered by a stop-time summary
+/// group under it, so concise shows one line per module while JSON
+/// keeps every row.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
+    // Deferred-attach fold: the stop-time summaries append while the
+    // per-receipt rows stay, so concise groups each covered
+    // per-receipt row under its scope's summary reason — one line per
+    // module. A per-receipt row with no covering summary (mid-run, or
+    // the summary suppressed) still reads on its own, never hidden.
+    let folded_by_scope: std::collections::BTreeMap<DeferralFoldScope, &str> = {
+        let mut map = std::collections::BTreeMap::new();
+        for gap in gaps.iter() {
+            if gap.subject
+                == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+                && crate::discovery::engine::inventory_coordinator::is_deferral_folded_reason(
+                    &gap.reason,
+                )
+            {
+                map.entry((gap.caller, gap.module, gap.pid))
+                    .or_insert(gap.reason.as_str());
+            }
+        }
+        map
+    };
     // Foreign-root open failures (retained-root prefix plus the
     // target-root suffix) fold by stored reason — one counted line per
     // distinct reason naming its root — while size-cap and precondition
@@ -2441,8 +2468,17 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         }
     }
     for gap in rest {
+        let mut reason_text = gap.reason.as_str();
+        if gap.subject == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+            && crate::discovery::engine::inventory_coordinator::is_deferral_receipt_reason(
+                &gap.reason,
+            )
+            && let Some(folded) = folded_by_scope.get(&(gap.caller, gap.module, gap.pid))
+        {
+            reason_text = folded;
+        }
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
-        let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
+        let reason = escape_controls(gap_plain_reason(reason_text)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += 1;

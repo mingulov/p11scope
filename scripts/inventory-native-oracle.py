@@ -7045,14 +7045,16 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
 
 # The attach receipt's backlog marker (DEFERRED_ATTACH_SUBJECT in
 # src/discovery/inventory_coordinator.rs): a pass that records or repeats no
-# gap with this subject and a "still deferred" reason drained its kernel
-# attach backlog. Sticky "failed to attach" gaps never drain; they are
-# terminal and must not block the gate (the COUNT judgment prices them).
-# The old failure subject stays matched for recorded streams that
-# predate the fold.
+# gap with this subject and a per-receipt "still deferred" reason drained
+# its kernel attach backlog. Sticky "failed to attach" gaps never drain;
+# they are terminal and must not block the gate (the COUNT judgment
+# prices them), and neither do the stop-time folded summaries ("still
+# deferred at stop"): terminal accounting appended after the last pass,
+# not live backlog. The old failure subject stays matched for recorded
+# streams that predate the fold.
 ATTACH_DEFERRED_SUBJECTS = ("native endpoint attach failed",
                             "native endpoint attach deferred")
-ATTACH_DEFERRED_MARKER = "still deferred"
+ATTACH_DEFERRED_MARKER = "still deferred when the receipt closed"
 
 
 def capacity_attach_drained(rows):

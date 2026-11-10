@@ -1783,8 +1783,10 @@ Limits that matter in pods:
   may still be deferred when a pass's receipt closes: calls through
   them in that window are never counted, and the report stays
   `PARTIAL` with the cause `native endpoint attach deferred` — one
-  gap per module naming the peak deferral, the pass count and whether
-  every endpoint had attached by stop. Endpoints that failed to attach
+  concise line per module naming the distinct deferred total, the pass
+  count (and the per-pass peak when it differs) and whether every
+  endpoint had attached by stop, while `--json` keeps every per-pass
+  row plus the appended summary. Endpoints that failed to attach
   keep their own `native endpoint attach failed` gap. `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can

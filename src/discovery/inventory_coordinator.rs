@@ -180,15 +180,31 @@ const PARTIAL_ATTACH_SUBJECT: &str = "native endpoint attach failed";
 /// exactly like failed ones, but a deferral is not a failure — the
 /// endpoint attaches on a later pass — so deferrals stage under their
 /// own subject, never the failure one. Pinned verbatim: the oracle
-/// matches this subject for the attach drain and COUNT-EXACT.
-const DEFERRED_ATTACH_SUBJECT: &str = "native endpoint attach deferred";
+/// matches this subject for the attach drain and COUNT-EXACT, and
+/// concise folds this subject's rows under the stop-time summaries.
+pub(crate) const DEFERRED_ATTACH_SUBJECT: &str = "native endpoint attach deferred";
 
-/// One stop-time deferral fold input: how many receipts deferred for the
-/// key, the peak per-receipt deferral, and every endpoint id ever
-/// deferred for it. The fold subtracts attached and failed ids and
-/// reattributes the remainder by fold-time membership, so an endpoint
-/// evicted after its deferral surfaces under "no recorded module"
-/// instead of vanishing.
+/// True for a per-receipt deferral gap reason: the live backlog rows
+/// the drain gate reads and concise folds under the stop-time
+/// summary. Pinned verbatim by the fold tests; keep in step with the
+/// per-receipt template in `note_partial_attach`.
+pub(crate) fn is_deferral_receipt_reason(reason: &str) -> bool {
+    reason.contains("still deferred when the receipt closed")
+}
+
+/// True for a stop-time folded deferral summary reason: concise
+/// groups the module's per-receipt rows under it. Pinned verbatim by
+/// the fold tests; keep in step with the summary templates in
+/// `fold_deferred_attach_gaps`.
+pub(crate) fn is_deferral_folded_reason(reason: &str) -> bool {
+    reason.starts_with("attach finished late:") || reason.starts_with("attach unfinished at stop:")
+}
+
+/// One stop-time deferral summary input: how many receipts deferred
+/// for the key, the peak per-receipt deferral, and every endpoint id
+/// ever deferred for it. The summary counts the key's own ids minus
+/// attached and failed, so each deferred endpoint counts exactly
+/// once under the module it deferred for.
 #[derive(Debug, Default)]
 struct DeferralFold {
     passes: u32,
@@ -3429,8 +3445,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// withholds COUNT-EXACT over it (explicitly nonqualifying).
     /// Endpoints no module claims (evicted before the receipt) report
     /// run-wide. The subject and reason shapes are pinned verbatim:
-    /// the oracle matches them. The stop-time fold collapses each
-    /// module's per-receipt deferral gaps to one.
+    /// the oracle matches them. At stop each module's per-receipt
+    /// deferral gaps gain one appended summary; concise folds the
+    /// rows under it at render time.
     fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
         // Deferred endpoints dedupe: a receipt may carry the same
         // endpoint twice across its defer calls.
@@ -3566,13 +3583,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Stop-time deferral fold: the per-receipt deferral gaps collapse to
-    /// one gap per module (plus one run-wide gap for endpoints no module
-    /// claims), carrying the peak deferral, the pass count and the stop
-    /// outcome. Outstanding ids reattribute by fold-time membership, so
-    /// an endpoint evicted after its deferral counts under "no recorded
-    /// module". Silent when no receipt ever deferred. True when anything
-    /// staged, so the tail can publish it. Runs once, from
+    /// Stop-time deferral summaries: one appended gap per key with
+    /// deferrals (one per module, plus one run-wide gap for endpoints
+    /// no module claims), carrying the distinct deferred total, the
+    /// pass count and the stop outcome. Each summary attributes where
+    /// its receipts did: `still` is the fold's own deferred ids minus
+    /// attached and failed, never reattributed by fold-time
+    /// membership, so every deferred endpoint counts exactly once
+    /// under the module it deferred for. The per-receipt rows stay:
+    /// gaps and the event stream stay append-only, and concise folds
+    /// each module's rows under its summary at render time. Silent
+    /// when no receipt ever deferred. True when anything staged, so
+    /// the tail can publish it. Runs once, from
     /// [`Self::end_capture_coverage`].
     fn fold_deferred_attach_gaps(&mut self) -> bool {
         if self.deferral_folds.is_empty() {
@@ -3582,26 +3604,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_ref() else {
             return false;
         };
-        let mut outstanding: BTreeMap<Option<AttachModuleKey>, usize> = BTreeMap::new();
-        for fold in folds.values() {
-            for id in &fold.deferred_ids {
-                if capture.attached_at.contains_key(id) || capture.failed.contains(id) {
-                    continue;
-                }
-                let owners: Vec<AttachModuleKey> =
-                    self.attach_set.modules_with_member(*id).cloned().collect();
-                if owners.is_empty() {
-                    *outstanding.entry(None).or_default() += 1;
-                } else {
-                    for key in owners {
-                        *outstanding.entry(Some(key)).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let mut folded = Vec::with_capacity(folds.len());
+        let mut staged = false;
         for (key, fold) in &folds {
-            let still = outstanding.get(key).copied().unwrap_or(0);
+            let still = fold
+                .deferred_ids
+                .iter()
+                .filter(|id| !capture.attached_at.contains_key(id) && !capture.failed.contains(id))
+                .count();
+            let total = fold.deferred_ids.len();
             let scope = if key.is_some() {
                 String::new()
             } else {
@@ -3612,23 +3622,56 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             } else {
                 format!("{} passes", fold.passes)
             };
+            // The distinct total is exact; the per-pass peak rides
+            // beside it only when it differs (non-nested patterns),
+            // so the line stays truthful either way.
+            let peak = fold.max_deferred != total;
             let reason = if still == 0 {
+                if peak {
+                    format!(
+                        "attach finished late: {total} endpoint(s){scope} deferred over {passes} \
+                         (peak {} in one pass; all attached by stop); counted uses are lower bounds",
+                        fold.max_deferred,
+                    )
+                } else {
+                    format!(
+                        "attach finished late: {total} endpoint(s){scope} deferred over {passes} \
+                         (all attached by stop); counted uses are lower bounds"
+                    )
+                }
+            } else if peak {
                 format!(
-                    "attach finished late: up to {} endpoint(s){scope} deferred over {passes} \
-                     (all attached by stop); counted uses are lower bounds",
+                    "attach unfinished at stop: {total} endpoint(s){scope} deferred over {passes} \
+                     (peak {} in one pass; {still} still deferred at stop); counted uses are lower bounds",
                     fold.max_deferred,
                 )
             } else {
                 format!(
-                    "attach unfinished at stop: up to {} endpoint(s){scope} deferred over {passes} \
-                     ({still} still deferred at stop); counted uses are lower bounds",
-                    fold.max_deferred,
+                    "attach unfinished at stop: {total} endpoint(s){scope} deferred over {passes} \
+                     ({still} still deferred at stop); counted uses are lower bounds"
                 )
             };
-            folded.push((key.as_ref().map(attach_module_registry_key), reason));
+            match key.as_ref().map(attach_module_registry_key) {
+                Some(registry_key) => self.registry.record_gap_for_key(
+                    None,
+                    registry_key,
+                    None,
+                    DEFERRED_ATTACH_SUBJECT.into(),
+                    reason,
+                    None,
+                ),
+                None => self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: DEFERRED_ATTACH_SUBJECT.into(),
+                    reason,
+                    budget: None,
+                }),
+            }
+            staged = true;
         }
-        self.registry
-            .fold_deferral_gaps(DEFERRED_ATTACH_SUBJECT, folded)
+        staged
     }
 
     /// Absorbs the capture's scope custody (`InventoryCapture::custody`,
@@ -4006,10 +4049,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             "native capture stopped before a clean health read proved the watch",
             until,
         );
-        // The per-receipt deferral gaps collapse now that no receipt can
-        // stage another: one gap per module with the peak, the pass
-        // count and the stop outcome. Runs once: a second call returns
-        // at the stopped check above.
+        // The deferral summaries append now that no receipt can stage
+        // another: one gap per module with the distinct total, the
+        // pass count and the stop outcome. Runs once: a second call
+        // returns at the stopped check above.
         self.fold_deferred_attach_gaps();
     }
 
@@ -15486,15 +15529,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn deferred_receipts_fold_to_one_gap_per_module_at_stop() {
+    fn deferred_receipts_gain_one_summary_per_module_at_stop() {
         // Deferred-gap fold: one module's endpoints attach in batches
         // across passes, and every pass's receipt defers the rest.
         // Mid-run each receipt stages its own deferral gap (the
-        // capacity drain gate reads that per-pass activity), but the
-        // stop-time fold leaves exactly one gap for the module, with
-        // the peak deferral, the pass count and the stop outcome. The
-        // rc-8 shape was 13 gaps for one module; the report keeps the
-        // honest lower-bounds cause exactly once, never under a
+        // capacity drain gate reads that per-pass activity); at stop
+        // one summary appends for the module, with the distinct
+        // total, the pass count and the stop outcome, while every
+        // per-receipt row stays. The rc-8 shape was 13 rows for one
+        // module; concise folds them under the summary, never under a
         // subject that says "failed".
         use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
         use crate::discovery::inventory_attach_set::tests as fx;
@@ -15553,7 +15596,7 @@ pub(crate) mod tests {
             });
             if pass == 4 {
                 // Apply the first five per-receipt gaps mid-run: the
-                // fold must remove applied rows as well as staged ones.
+                // summary appends after applied and staged rows alike.
                 coordinator.commit_batch(false).unwrap();
             }
         }
@@ -15595,19 +15638,42 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             gaps.len(),
+            14,
+            "thirteen per-receipt rows stay, one summary appends: {:?}",
+            coordinator.registry.gaps()
+        );
+        let receipts = gaps
+            .iter()
+            .filter(|gap| {
+                gap.reason
+                    .contains("still deferred when the receipt closed")
+            })
+            .count();
+        assert_eq!(
+            receipts,
+            13,
+            "every per-receipt row stays in gaps[]: {:?}",
+            coordinator.registry.gaps()
+        );
+        let folded: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.reason.starts_with("attach finished late:"))
+            .collect();
+        assert_eq!(
+            folded.len(),
             1,
-            "thirteen deferred receipts fold to one gap: {:?}",
+            "thirteen deferred receipts gain one summary: {:?}",
             coordinator.registry.gaps()
         );
         assert_eq!(
-            gaps[0].reason,
-            "attach finished late: up to 26 endpoint(s) deferred over 13 passes \
+            folded[0].reason,
+            "attach finished late: 26 endpoint(s) deferred over 13 passes \
              (all attached by stop); counted uses are lower bounds"
         );
         assert!(
-            gaps[0].module.is_some(),
+            folded[0].module.is_some(),
             "the folded gap attributes to the deferred module: {:?}",
-            gaps[0]
+            folded[0]
         );
         assert!(
             coordinator.registry.gaps().iter().all(|gap| {
@@ -15717,21 +15783,31 @@ pub(crate) mod tests {
             failures[0].reason,
             "1 of 4 endpoints failed to attach (sticky, never retried); counted uses are lower bounds"
         );
-        let folded: Vec<_> = coordinator
+        let deferred: Vec<_> = coordinator
             .registry
             .gaps()
             .iter()
             .filter(|gap| gap.subject == "native endpoint attach deferred")
             .collect();
         assert_eq!(
+            deferred.len(),
+            2,
+            "the per-receipt row stays, one summary appends: {:?}",
+            coordinator.registry.gaps()
+        );
+        let folded: Vec<_> = deferred
+            .iter()
+            .filter(|gap| gap.reason.starts_with("attach finished late:"))
+            .collect();
+        assert_eq!(
             folded.len(),
             1,
-            "the deferral side folds to one gap: {:?}",
+            "the deferral side gains one summary: {:?}",
             coordinator.registry.gaps()
         );
         assert_eq!(
             folded[0].reason,
-            "attach finished late: up to 2 endpoint(s) deferred over 1 pass \
+            "attach finished late: 2 endpoint(s) deferred over 1 pass \
              (all attached by stop); counted uses are lower bounds"
         );
     }
@@ -15740,8 +15816,8 @@ pub(crate) mod tests {
     fn deferrals_outstanding_at_stop_fold_with_the_remainder_named() {
         // Deferred-gap fold, still-deferred twin: endpoints that never
         // attached stay named in the folded gap — "still deferred at
-        // stop" with the outstanding count — beside the peak and the
-        // pass count. Counted uses stay lower bounds.
+        // stop" with the outstanding count — beside the distinct total
+        // and the pass count. Counted uses stay lower bounds.
         use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
         use crate::discovery::inventory_attach_set::tests as fx;
         let dir = tempfile::tempdir().unwrap();
@@ -15801,29 +15877,39 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             gaps.len(),
+            2,
+            "the per-receipt row stays, one summary appends: {:?}",
+            coordinator.registry.gaps()
+        );
+        let folded: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.reason.starts_with("attach unfinished at stop:"))
+            .collect();
+        assert_eq!(
+            folded.len(),
             1,
-            "the deferral folds to one gap: {:?}",
+            "the deferral gains one summary: {:?}",
             coordinator.registry.gaps()
         );
         assert_eq!(
-            gaps[0].reason,
-            "attach unfinished at stop: up to 4 endpoint(s) deferred over 1 pass \
+            folded[0].reason,
+            "attach unfinished at stop: 4 endpoint(s) deferred over 1 pass \
              (3 still deferred at stop); counted uses are lower bounds"
         );
         assert!(
-            gaps[0].module.is_some(),
+            folded[0].module.is_some(),
             "the folded gap attributes to the deferred module: {:?}",
-            gaps[0]
+            folded[0]
         );
     }
 
     #[test]
-    fn unclaimed_deferrals_fold_to_one_run_wide_gap() {
+    fn unclaimed_deferrals_gain_one_run_wide_summary() {
         // Deferred-gap fold, no-recorded-module twin: deferred
         // endpoints no module claims (evicted before the receipt)
-        // report run-wide, and the stop-time fold leaves exactly one
-        // run-wide gap with the peak, the pass count and the stop
-        // outcome.
+        // report run-wide, and at stop one run-wide summary appends
+        // with the distinct total, the pass count and the stop
+        // outcome, while the per-receipt row stays.
         use crate::attach::capture::ExtendReceipt;
         use crate::discovery::inventory_attach_set::tests as fx;
         let dir = tempfile::tempdir().unwrap();
@@ -15880,27 +15966,38 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             gaps.len(),
+            2,
+            "the deduped per-receipt row stays, one summary appends: {:?}",
+            coordinator.registry.gaps()
+        );
+        let folded: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.reason.starts_with("attach unfinished at stop:"))
+            .collect();
+        assert_eq!(
+            folded.len(),
             1,
-            "three unclaimed deferral receipts fold to one gap: {:?}",
+            "three unclaimed deferral receipts gain one summary: {:?}",
             coordinator.registry.gaps()
         );
         assert_eq!(
-            gaps[0].reason,
-            "attach unfinished at stop: up to 2 endpoint(s) with no recorded module deferred \
+            folded[0].reason,
+            "attach unfinished at stop: 2 endpoint(s) with no recorded module deferred \
              over 3 passes (2 still deferred at stop); counted uses are lower bounds"
         );
         assert_eq!(
-            gaps[0].module, None,
+            folded[0].module, None,
             "the unclaimed fold reports run-wide: {:?}",
-            gaps[0]
+            folded[0]
         );
     }
 
     #[test]
     fn folded_deferral_gap_renders_a_single_concise_line() {
-        // Deferred-gap fold, render twin: the folded gap renders as one
-        // concise line carrying the counts, the report stays PARTIAL,
-        // and no "failed" line names a deferral.
+        // Deferred-gap fold, render twin: the per-receipt rows stay in
+        // gaps[] but render as one concise line under the summary,
+        // carrying the counts; the report stays PARTIAL, and no
+        // "failed" line names a deferral.
         use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
         use crate::discovery::inventory_attach_set::tests as fx;
         use crate::inventory_present::{Presentation, render_snapshot_with_verbosity};
@@ -15978,8 +16075,8 @@ pub(crate) mod tests {
             "one concise line for the folded deferral: {out}"
         );
         assert!(
-            deferred_lines[0].contains("up to 4"),
-            "the line carries the folded peak (the tail truncates by design): {out}"
+            deferred_lines[0].contains("4 endpoint(s)"),
+            "the line carries the folded total (the tail truncates by design): {out}"
         );
         assert!(
             !out.contains("native endpoint attach failed"),
@@ -15989,10 +16086,14 @@ pub(crate) mod tests {
             render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
         assert!(
             verbose.contains(
-                "attach finished late: up to 4 endpoint(s) deferred over 2 passes \
+                "attach finished late: 4 endpoint(s) deferred over 2 passes \
                  (all attached by stop); counted uses are lower bounds"
             ),
             "verbose carries the full folded reason: {verbose}"
+        );
+        assert!(
+            verbose.contains("still deferred when the receipt closed"),
+            "verbose keeps the per-receipt rows: {verbose}"
         );
     }
 

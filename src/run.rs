@@ -3606,11 +3606,14 @@ fn capture_with_host(
         matches!(&a.scope, ScopeArg::Pid(pid) if crate::process::generation_gone(*pid));
     if engine.plan().modules.is_empty() && !named_pid_gone {
         // DR-K8S-5: a nested observer that found nothing cannot tell "no
-        // providers" from "providers only on the invisible host": refuse
-        // by name (nonzero, no report) instead of an empty view — unless
-        // this is a --cgroup capture whose every member was proven
-        // visible and readable, which ends as an ordinary empty capture
-        // naming its proof.
+        // providers" from "providers only on the invisible host" — but
+        // an idle node at start is normal (pods arrive later), so a
+        // --system capture still proceeds as an ordinary empty capture
+        // (PARTIAL with the pid_namespace cause) and watches for
+        // late providers. Only --pid (which can never match) and a
+        // --cgroup capture with an unproven member refuse by name
+        // (nonzero, no report); a proven --cgroup emptiness ends as an
+        // ordinary empty capture naming its proof.
         let what = match &a.scope {
             ScopeArg::Pid(pid) => format!("--pid {pid}"),
             ScopeArg::Cgroup(_) => "a --cgroup capture".to_string(),
@@ -7050,16 +7053,25 @@ fn cgroup_empty_proof(scope: &ScopeArg, engine: &Engine) -> bool {
     empty_plan_is_clean(engine.plan())
 }
 
-/// DR-K8S-5 refusal with the `--cgroup` carve-out: a nested observer
-/// whose `--cgroup` capture proved every member visible and readable
-/// ends as an ordinary empty capture; every other empty nested
-/// capture refuses by name exactly as before.
+/// DR-K8S-5 refusal with the `--system` and `--cgroup` carve-outs:
+/// an idle node at capture start is normal (pods arrive later), so a
+/// nested observer's `--system` capture always proceeds as an
+/// ordinary empty capture — PARTIAL with the `pid_namespace`
+/// observation cause — and the forced sweeps attach providers that
+/// appear mid-run. A `--cgroup` capture that proved every member
+/// visible and readable proceeds the same way. What still refuses is
+/// emptiness that cannot be told apart from invisibility: a `--pid`
+/// capture (already refused at preflight; kept here as defense in
+/// depth) and a `--cgroup` capture with an unproven member.
 fn refuse_nested_empty_capture_for_scope(
     numbering: &crate::pidns::PidNumbering,
     scope: &ScopeArg,
     what: &str,
     engine: &Engine,
 ) -> Result<()> {
+    if matches!(scope, ScopeArg::System) {
+        return Ok(());
+    }
     if cgroup_empty_proof(scope, engine) {
         return Ok(());
     }
@@ -23479,10 +23491,12 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// The carve-out is `--cgroup`-only: pid and system scopes keep
-    /// the refusal even over a proven-clean engine.
+    /// A `--pid` scope keeps the refusal even over a proven-clean
+    /// engine: its kernel filter can never match outside the initial
+    /// namespace. (`--system` proceeds instead; see
+    /// `nested_system_capture_with_zero_modules_proceeds_empty`.)
     #[test]
-    fn nested_pid_and_system_captures_keep_the_refusal() {
+    fn nested_pid_capture_keeps_the_refusal() {
         let dir = tempfile::tempdir().expect("a scope directory");
         std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
         let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
@@ -23494,23 +23508,18 @@ int main(int argc, char **argv) {
         .expect("discovery over an empty cgroup captures");
         assert!(engine.plan().modules.is_empty());
         assert!(empty_plan_is_clean(engine.plan()));
-        for (scope_arg, what) in [
-            (ScopeArg::System, "a --system capture"),
-            (ScopeArg::Pid(42), "--pid 42"),
-        ] {
-            let error = refuse_nested_empty_capture_for_scope(
-                &nested_own_numbering_for_test(),
-                &scope_arg,
-                what,
-                &engine,
-            )
-            .expect_err("pid/system scopes keep the refusal");
-            let text = format!("{error:#}");
-            assert!(
-                text.starts_with(&format!("pid-namespace-mismatch: refusing {what}:")),
-                "{text}"
-            );
-        }
+        let error = refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Pid(42),
+            "--pid 42",
+            &engine,
+        )
+        .expect_err("a pid scope keeps the refusal");
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("pid-namespace-mismatch: refusing --pid 42:"),
+            "{text}"
+        );
     }
 
     /// An idle node at capture start is normal (pods arrive later):

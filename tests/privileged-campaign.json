@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 229,
+  "default_floor": 231,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -230,6 +230,8 @@
     "run::tests::privileged_spawned_child_home_matches_the_target_passwd_row",
     "scope::tests::privileged_run_cgroup_place_moves_a_real_child",
     "scope::tests::privileged_run_cgroup_create_under_observer_stays_nested",
+    "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings",
+    "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
     "attach::tests::full_root_load_refusal_is_classified"
   ],
   "alternative_cells": [

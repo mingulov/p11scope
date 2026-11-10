@@ -1029,6 +1029,18 @@
     },
     {
       "file": "src/discovery/scan.rs",
+      "path": "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings",
+      "reason": "root: self-chrooting scan child (chroot, process scan)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/scan.rs",
+      "path": "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
+      "reason": "root: self-chrooting scan child in a fresh mount namespace",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/scan.rs",
       "path": "discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path",
       "reason": "requires a root-owned target with two private cross-device mounts",
       "cell": "privileged",

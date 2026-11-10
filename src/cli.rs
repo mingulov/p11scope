@@ -5716,6 +5716,354 @@ mod tests {
         }
     }
 
+    /// What the help-completeness probe asks the real parser per flag:
+    /// `parse` success (the flag parses past CLI into runtime checks),
+    /// help routing (exit 0), or a usage refusal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HelpProbe {
+        Accepted,
+        Help,
+        Refused,
+    }
+
+    /// Every flag the observer parser knows, with a sample value for
+    /// value-taking flags (`None` for bare switches). This extends the
+    /// `every_flag_is_documented_in_some_help` list with `--user`,
+    /// `--forwarding-module` and `--event-interval`, which that older
+    /// list predates.
+    const HELP_PROBE_FLAGS: [(&str, Option<&str>); 48] = [
+        ("--help", None),
+        ("-h", None),
+        ("--version", None),
+        ("-V", None),
+        ("--pid", Some("4242")),
+        ("--cgroup", Some("/sys/fs/cgroup/test.scope")),
+        ("--system", None),
+        ("--module", Some("provider.so")),
+        ("--exclude-module", Some("provider.so")),
+        ("--manifest", Some("provider.so")),
+        ("--prearm-module", Some("provider.so")),
+        ("--forwarding-module", Some("provider.so")),
+        ("--hook-symbol", Some("C_GetFunctionList")),
+        ("--mode", Some("profile")),
+        ("--counter-mode", Some("counts")),
+        ("--select-endpoint", Some("C_Initialize")),
+        ("--duration", Some("30s")),
+        ("--max-events", Some("100")),
+        ("--max-scan-pids", Some("8")),
+        ("--max-gaps", Some("16")),
+        ("--max-endpoints", Some("100")),
+        ("--ring-bytes", Some("1M")),
+        ("--drain-interval-ms", Some("500")),
+        ("--attach-backend", Some("auto")),
+        ("--identity-backend", Some("auto")),
+        ("--capture", Some("scan")),
+        ("--caller-metadata", Some("none")),
+        ("--key-operations", None),
+        ("--dashboard", None),
+        ("--event-log", Some("events.jsonl")),
+        ("--event-rotate-bytes", Some("1M")),
+        ("--event-max-files", Some("3")),
+        ("--event-interval", Some("5s")),
+        ("--diagnostics", Some("diag.jsonl")),
+        ("--diagnostics-pid", Some("4242")),
+        ("--trace", None),
+        ("--pause", Some("auto")),
+        ("--kill-on-timeout", None),
+        ("--user", Some("alice")),
+        ("--unsafe-unvalidated-metadata", None),
+        ("--allow-uretprobe-on-confined-target", None),
+        ("--track-short-lived", None),
+        ("--extra-strict", None),
+        ("-v", None),
+        ("--verbose", None),
+        ("--quiet", None),
+        ("--json", None),
+        ("-o", Some("out.json")),
+    ];
+
+    const HELP_PROBE_TOPICS: [HelpTopic; 9] = [
+        HelpTopic::Global,
+        HelpTopic::Profile,
+        HelpTopic::Trace,
+        HelpTopic::Run,
+        HelpTopic::Inspect,
+        HelpTopic::Doctor,
+        HelpTopic::Inventory,
+        HelpTopic::InventoryDiff,
+        HelpTopic::InventoryCbom,
+    ];
+
+    /// Companion options a probe needs so the probed flag — and only it —
+    /// decides the outcome: `--counter-mode` needs `--mode metrics`,
+    /// `--select-endpoint` needs both, the event-file tunables need
+    /// `--event-log`, and `--diagnostics-pid` needs `--diagnostics`.
+    fn help_probe_prereq(flag: &str) -> &'static [&'static str] {
+        match flag {
+            "--counter-mode" => &["--mode", "metrics"],
+            "--select-endpoint" => &["--mode", "metrics", "--counter-mode", "counts"],
+            "--event-rotate-bytes" | "--event-max-files" | "--event-interval" => {
+                &["--event-log", "events.jsonl"]
+            }
+            "--diagnostics-pid" => &["--diagnostics", "diag.jsonl"],
+            _ => &[],
+        }
+    }
+
+    /// Full probe argv for one topic and flag: a minimal valid base, the
+    /// prerequisites, then the flag with its sample value. `run` needs two
+    /// bases (`--max-events` parses only beside `--trace`, while `--mode`
+    /// and friends parse only without it). Scope flags replace the base
+    /// scope instead of doubling it — a second scope is refused, which
+    /// would misclassify an accepted flag — and `--capture` likewise
+    /// replaces the inventory base mode.
+    fn help_probe_argv(topic: HelpTopic, flag: &str) -> Vec<Vec<String>> {
+        let (_, sample) = HELP_PROBE_FLAGS
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .expect("probe flag must come from the universe");
+        let tail: Vec<String> = help_probe_prereq(flag)
+            .iter()
+            .map(ToString::to_string)
+            .chain(std::iter::once(flag.to_string()))
+            .chain(sample.iter().map(ToString::to_string))
+            .collect();
+        let argv = |base: &[&str], suffix: &[&str]| {
+            base.iter()
+                .map(ToString::to_string)
+                .chain(tail.clone())
+                .chain(suffix.iter().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        };
+        match topic {
+            HelpTopic::Global => vec![argv(&[], &[])],
+            HelpTopic::Profile => vec![match flag {
+                "--pid" | "--cgroup" | "--system" => argv(&["profile"], &[]),
+                _ => argv(&["profile", "--pid", "4242"], &[]),
+            }],
+            HelpTopic::Trace => vec![match flag {
+                "--pid" | "--cgroup" | "--system" => argv(&["trace"], &[]),
+                _ => argv(&["trace", "--pid", "4242"], &[]),
+            }],
+            HelpTopic::Run => vec![
+                argv(&["run"], &["--", "true"]),
+                argv(&["run", "--trace"], &["--", "true"]),
+            ],
+            HelpTopic::Inspect => vec![match flag {
+                "--pid" | "--cgroup" | "--system" => argv(&["inspect"], &[]),
+                _ => argv(&["inspect", "--pid", "4242"], &[]),
+            }],
+            HelpTopic::Doctor => vec![argv(&["doctor"], &[])],
+            HelpTopic::Inventory => vec![match flag {
+                "--pid" | "--cgroup" | "--system" => argv(&["inventory", "--capture", "auto"], &[]),
+                "--capture" => argv(&["inventory", "--system"], &[]),
+                _ => argv(&["inventory", "--system", "--capture", "auto"], &[]),
+            }],
+            HelpTopic::InventoryDiff => {
+                vec![argv(
+                    &["inventory", "diff", "before.json", "after.json"],
+                    &[],
+                )]
+            }
+            HelpTopic::InventoryCbom => vec![argv(&["inventory", "cbom", "input.json"], &[])],
+        }
+    }
+
+    /// Asks the real parser whether `topic` routes `flag`: accepted on any
+    /// probe base wins over help routing, which wins over refusal.
+    fn help_probe_classify(topic: HelpTopic, flag: &str) -> HelpProbe {
+        let mut routed_help = false;
+        for argv in help_probe_argv(topic, flag) {
+            match parse(argv) {
+                Ok(_) => return HelpProbe::Accepted,
+                Err(CliError::Help(_)) => routed_help = true,
+                Err(CliError::Usage { .. }) => {}
+            }
+        }
+        if routed_help {
+            HelpProbe::Help
+        } else {
+            HelpProbe::Refused
+        }
+    }
+
+    /// A flag occurrence with word boundaries on both sides, so `--mode`
+    /// never matches inside `--counter-mode` and `-o` never matches inside
+    /// `per-offset`.
+    fn help_mentions(help: &str, flag: &str) -> bool {
+        fn edge(byte: Option<u8>, leading: bool) -> bool {
+            match byte {
+                None => true,
+                Some(sep)
+                    if matches!(sep, b' ' | b'\n' | b'\t' | b'(' | b'[' | b',' | b'"' | b'/') =>
+                {
+                    true
+                }
+                Some(sep) => {
+                    !leading && matches!(sep, b')' | b']' | b'<' | b'=' | b'|' | b'.' | b':' | b';')
+                }
+            }
+        }
+        let bytes = help.as_bytes();
+        help.match_indices(flag).any(|(at, _)| {
+            edge(at.checked_sub(1).map(|i| bytes[i]), true)
+                && edge(bytes.get(at + flag.len()).copied(), false)
+        })
+    }
+
+    /// Flags the parser routes but scoped help leaves out on purpose, each
+    /// with its reason: `--help`/`-h` work after every command, yet
+    /// repeating them in all nine help texts would be noise — global help
+    /// documents the routing once (`--help and --version also answer to -h
+    /// and -V`) and the `help_routes_and_channels` integration test pins
+    /// every topic.
+    fn hidden_help_flag(topic: HelpTopic, flag: &str) -> Option<&'static str> {
+        if topic == HelpTopic::Global || (flag != "--help" && flag != "-h") {
+            return None;
+        }
+        Some("documented once in global help; routing pinned per topic by help_routes_and_channels")
+    }
+
+    /// Refused flags a scoped help may still name, each with its reason:
+    /// inspect's notes point at the capture `--manifest` workflow (quoting
+    /// the helper's own `-o`), and run's notes name the scope flags only
+    /// to say run takes no scope.
+    fn cross_referenced_flag(topic: HelpTopic, flag: &str) -> Option<&'static str> {
+        match (topic, flag) {
+            (HelpTopic::Inspect, "--manifest") => Some(
+                "inspect notes point at the capture workflow (p11scope-discover -o <manifest.json>, \
+                 capture --manifest); inspect itself takes no manifest",
+            ),
+            (HelpTopic::Inspect, "-o") => Some(
+                "the -o in inspect notes belongs to the quoted helper invocation \
+                 (p11scope-discover -o <manifest.json>); inspect itself takes no -o",
+            ),
+            (HelpTopic::Run, "--pid" | "--cgroup" | "--system") => {
+                Some("run notes name the scope flags only to say run takes no scope")
+            }
+            _ => None,
+        }
+    }
+
+    /// Every flag the shared parser accepts for a command appears in that
+    /// command's help, or is explicitly marked hidden with a reason
+    /// (`hidden_help_flag`). The accepted set comes from probing the real
+    /// parser, never from a second hand-kept list, so a flag added to
+    /// `capture_option` (or any `parse_*`) without help coverage fails here.
+    #[test]
+    fn every_accepted_flag_appears_in_its_command_help() {
+        for topic in HELP_PROBE_TOPICS {
+            let help = topic.text();
+            for (flag, _) in HELP_PROBE_FLAGS {
+                match help_probe_classify(topic, flag) {
+                    HelpProbe::Accepted | HelpProbe::Help => {
+                        assert!(
+                            help_mentions(&help, flag) || hidden_help_flag(topic, flag).is_some(),
+                            "{topic:?} routes {flag} but its help neither documents it nor marks it hidden"
+                        );
+                    }
+                    HelpProbe::Refused => {}
+                }
+            }
+        }
+        // The hidden list stays honest: every entry must still route, and
+        // every reason must say why. A refused flag needs no hidden entry.
+        for topic in HELP_PROBE_TOPICS {
+            for (flag, _) in HELP_PROBE_FLAGS {
+                if let Some(reason) = hidden_help_flag(topic, flag) {
+                    assert!(
+                        !reason.is_empty(),
+                        "{topic:?} hides {flag} without a reason"
+                    );
+                    assert!(
+                        matches!(
+                            help_probe_classify(topic, flag),
+                            HelpProbe::Accepted | HelpProbe::Help
+                        ),
+                        "{topic:?} no longer routes hidden {flag} ({reason})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other direction: scoped help must not offer a flag its parser
+    /// refuses (a cross-reference listed in `cross_referenced_flag` is the
+    /// only exception). Global help is an index over every command, so it
+    /// is exempt here; its byte pin owns its exact text.
+    #[test]
+    fn scoped_help_names_no_refused_flag() {
+        for topic in HELP_PROBE_TOPICS {
+            if topic == HelpTopic::Global {
+                continue;
+            }
+            let help = topic.text();
+            for (flag, _) in HELP_PROBE_FLAGS {
+                assert!(
+                    !help_mentions(&help, flag)
+                        || matches!(
+                            help_probe_classify(topic, flag),
+                            HelpProbe::Accepted | HelpProbe::Help
+                        )
+                        || cross_referenced_flag(topic, flag).is_some(),
+                    "{topic:?} help names {flag}, which its parser refuses"
+                );
+            }
+        }
+        // Cross-references stay honest: each must still probe refused (an
+        // accepted flag is documented normally and needs no exemption).
+        for topic in HELP_PROBE_TOPICS {
+            for (flag, _) in HELP_PROBE_FLAGS {
+                if let Some(reason) = cross_referenced_flag(topic, flag) {
+                    assert!(
+                        !reason.is_empty(),
+                        "{topic:?} exempts {flag} without a reason"
+                    );
+                    assert_eq!(
+                        help_probe_classify(topic, flag),
+                        HelpProbe::Refused,
+                        "{topic:?} now routes exempted {flag} ({reason})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The probe universe itself stays accurate: every entry must be routed
+    /// by at least one command (a typo or a removed flag probes refused
+    /// everywhere) and shown by at least one help (or hidden with a reason).
+    #[test]
+    fn help_probe_universe_stays_accurate() {
+        for (flag, _) in HELP_PROBE_FLAGS {
+            assert!(
+                HELP_PROBE_TOPICS.iter().any(|topic| matches!(
+                    help_probe_classify(*topic, flag),
+                    HelpProbe::Accepted | HelpProbe::Help
+                )),
+                "probe flag {flag} is routed by no command (typo or removed flag?)"
+            );
+            assert!(
+                HELP_PROBE_TOPICS
+                    .iter()
+                    .any(|topic| help_mentions(&topic.text(), flag)
+                        || hidden_help_flag(*topic, flag).is_some()),
+                "probe flag {flag} is documented by no help"
+            );
+        }
+    }
+
+    /// The global help's offline-helper line names `--isolation`, like the
+    /// helper's own `--help` and usage.md do.
+    #[test]
+    fn global_help_names_discover_isolation() {
+        assert!(
+            USAGE.contains(
+                "p11scope-discover --module <provider.so> [-o <manifest.json>] [--isolation trusted|isolated]"
+            ),
+            "global help omits the helper's --isolation flag: {USAGE}"
+        );
+    }
+
     #[test]
     fn global_help_text_is_pinned_byte_for_byte() {
         // FNV-1a over the UTF-8 bytes, so USAGE cannot drift silently.

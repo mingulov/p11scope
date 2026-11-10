@@ -1514,14 +1514,18 @@ impl Drop for SetflagsTwinDir {
 /// the named reason SETFLAGS_TWIN_PRECONDITION_FAILED, listing every
 /// candidate with its filesystem and probe error, when no candidate
 /// applies the flag. The returned guard removes a fallback dir on drop
-/// (panic-safe); the scratch dir is borrowed and left in place.
+/// (panic-safe); the scratch dir is borrowed and left in place. The
+/// guard also carries every probe row (rejected candidates with their
+/// reason, then the winner with its `probe ok` row) so a later
+/// trusted-child failure reports probe and child outcomes together.
 fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
+    let mut attempts = Vec::new();
     if let Err(reason) = setflags_probe(scratch) {
-        let mut attempts = vec![format!(
-            "{} [{}]: {reason}",
+        attempts.push(format!(
+            "{} [{}]: probe {reason}",
             scratch.display(),
             dir_fstype_name(scratch)
-        )];
+        ));
         for root in [Path::new("/dev/shm"), &std::env::temp_dir()] {
             if !root.is_dir() {
                 attempts.push(format!("{}: not a usable directory", root.display()));
@@ -1530,15 +1534,20 @@ fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
             let dir = scratch_in(root, &format!("setflags-fallback-{tag}"));
             match setflags_probe(&dir) {
                 Ok(()) => {
+                    attempts.push(format!(
+                        "{} [{}]: probe ok",
+                        dir.display(),
+                        dir_fstype_name(&dir)
+                    ));
                     return SetflagsTwinDir {
                         path: dir,
                         fallback: true,
-                        probe_attempts: Vec::new(),
+                        probe_attempts: attempts,
                     };
                 }
                 Err(reason) => {
                     attempts.push(format!(
-                        "{} [{}]: {reason}",
+                        "{} [{}]: probe {reason}",
                         dir.display(),
                         dir_fstype_name(&dir)
                     ));
@@ -1551,10 +1560,15 @@ fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
             attempts.join("; ")
         );
     }
+    attempts.push(format!(
+        "{} [{}]: probe ok",
+        scratch.display(),
+        dir_fstype_name(scratch)
+    ));
     SetflagsTwinDir {
         path: scratch.to_path_buf(),
         fallback: false,
-        probe_attempts: Vec::new(),
+        probe_attempts: attempts,
     }
 }
 
@@ -1666,8 +1680,10 @@ fn qualify_setflags_twins(
     provider: &Path,
 ) -> (SetflagsTwinDir, std::path::PathBuf, std::path::PathBuf) {
     const FS_NODUMP_FL: i32 = 0x40;
-    let mut attempts: Vec<String> = Vec::new();
     let mut twins = setflags_twin_dir(dir, tag);
+    // Seed the loud failure with what the in-process probes saw, so a
+    // child that disagrees with its probe still reports both sides.
+    let mut attempts: Vec<String> = twins.probe_attempts().to_vec();
     loop {
         let trusted_target = twins.path().join("setflags-trusted.tmp");
         let isolated_target = twins.path().join("setflags-isolated.tmp");
@@ -1680,7 +1696,7 @@ fn qualify_setflags_twins(
         );
         let trusted = Command::new(bin)
             .args(["--module"])
-            .arg(&provider)
+            .arg(provider)
             .env("ISOLATION_SETFLAGS_PATH", &trusted_target)
             .output()
             .unwrap();
@@ -1782,15 +1798,14 @@ fn setflags_precondition_names_probe_and_child_outcomes() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let provider = build_isolation_probe(&dir);
-    let message = match std::panic::catch_unwind(|| {
-        qualify_setflags_twins(&fake, &dir, TAG, &provider)
-    }) {
-        Ok(_) => panic!("a child that always reports EOPNOTSUPP must exhaust the chain"),
-        Err(payload) => match payload.downcast_ref::<String>() {
-            Some(message) => message.clone(),
-            None => panic!("the precondition failure must carry a message"),
-        },
-    };
+    let message =
+        match std::panic::catch_unwind(|| qualify_setflags_twins(&fake, &dir, TAG, &provider)) {
+            Ok(_) => panic!("a child that always reports EOPNOTSUPP must exhaust the chain"),
+            Err(payload) => match payload.downcast_ref::<String>() {
+                Some(message) => message.clone(),
+                None => panic!("the precondition failure must carry a message"),
+            },
+        };
     for pinned in [
         "SETFLAGS_TWIN_PRECONDITION_FAILED",
         "probe ok",

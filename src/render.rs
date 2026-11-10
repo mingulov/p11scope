@@ -1529,14 +1529,16 @@ pub struct ResourceSampleEvidence {
 /// The capture's resource timeline: `/proc/self` samples at capture start,
 /// attach readiness, and loop end, plus the bounded periodic summary (one
 /// sample every [`crate::timing::RESOURCE_SAMPLE_EVERY_N_TICKS`] ticks;
-/// only the count, maximum RSS, and latest sample publish).
+/// only the count and latest sample publish) and the process peak RSS.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct ResourceEvidence {
     /// Periodic samples taken.
     pub samples: u64,
-    /// Maximum periodic RSS, or `null` when no periodic sample read RSS.
-    /// It includes the EVENTS ring's double user mapping (about twice the
-    /// ring size), which is not extra memory: the ring is charged once.
+    /// Process peak RSS: the kernel high-water mark (`VmHWM`), or the
+    /// periodic-sample maximum when the peak read failed, or `null`
+    /// when neither read RSS. It includes the EVENTS ring's double user
+    /// mapping (about twice the ring size), which is not extra memory:
+    /// the ring is charged once.
     pub max_rss_kb: Option<u64>,
     pub start: ResourceSampleEvidence,
     pub readiness: ResourceSampleEvidence,

@@ -12126,7 +12126,7 @@ impl SchedulingAccumulator {
                 max_dropped_age_ms: self.newcomer.max_dropped_age_ms,
                 marks_dropped: self.newcomer.marks_dropped,
             },
-            resource: resource_evidence_of(&self.resource),
+            resource: resource_evidence_of(&self.resource, crate::timing::read_peak_rss_kb()),
             tail_publishes: self.tail_publishes,
             tail_skips: self.tail_skips,
         }
@@ -12187,10 +12187,24 @@ fn resource_sample_of(sample: &crate::timing::ResourceSample) -> render::Resourc
     }
 }
 
-fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::ResourceEvidence {
+fn resource_evidence_of(
+    timeline: &crate::timing::ResourceTimeline,
+    peak_rss_kb: Option<u64>,
+) -> render::ResourceEvidence {
+    // The published maximum is the true process peak: the kernel
+    // high-water mark covers the intra-tick transients (a full sweep
+    // blocks a tick for seconds) and the post-loop finalization the
+    // sparse periodic samples never see. When the peak read failed
+    // (non-Linux, a failed /proc read), the periodic maximum is the
+    // honest fallback, never a zero.
+    let max_rss_kb = match (peak_rss_kb, timeline.max_rss_kb) {
+        (Some(peak), Some(sampled)) => Some(peak.max(sampled)),
+        (Some(peak), None) => Some(peak),
+        (None, sampled) => sampled,
+    };
     render::ResourceEvidence {
         samples: timeline.periodic_samples,
-        max_rss_kb: timeline.max_rss_kb,
+        max_rss_kb,
         start: resource_sample_of(&timeline.start),
         readiness: resource_sample_of(&timeline.readiness),
         end: resource_sample_of(&timeline.end),

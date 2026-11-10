@@ -478,10 +478,13 @@ mark); a never-diffed pid — a refresh-first arrival dropped before any
 diff marked it — reports unknown age (`dropped_unknown`), never zero.
 `resource` is the `/proc/self` timeline (`start`, `readiness`, `end`
 samples of `rss_kb`, `utime_ms`, `stime_ms`, `read_bytes`, `write_bytes`,
-each null on a failed read; `samples`, `max_rss_kb`, `last_periodic`
-summarize the bounded periodic series). `max_rss_kb` covers the periodic
-samples only: a short capture with no periodic tick reports null max even
-though the start/readiness/end samples hold RSS. `tail_publishes`/
+each null on a failed read; `samples` and `last_periodic` summarize the
+bounded periodic series). `max_rss_kb` is the process peak RSS: the
+kernel high-water mark (`VmHWM` from `/proc/self/status`, read at each
+scheduling snapshot), which covers the intra-tick transients and the
+post-loop finalization the sparse periodic samples never see. When the
+peak read fails (non-Linux, a failed `/proc` read), the periodic-sample
+maximum is the fallback; `null` means neither read RSS. `tail_publishes`/
 `tail_skips` count executed versus provably redundant batch-tail
 publications.
 

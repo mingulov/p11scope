@@ -27,6 +27,8 @@
 //! - Resource samples are `/proc/self` reads at defined points (capture
 //!   start, attach readiness, loop end, every [`RESOURCE_SAMPLE_EVERY_N_TICKS`]
 //!   ticks). A failed read or parse yields `None` per field, never zero.
+//!   The published peak is the kernel high-water mark (`VmHWM`), read at
+//!   each scheduling snapshot; the periodic maximum is its fallback.
 //! - Missing samples publish as `null`, never as zero. A stage that never
 //!   ran publishes total `0` with `0` invocations (an exact empty sum, not a
 //!   missing sample).
@@ -428,7 +430,8 @@ pub enum ResourcePoint {
 }
 
 /// Periodic resource cadence: one sample every N capture ticks. The periodic
-/// series is not retained per tick (unbounded); only its count, maximum RSS,
+/// series is not retained per tick (unbounded); only its count, maximum RSS
+/// (the published peak's fallback when the kernel mark is unreadable),
 /// and latest sample publish.
 pub const RESOURCE_SAMPLE_EVERY_N_TICKS: u64 = 100;
 
@@ -488,6 +491,19 @@ pub fn parse_stat_cpu_ms(stat: &str, ticks_per_sec: u64) -> Option<(u64, u64)> {
     Some((to_ms(utime)?, to_ms(stime)?))
 }
 
+/// Parses the peak resident set (`VmHWM`, in kB) from
+/// `/proc/self/status`. Pure: unit tests drive it with fixture strings.
+/// The value is read as kB, the unit the kernel emits; a missing or
+/// malformed `VmHWM:` line yields `None`, never zero. Other resident
+/// lines (`VmRSS:`, `RssAnon:`, …) never answer for the peak.
+pub fn parse_status_hwm_kb(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.split_ascii_whitespace().next())
+        .and_then(|value| value.parse().ok())
+}
+
 /// Parses `read_bytes`/`write_bytes` from `/proc/self/io`.
 pub fn parse_io_bytes(io: &str) -> Option<(u64, u64)> {
     let mut read_bytes = None;
@@ -544,6 +560,22 @@ pub fn read_resource_sample() -> ResourceSample {
             read_bytes,
             write_bytes,
         }
+    }
+}
+
+/// Reads the capture process's peak RSS: the kernel high-water mark
+/// (`VmHWM` from `/proc/self/status`), in kB. Unlike the sparse
+/// periodic samples, the mark covers every intra-tick transient and
+/// the post-loop finalization. `None` off Linux or on a failed
+/// read/parse — a missing peak, never zero.
+pub fn read_peak_rss_kb() -> Option<u64> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        read_proc_file("/proc/self/status").and_then(|text| parse_status_hwm_kb(&text))
     }
 }
 

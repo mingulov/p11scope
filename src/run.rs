@@ -6042,7 +6042,7 @@ fn format_handoff_note(pid: u32) -> String {
 fn format_handed_back_exit_note(pid: u32, code: i32) -> String {
     format!(
         "p11scope: duration expired without --kill-on-timeout; child pid {pid} \
-         exited during hand-back with status {code} (the sealed report names it handed back)"
+         exited during hand-back with status {code} (the report already written lists it as handed back)"
     )
 }
 
@@ -15736,7 +15736,7 @@ mod tests {
         assert!(pending.is_none());
         let expected_note = format!(
             "p11scope: duration expired without --kill-on-timeout; child pid {pid} \
-             exited during hand-back with status {} (the sealed report names it handed back)",
+             exited during hand-back with status {} (the report already written lists it as handed back)",
             128 + libc::SIGKILL
         );
         assert_eq!(

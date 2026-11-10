@@ -230,8 +230,8 @@ after the main thread ended, because an ordinary exit looks the same.
 PKCS#11 calls do not count as such an event. So a provider first loaded
 in that window can go unreported, even if the threads kept calling
 providers p11scope already watches; those calls are still counted.
-`--pid` and `run` captures keep the count, and so does any capture that
-lost discovery records. The count can still over-report in a few cases
+`--pid`, `run` and selected-endpoint captures keep the count, and so
+does any capture that lost or dropped discovery records. The count can still over-report in a few cases
 (a thread's record racing the exit, an unknown exit order). Seeing
 those later loads needs a kernel-side witness and is 0.7.x work.
 

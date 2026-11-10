@@ -21002,6 +21002,9 @@ impl Engine {
         matches!(self.scope, Scope::System | Scope::Cgroup { .. })
             && self.static_probes_process_wide == Some(true)
             && self.counter_snapshot.ring_loss == 0
+            && self.counter_snapshot.export_state_failures == 0
+            && self.counter_snapshot.export_bounded_read_failures == 0
+            && self.counter_snapshot.abi_refusals == 0
             && self.malformed_discovery == 0
             && self.discovery_truncated == 0
             && self.pending_discovery_records.is_empty()

@@ -5796,10 +5796,36 @@ fn a_system_batch_record_after_removal_keeps_the_removed_loss() {
         )
         .unwrap();
     assert!(engine.group_last_record_ns.contains_key(&pid));
+    // A later batch prunes stamps to retained pids; the released proof's
+    // pid must keep its stamp through it.
+    engine
+        .apply_discovery_batch(&mut wide_session(), Vec::new(), 0)
+        .unwrap();
+    assert!(engine.group_last_record_ns.contains_key(&pid));
 
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn dropped_function_list_records_never_let_a_leader_exit_loss_be_withdrawn() {
+    // A BPF-side drop (state failure, bounded read failure, ABI refusal)
+    // can hide a survivor's record just like ring loss.
+    for drop in 0..3u32 {
+        let (mut engine, mut child, _) = counted_leader_exit_loss(78 + drop);
+        match drop {
+            0 => engine.counter_snapshot.export_state_failures = 1,
+            1 => engine.counter_snapshot.export_bounded_read_failures = 1,
+            _ => engine.counter_snapshot.abi_refusals = 1,
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        engine.settle_terminal_drain();
+
+        assert_eq!(engine.task_uprobe_link_losses, 1, "drop kind {drop}");
+    }
 }
 
 #[test]

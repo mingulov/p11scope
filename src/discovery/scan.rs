@@ -18600,6 +18600,49 @@ mod tests {
         );
     }
 
+    /// A VMA that raced between the maps read and the proof: the maps
+    /// key still names the old file while the proof bound the current
+    /// one. The exempt path skips the mount-table guard — the only
+    /// fd-key-vs-maps-key check — so it must refuse the stale key by
+    /// name here, never examine under it.
+    #[test]
+    fn map_files_fallback_refuses_a_racing_vma_on_the_exempt_path() {
+        use crate::discovery::identity::{FileIdentity, MappedFile};
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.set_arbitrary_key(8, 1, 999, "/libfixture-arbitrary.so");
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        let proven = FileIdentity {
+            dev: libc::makedev(8, 1),
+            ino: 999,
+        };
+        fixture.mapped = Some((
+            MappedFile {
+                identity: proven,
+                fs_magic: Some(0xef53),
+            },
+            proven,
+        ));
+        // The maps key predates the remap; the live re-stat reports
+        // the current file, which the kernel renders away from the
+        // stale key.
+        fixture.restated = None;
+        fixture.mountinfo_empty = Some(true);
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the racing object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == "/libfixture-arbitrary.so"
+                    && skip.reason.contains("does not match mapped object")
+            }),
+            "the stale key must refuse by name, got {:?}",
+            outcome.skipped()
+        );
+    }
+
     /// A served non-regular file is never scanned: the `map_files`
     /// entry of a file-backed VMA is its regular file, so anything
     /// else refuses with its own named reason.

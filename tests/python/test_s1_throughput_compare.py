@@ -3235,6 +3235,28 @@ class JointConservationGate(unittest.TestCase):
                     r"4 != issued 20006"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_driver_shed_unrouted_overcounted_sheds_fails(self):
+        # Named loss excuses only what it counts: sheds past the
+        # shortfall still fail, naming entries, loss and issued.
+        with tempfile.TemporaryDirectory(prefix="joint-shed-over-") as tmp:
+            def mutate(doc):
+                edge = next(row for row in doc["edges"]
+                            if row["caller"] == "c1")
+                edge["entries"]["count"] -= 1
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] -= 1
+                child["api_returns"]["count"] -= 1
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": _shed_unrouted_reason(4, {"unobserved": 4}),
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(
+                    require_s1(self).S1Error,
+                    r"entries\.count 20005 \+ shed-unrouted "
+                    r"4 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
     def test_driver_entries_short_without_shed_gaps_fails(self):
         # No named loss, no excuse: the plain shortfall message stands.
         with tempfile.TemporaryDirectory(prefix="joint-shed-none-") as tmp:

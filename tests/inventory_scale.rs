@@ -9,6 +9,7 @@
 use p11scope::discovery::inventory_workload::{FdScope, assert_settled, assert_subset_ledger};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -165,6 +166,17 @@ fn ready_pid(ready_file: &Path) -> u32 {
 /// `--system` run emits hundreds of kilobytes of progress, which
 /// deadlocks a 64 KiB pipe nobody drains mid-run.
 fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Output, u64) {
+    spawn_with_peak_pumping(cmd, stderr_log, &mut || {})
+}
+
+/// `spawn_with_peak` with a hook the churn test uses to tail the
+/// observer's event log while it runs. The hook must be infallible and
+/// cheap: it runs every 5 ms until the child exits.
+fn spawn_with_peak_pumping(
+    cmd: &mut Command,
+    stderr_log: &Path,
+    pump: &mut dyn FnMut(),
+) -> (std::process::Output, u64) {
     cmd.stderr(std::fs::File::create(stderr_log).unwrap());
     cmd.die_with_parent();
     let mut child = cmd.spawn().unwrap();
@@ -199,6 +211,7 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
                 }
             }
         }
+        pump();
         match child.try_wait().unwrap() {
             Some(_) => break,
             None => std::thread::sleep(Duration::from_millis(5)),
@@ -801,6 +814,141 @@ fn scale_48_drivers_4_providers_through_real_binary() {
 // E2: churn through the real binary.
 // ---------------------------------------------------------------------------
 
+/// A ready file still being written parses to nothing; the churn pump
+/// retries on its next tick instead of panicking on a torn read.
+fn try_ready_pid(ready_file: &Path) -> Option<u32> {
+    std::fs::read_to_string(ready_file)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// True while `pid` still names our fixture driver (never signal a
+/// stranger on a reused pid).
+fn pid_is_driver(pid: u32, driver_exe: &str) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .is_ok_and(|exe| exe.to_string_lossy() == *driver_exe)
+}
+
+/// Scratch dir outside the worktree for product-opened outputs: the
+/// product's output trust policy refuses group-writable ancestors (like
+/// this repo's checkout parent), which the target-tmp dir inherits.
+/// `TMPDIR` on lanes and CI runners, sticky `/tmp` elsewhere.
+fn trusted_scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Condition driver for the churn test: tails the observer's `--event-log`
+/// while it runs and kills the anchor plus churn-A once churn-A's
+/// admission publishes. No fixed sleeps: the kill lands between two
+/// passes (right after the admitting pass publishes, about a second
+/// before the next pass enumerates), whatever the host's pass cadence.
+/// Infallible by construction: a missed signal surfaces as a loud
+/// document assertion below, never as a pump panic.
+struct ChurnCondition {
+    ready: PathBuf,
+    events: PathBuf,
+    driver_exe: String,
+    offset: u64,
+    pending: String,
+    anchor: Option<u32>,
+    churn_a: Option<u32>,
+    churn_b: Option<u32>,
+    admitted: BTreeSet<u32>,
+    exited: BTreeSet<u32>,
+    killed: bool,
+}
+
+impl ChurnCondition {
+    fn pump(&mut self) {
+        if self.anchor.is_none() {
+            // Ready files exist before the observer execs (the helper
+            // ready-gates every fixture), so all three are pass-0
+            // baseline; a torn early read retries next tick.
+            let anchor = try_ready_pid(&self.ready.join("anchor.ready"));
+            let churn_a = try_ready_pid(&self.ready.join("churn-a.ready"));
+            let churn_b = try_ready_pid(&self.ready.join("churn-b.ready"));
+            if anchor.is_none() || churn_a.is_none() || churn_b.is_none() {
+                return;
+            }
+            self.anchor = anchor;
+            self.churn_a = churn_a;
+            self.churn_b = churn_b;
+        }
+        let mut file = match std::fs::File::open(&self.events) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        if file.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut fresh = String::new();
+        if file.read_to_string(&mut fresh).is_err() {
+            return;
+        }
+        self.offset += fresh.len() as u64;
+        self.pending.push_str(&fresh);
+        // Complete lines only: the observer may be mid-write, and files
+        // flush per line, so a newline-terminated line parses whole.
+        while let Some(end) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=end).collect();
+            self.handle_event_line(&line);
+        }
+        if !self.killed && self.churn_a.is_some_and(|a| self.admitted.contains(&a)) {
+            // Latched once the condition fires, even when a pid check
+            // refuses the kill below: a reused pid must never be
+            // signalled on a later tick, and the document assertions
+            // below stay loud about the missed kill.
+            self.killed = true;
+            if let (Some(churn_a), Some(anchor)) = (self.churn_a, self.anchor)
+                && pid_is_driver(churn_a, &self.driver_exe)
+                && pid_is_driver(anchor, &self.driver_exe)
+            {
+                unsafe {
+                    libc::kill(churn_a as i32, libc::SIGTERM);
+                    libc::kill(anchor as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    fn handle_event_line(&mut self, line: &str) {
+        let event: Value = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(_) => return,
+        };
+        if event["kind"] != "caller_event" {
+            return;
+        }
+        let payload = &event["event"];
+        let pid = payload["identity_context"]["caller"]["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok());
+        // Attribute by pid plus the fixture executable: a reused pid
+        // naming another program must not satisfy our conditions.
+        let ours = payload["identity_context"]["caller"]["executable"]["path"]
+            .as_str()
+            .is_some_and(|path| path == self.driver_exe);
+        if !ours {
+            return;
+        }
+        match (payload["event"].as_str(), pid) {
+            (Some("admitted"), Some(pid)) => {
+                self.admitted.insert(pid);
+            }
+            (Some("exited") | Some("retired"), Some(pid)) => {
+                self.exited.insert(pid);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn churn_anchor_and_churners_settle_through_real_binary() {
     let _guard = serial_guard();
@@ -821,35 +969,45 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         &[],
     );
     let out = dir.join("out.json");
+    let scratch = trusted_scratch("inventory-churn-e2-events");
+    let events = scratch.join("events.jsonl");
     let stderr_log = dir.join("stderr.log");
     let mut cmd = Command::new("sh");
     cmd.arg(fixture_source("inventory-churn-observe.sh"))
         .arg("--system")
         .args(["--json", "--duration", "14s", "--max-scan-pids", "4096"])
         .args(system_capture_args())
+        .arg("--event-log")
+        .arg(&events)
         .env("INV_DRIVER", &driver)
         .env("INV_PROV", &prov)
-        .env("INV_CHURNERS", "8")
-        .env("INV_ANCHOR_KILL_SECS", "11")
         .env("INV_READY", &ready)
         .env("INV_OUT", &out)
         .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
-    let (output, peak) = spawn_with_peak(&mut cmd, &stderr_log);
-    let anchor_pid = ready_pid(&ready.join("anchor.ready"));
-    let mut churn_pids = Vec::new();
-    for entry in std::fs::read_dir(&ready).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("churn-") && name.ends_with(".ready") {
-            churn_pids.push(ready_pid(&path));
-        }
-    }
-    let mut all_pids = churn_pids.clone();
-    all_pids.push(anchor_pid);
+    let mut condition = ChurnCondition {
+        ready: ready.clone(),
+        events: events.clone(),
+        driver_exe: driver.to_string_lossy().into_owned(),
+        offset: 0,
+        pending: String::new(),
+        anchor: None,
+        churn_a: None,
+        churn_b: None,
+        admitted: BTreeSet::new(),
+        exited: BTreeSet::new(),
+        killed: false,
+    };
+    let (output, peak) = spawn_with_peak_pumping(&mut cmd, &stderr_log, &mut || condition.pump());
+    // Final tail: the last pass may have published between the final
+    // pump tick and the child's exit.
+    condition.pump();
     let guard = FixtureGuard {
-        pids: all_pids.clone(),
+        pids: [condition.anchor, condition.churn_a, condition.churn_b]
+            .into_iter()
+            .flatten()
+            .collect(),
     };
     let stderr = std::fs::read_to_string(&stderr_log).unwrap();
     assert!(
@@ -859,6 +1017,9 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     );
     assert!(output.stdout.is_empty());
     assert_stderr_honest(&stderr);
+    let anchor_pid = condition.anchor.expect("helper readied the anchor");
+    let churn_a_pid = condition.churn_a.expect("helper readied churn-A");
+    let churn_b_pid = condition.churn_b.expect("helper readied churn-B");
     assert!(
         peak < OBSERVER_RSS_BOUND_BYTES,
         "observer peak RSS {peak} stays within {OBSERVER_RSS_BOUND_BYTES}"
@@ -866,38 +1027,67 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let body = std::fs::read_to_string(&out).unwrap();
     let doc: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["schema"], "p11scope/inventory/v1");
-    // The anchor was observed from the first pass and killed at 11s of
-    // 14: exactly one incarnation, deterministically exited.
-    let anchors: Vec<&Value> = doc["callers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|caller| caller["pid"] == u64::from(anchor_pid))
-        .collect();
-    assert_eq!(anchors.len(), 1, "one anchor incarnation");
-    assert_eq!(anchors[0]["lifecycle"], "exited");
-    assert_eq!(anchors[0]["retired"], true);
-    // At least one short-lived churner was observed mid-churn (8
-    // churners × 4s lives over 14 one-second passes).
-    let observed_churners = churn_pids
-        .iter()
-        .filter(|pid| {
-            doc["callers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|caller| caller["pid"] == u64::from(**pid))
-        })
-        .count();
+    // The conditioned kill lands after the admitting pass publishes, so
+    // settlement needs that pass plus a later one observing the deaths.
+    let passes = doc["observation"]["passes"].as_u64().unwrap();
     assert!(
-        observed_churners >= 1,
-        "at least one churner observed (spawned {})",
-        churn_pids.len(),
+        passes >= 2,
+        "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes in 14s"
     );
-    // Terminal settlement over our pids: every observed caller is live
-    // or retired-with-reason, every owned edge resolves.
-    let our_pids: std::collections::HashSet<u64> =
-        all_pids.iter().map(|pid| u64::from(*pid)).collect();
+    // The conditions fired mid-run: every fixture admitted, the two
+    // conditioned kills observed dead, the survivor never exited.
+    for (pid, name) in [
+        (anchor_pid, "anchor"),
+        (churn_a_pid, "churn-A"),
+        (churn_b_pid, "churn-B"),
+    ] {
+        assert!(
+            condition.admitted.contains(&pid),
+            "{name} (pid {pid}) admitted mid-run"
+        );
+    }
+    for (pid, name) in [(anchor_pid, "anchor"), (churn_a_pid, "churn-A")] {
+        assert!(
+            condition.exited.contains(&pid),
+            "{name} (pid {pid}) exited after its conditioned kill"
+        );
+    }
+    assert!(
+        !condition.exited.contains(&churn_b_pid),
+        "churn-B (pid {churn_b_pid}) stays alive to run end"
+    );
+    // Terminal settlement over our pids: exactly one incarnation each,
+    // the killed two exited and retired, the survivor mapped.
+    let incarnations = |pid: u32| {
+        doc["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|caller| caller["pid"] == u64::from(pid))
+            .collect::<Vec<_>>()
+    };
+    for (pid, name) in [
+        (anchor_pid, "anchor"),
+        (churn_a_pid, "churn-A"),
+        (churn_b_pid, "churn-B"),
+    ] {
+        assert_eq!(incarnations(pid).len(), 1, "one {name} incarnation");
+    }
+    let anchor = incarnations(anchor_pid)[0];
+    assert_eq!(anchor["lifecycle"], "exited");
+    assert_eq!(anchor["retired"], true);
+    let churn_a = incarnations(churn_a_pid)[0];
+    assert_eq!(churn_a["lifecycle"], "exited");
+    assert_eq!(churn_a["retired"], true);
+    let churn_b = incarnations(churn_b_pid)[0];
+    assert_eq!(churn_b["lifecycle"], "mapped");
+    assert_eq!(churn_b["retired"], false);
+    // Every observed caller is live or retired-with-reason, every owned
+    // edge resolves.
+    let our_pids: std::collections::HashSet<u64> = [anchor_pid, churn_a_pid, churn_b_pid]
+        .into_iter()
+        .map(u64::from)
+        .collect();
     for caller in doc["callers"].as_array().unwrap() {
         if !our_pids.contains(&caller["pid"].as_u64().unwrap()) {
             continue;
@@ -912,6 +1102,8 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     }
     assert_settled_consistent(&doc);
     drop(guard);
+    // The event stream served its conditions; failures above keep it.
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 // ---------------------------------------------------------------------------

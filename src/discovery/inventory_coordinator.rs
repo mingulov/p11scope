@@ -15341,7 +15341,7 @@ pub(crate) mod tests {
             .registry
             .gaps()
             .iter()
-            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .filter(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT)
             .collect();
         assert_eq!(
             gaps.len(),
@@ -15428,7 +15428,7 @@ pub(crate) mod tests {
             .registry
             .gaps()
             .iter()
-            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .filter(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT)
             .collect();
         assert_eq!(
             gaps.len(),
@@ -15470,7 +15470,7 @@ pub(crate) mod tests {
                 .registry
                 .gaps()
                 .iter()
-                .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+                .filter(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT)
                 .count(),
             1,
             "the clean retry adds no gap: {:?}",

@@ -3374,7 +3374,7 @@ fn demotion_retirement_revision_skew_unknown_keeps_ordinary_checkpoint() {
 
 #[test]
 fn demotion_retirement_module_change_across_skew_revokes_checkpoint() {
-    let mut scene = round4_placed_with_known_b();
+    let mut scene = Scene::shared();
     let object = scene.native.scene.delta.endpoints[0].object.index();
     let mut ownership = round4_ownership_with_sole(&scene, object);
     let original = ownership
@@ -3382,6 +3382,26 @@ fn demotion_retirement_module_change_across_skew_revokes_checkpoint() {
         .checkpoint(1_000);
     assert_ne!(original, 0);
     assert_eq!(ownership.ordinary_sequence(scene.caller, object), original);
+    // Probe the premise on a twin slice: the [A,B] window below must
+    // genuinely share the counted object, or this twin pins a
+    // module-set change rather than the sharing window it claims.
+    let mut probe = CountOwnership::new(scene.native.scene.coordinator.registry.limits());
+    assert!(probe.register_pair(scene.caller, object));
+    round4_queue_ownership(
+        &mut probe,
+        &scene,
+        vec![round4_a_key(&scene), round4_b_key(&scene)],
+        100,
+    );
+    round4_settle_ownership(&mut probe, &scene);
+    assert_eq!(probe.newest_accepted_post(scene.caller), 101);
+    assert!(
+        matches!(
+            probe.candidates(scene.caller, object),
+            CurrentCandidates::Shared
+        ),
+        "the [A,B] window must share the counted object"
+    );
     // A second module sharing the counted object arrives, but its [A,B]
     // scan is queued under a membership revision the attach set outgrows
     // before classification runs: the [A,B] window is never classified,
@@ -3413,6 +3433,47 @@ fn demotion_retirement_module_change_across_skew_revokes_checkpoint() {
         ownership.ordinary_view(scene.caller, object).sequence,
         original,
         "growth across an unclassified module-set change needs a new fence, not the old checkpoint"
+    );
+}
+
+#[test]
+fn demotion_retirement_module_swap_across_skew_revokes_checkpoint() {
+    let mut scene = round4_placed_with_known_b();
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let mut ownership = round4_ownership_with_sole(&scene, object);
+    let original = ownership
+        .ordinary_view(scene.caller, object)
+        .checkpoint(1_000);
+    assert_ne!(original, 0);
+    assert_eq!(ownership.ordinary_sequence(scene.caller, object), original);
+    // A same-length module swap ([A] -> [B]) is a different module
+    // list even though the length and the process generation match:
+    // the swapped scan moves the caller epoch. Queued under a
+    // membership revision the attach set outgrows before
+    // classification runs, the [B] window is never classified, so the
+    // unproven members-filter finish must revoke instead of retaining
+    // the proven sole-owner checkpoint across a module-set change it
+    // never examined.
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_b_key(&scene)], 300);
+    round4_grow_attach_revision(&mut scene);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert_eq!(
+        ownership.newest_accepted_post(scene.caller),
+        301,
+        "the [B] observation is accepted and moves the caller epoch"
+    );
+    assert_eq!(
+        ownership.last_cause(scene.caller, object),
+        RevocationCause::MembersFilter,
+        "the [B] scan finishes on the revision-skew leg"
+    );
+    round4_queue_ownership(&mut ownership, &scene, vec![round4_a_key(&scene)], 400);
+    round4_settle_ownership(&mut ownership, &scene);
+    assert!(ownership.sole(scene.caller, object).is_some());
+    assert_ne!(
+        ownership.ordinary_view(scene.caller, object).sequence,
+        original,
+        "growth across an unclassified same-length swap needs a new fence, not the old checkpoint"
     );
 }
 

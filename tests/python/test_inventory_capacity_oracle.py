@@ -2042,6 +2042,15 @@ class DeferralSubjectDrainGateTests(unittest.TestCase):
              "module": "m", "caller": None}]})
         self.assertTrue(oracle["has_partial_attach"](view, edge))
 
+    def test_folded_still_deferred_at_stop_is_terminal_accounting_not_backlog(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach deferred",
+               "reason": "attach unfinished at stop: 4 endpoint(s) deferred over "
+                         "2 passes (2 still deferred at stop); counted uses are lower bounds"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        self.assertTrue(drained(rows))
+
 
 def parse_native_row(line):
     return dict(token.split("=", 1) for token in line.split()[1:])

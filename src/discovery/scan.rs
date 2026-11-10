@@ -4089,27 +4089,6 @@ pub(crate) fn duplicate_exec_load_count(group: &[&MapEntry]) -> u32 {
     loads
 }
 
-/// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
-/// `map_files` is never required, and a container's own file is never copied out).
-/// A chroot-like view (foreign root, shared mount namespace) additionally retries
-/// the observer root; the opened-file identity guard below still verifies the
-/// mapping like-for-like, so a same-path different file is refused.
-fn open_in_target(
-    view: &ProcessView,
-    path: &str,
-    budget: &mut CaptureWorkBudget,
-) -> Result<File, MappedOpenError> {
-    match view.with_filesystem(budget, |filesystem, _| {
-        Ok(filesystem.open_mapped_object(Path::new(path)))
-    }) {
-        Ok(opened) => opened,
-        Err(reason) => Err(MappedOpenError {
-            reason,
-            foreign_target_root: None,
-        }),
-    }
-}
-
 /// One foreign-root open failure held for its own per-object gap record.
 struct ForeignOpenFailure {
     subject: String,
@@ -5661,6 +5640,54 @@ pub(crate) trait ScanIo {
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> std::io::Result<Self::Memory>;
+    /// Open an object as the *target* sees it (spec §4.5: needs only
+    /// `PTRACE_MODE_READ`; `map_files` is never required, and a
+    /// container's own file is never copied out). A chroot-like view
+    /// (foreign root, shared mount namespace) additionally retries the
+    /// observer root; the opened-file identity guard below still
+    /// verifies the mapping like-for-like, so a same-path different
+    /// file is refused. The default is the production open; scripted
+    /// IOs override it to fail or serve fixture bytes.
+    fn open_mapped_object(
+        &mut self,
+        view: &ProcessView,
+        path: &str,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<File, MappedOpenError> {
+        match view.with_filesystem(budget, |filesystem, _| {
+            Ok(filesystem.open_mapped_object(Path::new(path)))
+        }) {
+            Ok(opened) => opened,
+            Err(reason) => Err(MappedOpenError {
+                reason,
+                foreign_target_root: None,
+                errno: None,
+            }),
+        }
+    }
+    /// Open the VMA `[start, end)` of `view` through its
+    /// `/proc/<pid>/map_files` link: the kernel's own `vm_file` for
+    /// that range. The open runs under the view's generation pin, so
+    /// an exit (or pid reuse) fails instead of opening another
+    /// process's file. The default opens the live link; scripted IOs
+    /// override it to serve fixture files.
+    fn open_map_files(
+        &mut self,
+        view: &ProcessView,
+        start: u64,
+        end: u64,
+        _budget: &mut CaptureWorkBudget,
+    ) -> std::io::Result<File> {
+        match view.run_while_same(|| {
+            std::fs::File::open(format!(
+                "/proc/{}/map_files/{start:x}-{end:x}",
+                view.pid()
+            ))
+        }) {
+            Ok(opened) => opened,
+            Err(reason) => Err(std::io::Error::other(reason)),
+        }
+    }
     fn final_generation(
         &mut self,
         view: &ProcessView,
@@ -6777,7 +6804,7 @@ fn scan_view_examined_mode(
         };
         let path = usable.display().to_string();
         let sub_open = Instant::now();
-        let file = match open_in_target(view, &path, budget) {
+        let file = match io.open_mapped_object(view, &path, budget) {
             Ok(file) => file,
             Err(failure) => {
                 if !narrowed_out {
@@ -17574,6 +17601,367 @@ mod tests {
     /// keeps refusing (the `--system`/`--pid` fail-closed shape where
     /// the proof substrate itself is broken) — only the
     /// userspace-only cgroup path degrades.
+    /// How the fallback fixture answers a `map_files` open: serve a
+    /// fixture file (cloned per open), or fail with a scripted errno.
+    enum MapFilesScript {
+        Serve(File),
+        Fail(i32),
+    }
+
+    /// A scan fixture whose target-root open is scripted while its
+    /// `map_files` range opens a real fixture file: the sandboxed-process
+    /// shape (an unreachable root, a working `map_files` route), with the
+    /// maps key, guards and ELF facts all real.
+    struct MapFilesFallbackFixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        key: ObjectKey,
+        view: ProcessView,
+        maps: String,
+        mem: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        /// Scripted target-root open failure; `None` performs the real
+        /// open (the healthy route).
+        root_failure: Option<MappedOpenError>,
+        map_files: MapFilesScript,
+        /// Scripted `vm_file` identities (held fd, target range).
+        mapped: Option<(
+            crate::discovery::identity::FileIdentity,
+            crate::discovery::identity::FileIdentity,
+        )>,
+    }
+
+    struct MapFilesFallbackMemory {
+        file: File,
+    }
+
+    impl ScanMemory for MapFilesFallbackMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.file.read_at(bytes, offset)
+        }
+    }
+
+    impl ScanIo for MapFilesFallbackFixture {
+        type Memory = MapFilesFallbackMemory;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(
+                self.maps.as_bytes().to_vec(),
+            )))
+        }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<MapFilesFallbackMemory> {
+            Ok(MapFilesFallbackMemory {
+                file: self.mem.try_clone()?,
+            })
+        }
+        fn open_mapped_object(
+            &mut self,
+            view: &ProcessView,
+            path: &str,
+            budget: &mut CaptureWorkBudget,
+        ) -> Result<File, MappedOpenError> {
+            self.log.borrow_mut().push(format!("root open {path}"));
+            match &self.root_failure {
+                Some(failure) => Err(failure.clone()),
+                // The healthy route: the real open, mirroring the
+                // default (the fixture path exists under our own root).
+                None => match view.with_filesystem(budget, |filesystem, _| {
+                    Ok(filesystem.open_mapped_object(Path::new(path)))
+                }) {
+                    Ok(opened) => opened,
+                    Err(reason) => Err(MappedOpenError {
+                        reason,
+                        foreign_target_root: None,
+                        errno: None,
+                    }),
+                },
+            }
+        }
+        fn open_map_files(
+            &mut self,
+            view: &ProcessView,
+            start: u64,
+            end: u64,
+            _budget: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
+            self.log.borrow_mut().push(format!(
+                "map_files {start:x}-{end:x} pid {}",
+                view.pid()
+            ));
+            match &self.map_files {
+                MapFilesScript::Serve(file) => file.try_clone(),
+                MapFilesScript::Fail(errno) => Err(std::io::Error::from_raw_os_error(*errno)),
+            }
+        }
+        fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
+            match self.mapped {
+                // Scripted identities model an ordinary filesystem,
+                // like BracketFixture: the magic is explicit.
+                Some((held, _)) => Some(crate::discovery::identity::MappedFile {
+                    identity: held,
+                    fs_magic: Some(0xef53),
+                }),
+                None => crate::discovery::identity::self_mapped_file(file).ok(),
+            }
+        }
+        fn range_identity(
+            &mut self,
+            view: &ProcessView,
+            start: u64,
+            end: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            match self.mapped {
+                Some((_, range)) => Ok(Ok(range)),
+                None => view.run_while_same(|| {
+                    crate::discovery::identity::map_files_identity(view.pid(), start, end)
+                }),
+            }
+        }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    impl MapFilesFallbackFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("libfixture.so");
+            // Minimal independent x86-64 ELF header, mirroring
+            // BracketFixture: parseable, exporting nothing wanted.
+            let mut elf = vec![0u8; 64];
+            elf[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+            elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+            elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+            elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+            std::fs::write(&path, elf).unwrap();
+            let view = ProcessView::open(ProcessViewId(72), std::process::id()).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let maps = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 7000-8000 r--p 00004000 {identity}\n"
+            );
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(0xc000).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                key,
+                view,
+                maps,
+                mem,
+                log: Default::default(),
+                root_failure: None,
+                map_files: MapFilesScript::Fail(libc::EPERM),
+                mapped: None,
+            }
+        }
+
+        fn unreachable_root() -> MappedOpenError {
+            MappedOpenError {
+                reason: "opening object within retained target root: No such process (os error 3)"
+                    .into(),
+                foreign_target_root: Some("/proc/99999/fdinfo".into()),
+                errno: Some(libc::ESRCH),
+            }
+        }
+
+        fn run(
+            &mut self,
+            budget: &mut CaptureWorkBudget,
+        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
+            let hooks = HookRegistry::builtin();
+            let hints: &[PathBuf] = &[];
+            scan_view_with_examined(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+                true,
+            )
+        }
+    }
+
+    /// The sandboxed-process shape: the target-root open fails with
+    /// `ESRCH` (an unreachable root, not an exit — the generation pin
+    /// holds), while the VMA's `map_files` link opens the mapped file.
+    /// The object must be examined, with no gap left behind.
+    #[test]
+    fn map_files_fallback_examines_object_when_target_root_is_unreachable() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files =
+            MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((identity, identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the map_files object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.subject != subject),
+            "no gap may remain for the examined object, got {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("map_files 1000-2000")),
+            "the fallback must open the group's VMA range, got {:?}",
+            fixture.log.borrow()
+        );
+    }
+
+    /// Control twin: a reachable target root opens the object the
+    /// ordinary way; `map_files` stays untouched.
+    #[test]
+    fn map_files_fallback_keeps_the_root_open_on_a_reachable_target() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = None;
+        fixture.mapped = Some((identity, identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            examined.iter().any(|object| object.key == fixture.key),
+            "the root-opened object must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().is_empty(),
+            "no gap may remain on the healthy route, got {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            fixture
+                .log
+                .borrow()
+                .iter()
+                .all(|line| !line.starts_with("map_files")),
+            "the healthy route must not touch map_files, got {:?}",
+            fixture.log.borrow()
+        );
+    }
+
+    /// Safety twin: the served file and the VMA's kernel identity
+    /// disagree (the range was remapped after the maps read) — refuse
+    /// with a named gap, never examine the wrong file.
+    #[test]
+    fn map_files_fallback_refuses_when_the_vma_identity_differs() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files =
+            MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
+        fixture.mapped = Some((
+            FileIdentity { dev: 37, ino: 9 },
+            FileIdentity { dev: 37, ino: 10 },
+        ));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the mismatched object must stay unexamined, got {examined:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "the mismatched object must not join, got {:?}",
+            outcome.modules()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == subject
+                    && skip.reason.contains("map_files")
+                    && skip.reason.contains("refused")
+            }),
+            "the mismatch must refuse with a named map_files gap, got {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// The fallback attempt itself is recorded: when `map_files` stays
+    /// unreadable, the original failure keeps its count and name, with
+    /// the attempt beside it.
+    #[test]
+    fn map_files_fallback_keeps_a_named_gap_when_map_files_is_unreadable() {
+        use crate::discovery::identity::FileIdentity;
+        let mut fixture = MapFilesFallbackFixture::new();
+        let identity = FileIdentity { dev: 37, ino: 9 };
+        fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
+        fixture.map_files = MapFilesScript::Fail(libc::EPERM);
+        fixture.mapped = Some((identity, identity));
+        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let subject = fixture.path.display().to_string();
+        assert!(
+            examined.iter().all(|object| object.key != fixture.key),
+            "the unopenable object must stay unexamined, got {examined:?}"
+        );
+        let skip = outcome
+            .skipped()
+            .iter()
+            .find(|skip| skip.subject == subject)
+            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
+        assert!(
+            skip.reason.starts_with(
+                "opening object within retained target root: No such process (os error 3)"
+            ),
+            "the original failure keeps its name, got {:?}",
+            skip.reason
+        );
+        assert!(
+            skip.reason.contains("(map_files fallback:"),
+            "the attempt is recorded beside it, got {:?}",
+            skip.reason
+        );
+        assert!(
+            skip.reason
+                .contains("(target root /proc/99999/fdinfo differs from the observer root)"),
+            "the foreign root keeps its suffix, got {:?}",
+            skip.reason
+        );
+    }
+
     #[test]
     fn unscoped_scan_with_unavailable_witness_keeps_refusing() {
         let dir = tempfile::tempdir().unwrap();

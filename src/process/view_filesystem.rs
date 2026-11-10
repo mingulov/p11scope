@@ -275,10 +275,16 @@ fn same_filesystem(left: &Filesystem, right: &Filesystem) -> bool {
 /// A mapping-driven open failure: the user-facing reason, plus the target
 /// root's display when that root is foreign (differs from the observer's).
 /// Same-root failures keep today's per-object reasons byte-identical.
+/// `errno` carries the open(2)-family errno when the failure came from
+/// opening (the root handle or the `openat2` resolution); precondition,
+/// size, type and reopen refusals carry `None` and never authorize a
+/// fallback. The scan reads it to detect an unreachable target root
+/// (`ESRCH` under a live generation pin: a sandbox jail, not an exit).
 #[derive(Debug, Clone)]
 pub(crate) struct MappedOpenError {
     pub reason: String,
     pub foreign_target_root: Option<String>,
+    pub errno: Option<i32>,
 }
 
 /// Whether the observer may retry a mapping open in its own root: only a
@@ -322,10 +328,14 @@ fn fallback_allowed(
 /// failure came from the `openat2` resolution itself. Only a
 /// resolution errno can authorize the host fallback; a precondition,
 /// size, type or reopen refusal carries `None` and never retries.
+/// `errno` carries the open(2)-family errno from either the root-handle
+/// open or the `openat2` resolution, so the scan can detect an
+/// unreachable target root (`ESRCH`); every other refusal carries `None`.
 #[derive(Debug, Clone)]
 pub(crate) struct RootedOpenFailure {
     pub reason: String,
     pub resolution_errno: Option<i32>,
+    pub errno: Option<i32>,
 }
 
 /// Whether an `openat2` errno from the target-root open may retry on
@@ -695,6 +705,7 @@ impl<'a> ViewFilesystem<'a> {
         Self::open_pinned_regular(&pinned).map_err(|reason| RootedOpenFailure {
             reason,
             resolution_errno: None,
+            errno: None,
         })
     }
 
@@ -708,6 +719,7 @@ impl<'a> ViewFilesystem<'a> {
             .map_err(|error| RootedOpenFailure {
                 reason: error.to_string(),
                 resolution_errno: None,
+                errno: None,
             })?
             .len();
         let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
@@ -715,6 +727,7 @@ impl<'a> ViewFilesystem<'a> {
             return Err(RootedOpenFailure {
                 reason: format!("object is {size} bytes; limit is {limit}"),
                 resolution_errno: None,
+                errno: None,
             });
         }
         Ok(file)
@@ -766,6 +779,7 @@ impl<'a> ViewFilesystem<'a> {
             return Err(MappedOpenError {
                 reason: failure.reason,
                 foreign_target_root: foreign,
+                errno: failure.errno,
             });
         }
         let fallback = if with_size_cap {
@@ -778,6 +792,7 @@ impl<'a> ViewFilesystem<'a> {
             Err(fallback_reason) => Err(MappedOpenError {
                 reason: format!("{} (host-root fallback: {fallback_reason})", failure.reason),
                 foreign_target_root: foreign,
+                errno: failure.errno,
             }),
         }
     }
@@ -876,11 +891,13 @@ impl<'a> ViewFilesystem<'a> {
                 reason: "target-root object requires an absolute path without parent traversal"
                     .into(),
                 resolution_errno: None,
+                errno: None,
             });
         }
         let relative = path.strip_prefix("/").map_err(|error| RootedOpenFailure {
             reason: error.to_string(),
             resolution_errno: None,
+            errno: None,
         })?;
         let ordinary_root;
         let root = match &self.cold {
@@ -893,6 +910,7 @@ impl<'a> ViewFilesystem<'a> {
                     .map_err(|error| RootedOpenFailure {
                         reason: error.to_string(),
                         resolution_errno: None,
+                        errno: error.raw_os_error(),
                     })?;
                 &ordinary_root
             }
@@ -902,6 +920,7 @@ impl<'a> ViewFilesystem<'a> {
                 RootedOpenFailure {
                     reason: error.to_string(),
                     resolution_errno: None,
+                    errno: None,
                 }
             })?;
         let how = OpenHow {
@@ -935,6 +954,7 @@ impl<'a> ViewFilesystem<'a> {
         .map_err(|error| RootedOpenFailure {
             reason: format!("opening object within retained target root: {error}"),
             resolution_errno: error.raw_os_error(),
+            errno: error.raw_os_error(),
         })?;
         // SAFETY: successful openat2 returned a newly owned descriptor.
         let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(result as i32) });
@@ -943,12 +963,14 @@ impl<'a> ViewFilesystem<'a> {
             .map_err(|error| RootedOpenFailure {
                 reason: error.to_string(),
                 resolution_errno: None,
+                errno: None,
             })?
             .is_file()
         {
             return Err(RootedOpenFailure {
                 reason: "target-root object is not a regular file".into(),
                 resolution_errno: None,
+                errno: None,
             });
         }
         Ok(file)
@@ -1016,15 +1038,18 @@ mod tests {
                 "opening object within retained target root: No such file or directory (os error 2)"
                     .into(),
             resolution_errno: Some(libc::ENOENT),
+            errno: Some(libc::ENOENT),
         };
         let refused = RootedOpenFailure {
             reason: "target-root object is not a regular file".into(),
             resolution_errno: None,
+            errno: None,
         };
         let denied = RootedOpenFailure {
             reason: "opening object within retained target root: Permission denied (os error 13)"
                 .into(),
             resolution_errno: Some(libc::EACCES),
+            errno: Some(libc::EACCES),
         };
         // Healthy: a resolution failure in a gated view retries.
         assert!(fallback_allowed(

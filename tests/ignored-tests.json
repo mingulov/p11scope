@@ -1724,14 +1724,14 @@
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
-      "path": "attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_exhaustion_262144_then_quota",
       "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells",
       "until": "0.8.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
-      "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b",
+      "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_262145th_leader_in_b",
       "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders",
       "until": "0.8.0"
     },

@@ -43,8 +43,8 @@ pub(crate) const PROOF_OBJECT_NAME: &str = "p11scope-ebpf-image-bank-proof-v1";
 /// Cut headroom `H`: the Session prepares the next bank once the live
 /// bank's `next_ticket` reaches `LIMIT - H`.
 pub(crate) const CUT_HEADROOM: u64 = 1024;
-/// Real per-bank ticket limit. Never raised, never reset.
-pub(crate) const TICKET_LIMIT: u64 = 16384;
+/// Real per-bank ticket limit: the shared production budget. Never reset.
+pub(crate) const TICKET_LIMIT: u64 = p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT;
 /// Cut trigger: `LIMIT - H`.
 pub(crate) const CUT_TRIGGER: u64 = TICKET_LIMIT - CUT_HEADROOM;
 /// Attach cookie for every Singles link (one value so
@@ -571,8 +571,8 @@ fn quota_unavailable_after(before: u64, calls: u64) -> u64 {
     before + calls + 1
 }
 
-/// N4 second-bank tables budget: plan's per-element 88x16384+72x16384
-/// plus buckets 2x262144, within the plan's +-5% fdinfo-vs-computed
+/// N4 second-bank tables budget: plan's per-element 88xLIMIT+72xLIMIT
+/// plus buckets 2x16xLIMIT, within the plan's +-5% fdinfo-vs-computed
 /// rule. Newer kernels report buckets+htab+locks in fdinfo memlock
 /// via htab_map_mem_usage (kernel/bpf/hashtab.c); 5.15 reports the
 /// static footprint via bpf_map_memory_footprint (kernel/bpf/syscall.c),
@@ -736,7 +736,7 @@ fn n8_requires_exact_count(multi_possible: bool) -> bool {
 /// full at its declared worst case -- fails named on every kernel.
 /// Two signals: a START insert refused with E2BIG (the START map is
 /// full; N8 holds at most 4 live rows), and ticket saturation at the
-/// 16,384 limit with any counted failure on that bank (the per-bank
+/// 262,144 limit with any counted failure on that bank (the per-bank
 /// maps are full, so every refusal there is plausibly capacity; the
 /// seed errno is unrecorded, hence fail-closed). The START errno is
 /// last-writer under concurrent failures, exact at observed rates.
@@ -1097,10 +1097,11 @@ fn n5_production_ns(var: Option<&str>) -> Option<f64> {
     }
 }
 
-/// N4 computed second-bank tables figure: per-element 88x16384 +
-/// 72x16384 plus buckets 2x262144 = 3145728.
+/// N4 computed second-bank tables figure: per-element 88xLIMIT +
+/// 72xLIMIT plus buckets 2x16xLIMIT = 192xLIMIT (50,331,648 at the
+/// 262,144 ticket budget).
 fn n4_second_bank_tables_figure() -> u64 {
-    88 * 16384 + 72 * 16384 + 2 * 262144
+    88 * TICKET_LIMIT + 72 * TICKET_LIMIT + 2 * 16 * TICKET_LIMIT
 }
 
 /// N4 second-bank tables floor: 95% of the computed figure.
@@ -3179,14 +3180,14 @@ mod tests {
 
     #[test]
     #[ignore = "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells"]
-    fn privileged_image_bank_exhaustion_16384_then_quota() {
+    fn privileged_image_bank_exhaustion_262144_then_quota() {
         require_root();
         let driver = BankProofDriver::setup("exhaustion", Backend::Singles).expect("setup");
         let mut driver = driver;
         driver.attach_entry(Backend::Singles).expect("attach entry");
         let before = driver.control(0).expect("control A");
         assert_eq!(before.next_ticket, 0, "N6 bank A starts fresh");
-        for batch in 0..4 {
+        for batch in 0..TICKET_LIMIT / 4096 {
             let output = driver
                 .run_simple(&["callfork", "4096"])
                 .expect("callfork batch");
@@ -3234,12 +3235,15 @@ mod tests {
             driver.gate(1).expect("gate B"),
             driver.start_rows_for_slot(0).expect("scan START").len()
         );
-        assert_eq!(after.next_ticket, 16384, "N6 A.next_ticket reaches 16,384");
+        assert_eq!(
+            after.next_ticket, TICKET_LIMIT,
+            "N6 A.next_ticket reaches 262,144"
+        );
         assert_eq!(after.retry_exhausted, 0, "N6 no retry exhaustion");
         assert_eq!(
             ledger_with_all_burns(account.admitted, after.create_failures, &account),
-            16384,
-            "N6 successful + burned = 16,384"
+            TICKET_LIMIT,
+            "N6 successful + burned = 262,144"
         );
         assert_eq!(
             account.cookie_failures, after.create_failures,
@@ -3255,10 +3259,10 @@ mod tests {
         assert_eq!(driver.gate(1).expect("gate B"), 0, "N6 gate B balanced");
         let output = driver
             .run_simple(&["callfork", "1"])
-            .expect("16385th leader");
+            .expect("262145th leader");
         assert!(
             output.status.success(),
-            "N6 16385th: {}",
+            "N6 262145th: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let quota = driver.control(0).expect("control A");
@@ -3267,7 +3271,10 @@ mod tests {
             "P11_BANK_N6_quota next={} unavailable={} admitted={}",
             quota.next_ticket, quota.unavailable, quota_account.admitted
         );
-        assert_eq!(quota.next_ticket, 16384, "N6 quota consumes no ticket");
+        assert_eq!(
+            quota.next_ticket, TICKET_LIMIT,
+            "N6 quota consumes no ticket"
+        );
         assert_eq!(
             quota.unavailable,
             after.unavailable + 1,
@@ -3304,7 +3311,10 @@ mod tests {
             "P11_BANK_N16 next={} unavailable={} admitted={}",
             saturated.next_ticket, saturated.unavailable, saturated_account.admitted
         );
-        assert_eq!(saturated.next_ticket, 16384, "N16 burst consumes no ticket");
+        assert_eq!(
+            saturated.next_ticket, TICKET_LIMIT,
+            "N16 burst consumes no ticket"
+        );
         assert_eq!(
             saturated.unavailable,
             quota.unavailable + 2048,
@@ -3338,12 +3348,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders"]
-    fn privileged_image_bank_cut_16385th_leader_in_b() {
+    #[ignore = "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 262,145 leaders"]
+    fn privileged_image_bank_cut_262145th_leader_in_b() {
         require_root();
         let mut driver = BankProofDriver::setup("cut", Backend::Singles).expect("setup");
         driver.attach_entry(Backend::Singles).expect("attach entry");
-        for batch in 0..3 {
+        for batch in 0..(TICKET_LIMIT - CUT_HEADROOM) / 5120 {
             let output = driver
                 .run_simple(&["callfork", "5120"])
                 .expect("trigger fill batch");
@@ -3361,7 +3371,7 @@ mod tests {
         driver.prepare(1).expect("prepare B at trigger");
         let output = driver
             .run_simple(&["callfork", "1023"])
-            .expect("fill to 16383");
+            .expect("fill to LIMIT-1");
         assert!(
             output.status.success(),
             "N7 top-up: {}",
@@ -3369,8 +3379,8 @@ mod tests {
         );
         assert_eq!(
             driver.control(0).expect("control A").next_ticket,
-            16383,
-            "N7 A at 16,383"
+            TICKET_LIMIT - 1,
+            "N7 A at 262,143"
         );
         let mut held = driver
             .spawn_controlled(&["hold"])
@@ -3378,8 +3388,8 @@ mod tests {
         held.read_line("ENTERED").expect("held call entered");
         assert_eq!(
             driver.control(0).expect("control A").next_ticket,
-            16384,
-            "N7 held call takes A ticket 16,384"
+            TICKET_LIMIT,
+            "N7 held call takes A ticket 262,144"
         );
         let frozen = driver.control(0).expect("control A");
         let frozen_account = driver.account(0).expect("account A");
@@ -3392,10 +3402,10 @@ mod tests {
         );
         let output = driver
             .run_simple(&["callfork", "1"])
-            .expect("16385th leader");
+            .expect("262145th leader");
         assert!(
             output.status.success(),
-            "N7 16385th: {}",
+            "N7 262145th: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let bank_b = driver.control(1).expect("control B");
@@ -3412,7 +3422,10 @@ mod tests {
             bank_b.next_ticket, 1,
             "N7 first allocation after the cut is B ticket 1"
         );
-        assert_eq!(account_b.admitted, 1, "N7 leader 16,385 holds a B identity");
+        assert_eq!(
+            account_b.admitted, 1,
+            "N7 leader 262,145 holds a B identity"
+        );
         let check = driver.control(0).expect("control A");
         assert_eq!(
             check.next_ticket, frozen.next_ticket,
@@ -3475,7 +3488,7 @@ mod tests {
         assert_eq!(
             ledger_with_all_burns(final_a.admitted, burns_a, &final_a)
                 + ledger_with_all_burns(final_b.admitted, burns_b, &final_b),
-            16385,
+            TICKET_LIMIT + 1,
             "N7 bank counts plus counted burns sum to ledger calls"
         );
         assert_eq!(
@@ -4001,8 +4014,8 @@ mod tests {
             fork_birth_tickets(after_fork, 1) + ambient,
             "N12 birth-installed ticket reused by the call, plus ambient"
         );
-        // The burn: 17,000 more births saturate A and trigger the cut.
-        for batch in 0..4 {
+        // The burn: 263,500 more births saturate A and trigger the cut.
+        for batch in 0..(TICKET_LIMIT + 4249) / 4250 {
             let output = driver
                 .run_simple(&["fork", "4250"])
                 .expect("fork burn batch");
@@ -4017,7 +4030,7 @@ mod tests {
             "P11_BANK_N12 next={} unavailable={} create_failures={} retry_exhausted={}",
             burned.next_ticket, burned.unavailable, burned.create_failures, burned.retry_exhausted
         );
-        assert_eq!(burned.next_ticket, 16384, "N12 births saturate A");
+        assert_eq!(burned.next_ticket, TICKET_LIMIT, "N12 births saturate A");
         assert_eq!(burned.retry_exhausted, 0, "N12 no retry exhaustion");
         // Sentinel phase 2: quota refusals counted exactly through saturation.
         let unavailable_before = burned.unavailable;
@@ -4030,7 +4043,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let phase2 = driver.control(0).expect("control A");
-        assert_eq!(phase2.next_ticket, 16384, "N12 saturated admits nothing");
+        assert_eq!(
+            phase2.next_ticket, TICKET_LIMIT,
+            "N12 saturated admits nothing"
+        );
         let ambient = ambient_births(phase2.unavailable - unavailable_before, 101)
             .expect("N12 call 100: test-owned quota refusals missing during the window");
         println!("P11_BANK_AMBIENT births={ambient} phase=call100quota");
@@ -4071,7 +4087,7 @@ mod tests {
         assert_eq!(driver.gate(0).expect("gate A"), 0, "N12 gate A balanced");
         assert_eq!(driver.gate(1).expect("gate B"), 0, "N12 gate B balanced");
         drop(driver);
-        // N4 memlock at worst state: both banks seeded full at 16,384.
+        // N4 memlock at worst state: both banks seeded full at 262,144.
         let mut driver =
             BankProofDriver::setup("memlock", Backend::Singles).expect("memlock setup");
         driver.attach_entry(Backend::Singles).expect("attach entry");
@@ -4080,7 +4096,7 @@ mod tests {
             10,
             "N4 exactly 10 added maps under R0"
         );
-        for batch in 0..4 {
+        for batch in 0..TICKET_LIMIT / 4096 {
             let output = driver
                 .run_simple(&["callfork", "4096"])
                 .expect("seed bank A batch");
@@ -4092,12 +4108,12 @@ mod tests {
         }
         assert_eq!(
             driver.control(0).expect("control A").next_ticket,
-            16384,
+            TICKET_LIMIT,
             "N4 A full"
         );
         driver.prepare(1).expect("prepare B");
         driver.flip(1, 2).expect("flip to B");
-        for batch in 0..4 {
+        for batch in 0..TICKET_LIMIT / 4096 {
             let output = driver
                 .run_simple(&["callfork", "4096"])
                 .expect("seed bank B batch");
@@ -4109,7 +4125,7 @@ mod tests {
         }
         assert_eq!(
             driver.control(1).expect("control B").next_ticket,
-            16384,
+            TICKET_LIMIT,
             "N4 B full"
         );
         let shared = driver.loads.get("shared").expect("shared load");
@@ -4133,7 +4149,7 @@ mod tests {
             let tables_floor = n4_second_bank_tables_floor();
             assert!(
                 n4_tables_within_band(tables),
-                "N4 second-bank tables within plan 3145728 +-5%: {tables} not in [{tables_floor}, {tables_budget}]"
+                "N4 second-bank tables within plan 50331648 +-5%: {tables} not in [{tables_floor}, {tables_budget}]"
             );
         } else {
             println!(
@@ -4141,7 +4157,7 @@ mod tests {
             );
             assert!(
                 tables <= tables_budget,
-                "N4 second-bank tables fit plan 3145728 within 5%: {continuity_b} + {tgid_b} <= {tables_budget}"
+                "N4 second-bank tables fit plan 50331648 within 5%: {continuity_b} + {tgid_b} <= {tables_budget}"
             );
         }
         assert!(
@@ -5484,11 +5500,11 @@ mod tests {
 
     #[test]
     fn n7_burns_keep_ledger_exact() {
-        // Host r3-8-input: admitted 16383 + 1 B = 16384; one counted
+        // Host r3-8-input: admitted 262143 + 1 B = 262144; one counted
         // burn (task-storage creation failure under load) keeps the
-        // 16385 ledger exact, mirroring N6's successful+burned.
-        assert_eq!(super::n7_ledger_with_burns(16384, 1), 16385);
-        assert_eq!(super::n7_ledger_with_burns(16385, 0), 16385);
+        // 262145 ledger exact, mirroring N6's successful+burned.
+        assert_eq!(super::n7_ledger_with_burns(262144, 1), 262145);
+        assert_eq!(super::n7_ledger_with_burns(262145, 0), 262145);
     }
 
     #[test]
@@ -5917,7 +5933,7 @@ mod tests {
             .find("fn privileged_image_bank_verifier_stats")
             .expect("N2 present");
         let tail = source[start..]
-            .find("fn privileged_image_bank_exhaustion_16384_then_quota")
+            .find("fn privileged_image_bank_exhaustion_262144_then_quota")
             .expect("N2 end");
         let body = &source[start..start + tail];
         assert!(
@@ -5990,7 +6006,7 @@ mod tests {
 
     #[test]
     fn n8_capacity_failure_names_ticket_saturation() {
-        // Tickets saturated at the 16,384 limit means the per-bank
+        // Tickets saturated at the 262,144 limit means the per-bank
         // maps are full at the declared worst case: any counted
         // failure there is capacity, failing closed (the seed errno
         // is unrecorded). Saturation alone, without a failure, and
@@ -6062,10 +6078,10 @@ mod tests {
     #[test]
     fn n4_tables_figure_matches_plan() {
         // The computed second-bank figure and its +-5% band, pinned
-        // as values: 88x16384+72x16384+2x262144 = 3145728.
-        assert_eq!(super::n4_second_bank_tables_figure(), 3145728);
-        assert_eq!(super::n4_second_bank_tables_floor(), 2988441);
-        assert_eq!(super::n4_second_bank_tables_budget(), 3303014);
+        // as values: 88x262144+72x262144+2x16x262144 = 50331648.
+        assert_eq!(super::n4_second_bank_tables_figure(), 50331648);
+        assert_eq!(super::n4_second_bank_tables_floor(), 47815065);
+        assert_eq!(super::n4_second_bank_tables_budget(), 52848230);
     }
 
     #[test]
@@ -6082,23 +6098,24 @@ mod tests {
 
     #[test]
     fn n4_tables_band_binds_both_sides() {
-        // The band admits the computed figure, its edges, and the
-        // measured host/6.6 tables; it refuses above-budget and
-        // below-floor sums, including the measured 5.15 static
-        // footprint.
-        for measured in [
-            2988441,
-            3145728,
-            3303014,
-            1704832 + 1442688,
-            1704960 + 1442816,
-        ] {
+        // The band admits the computed figure and its edges; it refuses
+        // above-budget and below-floor sums, including the measured 5.15
+        // static footprint and the old-scale figure and host tables,
+        // which now sit far below the floor.
+        for measured in [47815065, 50331648, 52848230] {
             assert!(
                 super::n4_tables_within_band(measured),
                 "band admits {measured}"
             );
         }
-        for measured in [2988440, 3303015, 524288 + 262144] {
+        for measured in [
+            47815064,
+            52848231,
+            524288 + 262144,
+            3145728,
+            1704832 + 1442688,
+            1704960 + 1442816,
+        ] {
             assert!(
                 !super::n4_tables_within_band(measured),
                 "band refuses {measured}"
@@ -6344,16 +6361,16 @@ mod tests {
 
     #[test]
     fn n6_checkpoint_waits_for_quiescence_and_conserves_all_burns() {
-        // The host-only 16383/16384 flake: the N6 checkpoint must poll
+        // The host-only 262143/262144 flake: the N6 checkpoint must poll
         // for quiescence with a bounded deadline, print every counted
         // bucket, and conserve over all of them; a silent shortfall or
         // stuck live ref fails by name after the deadline.
         let source = include_str!("image_bank_proof.rs");
         let start = source
-            .find("fn privileged_image_bank_exhaustion_16384_then_quota")
+            .find("fn privileged_image_bank_exhaustion_262144_then_quota")
             .expect("N6 present");
         let tail = source[start..]
-            .find("fn privileged_image_bank_cut_16385th_leader_in_b")
+            .find("fn privileged_image_bank_cut_262145th_leader_in_b")
             .expect("N6 end");
         let body = &source[start..start + tail];
         assert!(
@@ -6385,7 +6402,7 @@ mod tests {
         // task-storage creation failures.
         let source = include_str!("image_bank_proof.rs");
         let start = source
-            .find("fn privileged_image_bank_cut_16385th_leader_in_b")
+            .find("fn privileged_image_bank_cut_262145th_leader_in_b")
             .expect("N7 present");
         let tail = source[start..]
             .find("fn privileged_image_bank_concurrent_cut_counts_once")
@@ -6410,7 +6427,7 @@ mod tests {
         // Entry slots carry ~370-byte frames (N3); on 6.13+ they take
         // the shared per-CPU private stack unless they issue a tail
         // call of their own, and a same-CPU preemption then clobbers
-        // keys and rows (host-only N6 16383/16384 flake). Both slot
+        // keys and rows (host-only N6 262143/262144 flake). Both slot
         // roots must opt out through STACK_GUARD: each driver loads
         // them once with its backend's attach type (the
         // template_second precedent: one program, one type per map
@@ -6868,7 +6885,7 @@ mod tests {
         let stats_body = fn_body_between(
             source,
             "fn privileged_image_bank_verifier_stats",
-            "fn privileged_image_bank_exhaustion_16384_then_quota",
+            "fn privileged_image_bank_exhaustion_262144_then_quota",
         );
         assert!(
             !stats_body.contains("install_slot")
@@ -7711,8 +7728,8 @@ mod tests {
         let source = include_str!("image_bank_proof.rs");
         let n6 = fn_body_between(
             source,
-            "fn privileged_image_bank_exhaustion_16384_then_quota",
-            "fn privileged_image_bank_cut_16385th_leader_in_b",
+            "fn privileged_image_bank_exhaustion_262144_then_quota",
+            "fn privileged_image_bank_cut_262145th_leader_in_b",
         );
         assert!(
             n6.contains("fresh_bank_admission_clean"),
@@ -7720,7 +7737,7 @@ mod tests {
         );
         let n7 = fn_body_between(
             source,
-            "fn privileged_image_bank_cut_16385th_leader_in_b",
+            "fn privileged_image_bank_cut_262145th_leader_in_b",
             "fn privileged_image_bank_concurrent_cut_counts_once",
         );
         assert!(

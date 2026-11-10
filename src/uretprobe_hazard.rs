@@ -1293,13 +1293,15 @@ mod tests {
             )?;
             let shared = body(attach, "fn load_capture_object_bytes_with_images(", "\n}\n")?;
             for setting in [
+                "let full_image_maps = IMAGE_IDENTITY_TICKET_LIMIT as u32;",
+                "let image_maps = if full_images { full_image_maps } else { 1 };",
                 "EbpfLoader::new()",
                 ".btf(Some(btf))",
                 ".allow_unsupported_maps()",
                 ".map_max_entries(\"EVENTS\", events_bytes)",
                 ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
-                ".map_max_entries(\"IMAGE_CONTINUITY\", if full_images { 16_384 } else { 1 })",
-                ".map_max_entries(\"IMAGE_TGID_INDEX\", if full_images { 16_384 } else { 1 })",
+                ".map_max_entries(\"IMAGE_CONTINUITY\", image_maps)",
+                ".map_max_entries(\"IMAGE_TGID_INDEX\", image_maps)",
                 ".map_max_entries(\"IMAGE_QUERY_REQUESTS\", if full_images { 1_024 } else { 1 })",
                 ".load(object)",
             ] {

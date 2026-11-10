@@ -44,7 +44,7 @@ _SPEC.loader.exec_module(stats)
 LIMITS = dict(stats.DEFAULTS)
 LOSS_GAP = "lifecycle evidence lost"
 LOSS_KEYS = ("ring_loss", "malformed", "failed_quanta")
-TICKET_LIMIT = 16384
+TICKET_LIMIT = 262144
 CLK_TCK = 100
 
 
@@ -667,12 +667,12 @@ def self_test():
         sample.mkdir(parents=True)
         (sample / "maps.tsv").write_text(
             "# ms map rows capacity extra\n"
-            "0\tCOOKIE_CTL\t1\t1\tnext_ticket=100 limit=16384\n0\tCALLER_USE\t10\t65536\t\n"
-            "10000\tCOOKIE_CTL\t1\t1\tnext_ticket=200 limit=16384\n10000\tCALLER_USE\t30\t65536\t\n"
+            "0\tCOOKIE_CTL\t1\t1\tnext_ticket=100 limit=262144\n0\tCALLER_USE\t10\t65536\t\n"
+            "10000\tCOOKIE_CTL\t1\t1\tnext_ticket=200 limit=262144\n10000\tCALLER_USE\t30\t65536\t\n"
         )
         result = m5_sample(sample)
         assert result["next_ticket_per_s"] == 10 and result["caller_use_rows_per_s"] == 2, result
-        assert round(result["s_to_ticket_limit"]) == 1618, result
+        assert round(result["s_to_ticket_limit"]) == 26194, result
         print("  m5: slopes and projections ok")
 
         # M7.

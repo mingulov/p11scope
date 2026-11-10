@@ -63,7 +63,7 @@ static void reset(void)
 {
     memset(&target, 0, sizeof(target)); target.mode = 1; target.tgid = 400;
     memset(&ctl, 0, sizeof(ctl)); ctl.generation = 3; ctl.deadline_ns = 200; ctl.visit_limit = 8;
-    memset(&cookie_ctl, 0, sizeof(cookie_ctl)); cookie_ctl.limit = 16384;
+    memset(&cookie_ctl, 0, sizeof(cookie_ctl)); cookie_ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT;
     memset(&continuity, 0, sizeof(continuity));
     flags = 1; coverage = 1; have_continuity = have_index = have_cookie = race_exec = 0;
     row_count = 0; task.tgid = 400; task.group_leader = &task; task.self_exec_id = 0;

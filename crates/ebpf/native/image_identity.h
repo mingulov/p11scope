@@ -14,7 +14,7 @@ typedef unsigned long long u64;
 #define BPF_F_NO_PREALLOC 1
 #define BPF_LOCAL_STORAGE_GET_F_CREATE 1
 #define CLONE_THREAD 0x00010000ULL
-#define IMAGE_IDENTITY_TICKET_LIMIT 16384ULL
+#define IMAGE_IDENTITY_TICKET_LIMIT 262144ULL
 #define COOKIE_CAS_TRIES 8
 #define U64_MAX_VALUE (~0ULL)
 
@@ -37,7 +37,7 @@ struct task_struct {
 } __attribute__((preserve_access_index));
 
 struct image_identity { u64 task_cookie; u64 exec_id; };
-/* Matches ebpf-common ImageIdentityControl. Loader publishes limit=16384,
+/* Matches ebpf-common ImageIdentityControl. Loader publishes limit=262144,
  * other fields zero, before links. BPF alone mutates while linked; no reset. */
 struct control {
     u64 limit;
@@ -80,9 +80,9 @@ u32 p11_image_identity_issued(u64 *watermark_out);
  * seeded there, so no key can alias across banks. */
 #define IMAGE_BANK_SLOTS 2U
 #define IMAGE_BANK_NO_SLOT 2U
-/* Incarnations are 48-bit: bit 16 + 48 fills the u64 exactly, so an
- * incarnation at or past 2^48 would wrap the qualifier into an alias. */
-#define IMAGE_IDENTITY_INCARNATION_LIMIT (1ULL << 48)
+/* Incarnations are 44-bit: bit 20 + 44 fills the u64 exactly, so an
+ * incarnation at or past 2^44 would wrap the qualifier into an alias. */
+#define IMAGE_IDENTITY_INCARNATION_LIMIT (1ULL << 44)
 /* Lifecycle: after the cut the Session proves the retired bank drained
  * (a Session-side drain proof, owned outside this unit), then clears
  * that bank's prepared bit as the fold claim. The kernel folds the
@@ -104,13 +104,13 @@ struct image_bank_select {
     u64 folded_issued;
     u64 update_losses;
 };
-/* Qualified identity cookie: the local ticket in bits 0..14, the bank
- * in bit 15, the incarnation in bits 16+. Bank A incarnation 0 keeps
+/* Qualified identity cookie: the local ticket in bits 0..18, the bank
+ * in bit 19, the incarnation in bits 20+. Bank A incarnation 0 keeps
  * legacy cookies identical to tickets; every other (bank,
  * incarnation) issues disjoint cookies while each bank keeps its
- * 1..16384 local budget. The ticket query and the EXEC binding keep
+ * 1..262144 local budget. The ticket query and the EXEC binding keep
  * returning the local ticket; only the task identity carries the
- * qualifier. Incarnations past the 48-bit range refuse (BAD_CONFIG)
+ * qualifier. Incarnations past the 44-bit range refuse (BAD_CONFIG)
  * instead of wrapping into an alias; stored-cell re-queries probe first
  * and read the source epoch after (safe today because incarnations are
  * immutable until P3b enables re-prepare), while fresh issues bind the
@@ -118,7 +118,7 @@ struct image_bank_select {
  * matches the ticket's epoch. */
 static __always_inline u64 image_identity_qualify(u64 ticket, u64 bank, u64 incarnation)
 {
-    return ticket | (bank << 15) | (incarnation << 16);
+    return ticket | (bank << 19) | (incarnation << 20);
 }
 _Static_assert(sizeof(struct image_bank_select) == 96, "bank select ABI");
 _Static_assert(__builtin_offsetof(struct image_bank_select, bank) == 0, "bank current");

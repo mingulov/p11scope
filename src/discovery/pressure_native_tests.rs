@@ -3282,7 +3282,7 @@ fn image_quota_262145_births_are_counted_identity_refusals() {
             .unwrap_or_else(|error| panic!("{WHAT}: reap {}: {error}", reaped + 1));
         reaped += 1;
         assert!(status.success(), "{WHAT}: owned birth {reaped} exits 0");
-        if reaped % 4096 == 0 {
+        if reaped.is_multiple_of(4096) {
             assert!(
                 wall_start.elapsed() < WAVE_DEADLINE,
                 "{WHAT}: birth wave exceeded its bound at {reaped}/{BIRTHS}"

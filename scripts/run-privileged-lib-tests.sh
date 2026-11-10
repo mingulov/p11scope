@@ -713,8 +713,8 @@ discovery::engine::pressure_native_tests::image_quota_262145_births_are_counted_
 SKIP_TESTS=(
 # Private image-bank cells require a separately enabled FULL proof build.
 attach::image_bank_proof::tests::privileged_image_bank_verifier_stats
-attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota
-attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b
+attach::image_bank_proof::tests::privileged_image_bank_exhaustion_262144_then_quota
+attach::image_bank_proof::tests::privileged_image_bank_cut_262145th_leader_in_b
 attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once
 attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut
 attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused
@@ -1113,7 +1113,7 @@ private_image_proof_name() {
     local prefix=attach::image_bank_proof::tests::privileged_image_bank_
     case $1 in "$prefix"*) ;; *) return 1 ;; esac
     case ${1#"$prefix"} in
-        verifier_stats|exhaustion_16384_then_quota|cut_16385th_leader_in_b|\
+        verifier_stats|exhaustion_262144_then_quota|cut_262145th_leader_in_b|\
         concurrent_cut_counts_once|held_return_across_cut|late_incarnation_refused|\
         failure_modes_refuse_and_balance|fork_burn_sentinel|second_rollover|\
         omitted_route_refuses|exec_query_span_cut|attach_cookie_through_dispatcher|\

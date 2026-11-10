@@ -85,8 +85,8 @@ pub(crate) const MAX_PENDING: usize = 1_024;
 pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
 /// Capture-wide exact-registry ceilings. Observed eviction degrades late
 /// calls; a coverage tombstone eviction latches unknown-key refusal. Retired
-/// image eviction compresses permanent per-cookie refusals into132KiB bounded
-/// negative metadata. Ordinary era changes clear positive observations and
+/// image eviction compresses permanent per-cookie refusals into ~2.06 MiB
+/// bounded negative metadata. Ordinary era changes clear positive observations and
 /// advance a checked original-scan fence, never resetting negative metadata.
 pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
 pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
@@ -563,7 +563,7 @@ impl fmt::Debug for ImageKey {
 const COOKIE_LIMIT: usize = p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize;
 
 /// Permanent negative metadata, bounded by the owning native domain's lifetime
-/// tickets: 128 KiB exec watermarks plus two 2 KiB bitsets. Exec0 is valid.
+/// tickets: 2 MiB exec watermarks plus two 32 KiB bitsets. Exec0 is valid.
 struct RetirementLedger {
     through: Box<[u64]>,
     valid: Box<[u64]>,

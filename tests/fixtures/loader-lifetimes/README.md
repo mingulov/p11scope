@@ -24,7 +24,7 @@ pointers) puts functions at the same offsets as a real 3.2 list.
 
 ## What one lifetime does
 
-`lifetime-driver PROVIDER LABEL` (LABEL 1..16385) stats the provider,
+`lifetime-driver PROVIDER LABEL` (LABEL 1..262145) stats the provider,
 dlopens it, calls `C_GetFunctionList`, `C_GetInterfaceList` (count query
 then one entry) and `C_GetInterface` with exact expected returns, then
 calls table slots 2 (`C_GetInfo`) and 4 (`C_GetSlotList`) with exact
@@ -53,8 +53,8 @@ plus private mapping, following `scripts/mapped-provider-pin.py`),
 retains that FD across the workload, executes each lifetime via the
 FD-backed path, re-hashes the same FD afterwards and fails on mutation.
 It binds each row's `pid` to its held child handle, and writes header +
-`N` lifetime rows + done as JSONL. Bounds: 20,000 rows, 4,096 bytes per
-line, 16 MiB total, at most 16,385 lifetimes, sequential launch (live 1,
+`N` lifetime rows + done as JSONL. Bounds: 300,000 rows, 4,096 bytes per
+line, 128 MiB total, at most 262,145 lifetimes, sequential launch (live 1,
 within the required at most 4).
 
 Driver `provider_dev`/`provider_ino` are the stat (file) domain. The
@@ -74,12 +74,12 @@ Host (unprivileged, short `N`): the fixtures compile, each lifetime
 really dlopens the provider, exercises all three publication surfaces
 and completes exactly 2 calls, pids/starts are distinct, and the
 validator refuses duplicates, gaps, foreign providers, malformed rows
-and overflows. Full `N` (300/16385) parser acceptance is checked with
-synthetic rows, not 16,385 host processes; full workload runs need
+and overflows. Full `N` (300/262145) parser acceptance is checked with
+synthetic rows, not 262,145 host processes; full workload runs need
 controller scheduling.
 
 Installed (blocked): one non-aggregate Detailed capture must observe
-300 (G16) or 16,385 distinct leaders with exact per-function counts,
+300 (G16) or 262,145 distinct leaders with exact per-function counts,
 `COMPLETE`, zero loss, no foreign/ambient rows and the required scope.
 The oracle additionally requires native evidence that does not exist
 yet and fails `BLOCKED` without manufacturing it:
@@ -88,7 +88,7 @@ yet and fails `BLOCKED` without manufacturing it:
   (proposed bounded aggregate loader transition counters, L4).
 - Retained controlled loader contexts at most 8 (same counters).
 - Per-context retirement cutoff (`LoaderRetirementFence`/ack).
-- Successful ticket issuance across 16,384 (producer receipts/control
+- Successful ticket issuance across 262,144 (producer receipts/control
   accounting; `kernel_control` shows only refusals).
 - Distinct `(pid,starttime)` leaders from observer output (trace rows
   lack starttime; profile aggregates).

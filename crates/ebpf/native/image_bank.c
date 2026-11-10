@@ -111,7 +111,7 @@ enum p11_bank_status p11_bank_admit(struct p11_bank_domain *d, uint32_t leader,
         m->next_ticket++;
         ticket = (uint32_t)m->next_ticket;
         m->admitted++;
-        m->leader_ticket[leader] = (uint16_t)ticket;
+        m->leader_ticket[leader] = (uint32_t)ticket;
         m->ticket_leader[ticket - 1] = leader;
     }
     r->present = 1;

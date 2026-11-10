@@ -1056,7 +1056,7 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
         values = struct.unpack("<" + "Q" * (size // 8), cell["value"])
         words[name] = values
         if name == "COOKIE_CTL":
-            healthy = values[0] == 16384 and values[1] <= 16384 and not any(values[2:])
+            healthy = values[0] == 262144 and values[1] <= 262144 and not any(values[2:])
         elif name == "OWNER_CTL":
             limit = 65 if small_state else 16448
             healthy = values[0] == limit and values[1] == len(seen["THREAD_OWNER"]) <= limit and not any(values[2:])

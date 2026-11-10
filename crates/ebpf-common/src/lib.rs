@@ -1580,7 +1580,7 @@ unsafe impl aya::Pod for ThreadOwnerControl {}
 
 /// Lifetime ticket budget for one production capture. Distinct from concurrent
 /// owner/affiliation reservations. Tickets are never reset or reused.
-pub const IMAGE_IDENTITY_TICKET_LIMIT: u64 = 16_384;
+pub const IMAGE_IDENTITY_TICKET_LIMIT: u64 = 262_144;
 
 /// Private producer transport identity. Zero cookie is unavailable; exec ID zero is valid.
 #[repr(C)]

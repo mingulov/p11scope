@@ -1024,7 +1024,11 @@ fn validate_image_map_contract(
 
 pub(super) fn prepare_maps(ebpf: &aya::Ebpf, full: bool) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    let hashes = if full { 16_384 } else { 1 };
+    let hashes = if full {
+        p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as u32
+    } else {
+        1
+    };
     for (name, kind, key, value, count, flags) in [
         (
             "IMAGE_CONTINUITY",

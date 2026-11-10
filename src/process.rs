@@ -24,6 +24,10 @@ pub(crate) use view_filesystem::{
 };
 
 pub(crate) const MAX_TRACKED: usize = 16_384;
+/// Producer history bound: one registry slot per lifetime identity ticket,
+/// tracking the ticket budget exactly (ADR identity-design Decision 4).
+pub(crate) const PRODUCER_HISTORY_LIMIT: usize =
+    p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize;
 #[cfg(test)]
 const RESERVED_FDS: usize = 64;
 

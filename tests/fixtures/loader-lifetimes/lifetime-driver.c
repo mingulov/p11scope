@@ -4,7 +4,7 @@
  *
  *   lifetime-driver PROVIDER LABEL
  *
- * LABEL is 1..16385. The driver stats the provider, dlopens it, exercises
+ * LABEL is 1..262145. The driver stats the provider, dlopens it, exercises
  * the three publication surfaces (C_GetFunctionList, C_GetInterfaceList,
  * C_GetInterface) with exact expected returns, then makes exactly two
  * useful table calls (C_GetInfo, C_GetSlotList) with exact expected
@@ -138,8 +138,8 @@ int main(int argc, char **argv) {
     char *end = NULL;
     errno = 0;
     long label = strtol(argv[2], &end, 10);
-    if (errno != 0 || end == argv[2] || *end != '\0' || label < 1 || label > 16385) {
-        fprintf(stderr, "lifetime-driver: LABEL must be 1..16385\n");
+    if (errno != 0 || end == argv[2] || *end != '\0' || label < 1 || label > 262145) {
+        fprintf(stderr, "lifetime-driver: LABEL must be 1..262145\n");
         return EXIT_USAGE;
     }
     struct stat identity;

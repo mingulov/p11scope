@@ -986,7 +986,7 @@ pub fn admission_envelope() -> String {
 ///
 /// Candidate A core: the identity-ticket namespace is already u64 end to end
 /// (native `cookie_for`, `ImageIdentity.task_cookie`, `COOKIE_CTL`), with
-/// cookie 0 reserved and 16,384 enforced as an explicit policy comparison.
+/// cookie 0 reserved and the bound enforced as an explicit policy comparison.
 /// These types version that policy, mirror the allocator semantics
 /// (monotonic, no reuse, quota/create/retry accounting) and add the separate
 /// live-admission accounting candidate A owes. Candidates B (bounded overlap)
@@ -1000,16 +1000,27 @@ pub struct TicketPolicy {
 
 impl TicketPolicy {
     /// Version 1 is the C1 policy: exactly the historical 16,384 lifetime
-    /// bound. This is the default until a reviewed migration selects wider.
+    /// bound, kept as a literal so later migrations cannot move history.
     pub const fn v1_c1() -> Self {
         Self {
-            limit: IMAGE_IDENTITY_TICKET_LIMIT,
+            limit: 16_384,
             version: 1,
         }
     }
 
+    /// Version 2 is the reviewed live policy: the production ticket budget
+    /// (`IMAGE_IDENTITY_TICKET_LIMIT`, 262,144). Production loaders publish
+    /// this policy's control image.
+    pub const fn v2() -> Self {
+        Self {
+            limit: IMAGE_IDENTITY_TICKET_LIMIT,
+            version: 2,
+        }
+    }
+
     /// A reviewed wider (or equal) namespace. Version 0 is reserved; version 1
-    /// is exactly the C1 bound; version 2+ carries an explicit reviewed limit.
+    /// is exactly the historical C1 bound; version 2+ carries an explicit
+    /// reviewed limit.
     pub fn reviewed(limit: u64, version: u32) -> Result<Self, String> {
         if version == 0 {
             return Err("ticket policy version 0 is reserved".into());
@@ -1017,9 +1028,9 @@ impl TicketPolicy {
         if limit == 0 {
             return Err("ticket policy limit must be non-zero".into());
         }
-        if version == 1 && limit != IMAGE_IDENTITY_TICKET_LIMIT {
+        if version == 1 && limit != 16_384 {
             return Err(format!(
-                "ticket policy v1 is exactly the C1 bound {IMAGE_IDENTITY_TICKET_LIMIT}, not {limit}"
+                "ticket policy v1 is exactly the historical C1 bound 16384, not {limit}"
             ));
         }
         Ok(Self { limit, version })

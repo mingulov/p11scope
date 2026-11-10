@@ -740,10 +740,7 @@ fn prepare_identity(
             )?;
         }
     }
-    let cookie = ImageIdentityControl {
-        limit: IMAGE_IDENTITY_TICKET_LIMIT,
-        ..Default::default()
-    };
+    let cookie = crate::capacity::TicketPolicy::v2().control_image();
     let owner = ThreadOwnerControl {
         limit: owner_limit_from_start(ebpf)?,
         poison: test_seeded_owner_poison(),
@@ -6517,14 +6514,16 @@ fn load_capture_object_bytes_with_images(
     object: &[u8],
     stats_slots: Option<u32>,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
+    let full_image_maps = IMAGE_IDENTITY_TICKET_LIMIT as u32;
+    let image_maps = if full_images { full_image_maps } else { 1 };
     let mut loader = EbpfLoader::new();
     loader
         .btf(Some(btf))
         .allow_unsupported_maps()
         .map_max_entries("EVENTS", events_bytes)
         .map_max_entries("DISCOVERY", discovery_bytes)
-        .map_max_entries("IMAGE_CONTINUITY", if full_images { 16_384 } else { 1 })
-        .map_max_entries("IMAGE_TGID_INDEX", if full_images { 16_384 } else { 1 })
+        .map_max_entries("IMAGE_CONTINUITY", image_maps)
+        .map_max_entries("IMAGE_TGID_INDEX", image_maps)
         .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 });
     if let Some(slots) = stats_slots {
         loader.map_max_entries("STATS", slots);

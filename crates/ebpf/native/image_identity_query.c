@@ -112,14 +112,14 @@ static IMG_INLINE int image_cookie_valid(u64 cookie)
 #ifdef P11SCOPE_LOADER_GATE
     if (cookie && cookie <= IMG_LIMIT)
         return 1;
-    /* Qualified bank-B identity at incarnation 0: bit 15 set, bits 16+
-     * clear, ticket 1..16384. Decoded exactly as image_identity.c issues
+    /* Qualified bank-B identity at incarnation 0: bit 19 set, bits 20+
+     * clear, ticket 1..262144. Decoded exactly as image_identity.c issues
      * it; the qualified keys keep same-number A/B cookies disjoint.
      * Malformed, unqualified-out-of-range and foreign cookies (any nonzero
      * incarnation, including a re-prepared bank A) still fail below. */
     {
-        u64 ticket = cookie & ((1ULL << 15) - 1);
-        if ((cookie >> 15) == 1 && ticket && ticket <= IMG_LIMIT)
+        u64 ticket = cookie & ((1ULL << 19) - 1);
+        if ((cookie >> 19) == 1 && ticket && ticket <= IMG_LIMIT)
             return 1;
     }
     return 0;

@@ -392,7 +392,8 @@ fn scenario(
     ensure!(seed.is_some(), "session did not acknowledge original root");
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(plan, session.capture_policy(), domain.clone());
-    let mut tracker = process::Tracker::for_producer(domain.clone(), 16_384);
+    let mut tracker =
+        process::Tracker::for_producer(domain.clone(), process::PRODUCER_HISTORY_LIMIT);
     let mut tracer = trace::Tracer::new(plan);
     let mut trace_bytes = Vec::new();
     let mut remaining = None;

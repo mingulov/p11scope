@@ -6,9 +6,9 @@
 G16 needs one capture over 300 sequential provider-bearing lifetimes (at
 most 4 live, at most 8 retained controlled contexts), every lifetime
 257-300 genuinely arming and executing publication plus useful calls.
-G17 needs one non-aggregate Detailed capture over 16,385 distinct
+G17 needs one non-aggregate Detailed capture over 262,145 distinct
 sequential leaders with exactly 2 controlled completed calls each
-(32,770 total, at most 4 live, including the last participant).
+(524,290 total, at most 4 live, including the last participant).
 
 This script owns only the disjoint workload plus independent oracle
 portion. It runs real sequential lifetimes, writes an independent JSONL
@@ -24,8 +24,8 @@ they prove what the owned fixture did, not what the observer saw. The
 uniqueness and positivity are checked, never absolute truth. Installed
 image identity must come from native task proof.
 
-Bounds: 20,000 ledger rows, 4,096 bytes per line, 16 MiB per ledger,
-64 MiB per profile report, 256 MiB per trace, at most 16,385 lifetimes
+Bounds: 300,000 ledger rows, 4,096 bytes per line, 128 MiB per ledger,
+64 MiB per profile report, 256 MiB per trace, at most 262,145 lifetimes
 per run, sequential launch (live 1, within the required at most 4),
 30 s per lifetime. No signals beyond the held child handle, no
 kill-by-PID, no process leaks: every child is reaped exactly once.
@@ -53,19 +53,19 @@ G16_LIFETIMES = 300
 G16_FINAL_START = 257
 G16_MAX_LIVE = 4
 G16_MAX_RETAINED = 8
-G17_LIFETIMES = 16385
+G17_LIFETIMES = 262145
 G17_CALLS_PER_LEADER = 2
 G17_TOTAL_CALLS = G17_LIFETIMES * G17_CALLS_PER_LEADER
 G17_MAX_LIVE = 4
 CALLS_PER_LIFETIME = 2
 EXPECTED_FUNCTIONS = ("C_GetInfo", "C_GetSlotList")
 
-MAX_ROWS = 20000
+MAX_ROWS = 300000
 MAX_LINE_BYTES = 4096
-MAX_LEDGER_BYTES = 16 * 1024 * 1024
+MAX_LEDGER_BYTES = 128 * 1024 * 1024
 MAX_REPORT_BYTES = 64 * 1024 * 1024
 MAX_TRACE_BYTES = 256 * 1024 * 1024
-MAX_LIFETIMES = 16385
+MAX_LIFETIMES = 262145
 PER_LIFETIME_SECONDS = 30
 MAX_MAPS_BYTES = 8 * 1024 * 1024
 
@@ -480,7 +480,7 @@ def run_lifetimes(*, cell, lifetimes, provider, driver, output):
     if cell not in ("g16", "g17"):
         raise LedgerError("unknown lifetime cell")
     if type(lifetimes) is not int or not 1 <= lifetimes <= MAX_LIFETIMES:
-        raise LedgerError("lifetimes must be 1..16385")
+        raise LedgerError("lifetimes must be 1..262145")
     provider_path = Path(provider)
     driver_path = Path(driver)
     output_path = Path(output)
@@ -645,7 +645,7 @@ def check_profile_report(report, *, pin, expected, cell):
         if type(kernel.get(key)) is not int or kernel.get(key) != 0:
             _fail("kernel loss or unknown " + key)
     if cell == "g16" and kernel.get("identity_budget_exhausted") is not False:
-        _fail("G16 must keep image-ticket use below 16,384")
+        _fail("G16 must keep image-ticket use below 262,144")
     admitted = evidence.get("discovery")
     if type(admitted) is not list:
         _fail("missing discovery admission")
@@ -808,7 +808,7 @@ def check_trace_output(text, *, expected):
 # update_losses}` (300 arms, retained peak <= 8, zero refusals, zero
 # update losses); G17 judges
 # `image_transitions{tickets_issued, bank_cuts, bank_refusals}`
-# (issuance crosses 16,384, exactly one bank cut, zero refusals) plus
+# (issuance crosses 262,144, exactly one bank cut, zero refusals) plus
 # one `invocation_receipt{id}`. No D2/T-L4b rename has landed; if those
 # owners rename first, only the map below changes.
 
@@ -900,7 +900,7 @@ def check_g17_l4_receipts(evidence, expected):
     refusals = _l4_counter(evidence, "image_bank_refusals")
     invocation = _l4_receipt(evidence, "invocation")
     if issued is not _MISSING and issued < expected:
-        _fail("L4 ticket issuance never crossed 16,384")
+        _fail("L4 ticket issuance never crossed 262,144")
     if cuts is not _MISSING and cuts != 1:
         _fail("L4 bank cuts are not exactly one")
     if refusals is not _MISSING and refusals != 0:
@@ -911,7 +911,7 @@ def check_g17_l4_receipts(evidence, expected):
         _fail("L4 invocation receipt is malformed")
     if any(value is _MISSING
            for value in (issued, cuts, refusals, invocation)):
-        _blocked("missing native seam: successful ticket issuance across 16,384 "
+        _blocked("missing native seam: successful ticket issuance across 262,144 "
                  "has no public producer receipt (kernel_control shows refusals "
                  "only); distinct (pid,starttime) leaders are not provable from "
                  "aggregated profile or starttime-less trace rows; single-capture "
@@ -952,7 +952,7 @@ def judge(cell, ledger_rows, *, report_text=None, trace_text=None):
         return (f"installed positive: {expected} owned loader arms with "
                 "peak retained <= 8 and zero refusals")
     check_g17_l4_receipts(evidence, expected)
-    return ("installed positive: ticket issuance crossed 16,384 with "
+    return ("installed positive: ticket issuance crossed 262,144 with "
             "exactly one bank cut, zero refusals, one invocation")
 
 

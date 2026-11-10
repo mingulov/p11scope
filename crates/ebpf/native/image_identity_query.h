@@ -8,7 +8,7 @@ typedef unsigned long long u64;
 #define IMG_INLINE inline __attribute__((always_inline))
 #define IMG_UINT(name, value) int (*name)[value]
 #define IMG_TYPE(name, value) typeof(value) *name
-#define IMG_LIMIT 16384U
+#define IMG_LIMIT 262144U
 #define IMG_REQUEST_LIMIT 1024U
 #define IMG_VISIT_LIMIT 65536ULL
 #define IMG_CAS_TRIES 8

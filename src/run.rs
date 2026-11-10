@@ -5125,7 +5125,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let mut state =
         semantics::State::for_capture(context.engine.plan(), context.policy, domain.clone());
     state.set_cgroup_label_root(std::path::PathBuf::from("/sys/fs/cgroup"));
-    let mut tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut tracker = process::Tracker::for_producer(domain, process::PRODUCER_HISTORY_LIMIT);
     let mut scheduling = SchedulingAccumulator::default();
     scheduling.note_resource(crate::timing::ResourcePoint::Start, context.resource_start);
     scheduling.note_attach(context.session.attach_mono_ns());
@@ -5520,7 +5520,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
     let domain = context.session.events_domain();
     let mut state =
         semantics::State::for_capture(context.engine.plan(), context.policy, domain.clone());
-    let mut tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut tracker = process::Tracker::for_producer(domain, process::PRODUCER_HISTORY_LIMIT);
     let mut tracer = trace::Tracer::new(context.engine.plan());
     if let Some(command) = context.owned_command {
         tracer.set_owned_command(context.owned.pid, command.to_string());
@@ -9000,7 +9000,8 @@ fn capture_profile(
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
     state.set_cgroup_label_root(std::path::PathBuf::from("/sys/fs/cgroup"));
-    let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut process_tracker =
+        process::Tracker::for_producer(domain, process::PRODUCER_HISTORY_LIMIT);
     if policy.uses_unsafe_decoders()
         && let Err(error) = load_mech_shapes(&mut state)
     {
@@ -10563,7 +10564,8 @@ fn capture_trace(
     };
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
-    let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
+    let mut process_tracker =
+        process::Tracker::for_producer(domain, process::PRODUCER_HISTORY_LIMIT);
     if policy.uses_unsafe_decoders()
         && let Err(error) = load_mech_shapes(&mut state)
     {
@@ -31601,7 +31603,7 @@ mod trace_identity_consumer_tests {
                     CapturePolicy::Allowlisted,
                     domain.clone(),
                 ),
-                tracker: process::Tracker::for_producer(domain, 16_384),
+                tracker: process::Tracker::for_producer(domain, process::PRODUCER_HISTORY_LIMIT),
                 tracer: trace::Tracer::new(&plan),
                 scope: if proof.is_cgroup() {
                     Scope::Cgroup {

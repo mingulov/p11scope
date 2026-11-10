@@ -14,7 +14,7 @@ use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
 use crate::semantic_capture::InstanceReloadNotExcluded;
 use crate::semantics::MechStat;
-use p11scope_ebpf_common::CounterMode;
+use p11scope_ebpf_common::{CounterMode, IMAGE_IDENTITY_TICKET_LIMIT};
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -4216,7 +4216,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 // its poison names, refused ownership admissions and
                 // root-affiliation failures. The verdict fires this
                 // cause exactly when one part is active, so at least
-                // one fragment always lands.
+                // one fragment always lands. A spent budget with zero
+                // refusals stays COMPLETE and is named on the longrun
+                // line instead (spark rv-v070-identity-reuse F1).
                 let control = &ev.kernel_control;
                 if control.capture_halted {
                     fragments.push(tag(if control.owner_poison.is_empty() {
@@ -4246,15 +4248,12 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         "processes refused an identity",
                     );
                     fragments.push(tag(if control.identity_budget_exhausted {
-                        format!("{plain} (lifetime budget of 16384 identities spent)")
+                        format!(
+                            "{plain} (lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent)"
+                        )
                     } else {
                         plain
                     }));
-                } else if control.identity_budget_exhausted {
-                    fragments.push(tag(
-                        "lifetime budget of 16384 identities spent (nothing refused yet)"
-                            .to_string(),
-                    ));
                 }
                 for reason in &control.root_affiliation_failures {
                     fragments.push(tag(format!("kernel root affiliation failure: {reason}")));

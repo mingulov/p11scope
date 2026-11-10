@@ -16,8 +16,8 @@ use aya::{Ebpf, EbpfLoader};
 #[cfg(not(p11scope_small_discovery_ring))]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
-    IMAGE_IDENTITY_TICKET_LIMIT, INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION,
-    ImageIdentityControl, InventoryUsageConfig, ThreadOwnerControl,
+    INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION, ImageIdentityControl, InventoryUsageConfig,
+    ThreadOwnerControl,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -267,14 +267,7 @@ impl PreparedInventory {
                             .map_mut("COOKIE_CTL")
                             .context("COOKIE_CTL map")?,
                     )?;
-                    map.set(
-                        0,
-                        ImageIdentityControl {
-                            limit: IMAGE_IDENTITY_TICKET_LIMIT,
-                            ..Default::default()
-                        },
-                        0,
-                    )?;
+                    map.set(0, crate::capacity::TicketPolicy::v2().control_image(), 0)?;
                 }
                 InventoryPreparation::ReadCallerControl => {
                     let map: Array<_, ImageIdentityControl> = Array::try_from(

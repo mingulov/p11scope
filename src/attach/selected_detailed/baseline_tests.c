@@ -40,7 +40,7 @@ static void reset(void)
 {
     memset(&ctl, 0, sizeof(ctl)); ctl.generation = 4; ctl.deadline_ns = 200; ctl.visit_limit = 8; ctl.count = 1;
     request.generation = 4; request.tgid = 400; request.slot = 0;
-    memset(&cookie_ctl, 0, sizeof(cookie_ctl)); cookie_ctl.limit = 16384;
+    memset(&cookie_ctl, 0, sizeof(cookie_ctl)); cookie_ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT;
     task.tgid = 400; task.group_leader = &task; task.self_exec_id = 0;
     have_cookie = unknown = 0; row_count = 0;
     baseline_lookup = lookup; baseline_ktime = clock_ns; baseline_output = output; bpf_task_storage_get = storage;

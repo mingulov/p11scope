@@ -14,7 +14,7 @@
  * and is reclaimed; identity is (incarnation, ticket).
  *
  * Admission reuses the production ticket semantics from image_identity.h
- * (tickets 1..16384, QUOTA past the real limit, no reset of next_ticket).
+ * (tickets 1..262144, QUOTA past the real limit, no reset of next_ticket).
  * This TU is plain single-threaded logic; the threaded harness scenario
  * serializes calls with a host mutex, which models kernel atomic ordering.
  */
@@ -27,8 +27,10 @@
 
 #define P11_BANK_SLOTS 2
 #define P11_BANK_CUT_HEADROOM 1024ULL
-#define P11_BANK_MAX_LEADER 65536u
-#define P11_BANK_MAX_CALL 65536u
+/* Scripted id space: the exhaustion fill runs distinct leaders/calls
+ * 1..LIMIT-384, so the model must index past the ticket limit. */
+#define P11_BANK_MAX_LEADER (IMAGE_IDENTITY_TICKET_LIMIT + 65536u)
+#define P11_BANK_MAX_CALL (IMAGE_IDENTITY_TICKET_LIMIT + 65536u)
 
 enum p11_bank_status {
     P11_BANK_OK = 0,
@@ -65,7 +67,7 @@ struct p11_bank_maps {
     uint64_t burned;
     uint64_t completed;
     uint32_t ticket_leader[IMAGE_IDENTITY_TICKET_LIMIT];
-    uint16_t leader_ticket[P11_BANK_MAX_LEADER];
+    uint32_t leader_ticket[P11_BANK_MAX_LEADER];
     unsigned char exec_invalid[P11_BANK_MAX_LEADER];
 };
 

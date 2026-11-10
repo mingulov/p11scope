@@ -239,8 +239,8 @@ static void ticket_query_failures(void)
     puts("ASSERT zero_cell_and_quota_exact");
 }
 
-/* G17-shaped crossing: issuance reaches exactly 16,384, then refuses. */
-static void ticket_crosses_16384(void)
+/* G17-shaped crossing: issuance reaches exactly 262,144, then refuses. */
+static void ticket_crosses_262144(void)
 {
     u64 ticket = 0, watermark = 0;
     u64 n;
@@ -259,7 +259,7 @@ static void ticket_crosses_16384(void)
     assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
     assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
     assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT);
-    puts("ASSERT watermark_reaches_16384");
+    puts("ASSERT watermark_reaches_262144");
     puts("ASSERT next_attempt_quota");
 }
 
@@ -286,7 +286,7 @@ static void ticket_ignores_exec_id(void)
     puts("ASSERT ticket_query_ignores_exec_id");
 }
 
-/* G17-shaped cut: with B prepared, the 16,385th birth cuts to B
+/* G17-shaped cut: with B prepared, the 262,145th birth cuts to B
  * exactly once and lands there; B quota refuses honestly after both
  * banks fill, with saturating counted refusals. */
 static void bank_cut_once(void)
@@ -320,7 +320,7 @@ static void bank_cut_once(void)
     puts("ASSERT b_issues_from_one");
     assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
     assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT + 1);
-    puts("ASSERT total_crosses_16384");
+    puts("ASSERT total_crosses_262144");
     /* A second cut is idempotent: no double count, admissions flow. */
     assert(p11_image_bank_cut(1) == 1);
     assert(select_stub.cuts == 1);
@@ -333,7 +333,7 @@ static void bank_cut_once(void)
     }
     assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
     assert(watermark == 2 * IMAGE_IDENTITY_TICKET_LIMIT);
-    puts("ASSERT total_reaches_32768");
+    puts("ASSERT total_reaches_524288");
     present_b[0] = 0;
     ticket = 99;
     assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
@@ -810,7 +810,7 @@ static void exec_return_isolation(void)
     puts("ASSERT return_mismatches_across_banks");
 }
 
-/* Incarnation guard: the top of the 48-bit incarnation range still
+/* Incarnation guard: the top of the 44-bit incarnation range still
  * issues; one past it refuses instead of wrapping the qualifier into
  * an aliasing cookie. */
 static void incarnation_guard(void)
@@ -820,14 +820,14 @@ static void incarnation_guard(void)
 
     reset();
     select_stub.prepared[1] = 1;
-    select_stub.incarnation[0] = (1ULL << 48) - 1;
+    select_stub.incarnation[0] = (1ULL << 44) - 1;
     present[0] = 0;
     assert(p11_link_task_identity(&leaders[0], &got) == COOKIE_STATUS_OK);
-    assert(got.task_cookie == image_identity_qualify(1, 0, (1ULL << 48) - 1));
+    assert(got.task_cookie == image_identity_qualify(1, 0, (1ULL << 44) - 1));
     puts("ASSERT incarnation_top_issues");
     reset();
     select_stub.prepared[1] = 1;
-    select_stub.incarnation[0] = 1ULL << 48;
+    select_stub.incarnation[0] = 1ULL << 44;
     present[1] = 0;
     ticket = 99;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
@@ -1125,7 +1125,7 @@ static void guard_spends_nothing(void)
 
     reset();
     select_stub.prepared[1] = 1;
-    select_stub.incarnation[0] = 1ULL << 48;
+    select_stub.incarnation[0] = 1ULL << 44;
     present[1] = 0;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
     assert(ticket == 0);
@@ -1212,7 +1212,7 @@ static void cut_refuses_corrupt_target(void)
         ticket = 0;
         assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
     }
-    select_stub.incarnation[1] = 1ULL << 48;
+    select_stub.incarnation[1] = 1ULL << 44;
     present[0] = 0;
     present_b[0] = 0;
     ticket = 99;
@@ -1261,7 +1261,7 @@ static void hit_overflow_refuses(void)
     select_stub.prepared[1] = 1;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
     assert(ticket == 1);
-    select_stub.incarnation[0] = 1ULL << 48;
+    select_stub.incarnation[0] = 1ULL << 44;
     ticket = 99;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
     assert(ticket == 0);
@@ -1281,7 +1281,7 @@ static void guard_before_zero_cell(void)
     select_stub.prepared[1] = 1;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
     assert(ticket == 1);
-    select_stub.incarnation[0] = 1ULL << 48;
+    select_stub.incarnation[0] = 1ULL << 44;
     stored[1] = 0;
     ticket = 99;
     assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
@@ -1355,8 +1355,8 @@ int main(int argc, char **argv)
         ticket_query_healthy();
     } else if (!strcmp(argv[1], "ticket-query-failures")) {
         ticket_query_failures();
-    } else if (!strcmp(argv[1], "ticket-crosses-16384")) {
-        ticket_crosses_16384();
+    } else if (!strcmp(argv[1], "ticket-crosses-262144")) {
+        ticket_crosses_262144();
     } else if (!strcmp(argv[1], "ticket-ignores-exec-id")) {
         ticket_ignores_exec_id();
     } else if (!strcmp(argv[1], "bank-cut-once")) {

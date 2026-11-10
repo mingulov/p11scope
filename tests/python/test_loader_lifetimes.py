@@ -340,9 +340,9 @@ class LedgerValidationTests(unittest.TestCase):
 
     def test_parser_enforces_row_and_byte_limits(self):
         with self.assertRaises(ORACLE.LedgerError):
-            ORACLE.read_jsonl(io.StringIO('{"x":0}\n' * 20001))
+            ORACLE.read_jsonl(io.StringIO('{"x":0}\n' * 300001))
         with self.assertRaises(ORACLE.LedgerError):
-            ORACLE.read_jsonl(io.StringIO(('{"x":"' + 'x' * 4000 + '"}\n') * 5000))
+            ORACLE.read_jsonl(io.StringIO(('{"x":"' + 'x' * 4000 + '"}\n') * 34000))
 
     def test_jsonl_roundtrip(self):
         text = "".join(json.dumps(r) + "\n" for r in valid_ledger("g16", 3))

@@ -49,7 +49,7 @@ pub(super) fn parse_bootstrap(
         || half(end, 32) != tgid
         || half(first, 36) != 1
         || half(end, 36) != 2
-        || !(1..=16384).contains(&cookie)
+        || !(1..=p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT).contains(&cookie)
         || word(end, 8) != 0
         || word(end, 16) != 0
         || word(first, 24) == 0
@@ -176,7 +176,7 @@ pub(super) fn parse_baseline(
             || half(row, 36) != 1
             || slot >= count
             || images[slot].is_some()
-            || !(1..=16384).contains(&cookie)
+            || !(1..=p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT).contains(&cookie)
             || !cookies.insert(cookie)
             || visit <= last_visit
             || visit >= visits

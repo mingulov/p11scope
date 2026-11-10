@@ -450,7 +450,7 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
                 map,
                 &0u32,
                 Some(&ImageIdentityControl {
-                    limit: IMAGE_IDENTITY_TICKET_LIMIT,
+                    limit: p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT,
                     ..Default::default()
                 }),
             ),

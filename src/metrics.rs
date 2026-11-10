@@ -720,15 +720,15 @@ fn identity_notice_line(control: &KernelControl) -> Option<String> {
     if control.identity_unavailable == 0 {
         return None;
     }
+    let spent = if control.identity_budget_exhausted {
+        format!("; lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent")
+    } else {
+        String::new()
+    };
     Some(format!(
         "p11scope: kernel could not give a process an identity ({} refused so far{}); \
          its calls and fork records are not captured and the report is PARTIAL",
-        control.identity_unavailable,
-        if control.identity_budget_exhausted {
-            "; lifetime budget of 16384 identities spent"
-        } else {
-            ""
-        }
+        control.identity_unavailable, spent,
     ))
 }
 

@@ -17,7 +17,7 @@
 #undef __always_inline
 #include "image_bank.c"
 
-_Static_assert(IMAGE_IDENTITY_TICKET_LIMIT == 16384, "proof uses the real limit");
+_Static_assert(IMAGE_IDENTITY_TICKET_LIMIT == 262144, "proof uses the real limit");
 _Static_assert(P11_BANK_CUT_HEADROOM == 1024, "plan headroom H");
 
 static struct p11_bank_domain G;
@@ -42,7 +42,7 @@ static void scenario_exhaustion(void)
     uint32_t joined;
 
     p11_bank_init(&G, P11_BANK_ROUTE_R0);
-    for (leader = 1; leader <= 16000; leader++) {
+    for (leader = 1; leader <= IMAGE_IDENTITY_TICKET_LIMIT - 384; leader++) {
         if (p11_bank_enter(&G, leader, leader, &id) != P11_BANK_OK ||
             p11_bank_leave(&G, leader, &id) != P11_BANK_OK) {
             printf("FAIL fill leader %u (line %d)\n", leader, __LINE__);
@@ -52,16 +52,17 @@ static void scenario_exhaustion(void)
     }
     for (i = 0; i < 384; i++)
         p11_bank_burn(&G);
-    CHECK(G.maps[0].next_ticket == 16384, "next_ticket_reaches_16384");
-    CHECK(G.maps[0].admitted + G.maps[0].burned == 16384, "successful_plus_burned_is_16384");
+    CHECK(G.maps[0].next_ticket == IMAGE_IDENTITY_TICKET_LIMIT, "next_ticket_reaches_262144");
+    CHECK(G.maps[0].admitted + G.maps[0].burned == IMAGE_IDENTITY_TICKET_LIMIT, "successful_plus_burned_is_262144");
     CHECK(G.maps[0].burned == 384, "burns_reported_384");
-    st = p11_bank_enter(&G, 60000, 60000, &id);
+    st = p11_bank_enter(&G, (uint32_t)IMAGE_IDENTITY_TICKET_LIMIT + 1,
+                          (uint32_t)IMAGE_IDENTITY_TICKET_LIMIT + 1, &id);
     CHECK(st == P11_BANK_QUOTA, "next_attempt_quota");
     CHECK(G.maps[0].unavailable == 1, "unavailable_plus_one");
-    CHECK(G.maps[0].leader_ticket[60000] == 0, "refused_has_no_identity");
-    CHECK(!p11_bank_join(&G, 0, 1, 16384, &joined),
+    CHECK(G.maps[0].leader_ticket[IMAGE_IDENTITY_TICKET_LIMIT + 1] == 0, "refused_has_no_identity");
+    CHECK(!p11_bank_join(&G, 0, 1, (uint32_t)IMAGE_IDENTITY_TICKET_LIMIT, &joined),
           "burned_ticket_has_no_record");
-    CHECK(G.maps[0].next_ticket == 16384, "refused_attempt_spends_no_ticket");
+    CHECK(G.maps[0].next_ticket == IMAGE_IDENTITY_TICKET_LIMIT, "refused_attempt_spends_no_ticket");
 }
 
 static void scenario_cut(void)
@@ -83,15 +84,15 @@ static void scenario_cut(void)
     CHECK(p11_bank_prepare(&G, 1) == P11_BANK_OK, "cut_setup_prepared");
     CHECK(p11_bank_cut(&G) == P11_BANK_OK, "cut_setup_cut");
     b_inc = G.maps[1].incarnation;
-    CHECK(p11_bank_enter(&G, 16385, 50001, &id) == P11_BANK_OK &&
+    CHECK(p11_bank_enter(&G, 262145, 50001, &id) == P11_BANK_OK &&
               id.bank == 1 && id.ticket == 1 &&
               id.incarnation == G.maps[1].incarnation &&
               id.incarnation != 1,
           "b_ticket_1_in_new_incarnation");
     p11_bank_leave(&G, 50001, &id);
     CHECK(G.maps[0].next_ticket == a_next, "a_next_ticket_unchanged");
-    CHECK(p11_bank_join(&G, 1, b_inc, 1, &joined) && joined == 16385,
-          "leader_16385_holds_b_identity");
+    CHECK(p11_bank_join(&G, 1, b_inc, 1, &joined) && joined == 262145,
+          "leader_262145_holds_b_identity");
     CHECK(!G.maps[0].admission_open && G.maps[0].admitted == 101, "a_admission_frozen");
     CHECK(G.maps[0].admitted + G.maps[1].admitted == 102, "bank_counts_sum_to_ledger");
     {
@@ -362,14 +363,17 @@ static void scenario_saturation(void)
     unsigned long orphans = 0;
 
     p11_bank_init(&G, P11_BANK_ROUTE_R0);
-    for (leader = 1; leader <= 15360; leader++) {
+    for (leader = 1; leader <= IMAGE_IDENTITY_TICKET_LIMIT - P11_BANK_CUT_HEADROOM; leader++) {
         p11_bank_enter(&G, leader, leader, &id);
         p11_bank_leave(&G, leader, &id);
     }
-    CHECK(G.maps[0].next_ticket == 15360, "saturation_setup_at_headroom_edge");
+    CHECK(G.maps[0].next_ticket == IMAGE_IDENTITY_TICKET_LIMIT - P11_BANK_CUT_HEADROOM, "saturation_setup_at_headroom_edge");
     CHECK(p11_bank_prepare(&G, 1) == P11_BANK_OK, "saturation_setup_prepared");
-    /* Burst of 1524 before the flip completes: 1024 fit, 500 refuse. */
-    for (leader = 20000; leader < 21524; leader++) {
+    /* Burst of 1524 fresh leaders before the flip completes: 1024 fit,
+     * 500 refuse. Fresh ids above the fill so every attempt spends. */
+    for (leader = (uint32_t)(IMAGE_IDENTITY_TICKET_LIMIT - P11_BANK_CUT_HEADROOM) + 1;
+         leader < (uint32_t)(IMAGE_IDENTITY_TICKET_LIMIT - P11_BANK_CUT_HEADROOM) + 1525;
+         leader++) {
         if (p11_bank_enter(&G, leader, leader, &id) == P11_BANK_OK) {
             admitted++;
             p11_bank_leave(&G, leader, &id);
@@ -383,8 +387,8 @@ static void scenario_saturation(void)
     CHECK(refused == 500, "quota_refusals_counted");
     CHECK(G.maps[0].unavailable == 500, "unavailable_delta_equals_refused");
     CHECK(orphans == 0, "refused_have_no_identity");
-    CHECK(admitted + refused == 1524 && G.maps[0].next_ticket == 16384 &&
-              G.maps[0].admitted == 16384 && p11_bank_cut(&G) == P11_BANK_OK &&
+    CHECK(admitted + refused == 1524 && G.maps[0].next_ticket == IMAGE_IDENTITY_TICKET_LIMIT &&
+              G.maps[0].admitted == IMAGE_IDENTITY_TICKET_LIMIT && p11_bank_cut(&G) == P11_BANK_OK &&
               p11_bank_enter(&G, 30000, 30000, &id) == P11_BANK_OK && id.ticket == 1 &&
               id.bank == 1,
           "no_silent_loss");

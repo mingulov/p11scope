@@ -441,7 +441,7 @@ int main(int argc, char **argv)
      * as they do without the gate. */
     reset();
     u64 b1 = image_identity_qualify(1, 1, 0);
-    assert(b1 == 32769);
+    assert(b1 == 524289);
     query_tgid = 101; assert(p11_image_entry(101, 1, 5));
     query_tgid = 102; assert(p11_image_entry(102, b1, 7));
     assert(coverage == IMG_ENABLED);
@@ -488,10 +488,10 @@ int main(int argc, char **argv)
     /* In-range but malformed B shapes fail: ticket zero and over-ticket. */
     reset();
     query_tgid = 105;
-    assert(!p11_image_entry(105, 1ULL << 15, 9) && coverage == IMG_FAILED);
+    assert(!p11_image_entry(105, 1ULL << 19, 9) && coverage == IMG_FAILED);
     reset();
     query_tgid = 106;
-    assert(!p11_image_entry(106, (1ULL << 15) + IMG_LIMIT + 1, 9));
+    assert(!p11_image_entry(106, (1ULL << 19) + IMG_LIMIT + 1, 9));
     assert(coverage == IMG_FAILED);
     /* Wide bank-B cookies (ADR identity-design P1.6): bit 19 carries the
      * bank and tickets span the full 262,144 budget. */

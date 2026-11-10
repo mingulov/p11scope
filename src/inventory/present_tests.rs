@@ -7,8 +7,9 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, CallerId, CoverageNote, ExeResolution, ImageAuthority, ModuleInfo, ModuleKey,
-    RegistryGap, RegistryLimits, UnboundExe, UnboundPid, UnknownReason, UseCoverage,
+    AdmissionChange, AdmissionState, CallerId, CoverageNote, ExeResolution, ImageAuthority,
+    ModuleInfo, ModuleKey, RegistryGap, RegistryLimits, UnboundExe, UnboundPid, UnknownReason,
+    UseCoverage,
 };
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory::{render_json, render_text};
@@ -3893,6 +3894,91 @@ fn concise_folds_many_replaced_files_into_one_counted_line() {
     );
 }
 
+/// Flood twin: a replaced file that is or was an admitted provider
+/// keeps its own named concise row even when unrelated replaced
+/// files fold (a provider must never hide in a count); the fold then
+/// counts only the rest. Verbose and JSON keep every row.
+#[test]
+fn concise_keeps_replaced_admitted_providers_named_in_a_flood() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    // An admitted provider plus a was-admitted one (refused now, with
+    // an admission in its history); the replaced copy lives under a
+    // different directory than the admitted path, so only the file
+    // name matches.
+    let admitted = presentation
+        .modules
+        .iter_mut()
+        .find(|module| module.admission == AdmissionState::Admitted)
+        .expect("varied harness admits a module");
+    admitted
+        .paths
+        .push("/usr/lib/x86_64-linux-gnu/libsoftokn3.so".to_string());
+    let retired = presentation
+        .modules
+        .iter_mut()
+        .find(|module| module.admission != AdmissionState::Admitted)
+        .expect("varied harness refuses a module");
+    retired.paths.push("/usr/lib/ykcs11.so".to_string());
+    retired.admission_history.push(AdmissionChange {
+        from: AdmissionState::Unresolved,
+        to: AdmissionState::Admitted,
+        at_ns: 1,
+    });
+    for (pid, subject) in [
+        (21u32, "/usr/lib/firefox/libsoftokn3.so (deleted)"),
+        (22u32, "/usr/lib/ykcs11.so (deleted)"),
+        (23u32, "/usr/lib/libpcre2-8.so.0.14.0 (deleted)"),
+        (24u32, "/usr/lib/gvfs/libgvfscommon.so (deleted)"),
+        (25u32, "/usr/lib/libsoup-3.0.so.0.7.4 (deleted)"),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: (*subject).into(),
+            reason: "replaced on disk while running; not examined, calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("gaps: 5"), "header counts rows: {concise}");
+    assert!(
+        concise.contains(
+            "3 × replaced files not examined — 3 files replaced while running (--json lists each)"
+        ),
+        "the fold counts only the non-provider rest: {concise}"
+    );
+    assert!(
+        concise.contains("libsoftokn3.so (deleted)"),
+        "an admitted provider keeps its named gap row: {concise}"
+    );
+    assert!(
+        concise.contains("ykcs11.so (deleted)"),
+        "a was-admitted provider keeps its named gap row: {concise}"
+    );
+    assert!(
+        !concise.contains("libpcre2")
+            && !concise.contains("libgvfscommon")
+            && !concise.contains("libsoup"),
+        "no per-file flood in concise: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("libpcre2-8.so.0.14.0 (deleted)"),
+        "{verbose}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        document["gaps"].as_array().expect("gaps array").len(),
+        5,
+        "JSON keeps every record: {document}"
+    );
+}
+
 /// Healthy twin: a two-file replaced family keeps its named per-file
 /// lines (the fold serves floods, not small named losses), and a
 /// maps-attribution lookalike with an unparsable reason stays out of
@@ -3944,7 +4030,9 @@ fn concise_keeps_small_replaced_and_unparsable_maps_rows_named() {
 
 /// Maps-attribution rows (one per pid per pass, each naming how many
 /// shared objects no deep scan examined) fold into ONE concise line
-/// with exact row, process and object counts; verbose and JSON keep
+/// with the exact row and process counts and the mapping counts
+/// summed over passes (never a distinct-object count: the same
+/// objects recur across passes and processes); verbose and JSON keep
 /// every row.
 #[test]
 fn concise_folds_maps_attribution_into_one_counted_line() {
@@ -3985,9 +4073,9 @@ fn concise_folds_maps_attribution_into_one_counted_line() {
     assert!(concise.contains("gaps: 4"), "header counts rows: {concise}");
     assert!(
         concise.contains(
-            "4 × maps attribution — 3 processes map 8 unexamined shared objects (--json lists each)"
+            "4 × maps attribution — 3 processes; 8 mappings summed over passes (--json lists each)"
         ),
-        "one family line carries exact row, process and object counts: {concise}"
+        "one family line carries exact row and process counts with the summed mappings: {concise}"
     );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains("maps 4 shared objects"), "{verbose}");

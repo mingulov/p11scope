@@ -488,8 +488,8 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 | Field | Meaning |
 | --- | --- |
 | `mechanism`, `mechanism_hex` | 64-bit mechanism id. Registered ids are admitted by the capture policy (finite published registry membership); v3 documents additionally list unregistered ids as bare numbers with counts (see `registered`). Historical v2 documents list registered ids only. |
-| `name` | v3 only: the `CKM_*` name when the id is a known standard mechanism, else null, never guessed. There are no vendor name tables. Absent from historical v2 documents. |
-| `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded, never named). Absent from historical v2 documents. |
+| `name` | v3 only: the `CKM_*` name when the id is a known standard or listed vendor mechanism, else null, never guessed. Display only: naming never affects counts, publication or row presence. Absent from historical v2 documents. |
+| `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded; a listed vendor id additionally carries its display-only name). Absent from historical v2 documents. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
 | `latency_ns` | Always the histogram object shape, independent of function timing availability; async semantic latency spans pending entry to completion. |

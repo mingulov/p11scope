@@ -1172,9 +1172,11 @@ pub struct Evidence {
     pub semantic_state_drops: u64,
     /// Mechanism observations shed because the per-id table already held
     /// 256 distinct ids (`semantics::SemanticEvidence::mechanism_id_overflow`):
-    /// one count per shed observation. The shed ids keep no row anywhere,
-    /// so row calls plus this count account for every mechanism-bearing
-    /// observation. Forces `PARTIAL`, like every other shed observation.
+    /// one count per shed observation. The shed ids keep no row anywhere.
+    /// Shed observations bypass the shared budget; row calls plus this
+    /// count account for every mechanism-bearing observation except those
+    /// refused by the shared budget (counted in `semantic_state_drops`).
+    /// Forces `PARTIAL`, like every other shed observation.
     pub mechanism_id_overflow: u64,
     pub semantic_history_drops: u64,
     pub pending_at_end: u64,
@@ -4831,14 +4833,16 @@ struct MechanismOut {
     /// Verbatim id — vendor ids survive unchanged, never renamed or dropped.
     mechanism: u64,
     mechanism_hex: String,
-    /// The `CKM_*` name when the id is a known standard mechanism, else
-    /// null — never guessed. There are no vendor name tables, so every
-    /// vendor-range id carries null here and its number above.
+    /// The `CKM_*` name when the id is a known standard or listed
+    /// vendor mechanism, else null — never guessed. Display only:
+    /// naming never affects counts, publication or row presence, so a
+    /// named vendor id still carries its number above.
     name: Option<&'static str>,
     /// The BPF return path found this id in `MECH_SHAPE` (registry
     /// membership, parameter shape published). `false` marks an
     /// unregistered publication: numeric id plus call/error counts
-    /// only, never decoded, never named.
+    /// only, never decoded; the name above is display-only and
+    /// independent of this flag.
     registered: bool,
     /// Operation categories (`"sign"`, `"encrypt"`, ...) this id was seen
     /// initializing. Empty when only ever seen as an orphan operational
@@ -5039,13 +5043,15 @@ struct SessionsOut {
 struct CgroupMechOut {
     mechanism: u64,
     mechanism_hex: String,
-    /// The `CKM_*` name when the id is a known standard mechanism, else
-    /// null — never guessed. Same meaning as the top-level rows' `name`.
+    /// The `CKM_*` name when the id is a known standard or listed
+    /// vendor mechanism, else null — never guessed. Same meaning as
+    /// the top-level rows' `name`.
     name: Option<&'static str>,
     /// The BPF return path found this id in `MECH_SHAPE` (registry
     /// membership). `false` marks an unregistered publication:
-    /// numeric id plus call/error counts only, never decoded, never
-    /// named — the same flag as the top-level `mechanisms[]` rows.
+    /// numeric id plus call/error counts only, never decoded — the
+    /// same flag as the top-level `mechanisms[]` rows, independent of
+    /// the display-only name above.
     registered: bool,
     calls: u64,
     errors: u64,
@@ -14205,8 +14211,8 @@ pub(crate) mod tests {
 
     /// Unassigned vendor-block gap (`0xCE53_43A9`), the codebase's
     /// unknown-vendor sentinel: exact registry membership never admits
-    /// it, and there are no vendor name tables (owner, 2026-11-10), so
-    /// it always publishes by number.
+    /// it, and the display-only vendor table lists no name for it, so
+    /// it always publishes by number with a null name.
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
     fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {

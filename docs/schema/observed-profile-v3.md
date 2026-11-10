@@ -201,7 +201,8 @@ Every `mechanisms[]` entry carries `registered`: `true` for an id the
 BPF return path found in `MECH_SHAPE`, `false` for an unregistered
 publication. Unregistered ids are public constants, so v3 documents
 list each 32-bit one as a bare hex number with its call/error counts
-(`params: null`, never decoded, never named) instead of only the
+(`params: null`, never decoded; a listed vendor id additionally
+carries its display-only name) instead of only the
 `evidence.unregistered_mechanisms`
 total, which still counts every occurrence. Ids above `0xFFFFFFFF`
 count in the total only. Like `selected_detail`,
@@ -211,15 +212,18 @@ the `registered` key. `cgroups[].mechanisms[]` rows carry the same
 `registered` flag with the same meaning.
 
 Every `mechanisms[]` and `cgroups[].mechanisms[]` row also carries
-`name`: the `CKM_*` name when the id is a known standard mechanism,
-else null, never guessed. There are no vendor name tables, so every
-vendor-range id carries null and its number. Profile text shows
-`vendor-defined 0x…` (ids at or above `0x80000000`) or `unknown 0x…`
-(other unknown ids) with counts; the JSON rows carry the numeric id
-(`mechanism`) beside the name. Like `registered`, `name` is a
-v3-additive disclosure with no new schema revision. The per-id table
-holds 256 distinct ids per capture; shed observations count in
-`evidence.mechanism_id_overflow` and force `PARTIAL`.
+`name`: the `CKM_*` name when the id is a known standard or listed
+vendor mechanism, else null, never guessed. Naming is a display-only
+layer over the generic per-number counts: removing the vendor table
+would change only the displayed name, never counts, publication or
+row presence. Profile text shows the `CKM_*` name for known standard
+and listed vendor ids, else `vendor-defined 0x…` (ids at or above
+`0x80000000`) or `unknown 0x…` (other unknown ids), with counts; the
+JSON rows carry the numeric id (`mechanism`) beside the name. Like
+`registered`, `name` is a v3-additive disclosure with no new schema
+revision. The per-id table holds 256 distinct ids per capture; shed
+observations count in `evidence.mechanism_id_overflow` and force
+`PARTIAL`.
 
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten

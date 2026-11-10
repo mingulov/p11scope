@@ -327,8 +327,10 @@ memory: pointer-derived function metadata becomes output only by *exact*
 membership in the 104 published function names, and other values in that
 field are dropped in the kernel. Mechanism ids are public constants: the
 observer publishes the numeric id with call/error counts (registered ids by
-registry membership; others as bare numbers, never decoded, never named —
-see the allowlist-v3 row on unregistered mechanism id publication). Ids
+registry membership; others as bare numbers, never decoded — a listed
+vendor id additionally carries its display-only name, a pure function
+of the id (see the allowlist-v3 row on unregistered mechanism id
+publication). Ids
 above `0xFFFFFFFF` count in the total only. That is a
 containment boundary, not pointer validation —
 `bpf_probe_read_user` avoids faults, it does not check types.

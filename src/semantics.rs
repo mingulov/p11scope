@@ -2224,8 +2224,10 @@ pub struct SemanticEvidence {
     /// Mechanism observations shed because the per-id table already held
     /// [`MAX_MECHANISMS`] distinct ids: one count per shed observation,
     /// saturating, never silent. The shed id keeps no row and no
-    /// cgroup/module cell; row calls plus this count account for every
-    /// mechanism-bearing observation the budget admitted.
+    /// cgroup/module cell. Shed observations bypass the shared budget;
+    /// row calls plus this count account for every mechanism-bearing
+    /// observation except those refused by the shared budget (counted
+    /// in `semantic_state_drops`).
     pub mechanism_id_overflow: u64,
     /// Closed or unauthenticated history records omitted from semantic totals.
     pub semantic_history_drops: u64,

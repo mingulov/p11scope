@@ -7,10 +7,15 @@
 //! (`crates/types/src/mechanism_official.rs` at the pinned rev):
 //! every official id maps to its header name, sorted by id. No
 //! hand-written literals: re-run the generator (see the S1 report)
-//! when the pin moves. There are no vendor name tables (owner,
-//! 2026-11-10): every vendor's ids publish by number, so an id
-//! outside the official list has no name and renders with its exact
-//! number (see [`mechanism_label`]), never guessed.
+//! when the pin moves. Listed vendor ids from the display-only
+//! table (`vendor_mechanisms::VENDOR_MECHANISMS`: NSS `CKM_NSS_*`
+//! plus the AWS CloudHSM `CKM_CLOUDHSM_*`, Yubico `CKM_YUBICO_*`
+//! and Thales Luna key-creation/derivation/wrap ids) resolve
+//! through the fallthrough below; naming never affects counts,
+//! publication or row presence. Every other id outside those two
+//! lists — vendor ids (`>= 0x8000_0000`) and unregistered ids —
+//! has no name and renders with its exact number (see
+//! [`mechanism_label`]), never guessed.
 
 /// Official `CKM_*` name for a standard mechanism id, or `None` when
 /// the id is vendor-defined or otherwise unknown. The caller renders
@@ -488,19 +493,23 @@ pub(crate) fn official_mechanism_name(id: u64) -> Option<&'static str> {
     }
 }
 
-/// `CKM_*` display name for a mechanism id: the official name when
-/// the id is a known standard mechanism, else `None` — never guessed.
-/// The caller renders `None` through [`mechanism_label`].
+/// `CKM_*` display name for a mechanism id: the official name for
+/// a known standard mechanism, falling back to the display-only
+/// vendor table for listed vendor ids, or `None` when the id is
+/// otherwise vendor-defined or unknown. The caller renders `None`
+/// through [`mechanism_label`], never by guessing a name. Display
+/// only: naming never affects counts, publication or row presence.
 pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
-    official_mechanism_name(id)
+    official_mechanism_name(id).or_else(|| crate::vendor_mechanisms::vendor_mechanism_name(id))
 }
 
 /// Table label for any observed mechanism id: the `CKM_*` name when
-/// the id is a known standard mechanism, `vendor-defined 0x…` for ids
-/// at or above `CKM_VENDOR_DEFINED` (`0x8000_0000`), and `unknown 0x…`
-/// for any other id. The hex is the exact id (`0x{id:x}`, the same
-/// spelling as `mechanism_hex`); a label never guesses a vendor's
-/// name for its number.
+/// the id is a known standard or listed vendor mechanism,
+/// `vendor-defined 0x…` for other ids at or above
+/// `CKM_VENDOR_DEFINED` (`0x8000_0000`), and `unknown 0x…` for any
+/// other id. The hex is the exact id (`0x{id:x}`, the same spelling
+/// as `mechanism_hex`); a label never guesses a vendor's name for
+/// its number.
 pub(crate) fn mechanism_label(id: u64) -> String {
     mechanism_label_with(id, mechanism_name)
 }
@@ -510,10 +519,7 @@ pub(crate) fn mechanism_label(id: u64) -> String {
 /// [`official_mechanism_name`] to render the same capture as if the
 /// display-only vendor table were removed. The generic fallback is
 /// identical either way — only the resolved name can differ.
-pub(crate) fn mechanism_label_with(
-    id: u64,
-    name_of: fn(u64) -> Option<&'static str>,
-) -> String {
+pub(crate) fn mechanism_label_with(id: u64, name_of: fn(u64) -> Option<&'static str>) -> String {
     if let Some(name) = name_of(id) {
         return name.to_string();
     }
@@ -560,10 +566,7 @@ mod tests {
         // A listed vendor id carries its display name; unlisted ids
         // keep the generic number.
         assert_eq!(mechanism_label(0xCE53_4351), "CKM_NSS_AES_KEY_WRAP");
-        assert_eq!(
-            mechanism_label(0xCE53_43A9),
-            "vendor-defined 0xce5343a9"
-        );
+        assert_eq!(mechanism_label(0xCE53_43A9), "vendor-defined 0xce5343a9");
         assert_eq!(mechanism_label(0x0000_FFFF), "unknown 0xffff");
     }
 

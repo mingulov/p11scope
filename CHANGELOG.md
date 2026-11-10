@@ -49,8 +49,8 @@ versioned separately and are opaque, exact dispatch keys.
   metrics, pid and run captures, including the owned tree under
   `run`.
 - Every `mechanisms[]` and `cgroups[].mechanisms[]` JSON row carries
-  `name`: the `CKM_*` name when the id is a known standard mechanism,
-  else null, never guessed.
+  `name`: the `CKM_*` name when the id is a known standard or listed
+  vendor mechanism, else null, never guessed.
   <!-- lane: mech-generic -->
 
 ### Changed
@@ -125,16 +125,22 @@ versioned separately and are opaque, exact dispatch keys.
 - A `run` whose `--pause always` cycle is refused keeps its report:
   the sealed report names the refused pause instead of the run
   failing without one.
-- Every observed mechanism id is shown with its counts without vendor
-  name tables: standard ids keep their `CKM_*` names, ids at or above
-  `0x80000000` show as `vendor-defined 0x…` with the exact number, and
-  other unknown ids show as `unknown 0x…`. Previously only standard
-  ids and a fixed list of NSS vendor ids were named and anything else
-  showed as a bare number. The per-id table holds 256 distinct ids per
-  capture; further observations shed into the named
+- Every observed mechanism id is shown with its counts: standard ids
+  and 53 listed vendor ids (NSS, CloudHSM, YubiHSM, Luna) keep their
+  `CKM_*` names as a display-only layer over the generic per-number
+  counts, other ids at or above `0x80000000` show as
+  `vendor-defined 0x…` with the exact number, and other unknown ids
+  show as `unknown 0x…`. Previously only standard ids and a fixed
+  list of NSS vendor ids were named and anything else showed as a
+  bare number. The per-id table holds 256 distinct ids per capture;
+  further observations shed into the named
   `evidence.mechanism_id_overflow` count and force `PARTIAL`, never
   silently.
   <!-- lane: mech-generic -->
+- Known vendor mechanism ids resolve display-only `CKM_*` names over
+  the generic per-number counts: 41 NSS ids plus 6 CloudHSM, 4 Luna
+  and 2 YubiHSM ids. Removing the name table would change only the
+  displayed name, never counts, publication or row presence.
 
 ### Fixed
 

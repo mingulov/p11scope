@@ -18464,7 +18464,21 @@ impl Engine {
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            let mut preserve: BTreeSet<PinnedObjectId> = candidate_pins
+                .view_claims(view_id)
+                .map(|claims| {
+                    claims
+                        .tables
+                        .iter()
+                        .copied()
+                        .chain(claims.targets.iter().map(|(id, _)| *id))
+                        .chain(claims.pins.iter().copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+            preserve.insert(loader);
+            let preserve: Vec<PinnedObjectId> = preserve.into_iter().collect();
+            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &preserve));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()

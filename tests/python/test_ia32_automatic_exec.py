@@ -4,6 +4,7 @@
 """ia32 H6 controls: ordinary owned ELF32 workloads, never native capture."""
 import copy
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -909,6 +910,17 @@ int main(int argc, char **argv) {
                     lines = output.splitlines(); ev = json.loads(lines[-1][9:]); ev["task_uprobe_link_losses"] = 1
                     lines[-1] = "EVIDENCE " + json.dumps(ev); output = "\n".join(lines) + "\n"
                 self.assertFalse(gate["evaluate_ia32"](output, doc, calls, bad, "trace", output)["pass"], change)
+
+
+class Ia32TraceArgvPinTest(unittest.TestCase):
+    """The ia32 trace legs run verbose so EVIDENCE reaches stdout."""
+
+    def test_run_leg_builds_verbose_trace_argv(self):
+        self.assertTrue(SCRIPT.is_file(), "ia32 installed acceptance controller missing")
+        gate = runpy.run_path(str(SCRIPT))
+        source = inspect.getsource(gate["run_leg"].__wrapped__)
+        self.assertIn('if mode == "trace":', source)
+        self.assertIn('argv += ["-v"]', source)
 
 
 if __name__ == "__main__":

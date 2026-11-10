@@ -1123,31 +1123,34 @@ fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
 fn loader_sample_exes(pid: Option<u32>) -> Vec<String> {
     match pid {
         Some(pid) => vec![format!("/proc/{pid}/exe")],
-        None => vec!["/proc/self/exe".to_string()],
+        None => vec!["/proc/self/exe".to_string(), "/proc/1/exe".to_string()],
     }
 }
 
 /// The loader facts behind a sample list: the first sample that offers
 /// one. No sample is an unbound loader, as before.
 fn loader_facts_from(samples: &[String]) -> (bool, bool, bool) {
-    let first = samples.first().map(String::as_str).unwrap_or("/proc/self/exe");
-    loader_sample_at(first).unwrap_or((false, false, false))
+    samples
+        .iter()
+        .find_map(|sample| loader_sample_at(sample))
+        .unwrap_or((false, false, false))
 }
 
 /// One loader sample: the `(bound, hook, state)` triple for the
-/// executable at `exe`, or `None` when it offers no loader to assess.
+/// executable at `exe`, or `None` when it offers no loader to assess
+/// (unreadable, unparseable, or statically linked: no `PT_INTERP`).
 /// A dynamic executable whose loader cannot be bound is `Some` of the
 /// negative classification, never `None`.
 fn loader_sample_at(exe: &str) -> Option<(bool, bool, bool)> {
     let unbound = (false, false, false);
     let Ok(file) = std::fs::File::open(exe) else {
-        return Some(unbound);
+        return None;
     };
     let Ok(snapshot) = p11scope_manifest::elf::ElfSnapshot::read(&file) else {
-        return Some(unbound);
+        return None;
     };
     let Some(interpreter) = snapshot.interpreter() else {
-        return Some(unbound);
+        return None;
     };
     let interpreter = PathBuf::from(std::ffi::OsString::from(
         String::from_utf8_lossy(interpreter).into_owned(),

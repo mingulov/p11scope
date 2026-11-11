@@ -944,25 +944,43 @@ fn mount_identity_of_fd(fd: &OwnedFd) -> Option<MountIdentity> {
     })
 }
 
-/// Adds one filesystem mark through a held descriptor for the mount
-/// point (the NULL-pathname dirfd form), returning the marked
-/// mount's identity read from that same descriptor. `None` when the
-/// kernel refuses (for example without `CAP_SYS_ADMIN` after the
-/// capability shed) or the identity cannot be read: an uncredited
-/// mark is a named gap, never silent coverage. Marking the held
-/// object — not re-resolving the pathname inside the syscall — is
-/// what binds the credit to the mount actually marked when an
-/// overmount races the mountinfo snapshot.
-fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> Option<MountIdentity> {
+/// Opens a mount point for a filesystem mark: a real `O_RDONLY`
+/// directory handle, never `O_PATH` (the kernel rejects
+/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF`).
+/// `O_DIRECTORY | O_NOFOLLOW` bind the handle to the directory
+/// itself, so the mark and its identity credit cannot slide onto a
+/// non-directory or through a trailing symlink. `None` (an
+/// unopenable mount point) is a named gap, never silent coverage.
+fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
     // SAFETY: libc call; the NUL-terminated path is valid.
-    let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if raw < 0 {
         return None;
     }
     // SAFETY: `raw` is a fresh owned descriptor from the open above.
-    let held = unsafe { OwnedFd::from_raw_fd(raw) };
+    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Adds one filesystem mark through a held `O_RDONLY` descriptor for
+/// the mount point (the NULL-pathname dirfd form), returning the
+/// marked mount's identity read from that same descriptor. `None`
+/// when the mount point cannot be held (for example an `O_RDONLY`
+/// open refused with `EACCES`), when the kernel refuses the mark
+/// (for example without `CAP_SYS_ADMIN` after the capability shed),
+/// or when the identity cannot be read: an uncredited mark is a
+/// named gap, never silent coverage. Marking the held object — not
+/// re-resolving the pathname inside the syscall — is what binds the
+/// credit to the mount actually marked when an overmount races the
+/// mountinfo snapshot.
+fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> Option<MountIdentity> {
+    let held = open_mount_for_mark(point)?;
     let identity = mount_identity_of_fd(&held);
     // SAFETY: libc call; the group and held descriptors are valid,
     // and a NULL pathname marks the held descriptor's object.
@@ -1621,6 +1639,66 @@ mod tests {
             .find(|mount| mount.point.as_os_str() == "/data")
             .expect("data mount parsed");
         assert_eq!(data.identity, Some(mnt(70, 0, 40)));
+    }
+
+    /// The mark fd is a real `O_RDONLY` directory handle, never
+    /// `O_PATH`: the kernel rejects `FAN_MARK_FILESYSTEM` through an
+    /// `O_PATH` fd with `EBADF`, so the held descriptor opens
+    /// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and still
+    /// yields the held-object identity. A non-directory and a
+    /// trailing symlink refuse (a fail-closed named gap, never a
+    /// mark on the wrong object).
+    #[test]
+    fn learn_mark_fd_is_a_readable_directory_handle() {
+        let held =
+            super::open_mount_for_mark(std::path::Path::new("/")).expect("root opens for marking");
+        // SAFETY: fcntl on our own live fd.
+        let flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL reads the mark fd flags");
+        assert_eq!(
+            flags & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "the mark fd opens O_RDONLY (O_PATH marks fail EBADF): {flags}"
+        );
+        assert_eq!(
+            flags & libc::O_PATH,
+            0,
+            "the mark fd is never O_PATH: {flags}"
+        );
+        assert!(
+            flags & libc::O_DIRECTORY != 0,
+            "the mark fd pins a directory: {flags}"
+        );
+        assert!(
+            flags & libc::O_NOFOLLOW != 0,
+            "the mark fd never follows a trailing symlink: {flags}"
+        );
+        // SAFETY: fcntl on our own live fd.
+        let fd_flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            fd_flags & libc::FD_CLOEXEC != 0,
+            "the mark fd is close-on-exec: {fd_flags}"
+        );
+        assert!(
+            super::mount_identity_of_fd(&held).is_some(),
+            "the held object still yields its mount identity"
+        );
+        // O_DIRECTORY: a regular file refuses.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "not a mount point").unwrap();
+        assert!(
+            super::open_mount_for_mark(&file).is_none(),
+            "a non-directory is never a mark fd"
+        );
+        // O_NOFOLLOW: a trailing symlink refuses instead of marking
+        // through to whatever it points at.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(
+            super::open_mount_for_mark(&link).is_none(),
+            "a symlink is never a mark fd"
+        );
     }
 
     /// A failed re-mark of an already covered filesystem is not a

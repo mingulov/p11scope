@@ -235,6 +235,83 @@ fn inventory_map_contract_refuses_missing_extra_unresized_and_opportunistic_smal
     assert!(validate_inventory_maps(&changed, capacity(576)).is_err());
 }
 
+/// Both embedded Inventory objects carry exactly the loader
+/// manifest's maps: a BPF-side map addition without the manifest twin
+/// refuses every load at runtime, and the fixture twins above compare
+/// the manifest against themselves, so only this object-vs-manifest
+/// check sees that drift. Shapes compare exactly except the load-time
+/// resizes (`USAGE`/`ENDPOINT_OBJECT` capacity, `CALLER_USE` pairs).
+#[test]
+fn inventory_objects_carry_exactly_the_loader_manifest_maps() {
+    // The caller flavor's extra maps, restated from
+    // `callers::validate_caller_maps` (entries for the resized maps
+    // are placeholders; the comparison skips them).
+    let caller_extra: &[(&str, MapType, u32, u32, u32, u32)] = &[
+        ("INV_BASELINE_RQ", MapType::Hash, 4, 16, 1024, 129),
+        ("INV_BASELINE_CT", MapType::Array, 4, 56, 1, 0),
+        ("ENDPOINT_OBJECT", MapType::Array, 4, 8, 1, BPF_F_RDONLY_PROG),
+        ("CALLER_USE", MapType::Hash, 24, 40, 1, 0),
+        (
+            "CALLER_EVIDENCE",
+            MapType::PerCpuArray,
+            4,
+            8,
+            4,
+            0,
+        ),
+        ("TASK_COOKIE", MapType::TaskStorage, 4, 8, 0, 1),
+        ("COOKIE_CTL", MapType::Array, 4, 40, 1, 0),
+    ];
+    let resized = ["USAGE", "ENDPOINT_OBJECT", "CALLER_USE"];
+    let manifest = inventory_maps(capacity(576));
+    for (flavor, bytes, extra) in [
+        (
+            "inventory",
+            crate::EBPF_INVENTORY_OBJECT,
+            &[][..],
+        ),
+        (
+            "inventory-callers",
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+            caller_extra,
+        ),
+    ] {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        let actual: BTreeSet<&str> = object.maps.keys().map(String::as_str).collect();
+        let mut expected: BTreeSet<&str> = manifest.keys().map(|name| *name).collect();
+        expected.extend(extra.iter().map(|(name, ..)| *name));
+        assert_eq!(actual, expected, "{flavor} map names match the loader manifest");
+        for (name, (_, expected)) in &manifest {
+            let map = object.maps.get(*name).unwrap();
+            assert_eq!(map.map_type(), expected.map_type as u32, "{flavor} {name} type");
+            assert_eq!(map.key_size(), expected.key_size, "{flavor} {name} key");
+            assert_eq!(
+                map.value_size(),
+                expected.value_size,
+                "{flavor} {name} value"
+            );
+            if !resized.contains(name) {
+                assert_eq!(
+                    map.max_entries(),
+                    expected.max_entries,
+                    "{flavor} {name} entries"
+                );
+            }
+            assert_eq!(map.map_flags(), expected.flags, "{flavor} {name} flags");
+        }
+        for (name, map_type, key_size, value_size, max_entries, flags) in extra {
+            let map = object.maps.get(*name).unwrap();
+            assert_eq!(map.map_type(), *map_type as u32, "{flavor} {name} type");
+            assert_eq!(map.key_size(), *key_size, "{flavor} {name} key");
+            assert_eq!(map.value_size(), *value_size, "{flavor} {name} value");
+            if !resized.contains(name) {
+                assert_eq!(map.max_entries(), *max_entries, "{flavor} {name} entries");
+            }
+            assert_eq!(map.map_flags(), *flags, "{flavor} {name} flags");
+        }
+    }
+}
+
 fn program_fixture() -> BTreeMap<String, InventoryProgramKind> {
     use InventoryProgramKind::*;
     [

@@ -50253,6 +50253,32 @@ fn busy_retained_refreshes_share_one_scan_ticks_with_newcomers() {
     // left queued — not an attach in every pass, so this test runs the
     // passes directly instead of through `fixture.run`'s per-pass
     // attach assertion.
+    //
+    // The queue-empty check alone cannot prove the retained class was
+    // serviced: completing a request also empties the queue. The
+    // retained cursor below is the independent witness — newcomer
+    // admissions never touch it (`note_retained_view_attempt` runs only
+    // in `scan_inventory_views`), so rotation proves the retained view
+    // itself rescanned within the two passes.
+    let retained_view = fixture
+        .engine
+        .views
+        .iter()
+        .find(|view| view.pid() == retained_pid)
+        .expect("the retained view is present before the passes")
+        .id()
+        .0;
+    let probe = if retained_view == u32::MAX {
+        vec![retained_view - 1, retained_view]
+    } else {
+        vec![retained_view, retained_view + 1]
+    };
+    assert_eq!(
+        fixture.engine.scheduler.retained_view_order(&probe),
+        probe,
+        "no retained rescan ran before the measured passes"
+    );
+    let scans_before = fixture.engine.deep_scans;
     let mut attached_any = false;
     for _ in 0..2 {
         let mut polls = 0;
@@ -50275,6 +50301,15 @@ fn busy_retained_refreshes_share_one_scan_ticks_with_newcomers() {
         attached_any |= !session.attached_slots.is_empty();
     }
     assert!(attached_any, "a candidate was applied within two passes");
+    assert_eq!(
+        fixture.engine.scheduler.retained_view_order(&probe),
+        vec![probe[1], probe[0]],
+        "the retained refresh rescanned within the two passes, not just the newcomer"
+    );
+    assert!(
+        fixture.engine.deep_scans >= scans_before + 2,
+        "the retained rescan plus the newcomer admission scanned within two passes"
+    );
     assert!(
         fixture.engine.refresh_requested.is_empty(),
         "neither the retained refresh nor the newcomer stayed queued"

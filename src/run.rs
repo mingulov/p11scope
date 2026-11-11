@@ -10367,6 +10367,10 @@ fn capture_profile(
             .scheduling
             .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
         consumers.scheduling.sync_tail_stats(context.0);
+        // The reap below never drains a ring, so the terminal ring
+        // reading stays contemporaneous ahead of it, and the reap keeps
+        // sitting immediately before the seal.
+        let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
         // A staged child that already exited is reaped before the seal,
         // so the sealed disposition and the process exit agree on its
         // natural status; a live child stays staged for the outer commit.
@@ -10378,7 +10382,6 @@ fn capture_profile(
                 &mut owned.still_running,
             );
         }
-        let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
         let mut ev = evidence_for(
             context.0,
             context.0.capture_facts(),
@@ -11745,6 +11748,10 @@ fn capture_trace(
                         .scheduling
                         .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
                     consumers.scheduling.sync_tail_stats(context.0);
+                    // The reap below never drains a ring, so the terminal ring
+                    // reading stays contemporaneous ahead of it, and the reap keeps
+                    // sitting immediately before the seal.
+                    let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
                     // A staged child that already exited is reaped before the seal,
                     // so the sealed disposition and the process exit agree on its
                     // natural status; a live child stays staged for the outer commit.
@@ -11758,7 +11765,6 @@ fn capture_trace(
                     }
                     // The frozen consumer map pins the single-line coordinator
                     // projections below; keep them byte-stable for the marker.
-                    let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
                     #[rustfmt::skip]
                     let mut evidence =
                         evidence_for(

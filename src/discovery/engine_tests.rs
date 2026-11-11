@@ -43283,8 +43283,10 @@ fn e07_metadata_rescan_with_new_provider_preserves_existing_coverage() {
         "the announcement attaches nothing new"
     );
 
-    // The deferred memory scan then covers the new provider while the
-    // first provider keeps its identity.
+    // The deferred memory scan keeps the first provider's identity.
+    // Whether that one scan also completes the new provider's table
+    // coverage depends on its own completeness, which this twin does
+    // not pin: the contract here is that validated coverage survives.
     e07_rescan(
         &mut engine,
         &mut session,
@@ -43383,7 +43385,9 @@ fn e07_metadata_contradiction_in_one_provider_preserves_the_other() {
     // holds the second provider's real file. Its own pins still
     // validate, but a fresh observation of the first provider no
     // longer merges into it.
-    engine.pinned.overwrite_test_entry(first_module, second_module);
+    engine
+        .pinned
+        .overwrite_test_entry(first_module, second_module);
     assert!(
         engine.view_pins_unchanged(view_id),
         "the spliced held files still validate"

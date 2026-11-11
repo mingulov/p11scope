@@ -85,6 +85,7 @@ pub mod pidns;
 pub mod plan;
 pub(crate) mod prearm_module;
 pub mod process;
+pub(crate) mod process_access;
 pub mod render;
 pub(crate) mod run;
 pub mod scope;

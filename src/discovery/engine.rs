@@ -26351,10 +26351,26 @@ impl Engine {
         }
         removed.retain(|view| !failed_retirements.contains(view));
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
+        // Only a view that is actually leaving queues the conservative
+        // replay: that candidate drops every pin the view owns, which is
+        // right for a generation that is gone and wrong for a retained
+        // view whose loader contexts merely retired for a refresh (the
+        // ExecRefresh rule at the other queueing site). A refreshed live
+        // holder queued here would have its provider re-pinned under a
+        // fresh object id on the next build, retiring its whole slot
+        // generation and allocating a duplicate one, so its calls would
+        // fall in detach/reattach windows and never count.
         let completed_retirements =
             completed_retirement_intent(&removed, &context_retirements, &failed_retirements);
         self.pending_retirements
-            .extend(completed_retirements.iter().copied());
+            .extend(completed_retirements.iter().copied().filter(|view| {
+                removed.contains(view)
+                    || !self
+                        .views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .is_some_and(ProcessView::still_the_same)
+            }));
         let mut pre_candidate_records = Vec::new();
         for queued in std::mem::take(records) {
             if new_view_pids.contains(&((queued.record.pid_tgid >> 32) as u32)) {

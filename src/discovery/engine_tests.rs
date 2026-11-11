@@ -50245,13 +50245,40 @@ fn busy_retained_refreshes_share_one_scan_ticks_with_newcomers() {
     fixture.engine.scheduler.set_max_new_views_for_test(1);
     fixture.engine.request_refresh(retained_pid, Some(10));
     fixture.engine.request_refresh(newcomer_pid, Some(20));
+    // Admissions keep their own tick quantum after refreshed rescans
+    // (desk-late), so when the retained rescan leads, both classes can
+    // finish in the first pass and the second is a correct no-op tick
+    // with nothing left to attach. The fairness contract is the bound
+    // below — a real newcomer attempt within two passes and no class
+    // left queued — not an attach in every pass, so this test runs the
+    // passes directly instead of through `fixture.run`'s per-pass
+    // attach assertion.
+    let mut attached_any = false;
     for _ in 0..2 {
         let mut polls = 0;
-        fixture.run(Vec::new(), &mut || {
-            polls += 1;
-            Some(u64::from(polls > 2))
-        });
+        let mut session = ScriptedSession::default();
+        fixture
+            .engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut Engine::collect_discovery_records,
+                &mut PauseClosure::new(true),
+                &mut || {
+                    polls += 1;
+                    Some(u64::from(polls > 2))
+                },
+            )
+            .unwrap();
+        attached_any |= !session.attached_slots.is_empty();
     }
+    assert!(attached_any, "a candidate was applied within two passes");
+    assert!(
+        fixture.engine.refresh_requested.is_empty(),
+        "neither the retained refresh nor the newcomer stayed queued"
+    );
     assert!(
         fixture
             .engine

@@ -625,11 +625,6 @@ pub struct Engine {
     /// One-shot scheduling hint after an older leader loss or actual global
     /// native retirement settles. It grants no admission authority.
     immediate_exec_recovery_frame: bool,
-    /// One-shot scheduling hint that kernel-found frame-only work is
-    /// queued: a newcomer pid awaiting the inventory pass, or a newly
-    /// deferred loader memory scan. It grants no admission authority; the
-    /// run loop only moves the next ordinary frame earlier.
-    fast_discovery_frame: bool,
     pending_global_retirement: Option<RetirementTicket>,
     /// Retired slots the last revival refresh observed physically
     /// detached. A slot clears for revival only when observed detached
@@ -11541,7 +11536,6 @@ impl Engine {
             pressure_attempts: 0,
             frame_fresh_blocked: false,
             immediate_exec_recovery_frame: false,
-            fast_discovery_frame: false,
             pending_global_retirement: None,
             revival_observed_detached: BTreeSet::new(),
             revival_finalized: BTreeSet::new(),
@@ -14655,13 +14649,6 @@ impl Engine {
         {
             *marker = Some(serial);
         }
-        // A consumed record that first queued a pid no retained view owns
-        // can only be admitted by a frame's inventory pass: ask the run
-        // loop to bring that frame forward. Renewals and self-queued
-        // (non-consumed) requests keep the ordinary cadence.
-        if consumed && existing.is_none() && owner.is_none() {
-            self.fast_discovery_frame = true;
-        }
         true
     }
 
@@ -14948,9 +14935,6 @@ impl Engine {
         }
         self.pending_loader_scans
             .insert(key, (hook_ts_ns, announced));
-        // A newly deferred scan is serviced only inside a frame: bring
-        // that frame forward instead of waiting out the drain interval.
-        self.fast_discovery_frame = true;
     }
 
     fn record_pending_loader_scan_loss(&mut self, reason: &str) {
@@ -24471,12 +24455,6 @@ impl Engine {
     /// Consume only the next-frame scheduling hint, never admission authority.
     pub(crate) fn take_immediate_exec_recovery_frame(&mut self) -> bool {
         std::mem::take(&mut self.immediate_exec_recovery_frame)
-    }
-
-    /// Consume only the fast-frame scheduling hint, never admission
-    /// authority.
-    pub(crate) fn take_fast_discovery_frame(&mut self) -> bool {
-        std::mem::take(&mut self.fast_discovery_frame)
     }
 
     /// Poll only the current Session allocation's ticket. Ordinary live work

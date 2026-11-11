@@ -73665,25 +73665,32 @@ fn complete_initial_arming_stops_between_views_with_a_named_gap() {
     );
 }
 
-/// Startup B4 twin (positive): a clean post-ready completion with a nonzero
-/// arming window names the window as a counted gap — calls into providers
-/// armed in that window before their hooks attached were not counted. The
-/// window is forced through the test seam (scripted arms take
-/// microseconds); the gap must reach both the counters and the published
-/// plan skip list.
+/// Startup B4 twin (positive): a clean wide-scope post-ready completion
+/// with a nonzero arming window names the window as a counted gap when
+/// the completion added coverage — here it attaches the initial dynamic
+/// export hooks, so calls reaching that coverage before it attached were
+/// not counted. The window is forced through the test seam (scripted
+/// arms take microseconds); the gap must reach both the counters and the
+/// published plan skip list.
 #[test]
 fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
-    let views: Vec<_> = (0..3)
-        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
-        .collect();
-    let mut engine = lifecycle_discovered(views);
-    engine.scope = Scope::Pid(std::process::id());
+    let (_fixture, mut engine, mut session) = initial_export_route();
+    engine.scope = Scope::System;
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(11);
-    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    assert!(
+        session.dynamic_attach_calls.is_empty(),
+        "no export hook is attached before the completion"
+    );
     engine
         .complete_initial_arming(&mut session, &|| false)
         .expect("healthy completion runs");
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        3,
+        "the completion attached the initial export hooks"
+    );
     let gap = engine
         .counters
         .object_skips
@@ -73702,6 +73709,168 @@ fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
             .iter()
             .any(|skip| skip.subject == "initial loader arming"),
         "the window gap reaches the published plan skip list"
+    );
+}
+
+/// Startup B4 twin (negative, no added coverage): a wide-scope completion
+/// that runs a loader arm but adds no coverage — every export hook is
+/// already attached and no plan slot appears — files no window gap even
+/// with a long forced window: nothing became countable only at the end
+/// of the window, so no calls in it went uncounted.
+#[test]
+fn complete_initial_arming_files_no_window_gap_when_no_coverage_added() {
+    let (_fixture, mut engine, mut session, _binding) = attached_selection_route();
+    engine.scope = Scope::System;
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(9000);
+    let arms_before = engine.loader_arms();
+    let exports_before = session.dynamic_attach_calls.len();
+    let slots_before = engine.plan.slots.len();
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert!(
+        engine.loader_arms() > arms_before,
+        "a loader arm ran post-ready"
+    );
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        exports_before,
+        "no export hook attached in the window"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots_before,
+        "no plan slot appeared in the window"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "initial loader arming"),
+        "no window gap without added coverage: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Startup B4 twin (negative, pid scope): a `--pid` capture completes
+/// initial arming before the `capturing:` line, so there is no post-ready
+/// window to name — the completion files no window gap even when it adds
+/// coverage inside a long forced window.
+#[test]
+fn complete_initial_arming_files_no_window_gap_for_pid_scope() {
+    let (_fixture, mut engine, mut session) = initial_export_route();
+    assert!(
+        matches!(engine.scope, Scope::Pid(_)),
+        "the route is a pid-scope capture"
+    );
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(11);
+    session.dynamic_attach_reports_added = true;
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert!(
+        !session.dynamic_attach_calls.is_empty(),
+        "the completion added coverage"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "initial loader arming"),
+        "no window gap for a pid-scope completion: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Startup B4 twin (real clock): with no window seam set, a loader attach
+/// that takes real time makes the completion measure a nonzero window on
+/// the monotonic clock and name it — the production clock wiring, not the
+/// forced-milliseconds seam.
+#[test]
+fn complete_initial_arming_measures_the_window_on_the_real_clock() {
+    let (fixture, view, mut module, pins) = loaded_seed_provider();
+    let _fixture = fixture;
+    module.exports = vec![
+        "C_GetFunctionList".into(),
+        "C_GetInterfaceList".into(),
+        "C_GetInterface".into(),
+    ];
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    let candidate = engine
+        .live_candidate(pins, vec![module], Vec::new())
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    session.dynamic_loader_reports_added = true;
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    // The loader is not pre-armed here: the completion arms it, and the
+    // attach sleeps so the real clock measures the window.
+    engine.initial_arming_pending = true;
+    session.before_dynamic_loader_attach = Some(Box::new(|| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }));
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert!(
+        !session.dynamic_attach_calls.is_empty(),
+        "the completion attached the initial export hooks"
+    );
+    let gap = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "initial loader arming")
+        .expect("the real-clock window names its gap");
+    assert!(
+        gap.reason.contains("ms after the capturing: line")
+            && gap.reason.contains("were not counted"),
+        "the gap names the measured window: {}",
+        gap.reason
+    );
+    assert!(
+        !gap.reason.contains("finished 0ms"),
+        "the measured window is nonzero: {}",
+        gap.reason
+    );
+}
+
+/// The arming window ends when the export attach settles; the discovery
+/// staging that follows it is not part of the window a provider call
+/// could have raced.
+#[test]
+fn completion_window_end_excludes_discovery_staging() {
+    let source = include_str!("engine.rs");
+    let completion = source
+        .split_once("fn complete_initial_arming(")
+        .expect("complete_initial_arming exists")
+        .1
+        .split_once("pub(crate) mod session_fixture")
+        .expect("session fixture bounds the completion")
+        .0;
+    let exports = completion
+        .find("self.attach_initial_exports(")
+        .expect("the completion attaches initial exports");
+    let armed = completion
+        .find("armed_ns = crate::attach::monotonic_ns();")
+        .expect("the completion stamps the window end");
+    let staging = completion
+        .find("session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)")
+        .expect("the completion stages discovery after the exports");
+    assert!(
+        exports < armed && armed < staging,
+        "the window ends at the export attach, before staging"
     );
 }
 
@@ -73795,24 +73964,21 @@ fn regressing_live_produced_reading_retains_the_prior_triple() {
 }
 
 /// Startup B4 twin (negative): a zero-millisecond window files no gap even
-/// with armed providers — below the clock's millisecond there is no window
-/// to name.
+/// when the wide-scope completion added coverage — below the clock's
+/// millisecond there is no window to name.
 #[test]
 fn complete_initial_arming_files_no_window_gap_when_arming_instant() {
-    let views: Vec<_> = (0..3)
-        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
-        .collect();
-    let mut engine = lifecycle_discovered(views);
-    engine.scope = Scope::Pid(std::process::id());
+    let (_fixture, mut engine, mut session) = initial_export_route();
+    engine.scope = Scope::System;
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(0);
-    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
     engine
         .complete_initial_arming(&mut session, &|| false)
         .expect("healthy completion runs");
     assert!(
-        engine.loader_arms() > 0,
-        "the completion armed providers post-ready"
+        !session.dynamic_attach_calls.is_empty(),
+        "the completion added coverage post-ready"
     );
     assert!(
         engine

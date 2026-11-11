@@ -26657,16 +26657,21 @@ int main(int argc, char **argv) {
         }
     }
 
-    /// Startup T3 twin 6: both capture loops run the deferred initial
-    /// arming after the ready line and before the hook recount, then
-    /// re-sync their plan consumers — the completion's cleanup pass can
-    /// change the plan silently (no plan-changed tick fires for it), so
-    /// the semantic state, the tracer, the trace header and the endpoint
-    /// selection all resolve against the post-completion plan, exactly as
-    /// when the start armed inline. The loops need a live session, so the
-    /// order is pinned statically; the acceptance transcripts prove it runs.
+    /// Per-scope initial-arming order: a `--pid` capture completes the
+    /// deferred initial arming (and, in profile, the endpoint selection)
+    /// before the `capturing:` line, so it has no post-ready window;
+    /// `--system`/`--cgroup` keep the completion after the ready line.
+    /// Both loops re-sync their plan consumers after the completion —
+    /// its cleanup pass can change the plan silently (no plan-changed
+    /// tick fires for it), so the semantic state, the tracer, the trace
+    /// header and the endpoint selection all resolve against the
+    /// post-completion plan, exactly as when the start armed inline.
+    /// The completion's stop check honours the `--duration` deadline
+    /// beside Ctrl-C, so a short duration is not spent inside arming
+    /// and then overrun. The loops need a live session, so the order
+    /// is pinned statically; the acceptance transcripts prove it runs.
     #[test]
-    fn both_capture_loops_complete_initial_arming_after_ready() {
+    fn capture_loops_arm_before_ready_for_pid_and_after_for_wide_scopes() {
         let source = include_str!("run.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         assert_eq!(
@@ -26699,9 +26704,24 @@ int main(int argc, char **argv) {
                 &["state.sync_plan(", "tracer.sync_plan("][..],
             ),
         ] {
-            let mut markers = vec!["capture_ready_line(", "complete_initial_arming("];
+            let mut markers = vec![
+                "let arm_before_ready = matches!(scope, Scope::Pid(_));",
+                "if !arm_before_ready {",
+                "capture_ready_line(",
+                "complete_initial_arming(",
+            ];
             markers.extend_from_slice(syncs);
-            markers.push("loader_readiness_hooks(");
+            if name == "profile" {
+                // The selection sits between the completion and the
+                // pid-scope ready line: its detail window is open
+                // before `capturing:` on that path.
+                markers.push("run_metrics_selection_stage(");
+            }
+            markers.extend_from_slice(&[
+                "if arm_before_ready {",
+                "capture_ready_line(",
+                "loader_readiness_hooks(",
+            ]);
             let mut pos = 0;
             for marker in markers {
                 let at = body[pos..]
@@ -26709,22 +26729,29 @@ int main(int argc, char **argv) {
                     .unwrap_or_else(|| panic!("{name} loop lacks {marker}"));
                 pos += at + marker.len();
             }
+            let complete = body.find("complete_initial_arming(").unwrap();
+            let call_end = body[complete..]
+                .find(")?;")
+                .expect("the completion call ends");
+            let call = &body[complete..complete + call_end];
+            assert!(
+                call.contains("interrupted.interrupted()"),
+                "{name} completion honours Ctrl-C between views"
+            );
+            assert!(
+                call.contains("duration.is_some_and(|limit| clock.elapsed() >= limit)"),
+                "{name} completion honours the duration deadline between views"
+            );
         }
-        let complete = trace.find("complete_initial_arming(").unwrap();
+        let pid_ready = trace
+            .find("if arm_before_ready {")
+            .expect("trace emits the pid-scope ready line");
         let header = trace
             .find("trace::header(")
             .expect("trace assembles its header");
         assert!(
-            complete < header,
-            "the trace header reads the post-completion plan"
-        );
-        let complete = profile.find("complete_initial_arming(").unwrap();
-        let selection = profile
-            .find("run_metrics_selection_stage(")
-            .expect("profile resolves its selection");
-        assert!(
-            complete < selection,
-            "the endpoint selection reads the post-completion plan"
+            pid_ready < header,
+            "the trace header reads the post-completion plan, after the ready line"
         );
     }
 

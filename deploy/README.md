@@ -21,6 +21,9 @@
   `tests/fixtures/public-cli/gated.c`. Never deploy it.
 - `k8s/e2e/workloads.yaml` — **test-only** ledgered pods and the idle negative
   control used by `scripts/kind-e2e.sh`.
+- [`seccomp-p11scope.json`](seccomp-p11scope.json) — the vendored Docker
+  default seccomp profile plus one `bpf()` allow rule, for engines whose
+  default cannot be used and for Kubernetes `Localhost` profiles (below).
 
 The observer image is published on releases as
 `ghcr.io/mingulov/p11scope:<version>` (see `RELEASING.md`); the holder image
@@ -51,9 +54,7 @@ shipped set. `doctor` exits 0 with `capture available`, and `profile
 --pid`, `--cgroup` and `--system` count a ledgered SoftHSM workload
 exactly. Docker 24 and later already allow `bpf()` with `CAP_BPF` and
 `perf_event_open()` with `CAP_PERFMON` under the default profile, so no
-custom seccomp file is shipped and no `--security-opt seccomp` flag is
-needed. (On Docker 20.10 and older the default profile allows `bpf()`
-only with `CAP_SYS_ADMIN`; use the shipped set there.)
+`--security-opt seccomp` flag is needed there.
 
 ```sh
 docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
@@ -72,6 +73,21 @@ Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 000001c000080004` (the five, no `SYS_ADMIN`) and `Seccomp: 2` (the
 default filter active). `scripts/matrix/verify-container-image.sh`
 covers the recipe as `five-cap-exact`.
+
+Where the engine default cannot be used — Docker 20.10 and older
+(whose default allows `bpf()` only with `CAP_SYS_ADMIN`), a daemon
+with a custom default, or a Kubernetes `Localhost` seccomp profile —
+use [`seccomp-p11scope.json`](seccomp-p11scope.json) via
+`--security-opt seccomp=deploy/seccomp-p11scope.json` (Docker) or
+installed at `/var/lib/kubelet/seccomp/p11scope.json` with
+`localhostProfile: p11scope.json` (Kubernetes; measured exact on
+kind). It is the Docker default profile vendored from moby/moby
+v28.3.3 (Apache-2.0; upstream `sha256:01536f1d…`, the last release
+carrying `profiles/seccomp/default.json`) plus exactly one appended
+allow rule for `bpf()`; the vendored 31 groups are byte-identical to
+upstream. `perf_event_open()` stays at the default (conditional),
+proven unneeded on the default uprobe-multi lane. The same five-cap
+matrix is exact with this file on Docker 29.7/29.8/29.9.
 
 To rebuild the development image from this tree instead
 (`scripts/kind-e2e.sh` shows the exact steps, repeatable but not

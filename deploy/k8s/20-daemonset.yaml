@@ -44,9 +44,12 @@
 # DAC_READ_SEARCH, no SYS_ADMIN) with seccomp RuntimeDefault captures
 # exactly on kind (ledger-a 6 x 400 and ledger-p 6 x 300, the private-0700
 # provider case; doctor verdict capture available), at any paranoid on
-# the default lane. The shipped manifest keeps its SYS_ADMIN grant as
-# the default; use the narrow set by replacing the three adds below
-# with the five. Do not simply drop SYS_ADMIN without adding
+# the default lane, and the same pair is exact with a Localhost profile
+# (install deploy/seccomp-p11scope.json at
+# /var/lib/kubelet/seccomp/p11scope.json on each node). The shipped
+# manifest keeps its SYS_ADMIN grant as the default; use the narrow set
+# by replacing the three adds below with the five. Do not simply drop
+# SYS_ADMIN without adding
 # CHECKPOINT_RESTORE: SYS_ADMIN also covers /proc/<pid>/map_files,
 # which inventory's caller attribution past the scan cap reads and
 # which needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE (without either

@@ -191,15 +191,20 @@ Why each grant:
 `CHECKPOINT_RESTORE` + `SYS_PTRACE` + `DAC_READ_SEARCH`) with seccomp
 `RuntimeDefault` captures exactly at any paranoid on the default lane
 — ledger-a 6 x 400 and ledger-p 6 x 300 (the private-0700 provider
-case), `doctor` verdict `capture available`. The shipped manifest
-keeps its `SYS_ADMIN` grant as the default; use the narrow set by
-replacing the three `capabilities.add` entries with the five. **Do not
-simply drop `SYS_ADMIN`** without adding `CHECKPOINT_RESTORE`: it
-also covers `/proc/<pid>/map_files`, which `inventory`'s caller
-attribution past the scan cap reads and which needs `CAP_SYS_ADMIN` or
-`CAP_CHECKPOINT_RESTORE` (without either, those callers are reported as
-`map_files_unavailable`). Prove a node with `--command doctor`: `uprobe
-attach (self) ... ok` and `verdict: capture available`.
+case), `doctor` verdict `capture available`. The same pair is exact
+with a `Localhost` profile: install
+[`seccomp-p11scope.json`](../seccomp-p11scope.json) at
+`/var/lib/kubelet/seccomp/p11scope.json` on each node and set
+`seccompProfile: {type: Localhost, localhostProfile: p11scope.json}`.
+The shipped manifest keeps its `SYS_ADMIN` grant as the default; use
+the narrow set by replacing the three `capabilities.add` entries with
+the five. **Do not simply drop `SYS_ADMIN`** without adding
+`CHECKPOINT_RESTORE`: it also covers `/proc/<pid>/map_files`, which
+`inventory`'s caller attribution past the scan cap reads and which
+needs `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` (without either,
+those callers are reported as `map_files_unavailable`). Prove a node
+with `--command doctor`: `uprobe attach (self) ... ok` and `verdict:
+capture available`.
 
 ### Blast radius
 

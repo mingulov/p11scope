@@ -169,6 +169,7 @@ RUN = [
     ("test_runtime_observer_download.py", []),
     ("test_s1_throughput_compare.py", []),
     ("test_schema_json.py", []),
+    ("test_seccomp_profile.py", []),
     ("test_skip_reason_vocabulary.py", []),
     ("test_stop_race_oracle.py", []),
     ("test_system_first_use_fixture.py", []),

@@ -55,9 +55,11 @@ versioned separately and are opaque, exact dispatch keys.
 - A documented least-privilege container recipe (no `--privileged`,
   no `CAP_SYS_ADMIN`): `--cap-drop ALL` plus `BPF`, `PERFMON`,
   `CHECKPOINT_RESTORE`, `SYS_PTRACE` and `DAC_READ_SEARCH` under the
-  Docker default seccomp profile (Docker 24+, no custom profile
-  needed) or the Kubernetes `RuntimeDefault` profile captures
-  exactly like the shipped set. The shipped `SYS_ADMIN` default is
+  Docker default seccomp profile (Docker 24+) or the Kubernetes
+  `RuntimeDefault` profile captures exactly like the shipped set,
+  with `deploy/seccomp-p11scope.json` (vendored Docker default plus
+  one `bpf()` allow) for older engines, custom daemon defaults and
+  Kubernetes `Localhost` profiles. The shipped `SYS_ADMIN` default is
   unchanged. <!-- lane: nosysadmin -->
 
 ### Changed

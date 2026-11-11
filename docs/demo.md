@@ -151,7 +151,10 @@ docker run --rm $FLAGS $IMG profile --system --duration 30s
 Least privilege (measured 2026-11-11; no `--privileged`, no
 `CAP_SYS_ADMIN`) captures the same demo exactly with the narrow
 five-capability set under the Docker default seccomp profile — no
-custom profile is needed on Docker 24 and later:
+`--security-opt seccomp` flag is needed on Docker 24 and later (where
+the engine default cannot be used, pass
+`--security-opt seccomp=deploy/seccomp-p11scope.json` from the
+checkout):
 
 ```sh
 FLAGS="--pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro"

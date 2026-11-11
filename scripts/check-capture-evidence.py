@@ -3728,8 +3728,23 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         ("interface_list", "absent"),
     ):
         require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
+    # The Detailed ceiling the planner admitted against: the validated
+    # host-sized `slot_sizing.effective_slots` when present, else the
+    # compiled ceiling. The reserve is a quarter of that ceiling, never
+    # under one 3.2 function list (`shared_scope_reserve`, src/plan.rs).
+    detailed_ceiling = (
+        evidence["slot_sizing"]["effective_slots"]
+        if "slot_sizing" in evidence
+        else MAX_SLOTS
+    )
+    reserve = min(max(detailed_ceiling * 25 // 100, 104), detailed_ceiling)
+    prefix_ceiling = detailed_ceiling - reserve
     require(
-        68 + prefix_slots <= PROXY_PREFIX_CEILING
+        evidence["slots"] <= detailed_ceiling,
+        f"slots exceed the Detailed ceiling: {evidence['slots']} > {detailed_ceiling}",
+    )
+    require(
+        68 + prefix_slots <= prefix_ceiling
         < 68 + (prefix_tables + 1) * (table_entries - 2) + 2,
         f"prefix is not the reserve-capped maximum: N={prefix_tables} M={proxy_total}",
     )
@@ -5743,6 +5758,13 @@ def self_test():
         "budget_bytes": 67108864,
         "stats_bytes": 889323520,
     }
+    # The per-document formula reproduces the compiled pin when sizing
+    # is absent, so the old 1584 ceiling behavior is preserved exactly.
+    require(
+        MAX_SLOTS - min(max(MAX_SLOTS * 25 // 100, 104), MAX_SLOTS)
+        == PROXY_PREFIX_CEILING == 1584,
+        "the compiled prefix ceiling pin drifted",
+    )
     for sizing, want_tables in ((sized_662, 4), (sized_512, 3)):
         effective = sizing["effective_slots"]
         ceiling = effective - min(max(effective * 25 // 100, 104), effective)

@@ -424,12 +424,37 @@ const PSEUDO_FS: &[&str] = &[
     "anon_inodefs",
 ];
 
-/// Mount points to mark, parsed from `/proc/self/mountinfo` text:
-/// field 5 is the mount point, the field after `" - "` is the fstype.
-/// Malformed lines are skipped; escapes (`\040` etc.) are decoded.
-/// Paths stay byte-exact (`PathBuf`): a lossy string could miss a mark.
-pub(crate) fn mount_points_for_marks(mountinfo: &str) -> Vec<std::path::PathBuf> {
-    let mut points = Vec::new();
+/// One mount's kernel identity: its mount id plus its filesystem
+/// device (`major:minor` from mountinfo). Mark coverage keys on
+/// this, never on the mount-point path: a filesystem mounted at a
+/// path an earlier mount occupied is a different identity, and the
+/// earlier mount's mark died with its unmounted superblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MountIdentity {
+    mount_id: u64,
+    dev_major: u32,
+    dev_minor: u32,
+}
+
+/// One visible mount a mark pass must cover: the point is only the
+/// locator handed to `fanotify_mark`; the identity decides coverage.
+/// `None` when the mountinfo identity fields do not parse — such a
+/// mount can be marked but its coverage cannot be retained, so a
+/// failed mark counts it uncovered (fail-closed).
+pub(crate) struct MountToMark {
+    point: std::path::PathBuf,
+    identity: Option<MountIdentity>,
+}
+
+/// Mounts to mark, parsed from `/proc/self/mountinfo` text: field 1
+/// is the mount id, field 3 the filesystem device, field 5 the mount
+/// point, and the field after `" - "` is the fstype. Malformed lines
+/// are skipped; escapes (`\040` etc.) are decoded. Paths stay
+/// byte-exact (`PathBuf`): a lossy string could miss a mark. A point
+/// mounted over keeps the last (topmost) entry, which is where the
+/// path resolves.
+pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
+    let mut mounts: Vec<MountToMark> = Vec::new();
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split(' ').collect();
         let Some(sep) = fields.iter().position(|field| *field == "-") else {
@@ -442,12 +467,27 @@ pub(crate) fn mount_points_for_marks(mountinfo: &str) -> Vec<std::path::PathBuf>
             continue;
         }
         let point = unescape_mountinfo(fields[4]);
-        if point.as_os_str().is_empty() || points.contains(&point) {
+        if point.as_os_str().is_empty() {
             continue;
         }
-        points.push(point);
+        let identity = parse_mount_identity(fields[0], fields[2]);
+        if let Some(existing) = mounts.iter_mut().find(|mount| mount.point == point) {
+            existing.identity = identity;
+            continue;
+        }
+        mounts.push(MountToMark { point, identity });
     }
-    points
+    mounts
+}
+
+/// Parses one mountinfo identity pair (`mount id`, `major:minor`).
+fn parse_mount_identity(mount_id: &str, dev: &str) -> Option<MountIdentity> {
+    let (major, minor) = dev.split_once(':')?;
+    Some(MountIdentity {
+        mount_id: mount_id.parse().ok()?,
+        dev_major: major.parse().ok()?,
+        dev_minor: minor.parse().ok()?,
+    })
 }
 
 /// Decodes mountinfo octal escapes in a mount-point field, byte-exact.
@@ -654,7 +694,7 @@ pub(crate) struct FileLearner {
     pending: Option<(
         OwnedFd,
         SyncSender<LearnMsg>,
-        BTreeSet<std::path::PathBuf>,
+        BTreeSet<MountIdentity>,
         bool,
     )>,
 }
@@ -689,7 +729,10 @@ impl FileLearner {
         // SAFETY: fanotify_init returned an owned fd.
         let group = unsafe { OwnedFd::from_raw_fd(fd) };
         let (covered, uncovered) = mark_visible_filesystems(&group, &BTreeSet::new());
-        if covered.is_empty() {
+        // An identity-less fallback mount that marked successfully
+        // leaves the retained set empty with nothing uncovered: that
+        // is still a working learner, re-decided at the next pass.
+        if covered.is_empty() && uncovered > 0 {
             return Err(LearnAbsent {
                 reason: format!("no filesystem could be marked ({uncovered} skipped)"),
             });
@@ -772,47 +815,66 @@ impl Drop for FileLearner {
 const MARK_COVERAGE_CAP: usize = 8192;
 
 /// Decides filesystem-mark coverage for one (re-)mark pass: each
-/// visible mount point is offered to `mark`; a success covers it, a
-/// failure still covers it when a mark from an earlier pass is
-/// retained (the startup marks survive the post-setup capability
-/// shed and keep delivering), and a failure on a filesystem never
-/// covered before counts as uncovered. Coverage therefore comes
-/// from this retained set alone — traffic on older filesystems can
+/// visible mount is offered to `mark` by its point; a success covers
+/// its identity, a failure still covers it when a mark from an
+/// earlier pass on the *same mount identity* is retained (the
+/// startup marks survive the post-setup capability shed and keep
+/// delivering), and a failure on a mount never covered before
+/// counts as uncovered. A remount or a replacement filesystem at an
+/// already covered path carries a new mount id, so it never inherits
+/// the dead mount's coverage. Coverage therefore comes from this
+/// retained-identity set alone — traffic on older filesystems can
 /// never stand in for a filesystem whose mark failed. Returns the
 /// next covered set and the uncovered-visible count; a nonzero
 /// count owes the finite unavailable-learning gap.
 pub(crate) fn evaluate_mark_coverage(
-    previously_covered: &BTreeSet<std::path::PathBuf>,
-    visible: &[std::path::PathBuf],
+    previously_covered: &BTreeSet<MountIdentity>,
+    visible: &[MountToMark],
     mut mark: impl FnMut(&std::path::Path) -> bool,
-) -> (BTreeSet<std::path::PathBuf>, usize) {
+) -> (BTreeSet<MountIdentity>, usize) {
     let mut covered = BTreeSet::new();
     let mut uncovered = 0usize;
-    for point in visible {
-        if covered.contains(point) {
+    for mount in visible {
+        if let Some(identity) = mount.identity
+            && covered.contains(&identity)
+        {
             continue;
         }
-        if (mark(point) || previously_covered.contains(point)) && covered.len() < MARK_COVERAGE_CAP
-        {
-            covered.insert(point.clone());
-        } else {
-            uncovered += 1;
+        let marked = mark(&mount.point);
+        match mount.identity {
+            Some(identity)
+                if (marked || previously_covered.contains(&identity))
+                    && covered.len() < MARK_COVERAGE_CAP =>
+            {
+                covered.insert(identity);
+            }
+            // Marked now, but without a parsed identity its coverage
+            // cannot be retained for later passes; it is covered for
+            // this pass and re-decided (fail-closed) next time.
+            None if marked => {}
+            _ => uncovered += 1,
         }
     }
     (covered, uncovered)
 }
 
-/// The mount points a mark pass must cover, from the observer's
-/// mount table; an unreadable table falls back to `/` alone.
-fn visible_mount_points() -> Vec<std::path::PathBuf> {
+/// The mounts a mark pass must cover, from the observer's mount
+/// table; an unreadable table falls back to `/` alone, its identity
+/// unknown until a later pass can parse the table.
+fn visible_mounts() -> Vec<MountToMark> {
     const MOUNTINFO_CAP: usize = 1024 * 1024;
     let text = std::fs::read_to_string("/proc/self/mountinfo")
         .ok()
         .filter(|text| text.len() <= MOUNTINFO_CAP);
     text.as_deref()
-        .map(mount_points_for_marks)
-        .filter(|points| !points.is_empty())
-        .unwrap_or_else(|| vec![std::path::PathBuf::from("/")])
+        .map(mounts_for_marks)
+        .filter(|mounts| !mounts.is_empty())
+        .unwrap_or_else(|| {
+            vec![MountToMark {
+                point: std::path::PathBuf::from("/"),
+                identity: None,
+            }]
+        })
 }
 
 /// Adds one filesystem mark; false when the kernel refuses (for
@@ -840,10 +902,10 @@ fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> bool {
 /// and how many visible filesystems it leaves uncovered.
 fn mark_visible_filesystems(
     group: &OwnedFd,
-    previously_covered: &BTreeSet<std::path::PathBuf>,
-) -> (BTreeSet<std::path::PathBuf>, usize) {
-    let points = visible_mount_points();
-    evaluate_mark_coverage(previously_covered, &points, |point| {
+    previously_covered: &BTreeSet<MountIdentity>,
+) -> (BTreeSet<MountIdentity>, usize) {
+    let mounts = visible_mounts();
+    evaluate_mark_coverage(previously_covered, &mounts, |point| {
         try_mark_filesystem(group, point)
     })
 }
@@ -932,7 +994,7 @@ fn drain_loop(
     group: OwnedFd,
     tx: SyncSender<LearnMsg>,
     state: Arc<LearnShutdownState>,
-    mut covered: BTreeSet<std::path::PathBuf>,
+    mut covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
 ) {
     // Scheduling note: loader processes live ~15 ms, so the drain

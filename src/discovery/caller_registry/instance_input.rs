@@ -216,17 +216,34 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
+        // A birth offer for a key already holding an installed
+        // non-S1Only feed is a healthy duplicate: name it
+        // AlreadySelected exactly, never as capacity — the
+        // coordinator leaves it final, with no deferral, no
+        // re-offer and no eviction of the healthy feed.
+        if self.registry.held_feed_is_not_s1only(input)
+            && !self.registry.joint_upgrade_eligible(&input.key)
+        {
+            return Err(JointReceiptInstallRefusal::AlreadySelected);
+        }
         // An untouched registered row holds its slot already: its
         // first call's birth selects Joint in place instead of
         // minting, so the fits gate admits it without new capacity.
-        // A drained row that can no longer upgrade (a call already
-        // returned through it, a trip, a selected feed) refuses
-        // Capacity here: no grant is reserved for a feed that can
-        // never consume it. The AlreadySelected naming for drained
-        // registrations survives at reserve/install, which restate it
-        // defensively for re-installs.
+        // Any other row that fits nowhere and can no longer
+        // upgrade refuses Capacity here: an unheld row past the
+        // table limit is genuine capacity pressure, while an
+        // S1Only-held drained row (a call already returned
+        // through it, a trip, a degraded feed) could never
+        // consume the grant its late birth would reserve — its
+        // birth defers for a bounded re-offer instead.
         if !row.fits && !self.registry.joint_upgrade_eligible(&input.key) {
-            self.registry.latch_birth_capacity("fits");
+            // Latch genuine capacity walls only: a held row refuses
+            // for drain state (it needs no slot), so it must not
+            // occupy the first-arm diagnostic slot and mask a later
+            // real capacity arm.
+            if !self.registry.instance_state.by_key.contains_key(&input.key) {
+                self.registry.latch_birth_capacity("fits");
+            }
             return Err(JointReceiptInstallRefusal::Capacity);
         }
         Ok(position)
@@ -6289,14 +6306,14 @@ mod journal_unavailable_tests {
     /// drained refuses Capacity at the fits gate: its late birth
     /// could never select Joint, so no grant is reserved for it.
     /// (An untouched held key instead passes the gate: its first
-    /// call's birth selects Joint in place. The AlreadySelected
-    /// naming for drained registrations survives at
-    /// reserve/install, which restate it defensively for
-    /// re-installs.) No journal link:
-    /// linkage must not change the fits verdict for a held key.
+    /// call's birth selects Joint in place. A Joint-held duplicate
+    /// instead names AlreadySelected at the gate above and stays
+    /// final.) No journal link: linkage must not change the fits
+    /// verdict for a held key.
     #[test]
     fn held_touched_key_birth_position_refuses_capacity() {
         let mut scene = UnlinkedScene::new();
+        scene.registry.note_journal_linked(false);
         let (key, _) = scene.register(0);
         scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
         scene.registry.publish();

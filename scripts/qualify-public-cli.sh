@@ -190,12 +190,13 @@ import json,sys
 print(json.dumps({'cell':sys.argv[1],'pass':sys.argv[2]=='1','detail':sys.argv[3],'qualification':sys.argv[4]}))
 PY
 }
-# Expected-failure reasons for known product gaps. Each names the gap and the
-# product fix lane. Unexpected passes fail via summary() and the WP-1 template.
+# Expected-failure reasons for known product gaps. Each names the gap and,
+# where a fix is still pending, the product fix lane. Unexpected passes
+# fail via summary() and the WP-1 template.
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
-REASON_COUNTER_WIDE="counter modes unavailable in the wide build (the build omits counter objects); product fix lane: 0.7.x companion restore"
+REASON_COUNTER_SMALL="counter modes unavailable in this SMALL build (the build omits counter objects)"
 # The documented build-gate refusal, byte-exact without the p11scope prefix
 # (src/attach/counter_banks.rs check_counter_build; release builds emit
 # the objects and can never print it). The probe and the per-cell arm
@@ -434,7 +435,7 @@ counter_refused() {
   "$P" "${args[@]}" >"$cell.stdout" 2>"$cell.stderr" || rc=$?
   if [ "$rc" = 1 ] && [ ! -e "$out" ] && [ ! -s "$cell.stdout" ] \
       && printf 'p11scope: %s\n' "$COUNTER_BUILD_REFUSAL" | cmp -s - "$cell.stderr"; then
-    result "$cell" 0 "$REASON_COUNTER_WIDE: [$cell] exit=1 refusal=$COUNTER_BUILD_REFUSAL" expected-failure
+    result "$cell" 0 "$REASON_COUNTER_SMALL: [$cell] exit=1 refusal=$COUNTER_BUILD_REFUSAL" expected-failure
     return 0
   fi
   result "$cell" 0 "expected the documented counter-build refusal, got rc=$rc stderr=$(head -c 200 "$cell.stderr" | tr '\n' ' ')" failed

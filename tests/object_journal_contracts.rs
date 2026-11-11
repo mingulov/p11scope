@@ -2393,14 +2393,15 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     );
 }
 
-/// Slot-sized map equality behind the profile pin: STATS, RV_COUNTS and
-/// START carry identical shapes in both ELFs.
+/// Slot-sized map equality behind the profile pin: STATS, RV_COUNTS,
+/// START and SLOT_FILE carry identical shapes in both ELFs.
 fn slot_maps_match(
     detailed: &std::collections::HashMap<String, aya_obj::Map>,
     journal: &std::collections::HashMap<String, aya_obj::Map>,
 ) -> bool {
-    ["STATS", "RV_COUNTS", "START"].iter().all(|name| {
-        match (detailed.get(*name), journal.get(*name)) {
+    ["STATS", "RV_COUNTS", "START", "SLOT_FILE"]
+        .iter()
+        .all(|name| match (detailed.get(*name), journal.get(*name)) {
             (Some(left), Some(right)) => {
                 (
                     left.map_type(),
@@ -2417,8 +2418,7 @@ fn slot_maps_match(
                 )
             }
             _ => false,
-        }
-    })
+        })
 }
 
 /// Slot-profile pin: the production journal object is a Detailed object
@@ -2464,10 +2464,7 @@ fn object_journal_slot_maps_match_detailed_profile() {
         "a one-entry STATS drift must mismatch"
     );
     let mut tampered_slot = journal.maps.clone();
-    let stats = tampered_slot
-        .get("STATS")
-        .expect("journal STATS")
-        .clone();
+    let stats = tampered_slot.get("STATS").expect("journal STATS").clone();
     // SLOT_FILE is BTF-defined, whose shape fields stay immutable through
     // aya-obj, so the drift twin swaps in a differently-shaped map instead
     // of bumping max_entries in place like the STATS twin above.

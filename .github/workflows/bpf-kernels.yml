@@ -727,6 +727,11 @@ jobs:
             "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
           grep -q '^# object: journal-gate1$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          # Geometry note: the journal-gate1/ rows were recorded on the
+          # FULL-512 journal and bind the wide journal too (width changes
+          # only map sizes and compare immediates): budgeted PASS on all
+          # five kernels in run 42976254421 @4cd90db22, min headroom
+          # 65.59% (v7.3.1); the policy-wiring follow-up has no BPF delta.
           # A gate-1 journal row must be budgeted, never the unbudgeted
           # loaded-plus-headroom fallback.
           grep -q '"pass": true' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out/results.jsonl"

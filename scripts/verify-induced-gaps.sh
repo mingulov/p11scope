@@ -455,8 +455,8 @@ STATE_BPF=$1
 set -- "$WORK"/freeze-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "feature BPF object is not unique"; exit 1; }
 FREEZE_BPF=$1
-python3 scripts/check-bpf-map-defs.py "$DEFAULT_BPF" EVENTS=33554432 START=16384 RV_COUNTS=4096
-python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COUNTS=4096
+python3 scripts/check-bpf-map-defs.py "$DEFAULT_BPF" EVENTS=33554432 START=16384 RV_COUNTS=8192
+python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COUNTS=8192
 python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=33554432 START=1 RV_COUNTS=1
 # All four isolated builds keep default features, so both policy objects
 # are wide.

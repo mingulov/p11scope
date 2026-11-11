@@ -72421,6 +72421,165 @@ fn healthy_twin_has_no_dropped_pass_gap() {
     child.wait().unwrap();
 }
 
+fn spawn_sleep() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap()
+}
+
+/// With candidate reuse enabled, a refresh whose post-retirement rescan
+/// reproduces the First build's inputs exactly spends one candidate
+/// build per tick instead of two, and commits byte-identical state to
+/// the full-rebuild twin run beside it.
+#[test]
+fn stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin() {
+    let mut child = spawn_sleep();
+    let pid = child.id();
+    let (mut reused, _dir_a) = engine_over_cgroup_naming(&[pid]);
+    let (mut full, _dir_b) = engine_over_cgroup_naming(&[pid]);
+    reused.set_enable_candidate_reuse_for_test(true);
+    let mut session_a = ScriptedSession::with_records([], 0);
+    let mut session_b = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+    apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+    assert_eq!(reused.views.len(), 1);
+    assert_eq!(full.views.len(), 1);
+
+    let reused_calls = reused.inventory_candidate_calls_for_test;
+    let full_calls = full.inventory_candidate_calls_for_test;
+    assert!(reused.request_refresh(pid, None));
+    assert!(full.request_refresh(pid, None));
+    let outcome_a = apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+    let outcome_b = apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+    assert_eq!(outcome_a.required_complete, outcome_b.required_complete);
+    assert_eq!(
+        reused.inventory_candidate_calls_for_test - reused_calls,
+        1,
+        "a stable refresh builds only the First candidate"
+    );
+    assert_eq!(
+        full.inventory_candidate_calls_for_test - full_calls,
+        2,
+        "the full twin still builds First and Final"
+    );
+    assert_eq!(reused.plan, full.plan, "reuse commits the identical plan");
+    assert_eq!(
+        reused.modules, full.modules,
+        "reuse commits identical modules"
+    );
+    assert_eq!(
+        reused.counters.object_skips, full.counters.object_skips,
+        "reuse records identical skips"
+    );
+    assert_eq!(reused.views.len(), full.views.len());
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// A tick whose inputs move between the First build and the Final build
+/// (here: the named process exits, so the rescan/removed sets differ)
+/// must not reuse: both builds run, exactly as without the feature.
+#[test]
+fn changed_inputs_between_builds_disable_candidate_reuse() {
+    let mut child = spawn_sleep();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    engine.set_enable_candidate_reuse_for_test(true);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    let calls = engine.inventory_candidate_calls_for_test;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 0, "the departed view is removed");
+    assert_eq!(
+        engine.inventory_candidate_calls_for_test - calls,
+        2,
+        "a departing view rebuilds First and Final"
+    );
+}
+
+/// Property twin (oracle = full rebuild): twin engines driven through
+/// the same seeded random delta sequence — spawn a sleeper, kill one,
+/// refresh a live pid, empty tick — must commit identical plans,
+/// modules and skips after every batch, while the reuse engine never
+/// builds more candidates than the full engine. The generator is a
+/// fixed-seed xorshift; each seed runs the same ops on both engines.
+#[test]
+fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+    for seed in [0x1234_5678_9abc_def1u64, 0x0fed_cba9_8765_4321, 7] {
+        let mut state = seed;
+        // Four in-scope sleepers up front: the first batch admits all of
+        // them, later steps refresh or remove them in random order.
+        let mut children: Vec<std::process::Child> =
+            (0..4).map(|_| spawn_sleep()).collect();
+        let pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+        let (mut reused, _dir_a) = engine_over_cgroup_naming(&pids);
+        let (mut full, _dir_b) = engine_over_cgroup_naming(&pids);
+        reused.set_enable_candidate_reuse_for_test(true);
+        let mut session_a = ScriptedSession::with_records([], 0);
+        let mut session_b = ScriptedSession::with_records([], 0);
+        apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+        apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+        assert_eq!(reused.views.len(), full.views.len());
+        for step in 0..10 {
+            match xorshift(&mut state) % 3 {
+                0 if children.len() > 1 => {
+                    let index = 1 + (xorshift(&mut state) as usize) % (children.len() - 1);
+                    let mut child = children.remove(index);
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+                1 => {
+                    let pid = children[(xorshift(&mut state) as usize) % children.len()].id();
+                    reused.request_refresh(pid, None);
+                    full.request_refresh(pid, None);
+                }
+                _ => {}
+            }
+            apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+            apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+            assert_eq!(
+                reused.plan, full.plan,
+                "seed {seed:#x} step {step}: plans diverge"
+            );
+            assert_eq!(
+                reused.modules, full.modules,
+                "seed {seed:#x} step {step}: modules diverge"
+            );
+            assert_eq!(
+                reused.counters.object_skips, full.counters.object_skips,
+                "seed {seed:#x} step {step}: skips diverge"
+            );
+            assert_eq!(
+                reused.views.len(),
+                full.views.len(),
+                "seed {seed:#x} step {step}: views diverge"
+            );
+            assert!(
+                reused.inventory_candidate_calls_for_test
+                    <= full.inventory_candidate_calls_for_test,
+                "seed {seed:#x} step {step}: reuse built more candidates than full"
+            );
+        }
+        for mut child in children {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+}
+
 /// P1-5 real-bail twin: a genuine `resolve_merge_inputs` invariant
 /// (manifest history lost its ordinals) drops the pass with a gap
 /// instead of aborting, keeping earlier data.

@@ -27038,6 +27038,29 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Kernel-found work must not promote early frames: under desktop
+    /// churn every frame batch queues more unowned pids, so promotion
+    /// re-runs the full frame pass at the minimum interval instead of
+    /// the drain cadence and starves newcomer admission itself. The
+    /// ordinary frame cadence plus between-frame backlog passes service
+    /// newcomers; neither capture loop may move its frame clock for a
+    /// discovery hint.
+    #[test]
+    fn capture_loops_never_promote_frames_for_kernel_found_work() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("take_fast_discovery_frame(").count(),
+            0,
+            "no capture loop consumes a fast-frame promotion hint"
+        );
+        assert_eq!(
+            production.matches("request_fast_discovery_frame(").count(),
+            0,
+            "no capture loop moves its frame clock for kernel-found work"
+        );
+    }
+
     #[test]
     fn target_exit_marker_says_the_target_exited() {
         assert_eq!(

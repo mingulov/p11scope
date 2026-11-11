@@ -32,7 +32,7 @@ pub(crate) const SAMPLE_CANDIDATES: usize = 64;
 pub(crate) const MIN_ATTEMPTED: usize = 3;
 
 /// The one fix, shared by the doctor row, the stderr line and the gap.
-pub(crate) const FIX: &str = "load deploy/apparmor-p11scope with `apparmor_parser -r deploy/apparmor-p11scope` and re-run with `--security-opt apparmor=p11scope-observer`";
+pub(crate) const FIX: &str = "re-run with `--security-opt apparmor=unconfined`; for the hardened option load deploy/apparmor-p11scope with `apparmor_parser -r deploy/apparmor-p11scope` and re-run with `--security-opt apparmor=p11scope-observer` (which cannot read snap-confined apps)";
 
 /// One sampling run: how many other processes were mem-probed and how many
 /// of those probes failed with `EACCES`/`EPERM`.

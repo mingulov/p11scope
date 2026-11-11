@@ -1948,11 +1948,14 @@ mod corrective_tests {
     fn state_key_budget_meets_the_churn_floor() {
         // kind churn (451 pods) exhausted the 16,384 monotonic key
         // budget, so only 98 pods got cgroup rows: long runs must not
-        // go blind, and the budget floor is 262,144 keys per capture.
+        // go blind, and the default budget floor is 262,144 keys per
+        // capture. Reads the constructed default, so the wiring that
+        // selects the limit is pinned too, not just the constant.
+        let p = plan(&["C_Sign"]);
+        let budget = State::new(&p).key_limit();
         assert!(
-            MAX_STATE_KEYS >= 262_144,
-            "budget {} below the 262144 churn floor",
-            MAX_STATE_KEYS
+            budget >= 262_144,
+            "default budget {budget} below the 262144 churn floor"
         );
     }
 
@@ -2548,7 +2551,7 @@ pub(crate) const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_ENCAPSULATE
     | CKF_DECAPSULATE;
 pub(crate) const MAX_PENDING: usize = 16_384;
-pub(crate) const MAX_STATE_KEYS: usize = 16_384;
+pub(crate) const MAX_STATE_KEYS: usize = 262_144;
 /// Distinct mechanism ids the capture-wide per-id table holds: the same
 /// 256 as the per-edge reducer's [`crate::semantics_edge::MAX_EDGE_MECHANISMS`].
 /// A new id past the cap sheds its observation into
@@ -2895,8 +2898,16 @@ impl State {
             .saturating_add(u64::from(changed));
     }
 
-    // ponytail: admissions are a monotonic per-capture budget. Replace with
-    // counted eviction only if long captures routinely exhaust 16K keys.
+    // ponytail: admissions are a monotonic per-capture budget, widened
+    // to 262,144 keys after kind churn exhausted 16K (only 98 of 451
+    // pods kept cgroup rows). Counted eviction stays future work:
+    // revisit if long captures routinely exhaust this bound.
+    //
+    // The enforced limit, published so a report names its own budget.
+    pub(crate) fn key_limit(&self) -> usize {
+        self.state_key_limit
+    }
+
     fn admit(&mut self, new_keys: usize) -> bool {
         if new_keys == 0 {
             return true;

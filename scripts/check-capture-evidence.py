@@ -496,6 +496,10 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     # per-object cap is correct admission, not a coverage gap, so it never
     # forces PARTIAL and needs no lane allowance or mutation.
     "discovery_uncorroborated_candidates",
+    # Informational, not a COUNTER: the enforced per-capture
+    # semantic-state key budget. A limit, not a refusal count, so it
+    # never forces PARTIAL on its own.
+    "semantic_key_budget",
 }
 TRACE_TERMINAL_KEYS = {
     "privacy_mode", "capture_aborted", "final_drain", "counters_available",
@@ -1163,6 +1167,12 @@ def helper_selection_call_count():
     return int(selectors.group(1)) * 2
 
 
+# The enforced per-capture semantic-state key budget
+# (`semantics::MAX_STATE_KEYS`). Pinning its value here forces the oracle
+# and the producer to change together.
+SEMANTIC_KEY_BUDGET = 262144
+
+
 def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, historical=False):
     counter_keys = set(HISTORICAL_COUNTERS if historical else COUNTERS)
     wanted = (BASE_EVIDENCE_KEYS - set(COUNTERS)) | counter_keys
@@ -1173,6 +1183,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         # They also predate active_slots (U-14, 2026-09-23).
         wanted.discard("scheduling")
         wanted.discard("active_slots")
+        wanted.discard("semantic_key_budget")
         wanted -= RESIDUAL_EVIDENCE_KEYS
         wanted -= VERDICT_CLASS_KEYS
         wanted.discard("kernel_control")
@@ -1265,6 +1276,8 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         # Historical v2-metrics documents predate active_slots (see above);
         # every current document's bound lives in one shared helper.
         exact_active_slots_bound(evidence)
+        require(evidence["semantic_key_budget"] == SEMANTIC_KEY_BUDGET,
+                f"semantic_key_budget drifted: {evidence['semantic_key_budget']!r}")
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
@@ -4557,6 +4570,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
             1 if list(sources) and set(sources) <= {"manifest", "prearm"} else 0
         ),
         "discovery_uncorroborated_candidates": 0,
+        "semantic_key_budget": SEMANTIC_KEY_BUDGET,
         "templates_truncated": False,
         "provider_changed": False,
         "scheduling": scheduling_fixture(),
@@ -4616,6 +4630,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("mechanism_id_overflow", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
+            evidence.pop("semantic_key_budget", None)
             evidence.pop("kernel_control", None)
             for field in RESIDUAL_EVIDENCE_KEYS | VERDICT_CLASS_KEYS:
                 evidence.pop(field, None)

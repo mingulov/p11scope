@@ -355,6 +355,13 @@ and render-side shape notes are computed over the published subset only.
 With the shipped registry the count is 0. Nonzero forces `PARTIAL` with
 the `unpublished_mechanisms` attribution cause.
 
+`semantic_key_budget` is a u64 limit, always present: the enforced
+per-capture semantic-state key budget (262,144). At most this many keys
+are ever admitted across every semantic map; every refused admission
+counts in `semantic_state_drops`. It never feeds shares, verdicts, or
+completeness — it states the report's own budget so a reader can tell a
+fitting capture from a spent one.
+
 `attach_backend` is always present in both v3 lanes and says how the session
 chose its static attach backend, as
 the inventory document's `observation.attach` does. The backend is chosen by

@@ -48,6 +48,7 @@ fn evidence() -> Evidence {
         async_duplicates: 0,
         async_evictions: 0,
         fork_state_ambiguities: 0,
+        semantic_key_budget: 262_144,
         semantic_state_drops: 0,
         mechanism_id_overflow: 0,
         semantic_history_drops: 0,

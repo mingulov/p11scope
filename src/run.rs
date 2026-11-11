@@ -13251,6 +13251,7 @@ pub(crate) fn evidence_for(
         async_duplicates: semantic.async_duplicates,
         async_evictions: semantic.async_evictions,
         fork_state_ambiguities: semantic.fork_state_ambiguities,
+        semantic_key_budget: state.key_limit(),
         semantic_state_drops: semantic.semantic_state_drops,
         mechanism_id_overflow: semantic.mechanism_id_overflow,
         semantic_history_drops: semantic.semantic_history_drops,

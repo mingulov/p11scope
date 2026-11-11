@@ -1169,6 +1169,12 @@ pub struct Evidence {
     pub async_duplicates: u64,
     pub async_evictions: u64,
     pub fork_state_ambiguities: u64,
+    /// The enforced per-capture semantic-state key budget: at most this
+    /// many keys are ever admitted, and every refused admission counts
+    /// in `semantic_state_drops` below. Always present, so a report
+    /// states its own budget; never feeds shares, verdicts, or
+    /// completeness.
+    pub semantic_key_budget: usize,
     pub semantic_state_drops: u64,
     /// Mechanism observations shed because the per-id table already held
     /// 256 distinct ids (`semantics::SemanticEvidence::mechanism_id_overflow`):
@@ -4288,7 +4294,16 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
     if state_gaps > 0 {
         let plain = count(state_gaps, "session-tracking gap", "session-tracking gaps");
         fragments.push(if verbose && !state_causes.is_empty() {
-            format!("{plain} ({})", state_causes.join(", "))
+            let mut detail = state_causes.join(", ");
+            // Drops exist only once the monotonic budget is spent, so a
+            // nonzero count names the spent budget beside the causes.
+            if ev.semantic_state_drops > 0 {
+                detail.push_str(&format!(
+                    "; key budget of {} spent",
+                    crate::semantics::MAX_STATE_KEYS
+                ));
+            }
+            format!("{plain} ({detail})")
         } else {
             plain
         });
@@ -5865,6 +5880,7 @@ pub(crate) mod tests {
             async_duplicates: 0,
             async_evictions: 0,
             fork_state_ambiguities: 0,
+            semantic_key_budget: crate::semantics::MAX_STATE_KEYS,
             semantic_state_drops: 0,
             mechanism_id_overflow: 0,
             semantic_history_drops: 0,
@@ -15846,10 +15862,7 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
         let verbose = coverage_line(&ev, true);
         assert!(verbose.contains("3 session-tracking gaps"), "{verbose}");
-        assert!(
-            verbose.contains("semantic_state_drops"),
-            "{verbose}"
-        );
+        assert!(verbose.contains("semantic_state_drops"), "{verbose}");
         assert!(verbose.contains("262144"), "{verbose}");
         let line = coverage_line(&ev, false);
         assert!(line.contains("3 session-tracking gaps"), "{line}");

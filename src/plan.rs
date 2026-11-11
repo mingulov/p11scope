@@ -5501,17 +5501,20 @@ fn standard_layout_shape(table: &ScannedTable) -> bool {
 
 /// The ruling's common prerequisites (controller ruling 2026-11-11
 /// clause 1) that every standard-layout admission leg must satisfy:
-/// the version/count shape holds and every retained entry points
-/// into the provider's own object. The sole-complete and
-/// getter-export legs prove this inside their stricter predicates;
-/// the interface-linkage and live-return legs prove it here, so no
-/// leg can grant argument-read authority on linkage or return
-/// evidence alone. Entries reconciliation could not pin mint no
-/// target rows, so no argument is read through them either way.
+/// the version/count shape holds, every retained entry points
+/// into the provider's own object, and no non-NULL slot was moved
+/// aside unpinned — clause 1 constrains every non-NULL slot, so an
+/// unusable or unreconciled target the retained-entry proof never
+/// covered refuses the whole table, exactly as the sole-complete
+/// and getter-export legs already refuse it inside their stricter
+/// predicates. The interface-linkage and live-return legs prove
+/// it here, so no leg can grant argument-read authority on
+/// linkage or return evidence alone. A refusal keeps the usable
+/// observations count-only; NULL holes stay admissible.
 fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
     let scanned = &module.scanned;
     let table = &scanned.tables[index];
-    if !standard_layout_shape(table) {
+    if !standard_layout_shape(table) || !table.unpinned.is_empty() {
         return false;
     }
     let Some(objects) = module.entry_objects.get(index) else {
@@ -5746,7 +5749,8 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // count-only: no argument is ever read through an unproven slot.
         // Every leg also satisfies the clause-1 core
         // (`standard_layout_core`: version-consistent slot count,
-        // every retained entry in the provider's own object). The
+        // every retained entry in the provider's own object, and no
+        // unpinned non-NULL slot). The
         // sole-complete and getter-export predicates include it in
         // their stricter checks; an interface record naming the
         // table or a live getter return proves neither the shape

@@ -214,22 +214,33 @@ fn elf_may_export_entry_points(file: &std::fs::File) -> Result<bool, String> {
     let half = |at: usize| -> usize {
         u16::from_le_bytes(ehdr[at..at + 2].try_into().unwrap_or([0; 2])) as usize
     };
+    // Relocatable objects and core dumps can never be loaded as a
+    // provider: certain negatives. Without this arm every `.o` a build
+    // opens (thousands per minute on a busy host) fell through to the
+    // full inspect and the single drain thread fell minutes behind.
+    let e_type = half(0x10);
+    if e_type == 1 || e_type == 4 {
+        return Ok(false);
+    }
     let (phoff, phentsize, phnum) = (word(0x20), half(0x36), half(0x38));
     if phentsize < PHDR_64 || phnum == 0 || phnum > MAX_PHNUM {
+        return Ok(true);
+    }
+    // One bounded read for all program headers (the drain runs this on
+    // every distinct ELF a busy system opens; per-header reads cost
+    // more than the parse).
+    let mut phdrs = vec![0u8; phnum * phentsize];
+    if file
+        .read_at(&mut phdrs, phoff)
+        .map_err(|error| format!("phdr: {error}"))?
+        < phdrs.len()
+    {
         return Ok(true);
     }
     let mut segments = Vec::new();
     let mut dynamic = None;
     for index in 0..phnum {
-        let mut phdr = [0u8; PHDR_64];
-        let at = phoff.saturating_add((index * phentsize) as u64);
-        if file
-            .read_at(&mut phdr, at)
-            .map_err(|error| format!("phdr: {error}"))?
-            < PHDR_64
-        {
-            return Ok(true);
-        }
+        let phdr = &phdrs[index * phentsize..index * phentsize + PHDR_64];
         let field = |at: usize| -> u64 {
             u64::from_le_bytes(phdr[at..at + 8].try_into().unwrap_or([0; 8]))
         };
@@ -248,19 +259,19 @@ fn elf_may_export_entry_points(file: &std::fs::File) -> Result<bool, String> {
     }
     let mut strtab = None;
     let mut strsz = None;
+    // One bounded read for the whole dynamic array, like the phdrs.
+    let mut dynamics = vec![0u8; dyn_size as usize];
+    if file
+        .read_at(&mut dynamics, dyn_offset)
+        .map_err(|error| format!("dynamic: {error}"))?
+        < dynamics.len()
+    {
+        return Ok(true);
+    }
     for index in 0..MAX_DYNAMIC {
-        let mut entry = [0u8; DYNAMIC_ENTRY];
-        let at = dyn_offset.saturating_add((index * DYNAMIC_ENTRY) as u64);
-        if at.saturating_add(DYNAMIC_ENTRY as u64) > dyn_offset.saturating_add(dyn_size) {
+        let Some(entry) = dynamics.get(index * DYNAMIC_ENTRY..(index + 1) * DYNAMIC_ENTRY) else {
             break;
-        }
-        if file
-            .read_at(&mut entry, at)
-            .map_err(|error| format!("dynamic: {error}"))?
-            < DYNAMIC_ENTRY
-        {
-            return Ok(true);
-        }
+        };
         let tag = i64::from_le_bytes(entry[0..8].try_into().unwrap_or([0; 8]));
         let value = u64::from_le_bytes(entry[8..16].try_into().unwrap_or([0; 8]));
         if tag == 0 {
@@ -1404,6 +1415,36 @@ mod tests {
             !super::check_elf_provider(&file).unwrap(),
             "the full parse is the authority: no exact entry-point export"
         );
+    }
+
+    /// A relocatable object is a certain negative even when it defines
+    /// an entry-point symbol: it can never be loaded as a provider, and
+    /// builds open thousands of them per minute.
+    #[test]
+    fn learn_prefilter_refuses_relocatable_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("obj.c");
+        let o = dir.path().join("obj.o");
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-c", "-o"])
+                .arg(&o)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let file = std::fs::File::open(&o).unwrap();
+        assert!(
+            !super::elf_may_export_entry_points(&file).unwrap(),
+            "ET_REL is a certain negative"
+        );
+        assert!(!super::check_elf_provider(&file).unwrap());
     }
 
     /// The unread tail of an already-read buffer closes its fds: an

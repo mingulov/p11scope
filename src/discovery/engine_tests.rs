@@ -43211,6 +43211,215 @@ fn e07_metadata_only_rescan_preserves_validated_endpoints() {
     );
 }
 
+/// A metadata announcement that first observes a second provider in the
+/// same view must not retire the already-covered provider: the scan
+/// pins modules before restored tables exist, so its fresh pin set
+/// lacks the covered table's dependency pins. Replacing the whole
+/// view's ownership with that set drops exactly those pins and the
+/// restored table can no longer bind, even though the covered
+/// provider's files never changed.
+#[test]
+fn e07_metadata_rescan_with_new_provider_preserves_existing_coverage() {
+    let existing = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![existing.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert_eq!(before.len(), 1, "the first provider is covered: {before:?}");
+    let slots = engine.plan.slots.len();
+    assert!(slots > 0, "the first provider plans slots");
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "the covered provider's pins still validate"
+    );
+
+    // A second provider loads into the same process; the announcement
+    // path rescans metadata-only and now observes both modules.
+    let late = E07Provider::dlopen();
+    engine.module_hints = vec![existing.path.clone(), late.path.clone()];
+    e07_rescan_with_mode(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+        LoaderScanMode::MetadataOnly,
+    );
+    assert_eq!(
+        e07_active_targets(&engine),
+        before,
+        "observing a new provider keeps the covered provider attached"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots,
+        "no slot rows across the metadata announcement"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .next()
+            .is_none(),
+        "no detach submissions on metadata: {:?}",
+        session.detached_slot_indices
+    );
+    assert_eq!(
+        session.attached_slots,
+        vec![1, 0],
+        "the announcement attaches nothing new"
+    );
+
+    // The deferred memory scan then covers the new provider while the
+    // first provider keeps its identity.
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let after = e07_active_targets(&engine);
+    assert_eq!(after.len(), 2, "both providers are covered: {after:?}");
+    assert!(
+        before.is_subset(&after),
+        "the first provider keeps its target: before={before:?} after={after:?}"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .next()
+            .is_none(),
+        "zero detach submissions across the whole sequence: {:?}",
+        session.detached_slot_indices
+    );
+}
+
+/// A metadata announcement that contradicts one provider's identity
+/// retires only that provider: the other provider in the same view is
+/// unchanged, its pins still validate, and its restored table must
+/// stay bound to the same dependency identity.
+#[test]
+fn e07_metadata_contradiction_in_one_provider_preserves_the_other() {
+    let first = E07Provider::dlopen();
+    let second = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![first.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let first_targets = e07_active_targets(&engine);
+    assert_eq!(
+        first_targets.len(),
+        1,
+        "the first provider is covered: {first_targets:?}"
+    );
+    let first_module = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the first provider module is retained")
+        .object;
+
+    engine.module_hints = vec![first.path.clone(), second.path.clone()];
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert_eq!(before.len(), 2, "both providers are covered: {before:?}");
+    assert!(
+        first_targets.is_subset(&before),
+        "the first provider keeps its identity: {before:?}"
+    );
+    let second_target = before
+        .difference(&first_targets)
+        .next()
+        .copied()
+        .expect("the second provider adds one target");
+    let second_module = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id && module.object != first_module)
+        .expect("the second provider module is retained")
+        .object;
+    let first_slot = engine
+        .plan
+        .slots
+        .iter()
+        .find(|slot| first_targets.contains(&(slot.object, slot.file_offset)))
+        .expect("the first provider plans a slot")
+        .index;
+
+    // Craft the contradiction: the first provider's retained ID now
+    // holds the second provider's real file. Its own pins still
+    // validate, but a fresh observation of the first provider no
+    // longer merges into it.
+    engine.pinned.overwrite_test_entry(first_module, second_module);
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "the spliced held files still validate"
+    );
+
+    e07_rescan_with_mode(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+        LoaderScanMode::MetadataOnly,
+    );
+    assert_eq!(
+        e07_active_targets(&engine),
+        BTreeSet::from([second_target]),
+        "only the contradicted provider retires"
+    );
+    let retired: Vec<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        retired,
+        vec![first_slot],
+        "the announcement detaches exactly the contradicted slot"
+    );
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        2,
+        "the announcement attaches nothing new"
+    );
+}
+
 /// A complete same-file rescan lowers proof it disproves: after one of two
 /// same-file loads goes away, the retained load count drops back to one
 /// instead of keeping the union maximum.

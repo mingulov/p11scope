@@ -72523,8 +72523,7 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
         let mut state = seed;
         // Four in-scope sleepers up front: the first batch admits all of
         // them, later steps refresh or remove them in random order.
-        let mut children: Vec<std::process::Child> =
-            (0..4).map(|_| spawn_sleep()).collect();
+        let mut children: Vec<std::process::Child> = (0..4).map(|_| spawn_sleep()).collect();
         let pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
         let (mut reused, _dir_a) = engine_over_cgroup_naming(&pids);
         let (mut full, _dir_b) = engine_over_cgroup_naming(&pids);

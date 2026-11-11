@@ -9996,7 +9996,10 @@ fn refreshed_scans_equal(
 ) -> bool {
     first.len() == second.len()
         && first.iter().zip(second).all(
-            |((first_view, first_modules, first_pins), (second_view, second_modules, second_pins))| {
+            |(
+                (first_view, first_modules, first_pins),
+                (second_view, second_modules, second_pins),
+            )| {
                 first_view == second_view
                     && first_modules == second_modules
                     && first_pins.same_pin_content(second_pins)
@@ -24834,11 +24837,9 @@ impl Engine {
     #[cfg(test)]
     fn candidate_reuse_enabled(&self) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        self.candidate_reuse_for_test
-            .unwrap_or_else(|| {
-                *ENABLED
-                    .get_or_init(|| std::env::var_os("P11SCOPE_ENABLE_CANDIDATE_REUSE").is_some())
-            })
+        self.candidate_reuse_for_test.unwrap_or_else(|| {
+            *ENABLED.get_or_init(|| std::env::var_os("P11SCOPE_ENABLE_CANDIDATE_REUSE").is_some())
+        })
     }
 
     #[cfg(test)]
@@ -26669,8 +26670,7 @@ impl Engine {
         let reuse_enabled = self.candidate_reuse_enabled();
         let first_removed = removed.clone();
         let first_declined = declined.clone();
-        let first_new_view_ids: Vec<_> =
-            new_views.iter().map(|(view, _, _)| view.id()).collect();
+        let first_new_view_ids: Vec<_> = new_views.iter().map(|(view, _, _)| view.id()).collect();
         let first_pinned_fence = (self.pinned.revision(), self.pinned.copy_version());
         let (candidate, first_direct) = match inventory_candidate_observed(
             session,
@@ -26830,8 +26830,8 @@ impl Engine {
             self.counters.corroboration.len(),
             self.counters.manifest_fallbacks.len(),
         );
-        let mut reusable_first = (reuse_enabled && first_direct && !first_latch_changed)
-            .then_some(candidate);
+        let mut reusable_first =
+            (reuse_enabled && first_direct && !first_latch_changed).then_some(candidate);
 
         for context_id in &admission.missing_contexts {
             let Some(context) = self.loader_registry.context(*context_id) else {

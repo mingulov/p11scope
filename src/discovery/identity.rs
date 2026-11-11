@@ -10000,10 +10000,16 @@ mod tests {
             "scan-local id assignment order is not content"
         );
 
-        let digest = pin_set(&[(overlay(102), "beefcafe", 7), (overlay(104), SHA, 9)], false);
+        let digest = pin_set(
+            &[(overlay(102), "beefcafe", 7), (overlay(104), SHA, 9)],
+            false,
+        );
         assert!(!one.same_pin_content(&digest), "a digest change is content");
         let ctime = pin_set(&[(overlay(102), SHA, 8), (overlay(104), SHA, 9)], false);
-        assert!(!one.same_pin_content(&ctime), "a pin ctime change is content");
+        assert!(
+            !one.same_pin_content(&ctime),
+            "a pin ctime change is content"
+        );
         let fewer = pin_set(&[(overlay(102), SHA, 7)], false);
         assert!(!one.same_pin_content(&fewer), "a missing pin is content");
 

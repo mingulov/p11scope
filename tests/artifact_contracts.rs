@@ -16513,3 +16513,121 @@ fn verifier_headroom_probe_unprivileged_controls_fail_closed() {
         assert!(checked.contains(marker), "headroom checks omitted {marker}");
     }
 }
+
+/// The nearest enclosing function definition above `index`, for naming the
+/// BPF emit site a pairing failure points at.
+fn enclosing_bpf_fn(lines: &[&str], index: usize) -> String {
+    for line in lines[..index].iter().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.contains('(')
+            && (trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub") && trimmed.contains(" fn "))
+        {
+            return trimmed.to_string();
+        }
+    }
+    "top level".to_string()
+}
+
+#[test]
+fn every_bpf_ring_emit_site_counts_its_produced_record() {
+    // The ring cross-check claims PRODUCED covers every submit site: the one
+    // discovery submit plus every EVENTS submit and every EVENTS.output
+    // refused-base fallback. Each site below must pair its emission with a
+    // bump of the matching PRODUCED cell, or userspace consumes records the
+    // kernel never counted and the cross-check undercounts silently.
+    let files = [
+        "crates/ebpf/src/main.rs",
+        "crates/ebpf/src/journal_roots.rs",
+    ];
+    let mut output_sites = Vec::new();
+    let mut submit_sites = Vec::new();
+    let mut events_bumps = Vec::new();
+    let mut discovery_bumps = Vec::new();
+    let mut other_outputs = Vec::new();
+    let mut other_submits = Vec::new();
+    for file in files {
+        let source = read(file);
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let number = index + 1;
+            if line.contains(".output::<") {
+                let site = enclosing_bpf_fn(&lines, index);
+                if line.contains(".output::<EventRecord>") {
+                    output_sites.push(format!("{file}:{number} ({site})"));
+                    let window = lines[index..(index + 6).min(lines.len())].join("\n");
+                    assert!(
+                        window.contains("bump_produced(PRODUCED_EVENTS)"),
+                        "{file}:{number} ({site}): EVENTS.output without a PRODUCED_EVENTS bump in the next 5 lines",
+                    );
+                } else {
+                    other_outputs.push(format!("{file}:{number} ({site}): {line}"));
+                }
+            }
+            if line.contains(".submit(") {
+                let site = enclosing_bpf_fn(&lines, index);
+                if line.contains(".submit(0)") {
+                    submit_sites.push(format!("{file}:{number} ({site})"));
+                    let next = lines.get(index + 1).copied().unwrap_or("");
+                    assert!(
+                        next.contains("bump_produced(PRODUCED_"),
+                        "{file}:{number} ({site}): ring submit not followed by a PRODUCED bump: {next:?}",
+                    );
+                } else {
+                    other_submits.push(format!("{file}:{number} ({site}): {line}"));
+                }
+            }
+            if line.contains("bump_produced(PRODUCED_EVENTS)") {
+                events_bumps.push(format!("{file}:{number}"));
+            }
+            if line.contains("bump_produced(PRODUCED_DISCOVERY)") {
+                discovery_bumps.push(format!("{file}:{number}"));
+                assert_eq!(
+                    enclosing_bpf_fn(&lines, index),
+                    "fn finish_discovery_record(",
+                    "{file}:{number}: the PRODUCED_DISCOVERY bump belongs to the discovery submit",
+                );
+            }
+        }
+    }
+    assert!(
+        other_outputs.is_empty() && other_submits.is_empty(),
+        "uncovered emit form: outputs {other_outputs:?}, submits {other_submits:?}",
+    );
+    for entry in fs::read_dir("crates/ebpf/src").expect("list BPF sources") {
+        let entry = entry.expect("read BPF source entry");
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("utf-8 BPF file name");
+        if !name.ends_with(".rs") || files.iter().any(|file| file.ends_with(&name)) {
+            continue;
+        }
+        let path = format!("crates/ebpf/src/{name}");
+        let source = read(&path);
+        assert!(
+            !source.contains(".submit(") && !source.contains(".output::<"),
+            "{path}: ring emit site outside the paired files",
+        );
+    }
+    assert_eq!(
+        output_sites.len(),
+        3,
+        "EVENTS.output sites must stay exactly the three refused-base fallbacks: {output_sites:?}",
+    );
+    assert_eq!(
+        submit_sites.len(),
+        6,
+        "ring submits must stay exactly the discovery submit plus the five EVENTS submits: {submit_sites:?}",
+    );
+    assert_eq!(
+        events_bumps.len(),
+        8,
+        "PRODUCED_EVENTS bumps must cover every EVENTS submit and fallback: {events_bumps:?}",
+    );
+    assert_eq!(
+        discovery_bumps.len(),
+        1,
+        "PRODUCED_DISCOVERY bumps must stay exactly the discovery submit: {discovery_bumps:?}",
+    );
+}

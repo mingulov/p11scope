@@ -1945,6 +1945,75 @@ mod corrective_tests {
     }
 
     #[test]
+    fn state_key_budget_meets_the_churn_floor() {
+        // kind churn (451 pods) exhausted the 16,384 monotonic key
+        // budget, so only 98 pods got cgroup rows: long runs must not
+        // go blind, and the budget floor is 262,144 keys per capture.
+        assert!(
+            MAX_STATE_KEYS >= 262_144,
+            "budget {} below the 262144 churn floor",
+            MAX_STATE_KEYS
+        );
+    }
+
+    #[test]
+    fn churn_wave_admits_every_pod_cgroup_cell() {
+        // Churn twin: 20,000 pods (one history + one cgroup key each)
+        // must all fit the widened budget with zero refused
+        // admissions. Fails on the 16,384 budget with drops and
+        // missing rows, exactly the kind-churn blindness.
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        const PODS: u64 = 20_000;
+        for pod in 0..PODS {
+            let mut call = event(&p, "C_Sign", pod + 1, CkRv::OK.0);
+            call.pid_tgid = (1000 + pod) << 32;
+            call.cgroup_id = pod;
+            state.observe(&call);
+        }
+        assert_eq!(
+            state.cgroups().len(),
+            PODS as usize,
+            "every churn pod keeps its cgroup row"
+        );
+        assert_eq!(
+            state.semantic_evidence().semantic_state_drops,
+            0,
+            "a fitting churn wave refuses nothing"
+        );
+    }
+
+    #[test]
+    fn churn_past_the_widened_budget_still_counts_drops() {
+        // Failure twin: past the widened budget the seam still refuses
+        // honestly — refused cells record nothing and every refusal is
+        // counted, never silently dropped.
+        let p = plan(&["C_Sign"]);
+        let mut state = State::new(&p);
+        const PODS: u64 = 140_000;
+        for pod in 0..PODS {
+            let mut call = event(&p, "C_Sign", pod + 1, CkRv::OK.0);
+            call.pid_tgid = (1000 + pod) << 32;
+            call.cgroup_id = pod;
+            state.observe(&call);
+        }
+        assert!(
+            state.cgroups().len() < PODS as usize,
+            "an over-budget wave cannot admit every row"
+        );
+        assert!(
+            state.semantic_evidence().semantic_state_drops > 0,
+            "over-budget refusals stay counted"
+        );
+        assert!(
+            state.retained_dynamic_keys() <= MAX_STATE_KEYS,
+            "retained {} keys over the {} budget",
+            state.retained_dynamic_keys(),
+            MAX_STATE_KEYS
+        );
+    }
+
+    #[test]
     fn refused_hidden_ambiguity_purges_unchanged_second_owner_state() {
         assert_hidden_ambiguity_purges_unchanged_second_owner_state(false, false);
     }

@@ -15836,6 +15836,37 @@ pub(crate) mod tests {
         assert!(verbose.contains("262144"), "{verbose}");
     }
 
+    // Semantic key budget (RED): verbose names the spent per-capture
+    // key budget beside the refusal count; concise stays quiet.
+    #[test]
+    fn coverage_line_verbose_names_spent_semantic_key_budget() {
+        let mut ev = evidence();
+        ev.semantic_state_drops = 3;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let verbose = coverage_line(&ev, true);
+        assert!(verbose.contains("3 session-tracking gaps"), "{verbose}");
+        assert!(
+            verbose.contains("semantic_state_drops"),
+            "{verbose}"
+        );
+        assert!(verbose.contains("262144"), "{verbose}");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("3 session-tracking gaps"), "{line}");
+        assert!(!line.contains("262144"), "{line}");
+    }
+
+    // Semantic key budget (RED): the JSON evidence names the enforced
+    // per-capture key limit, so a report states its own budget.
+    #[test]
+    fn versioned_evidence_names_the_semantic_key_budget() {
+        let mut ev = evidence();
+        ev.semantic_state_drops = 3;
+        ev.verdict();
+        let json = versioned_evidence(&ev);
+        assert_eq!(json["semantic_key_budget"], 262144);
+    }
+
     // Identity budget (RED): refusals without a spent budget name
     // the count and stay silent about the budget.
     #[test]

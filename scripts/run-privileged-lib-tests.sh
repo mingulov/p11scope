@@ -376,6 +376,11 @@ discovery::pause::tests::privileged_pause_sigint_during_hold_still_writes_report
 # concise unidentified line (root, BPF, SoftHSM, pkcs11-tool; a holder
 # keeps the module mapped; about 1-4 min with retries).
 discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executable
+# Kernel file-open learning live cells: the fanotify drain reports a
+# provider a child process opens, also across a fresh mount namespace
+# (root, CAP_SYS_ADMIN; seconds).
+fanotify::tests::learn_live_drain_reports_opened_provider
+fanotify::tests::learn_live_drain_reports_opened_provider_across_mount_ns
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up no-re-edge positive runs in the

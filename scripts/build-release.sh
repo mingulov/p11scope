@@ -818,7 +818,8 @@ P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 # features and is wide, the p0 build passes --no-default-features and
 # stays 512. The diagnostic object always comes from the canary
 # feature build, which keeps default features, so it is always wide.
-case ${RELEASE_CAPTURE_MODE-full} in
+# Quoted so the capture-mode selector above stays the unique slice marker.
+case "${RELEASE_CAPTURE_MODE-full}" in
     full) OFFICIAL_VARIANT=wide; JOURNAL_VARIANT=journal-wide ;;
     p0) OFFICIAL_VARIANT=default; JOURNAL_VARIANT=journal ;;
 esac

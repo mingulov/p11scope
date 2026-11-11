@@ -5673,6 +5673,112 @@ def self_test():
             mutate(bad)
             settle_fixture_verdict(bad)
             rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+    # Host-sized proxy prefix: the maximal N is taken against the
+    # effective ceiling (effective minus its reserve), not the compiled
+    # 1584. Six positives — the documented 662 downsized shape and the
+    # 512 floor (4096-CPU/1-GiB object) across all three table shapes —
+    # plus underfilled/N+1 maximality refusals and over-effective-count
+    # refusals. Absent sizing keeps the compiled ceiling above.
+    def build_sized_proxy(base, sizing, shape, prefix_tables):
+        entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
+        spill = PROXY_TABLES - prefix_tables
+        admitted = prefix_tables * (entries - 2) + 2
+        doc = copy.deepcopy(base)
+        for index, table in enumerate(doc["evidence"]["discovery"][1]["tables"]):
+            table["version"] = list(shape)
+            table["entries"] = (
+                SHORT_PREFIX_SLOTS if index < prefix_tables else entries
+            )
+        label = f"table {shape[0]}.{shape[1]}"
+        doc["evidence"]["surfaces"] = [doc["evidence"]["surfaces"][0]] + [
+            {
+                "walk": "full",
+                "functions": entries,
+                "acquisition": "ok",
+                "source": f"{PROXY_MODULE_FIXTURE['path']} {label}",
+            }
+            for _ in range(spill)
+        ] + [
+            {
+                "walk": "known_prefix",
+                "functions": SHORT_PREFIX_SLOTS,
+                "acquisition": "ok",
+                "source": f"{PROXY_MODULE_FIXTURE['path']} {label}",
+            }
+            for _ in range(prefix_tables)
+        ]
+        doc["evidence"].update(
+            table_entries=68 + spill * entries + prefix_tables * 68,
+            slots=68 + admitted,
+            attached_probes=2 * (68 + admitted),
+            discovery_uncorroborated_candidates=spill,
+            semantic_unverified_slots=68 + admitted,
+            modules_skipped=[
+                {
+                    "name": PROXY_MODULE_FIXTURE["path"],
+                    "reason": proxy_prefix_reason(prefix_tables),
+                }
+            ],
+            slot_sizing=copy.deepcopy(sizing),
+        )
+        doc["functions"] = doc["functions"][:68] + function_items(
+            [(["unknown"], 1)] + [(["unknown"], 0)] * (admitted - 1),
+            identity=proxy_id,
+        )
+        settle_fixture_verdict(doc)
+        return doc, admitted
+    sized_662 = {
+        "requested_slots": 2112,
+        "effective_slots": 662,
+        "possible_cpus": 256,
+        "mem_total_bytes": 2147483648,
+        "budget_bytes": 67108864,
+        "stats_bytes": 67072000,
+    }
+    sized_512 = {
+        "requested_slots": 2112,
+        "effective_slots": 512,
+        "possible_cpus": 4096,
+        "mem_total_bytes": 1073741824,
+        "budget_bytes": 67108864,
+        "stats_bytes": 889323520,
+    }
+    for sizing, want_tables in ((sized_662, 4), (sized_512, 3)):
+        effective = sizing["effective_slots"]
+        ceiling = effective - min(max(effective * 25 // 100, 104), effective)
+        for shape in ((3, 2), (3, 0), (3, 1)):
+            entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
+            admitted = want_tables * (entries - 2) + 2
+            # Literal maximality oracle: N is pinned, the ceiling is the
+            # effective reserve-capped value (497 at 662, 384 at 512).
+            require(
+                68 + admitted <= ceiling
+                < 68 + (want_tables + 1) * (entries - 2) + 2,
+                f"sized oracle is not maximal: {effective}/{shape} N={want_tables}",
+            )
+            sized, _ = build_sized_proxy(proxy, sizing, shape, want_tables)
+            validate_proxy_capacity_fallback(sized)
+            # A consistent underfilled prefix and a consistent N+1 prefix
+            # are both refused: strict maximality under the same ceiling.
+            for off_tables in (want_tables - 1, want_tables + 1):
+                bad, _ = build_sized_proxy(proxy, sizing, shape, off_tables)
+                rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+            # A record that contradicts the decoded tables is refused too.
+            for off_record in (want_tables - 1, want_tables + 1):
+                bad, _ = build_sized_proxy(proxy, sizing, shape, want_tables)
+                bad["evidence"]["modules_skipped"] = [
+                    {
+                        "name": PROXY_MODULE_FIXTURE["path"],
+                        "reason": proxy_prefix_reason(off_record),
+                    }
+                ]
+                rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+    for sizing in (sized_662, sized_512):
+        oversized = copy.deepcopy(proxy)
+        oversized["evidence"]["slot_sizing"] = copy.deepcopy(sizing)
+        settle_fixture_verdict(oversized)
+        rejected(lambda oversized=oversized: validate_proxy_capacity_fallback(oversized))
+    print("proxy prefix follows the effective host-sized ceiling: OK")
     print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
     version = evidence_fixture(

@@ -675,7 +675,8 @@ fn counter_start_state_with_owning_modules_survives_loader_arming() {
         });
     let mut additions_allowed = true;
     let mut pending_views = PendingViewRetirements::new();
-    let fatal = engine.arm_initial_views(&mut session, &mut additions_allowed, &mut pending_views);
+    let (fatal, _) =
+        engine.arm_initial_views(&mut session, &mut additions_allowed, &mut pending_views);
     assert!(fatal.is_none(), "loader arming must not fail: {fatal:?}");
     assert_eq!(
         session.staged_counter_calls,

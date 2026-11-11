@@ -3308,7 +3308,7 @@ fn capture_start_stages_the_discovery_ring_between_armed_views() {
     engine.scope = Scope::System;
     let mut session = ScriptedSession::default();
 
-    let fatal =
+    let (fatal, _) =
         engine.arm_initial_views(&mut session, &mut true, &mut PendingViewRetirements::new());
 
     assert!(fatal.is_none());

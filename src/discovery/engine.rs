@@ -33713,6 +33713,10 @@ pub(crate) mod session_fixture {
         fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
         pub(crate) attached_slots: Vec<usize>,
+        /// Every attach request's exact `(slot, object, file offset)`
+        /// targets in submission order, so a twin can tell a correct plan
+        /// from a wrong submitted target.
+        pub(crate) attached_requests: Vec<Vec<(u32, PinnedObjectId, u64)>>,
         /// Counter growth staging calls, as plan slot counts at call time.
         pub(crate) staged_counter_calls: Vec<usize>,
         /// Scripted counter staging outcomes, replayed in order.
@@ -34341,6 +34345,12 @@ pub(crate) mod session_fixture {
             }
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             self.attached_slots.push(slots.len());
+            self.attached_requests.push(
+                slots
+                    .iter()
+                    .map(|slot| (slot.index, slot.object, slot.file_offset))
+                    .collect(),
+            );
             let physical = self
                 .pid_continuity
                 .as_mut()

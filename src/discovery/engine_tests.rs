@@ -42125,6 +42125,36 @@ fn e07_rescan_with_mode(
 }
 
 /// Active (object, file offset) targets: the covered-endpoint set.
+/// The file offset of a live in-process address, from this process's own
+/// maps: the target an attach request must name for that function.
+fn e07_self_file_offset(addr: u64) -> u64 {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(_), Some(offset)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let start = u64::from_str_radix(start, 16).unwrap();
+        let end = u64::from_str_radix(end, 16).unwrap();
+        if (start..end).contains(&addr) {
+            return addr - start + u64::from_str_radix(offset, 16).unwrap();
+        }
+    }
+    panic!("address {addr:#x} is not mapped in this process");
+}
+
+/// The exact `(object, file offset)` targets of one recorded attach request.
+fn e07_request_targets(request: &[(u32, PinnedObjectId, u64)]) -> BTreeSet<(PinnedObjectId, u64)> {
+    request
+        .iter()
+        .map(|(_, object, offset)| (*object, *offset))
+        .collect()
+}
+
 fn e07_active_targets(engine: &Engine) -> BTreeSet<(PinnedObjectId, u64)> {
     engine
         .plan
@@ -42782,6 +42812,29 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
         vec![1, 1],
         "the replacement attaches exactly its new target"
     );
+    assert_eq!(session.attached_requests.len(), 2);
+    assert_eq!(
+        e07_request_targets(&session.attached_requests[0]),
+        before,
+        "the first attach submits exactly the planned target"
+    );
+    assert_eq!(
+        e07_request_targets(&session.attached_requests[1]),
+        after,
+        "the replacement submits exactly the planned new target"
+    );
+    let (_, retarget_offset) = after.iter().next().copied().expect("one target after");
+    assert_eq!(
+        retarget_offset,
+        e07_self_file_offset(provider.second_bootstrap),
+        "the new target is the retargeted function's own file offset"
+    );
+    assert!(
+        session.attached_requests[1]
+            .iter()
+            .all(|(index, _, _)| !indices.contains(index)),
+        "the replacement never reuses the stale slot"
+    );
 }
 
 /// An incomplete loader rescan must not merge fresh facts into a module
@@ -43316,6 +43369,26 @@ fn late_provider_loader_rescans_keep_stable_slots() {
         session.attached_slots,
         vec![1, 0, 0, 0, 0, 0],
         "one attach call per rescan, slots only on the first"
+    );
+    assert_eq!(
+        e07_request_targets(&session.attached_requests[0]),
+        attached,
+        "the first attach submits exactly the planned targets"
+    );
+    assert_eq!(
+        session.attached_requests[0]
+            .iter()
+            .map(|(index, _, _)| *index)
+            .collect::<Vec<_>>(),
+        indices,
+        "the first attach submits exactly the planned slots"
+    );
+    assert!(
+        session.attached_requests[1..]
+            .iter()
+            .all(|request| request.is_empty()),
+        "stable rescans submit no attach targets: {:?}",
+        session.attached_requests
     );
     assert_eq!(
         session.detached_slots.iter().sum::<usize>(),

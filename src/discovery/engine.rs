@@ -12527,22 +12527,31 @@ impl Engine {
     /// cross-check. The capture loop calls this from the live drains
     /// before it reads [`Self::capture_facts`]; until the first note
     /// every reading is unknown. Produced totals replace monotonically:
-    /// a regressing read keeps the prior snapshot, like the counters.
+    /// a regressing read retains the entire prior triple and files the
+    /// live cross-check stale, like the counters.
     pub(crate) fn note_ring_reading(
         &mut self,
         produced: ProducedSnapshot,
         consumed: crate::ring_accounting::RingConsumed,
         positions: crate::ring_accounting::RingPositions,
     ) {
-        self.produced.replace_with(produced);
-        self.ring_consumed = consumed;
-        self.ring_positions = positions;
+        if !self.stash_ring_reading(produced, consumed, positions) {
+            self.mark_partial(
+                "live ring accounting",
+                "a produced counter decreased; the prior ring reading was retained",
+            );
+        }
     }
 
     /// A live produced-counter read failed: the stash keeps the prior
     /// triple, and the live cross-check is filed stale instead of
     /// silently keeping the old numbers.
-    pub(crate) fn note_ring_reading_failed(&mut self) {}
+    pub(crate) fn note_ring_reading_failed(&mut self) {
+        self.mark_partial(
+            "live ring accounting",
+            "the produced-counter read failed; the prior ring reading was retained",
+        );
+    }
 
     /// Stashes the terminal ring reading and reports whether the
     /// produced snapshot was accepted. A regressing terminal read keeps
@@ -12555,10 +12564,7 @@ impl Engine {
         consumed: crate::ring_accounting::RingConsumed,
         positions: crate::ring_accounting::RingPositions,
     ) -> bool {
-        self.produced.replace_with(produced);
-        self.ring_consumed = consumed;
-        self.ring_positions = positions;
-        true
+        self.stash_ring_reading(produced, consumed, positions)
     }
 
     /// True when the stashed triple shows negative conservation on a
@@ -12567,7 +12573,66 @@ impl Engine {
     /// count. Live sampling stays provisional; only the terminal seal
     /// probes this, over a quiescent triple.
     pub(crate) fn terminal_ring_skewed(&self) -> bool {
-        false
+        let readings = self.stashed_ring_readings();
+        [readings.discovery, readings.events]
+            .into_iter()
+            .any(|reading| match (reading.consumed, reading.queued) {
+                (Some(consumed), Some(queued)) => {
+                    consumed.saturating_add(queued) > reading.produced
+                }
+                _ => false,
+            })
+    }
+
+    /// Installs one ring triple when the produced snapshot advances, or
+    /// retains the entire prior triple when any produced cell regresses.
+    /// Returns whether the snapshot was accepted; callers file the
+    /// rejection on their own path (live folds it, the seal files it).
+    fn stash_ring_reading(
+        &mut self,
+        produced: ProducedSnapshot,
+        consumed: crate::ring_accounting::RingConsumed,
+        positions: crate::ring_accounting::RingPositions,
+    ) -> bool {
+        if !self.produced.replace_with(produced) {
+            return false;
+        }
+        self.ring_consumed = consumed;
+        self.ring_positions = positions;
+        true
+    }
+
+    /// The stashed ring triple as raw cross-check inputs: kernel
+    /// submitted totals plus userspace consumed totals and queued
+    /// remainders derived from ring positions. Shared by
+    /// [`Self::capture_facts`] and the terminal skew probe so both read
+    /// the same account.
+    fn stashed_ring_readings(&self) -> crate::ring_accounting::RingReadings {
+        crate::ring_accounting::RingReadings {
+            discovery: crate::ring_accounting::RingReading {
+                produced: self.produced.discovery,
+                consumed: self.ring_consumed.discovery,
+                dropped: self.counter_snapshot.ring_loss,
+                queued: self.ring_positions.discovery.and_then(|positions| {
+                    crate::ring_accounting::queued_records(
+                        positions,
+                        Some(crate::ring_accounting::DISCOVERY_RING_RECORD_BYTES),
+                    )
+                }),
+            },
+            events: crate::ring_accounting::RingReading {
+                produced: self.produced.events,
+                consumed: self.ring_consumed.events,
+                // The EVENTS reserve-failure total lives in kernel
+                // evidence, which the report merges (see
+                // `evidence_for`); the engine never sees it.
+                dropped: 0,
+                queued: self
+                    .ring_positions
+                    .events
+                    .and_then(|positions| crate::ring_accounting::queued_records(positions, None)),
+            },
+        }
     }
 
     pub fn capture_facts(&self) -> render::CaptureFacts {
@@ -12619,30 +12684,7 @@ impl Engine {
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
-            ring_readings: crate::ring_accounting::RingReadings {
-                discovery: crate::ring_accounting::RingReading {
-                    produced: self.produced.discovery,
-                    consumed: self.ring_consumed.discovery,
-                    dropped: self.counter_snapshot.ring_loss,
-                    queued: self.ring_positions.discovery.and_then(|positions| {
-                        crate::ring_accounting::queued_records(
-                            positions,
-                            Some(crate::ring_accounting::DISCOVERY_RING_RECORD_BYTES),
-                        )
-                    }),
-                },
-                events: crate::ring_accounting::RingReading {
-                    produced: self.produced.events,
-                    consumed: self.ring_consumed.events,
-                    // The EVENTS reserve-failure total lives in kernel
-                    // evidence, which the report merges (see
-                    // `evidence_for`); the engine never sees it.
-                    dropped: 0,
-                    queued: self.ring_positions.events.and_then(|positions| {
-                        crate::ring_accounting::queued_records(positions, None)
-                    }),
-                },
-            },
+            ring_readings: self.stashed_ring_readings(),
             task_uprobe_link_losses: self.task_uprobe_link_losses,
             discovery_truncated,
             // The exit-ended subset of the truncation total above: K0

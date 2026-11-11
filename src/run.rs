@@ -5323,7 +5323,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             .is_some(),
         context.session.lifecycle_tracking_unavailable().is_some(),
     );
-    note_session_ring_reading(&mut *context.engine, &*context.session);
+    let ring_outcome = note_terminal_ring_reading(&mut *context.engine, &*context.session);
     let mut ev = evidence_for(
         context.engine,
         context.engine.capture_facts(),
@@ -5359,6 +5359,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         reason: HANDOFF_REASON_STEP_PROFILE.to_string(),
     });
     ev.skipped.extend(handoff_gaps);
+    apply_terminal_ring_outcome(&mut ev, ring_outcome);
     // No stop gate ran: quiescence is unproven, never reached.
     ev.apply_stop_quiescence(render::StopQuiescence {
         state: render::QuiescenceState::Unproven,
@@ -5749,7 +5750,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             .is_some(),
         context.session.lifecycle_tracking_unavailable().is_some(),
     );
-    note_session_ring_reading(&mut *context.engine, &*context.session);
+    let ring_outcome = note_terminal_ring_reading(&mut *context.engine, &*context.session);
     let mut ev = evidence_for(
         context.engine,
         context.engine.capture_facts(),
@@ -5784,6 +5785,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
         reason: HANDOFF_REASON_STEP_TRACE.to_string(),
     });
     ev.skipped.extend(handoff_gaps);
+    apply_terminal_ring_outcome(&mut ev, ring_outcome);
     ev.apply_stop_quiescence(render::StopQuiescence {
         state: render::QuiescenceState::Unproven,
         post_q_events: false,
@@ -8155,11 +8157,27 @@ fn loop_end_discovery_loss(fresh: Result<u64>, cached: u64) -> u64 {
 /// cross-check: kernel submitted totals plus userspace consumed totals
 /// and ring positions, read together so the triple is contemporaneous.
 /// Best effort like every diagnostic read: a failed produced read keeps
-/// the prior stash instead of zeroing it.
+/// the prior stash instead of zeroing it, and files the live cross-check
+/// stale instead of silently keeping it.
 fn note_session_ring_reading(engine: &mut Engine, session: &Session) {
-    if let Ok(produced) = session.produced_snapshot() {
-        engine.note_ring_reading(produced, session.ring_consumed(), session.ring_positions());
+    match session.produced_snapshot() {
+        Ok(produced) => {
+            engine.note_ring_reading(produced, session.ring_consumed(), session.ring_positions());
+        }
+        Err(_) => engine.note_ring_reading_failed(),
     }
+}
+
+/// Stashes the session's terminal ring reading and reports the
+/// acquisition outcome for the seal: the [`Session`] caller of
+/// [`terminal_ring_outcome_from`].
+fn note_terminal_ring_reading(engine: &mut Engine, session: &Session) -> TerminalRingOutcome {
+    terminal_ring_outcome_from(
+        session.produced_snapshot(),
+        engine,
+        session.ring_consumed(),
+        session.ring_positions(),
+    )
 }
 
 /// The terminal ring acquisition's outcome: fresh measured evidence, or
@@ -8205,7 +8223,27 @@ fn terminal_ring_outcome_from(
 /// evidence: PARTIAL via the `skipped` cause with the existing generic
 /// vocabulary, like every terminal seal failure, with the specific
 /// cross-check named on stderr. A fresh outcome files nothing.
-fn apply_terminal_ring_outcome(_evidence: &mut render::Evidence, _outcome: TerminalRingOutcome) {}
+fn apply_terminal_ring_outcome(evidence: &mut render::Evidence, outcome: TerminalRingOutcome) {
+    let detail = match outcome {
+        TerminalRingOutcome::Fresh => return,
+        TerminalRingOutcome::StaleRead => {
+            "the final produced-counter read failed; the published account is the prior reading"
+        }
+        TerminalRingOutcome::StaleRegression => {
+            "the final produced snapshot regressed; the published account retains the prior triple"
+        }
+        TerminalRingOutcome::Skewed => {
+            "userspace consumed more than the kernel submitted; the cross-check is skewed"
+        }
+    };
+    evidence.skipped.push(render::SkippedOut {
+        name: "discovery subject".into(),
+        reason: "discovery unavailable".into(),
+    });
+    emit_capture_diagnostic(&format!(
+        "p11scope: final ring cross-check filed stale: {detail}"
+    ));
+}
 
 /// Staged DISCOVERY items as the terminal batch's leading records and its
 /// malformed count.
@@ -10243,7 +10281,7 @@ fn capture_profile(
                 &mut owned.still_running,
             );
         }
-        note_session_ring_reading(context.0, &*context.1);
+        let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
         let mut ev = evidence_for(
             context.0,
             context.0.capture_facts(),
@@ -10318,6 +10356,7 @@ fn capture_profile(
                 reason: "discovery unavailable".into(),
             });
         }
+        apply_terminal_ring_outcome(&mut ev, ring_outcome);
         // Every seal failure is kept for the nonzero exit below; later
         // publication steps combine with it instead of dropping it. The
         // identity member already names its step ("revalidating pinned
@@ -11591,7 +11630,7 @@ fn capture_trace(
                     }
                     // The frozen consumer map pins the single-line coordinator
                     // projections below; keep them byte-stable for the marker.
-                    note_session_ring_reading(context.0, &*context.1);
+                    let ring_outcome = note_terminal_ring_reading(context.0, &*context.1);
                     #[rustfmt::skip]
                     let mut evidence =
                         evidence_for(
@@ -11667,6 +11706,7 @@ fn capture_trace(
                             reason: "discovery unavailable".into(),
                         });
                     }
+                    apply_terminal_ring_outcome(&mut evidence, ring_outcome);
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();

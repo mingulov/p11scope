@@ -100,7 +100,13 @@ reserve failures), and, when the queued remainder is measurable,
 `still_queued` and `unexplained = produced - consumed - still_queued`.
 A live EVENTS ring omits both remainders (mixed record sizes make the
 remainder unknowable until the terminal drain verifies the ring empty);
-the terminal account is always exact. A measured nonzero `unexplained`
+the terminal account is exact only when its final acquisition succeeded.
+A failed final produced read or a regressing final snapshot retains the
+prior triple as explicitly stale and files the cross-check (PARTIAL with
+a `skipped` cause and a stderr line naming it) instead of certifying the
+old numbers; consumed plus queued above produced is counter skew, filed
+the same way apart from a positive `unexplained` count, which stays
+saturated at zero. A measured nonzero `unexplained`
 adds `discovery_ring_unexplained` or `events_ring_unexplained` to the
 observation gap causes and requires `PARTIAL`: loss the reserve-failure
 counter never saw is a named gap, never zero loss. This is a

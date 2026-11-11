@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) const CHECK_NAME: &str = "process access";
 /// How many sampled processes are mem-probed at most.
 pub(crate) const SAMPLE_ATTEMPTS: usize = 32;
-/// How many enumerated pids are scanned for live user processes.
+/// How many enumerated pids are maps-gated at most. The gates spread across
+/// the whole enumerated range: kernel threads cluster at low pids, so the
+/// first sixty-four alone may hold no user process at all.
 pub(crate) const SAMPLE_CANDIDATES: usize = 64;
 /// Below this many mem probes no assessment is made: with one or two other
 /// processes a denial is a per-process fact (a snap-confined app), not proof
@@ -95,7 +97,8 @@ where
     let me = std::process::id();
     let mut attempted = 0usize;
     let mut denied = 0usize;
-    for &pid in candidates.iter().take(SAMPLE_CANDIDATES) {
+    let step = (candidates.len() / SAMPLE_CANDIDATES).max(1);
+    for &pid in candidates.iter().step_by(step).take(SAMPLE_CANDIDATES) {
         if attempted >= SAMPLE_ATTEMPTS {
             break;
         }

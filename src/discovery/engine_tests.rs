@@ -41871,6 +41871,7 @@ struct E07Provider {
     handle: *mut std::ffi::c_void,
     interposer_handle: *mut std::ffi::c_void,
     table: *mut u64,
+    second_bootstrap: u64,
 }
 
 impl E07Provider {
@@ -41901,7 +41902,8 @@ impl E07Provider {
         let interposer = dir.path().join("interposer.so");
         std::fs::write(
             &interposer_c,
-            "void *C_GetFunctionList(void) { return 0; }\n",
+            "void *C_GetFunctionList(void) { return 0; }\n\
+             void *C_GetSlotList(void) { return 0; }\n",
         )
         .unwrap();
         let status = std::process::Command::new("gcc")
@@ -41942,6 +41944,18 @@ impl E07Provider {
         // stays open until Drop.
         let bootstrap = unsafe { libc::dlsym(interposer_handle, bootstrap_name.as_ptr()) } as u64;
         assert_ne!(bootstrap, 0, "the interposed bootstrap must resolve");
+        let second_name = std::ffi::CString::new("C_GetSlotList").unwrap();
+        // SAFETY: as above; the second planted address for retarget twins.
+        let second_bootstrap =
+            unsafe { libc::dlsym(interposer_handle, second_name.as_ptr()) } as u64;
+        assert_ne!(
+            second_bootstrap, 0,
+            "the second interposed address must resolve"
+        );
+        assert_ne!(
+            second_bootstrap, bootstrap,
+            "the two planted addresses must differ"
+        );
         let words = unsafe { std::slice::from_raw_parts_mut(table, E07_TABLE_WORDS) };
         words[0] = 0x2802; // CK_VERSION { major 2, minor 40 }.
         // One collapsed address keeps the single covered target the
@@ -41962,12 +41976,40 @@ impl E07Provider {
             handle,
             interposer_handle,
             table,
+            second_bootstrap,
         }
     }
 
     /// Zero the version word: the next scan finds the module with no table.
     fn zero_version(&self) {
         unsafe { self.table.write(0) };
+    }
+
+    /// Rewrite every function word to `target`: the next scan decodes a
+    /// different nonempty table at the same address.
+    fn retarget_table(&self, target: u64) {
+        let words = unsafe { std::slice::from_raw_parts_mut(self.table, E07_TABLE_WORDS) };
+        for word in &mut words[1..] {
+            *word = target;
+        }
+    }
+
+    /// A second load of the same file in a fresh linker namespace (the
+    /// `dlmopen` double-load shape): the scanner must see one module with
+    /// two same-file loads, not two modules. The caller `dlclose`s it.
+    fn open_second_load(&self) -> *mut std::ffi::c_void {
+        let cpath = std::ffi::CString::new(self.path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: an owned file still on disk; RTLD_LOCAL keeps its
+        // symbols out of every other test in this process.
+        let handle = unsafe {
+            libc::dlmopen(
+                libc::LM_ID_NEWLM,
+                cpath.as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        assert!(!handle.is_null(), "the second load must map");
+        handle
     }
 }
 
@@ -42544,6 +42586,320 @@ fn e07_same_files_with_changed_pins_replaces_stale_identity() {
     assert!(
         engine.pinned.rejects(key),
         "the rewritten key fails closed through the collision path"
+    );
+}
+
+/// Physical identity across a same-key rescan: a rename keeps the file
+/// bytes (same device+inode) but bumps `st_ctime`, so pins fail
+/// revalidation and the rescan replaces through the ordinary identity
+/// path. The same digest under a changed pin is indistinguishable from
+/// the btrfs/forgery shape, so the key fails closed like a rewrite:
+/// no stale module is retained, no target stays active.
+#[test]
+fn e07_same_key_renamed_path_replaces_stale_module() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert!(
+        !before.is_empty(),
+        "the provider is attached before the rename"
+    );
+    let key = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the provider module is retained before the rename")
+        .scanned
+        .key;
+
+    let renamed = provider.path.with_extension("renamed.so");
+    std::fs::rename(&provider.path, &renamed).unwrap();
+    engine.module_hints = vec![renamed.clone()];
+    assert!(
+        !engine.view_pins_unchanged(view_id),
+        "a rename bumps ctime, so pins fail revalidation"
+    );
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let view_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view == view_id)
+        .collect();
+    assert!(
+        view_modules.is_empty(),
+        "the renamed scan retains no stale module"
+    );
+    let after = e07_active_targets(&engine);
+    assert!(
+        after.is_disjoint(&before),
+        "no stale target stays active: before={before:?} after={after:?}"
+    );
+    assert!(
+        engine.pinned.rejects(key),
+        "the same-digest divergence fails closed through the collision path"
+    );
+    assert!(
+        engine.pinned.check_unchanged().unwrap(),
+        "replaced pins validate; stale identity must retire, not be retained"
+    );
+}
+
+/// A complete same-file rescan replaces the tables it disproves: every
+/// function word now points at a different address, so the stale targets
+/// retire while the retargeted table stays covered.
+#[test]
+fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert!(!before.is_empty(), "the planted table is covered");
+
+    provider.retarget_table(provider.second_bootstrap);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let after = e07_active_targets(&engine);
+    assert!(outcome.changed(), "a retargeted table detaches stale targets");
+    assert!(
+        !after.is_empty(),
+        "the retargeted table stays covered"
+    );
+    assert!(
+        after.is_disjoint(&before),
+        "no stale target stays active: before={before:?} after={after:?}"
+    );
+}
+
+/// A complete same-file rescan lowers proof it disproves: after one of two
+/// same-file loads goes away, the retained load count drops back to one
+/// instead of keeping the union maximum.
+#[test]
+fn e07_complete_rescan_with_fewer_loads_lowers_load_count() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let loads = |engine: &Engine| {
+        engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == view_id)
+            .expect("the provider module is retained")
+            .scanned
+            .same_file_loads
+    };
+    assert_eq!(loads(&engine), 1, "a single load scans as one");
+
+    let second = provider.open_second_load();
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert_eq!(
+        loads(&engine),
+        2,
+        "the double load is observed before the unload"
+    );
+
+    unsafe { libc::dlclose(second) };
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let module = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the provider module is retained after the unload");
+    assert_eq!(
+        module.scanned.same_file_loads, 1,
+        "a complete scan lowers the load count it disproved"
+    );
+    assert!(
+        !module.scanned.double_loaded,
+        "the single load clears the double-load flag"
+    );
+}
+
+/// Late-route slot stability through the loader-rescan seam: repeated
+/// complete rescans keep one stable active slot set (same pin IDs, same
+/// slot indices, attach once, no detaches); a table change retires
+/// exactly the stale targets; later rescans are quiet again.
+#[test]
+fn late_provider_loader_rescans_keep_stable_slots() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+    let objects: Vec<PinnedObjectId> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view == view_id)
+        .map(|module| module.object)
+        .collect();
+    let slots = engine.plan.slots.len();
+    assert!(slots > 0, "a late load must plan slots");
+    let indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    let attempts = engine.loader_memory_scan_attempts;
+    assert_eq!(attempts, 1, "the attach runs the loader seam once");
+
+    for round in 0..5 {
+        let outcome = e07_rescan(
+            &mut engine,
+            &mut session,
+            context,
+            &mut additions,
+            &mut pending,
+        );
+        assert!(
+            !outcome.changed(),
+            "stable rescan {round} changes nothing"
+        );
+        assert_eq!(
+            engine.loader_memory_scan_attempts,
+            attempts + 1 + round,
+            "rescan {round} runs the loader seam"
+        );
+        let round_objects: Vec<PinnedObjectId> = engine
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view_id)
+            .map(|module| module.object)
+            .collect();
+        assert_eq!(round_objects, objects, "pin IDs stay stable");
+        assert_eq!(
+            e07_active_targets(&engine),
+            attached,
+            "the active target set stays stable"
+        );
+        assert_eq!(
+            engine.plan.slots.len(),
+            slots,
+            "no duplicate slot rows across loader rescans"
+        );
+        let round_indices: Vec<u32> =
+            engine.plan.slots.iter().map(|slot| slot.index).collect();
+        assert_eq!(round_indices, indices, "slot indices stay stable");
+    }
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        1,
+        "the coverage attaches once"
+    );
+    assert_eq!(
+        session.detached_slots.iter().sum::<usize>(),
+        0,
+        "no detaches while the provider is stable"
+    );
+
+    provider.zero_version();
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(outcome.changed(), "changed bytes detach stale targets");
+    assert!(
+        e07_active_targets(&engine).is_empty(),
+        "changed bytes retire stale targets"
+    );
+    let detached: usize = session.detached_slots.iter().sum();
+    assert!(detached > 0, "the retirement detaches its slots");
+
+    for round in 0..2 {
+        let outcome = e07_rescan(
+            &mut engine,
+            &mut session,
+            context,
+            &mut additions,
+            &mut pending,
+        );
+        assert!(
+            !outcome.changed(),
+            "post-change rescan {round} changes nothing"
+        );
+        assert!(
+            e07_active_targets(&engine).is_empty(),
+            "retired targets stay retired"
+        );
+    }
+    assert_eq!(
+        session.detached_slots.iter().sum::<usize>(),
+        detached,
+        "no repeat detaches after the retirement"
     );
 }
 

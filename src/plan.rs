@@ -3016,6 +3016,11 @@ impl AttachPlan {
             )
             .max()
             .map_or(0, |id| id + 1);
+        // Ids already spoken for in this remap: live modules keep
+        // theirs, and the retired-memory fallback below must never
+        // hand one historical id to two returning objects.
+        let mut stable_in_use: BTreeSet<ModuleId> =
+            self.modules.iter().map(|module| module.id).collect();
         for module in &mut rebuilt.modules {
             if !objects.insert(module.object) {
                 return Err(format!("duplicate module object {:?}", module.object));
@@ -3026,11 +3031,13 @@ impl AttachPlan {
                 .iter()
                 .find(|old| old.object == module.object)
                 .map(|old| old.id)
+                .or_else(|| self.retired_module_id(module.object, &stable_in_use))
                 .unwrap_or_else(|| {
                     let id = ModuleId(next);
                     next += 1;
                     id
                 });
+            stable_in_use.insert(stable);
             if source_ids.insert(source, stable).is_some() {
                 return Err(format!("duplicate rebuilt module id {}", source.0));
             }
@@ -3052,6 +3059,35 @@ impl AttachPlan {
             slot.module_ids = ids;
         }
         Ok(())
+    }
+
+    /// Historical module id for a returning object: a still-retired
+    /// slot that names exactly this object under one module id donates
+    /// that id, so the returnee reoccupies its retired indices
+    /// (revival) instead of burning fresh slots. Multi-module retired
+    /// slots cannot donate (the id for this object is ambiguous
+    /// there), reoccupied positions are skipped (their slot key no
+    /// longer matches the retired memory), and an id already spoken
+    /// for in this remap is never donated twice.
+    fn retired_module_id(
+        &self,
+        object: PinnedObjectId,
+        in_use: &BTreeSet<ModuleId>,
+    ) -> Option<ModuleId> {
+        self.retired_keys
+            .iter()
+            .filter(|(key, _)| key.object == object)
+            .filter_map(|(key, position)| {
+                if !self.retired_slots.contains(position) {
+                    return None;
+                }
+                let slot = self.slots.get(*position)?;
+                (AttachKey::of(slot) == *key).then_some(slot)
+            })
+            .find_map(|slot| match slot.module_ids.as_slice() {
+                [id] if !in_use.contains(id) => Some(*id),
+                _ => None,
+            })
     }
 }
 
@@ -5701,14 +5737,18 @@ fn sole_complete_table_authorized(
 /// name-authorized tables whose standard layout is proven by scan-time
 /// evidence the observer already has — exact interface linkage (the
 /// provider's own "PKCS 11" static data names this table), manifest
-/// corroboration, or the sole-complete-table leg (KO-SOLE) — carry
-/// semantic authority in every lowering, so profile/trace attribute
-/// mechanism ids without --manifest. The subset additionally keeps its
-/// live-return grant for heap-first tables; the main plan does not take
-/// it (descriptors freeze at attach, so a late return cannot upgrade an
-/// attached slot). Exact exports agreement stays names-only here; the
-/// per-ordinal exports leg is a follow-up. Unknown or vendor-shifted
-/// tables stay count-only.
+/// corroboration, the sole-complete-table leg (KO-SOLE), or an observed
+/// typed-getter return — carry semantic authority in every lowering, so
+/// profile/trace attribute mechanism ids without --manifest. The
+/// live-return leg runs in every lowering: the subset takes any
+/// core-passing return (heap-first tables), while the main plan only
+/// takes a return that confirms the provider's own exports per-ordinal.
+/// A late return cannot upgrade a frozen attached slot, but denying a
+/// confirming return after the scan legs granted downgrades attached
+/// semantic slots to count-only, churning every capture with an observed
+/// return through a detach+reattach static episode. Exact exports
+/// agreement stays names-only here; the per-ordinal exports leg is a
+/// follow-up. Unknown or vendor-shifted tables stay count-only.
 fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -5756,10 +5796,12 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // exact "PKCS 11" interface linkage, the sole-complete-table
         // leg, a typed-getter export with full per-ordinal export
         // agreement (the table reached through the provider's own
-        // exports), or (subset only) an observed typed-getter return.
-        // Manifest corroboration is confirmed authority, not
-        // standard-layout. Unknown or vendor-shifted tables stay
-        // count-only: no argument is ever read through an unproven slot.
+        // exports), or an observed typed-getter return (the main plan
+        // additionally requires per-ordinal export confirmation; the
+        // subset takes heap-first returns). Manifest corroboration is
+        // confirmed authority, not standard-layout.
+        // Unknown or vendor-shifted tables stay count-only: no
+        // argument is ever read through an unproven slot.
         // Every leg is gated once by the clause-1 core
         // (`standard_layout_core`: version-consistent slot count,
         // every retained entry in the provider's own object, and no
@@ -5779,7 +5821,15 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
                 Some("sole complete table")
             } else if getter_export_authorized(module, index, &exports, &score) {
                 Some("typed getter export")
-            } else if scan_authorized && score.live_return {
+            } else if score.live_return && (scan_authorized || score.exports) {
+                // The subset takes any core-passing return (heap-first
+                // tables); the main plan only takes a return that
+                // confirms the provider's own exports per-ordinal — the
+                // observed table a caller reaches. Denying a confirming
+                // return after the scan legs granted churns the capture
+                // through a detach+reattach static episode, while a
+                // non-confirming (heap-novel, forged-name) return keeps
+                // no layout proof and stays count-only.
                 Some("typed getter return")
             } else {
                 None
@@ -8873,6 +8923,94 @@ mod tests {
             "the usable observations remain available"
         );
         assert_plan_count_only(&plan, "live-return table with an unpinned non-NULL entry");
+    }
+
+    #[test]
+    fn live_return_confirmation_keeps_main_plan_semantics_without_replace() {
+        // Static-first episode (v070-static-gap, observed live): the
+        // initial scan grants the sole-complete leg and attaches
+        // semantic slots; the live C_GetFunctionList return then
+        // relabels the same table (live_return) and the rebuilt
+        // candidate must confirm — not defeat — the grant, or every
+        // capture churns through a detach+reattach static episode.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut confirmed = sole_complete_module();
+        confirmed.scanned.tables[0].live_return = true;
+        // The live publication module never ran a tables scan
+        // (`publication_module` sets `tables_scan_finished: false`),
+        // so the scan-finished legs cannot grant it — exactly the
+        // live rebuilt candidate.
+        confirmed.scanned.tables_scan_finished = false;
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&confirmed),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            rebuilt.slots.iter().all(|slot| slot.semantic_authorized),
+            "the confirming live return keeps semantic authority"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.retire.is_empty());
+        assert!(
+            delta.replace.is_empty(),
+            "confirmation must not downgrade attached semantic slots"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index != 0),
+            "attached descriptors survive the confirmation"
+        );
+    }
+
+    #[test]
+    fn agreeing_live_return_sibling_keeps_main_plan_semantics_without_replace() {
+        // Fedora SoftHSM 2.7 shape: the exports table plus its
+        // agreeing live C_GetFunctionList return. The sibling
+        // confirms the reachable table; it must not read as a rival
+        // that downgrades the attached sole-complete grant.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut paired = sole_complete_module();
+        let mut sibling = paired.scanned.tables[0].clone();
+        sibling.live_return = true;
+        sibling.address = 0x7f00_0000;
+        paired.scanned.tables.push(sibling);
+        paired
+            .entry_objects
+            .push(vec![paired.object; paired.scanned.tables[0].entries.len()]);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&paired), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.slots.iter().all(|slot| slot.semantic_authorized),
+            "the agreeing sibling keeps semantic authority"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.retire.is_empty());
+        assert!(
+            delta.replace.is_empty(),
+            "an agreeing sibling must not downgrade attached semantic slots"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index != 0),
+            "attached descriptors survive the agreeing sibling"
+        );
     }
 
     #[test]

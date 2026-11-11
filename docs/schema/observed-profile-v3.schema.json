@@ -575,6 +575,10 @@
                   "process-tree members were still present when the command exited; their calls after the run end are out of scope",
                   "only the started command is observed",
                   "handed-back descendants are unknown",
+                  "a provider file was learned after its first use; its earlier calls were not observed",
+                  "file-learning events were lost; some provider files may not have been learned",
+                  "file learning reached its 32-file per-capture cap; further provider files were not learned",
+                  "file learning was unavailable; short-lived first loads of new provider files were not learned",
                   "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
                   "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure",
                   "the terminal identity recheck failed; provider sameness is unproven",
@@ -789,6 +793,9 @@
         },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},
         "multi_rebuild_gaps": {"type": "integer", "minimum": 0},
+        "learned_staged_files": {"type": "integer", "minimum": 0},
+        "learned_event_loss": {"type": "integer", "minimum": 0},
+        "learned_cap_skipped": {"type": "integer", "minimum": 0},
         "selected_detail": {
           "description": "Optional additive 6.15 endpoint-selection envelope (--select-endpoint beside counter captures). Closed nested shape; the release oracle is the enforcement behind this file. Never carries process identity.",
           "type": "object",
@@ -1127,7 +1134,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -1145,6 +1152,9 @@
                 {"required": ["attach_mechanisms"]},
                 {"required": ["pid_descendant_gaps"]},
                 {"required": ["multi_rebuild_gaps"]},
+                {"required": ["learned_staged_files"]},
+                {"required": ["learned_event_loss"]},
+                {"required": ["learned_cap_skipped"]},
                 {"required": ["gap_exit_mappings"]}
               ]
             }

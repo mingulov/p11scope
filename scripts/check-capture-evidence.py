@@ -209,6 +209,8 @@ ALLOWED_UNOBSERVED_REASONS = {
 WATCH_KEYS = {"since_ns", "state", "until_ns", "ended_by", "changed"}
 WATCH_CHANGED_KEYS = {"last_ok_ns", "detected_ns", "previous_ino"}
 UNOBSERVED_WINDOW_KEYS = {"start_ns", "end_ns", "reason"}
+FIRST_LOADED_BY_KEYS = {"exe", "exe_unknown_reason", "pre_attach_loads"}
+LOADER_EXE_UNKNOWN_REASONS = {"loader exe link unreadable"}
 ALLOWED_TABLE_SOURCES = {"scan", "manifest"}
 ALLOWED_CORROBORATION = {
     "single_source",
@@ -272,6 +274,7 @@ ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
 PROFILE_V3_FIELDS = {
     "interface_selection", "attach_mechanisms",
     "pid_descendant_gaps", "multi_rebuild_gaps",
+    "learned_staged_files", "learned_event_loss", "learned_cap_skipped",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
 OBJECT_CAPTURE_KEYS = {"available", "reason"}
@@ -643,6 +646,36 @@ RUN_TREE_REASONS = {
     RUN_TREE_SURVIVORS,
     RUN_TREE_DEGRADED,
     RUN_TREE_MEMBERSHIP_UNKNOWN,
+}
+# Learned-file gaps (v0.7.0): a provider the fanotify drain staged files
+# one fixed first-run gap under its own subject; overflow, the
+# per-capture cap and unavailable learning file their own aggregate
+# rows there (render.rs `capture_skipped_out` learned arm). Anything
+# else under the subject redacts to the generic discovery pair. Counts
+# ride in `evidence.learned_staged_files`, `evidence.learned_event_loss`
+# and `evidence.learned_cap_skipped`, never in the reason.
+LEARNED_SKIP_SUBJECT = "learned provider file"
+LEARNED_FIRST_RUN_REASON = (
+    "a provider file was learned after its first use; "
+    "its earlier calls were not observed"
+)
+LEARNED_OVERFLOW_REASON = (
+    "file-learning events were lost; "
+    "some provider files may not have been learned"
+)
+LEARNED_CAP_REASON = (
+    "file learning reached its 32-file per-capture cap; "
+    "further provider files were not learned"
+)
+LEARNED_UNAVAILABLE_REASON = (
+    "file learning was unavailable; short-lived first loads "
+    "of new provider files were not learned"
+)
+LEARNED_SKIP_REASONS = {
+    LEARNED_FIRST_RUN_REASON,
+    LEARNED_OVERFLOW_REASON,
+    LEARNED_CAP_REASON,
+    LEARNED_UNAVAILABLE_REASON,
 }
 # Owned-handoff (v0.7.0): a run whose startup step failed after probes
 # attached seals a partial report naming the failed step, with every
@@ -1023,6 +1056,10 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     exact_terminal_verdict(evidence)
     missing = PROFILE_V3_FIELDS - set(evidence)
     require(not missing, f"missing profile-v3 evidence: {sorted(missing)}")
+    for field in (
+        "learned_staged_files", "learned_event_loss", "learned_cap_skipped",
+    ):
+        uint(evidence[field], U64_MAX, field)
     selection = evidence["interface_selection"]
     exact_keys(selection, SELECTION_KEYS, "interface_selection")
     require(isinstance(selection["selection_truncated"], bool), selection)
@@ -2619,6 +2656,25 @@ def exact_prearm_keys(module):
                 and window["reason"] in ALLOWED_UNOBSERVED_REASONS,
                 f"invalid unobserved window: {module}",
             )
+    if "first_loaded_by" in module:
+        by = module["first_loaded_by"]
+        require(
+            isinstance(by, dict) and set(by) == FIRST_LOADED_BY_KEYS,
+            f"invalid first_loaded_by keys: {module}",
+        )
+        require(
+            (by["exe"] is None) != (by["exe_unknown_reason"] is None),
+            f"first_loaded_by names exe or its reason, never both: {module}",
+        )
+        require(
+            (by["exe"] is None or isinstance(by["exe"], str))
+            and by["exe_unknown_reason"] in (LOADER_EXE_UNKNOWN_REASONS | {None}),
+            f"invalid first_loaded_by loader: {module}",
+        )
+        require(
+            u64(by["pre_attach_loads"]),
+            f"invalid first_loaded_by loads: {module}",
+        )
 
 
 def exact_discovery_semantics(evidence):
@@ -2959,9 +3015,10 @@ def bounded_skip(item):
     entry = item["name"].startswith("C_")
     gated_null = item == UNKNOWN_NULL_SKIP
     run_tree = item["name"] == RUN_TREE_SUBJECT
+    learned = item["name"] == LEARNED_SKIP_SUBJECT
     handoff = item["name"] in HANDOFF_SUBJECTS
     require(
-        entry or gated_null or run_tree or handoff
+        entry or gated_null or run_tree or learned or handoff
         or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
@@ -2969,6 +3026,8 @@ def bounded_skip(item):
         allowed = ENTRY_REASONS
     elif run_tree:
         allowed = RUN_TREE_REASONS
+    elif learned:
+        allowed = LEARNED_SKIP_REASONS
     elif handoff:
         allowed = HANDOFF_REASONS_BY_SUBJECT[item["name"]]
     else:
@@ -4675,6 +4734,9 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
+        evidence.setdefault("learned_staged_files", 0)
+        evidence.setdefault("learned_event_loss", 0)
+        evidence.setdefault("learned_cap_skipped", 0)
     elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
         for field in PROFILE_V3_FIELDS:
             evidence.pop(field, None)

@@ -262,9 +262,10 @@ capture, and a consumer must dispatch on the top-level `lane` field
 
 - The **profile** lane (`render::profile_json`, verdict
   `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
-  set plus the four profile-only fields `interface_selection`,
-  `attach_mechanisms`, `pid_descendant_gaps`, and
-  `multi_rebuild_gaps`. Its
+  set plus the profile-only fields `interface_selection`,
+  `attach_mechanisms`, `pid_descendant_gaps`, `multi_rebuild_gaps`,
+  and the learned-file counts `learned_staged_files`,
+  `learned_event_loss`, and `learned_cap_skipped`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
@@ -416,6 +417,22 @@ facts are complete; this disclaims attribute coverage instead of claiming it:
 - `reason`: finite machine reason when unavailable, else `null`. The one
   v0.4.0 reason is `not_enabled`: the stub feature compiled attribute
   capture out.
+
+`learned_staged_files`, `learned_event_loss`, and `learned_cap_skipped`
+are saturating u64 counts from kernel file-open learning (the fanotify
+drain, system scope, profile/trace lanes), always present on the profile
+lane and zero when nothing was learned. `learned_staged_files` counts
+provider files the drain proved on held bytes and staged for later runs;
+it is informational and never a verdict input. `learned_event_loss`
+counts queue overflows, lost drain tails, and unexpected drain deaths
+(each +1; any means some provider files may not have been learned).
+`learned_cap_skipped` counts candidates refused by the 32-file
+per-capture cap. Each loss files its own aggregate gap row in
+`evidence.skipped` per capture (repeat filings dedupe to the same row;
+vocabulary below), and every learned row forces `PARTIAL` through the
+`skipped` observation cause. Unavailable learning (no fanotify marks)
+files its own row once and the capture continues with ordinary
+discovery only.
 
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
@@ -574,7 +591,19 @@ assembly from real attach-complete stamps. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
 `late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
 absent means undisclosed, and an explicitly empty list reads as exact only
-with an R2-D1-6 proof behind it. Key presence never proves exactness. The
+with an R2-D1-6 proof behind it. Key presence never proves exactness.
+Modules the fanotify drain staged also carry `first_loaded_by`:
+`{exe, exe_unknown_reason, pre_attach_loads}`. `exe` is the loading
+program's `/proc/<pid>/exe` link text read at first sight (lossy
+UTF-8), resolved from a reuse-immune pidfd handle;
+`exe_unknown_reason` is exactly `loader exe link unreadable` when the
+link could not be read (the loader usually already exited). Exactly
+one of the two is non-null. `pre_attach_loads` is a saturating u64
+count of distinct loader processes observed opening the file before
+it staged; loads between staging and attach are covered by the
+module's unobserved window, not this count, and the count is not a
+bound on missed calls. The key is absent, never null, on every module
+no learn event staged. No PID number is carried. The
 pause-gate proof ships for owned `run` only: `[]` appears on a pre-armed
 module only when every declared probe attached at or before the barrier
 release while the child was barrier-held from its start — the spawn barrier
@@ -972,6 +1001,31 @@ Run-tree scope gaps file under their own subject. Each record is
   fixed reason.
 - `handed-back descendants are unknown`: the run cgroup membership
   could not be read at run end.
+
+Learned-file gaps file under their own subject. Each record is
+`{name: "learned provider file", reason}` with `reason` exactly one of:
+
+- `a provider file was learned after its first use; its earlier calls
+  were not observed`: the fanotify drain staged a provider file after
+  its first loads already ran. Repeat stagings dedupe to this one row;
+  the staged-file count rides in `evidence.learned_staged_files`, and
+  each staged module names its first loader and opens-before-staging
+  count in `first_loaded_by`.
+- `file-learning events were lost; some provider files may not have
+  been learned`: the drain queue overflowed, a drain tail was lost at
+  shutdown, or the drain died unexpectedly. The loss count rides in
+  `evidence.learned_event_loss`.
+- `file learning reached its 32-file per-capture cap; further provider
+  files were not learned`: later candidates were refused loudly. The
+  refused count rides in `evidence.learned_cap_skipped`.
+- `file learning was unavailable; short-lived first loads of new
+  provider files were not learned`: fanotify could not start or mark
+  any filesystem (or later lost all marks). Ordinary discovery still
+  ran; this names only the learning loss.
+
+No path, pid, or executable ever appears in these rows: anything else
+filed under the subject redacts to the generic `discovery subject` /
+`discovery unavailable` pair.
 
 `evidence.run_tree_handed_back` (integer, `run` documents only, required
 there) counts the handed-back survivors: measured zero when the tree

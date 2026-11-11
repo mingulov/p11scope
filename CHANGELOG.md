@@ -10,6 +10,12 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Added
 
+- Kernel file-open learning under `--system` (`profile`/`trace`):
+  providers loaded by one-shot tools are learned generically (any
+  vendor, any path), listed with the program that first loaded them,
+  and attached so later runs in the same capture are caught; the first
+  use stays a named gap (`first_loaded_by`, `learned_*` evidence,
+  `learned provider file` rows).
 - `inventory --event-log -` streams the versioned JSONL event lines to
   stdout (same schema, never interleaved; the text summary moves to
   stderr), and `--event-interval <dur>` adds periodic `totals`
@@ -253,12 +259,11 @@ The v0.7.0 limits live in
   arrive seconds late and part of a window shows as exact named
   counts instead of per-call rows. Exact per-call rows past 6,250/s
   wait for the 0.7.1 event reader.
-- A one-shot tool whose provider no running program holds is not
-  counted yet under `--system` — not even on later runs, because the
-  millisecond tool exits before anything is staged; wrap such tools in
+- A one-shot tool's first use of a provider no running program holds
+  is still missed under `--system`; later runs in the same capture are
+  caught by kernel file-open learning. Wrap such tools in
   `sudo p11scope run --user $USER -- <tool>` (or pass `--prearm-module
-  PATH`). A later version learns the provider from the kernel so later
-  runs are caught.
+  PATH`) when first-run coverage matters.
 
 ## [0.6.0] - 2026-11-06
 

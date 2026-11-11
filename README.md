@@ -66,11 +66,13 @@ sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 New here? Work through the [Quickstart](docs/usage.md#quickstart): it sets up a
 throwaway SoftHSM token and runs your first observed workload in a few minutes.
 
-One-shot tools (a single `pkcs11-tool` call) under `--system` are not
-counted yet when no running program holds their provider — on any run.
-Wrap them in `sudo p11scope run --user $USER -- <tool>` (or pass
-`--prearm-module PATH`); a later version learns the provider from the
-kernel so later runs are caught.
+One-shot tools (a single `pkcs11-tool` call) under `--system` are
+caught from their second run inside one capture: the provider file is
+learned from the kernel, listed with the program that first loaded it,
+and attached so later runs are counted. The first use itself stays a
+named miss — wrap such tools in `sudo p11scope run --user $USER --
+<tool>` (or pass `--prearm-module PATH`) when first-run coverage
+matters.
 
 `doctor` reports host readiness (real output, v0.7.0 on Ubuntu 26.04):
 

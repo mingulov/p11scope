@@ -1197,6 +1197,7 @@ class SchemaOracleAgreement(unittest.TestCase):
             set(CHECKER["ENTRY_REASONS"])
             | set(CHECKER["DISCOVERY_REASONS"])
             | set(CHECKER["RUN_TREE_REASONS"])
+            | set(CHECKER["LEARNED_SKIP_REASONS"])
             | set(CHECKER["HANDOFF_REASONS"]),
         )
 

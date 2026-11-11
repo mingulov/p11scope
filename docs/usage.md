@@ -817,6 +817,14 @@ tell (`unknown`); the cells persist across unmap and exec, so `mapped`
 never means the file was still mapped at the exit instant.
 Multi-threaded exits and late watches read `unknown`; nothing here
 proves a process did not map a watched provider.
+Under `--system`, kernel file-open learning also catches the second
+and later runs of one-shot tools whose provider no running program
+holds: file opens are watched, opened files are proved from their own
+held bytes, and provider files attach for all later processes. The
+learned provider is listed with its path and the program that first
+loaded it; that first use itself stays a named, missed interval, and
+learning being unavailable (no fanotify privilege) is a named gap,
+never a failed capture.
 Any admission after the initial sweep, and any unmatched leader exit, keeps
 the observation lossy by design: the process could have used an unattached
 provider before admission left no trace (see the

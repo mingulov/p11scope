@@ -52,6 +52,12 @@ PRODUCER_CONSTANTS = (
     "RUN_TREE_SURVIVORS",
     "RUN_TREE_DEGRADED",
     "RUN_TREE_MEMBERSHIP_UNKNOWN",
+    # Learned-file gaps: first-run, overflow, cap and unavailable
+    # reasons under their own subject.
+    "LEARNED_FIRST_RUN_REASON",
+    "LEARNED_OVERFLOW_REASON",
+    "LEARNED_CAP_REASON",
+    "LEARNED_UNAVAILABLE_REASON",
 )
 
 
@@ -67,15 +73,16 @@ def producer_constant(name):
 
 
 def producer_reasons():
-    """(entry_reasons, discovery_reasons, run_tree_reasons) as the producer
-    defines them.
+    """(entry_reasons, discovery_reasons, run_tree_reasons, learned_reasons)
+    as the producer defines them.
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
     fourteen discovery reasons; the run-tree scope renders one of its three
-    reasons under its own subject. The split mirrors `capture_skipped_out`'s
-    branches; the strings themselves come from the source, never from a
-    copy pasted into this test.
+    reasons under its own subject, and the learned-file scope renders one
+    of its four reasons under its own subject. The split mirrors
+    `capture_skipped_out`'s branches; the strings themselves come from the
+    source, never from a copy pasted into this test.
     """
     const = {name: producer_constant(name) for name in PRODUCER_CONSTANTS}
     body = RENDER_RS.read_text(encoding="utf-8")
@@ -102,21 +109,33 @@ def producer_reasons():
         const["RUN_TREE_DEGRADED"],
         const["RUN_TREE_MEMBERSHIP_UNKNOWN"],
     }
-    assert len(entry) == 2 and len(discovery) == 14 and len(run_tree) == 3, const
-    return entry, discovery, run_tree
+    learned = {
+        const["LEARNED_FIRST_RUN_REASON"],
+        const["LEARNED_OVERFLOW_REASON"],
+        const["LEARNED_CAP_REASON"],
+        const["LEARNED_UNAVAILABLE_REASON"],
+    }
+    assert (
+        len(entry) == 2
+        and len(discovery) == 14
+        and len(run_tree) == 3
+        and len(learned) == 4
+    ), const
+    return entry, discovery, run_tree, learned
 
 
 class SkipReasonVocabularyTests(unittest.TestCase):
     def test_validator_accepts_exactly_the_producer_vocabulary(self):
-        entry, discovery, run_tree = producer_reasons()
+        entry, discovery, run_tree, learned = producer_reasons()
         # Two-way: a producer reason the validator rejects fails here, and
         # so does a validator reason the producer never emits.
         self.assertEqual(set(CHECKER["ENTRY_REASONS"]), entry)
         self.assertEqual(set(CHECKER["DISCOVERY_REASONS"]), discovery)
         self.assertEqual(set(CHECKER["RUN_TREE_REASONS"]), run_tree)
+        self.assertEqual(set(CHECKER["LEARNED_SKIP_REASONS"]), learned)
 
     def test_every_producer_reason_passes_bounded_skip(self):
-        entry, discovery, run_tree = producer_reasons()
+        entry, discovery, run_tree, learned = producer_reasons()
         for reason in sorted(entry):
             item = {"name": "C_Initialize", "reason": reason}
             self.assertTrue(CHECKER["bounded_skip"](item), item)
@@ -125,6 +144,9 @@ class SkipReasonVocabularyTests(unittest.TestCase):
             self.assertFalse(CHECKER["bounded_skip"](item), item)
         for reason in sorted(run_tree):
             item = {"name": CHECKER["RUN_TREE_SUBJECT"], "reason": reason}
+            self.assertFalse(CHECKER["bounded_skip"](item), item)
+        for reason in sorted(learned):
+            item = {"name": CHECKER["LEARNED_SKIP_SUBJECT"], "reason": reason}
             self.assertFalse(CHECKER["bounded_skip"](item), item)
 
     def test_gated_null_skip_matches_plan_subject(self):
@@ -139,9 +161,9 @@ class SkipReasonVocabularyTests(unittest.TestCase):
         self.assertTrue(CHECKER["bounded_skip"](dict(expected)))
 
     def test_schema_doc_names_every_public_reason(self):
-        entry, discovery, run_tree = producer_reasons()
+        entry, discovery, run_tree, learned = producer_reasons()
         doc = SCHEMA_DOC.read_text(encoding="utf-8")
-        for reason in sorted(entry | discovery | run_tree):
+        for reason in sorted(entry | discovery | run_tree | learned):
             self.assertIn(reason, doc, f"schema doc omits {reason!r}")
 
 

@@ -195,14 +195,26 @@ verdicts (`mapped`/`unknown`, plus `STATIC HINT` identity hints under
 `--track-short-lived`) classify them, but full per-caller call
 attribution below the discovery floor is still planned.
 
-### One-shot tools under `--system` are not counted yet
+### One-shot tools under `--system`: first use missed, later runs caught
 
-Measured: under `--system`, a one-shot tool whose provider no running
-program holds is not counted on any run (0 of 20 on every round — the
-millisecond tool exits before anything is staged). Wrap such tools in
-`sudo p11scope run --user $USER -- <tool>` (or pass `--prearm-module
-PATH`); a later version learns the provider from the kernel so later
-runs are caught.
+Under `profile --system` (and `trace --system`), kernel file-open
+learning catches the second and later runs of one-shot tools
+generically (any vendor, any path, no lists): the observer watches
+file opens, proves opened files from their own held bytes, and
+attaches providers for all later processes. The learned provider is
+listed with its path, the program that first loaded it
+(`first_loaded_by`), and its missed first use as an unobserved
+window; the capture stays `PARTIAL` with the fixed learned-file gap
+row. The first use itself is still missed. Learning covers detailed
+`profile`/`trace` under `--system` only (cgroup, pid, run, inventory
+and counter scopes keep their existing gaps), needs privilege for
+fanotify filesystem marks (a capture without it keeps today's gaps
+and files the unavailable-learning gap), caps at 32 learned files per
+capture (named aggregate refusal beyond), and cannot see providers
+only on filesystems invisible to the observer's mount namespace (such
+as a container-private tmpfs): those stay unknown, never guessed.
+Wrap such tools in `sudo p11scope run --user $USER -- <tool>` (or
+pass `--prearm-module PATH`) when first-run coverage matters.
 
 ### Kernels before 6.12
 

@@ -295,17 +295,20 @@ python3 -I scripts/dump-owned-bpf-maps.py --self-test
 # that no longer describes it.
 sudo -n true 2>/dev/null || { echo "existing sudo authorization required"; exit 1; }
 sudo python3 -I scripts/dump-owned-bpf-maps.py --refusal-probe
+# Both canary builds keep default features (the p0 capture mode only adds
+# stub-object-attributes), so both objects are wide, and prebuilt inputs
+# are exported from this same build.
 if [ "$OBJECT_PILOT" -eq 1 ]; then
-python3 -I scripts/check-bpf-map-defs.py --inventory default "$DEFAULT_BPF"
+python3 -I scripts/check-bpf-map-defs.py --inventory wide "$DEFAULT_BPF"
 else
-python3 -I scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
+python3 -I scripts/check-bpf-map-defs.py --policy-inventory --safe-variant wide --unsafe-variant wide-diagnostic "$DEFAULT_BPF" "$FEATURE_BPF"
 fi
 if [ -n "$PREBUILT_DIR" ]; then
 echo "journal object check skipped: prebuilt inputs carry no journal ELF"
 else
 set -- "$WORK"/default-build/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "journal BPF object is not unique"; exit 1; }
-python3 -I scripts/check-bpf-map-defs.py --inventory journal "$1"
+python3 -I scripts/check-bpf-map-defs.py --inventory journal-wide "$1"
 fi
 
 refuse_lane_destinations() {

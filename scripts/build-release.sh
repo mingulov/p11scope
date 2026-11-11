@@ -813,16 +813,25 @@ P11SCOPE_PREPARED_BPF_RUSTC="$t4_nightly_rustc" \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 
+# The checker legs compare each object against the frozen inventory for
+# the width the build's own flags selected: the full build keeps default
+# features and is wide, the p0 build passes --no-default-features and
+# stays 512. The diagnostic object always comes from the canary
+# feature build, which keeps default features, so it is always wide.
+case ${RELEASE_CAPTURE_MODE-full} in
+    full) OFFICIAL_VARIANT=wide; JOURNAL_VARIANT=journal-wide ;;
+    p0) OFFICIAL_VARIANT=default; JOURNAL_VARIANT=journal ;;
+esac
 set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official BPF object is not unique"; exit 1; }
 OFFICIAL_BPF=$1
 set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
-"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory --safe-variant "$OFFICIAL_VARIANT" --unsafe-variant wide-diagnostic "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
 set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official journal object is not unique"; exit 1; }
-"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --inventory journal "$1"
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --inventory "$JOURNAL_VARIANT" "$1"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \

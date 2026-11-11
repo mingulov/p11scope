@@ -2090,6 +2090,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         raise RuntimeError(f"unknown object variant {variant!r}")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
+    journal = variant in ("journal", "journal-wide")
     elf = Elf(Path(path).read_bytes())
     records, sections = elf_records(path)
     if records != elf.records or {name: index for name, index in sections.items() if index} != elf.indices:
@@ -2108,7 +2109,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
             raise RuntimeError("LLVM/raw legacy section mismatch")
         maps = decode_map_definitions(records, sections["maps"], data)
     if ".maps" in sections:
-        if variant == "journal":
+        if journal:
             native = decode_journal_native_maps(elf)
         else:
             native = decode_btf_maps(elf)
@@ -2119,13 +2120,13 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         btf = Btf(elf.sections[".BTF"][1])
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
-    validate_ia32_reader(elf, inventory, journal=(variant == "journal"))
+    validate_ia32_reader(elf, inventory, journal=journal)
     validate_object_capture_globals(elf, inventory)
-    validate_owner_helpers(elf, inventory, journal=(variant == "journal"))
+    validate_owner_helpers(elf, inventory, journal=journal)
     validate_exec_helpers(elf, inventory)
     validate_exe_helpers(elf, inventory)
     validate_exec_cookie_helper(elf, inventory, callers)
-    if variant == "journal":
+    if journal:
         validate_journal_marker_helpers(elf)
         validate_marker_call_sites(elf, journal=True)
         validate_journal_producers(elf)
@@ -2140,7 +2141,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
-    validate_classic_uprobe_kernel_stack(elf, journal=(variant == "journal"))
+    validate_classic_uprobe_kernel_stack(elf, journal=journal)
     # A literal pool or static (.rodata*/.data*/.bss*) becomes one more loaded
     # map: it breaks the exact owned-map inventory and the live map counts.
     global_data = sorted(name for name in elf.sections
@@ -2155,7 +2156,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
                           | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS
                           | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS)
                           | (JOURNAL_GLOBAL_OWNER_HELPERS | JOURNAL_GLOBAL_PRODUCERS
-                             if variant == "journal" else frozenset()),
+                             if journal else frozenset()),
                           inventory=inventory), {
         record[-1] for record in records
     }
@@ -2375,6 +2376,17 @@ JOURNAL_MAPS = _DETAILED_BASE_MAPS | {
     "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
     "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
 }
+# The wide production journal object: the journal build takes the build's
+# own Detailed geometry, so the wide release journal carries wide slot
+# capacities under the same journal roots. The release p0 build (no
+# default features) keeps JOURNAL_MAPS.
+JOURNAL_WIDE_MAPS = WIDE_MAPS | {
+    "JOURNAL_START": map_def(1, 16, 24, 16_384, 0),
+    "JOURNAL_CTL": map_def(2, 4, 24, 1, 0),
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
+}
 JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
     "p11_entry_journal", "p11_return_journal",
 }
@@ -2432,6 +2444,7 @@ FROZEN_INVENTORY = {
     "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide": (WIDE_MARKER_MAPS, SAFE_PROGRAMS),
     "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
+    "journal-wide": (JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS),
 }
 
 
@@ -2453,6 +2466,7 @@ FROZEN_SYMBOLS = {
     "wide-diagnostic": (True, True, True, 2, 2, 2),
     "wide": (False, False, False, 0, 0, 0),
     "journal": (False, False, False, 0, 0, 0),
+    "journal-wide": (False, False, False, 0, 0, 0),
 }
 
 
@@ -2482,7 +2496,7 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
-    journal = variant == "journal"
+    journal = variant in ("journal", "journal-wide")
     if journal:
         # The exact map comparison above already excludes every map the
         # journal must not carry, including inventory-only maps; here
@@ -2540,9 +2554,21 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} decoder symbol inventory differs")
 
 
-def validate_policy_inventory(safe, unsafe):
-    validate_inventory("default", *safe)
-    validate_inventory("diagnostic", *unsafe)
+# The policy check compares the official safe object and the diagnostic
+# object against the frozen inventory for the width each build selected.
+# The release p0 mix pairs a 512 safe object with a wide diagnostic
+# object, so each side selects its own width.
+POLICY_SAFE_VARIANTS = ("default", "wide")
+POLICY_UNSAFE_VARIANTS = ("diagnostic", "wide-diagnostic")
+
+
+def validate_policy_inventory(safe, unsafe, safe_variant="default", unsafe_variant="diagnostic"):
+    if safe_variant not in POLICY_SAFE_VARIANTS:
+        raise RuntimeError(f"unknown policy safe variant {safe_variant!r}")
+    if unsafe_variant not in POLICY_UNSAFE_VARIANTS:
+        raise RuntimeError(f"unknown policy unsafe variant {unsafe_variant!r}")
+    validate_inventory(safe_variant, *safe)
+    validate_inventory(unsafe_variant, *unsafe)
 
 
 def self_test():
@@ -2904,8 +2930,9 @@ def usage():
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
         "--inventory VARIANT BPF_ELF (default, default-no-marker, diagnostic, "
         "inventory[-small-discovery], inventory-callers[-small-discovery], "
-        "wide, wide-default, wide-diagnostic, journal) | "
-        "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
+        "wide, wide-default, wide-diagnostic, journal, journal-wide) | "
+        "--policy-inventory [--safe-variant VARIANT] [--unsafe-variant VARIANT] "
+        "DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 
 
@@ -2934,14 +2961,28 @@ def main():
         print(f"inventory {variant}: maps={len(maps)} programs={len(programs)} OK")
         return
     if sys.argv[1:2] == ["--policy-inventory"]:
-        if len(sys.argv) != 4:
+        args = sys.argv[2:]
+        safe_variant, unsafe_variant = "default", "diagnostic"
+        while args[:1] in (["--safe-variant"], ["--unsafe-variant"]):
+            if len(args) < 3:
+                raise SystemExit(usage())
+            flag, value, *args = args
+            if flag == "--safe-variant":
+                safe_variant = value
+            else:
+                unsafe_variant = value
+        if len(args) != 2:
             raise SystemExit(usage())
-        safe = inspect(sys.argv[2])
-        unsafe = inspect(sys.argv[3], DIAGNOSTIC_GLOBAL_HELPERS)
-        validate_policy_inventory(safe, unsafe)
+        if safe_variant not in POLICY_SAFE_VARIANTS:
+            raise RuntimeError(f"unknown policy safe variant {safe_variant!r}")
+        if unsafe_variant not in POLICY_UNSAFE_VARIANTS:
+            raise RuntimeError(f"unknown policy unsafe variant {unsafe_variant!r}")
+        safe = inspect(args[0])
+        unsafe = inspect(args[1], DIAGNOSTIC_GLOBAL_HELPERS)
+        validate_policy_inventory(safe, unsafe, safe_variant, unsafe_variant)
         print(
-            f"policy inventory: default maps={len(safe[0])} programs={len(safe[1])}; "
-            f"diagnostic maps={len(unsafe[0])} programs={len(unsafe[1])} OK"
+            f"policy inventory: {safe_variant} maps={len(safe[0])} programs={len(safe[1])}; "
+            f"{unsafe_variant} maps={len(unsafe[0])} programs={len(unsafe[1])} OK"
         )
         return
     if len(sys.argv) < 3:

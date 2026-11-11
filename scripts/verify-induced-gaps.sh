@@ -458,7 +458,9 @@ FREEZE_BPF=$1
 python3 scripts/check-bpf-map-defs.py "$DEFAULT_BPF" EVENTS=33554432 START=16384 RV_COUNTS=4096
 python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COUNTS=4096
 python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=33554432 START=1 RV_COUNTS=1
-python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FREEZE_BPF"
+# All four isolated builds keep default features, so both policy objects
+# are wide.
+python3 scripts/check-bpf-map-defs.py --policy-inventory --safe-variant wide --unsafe-variant wide-diagnostic "$DEFAULT_BPF" "$FREEZE_BPF"
 
 pin_workload() {
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {

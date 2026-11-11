@@ -8632,6 +8632,275 @@ mod tests {
         );
     }
 
+    fn interface_linked_module() -> ReconciledModule {
+        let mut module = sole_complete_module();
+        module.getter_present = true;
+        module.exports = std::sync::Arc::from(vec![("C_GetFunctionList".to_string(), 0x1000u64)]);
+        module
+            .scanned
+            .interfaces
+            .push(crate::discovery::scan::ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: None,
+                name_private: None,
+                flags: 0,
+                table: Some(0),
+            });
+        module
+    }
+
+    fn assert_plan_count_only(plan: &AttachPlan, why: &str) {
+        assert!(
+            plan.slots.iter().all(|slot| !slot.semantic_authorized),
+            "{why}: no slot carries semantic authority"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 0, "{why}");
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+            "{why}: every slot stays count-only"
+        );
+    }
+
+    #[test]
+    fn interface_linked_table_with_version_mismatch_stays_count_only() {
+        // Ruling clause 1 on the linkage path: an exact "PKCS 11"
+        // interface record naming the table does not by itself prove
+        // the standard layout — the version field must still match
+        // the decoded slot count. A 3.0 table decoded at 68 slots
+        // without the wider layouts refuted is unproven, linked or not.
+        let mut module = interface_linked_module();
+        module.scanned.tables[0].version = (3, 0);
+        module.scanned.tables[0].extension_impossible = false;
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "linked table with a version/count mismatch");
+    }
+
+    #[test]
+    fn interface_linked_table_with_foreign_entry_stays_count_only() {
+        // Ruling clause 1 on the linkage path: every retained entry
+        // must point into the provider's own object. One entry
+        // attaching into another object refuses the whole table —
+        // no argument is read through an unproven slot.
+        let mut module = interface_linked_module();
+        let position = module.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "linked table with a foreign entry");
+    }
+
+    fn live_return_module() -> ReconciledModule {
+        // Only the subset live-return leg can grant here: the 3.x
+        // getter presence refuses the sole leg and the getter-export
+        // leg refuses a 2.x table beside it, and nothing links.
+        let mut module = sole_complete_module();
+        module.getter_present = true;
+        module.exports = std::sync::Arc::from(vec![("C_GetFunctionList".to_string(), 0x1000u64)]);
+        module.scanned.tables[0].live_return = true;
+        module
+    }
+
+    #[test]
+    fn live_return_subset_table_with_version_mismatch_stays_count_only() {
+        // The live-return leg carries the same clause-1 core: a
+        // returned table whose version disagrees with its decoded
+        // slot count is unproven even in the scan-authorized subset.
+        let mut module = live_return_module();
+        module.scanned.tables[0].version = (3, 0);
+        module.scanned.tables[0].extension_impossible = false;
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_plan_count_only(&plan, "live-return table with a version/count mismatch");
+    }
+
+    #[test]
+    fn live_return_subset_table_with_foreign_entry_stays_count_only() {
+        let mut module = live_return_module();
+        let position = module.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_plan_count_only(&plan, "live-return table with a foreign entry");
+    }
+
+    #[test]
+    fn live_return_subset_healthy_table_still_grants_standard_layout() {
+        // Healthy twin: a version-consistent own-object table
+        // returned by the typed getter keeps its subset grant.
+        let module = live_return_module();
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "healthy live-return table carries semantic authority in the subset"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 68);
+    }
+
+    fn observed_event(slot: u32, mechanism: u64, capture: u32) -> p11scope_ebpf_common::Event {
+        p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism,
+            rv: 0,
+            slot,
+            capture,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        }
+    }
+
+    #[test]
+    fn rejected_standard_layout_init_never_publishes_via_confirmed_operation() {
+        // Mixed authority (per-target merge shape): C_SignInit is
+        // standard-layout-only, C_Sign is manifest-confirmed. An
+        // unregistered value read at the Init is gated there; the
+        // later confirmed operation must not publish it either —
+        // publication authority belongs to the slot that read the
+        // number, not the slot that later uses the binding.
+        let module = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        let slot_named = |plan: &AttachPlan, name: &str| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.names == [name])
+                .unwrap_or_else(|| panic!("{name} slot"))
+                .index
+        };
+        let sign_init = slot_named(&plan, "C_SignInit");
+        let sign = slot_named(&plan, "C_Sign");
+        assert!(plan.is_standard_layout_slot(sign_init));
+        plan.standard_layout_slots.remove(&sign);
+        assert!(!plan.is_standard_layout_slot(sign), "C_Sign confirmed");
+        let init_ev = |mechanism: u64, extra: u32| {
+            observed_event(
+                sign_init,
+                mechanism,
+                p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL
+                    | extra,
+            )
+        };
+        let sign_ev = || {
+            observed_event(
+                sign,
+                0,
+                p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            )
+        };
+        let mut state = crate::semantics::State::new(&plan);
+        state.observe(&init_ev(
+            0xCE53_43A9,
+            p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED,
+        ));
+        state.observe(&sign_ev());
+        assert!(
+            !state.mechanisms().contains_key(&0xCE53_43A9),
+            "gated Init value keeps no global row after a confirmed operation"
+        );
+        assert!(
+            state
+                .cgroups()
+                .values()
+                .all(|stat| !stat.mechanisms.contains_key(&0xCE53_43A9)),
+            "gated Init value keeps no cgroup cell"
+        );
+        assert!(
+            state
+                .semantic_evidence()
+                .unregistered_standard_layout_mechanisms
+                >= 1,
+            "the gated value is counted without its number"
+        );
+        // A withheld Init also replaces any earlier binding: a
+        // registered Init followed by a gated Init on the same
+        // session must not leave the old mechanism active.
+        state.observe(&init_ev(0x40, 0)); // CKM_SHA256_RSA_PKCS
+        state.observe(&init_ev(
+            0xCE53_43A9,
+            p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED,
+        ));
+        let before = state.mechanisms()[&0x40].calls;
+        state.observe(&sign_ev());
+        assert_eq!(
+            state.mechanisms()[&0x40].calls,
+            before,
+            "the gated Init replaced the earlier binding"
+        );
+        assert!(!state.mechanisms().contains_key(&0xCE53_43A9));
+    }
+
+    #[test]
+    fn confirmed_init_mechanism_still_publishes_via_standard_layout_operation() {
+        // Reverse authority: a vendor/unknown value read through a
+        // manifest-confirmed Init publishes today and keeps
+        // publishing through a later standard-layout operation —
+        // the gate follows the reading slot, so confirmed behavior
+        // is not silently narrowed.
+        let module = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        let slot_named = |plan: &AttachPlan, name: &str| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.names == [name])
+                .unwrap_or_else(|| panic!("{name} slot"))
+                .index
+        };
+        let sign_init = slot_named(&plan, "C_SignInit");
+        let sign = slot_named(&plan, "C_Sign");
+        plan.standard_layout_slots.remove(&sign_init);
+        assert!(!plan.is_standard_layout_slot(sign_init), "Init confirmed");
+        assert!(plan.is_standard_layout_slot(sign), "operation standard-layout");
+        let mut state = crate::semantics::State::new(&plan);
+        state.observe(&observed_event(
+            sign_init,
+            0xCE53_43A9,
+            p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL
+                | p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED,
+        ));
+        state.observe(&observed_event(
+            sign,
+            0,
+            p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        ));
+        let stat = state
+            .mechanisms()
+            .get(&0xCE53_43A9)
+            .expect("confirmed Init publishes its vendor mechanism");
+        assert_eq!(stat.calls, 2, "Init and operation both recorded");
+        assert_eq!(
+            state
+                .semantic_evidence()
+                .unregistered_standard_layout_mechanisms,
+            0,
+            "nothing was gated: the reading slot was confirmed"
+        );
+    }
+
     #[test]
     fn late_verified_frozen_slots_report_as_unverified() {
         // Review F2 (option (c)): a table verified only after probes

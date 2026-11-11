@@ -3,8 +3,12 @@
 # Scan-seal seating on short runs and non-pid scopes (design, 2026-11-11)
 
 Status: diagnosis proven live; message-only fix shipped (see below).
-Seating the seal earlier, for `--cgroup`, or under `--dashboard` is a
-design change for 0.7.x — this note records the options and risks.
+Update (round 2, v0.7.1): `--cgroup` now attempts the seal post-commit
+(`ClassicDriver::finish_pass`) over the run's cgroup scope, with the
+commit stashing the mint's sources — option 3 below, shipped; the
+cgroup "did not run" message is retired. Seating the seal earlier
+(options 1–2) and arming it under `--dashboard` (option 4) remain
+design changes — this note records the options and risks.
 
 ## Diagnosis (proven)
 
@@ -72,12 +76,14 @@ message fix above.
    re-seat follow-up need re-tuning together.
 2. Fewer stable peeks. Cheaper but blunter than (1): same newcomer
    risk, plus churned sets seat partial providers more often.
-3. Attempt the seal for `--cgroup` collections. Call the deferred
-   attempt from the cgroup apply path once per pass. Risk: cgroup
-   collections are frequently incomplete (`cgroup collection
-   incomplete` legs observed live); seating over a partial member set
-   needs its own completeness rule, or the seal mints over members
-   that later scans refute.
+3. Attempt the seal for `--cgroup` collections. SHIPPED in round 2
+   (v0.7.1), with one correction: the attempt runs from the
+   post-commit `finish_pass` hook, not the apply path — apply is too
+   early (the commit absorbs the mint's sources), and the commit now
+   stashes them for the seal. No separate completeness rule: the mint
+   covers discovered-complete providers only, undiscovered members
+   stay honestly unattributed, exactly like discovery-capped legacy
+   passes that seat today.
 4. Arm the seal under `--dashboard`. Small (one flag plus the already
    wired finish disclosure) but unproven interactively: pass cadence
    under a live display differs, and mid-run seating must publish

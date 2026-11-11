@@ -4668,6 +4668,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.completed_cgroup.take()
     }
 
+    /// The run's engine scope, cloned for driver twins that must
+    /// mirror the run's attach scope without running the constructor.
+    #[cfg(test)]
+    pub(crate) fn engine_scope_for_test(&self) -> Scope {
+        self.engine.scope.clone()
+    }
+
+    /// Pose one cgroup completion for a driver `finish_pass` twin: the
+    /// transaction outcome posed, nothing admitted or scanned.
+    #[cfg(test)]
+    pub(crate) fn pose_cgroup_completion_for_test(&mut self, outcome: ScopedCollectionOutcome) {
+        self.completed_cgroup = Some(CgroupCompletion {
+            state: CgroupWalkState::default(),
+            outcome,
+            events: Vec::new(),
+            admitted: 0,
+            scan_callers: 0,
+        });
+    }
+
     /// The pass after collection: absorb the lowering into the attach set,
     /// reconcile caller incarnations over every attributable member
     /// (deep-scanned or maps-matched), scan native owners, and project the
@@ -10760,7 +10780,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             let absorbed = match (provider, catalog.lowering.take()) {
                 (Some(provider), Some(lowering)) => {
-                    match provider
+                    let absorbed = match provider
                         .absorb(&lowering.plan, &lowering.pins, |units| work.charge(units))
                     {
                         Ok(absorbed) => Some(absorbed),
@@ -10776,7 +10796,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             });
                             None
                         }
+                    };
+                    // DEMO-4, like `absorb_lowering`: retain this
+                    // pass's reconciled scan modules and their
+                    // aggregate pins for one no-manifest scan-seal
+                    // attempt after the pass. Only when the run will
+                    // actually attempt that seal, and only disjoint
+                    // field access fits beside the provider borrow.
+                    if self.scan_mint_requested && !lowering.modules.is_empty() {
+                        let crate::inspect_system::CatalogLowering { pins, modules, .. } = lowering;
+                        self.scan_mint_sources = Some((modules, pins));
                     }
+                    absorbed
                 }
                 _ => None,
             };
@@ -17673,6 +17704,59 @@ pub(crate) mod tests {
                 assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
             },
         )
+    }
+
+    /// The cgroup commit feeds the no-manifest scan seal: with a seal
+    /// requested, the absorbed lowering's scan modules stash as the
+    /// mint's sources, exactly like the legacy `absorb_lowering`.
+    /// Without the stash the cgroup seal would mint over a stale
+    /// snapshot and never seat.
+    #[test]
+    fn cgroup_commit_stashes_scan_mint_sources_when_requested() {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        coordinator.note_scan_mint_requested();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let _completion = coordinator.take_cgroup_completion().unwrap();
+        assert!(
+            coordinator.scan_mint_sources.is_some(),
+            "the cgroup commit stashes this pass's scan modules for the seal mint"
+        );
+    }
+
+    /// Twin: with no seal requested the cgroup commit stashes
+    /// nothing, like the legacy path (the stash's pins must not
+    /// outlive broad admission for providers it never took).
+    #[test]
+    fn cgroup_commit_stashes_no_scan_mint_sources_without_request() {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let _completion = coordinator.take_cgroup_completion().unwrap();
+        assert!(
+            coordinator.scan_mint_sources.is_none(),
+            "with no seal requested the cgroup commit stashes nothing"
+        );
     }
 
     #[test]

@@ -1719,6 +1719,7 @@ fn run_with_terminal_budget(
                 return run_dashboard(
                     DashboardRun {
                         scope,
+                        engine_scope: engine_scope.clone(),
                         inventory_scope,
                         cgroup,
                         scope_label,
@@ -1801,6 +1802,7 @@ fn run_with_terminal_budget(
         attach_backend,
         display: None,
         semantic,
+        seal_scope: engine_scope.clone(),
         scan_seal_pending: manifests.is_empty() && key_operations && native_available,
         scan_seal_last_sets: None,
         scan_seal_stable_runs: 0,
@@ -2504,6 +2506,12 @@ struct ClassicDriver<'a> {
     /// attested a subset. Ticks drive H0; commits finalize beside the
     /// physical evidence; the stop path owns its terminal sequence.
     semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    /// The run's attach scope for the deferred scan-seal lane
+    /// start: `Scope::from(scope)` for PID/system runs, the run's
+    /// `Scope::Cgroup` for cgroup runs (which `InventoryRunScope`
+    /// cannot carry). The cgroup seal starts over this, so the
+    /// lane's BPF membership gate matches the run.
+    seal_scope: Scope,
     /// DEMO-4 deferred scan seal: with `--key-operations` and no
     /// manifest, no subset exists before the first discovery pass,
     /// so the lane start retries after engine-changing passes until
@@ -2655,6 +2663,7 @@ pub(crate) fn classic_semantic_ticks_for_test(
         coordinator,
         inventory_scope: None,
         scope: InventoryRunScope::Pid(std::process::id()),
+        seal_scope: Scope::Pid(std::process::id()),
         cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
@@ -2730,6 +2739,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         coordinator,
         inventory_scope: None,
         scope: scope.into(),
+        seal_scope: scope.clone(),
         cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
@@ -2918,6 +2928,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         coordinator,
         inventory_scope: None,
         scope: InventoryRunScope::Pid(std::process::id()),
+        seal_scope: Scope::Pid(std::process::id()),
         cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
@@ -3019,6 +3030,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         coordinator,
         inventory_scope: None,
         scope: scope.into(),
+        seal_scope: scope.clone(),
         cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
@@ -3424,7 +3436,7 @@ impl ClassicDriver<'_> {
     /// tracks native owner commits, so a system scan-lane pass
     /// (zero native callers) would never set it and the seal
     /// would never be attempted (fedora diag1, 2026-11-05).
-    fn attempt_deferred_scan_seal(&mut self, scope: InspectScope) {
+    fn attempt_deferred_scan_seal(&mut self, engine_scope: Scope) {
         if self.semantic.is_none() && self.scan_seal_pending {
             // Settle first: a pre-existing provider lets the first
             // mint succeed while the application's provider is still
@@ -3432,7 +3444,6 @@ impl ClassicDriver<'_> {
             if !self.settle_scan_seal() {
                 return;
             }
-            let engine_scope = Scope::from(scope);
             if let Some(lane) = start_semantic_lane(
                 self.coordinator,
                 &engine_scope,
@@ -3522,16 +3533,11 @@ impl ClassicDriver<'_> {
             return false;
         }
         let passes = self.coordinator.passes();
-        // Cgroup collections return before the deferred attempt, so a
-        // pending seal there never ran; more passes cannot seat it.
-        let reason = if matches!(self.scope, InventoryRunScope::Cgroup) {
-            "the scan seal did not run for this --cgroup capture; \
-             pass --manifest <manifest.json> for per-key rows; \
-             broad inventory continues with S1 mechanisms and API results"
-                .to_string()
         // A peeked set exists: the settle held the start back for the
         // whole run (too few passes, or a set that never held still).
-        } else if self.scan_seal_last_sets.is_some() {
+        // Every scope attempts the seal now, so `--cgroup` reads this
+        // arm (or the empty-discovery one) like the rest.
+        let reason = if self.scan_seal_last_sets.is_some() {
             format!(
                 "the scan seal never seated: {} passes ran, {} stable passes over one provider \
                  set needed; rerun with a longer --duration, a narrower scope (--pid or \
@@ -5953,6 +5959,7 @@ fn seal_start_live(
 > {
     #[cfg(test)]
     if let Some(verdict) = seal_startup_test::take_start_verdict() {
+        seal_startup_test::record_start_scope(scope);
         return verdict;
     }
     crate::inventory_semantics::AttestedSemanticLane::start_live(
@@ -5984,12 +5991,24 @@ mod seal_startup_test {
             const { std::cell::RefCell::new(VecDeque::new()) };
         static START: std::cell::RefCell<VecDeque<StartVerdict>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
+        static START_SCOPES: std::cell::RefCell<Vec<Scope>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     pub(super) fn take_prepared() -> Option<Preparation> {
         PREPARE.with(|queued| queued.borrow_mut().pop_front())
     }
     pub(super) fn take_start_verdict() -> Option<StartVerdict> {
         START.with(|queued| queued.borrow_mut().pop_front())
+    }
+    /// Record one scripted start's attach scope, in order. Twins
+    /// drain it through `take_start_scopes` to prove the lane
+    /// started over the run's scope (a cgroup seal must carry the
+    /// cgroup's BPF membership gate, never a widened system scope).
+    pub(super) fn record_start_scope(scope: &Scope) {
+        START_SCOPES.with(|recorded| recorded.borrow_mut().push(scope.clone()));
+    }
+    pub(super) fn take_start_scopes() -> Vec<Scope> {
+        START_SCOPES.with(|recorded| recorded.take())
     }
     pub(super) fn with<R>(
         prepares: Vec<Preparation>,
@@ -6011,6 +6030,7 @@ mod seal_startup_test {
             fn drop(&mut self) {
                 PREPARE.with(|queued| queued.borrow_mut().clear());
                 START.with(|queued| queued.borrow_mut().clear());
+                START_SCOPES.with(|recorded| recorded.borrow_mut().clear());
             }
         }
         PREPARE.with(|queued| queued.borrow_mut().extend(prepares));
@@ -6590,7 +6610,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(warning) = warning {
             self.warn(&warning);
         }
-        self.attempt_deferred_scan_seal(scope);
+        self.attempt_deferred_scan_seal(Scope::from(scope));
         if let Some(lane) = self.semantic.as_mut() {
             bind_semantic_callers(self.coordinator, lane);
         }
@@ -6684,6 +6704,16 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     completion.outcome.reason()
                 ));
             }
+        }
+        // The deferred scan seal runs post-commit on the cgroup path:
+        // the commit above absorbed this pass's lowering (the mint's
+        // sources), so the legacy apply hook is too early there. The
+        // settle, mint, start and authority rules are the same; only
+        // the hook and the scope differ. Legacy passes attempt in
+        // `apply` and must not attempt again here.
+        if matches!(self.scope, InventoryRunScope::Cgroup) {
+            let engine_scope = self.seal_scope.clone();
+            self.attempt_deferred_scan_seal(engine_scope);
         }
         Ok(())
     }
@@ -8182,6 +8212,7 @@ fn note_identity_observation(
 /// What the interactive dashboard run is over.
 struct DashboardRun {
     scope: InventoryRunScope,
+    engine_scope: Scope,
     inventory_scope: Option<InventoryScope>,
     cgroup: Option<CgroupDriverState>,
     scope_label: String,
@@ -8415,6 +8446,7 @@ fn run_dashboard(
 ) -> Result<i32> {
     let DashboardRun {
         scope,
+        engine_scope,
         inventory_scope,
         cgroup,
         scope_label,
@@ -8457,6 +8489,7 @@ fn run_dashboard(
         attach_backend,
         display: Some(display),
         semantic,
+        seal_scope: engine_scope,
         scan_seal_pending: false,
         scan_seal_last_sets: None,
         scan_seal_stable_runs: 0,
@@ -16542,6 +16575,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -16644,6 +16678,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -16724,6 +16759,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -16859,6 +16895,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -17002,6 +17039,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -17101,6 +17139,7 @@ mod tests {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
                 cgroup: None,
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -21572,6 +21611,7 @@ mod promotion_driver_tests {
             coordinator,
             inventory_scope: None,
             scope: InventoryRunScope::Pid(std::process::id()),
+            seal_scope: Scope::Pid(std::process::id()),
             cgroup: None,
             max_scan_pids: None,
             guard: UnavailableImageGuard,
@@ -28387,6 +28427,7 @@ mod promotion_driver_tests {
             coordinator: &mut coordinator,
             inventory_scope: None,
             scope: InventoryRunScope::Pid(std::process::id()),
+            seal_scope: Scope::Pid(std::process::id()),
             cgroup: None,
             max_scan_pids: None,
             guard: UnavailableImageGuard,
@@ -28495,7 +28536,7 @@ mod seal_readiness_tests {
                 Err(SemanticRefusal::Unavailable),
                 Err(SemanticRefusal::Unavailable),
             ],
-            || driver.attempt_deferred_scan_seal(scope),
+            || driver.attempt_deferred_scan_seal(Scope::from(scope)),
         );
         assert!(
             driver.semantic.is_none(),
@@ -28510,7 +28551,7 @@ mod seal_readiness_tests {
         seal_startup_test::with(
             vec![some_preparation(), some_preparation()],
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
-            || driver.attempt_deferred_scan_seal(scope),
+            || driver.attempt_deferred_scan_seal(Scope::from(scope)),
         );
         assert!(
             driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
@@ -28560,11 +28601,11 @@ mod seal_readiness_tests {
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
             || {
                 for n in 1..attempts {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                     assert!(driver.semantic.is_none(), "attempt {n} still settles");
                     assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
                 }
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             },
         );
         assert!(
@@ -28622,11 +28663,11 @@ mod seal_readiness_tests {
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
             || {
                 for n in 1..attempts {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                     assert!(driver.semantic.is_none(), "attempt {n} still settles");
                     assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
                 }
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             },
         );
         assert!(
@@ -28666,11 +28707,11 @@ mod seal_readiness_tests {
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
             || {
                 for n in 1..attempts {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                     assert!(driver.semantic.is_none(), "attempt {n} still settles");
                     assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
                 }
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             },
         );
         assert!(
@@ -28708,11 +28749,11 @@ mod seal_readiness_tests {
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
             || {
                 for n in 1..attempts {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                     assert!(driver.semantic.is_none(), "attempt {n} still settles");
                     assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
                 }
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             },
         );
         assert!(
@@ -28759,10 +28800,10 @@ mod seal_readiness_tests {
                 Ok(joint_lane(WindDownIo::completing(), false)),
             ],
             || {
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
                 assert!(driver.semantic.is_none(), "attempt 1 still settles");
                 assert!(driver.scan_seal_pending, "attempt 1 keeps pending");
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
                 assert!(
                     driver.semantic.is_none(),
                     "a refused fall-through never seats"
@@ -28776,11 +28817,11 @@ mod seal_readiness_tests {
                     "a refused fall-through notes no seal line"
                 );
                 for n in 3..attempts {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                     assert!(driver.semantic.is_none(), "attempt {n} still settles");
                     assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
                 }
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             },
         );
         assert!(
@@ -28813,7 +28854,7 @@ mod seal_readiness_tests {
             vec![some_preparation()],
             Some(Err(SemanticRefusal::Unavailable)),
             || {
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
                 seal_startup_test::take_prepared().is_some()
                     && seal_startup_test::take_start_verdict().is_some()
             },
@@ -28825,7 +28866,7 @@ mod seal_readiness_tests {
         seal_startup_test::with(
             vec![some_preparation(), some_preparation()],
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
-            || driver.attempt_deferred_scan_seal(scope),
+            || driver.attempt_deferred_scan_seal(Scope::from(scope)),
         );
         assert!(driver.semantic.is_some(), "the pending attempt seals");
         assert!(!driver.scan_seal_pending);
@@ -28854,7 +28895,7 @@ mod seal_readiness_tests {
         let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize - 1];
         seal_startup_test::with_peek(peeks, Vec::new(), None, || {
             for _ in 0..super::SCAN_SEAL_STABLE_PEEKS - 1 {
-                driver.attempt_deferred_scan_seal(scope);
+                driver.attempt_deferred_scan_seal(Scope::from(scope));
             }
         });
         assert!(driver.semantic.is_none(), "short of stable, nothing seats");
@@ -28905,7 +28946,7 @@ mod seal_readiness_tests {
             Vec::new(),
             || {
                 for _ in 0..3 {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                 }
             },
         );
@@ -28924,18 +28965,140 @@ mod seal_readiness_tests {
         );
     }
 
-    /// `--cgroup` collections return before the deferred attempt, so a
-    /// pending seal there means "never ran", never "needs more passes".
-    /// The disclosure names the scope instead of the missing flag.
+    /// `--cgroup` attempts the deferred seal after each pass's commit
+    /// (the commit absorbed this pass's lowering, the mint's sources,
+    /// so the legacy apply hook is too early there): eight stable
+    /// peeks seat over the run's cgroup scope, with the seal line and
+    /// the scan-derived provenance, exactly like the legacy path. The
+    /// recorded start scope proves the lane carries the cgroup's BPF
+    /// membership gate, never a widened system scope.
     #[test]
-    fn unseated_scan_seal_cgroup_names_scope() {
+    fn cgroup_finish_pass_attempts_seal_and_seats_over_stable_set() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        driver.cgroup =
+            Some(CgroupDriverState::new(None, None).expect("cgroup driver state builds"));
+        let root = tempfile::tempdir().expect("cgroup root");
+        driver.seal_scope = Scope::Cgroup {
+            id: 7,
+            path: root.path().to_path_buf(),
+            dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+        };
+        driver.scan_seal_pending = true;
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        // Drained inside the guard: its drop clears recordings so a
+        // twin that returns early cannot leak into the next test.
+        let start_scopes = seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for n in 1..attempts {
+                    driver.coordinator.pose_cgroup_completion_for_test(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                    );
+                    driver.finish_pass(&mut report).expect("finish consumes");
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.coordinator.pose_cgroup_completion_for_test(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                );
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_start_scopes()
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the stable cgroup set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE.to_string()],
+            "the seating notes the seal line once"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "semantic subset scan-derived").len(),
+            1,
+            "the seated scan-derived lane discloses its provenance once"
+        );
+        assert!(
+            matches!(start_scopes.as_slice(), [Scope::Cgroup { id: 7, .. }]),
+            "the lane started over the run's cgroup scope: {start_scopes:?}"
+        );
+    }
+
+    /// The post-commit hook is cgroup-only: a legacy pass attempts in
+    /// `apply`, so its `finish_pass` must not attempt again (a second
+    /// attempt would consume the scripted start behind the test).
+    #[test]
+    fn legacy_finish_pass_attempts_no_seal() {
         use super::promotion_driver_tests::{driver_with_display, headless_display};
         take_sealed_for_test();
         let mut coordinator = coordinator();
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
         driver.scan_seal_pending = true;
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let untouched = seal_startup_test::with(
+            vec![some_preparation()],
+            Some(Err(SemanticRefusal::Unavailable)),
+            || {
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_prepared().is_some()
+                    && seal_startup_test::take_start_verdict().is_some()
+            },
+        );
+        assert!(untouched, "legacy finish_pass mints and starts nothing");
+        assert!(driver.semantic.is_none());
+        assert!(driver.scan_seal_pending, "legacy finish keeps pending");
+    }
+
+    /// `--cgroup` attempts the seal like every scope now: a pending
+    /// seal with peeks discloses the settle it missed, never a
+    /// scope-specific "did not run".
+    #[test]
+    fn unseated_scan_seal_cgroup_attempts_like_system() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
         driver.scope = InventoryRunScope::Cgroup;
+        driver.scan_seal_last_sets = Some(BTreeSet::from([PinnedObjectId(0)]));
         assert!(
             driver.disclose_unseated_scan_seal(),
             "the terminal run discloses the unseated seal"
@@ -28943,8 +29106,12 @@ mod seal_readiness_tests {
         let gaps = gaps_for_subject(&mut *driver.coordinator, "key operations unavailable");
         assert_eq!(gaps.len(), 1, "exactly one terminal gap: {gaps:?}");
         assert!(
-            gaps[0].1.contains("--cgroup"),
-            "the gap names the scope: {:?}",
+            gaps[0].1.contains("never seated")
+                && gaps[0].1.contains(&format!(
+                    "{} stable passes over one provider set",
+                    super::SCAN_SEAL_STABLE_PEEKS
+                )),
+            "the gap names the settle the run missed: {:?}",
             gaps[0].1
         );
     }
@@ -28970,7 +29137,7 @@ mod seal_readiness_tests {
             Some(Ok(joint_lane(WindDownIo::completing(), false))),
             || {
                 for _ in 0..super::SCAN_SEAL_STABLE_PEEKS {
-                    driver.attempt_deferred_scan_seal(scope);
+                    driver.attempt_deferred_scan_seal(Scope::from(scope));
                 }
             },
         );

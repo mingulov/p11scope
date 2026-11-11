@@ -30,11 +30,13 @@ impl<'a> ObservedDriver<'a> {
         coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
         control: CollectionControl,
     ) -> Self {
+        let seal_scope = coordinator.engine_scope_for_test();
         Self {
             inner: ClassicDriver {
                 coordinator,
                 inventory_scope: None,
                 scope: InventoryRunScope::Cgroup,
+                seal_scope,
                 cgroup: Some(CgroupDriverState {
                     observer: None,
                     continuation: Some(CgroupWalkState::default()),

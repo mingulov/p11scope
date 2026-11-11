@@ -288,6 +288,13 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
+      # The EXEC-ticket pin is compiled out of the wide default build; run it
+      # on the P0 feature set so the stamp boundary stays pinned in CI. Same
+      # proven-pass grep as the guard above: an empty filter fails here.
+      - shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" test --locked --offline -p p11scope --no-default-features --features stub-object-attributes --test exec_task_continuity -- --exact --nocapture exec_ticket_absent_from_counter_flavors | tee "$RUNNER_TEMP/exec-ticket-p0.log"
+          grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/exec-ticket-p0.log"
       - name: Run feature host-admission regressions
         shell: bash
         run: |

@@ -77,11 +77,14 @@ versioned separately and are opaque, exact dispatch keys.
   on every surface (`identity_budget_exhausted`, `identity_unavailable`).
 - The semantic-state key budget is **262,144 keys per capture** (was
   16,384): churn-heavy nodes keep per-pod attribution (a kind churn
-  cell admitted only 98 of 451 pods before). Admissions are still
-  monotonic and never reused; the enforced limit is now named in the
-  report itself (`evidence.semantic_key_budget` in JSON, the spent
-  budget beside the verbose session-tracking gaps), and refusals still
-  count in `semantic_state_drops`.
+  cell admitted only 98 of 451 pods before). Live-state keys (open
+  sessions, active ops, find state, per-process pseudonym counters)
+  are returned to the budget where their entries are removed, so
+  short-lived churn cannot spend it; report rows stay kept and stay
+  counted. The enforced limit is now named in the report itself
+  (`evidence.semantic_key_budget` in JSON, the spent budget beside
+  the verbose session-tracking gaps), and refusals still count in
+  `semantic_state_drops`.
 - The default EVENTS ring is 32 MiB (was 4 MiB) for `profile`, `trace`
   and `run` in profile and trace modes, and the key-operations (Joint)
   lane's ring is 32 MiB (was 16 MiB). `--mode metrics` (with or without

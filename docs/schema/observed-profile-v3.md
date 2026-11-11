@@ -357,8 +357,10 @@ the `unpublished_mechanisms` attribution cause.
 
 `semantic_key_budget` is a u64 limit, always present: the enforced
 per-capture semantic-state key budget (262,144). At most this many keys
-are ever admitted across every semantic map; every refused admission
-counts in `semantic_state_drops`. It never feeds shares, verdicts, or
+are ever held across every semantic map: live-state keys return to the
+budget where their entries are removed, while report rows stay kept and
+stay counted. Every refused admission counts in
+`semantic_state_drops`. It never feeds shares, verdicts, or
 completeness — it states the report's own budget so a reader can tell a
 fitting capture from a spent one.
 
@@ -800,7 +802,7 @@ entry sums never exceed the row. The error rule matches the row
 (nonzero non-PENDING `rv`; PENDING diverts to the async queue
 upstream and its completion is recorded once with the final `rv`),
 so a fully attributed row partitions exactly. Each
-entry takes one key from the capture's shared monotonic
+entry takes one key from the capture's shared
 semantic-state budget; a refused entry records nothing and counts the
 usual `semantic_state_drops` gap.
 

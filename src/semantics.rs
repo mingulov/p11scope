@@ -60,7 +60,7 @@ pub struct MechStat {
     /// the row's own error rule (nonzero non-PENDING `rv`: PENDING
     /// diverts to the async queue upstream and its completion is
     /// recorded once with the final `rv`). Each new key takes
-    /// one key from the shared monotonic state budget, like
+    /// one key from the shared state budget, like
     /// `param_combos` entries; observations on slots with no sole owner
     /// count in the row but in no cell, so the cells sum to at most the
     /// row totals. Living inside the row keeps the breakdown inseparable
@@ -134,7 +134,7 @@ mod corrective_tests {
 
     #[test]
     fn unregistered_mechanism_refused_by_state_budget_counts_a_disclosed_drop() {
-        // The mechanisms map shares the capture's monotonic key budget:
+        // The mechanisms map shares the capture's state key budget:
         // a refused unregistered id never appears, and the refusal is
         // counted in `semantic_state_drops` (rendered as semantic state
         // gaps, forcing PARTIAL), never silently dropped.
@@ -341,7 +341,7 @@ mod corrective_tests {
 
     #[test]
     fn module_cells_share_the_state_key_budget() {
-        // The provider breakdown takes its keys from the same monotonic
+        // The provider breakdown takes its keys from the same shared
         // budget as every other semantic map: a refused cell records
         // nothing, counts a disclosed drop, and retained keys stay
         // within the limit. Limit 3 admits the history, cgroup and row
@@ -3065,10 +3065,14 @@ impl State {
             .saturating_add(u64::from(changed));
     }
 
-    // ponytail: admissions are a monotonic per-capture budget, widened
-    // to 262,144 keys after kind churn exhausted 16K (only 98 of 451
-    // pods kept cgroup rows). Counted eviction stays future work:
-    // revisit if long captures routinely exhaust this bound.
+    // ponytail: admissions are a per-capture budget, widened to
+    // 262,144 keys after kind churn exhausted 16K (only 98 of 451 pods
+    // kept cgroup rows). Live entries (open sessions, active ops, find
+    // state, per-process pseudonym counters) return their key to the
+    // budget where they are removed, so short-lived churn cannot spend
+    // it; report rows (histories, mechanisms, templates, logins,
+    // cgroups) stay kept and stay counted. Revisit if long captures
+    // routinely exhaust this bound with new report rows.
     //
     // The enforced limit, published so a report names its own budget.
     pub(crate) fn key_limit(&self) -> usize {
@@ -3090,6 +3094,16 @@ impl State {
                 false
             }
         }
+    }
+
+    /// Returns `freed` live-state keys to the admission budget. Callers
+    /// pass the entries actually removed, so each live entry holds its
+    /// key only while retained; saturating, so map surgery the budget
+    /// never admitted cannot underflow it. Report rows are never
+    /// released: they stay counted and — outside `purge_modules`
+    /// reconciliation, which drops them without refund — kept.
+    fn release_keys(&mut self, freed: usize) {
+        self.state_keys = self.state_keys.saturating_sub(freed);
     }
 
     #[cfg(test)]
@@ -3274,6 +3288,7 @@ impl State {
                 .inherited_ambiguous
                 .remove(&(process, meta.session(ev.session)))
         {
+            self.release_keys(1);
             self.evidence.fork_state_ambiguities =
                 self.evidence.fork_state_ambiguities.saturating_add(1);
         }
@@ -3417,14 +3432,18 @@ impl State {
                     }
                 }
                 MechanismCapture::Null => {
-                    self.active_ops.remove(&key);
+                    if self.active_ops.remove(&key).is_some() {
+                        self.release_keys(1);
+                    }
                     if meta.semantics.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL == 0 {
                         self.evidence.semantic_capture_failures =
                             self.evidence.semantic_capture_failures.saturating_add(1);
                     }
                 }
                 MechanismCapture::Unreadable | MechanismCapture::Absent => {
-                    self.active_ops.remove(&key);
+                    if self.active_ops.remove(&key).is_some() {
+                        self.release_keys(1);
+                    }
                 }
             }
         }
@@ -3494,8 +3513,13 @@ impl State {
         };
         if !retain {
             for (operation, _) in operation_bits(meta.semantics.operations) {
-                self.active_ops
-                    .remove(&(process, meta.session(ev.session), operation));
+                if self
+                    .active_ops
+                    .remove(&(process, meta.session(ev.session), operation))
+                    .is_some()
+                {
+                    self.release_keys(1);
+                }
             }
         }
     }
@@ -3504,18 +3528,24 @@ impl State {
         if ev.rv == CkRv::OPERATION_NOT_INITIALIZED.0 {
             let mut changed = false;
             for (operation, _) in operation_bits(meta.semantics.operations) {
-                changed |= self
+                if self
                     .active_ops
                     .remove(&(process, meta.session(ev.session), operation))
-                    .is_some();
+                    .is_some()
+                {
+                    self.release_keys(1);
+                    changed = true;
+                }
             }
             if matches!(
                 meta.semantics.lifecycle,
                 lifecycle::FIND_OPERATION | lifecycle::FIND_FINAL
-            ) {
-                changed |= self
-                    .find_active
-                    .remove(&(process, meta.session(ev.session)));
+            ) && self
+                .find_active
+                .remove(&(process, meta.session(ev.session)))
+            {
+                self.release_keys(1);
+                changed = true;
             }
             self.evidence.state_reconciliations = self
                 .evidence
@@ -3609,7 +3639,9 @@ impl State {
                 }
             }
             lifecycle::FIND_FINAL if ev.rv == CkRv::OK.0 => {
-                self.find_active.remove(&(process, session));
+                if self.find_active.remove(&(process, session)) {
+                    self.release_keys(1);
+                }
             }
             lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev, session),
             lifecycle::SET_OPERATION_STATE if ev.rv == CkRv::OK.0 => {
@@ -3674,8 +3706,8 @@ impl State {
 
     fn clear_selected(&mut self, process: ProcessKey, session: SessionRef, flags: u64) {
         self.clear_operations(process, session, cancel_operation_mask(flags));
-        if flags & CKF_FIND_OBJECTS != 0 {
-            self.find_active.remove(&(process, session));
+        if flags & CKF_FIND_OBJECTS != 0 && self.find_active.remove(&(process, session)) {
+            self.release_keys(1);
         }
         self.pending.retain(|(owner, handle, _), pending| {
             !(*owner == process
@@ -3896,6 +3928,9 @@ impl State {
     }
 
     fn evict_pending_if_needed(&mut self) {
+        // `pending`/`detached` never drew from the state budget
+        // (`MAX_PENDING` bounds them instead), so this eviction returns
+        // no keys.
         if self.pending.len() + self.detached.len() <= MAX_PENDING {
             return;
         }
@@ -4039,7 +4074,7 @@ impl State {
     /// module, inside the capture-wide row. Slots with no sole owner
     /// (`MODULE_UNRESOLVED`) count in the row but in no cell — a guess
     /// at a provider is never recorded. Each new cell takes one key
-    /// from the shared monotonic budget; a refused cell records nothing
+    /// from the shared state budget; a refused cell records nothing
     /// and counts the usual disclosed drop. The error rule mirrors
     /// [`record_call`] (any nonzero `rv`), which is observably the
     /// cgroup recorder's nonzero non-PENDING rule: PENDING diverts to
@@ -4079,13 +4114,21 @@ impl State {
         self.active_ops.retain(|(owner, handle, operation), _| {
             !(*owner == process && *handle == session && mask & *operation != 0)
         });
-        self.active_ops.len() != before
+        let freed = before - self.active_ops.len();
+        self.release_keys(freed);
+        freed != 0
     }
 
     fn clear_session_state(&mut self, process: ProcessKey, session: SessionRef) -> bool {
         let mut changed = self.clear_operations(process, session, u16::MAX);
-        changed |= self.find_active.remove(&(process, session));
-        changed |= self.inherited_ambiguous.remove(&(process, session));
+        if self.find_active.remove(&(process, session)) {
+            self.release_keys(1);
+            changed = true;
+        }
+        if self.inherited_ambiguous.remove(&(process, session)) {
+            self.release_keys(1);
+            changed = true;
+        }
         let pending_before = self.pending.len();
         self.pending
             .retain(|(owner, handle, _), _| !(*owner == process && *handle == session));
@@ -4101,6 +4144,9 @@ impl State {
 
     fn retire_session(&mut self, process: ProcessKey, session: SessionRef) -> bool {
         let existed = self.open.remove(&(process, session)).is_some();
+        if existed {
+            self.release_keys(1);
+        }
         self.clear_session_state(process, session);
         if existed {
             self.sessions.closed = self.sessions.closed.saturating_add(1);
@@ -4138,6 +4184,9 @@ impl State {
             .collect();
         for session in &sessions {
             let existed = self.open.remove(&(process, *session)).is_some();
+            if existed {
+                self.release_keys(1);
+            }
             self.clear_session_state(process, *session);
             if existed && count_closed {
                 self.sessions.closed = self.sessions.closed.saturating_add(1);
@@ -4145,12 +4194,21 @@ impl State {
         }
         // Sessions the capture never saw opening leave state behind that no
         // `retire_session` above could have reached.
+        let ops_before = self.active_ops.len();
         self.active_ops
             .retain(|(owner, session, _), _| !owned(owner, session));
+        self.release_keys(ops_before - self.active_ops.len());
+        let find_before = self.find_active.len();
         self.find_active
             .retain(|(owner, session)| !owned(owner, session));
+        self.release_keys(find_before - self.find_active.len());
+        let ambiguous_before = self.inherited_ambiguous.len();
         self.inherited_ambiguous
             .retain(|(owner, session)| !owned(owner, session));
+        self.release_keys(ambiguous_before - self.inherited_ambiguous.len());
+        // `pending` and `detached` never drew from the budget
+        // (`MAX_PENDING` bounds them instead), so their sweep below
+        // returns nothing.
         self.pending
             .retain(|(owner, session, _), _| !owned(owner, session));
         // Async ids die with the Cryptoki that issued them, adopted or
@@ -4164,7 +4222,9 @@ impl State {
         if module.is_none() {
             // Pseudonym numbering is per process and must not restart while
             // another module's sessions are still live under it.
-            self.next_pseudonym.remove(&process);
+            if self.next_pseudonym.remove(&process).is_some() {
+                self.release_keys(1);
+            }
         }
         u64::from(had_state)
     }

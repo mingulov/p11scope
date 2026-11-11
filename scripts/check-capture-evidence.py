@@ -516,6 +516,13 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     # semantic-state key budget. A limit, not a refusal count, so it
     # never forces PARTIAL on its own.
     "semantic_key_budget",
+    # Informational, not a COUNTER: mechanism values read through
+    # standard-layout-only slots that fell outside the registered
+    # CKM_* registry and were counted without their number (ruling
+    # 2026-11-11 clause 2). Withholding an unconfirmed number is the
+    # designed disclosure, not a coverage gap, so it never forces
+    # PARTIAL and needs no lane allowance.
+    "unregistered_standard_layout_mechanisms",
 }
 TRACE_TERMINAL_KEYS = {
     "privacy_mode", "capture_aborted", "final_drain", "counters_available",
@@ -1250,6 +1257,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.discard("scheduling")
         wanted.discard("active_slots")
         wanted.discard("semantic_key_budget")
+        wanted.discard("unregistered_standard_layout_mechanisms")
         wanted -= RESIDUAL_EVIDENCE_KEYS
         wanted -= VERDICT_CLASS_KEYS
         wanted.discard("kernel_control")
@@ -1345,6 +1353,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         exact_active_slots_bound(evidence)
         require(evidence["semantic_key_budget"] == SEMANTIC_KEY_BUDGET,
                 f"semantic_key_budget drifted: {evidence['semantic_key_budget']!r}")
+        require(u64(evidence["unregistered_standard_layout_mechanisms"]),
+                f"invalid unregistered_standard_layout_mechanisms: "
+                f"{evidence['unregistered_standard_layout_mechanisms']!r}")
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
@@ -4706,6 +4717,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         ),
         "discovery_uncorroborated_candidates": 0,
         "semantic_key_budget": SEMANTIC_KEY_BUDGET,
+        "unregistered_standard_layout_mechanisms": 0,
         "templates_truncated": False,
         "provider_changed": False,
         "ring_accounting": {},
@@ -4771,6 +4783,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
             evidence.pop("semantic_key_budget", None)
+            evidence.pop("unregistered_standard_layout_mechanisms", None)
             evidence.pop("kernel_control", None)
             for field in RESIDUAL_EVIDENCE_KEYS | VERDICT_CLASS_KEYS:
                 evidence.pop(field, None)
@@ -4938,6 +4951,22 @@ def self_test():
             lambda bad=bad: exact_prearm_keys(dict(learned_module, first_loaded_by=bad))
         )
     print("first_loaded_by closed shape validates both arms and rejects extras: OK")
+    # The always-emitted standard-layout withheld count (ruling
+    # 2026-11-11 clause 2): zero and nonzero ride the clean lane
+    # without moving completeness, and malformed values are refused
+    # for their own shape, not as unexpected keys.
+    withheld = copy.deepcopy(clean)
+    withheld["evidence"]["unregistered_standard_layout_mechanisms"] = 3
+    validate_clean_metrics(withheld, {"C_Initialize": 1})
+    require(
+        withheld["evidence"]["completeness"] == clean["evidence"]["completeness"],
+        "the withheld count alone must not move completeness",
+    )
+    for bad_value in (-1, True, 2**64, "3", None):
+        bad = copy.deepcopy(clean)
+        bad["evidence"]["unregistered_standard_layout_mechanisms"] = bad_value
+        rejected(lambda bad=bad: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    print("unregistered_standard_layout_mechanisms is a bounded informational count: OK")
     historical = document_fixture(
         historical_evidence,
         schema=HISTORICAL_METRICS_SCHEMA,

@@ -67,7 +67,8 @@
         "templates_truncated", "unmatched_closes", "unmatched_returns",
         "unprotected_live_windows",
         "unpublished_mechanisms",
-        "unregistered_mechanisms", "uretprobe_override", "vendor_interfaces",
+        "unregistered_mechanisms", "unregistered_standard_layout_mechanisms",
+        "uretprobe_override", "vendor_interfaces",
         "verdict_detail"
       ],
       "properties": {
@@ -639,6 +640,7 @@
         "unmatched_returns": {"type": "integer", "minimum": 0},
         "unpublished_mechanisms": {"type": "integer", "minimum": 0},
         "unregistered_mechanisms": {"type": "integer", "minimum": 0},
+        "unregistered_standard_layout_mechanisms": {"type": "integer", "minimum": 0},
         "uretprobe_override": {
           "type": ["object", "null"],
           "properties": {

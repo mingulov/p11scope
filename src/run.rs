@@ -8189,6 +8189,33 @@ fn discovery_stage_quantum(staged_len: usize, engine_held: usize) -> usize {
         .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)
 }
 
+/// Stages one tick's discovery share: pinned quanta from the ring into
+/// the session FIFO until the ring runs dry or the shared allowance
+/// fills. One [`discovery_stage_quantum`] per round; a round that stages
+/// less than its quantum found the ring dry (or the cap) and ends the
+/// drain. Rounds
+/// strictly consume allowance, so the drain always terminates (at most
+/// the allowance in quanta); staging applies nothing, so no round runs
+/// discovery work. Returns the tick's staged total.
+pub(crate) fn drain_discovery_rounds(
+    session: &mut dyn EngineSession,
+    engine_held: usize,
+) -> Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let quantum = discovery_stage_quantum(session.staged_discovery_len(), engine_held);
+        if quantum == 0 {
+            break;
+        }
+        let outcome = session.stage_discovery(quantum, engine_held)?;
+        total = total.saturating_add(outcome.staged);
+        if outcome.staged < quantum {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// Stages one quiescence poll's discovery items up to the shared allowance.
 /// Stops at the cap instead of growing past it; the first unstaged record
 /// stays unread in the ring, and the caller stops draining discovery on
@@ -9457,17 +9484,13 @@ fn capture_profile(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // (RB-2). Rounds drain the ring to empty-or-allowance in pinned
+        // quanta, so one tick absorbs a burst instead of one ninth of the
+        // ring. Staging applies nothing. The quanta and the readiness
         // poll share one allowance with what the Engine still holds (H5).
         // The session enforces the shared allowance structurally from
-        // the same Engine-held count the quantum was sized from.
-        session.stage_discovery(
-            discovery_stage_quantum(
-                session.staged_discovery_len(),
-                engine.discovery_held_len(),
-            ),
-            engine.discovery_held_len(),
-        )?;
+        // the same Engine-held count the quanta were sized from.
+        drain_discovery_rounds(session, engine.discovery_held_len())?;
         wait_until_ready(
             &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
@@ -10962,17 +10985,13 @@ fn capture_trace(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // (RB-2). Rounds drain the ring to empty-or-allowance in pinned
+        // quanta, so one tick absorbs a burst instead of one ninth of the
+        // ring. Staging applies nothing. The quanta and the readiness
         // poll share one allowance with what the Engine still holds (H5).
         // The session enforces the shared allowance structurally from
-        // the same Engine-held count the quantum was sized from.
-        session.stage_discovery(
-            discovery_stage_quantum(
-                session.staged_discovery_len(),
-                engine.discovery_held_len(),
-            ),
-            engine.discovery_held_len(),
-        )?;
+        // the same Engine-held count the quanta were sized from.
+        drain_discovery_rounds(session, engine.discovery_held_len())?;
         wait_until_ready(
             &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
@@ -26170,8 +26189,12 @@ int main(int argc, char **argv) {
                 .split_once(end)
                 .unwrap()
                 .0;
-            let stage = body
-                .find("session.stage_discovery(")
+            // Either the single-quantum staging call or the rounds drain
+            // that re-polls it: both stage the ring on this tick.
+            let stage = ["session.stage_discovery(", "drain_discovery_rounds("]
+                .into_iter()
+                .filter_map(|marker| body.find(marker))
+                .min()
                 .unwrap_or_else(|| panic!("{start} never stages discovery"));
             let wait = body.find("wait_until_ready(").unwrap();
             assert!(stage < wait, "{start} stages before its readiness wait");
@@ -31103,6 +31126,55 @@ int main(int argc, char **argv) {
             0,
             "over full still stages nothing"
         );
+    }
+
+    /// RED twin: one tick's staging drains the ring in pinned quanta
+    /// until it runs dry or the shared allowance fills, so a burst
+    /// drains in one tick instead of one quantum per tick.
+    #[test]
+    fn discovery_rounds_drain_bursts_in_pinned_quanta() {
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::engine::{DISCOVERY_HELD_CAP, LIVE_DISCOVERY_DRAIN_QUANTUM};
+        fn records(count: u32) -> Vec<p11scope_ebpf_common::DiscoveryRecord> {
+            (0..count)
+                .map(|offset| {
+                    let mut record: p11scope_ebpf_common::DiscoveryRecord =
+                        unsafe { std::mem::zeroed() };
+                    record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+                    record.pid_tgid = u64::from(5_000_000 + offset) << 32;
+                    record
+                })
+                .collect()
+        }
+        // 600 scripted records: three rounds (256, 256, 88), not one.
+        let mut session = ScriptedSession::with_records(records(600), 0);
+        let total = drain_discovery_rounds(&mut session, 0).unwrap();
+        assert_eq!(total, 600);
+        assert_eq!(session.staged_discovery_len(), 600);
+        assert_eq!(
+            session.stage_calls,
+            600usize.div_ceil(LIVE_DISCOVERY_DRAIN_QUANTUM)
+        );
+        // The shared allowance still bounds the drain: 5000 scripted
+        // records stop at the cap in full rounds only.
+        let mut session = ScriptedSession::with_records(records(5000), 0);
+        let total = drain_discovery_rounds(&mut session, 0).unwrap();
+        assert_eq!(total, DISCOVERY_HELD_CAP);
+        assert_eq!(session.staged_discovery_len(), DISCOVERY_HELD_CAP);
+        assert_eq!(
+            session.stage_calls,
+            DISCOVERY_HELD_CAP / LIVE_DISCOVERY_DRAIN_QUANTUM
+        );
+        // An empty ring stages nothing in one empty round.
+        let mut session = ScriptedSession::with_records(records(0), 0);
+        let total = drain_discovery_rounds(&mut session, 0).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(session.stage_calls, 1);
+        // A saturated allowance stages nothing without touching the ring.
+        let mut session = ScriptedSession::with_records(records(10), 0);
+        let total = drain_discovery_rounds(&mut session, DISCOVERY_HELD_CAP).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(session.stage_calls, 0);
     }
 
     #[test]

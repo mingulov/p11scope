@@ -2147,6 +2147,12 @@
       "path": "attach::tests::revival_probe_never_clears_a_singles_slot_lp64",
       "reason": "privileged: real Detailed Session revival probe",
       "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64",
+      "reason": "privileged: real Detailed Session revival probe",
+      "cell": "privileged"
     }
   ]
 }

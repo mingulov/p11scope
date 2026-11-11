@@ -15472,8 +15472,9 @@ mod tests {
     }
 
     /// A dummy aya uprobe link id for identity-projection tests. Never
-    /// attached or detached; only `DetachQuarantine::of_link` (which ignores
-    /// the id) reads these links.
+    /// attached; only `DetachQuarantine::of_link` (which ignores the id)
+    /// reads these links, plus one privileged probe that detaches one as
+    /// an unknown-id lookup (a userspace table miss, no kernel call).
     /// SAFETY: `UProbeLinkId` (aya 0.14.0-p2) is a plain id value: nested
     /// enums over `RawFd` integers, no `Drop`, no kernel ownership. All-zero
     /// bytes select each enum's first variant (`One`/`FdLinkId`) with fd 0,
@@ -22547,6 +22548,120 @@ mod tests {
             "re-attached links never clear"
         );
         eprintln!("retirement-cell multi: revival probe cleared and re-attached slot 0");
+        Ok(())
+    }
+
+    /// Revival probe on a live Multi session with a forced detach
+    /// failure: the failed slot lands in the detach quarantine and never
+    /// re-clears for revival — across repeated refreshes — so no tick
+    /// loop re-admits it, and `attach_failures` grows only by explicit
+    /// re-admission attempts, never by revival. A clean detach first
+    /// proves this probe observes real clearing (healthy control); the
+    /// forced failure then proves the quarantine skip.
+    #[ignore = "privileged: real Detailed Session revival probe"]
+    #[test]
+    fn revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::collections::BTreeSet as Set;
+        let cell = CollectedSessionCell::build()?;
+        let init = cell.provider_init_offset()?;
+        let (pins, plan) = cell.pin_and_plan(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(cell.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        // The fault-injection id is unknown to the live program: its aya
+        // link table holds no singles links on a Multi session, so
+        // detaching it fails in userspace without touching the kernel.
+        {
+            let probe: &mut aya::programs::UProbe = session
+                .ebpf
+                .program_mut("p11_entry")
+                .context("live p11_entry program")?
+                .try_into()?;
+            anyhow::ensure!(
+                probe.detach(dummy_uprobe_link_id()).is_err(),
+                "the injected id must be unknown to the live program"
+            );
+        }
+        // Healthy control: a clean live detach clears for revival.
+        let retired: Set<usize> = Set::from([0]);
+        session.detach_slots(&plan.slots)?;
+        anyhow::ensure!(!session.has_slot_link(0), "the live detach closed it");
+        anyhow::ensure!(
+            session.revival_detached(&retired) == Set::from([0]),
+            "a clean live-detached Multi slot clears"
+        );
+        session.attach_targets(&plan.slots, &pins, &Set::new())?;
+        anyhow::ensure!(session.has_slot_link(0), "re-attached before the fault");
+        // Force the detach failure through the production detach path: a
+        // registry link whose aya id is unknown passes the program
+        // preflight, then fails the detach and quarantines its slot.
+        session.links.push(super::RegisteredLink::UProbe {
+            program: "p11_entry",
+            slot: 0,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        });
+        let failures_before = session.attach_failures().len();
+        let detached = session.detach_slots(&plan.slots);
+        anyhow::ensure!(detached.is_err(), "the forced detach failure surfaces");
+        anyhow::ensure!(
+            !session.has_slot_link(0),
+            "links are extracted despite the failure"
+        );
+        // The quarantined slot never re-clears, however often the engine
+        // refreshes: no revival loop, and refreshes add no failures.
+        for round in 0..3 {
+            anyhow::ensure!(
+                session.revival_detached(&retired).is_empty(),
+                "quarantined slot 0 re-cleared on refresh {round}"
+            );
+        }
+        anyhow::ensure!(
+            session.attach_failures().len() == failures_before,
+            "refreshes add no attach failures: {:?}",
+            session.attach_failures()
+        );
+        // An explicit re-admission refuses once, naming the quarantine,
+        // and the slot still never re-clears afterwards.
+        let (failed, completed) = session.attach_targets(&plan.slots, &pins, &Set::new())?;
+        anyhow::ensure!(completed.is_empty(), "quarantined slot attaches nothing");
+        anyhow::ensure!(failed == vec![0], "quarantined slot 0 refused: {failed:?}");
+        anyhow::ensure!(
+            session.attach_failures().len() == failures_before + 1,
+            "one explicit refusal, one failure: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(
+            session
+                .attach_failures()
+                .last()
+                .is_some_and(|(slot, reason)| {
+                    *slot == 0 && reason.contains("quarantined after detach failure")
+                }),
+            "the refusal names the quarantine: {:?}",
+            session.attach_failures()
+        );
+        for round in 0..3 {
+            anyhow::ensure!(
+                session.revival_detached(&retired).is_empty(),
+                "quarantined slot 0 re-cleared after refusal {round}"
+            );
+        }
+        eprintln!("retirement-cell multi: quarantined slot 0 never re-cleared");
         Ok(())
     }
 

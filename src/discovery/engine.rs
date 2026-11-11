@@ -18415,22 +18415,49 @@ impl Engine {
         // partial results. Metadata-only scans keep their own explicit
         // table restoration above; failed revalidation falls through to the
         // replacement below, so stale identity still retires. A rescan that
-        // finds exactly the same files also retains — but only when their
-        // pins still validate: an in-place rewrite (same key, new bytes)
-        // must replace, not credit the new bytes as the old file.
-        let retained_keys: BTreeSet<_> = self
+        // finds exactly the same files also retains their pin IDs — but
+        // only when the fresh pins reprove every retained physical
+        // identity they name, including dependencies: equal maps keys
+        // alone never suffice (an in-place rewrite, a same-key
+        // collision, or a moved path must replace, not credit new
+        // bytes as the old file). On a complete scan the retained IDs
+        // keep their slots while the fresh module facts replace the
+        // view's modules below; only an incomplete scan unions its
+        // partial facts into the retained ones.
+        let mut retained_files: Vec<_> = self
             .modules
             .iter()
             .filter(|module| module.scanned.view == view_id)
-            .map(|module| module.scanned.key)
+            .map(|module| {
+                (
+                    module.scanned.mount_namespace,
+                    module.scanned.key,
+                    module.scanned.path.clone(),
+                    module.scanned.pre_copy_up,
+                )
+            })
             .collect();
-        let found_keys: BTreeSet<_> = found.iter().map(|module| module.key).collect();
-        let same_files = found_keys == retained_keys && self.views[position].still_the_same();
+        retained_files.sort();
+        let mut found_files: Vec<_> = found
+            .iter()
+            .map(|module| {
+                (
+                    module.mount_namespace,
+                    module.key,
+                    module.path.clone(),
+                    module.pre_copy_up,
+                )
+            })
+            .collect();
+        found_files.sort();
+        let same_files = retained_files == found_files && self.views[position].still_the_same();
         let revalidated = (!found_complete
             && mode == LoaderScanMode::Memory
             && self.views[position].still_the_same()
             && self.view_pins_unchanged(view_id))
-            || (same_files && self.view_pins_unchanged(view_id));
+            || (same_files
+                && self.view_pins_unchanged(view_id)
+                && self.pinned.fresh_pins_reprove(&fresh_pins, &found));
         let (candidate_pins, raw_modules) = if revalidated {
             let mut candidate_pins = self.pinned.clone();
             // Fresh pins cover only newly observed modules: re-pinning
@@ -18462,17 +18489,28 @@ impl Engine {
             let (new_pins, pin_skips) = pinned.map_err(anyhow::Error::msg)?;
             skipped.extend(pin_skips);
             skipped.extend(candidate_pins.absorb(new_pins));
-            let mut retained = retained;
-            for module in found {
-                merge_scanned_module(&mut retained, module);
-            }
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()
                 .filter(|module| module.scanned.view != view_id)
                 .map(|module| module.scanned.clone())
                 .collect();
-            raw_modules.extend(retained);
+            if found_complete {
+                // A complete scan proved its facts: rebuild the view's
+                // modules from the fresh snapshot while the retained pin
+                // IDs above keep their slots. Tables, exports, load
+                // counts and finished flags the scan disproved retire
+                // instead of lingering in the union.
+                for module in found {
+                    merge_scanned_module(&mut raw_modules, module);
+                }
+            } else {
+                let mut retained = retained;
+                for module in found {
+                    merge_scanned_module(&mut retained, module);
+                }
+                raw_modules.extend(retained);
+            }
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();

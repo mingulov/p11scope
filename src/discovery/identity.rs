@@ -1384,6 +1384,59 @@ impl PinnedObjects {
         skipped
     }
 
+    /// Whether fresh pins for `modules` reprove the retained identities
+    /// they name: every observed raw is freshly pinned, and absorbing
+    /// the fresh set adds no skip and no rejection while resolving
+    /// every raw to its retained ID. Side-effect-free (a scratch clone
+    /// absorbs and is discarded); the caller keeps its own pins on
+    /// success and reconciles through the ordinary identity path on
+    /// failure. A maps-key match alone never suffices: the fresh
+    /// observation must merge into the retained physical identities,
+    /// including the dependencies table entries point into.
+    pub(crate) fn fresh_pins_reprove(
+        &self,
+        incoming: &PinnedObjects,
+        modules: &[ScannedModule],
+    ) -> bool {
+        let mut raws = Vec::new();
+        for module in modules {
+            let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) else {
+                return false;
+            };
+            raws.push(own);
+            for entry in module.tables.iter().flat_map(|table| &table.entries) {
+                let Some(target) =
+                    RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+                else {
+                    return false;
+                };
+                raws.push(target);
+            }
+        }
+        // Every observed raw must be freshly pinned: a pin failure
+        // never silently inherits the retained identity.
+        if raws.iter().any(|raw| !incoming.raw_to_id.contains_key(raw)) {
+            return false;
+        }
+        let mut probe = self.clone();
+        if !probe.absorb(incoming.clone()).is_empty() {
+            return false;
+        }
+        if !probe.newly_rejected_keys(self).is_empty() {
+            return false;
+        }
+        // Every observed raw must resolve to its retained ID: a fresh
+        // observation that mints a new identity is a changed file,
+        // not a reproof.
+        for raw in &raws {
+            match (self.raw_to_id.get(raw), probe.raw_to_id.get(raw)) {
+                (Some(kept), Some(merged)) if kept == merged => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     pub(crate) fn has_overlay_uncertainty(&self) -> bool {
         self.overlay_uncertain
     }
@@ -11336,6 +11389,134 @@ mod tests {
         assert!(replay.rejects(key));
         assert_eq!(replay.pinned().count(), 0);
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
+    }
+
+    #[test]
+    fn reproof_accepts_fresh_pins_of_unchanged_files() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1)]);
+        assert!(
+            retained.fresh_pins_reprove(&fresh, &[module(key)]),
+            "identical fresh pins reprove the retained identity"
+        );
+    }
+
+    #[test]
+    fn reproof_covers_entry_target_dependencies() {
+        // A module whose table entry points into a distinct dependency
+        // reproves only when the dependency merges too.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dependency = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        let mut scanned = module(key);
+        scanned.tables[0].entries[0].object = dependency;
+        assert!(
+            retained.fresh_pins_reprove(&fresh, &[scanned]),
+            "a merged dependency is part of the reproof"
+        );
+    }
+
+    #[test]
+    fn reproof_refuses_a_rewritten_digest() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let fresh = image_pins(&[(key, "bbbbbbbb", 1)]);
+        assert!(
+            !retained.fresh_pins_reprove(&fresh, &[module(key)]),
+            "a changed digest is not a reproof"
+        );
+    }
+
+    #[test]
+    fn reproof_refuses_same_key_distinct_files() {
+        // The btrfs-clone shape: identical bytes and pins, two kernel files.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut retained, &backing_file(&dir, "first.so"));
+        let mut fresh = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut fresh, &backing_file(&dir, "second.so"));
+        fresh.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+        assert!(
+            !retained.fresh_pins_reprove(&fresh, &[module(key)]),
+            "equal maps keys over distinct files are not a reproof"
+        );
+    }
+
+    #[test]
+    fn reproof_refuses_without_a_fresh_pin() {
+        // A pin failure never silently inherits the retained identity.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        assert!(
+            !retained.fresh_pins_reprove(&PinnedObjects::empty(), &[module(key)]),
+            "an unpinned observation is not a reproof"
+        );
+    }
+
+    #[test]
+    fn reproof_refuses_an_unretained_fresh_raw() {
+        // A fresh observation naming a raw the retained set never filed
+        // (a new dependency) is not a reproof: the ordinary identity
+        // path must reconcile it instead.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dependency = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        let mut scanned = module(key);
+        scanned.tables[0].entries[0].object = dependency;
+        assert!(
+            !retained.fresh_pins_reprove(&fresh, &[scanned]),
+            "a fresh raw outside the retained set is not a reproof"
+        );
+    }
+
+    #[test]
+    fn reproof_refuses_a_same_file_moved_path() {
+        // Same key, same pin, same digest — but the fresh observation
+        // files under a path the retained set never saw. The identity
+        // may still merge there, but it is not this observation's reproof.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let moved = "/usr/lib/moved/libsofthsm2.so";
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let mut fresh = image_pins(&[(key, "aaaaaaaa", 1)]);
+        test_fixture::repath_single_pin(&mut fresh, moved);
+        let mut scanned = module(key);
+        scanned.path = moved.into();
+        scanned.tables[0].entries[0].object_path = moved.into();
+        assert!(
+            !retained.fresh_pins_reprove(&fresh, &[scanned]),
+            "a moved path is not a reproof of the old observation"
+        );
     }
 
     #[test]

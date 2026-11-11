@@ -173,6 +173,15 @@ verdicts (`mapped`/`unknown`, plus `STATIC HINT` identity hints under
 `--track-short-lived`) classify them, but full per-caller call
 attribution below the discovery floor is still planned.
 
+### One-shot tools under `--system` are not counted yet
+
+Measured: under `--system`, a one-shot tool whose provider no running
+program holds is not counted on any run (0 of 20 on every round — the
+millisecond tool exits before anything is staged). Wrap such tools in
+`sudo p11scope run --user $USER -- <tool>` (or pass `--prearm-module
+PATH`); a later version learns the provider from the kernel so later
+runs are caught.
+
 ### Kernels before 6.12
 
 Per the owner's 2026-11-08 ruling, specific pre-6.12 edge cases are

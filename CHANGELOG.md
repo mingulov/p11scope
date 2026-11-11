@@ -220,6 +220,12 @@ The v0.7.0 limits live in
   arrive seconds late and part of a window shows as exact named
   counts instead of per-call rows. Exact per-call rows past 6,250/s
   wait for the 0.7.1 event reader.
+- A one-shot tool whose provider no running program holds is not
+  counted yet under `--system` — not even on later runs, because the
+  millisecond tool exits before anything is staged; wrap such tools in
+  `sudo p11scope run --user $USER -- <tool>` (or pass `--prearm-module
+  PATH`). A later version learns the provider from the kernel so later
+  runs are caught.
 
 ## [0.6.0] - 2026-11-06
 

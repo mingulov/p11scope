@@ -3266,8 +3266,10 @@ struct RefreshRequest {
     exec_hook_ts_ns: Option<u64>,
     // Windowed as a fresh newcomer (or into the admission window) but the
     // tick quantum expired before any attempt: the request keeps fresh
-    // priority on later scarce ticks until its first attempt, instead of
-    // demoting to backlog by arrival age alone behind the whole queue.
+    // priority on the NEXT scarce tick instead of demoting to backlog by
+    // arrival age alone behind the whole queue. One extra tick only:
+    // classification consumes the flag, so a persistently unattempted
+    // pid cannot bloat the fresh class and starve later arrivals.
     deferred_fresh: bool,
 }
 type SlotCompletion = (u32, Option<u64>);
@@ -26568,6 +26570,16 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
+            // Kept-fresh priority is consumed by this classification: a
+            // pid still unattempted after its extra tick demotes to
+            // backlog instead of bloating the fresh class. This tick's
+            // own unattempted fresh pids are re-marked below and in the
+            // admission loop.
+            for pid in fresh.iter() {
+                if let Some(request) = self.refresh_requested.get_mut(pid) {
+                    request.deferred_fresh = false;
+                }
+            }
             // A fresh pid the window itself deferred was never attempted:
             // it keeps fresh priority next tick instead of demoting by age.
             let fresh_set: BTreeSet<u32> = fresh.iter().copied().collect();

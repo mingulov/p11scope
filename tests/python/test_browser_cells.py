@@ -513,6 +513,32 @@ class BrowserCells(unittest.TestCase):
         with open(result.report_path, encoding="utf-8") as handle:
             report = json.load(handle)
         observations = report.get("object_observations") or {}
+        # Wide-default build (v0.7.0): the production journal is omitted
+        # (docs/known-limitations.md "Counter and journal companions at
+        # the wide profile"), so `inventory --key-operations` refuses
+        # with `journal-pair-unavailable-in-build` and reports zero rows
+        # under `journal_unavailable`. Pin that documented refusal
+        # instead of key rows; the journal build (FULL-512) still must
+        # populate rows below. (N2; restoring the companions is 0.7.x.)
+        if observations.get("reason") == "journal_unavailable":
+            self.assertEqual(
+                observations.get("status"), "unavailable",
+                "journal refusal must stay unavailable")
+            rows = observations.get("key_operations") or []
+            self.assertEqual(len(rows), 0, "journal refusal must carry zero rows")
+            refusal_gaps = [
+                gap.get("reason") or ""
+                for gap in report.get("gaps") or []
+                if isinstance(gap, dict)
+                and gap.get("subject") == "key operations unavailable"
+            ]
+            self.assertTrue(
+                any("journal-pair-unavailable-in-build" in reason
+                    for reason in refusal_gaps),
+                "journal refusal must name its build cause")
+            capture = (report.get("observation") or {}).get("semantic_capture") or {}
+            self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
+            return
         # Name the cause on failure: every Joint birth refusal (caller,
         # reason, repeats) and the observation gaps, so a CI miss says
         # whether a birth was refused or never offered.

@@ -8223,6 +8223,58 @@ mod tests {
     }
 
     #[test]
+    fn standard_layout_scan_table_mints_main_plan_semantics_without_manifest() {
+        // No-manifest mechanism attribution (owner 2026-11-11: no manifest
+        // needed for standard providers): a SoftHSM-shaped standard table —
+        // single 2.x function list, full walk, every entry in own code and
+        // agreeing with the provider's exports, finished scan — carries
+        // semantic authority in the main plan, so profile/trace attribute
+        // mechanism ids without --manifest.
+        let module = sole_complete_module();
+        let plan = build_from_sources(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "standard-layout scan slots carry semantic authority without a manifest"
+        );
+        let sign_init = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot");
+        assert_ne!(
+            sign_init.semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            "C_SignInit carries argument semantics for mechanism reads"
+        );
+        // Mechanism rows: an observed C_SignInit with a mechanism value is attributed.
+        let mut state = crate::semantics::State::new(&plan);
+        let ev = p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism: 0x101,
+            rv: 0,
+            slot: sign_init.index,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        state.observe(&ev);
+        assert_eq!(
+            state.mechanisms().get(&0x101).map(|stat| stat.calls),
+            Some(1),
+            "mechanism id from a standard-layout slot is attributed without a manifest"
+        );
+    }
+
+    #[test]
     fn sole_complete_second_table_refuses() {
         let mut module = sole_complete_module();
         let mut second = module.scanned.tables[0].clone();

@@ -2017,6 +2017,173 @@ mod corrective_tests {
     }
 
     #[test]
+    fn short_lived_session_churn_returns_live_state_keys() {
+        // Retirement twin: churning short-lived sessions — each with
+        // an operation and a find — must not consume the admission
+        // budget: every close returns the session's live keys. Report
+        // rows stay kept and counted, never evicted for budget. Fails
+        // while retirement never gives keys back: 40 cycles need
+        // ~120 live keys against a 12-key budget although at most one
+        // session is ever live.
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_SignInit",
+            "C_Sign",
+            "C_FindObjectsInit",
+            "C_FindObjectsFinal",
+        ]);
+        let mut state = State::with_limit(&p, 12);
+        for session in 1..=40u64 {
+            state.observe(&open(&p, session, 1));
+            state.observe(&mechanism(&p, "C_SignInit", session, 0x101, 0));
+            state.observe(&event(&p, "C_Sign", session, 0));
+            state.observe(&event(&p, "C_FindObjectsInit", session, 0));
+            state.observe(&event(&p, "C_FindObjectsFinal", session, 0));
+            state.observe(&event(&p, "C_CloseSession", session, CkRv::OK.0));
+        }
+        assert_eq!(
+            state.semantic_evidence().semantic_state_drops,
+            0,
+            "closed sessions return their keys, so churn refuses nothing"
+        );
+        assert!(state.open.is_empty(), "no session left live");
+        assert!(state.active_ops.is_empty(), "no op left live");
+        assert!(state.find_active.is_empty(), "no find left live");
+        assert_eq!(
+            state.cgroups().len(),
+            1,
+            "the cgroup report row stays kept, not evicted for budget"
+        );
+        assert_eq!(
+            state.mechanisms().len(),
+            1,
+            "the mechanism report row stays kept"
+        );
+        assert_eq!(
+            state.state_keys,
+            state.retained_dynamic_keys(),
+            "every retained key is counted exactly once"
+        );
+    }
+
+    #[test]
+    fn retiring_a_process_returns_its_live_state_keys() {
+        // Process-exit twin: `retire_process` frees the process's open
+        // sessions, active ops, find state and pseudonym counter, and
+        // each freed entry returns its budget key — while history and
+        // report rows stay kept and counted. Fails while retirement
+        // never gives keys back: the freed keys stay spent.
+        let p = plan(&["C_OpenSession", "C_SignInit", "C_FindObjectsInit"]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::with_limit(&p, 12);
+        state.observe(&open(&p, 7, 1));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&event(&p, "C_FindObjectsInit", 7, 0));
+        assert_eq!(
+            state.state_keys, 9,
+            "history + cgroup + open + counter + op + find + row + 2 cells"
+        );
+        state.retire_process(process);
+        assert!(!state.has_process_state(process));
+        assert_eq!(state.cgroups().len(), 1, "the cgroup row stays");
+        assert_eq!(state.mechanisms().len(), 1, "the mechanism row stays");
+        assert_eq!(
+            state.state_keys, 5,
+            "only history + cgroup + row + 2 cells stay counted"
+        );
+        assert_eq!(
+            state.state_keys,
+            state.retained_dynamic_keys(),
+            "every retained key is counted exactly once"
+        );
+    }
+
+    #[test]
+    fn every_live_state_removal_returns_its_budget_key() {
+        // Site twin: every path that drops live state — session
+        // cancel, operation-state import, error reconciliation,
+        // null-mechanism unbind, close-all, finalize, fork-ambiguity
+        // decay and process exit — returns exactly the keys it frees.
+        // Report rows stay kept and counted throughout. Fails while any
+        // removal site spends budget without returning it.
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_Sign",
+            "C_FindObjectsInit",
+            "C_SessionCancel",
+            "C_SetOperationState",
+            "C_CloseAllSessions",
+            "C_Finalize",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let child = ProcessKey::from_pid(101);
+        let child2 = ProcessKey::from_pid(102);
+        let mut state = State::with_limit(&p, 64);
+        state.observe(&open(&p, 7, 1));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&event(&p, "C_FindObjectsInit", 7, 0));
+        // Fork-ambiguity decay: the retired child's entry frees
+        // through the sweep, the observing child's through its event.
+        state.fork_process(process, child);
+        state.retire_process(child);
+        state.fork_process(process, child2);
+        state.observe_process(child2, &event(&p, "C_Sign", 7, 0));
+        assert_eq!(state.semantic_evidence().fork_state_ambiguities, 1);
+        // Cancel clears the op and the find.
+        let mut cancel = event(&p, "C_SessionCancel", 7, CkRv::OK.0);
+        cancel.flags = CKF_SIGN | CKF_FIND_OBJECTS;
+        state.observe(&cancel);
+        assert!(state.active_ops.is_empty());
+        assert!(state.find_active.is_empty());
+        // Operation-state import clears rebound ops.
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&event(&p, "C_SetOperationState", 7, 0));
+        assert!(state.active_ops.is_empty());
+        // Error reconciliation drops the rebound op.
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&event(&p, "C_Sign", 7, CkRv::OPERATION_NOT_INITIALIZED.0));
+        assert!(state.active_ops.is_empty());
+        // A null-mechanism bind failure unbinds the rebound op.
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        let null_ok = Event {
+            capture: capture::MECHANISM_NULL,
+            ..event(&p, "C_SignInit", 7, 0)
+        };
+        state.observe(&null_ok);
+        assert!(state.active_ops.is_empty());
+        // Close-all retires the session; finalize retires the reopened
+        // module scope; process exit retires the rest.
+        let mut close_all = event(&p, "C_CloseAllSessions", SESSION_NONE, 0);
+        close_all.slot_id = 1;
+        state.observe(&close_all);
+        assert!(state.open.is_empty());
+        state.observe(&open(&p, 9, 1));
+        state.observe(&mechanism(&p, "C_SignInit", 9, 0x101, 0));
+        state.observe(&event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert!(!state.has_process_state(process));
+        state.retire_process(process);
+        state.retire_process(child2);
+        assert_eq!(
+            state.semantic_evidence().semantic_state_drops,
+            0,
+            "returned keys keep this scale fitting"
+        );
+        assert_eq!(state.cgroups().len(), 1, "the cgroup row stays");
+        assert_eq!(state.mechanisms().len(), 1, "the mechanism row stays");
+        assert_eq!(
+            state.state_keys, 7,
+            "only 3 histories + cgroup + row + 2 cells stay counted"
+        );
+        assert_eq!(
+            state.state_keys,
+            state.retained_dynamic_keys(),
+            "every retained key is counted exactly once"
+        );
+    }
+
+    #[test]
     fn refused_hidden_ambiguity_purges_unchanged_second_owner_state() {
         assert_hidden_ambiguity_purges_unchanged_second_owner_state(false, false);
     }

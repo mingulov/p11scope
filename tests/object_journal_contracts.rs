@@ -2463,6 +2463,19 @@ fn object_journal_slot_maps_match_detailed_profile() {
         !slot_maps_match(&detailed.maps, &tampered),
         "a one-entry STATS drift must mismatch"
     );
+    let mut tampered_slot = journal.maps.clone();
+    let stats = tampered_slot
+        .get("STATS")
+        .expect("journal STATS")
+        .clone();
+    // SLOT_FILE is BTF-defined, whose shape fields stay immutable through
+    // aya-obj, so the drift twin swaps in a differently-shaped map instead
+    // of bumping max_entries in place like the STATS twin above.
+    tampered_slot.insert("SLOT_FILE".to_string(), stats);
+    assert!(
+        !slot_maps_match(&detailed.maps, &tampered_slot),
+        "a SLOT_FILE shape drift must mismatch"
+    );
 }
 
 /// Journal/marker inventory policy: the pure-policy

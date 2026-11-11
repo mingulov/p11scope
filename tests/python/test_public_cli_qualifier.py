@@ -748,7 +748,7 @@ class CounterRefusalTests(unittest.TestCase):
         match = re.search(r'^COUNTER_BUILD_REFUSAL="([^"]+)"', script, re.M)
         self.assertIsNotNone(match, "qualifier pins the refusal constant")
         self.assertEqual(match.group(1), REFUSAL)
-        self.assertIn("REASON_COUNTER_WIDE", script)
+        self.assertIn("REASON_COUNTER_SMALL", script)
         self.assertIn(BOGUS_PID, script,
                       "probe and refusal arm share one bogus pid")
 
@@ -832,7 +832,8 @@ class CounterRefusalTests(unittest.TestCase):
             self.assertEqual(row["cell"], "counter-counts-pid")
             self.assertFalse(row["pass"])
             self.assertEqual(row["qualification"], "expected-failure")
-            self.assertIn("0.7.x", row["detail"])
+            self.assertIn("SMALL build", row["detail"])
+            self.assertNotIn("0.7.x", row["detail"])
             self.assertFalse(out.exists())
 
     def test_refused_cell_fails_a_full_style_error(self):

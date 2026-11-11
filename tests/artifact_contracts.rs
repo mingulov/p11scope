@@ -2230,6 +2230,25 @@ fn official_build_is_safe_only() {
     }
 }
 
+/// The induced-gaps map pins track the wide default: all four isolated
+/// builds keep default features, so the DEFAULT and RING legs pin the
+/// wide RV width while the SMALL-state leg keeps its 1/1 pins.
+#[test]
+fn induced_gaps_map_pins_match_wide_default() {
+    let induced = read("scripts/verify-induced-gaps.sh");
+    for marker in [
+        "\"$DEFAULT_BPF\" EVENTS=33554432 START=16384 RV_COUNTS=8192",
+        "\"$RING_BPF\" EVENTS=4096 START=16384 RV_COUNTS=8192",
+        "\"$STATE_BPF\" EVENTS=33554432 START=1 RV_COUNTS=1",
+    ] {
+        assert!(induced.contains(marker), "induced-gaps misses {marker}");
+    }
+    assert!(
+        !induced.contains("RV_COUNTS=4096"),
+        "induced-gaps must not pin the FULL-512 RV width on a wide build"
+    );
+}
+
 /// The official release bytes keep the explicit P0 option (attribute gate
 /// shut) for the verifier-budget lane; FULL is the default.
 #[test]

@@ -47980,6 +47980,69 @@ fn refresh_completion_interleaving(same_pid: bool) {
     }
 }
 
+/// H-1 starvation bound: a host whose record inflow outruns every live
+/// frame's budget defers each frame, and a deferring frame skips its
+/// inventory tick. Without a bound the tick never runs again, so a
+/// process that loads a provider after capture start is never admitted
+/// or armed (a churned busy host: 0 calls for a late provider). After two
+/// consecutive deferring frames the third runs its tick to completion:
+/// the late provider is admitted and armed, while the deferred records
+/// stay queued in ring order for the next frame.
+#[test]
+fn deferring_frames_still_admit_a_late_provider_within_the_bound() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let retained = fixture.children[0].pid();
+    let newcomer = fixture.children[1].pid();
+    e06_write_listing(fixture.listing.path(), &[retained, newcomer]);
+    fixture.engine.frame_work_budget_ns = 0;
+    let slots_before = fixture.engine.plan.slots.len();
+    let late_provider = fixture.providers[1].display().to_string();
+    let admitted = |engine: &Engine| {
+        engine.views.iter().any(|view| view.pid() == newcomer)
+            && engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.path == late_provider)
+    };
+    let mut frame = |engine: &mut Engine, offset: u32| {
+        let mut session = ScriptedSession::default();
+        session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+            exec_record_for(FAKE_PID_FLOOR + 300 + offset),
+        )))]
+        .into();
+        engine.drain_discovery_from(&mut session).unwrap();
+    };
+    frame(&mut fixture.engine, 0);
+    frame(&mut fixture.engine, 1);
+    assert!(
+        !admitted(&fixture.engine),
+        "within the bound a deferring frame still skips its tick (H-1)"
+    );
+    assert_eq!(fixture.engine.discovery_deferrals(), 2);
+    frame(&mut fixture.engine, 2);
+    assert!(
+        admitted(&fixture.engine),
+        "the third consecutive deferring frame runs its tick: the late provider is admitted"
+    );
+    assert!(
+        fixture.engine.plan.slots.len() > slots_before,
+        "the late provider is planned for attach in the same tick"
+    );
+    assert!(
+        fixture.engine.pending_discovery_records_for_test() >= 3,
+        "deferred records stay queued for the next frame, none dropped"
+    );
+    assert_eq!(fixture.engine.discovery_truncated, 0);
+    fixture.engine.frame_work_budget_ns = u64::MAX;
+    frame(&mut fixture.engine, 3);
+    assert_eq!(
+        fixture.engine.pending_discovery_records_for_test(),
+        0,
+        "a frame with budget dispatches the deferred records in order"
+    );
+    assert!(admitted(&fixture.engine), "the admitted provider stays");
+}
+
 #[test]
 fn refresh_retry_preserves_newer_serial_and_first_seen() {
     let mut engine = Engine::empty();

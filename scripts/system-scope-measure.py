@@ -178,6 +178,7 @@ EMBEDDED_COUNTERS = (
     "async_evictions",
     "fork_state_ambiguities",
     "semantic_state_drops",
+    "mechanism_id_overflow",
     "semantic_history_drops",
     "pending_at_end",
     "malformed_records",

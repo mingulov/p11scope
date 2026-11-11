@@ -34,6 +34,7 @@ VERDICT_COUNTERS = (
     "state_reconciliations", "session_cancel_ambiguities", "session_cancel_unknown_flags",
     "operation_state_imports", "auth_state_ambiguities", "async_target_failures", "async_orphans",
     "async_duplicates", "async_evictions", "fork_state_ambiguities", "semantic_state_drops",
+    "mechanism_id_overflow",
     "semantic_history_drops", "pending_at_end", "orphan_ops", "unmatched_closes",
     "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
     "discovery_uncorroborated", "module_ambiguous", "semantic_unverified_slots",

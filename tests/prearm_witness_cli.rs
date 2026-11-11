@@ -887,9 +887,7 @@ fn learned_second_round_accepts(
     pre_attach_loads: Option<u64>,
     staged: Option<u64>,
 ) -> bool {
-    (19..=20).contains(&caught)
-        && pre_attach_loads == Some(1)
-        && staged.is_some_and(|staged| staged >= 1)
+    caught == 20 && pre_attach_loads == Some(1) && staged.is_some_and(|staged| staged >= 1)
 }
 
 /// Negative controls for the verdict above: only a complete second
@@ -919,18 +917,25 @@ fn learned_second_round_oracle_requires_every_second_round_call() {
 /// `profile --system` capture. Round 1 is one one-shot tool run: its
 /// calls may be missed, but the run must be shown as a named miss
 /// (provider path + loading program). Round 2 is twenty identical
-/// one-shot runs in the same capture: at least 19 must be counted.
+/// one-shot runs in the same capture: every one must be counted.
 ///
-/// The round boundary is causal, not arithmetic: the staging event is
-/// observed on the capture's stderr *after* the round-1 run and
-/// *before* any round-2 run, and the final record must show
-/// `learned_staged_files >= 1` with `pre_attach_loads == 1` (exactly
-/// the round-1 loader tallied before staging; nothing else opens this
-/// unique-sha copy). A round-1 run caught by ordinary discovery would
-/// be scan-covered and stage nothing. So round 1 is *proven* missed,
-/// and a combined `C_Initialize` of 19..=20 over 21 in-capture runs
-/// isolates round 2 at >=19/20: one caught round-1 run plus 18
-/// round-2 runs cannot satisfy the conjunction.
+/// The rounds are isolated by construction, not by arithmetic on the
+/// combined total: only the observer is stopped (SIGSTOP) after its
+/// ready line — group and marks already exist, so opens queue in the
+/// kernel — round 1 then runs to completion and exits while no probe
+/// for this file can possibly exist yet, and the resumed observer
+/// drains its real fanotify queue, stages the file, and attaches it
+/// with the round-1 process already dead. Every counted call is
+/// therefore a round-2 call, and the verdict requires all twenty
+/// (see `learned_second_round_accepts` and its negative controls).
+/// The opens-before-staging tally (`pre_attach_loads == 1`, exactly
+/// the round-1 loader; nothing else opens this unique-sha copy) and
+/// the staging event observed between the rounds pin that round 1
+/// was learned from, not scan-covered: a scan-caught round 1 would
+/// stage nothing. The tally alone would not prove round-1 calls were
+/// missed — it counts opens before *staging*, not calls before
+/// *attachment* — which is why the stopped-observer round, not the
+/// tally, carries the isolation.
 #[test]
 #[ignore = "privileged: learned provider second round catches one-shot tools (root, BPF, SoftHSM, pkcs11-tool)"]
 fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
@@ -1044,8 +1049,27 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     let stderr = child.stderr.take().expect("capture stderr");
     let mut capture = GuardedChild::new(child, stderr);
     wait_line(&mut capture, "capture ready", READY_LINE);
+    // Stop only the observer (its fanotify group and marks exist, so
+    // opens queue in the kernel) and run round 1 to completion: no
+    // probe for this file can exist while the observer is stopped,
+    // so no round-1 call can be counted, whatever the expedited
+    // attach would otherwise have raced. Resuming drains the real
+    // queued open through staging and attach with the round-1
+    // process already exited, isolating the round-2 count exactly.
+    // SAFETY: signalling our own capture child.
+    assert_eq!(
+        unsafe { libc::kill(capture.child.id() as i32, libc::SIGSTOP) },
+        0,
+        "stop capture for round 1"
+    );
     // Round 1: the first-ever run against this file in the capture.
     run_tool("round 1");
+    // SAFETY: signalling our own capture child.
+    assert_eq!(
+        unsafe { libc::kill(capture.child.id() as i32, libc::SIGCONT) },
+        0,
+        "resume capture after round 1"
+    );
     // Wait for the learning event itself (the diagnostics staging line
     // names the copy), then a few ordinary frames for the expedited
     // attach, so the rate below measures steady-state catching, not

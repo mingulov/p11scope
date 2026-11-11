@@ -934,6 +934,7 @@ mod corrective_tests {
                 mechanism: 9,
                 fork_safe: true,
                 unregistered: false,
+                standard_layout: false,
             },
         );
         state.active_ops.insert(
@@ -942,6 +943,7 @@ mod corrective_tests {
                 mechanism: 9,
                 fork_safe: false,
                 unregistered: false,
+                standard_layout: false,
             },
         );
         state.active_ops.insert(
@@ -950,6 +952,7 @@ mod corrective_tests {
                 mechanism: 9,
                 fork_safe: true,
                 unregistered: false,
+                standard_layout: false,
             },
         );
         state.find_active.insert((parent, sess(7)));
@@ -1020,6 +1023,7 @@ mod corrective_tests {
                         mechanism: 1,
                         fork_safe: true,
                         unregistered: false,
+                        standard_layout: false,
                     },
                 );
             }
@@ -1540,6 +1544,7 @@ mod corrective_tests {
                         mechanism: 1,
                         fork_safe: true,
                         unregistered: false,
+                        standard_layout: false,
                     },
                 );
             }
@@ -2636,6 +2641,13 @@ struct Binding {
     /// Operational calls attributed through this binding recreate the
     /// mechanism row (after a row purge) with the flag intact.
     unregistered: bool,
+    /// The binding Init's slot held standard-layout-only authority.
+    /// Publication of the bound value follows the slot that read
+    /// the number, not the slot of a later operational call: a
+    /// value gated at its Init must not escape through a confirmed
+    /// operation, and a confirmed Init's vendor value must not be
+    /// gated by a standard-layout operation.
+    standard_layout: bool,
 }
 
 #[derive(Clone)]
@@ -2828,9 +2840,11 @@ enum MechanismCapture {
 /// value read through a standard-layout-only slot publishes only when
 /// it is an exact member of the registered CKM_* registry (standard ids
 /// plus the listed vendor ids, i.e. it has a registered name). Through
-/// a manifest/confirmed slot every value publishes as before.
-fn mechanism_publishable(meta: &SlotMeta, mechanism: u64) -> bool {
-    !meta.standard_layout || crate::mechanism_names::mechanism_name(mechanism).is_some()
+/// a manifest/confirmed slot every value publishes as before. The
+/// authority is the reading slot's: direct/Init reads pass their own
+/// slot's basis, operational calls pass the binding Init's.
+fn mechanism_publishable(standard_layout_only: bool, mechanism: u64) -> bool {
+    !standard_layout_only || crate::mechanism_names::mechanism_name(mechanism).is_some()
 }
 
 fn mechanism_capture(ev: &Event) -> MechanismCapture {
@@ -3372,7 +3386,7 @@ impl State {
         let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
             return;
         };
-        if !mechanism_publishable(meta, mechanism) {
+        if !mechanism_publishable(meta.standard_layout, mechanism) {
             self.evidence.unregistered_standard_layout_mechanisms = self
                 .evidence
                 .unregistered_standard_layout_mechanisms
@@ -3460,6 +3474,7 @@ impl State {
                                 mechanism,
                                 fork_safe: meta.fork_safe,
                                 unregistered: ev.capture & capture::MECHANISM_UNREGISTERED != 0,
+                                standard_layout: meta.standard_layout,
                             },
                         );
                     }
@@ -3483,24 +3498,32 @@ impl State {
     }
 
     fn apply_operations(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
-        // One entry per attributed mechanism id; the flag OR-merges
+        // One entry per attributed mechanism id; the flags OR-merge
         // across bindings (bindings for one id always agree in
         // production — membership is fixed per capture — so a set bit
-        // anywhere wins, exactly like the sticky row flag).
-        let mut mechanisms = BTreeMap::new();
+        // anywhere wins, exactly like the sticky row flag). The
+        // publication authority merges the same way: the value was
+        // read by the binding Inits, so any confirmed Init publishes
+        // it and only an all-standard-layout set is registry-gated.
+        let mut mechanisms: BTreeMap<u64, (bool, bool, bool)> = BTreeMap::new();
         for (operation, _) in operation_bits(meta.semantics.operations) {
             match self
                 .active_ops
                 .get(&(process, meta.session(ev.session), operation))
             {
                 Some(binding) => {
-                    *mechanisms.entry(binding.mechanism).or_insert(false) |= binding.unregistered;
+                    let flags = mechanisms
+                        .entry(binding.mechanism)
+                        .or_insert((false, false, false));
+                    flags.0 |= binding.unregistered;
+                    flags.1 |= binding.standard_layout;
+                    flags.2 |= !binding.standard_layout;
                 }
                 None => self.orphan_ops += 1,
             }
         }
-        for (mechanism, unregistered) in mechanisms {
-            if !mechanism_publishable(meta, mechanism) {
+        for (mechanism, (unregistered, from_standard_layout, from_confirmed)) in mechanisms {
+            if !mechanism_publishable(!from_confirmed, mechanism) {
                 self.evidence.unregistered_standard_layout_mechanisms = self
                     .evidence
                     .unregistered_standard_layout_mechanisms
@@ -3531,8 +3554,8 @@ impl State {
             }
             let stat = self.mechanisms.entry(mechanism).or_default();
             stat.unregistered |= unregistered;
-            stat.attributed_standard_layout |= meta.standard_layout;
-            stat.attributed_confirmed |= !meta.standard_layout;
+            stat.attributed_standard_layout |= from_standard_layout;
+            stat.attributed_confirmed |= from_confirmed;
             record_call(stat, ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
             self.record_module_mechanism(mechanism, meta.module, ev.rv, unregistered);

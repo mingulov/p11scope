@@ -72874,6 +72874,7 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
     c.wait().unwrap();
 }
 
+<<<<<<< HEAD
 /// Startup T1: the segment marker names the segment and its milliseconds,
 /// or `n/a` when the clock read failed.
 #[test]
@@ -73350,4 +73351,40 @@ fn startup_post_ready_window_line_names_ms_and_uncounted_calls() {
         Engine::startup_post_ready_window_line(11327),
         "p11scope: post-ready arming window: initial loader arming finished 11327ms after capturing:; calls made before a provider armed were not counted"
     );
+}
+
+/// Late provider under churn: a live holder's refresh request must queue
+/// even when the pending queue holds only departed pids. Without relief
+/// the bounded queue refuses it, so a provider loaded after capture start
+/// never attaches on a busy host.
+#[test]
+fn late_holder_refresh_queues_past_departed_pending() {
+    let guards = e06_spawn_sleeps(1);
+    let holder = guards[0].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[holder]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("a cgroup capture");
+    engine.refresh_requested.remove(&holder);
+    let mut fake = 4_000_000u32;
+    let mut filled = 0;
+    while filled < MAX_PENDING_REFRESH {
+        let proc = format!("/proc/{fake}");
+        if fake != holder && !std::path::Path::new(&proc).exists() {
+            assert!(
+                engine.request_refresh(fake, Some(1_000_000)),
+                "the queue accepts departed pid {fake} while filling"
+            );
+            filled += 1;
+        }
+        fake += 1;
+        assert!(fake < 4_200_000, "enough unused pids to fill the queue");
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert!(
+        engine.request_refresh(holder, Some(2_000_000)),
+        "a live holder queues past departed pending"
+    );
+    assert!(engine.refresh_requested.contains_key(&holder));
 }

@@ -1308,6 +1308,108 @@ impl PinnedObjects {
         self.revision
     }
 
+    /// The current copy-generation fence: bumped by every mutation that
+    /// must invalidate state derived from this set, including derived
+    /// claim resets that do not change membership.
+    pub fn copy_version(&self) -> u64 {
+        self.copy_version
+    }
+
+    /// Whether two scan-produced pin sets carry identical identity
+    /// content: every raw observation resolves to an entry with the same
+    /// mapping identity, held-fd device, pin, digest, ABI, exports and
+    /// proof flags, and the rejection, ambiguity, ownership and
+    /// raw-ownership layers agree. Scan-local object ids, the held
+    /// `File` handles and the per-object unchanged-check stamps are not
+    /// content: ids are remapped by identity on absorb, and the stamps
+    /// only ever move later under `check_unchanged`.
+    pub(crate) fn same_pin_content(&self, other: &Self) -> bool {
+        if self.rejected_keys != other.rejected_keys
+            || self.ambiguous_keys != other.ambiguous_keys
+            || self.ambiguity_published != other.ambiguity_published
+            || self.overlay_uncertain != other.overlay_uncertain
+            || self.changed.get() != other.changed.get()
+            || self.raw_ownership != other.raw_ownership
+            || self.raw_to_id.len() != other.raw_to_id.len()
+            || self.by_id.len() != other.by_id.len()
+        {
+            return false;
+        }
+        let raws_of = |pins: &Self, id: PinnedObjectId| {
+            pins.raw_to_id
+                .iter()
+                .filter(|(_, candidate)| **candidate == id)
+                .map(|(raw, _)| raw.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let claims_of = |pins: &Self| {
+            pins.ownership
+                .iter()
+                .map(|(view, claims)| {
+                    (
+                        *view,
+                        (
+                            claims
+                                .tables
+                                .iter()
+                                .map(|id| raws_of(pins, *id))
+                                .collect::<Vec<_>>(),
+                            claims
+                                .targets
+                                .iter()
+                                .map(|(id, offset)| (raws_of(pins, *id), *offset))
+                                .collect::<Vec<_>>(),
+                            claims
+                                .pins
+                                .iter()
+                                .map(|id| raws_of(pins, *id))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        if claims_of(self) != claims_of(other) {
+            return false;
+        }
+        self.raw_to_id.iter().all(|(raw, id)| {
+            let (Some(entry), Some(other_entry)) = (
+                self.by_id.get(id),
+                other
+                    .raw_to_id
+                    .get(raw)
+                    .and_then(|other_id| other.by_id.get(other_id)),
+            ) else {
+                return false;
+            };
+            entry.raw == other_entry.raw
+                && entry.mapping == other_entry.mapping
+                && entry.fd_dev == other_entry.fd_dev
+                && entry.pin == other_entry.pin
+                && entry.path == other_entry.path
+                && entry.sha256 == other_entry.sha256
+                && entry.build_id == other_entry.build_id
+                && entry.abi == other_entry.abi
+                && entry.exports == other_entry.exports
+                && entry.getter_present == other_entry.getter_present
+                && entry.witness_fault == other_entry.witness_fault
+                && entry.overlay == other_entry.overlay
+                && entry.pre_copy_up == other_entry.pre_copy_up
+                && entry.collapsed == other_entry.collapsed
+                && entry.probed_maps_unproven == other_entry.probed_maps_unproven
+                && entry.probed_maps_key == other_entry.probed_maps_key
+                && entry.changed.get() == other_entry.changed.get()
+                && match (&entry.mapped, &other_entry.mapped) {
+                    (None, None) => true,
+                    (Some(mapped), Some(other_mapped)) => {
+                        mapped.identity == other_mapped.identity
+                            && mapped.fs_magic == other_mapped.fs_magic
+                    }
+                    _ => false,
+                }
+        })
+    }
+
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.bump_copy_version();

@@ -140,6 +140,62 @@
       "identical": [],
       "lane": "v0.7.0 copyright-header pass",
       "rationale": "Comment-only license pass on top of the transition above: every BPF input gains only SPDX/copyright comment lines (68 added across 65 files, none removed), so code-section sizes are exactly the transition-2 values (.text +504/+64 B, uprobe +40 B) and only .BTF.ext line info and .debug_* move with the added lines (Detailed .debug_abbrev +46, .debug_info +5, .debug_line +2; Inventory and Callers .debug_abbrev -2, .debug_info -1, .debug_line +1 against transition 2). No section is added or removed, symbol sets are unchanged, and the shape is verified run-independent across two snapshot builds."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "v0.7.0 rc line (measured at ae315bbd0fa3679dd89bbc334976572f1bf71aaa, push-1 CI run 42973297502 bpf-noninterference job; BPF inputs identical from the rc18 tip through the identity native widening; the record pins the run-independent diff shape)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF": 36,
+            ".BTF.ext": 48,
+            ".debug_abbrev": 62,
+            ".debug_addr": -8,
+            ".debug_info": 205,
+            ".debug_line": 151,
+            ".debug_loclists": 434,
+            ".debug_rnglists": 137,
+            ".debug_str": 13,
+            ".debug_str_offsets": 4,
+            ".rel.BTF.ext": 48,
+            ".rel.debug_addr": -16,
+            ".rel.debug_info": 80,
+            ".rel.debug_str_offsets": 16,
+            ".rel.text": 16,
+            ".text": 504,
+            "uprobe": 40
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".debug_abbrev": -23,
+            ".debug_info": -4,
+            ".debug_line": -3,
+            ".debug_str": 12
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF.ext": 16,
+            ".debug_abbrev": -23,
+            ".debug_info": 30,
+            ".debug_line": 1,
+            ".debug_loclists": 15,
+            ".debug_rnglists": 10,
+            ".rel.BTF.ext": 16,
+            ".text": 64
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "identity ticket budget 262144 (rc-19 integration)",
+      "rationale": "Identity native widening on top of the transition above (reviewed IMAGE_IDENTITY_TICKET_LIMIT 16384 to 262144 and IMAGE_IDENTITY_INCARNATION_LIMIT 2^48 to 2^44): code sections are byte-identical to transition 3 (.text +504/+64 B, uprobe +40 B, so no BPF logic growth: the widened limits change immediates only) and only BTF/debug metadata moves (.BTF +36, .debug_abbrev +10, .debug_info +23 on the Detailed object); both Inventory objects keep exactly the transition-3 deltas. Map capacities are load-time userspace .map_max_entries, not object content. No section is added or removed."
     }
   ],
   "version": 1

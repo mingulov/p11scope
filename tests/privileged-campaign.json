@@ -290,6 +290,50 @@
       "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact"
     ]
   },
+  "counter_flavor": {
+    "note": "FULL-512 counter campaign from the journal build (FULL capacities carry counter objects; the wide default omits them, so these cells take the exact-refusal twin arm in the default shards). Every listed cell exists, so the job hard-fails on any absent cell. When 0.7.x restores wide companions, the twins flip back to positive and this campaign stays as the FULL positive.",
+    "build_env": {
+      "P11SCOPE_JOURNAL": "1"
+    },
+    "cells": [
+      "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",
+      "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64",
+      "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+      "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+      "metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64",
+      "metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64",
+      "metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64",
+      "metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64",
+      "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+      "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+      "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64",
+      "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+      "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+      "metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64",
+      "metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64",
+      "metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64",
+      "metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64",
+      "metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64",
+      "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+      "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+      "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+      "metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64",
+      "metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64",
+      "metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64",
+      "metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64",
+      "metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64",
+      "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64"
+    ]
+  },
   "journal_proof": {
     "note": "P11SCOPE_JOURNAL_PROOF=1 build runs root_proof_tests (unprivileged, no BPF load).",
     "build_env": {

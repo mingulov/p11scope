@@ -10111,14 +10111,14 @@ fn documented_scan_operation_cap_matches_the_code() {
 fn daemonset_posture_is_hardened_and_documented() {
     // MED (DaemonSet privilege posture): node-root-capable by design, so
     // the manifest ships the cheap hardening (read-only root + a size-capped
-    // scratch emptyDir) and documents the gated variant + seccomp backlog.
+    // scratch emptyDir) and documents the least-privilege variant + seccomp backlog.
     let daemonset = read("deploy/k8s/20-daemonset.yaml");
     for marker in [
         "readOnlyRootFilesystem: true",
         "emptyDir:",
         "sizeLimit:",
         "mountPath: /tmp",
-        "Gated variant",
+        "Least-privilege variant",
         "allowPrivilegeEscalation: false",
         "type: RuntimeDefault",
         "- ALL",
@@ -10134,8 +10134,8 @@ fn daemonset_posture_is_hardened_and_documented() {
     );
     let readme = read("deploy/k8s/README.md").to_lowercase();
     assert!(
-        readme.contains("read-only root") && readme.contains("gated variant"),
-        "deploy/k8s/README.md must document the read-only-root + gated-variant posture"
+        readme.contains("read-only root") && readme.contains("least-privilege variant"),
+        "deploy/k8s/README.md must document the read-only-root + least-privilege-variant posture"
     );
 }
 

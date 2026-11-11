@@ -18415,9 +18415,9 @@ impl Engine {
         // partial results. Metadata-only scans keep their own explicit
         // table restoration above; failed revalidation falls through to the
         // replacement below, so stale identity still retires. A rescan that
-        // finds exactly the same files also retains: replacing stable pins
-        // with fresh IDs would allocate duplicate slots for targets that
-        // already have them.
+        // finds exactly the same files also retains — but only when their
+        // pins still validate: an in-place rewrite (same key, new bytes)
+        // must replace, not credit the new bytes as the old file.
         let retained_keys: BTreeSet<_> = self
             .modules
             .iter()
@@ -18430,7 +18430,7 @@ impl Engine {
             && mode == LoaderScanMode::Memory
             && self.views[position].still_the_same()
             && self.view_pins_unchanged(view_id))
-            || same_files;
+            || (same_files && self.view_pins_unchanged(view_id));
         let (candidate_pins, raw_modules) = if revalidated {
             let mut candidate_pins = self.pinned.clone();
             // Fresh pins cover only newly observed modules: re-pinning

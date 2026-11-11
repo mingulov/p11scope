@@ -71574,6 +71574,58 @@ fn scarce_tick_keeps_unattempted_fresh_newcomer_ahead_of_backlog() {
     assert_eq!(engine.probationary_completions, 1);
 }
 
+/// At view capacity, a provider-free attempt must not consume the last
+/// free slot while another newcomer still waits in the same window: a
+/// complete scan proving provider-freedom completes the request
+/// without a view (the probationary outcome), so the freed slot
+/// reaches the waiting provider pid in the same tick instead of
+/// refilling with an ambient process that merely attempted first.
+#[test]
+fn scarce_tick_provider_free_attempt_does_not_consume_last_slot() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-slot-proven");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    // Spawned before the second loaded pid so it sorts (and attempts)
+    // first in the admission window.
+    let sleeps = e06_spawn_sleeps(1);
+    let sleep_pid = sleeps[0].pid();
+    let loaded2 = system_scope_spawn_loaded(&driver, &provider);
+    let provider_pid = loaded2.pid();
+    assert!(
+        sleep_pid < provider_pid,
+        "the provider-free pid must attempt first"
+    );
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(2));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 1, "one free slot below the cap");
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    let mut listing = vec![owner_pid, sleep_pid, provider_pid];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    // The provider pid is backlog; the provider-free sleep is fresh, so
+    // the sleep attempts first and would take the last slot today.
+    assert!(engine.request_refresh(provider_pid, Some(100)));
+    assert!(engine.request_refresh(sleep_pid, Some(200)));
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    opus_probe_refresh_with_permits(&mut engine, 4);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == provider_pid),
+        "the waiting provider pid takes the last slot in the same tick"
+    );
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == sleep_pid),
+        "the provider-free attempt consumed no view slot"
+    );
+    assert_eq!(engine.probationary_completions, 1);
+    assert!(!engine.refresh_requested.contains_key(&sleep_pid));
+    assert!(!engine.refresh_requested.contains_key(&provider_pid));
+}
+
 /// Kept-fresh priority is one extra tick only: a fresh pid deferred
 /// unattempted on two consecutive scarce ticks demotes to backlog on
 /// the third, so the older backlog pid completes ahead of it. Without

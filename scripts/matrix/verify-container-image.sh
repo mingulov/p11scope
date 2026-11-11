@@ -32,6 +32,12 @@
 #                     pid-namespace-mismatch (no report is written)
 #   refusal-cap       without CAP_SYS_PTRACE the capture fails naming the
 #                     mount-namespace denial (no report is written)
+#   five-cap-exact    containerized profile --pid of a host workload under
+#                     the least-privilege set (--cap-drop ALL + BPF PERFMON
+#                     CHECKPOINT_RESTORE SYS_PTRACE DAC_READ_SEARCH, no
+#                     SYS_ADMIN, Docker default seccomp): same oracles as
+#                     host-exact. Needs Docker 24+ (older defaults allow
+#                     bpf() only with CAP_SYS_ADMIN).
 # The target outlives every capture (go-file + finish-file), so a short-lived
 # target never donates discovery-unavailable skips to a clean oracle.
 #
@@ -124,12 +130,14 @@ OPID=
 SPID=
 TABLE_CLASS_HOST=
 TABLE_CLASS_CONTAINER=
+TABLE_CLASS_FIVE=
+HPID_FIVE=
 
 cleanup() {
     CLEANUP_STATUS=$?
     trap - EXIT INT TERM
     set +e
-    for pid in "${HPID_H-}" "${WPID-}" "${HPID_R-}" "${OPID-}"; do
+    for pid in "${HPID_H-}" "${HPID_FIVE-}" "${WPID-}" "${HPID_R-}" "${OPID-}"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
@@ -137,7 +145,8 @@ cleanup() {
     done
     for name in "$VICTIM_NAME" \
         "p11scope-container-obs1-$RUN_ID" "p11scope-container-obs2-$RUN_ID" \
-        "p11scope-container-obs3-$RUN_ID" "p11scope-container-obs4-$RUN_ID"; do
+        "p11scope-container-obs3-$RUN_ID" "p11scope-container-obs4-$RUN_ID" \
+        "p11scope-container-obs5-$RUN_ID"; do
         docker rm -f "$name" >/dev/null 2>&1 || true
     done
     docker image rm "$VICTIM_IMAGE" >/dev/null 2>&1 || true
@@ -317,6 +326,15 @@ OBS_FLAGS+=("${SE_FLAGS[@]}")
 OBS_FLAGS+=("${NET_FLAGS[@]}")
 OBS_FLAGS+=(-v /sys/fs/cgroup:/sys/fs/cgroup:ro)
 echo "observer flags: ${OBS_FLAGS[*]}"
+FIVE_FLAGS=(--pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH)
+if [ -r /sys/module/apparmor/parameters/enabled ] \
+    && grep -q Y /sys/module/apparmor/parameters/enabled 2>/dev/null; then
+    FIVE_FLAGS+=(--security-opt apparmor=unconfined)
+fi
+FIVE_FLAGS+=("${SE_FLAGS[@]}")
+FIVE_FLAGS+=("${NET_FLAGS[@]}")
+FIVE_FLAGS+=(-v /sys/fs/cgroup:/sys/fs/cgroup:ro)
+echo "five-cap flags: ${FIVE_FLAGS[*]}"
 
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
 DURATION=12
@@ -484,6 +502,76 @@ leg_host() {
     esac
     assert_module_identity "$OUT/host.json" "$OUT/host-mountinfo.txt" "$host_sha" \
         >>"$OUT/host-oracle.log" 2>&1 || return 1
+    return 0
+}
+
+leg_host_five() {
+    echo "=== leg: five-cap-exact ==="
+    local name log hlog
+    name="p11scope-container-obs5-$RUN_ID"
+    log="$OUT/host-five-observer.log"
+    hlog="$OUT/host-five-harness.log"
+    rm -f "$WORK/shared/go-h5" "$WORK/shared/fin-h5" || return 1
+    SOFTHSM2_CONF="$SOFTHSM2_CONF" "$WORK/harness" "$MODULE" \
+        "$WORK/shared/go-h5" "$WORK/shared/fin-h5" >"$hlog" 2>&1 &
+    HPID_FIVE=$!
+    local attempt
+    attempt=0
+    while [ "$attempt" -lt 200 ]; do
+        grep -Fq libsofthsm2.so "/proc/$HPID_FIVE/maps" 2>/dev/null && break
+        attempt=$((attempt + 1))
+        sleep 0.05
+    done
+    grep -Fq libsofthsm2.so "/proc/$HPID_FIVE/maps" 2>/dev/null || return 1
+    cat "/proc/$HPID_FIVE/mountinfo" >"$OUT/host-five-mountinfo.txt" || return 1
+    local host_sha
+    host_sha=$(sha256sum "$MODULE" | cut -d' ' -f1) || return 1
+    timeout --signal=TERM --kill-after=10s 90s docker run --name "$name" "${FIVE_FLAGS[@]}" \
+        "$OBS_IMAGE" profile --pid "$HPID_FIVE" --mode metrics --duration "$DURATION" \
+        -o /tmp/host-five.json >"$log" 2>&1 &
+    OPID=$!
+    SPID=$OPID
+    wait_for_capture_ready "$log" aggregate-only metrics || {
+        kill_obs
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    SPID=
+    touch "$WORK/shared/go-h5" || return 1
+    wait "$OPID" || {
+        OPID=
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    OPID=
+    touch "$WORK/shared/fin-h5" || return 1
+    wait "$HPID_FIVE" || return 1
+    HPID_FIVE=
+    docker cp "$name:/tmp/host-five.json" "$OUT/host-five.json" >/dev/null 2>&1 || {
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return 1
+    }
+    reclaim_root_output "$OUT/host-five.json" || return 1
+    docker rm -f "$name" >/dev/null 2>&1 || return 1
+    python3 -I scripts/matrix/check-count-multiset.py "$OUT/host-five.json" spike/expected.txt \
+        >>"$OUT/host-five-oracle.log" 2>&1 || return 1
+    local table_class
+    table_class=$(classify_provider_tables "$OUT/host-five.json" 2>>"$OUT/host-five-oracle.log") || return 1
+    echo "provider table class: $table_class" >>"$OUT/host-five-oracle.log"
+    TABLE_CLASS_FIVE=$table_class
+    case $table_class in
+        26)
+            python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/host-five.json" spike/expected.txt \
+                >>"$OUT/host-five-oracle.log" 2>&1 || return 1
+            ;;
+        27) ;;
+        *)
+            echo "unknown provider table shape: $table_class" >&2
+            return 1
+            ;;
+    esac
+    assert_module_identity "$OUT/host-five.json" "$OUT/host-five-mountinfo.txt" "$host_sha" \
+        >>"$OUT/host-five-oracle.log" 2>&1 || return 1
     return 0
 }
 
@@ -697,6 +785,16 @@ if leg_container; then
     record container-exact 1 qualified "exact counts, victim provider file attributed (provider table class $TABLE_CLASS_CONTAINER)"
 else
     record container-exact 0 failed "see container-observer.log and container-oracle.log"
+    FAILED=1
+fi
+if leg_host_five; then
+    if [ "$TABLE_CLASS_FIVE" = 26 ]; then
+        record five-cap-exact 1 qualified "least-privilege set, exact counts, host provider file attributed (provider table class 26)"
+    else
+        record five-cap-exact 1 qualified "least-privilege set, multiset counts plus oracle core, host provider file attributed (provider table class $TABLE_CLASS_FIVE)"
+    fi
+else
+    record five-cap-exact 0 failed "see host-five-observer.log and host-five-oracle.log"
     FAILED=1
 fi
 if start_refusal_target; then

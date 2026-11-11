@@ -52,6 +52,13 @@ versioned separately and are opaque, exact dispatch keys.
   `name`: the `CKM_*` name when the id is a known standard or listed
   vendor mechanism, else null, never guessed.
   <!-- lane: mech-generic -->
+- A documented least-privilege container recipe (no `--privileged`,
+  no `CAP_SYS_ADMIN`): `--cap-drop ALL` plus `BPF`, `PERFMON`,
+  `CHECKPOINT_RESTORE`, `SYS_PTRACE` and `DAC_READ_SEARCH` under the
+  Docker default seccomp profile (Docker 24+, no custom profile
+  needed) or the Kubernetes `RuntimeDefault` profile captures
+  exactly like the shipped set. The shipped `SYS_ADMIN` default is
+  unchanged. <!-- lane: nosysadmin -->
 
 ### Changed
 

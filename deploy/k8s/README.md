@@ -148,7 +148,8 @@ lane, which attaches every probe through links paranoid does not gate.
 | --- | --- | --- |
 | shipped: `SYS_ADMIN SYS_PTRACE DAC_READ_SEARCH`, hostPID, cgroupfs | exact | exact |
 | + `BPF PERFMON` (the previous five-cap set) | exact | exact |
-| without `SYS_ADMIN` (`BPF PERFMON SYS_PTRACE DAC_READ_SEARCH`) | exit 1: uretprobe self-probe `perf_event_open` EACCES; doctor T0 | same |
+| least privilege, measured 2026-11-11: `BPF PERFMON CHECKPOINT_RESTORE SYS_PTRACE DAC_READ_SEARCH`, hostPID, cgroupfs, seccomp RuntimeDefault | exact | exact |
+| without `SYS_ADMIN` 2026-10-03 (`BPF PERFMON SYS_PTRACE DAC_READ_SEARCH`, no `CHECKPOINT_RESTORE`) | exit 1: uretprobe self-probe `perf_event_open` EACCES; doctor T0 | same |
 | same, seccomp `Unconfined` | same failure (not seccomp) | same |
 | without `SYS_PTRACE` | p11scope: `/proc/<pid>/mem` EACCES, 0 modules, 0 probes; entry script now refuses first ("0 with readable memory") | same |
 | without `DAC_READ_SEARCH` | p11scope: counts exact but memory scan EACCES (`scan_unavailable: ptrace`, `concrete_gap`); entry script now refuses first ("1 with readable memory" of 2) | p11scope: 0 modules; entry refuses ("0 with readable memory") |
@@ -185,13 +186,16 @@ Why each grant:
   (nothing is pinned), tracefs/debugfs (raw and BTF tracepoints, uprobes via
   the perf PMU), a `/sys/kernel/btf` mount (the container's sysfs shows it).
 
-**Gated variant**: the five-capability minimal set (`BPF` + `PERFMON` +
-`CHECKPOINT_RESTORE` + `SYS_PTRACE` + `DAC_READ_SEARCH`, no `SYS_ADMIN`)
-is expected to suffice at any paranoid on the default lane — measured at
-host level on both Ubuntu-style hardened sysctls and Fedora defaults,
-but this repository has **not** measured the kind removal, so
-the shipped manifest keeps its grant. **Do not simply drop `SYS_ADMIN`**:
-it also covers `/proc/<pid>/map_files`, which `inventory`'s caller
+**Least-privilege variant** (measured 2026-11-11 on kind; no
+`CAP_SYS_ADMIN`): the five-capability minimal set (`BPF` + `PERFMON` +
+`CHECKPOINT_RESTORE` + `SYS_PTRACE` + `DAC_READ_SEARCH`) with seccomp
+`RuntimeDefault` captures exactly at any paranoid on the default lane
+— ledger-a 6 x 400 and ledger-p 6 x 300 (the private-0700 provider
+case), `doctor` verdict `capture available`. The shipped manifest
+keeps its `SYS_ADMIN` grant as the default; use the narrow set by
+replacing the three `capabilities.add` entries with the five. **Do not
+simply drop `SYS_ADMIN`** without adding `CHECKPOINT_RESTORE`: it
+also covers `/proc/<pid>/map_files`, which `inventory`'s caller
 attribution past the scan cap reads and which needs `CAP_SYS_ADMIN` or
 `CAP_CHECKPOINT_RESTORE` (without either, those callers are reported as
 `map_files_unavailable`). Prove a node with `--command doctor`: `uprobe

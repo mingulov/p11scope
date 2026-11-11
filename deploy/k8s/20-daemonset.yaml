@@ -39,18 +39,21 @@
 # cell passes): nothing is pinned, the programs are raw/BTF tracepoints and
 # uprobes, and the container's sysfs already shows /sys/kernel/btf/vmlinux.
 #
-# Gated variant: the five-capability minimal set (BPF + PERFMON +
-# CHECKPOINT_RESTORE + SYS_PTRACE + DAC_READ_SEARCH, no SYS_ADMIN) is
-# expected to suffice at any paranoid on the default lane — measured at host
-# level on both Ubuntu-style hardened sysctls and Fedora defaults, but this
-# repository has NOT measured the kind removal, so the shipped manifest
-# keeps its grant. Do not simply drop SYS_ADMIN: it
-# also covers /proc/<pid>/map_files, which inventory's caller attribution
-# past the scan cap reads and which needs CAP_SYS_ADMIN or
-# CAP_CHECKPOINT_RESTORE (without either those callers read
-# `map_files_unavailable`). Prove a node first: `kubectl exec ... --
-# k8s-profile-entry --pod-uid <uid> --command doctor` must read `uprobe
-# attach (self) ... ok` and `verdict: capture available`.
+# Least-privilege variant (measured 2026-11-11): the five-capability
+# minimal set (BPF + PERFMON + CHECKPOINT_RESTORE + SYS_PTRACE +
+# DAC_READ_SEARCH, no SYS_ADMIN) with seccomp RuntimeDefault captures
+# exactly on kind (ledger-a 6 x 400 and ledger-p 6 x 300, the private-0700
+# provider case; doctor verdict capture available), at any paranoid on
+# the default lane. The shipped manifest keeps its SYS_ADMIN grant as
+# the default; use the narrow set by replacing the three adds below
+# with the five. Do not simply drop SYS_ADMIN without adding
+# CHECKPOINT_RESTORE: SYS_ADMIN also covers /proc/<pid>/map_files,
+# which inventory's caller attribution past the scan cap reads and
+# which needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE (without either
+# those callers read `map_files_unavailable`). Prove a node first:
+# `kubectl exec ... -- k8s-profile-entry --pod-uid <uid> --command
+# doctor` must read `uprobe attach (self) ... ok` and `verdict: capture
+# available`.
 #
 # BLAST RADIUS — read before deploying. This pod is root on its node, and
 # the hardening below narrows the surface, not the power:

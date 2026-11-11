@@ -179,7 +179,8 @@ jobs:
           test -s "$RUNNER_TEMP/cell/results.jsonl"
           python3 -I scripts/ci/check-cell-results.py "$RUNNER_TEMP/cell/results.jsonl" \
             --require host-exact --require container-exact \
-            --require refusal-pidns --require refusal-cap
+            --require refusal-pidns --require refusal-cap \
+            --require five-cap-exact
       - name: Save the image for the push job
         shell: bash
         run: |

@@ -42087,6 +42087,26 @@ fn e07_rescan(
     additions: &mut bool,
     pending: &mut PendingViewRetirements,
 ) -> DiscoveryRecordOutcome {
+    e07_rescan_with_mode(
+        engine,
+        session,
+        context,
+        additions,
+        pending,
+        LoaderScanMode::Memory,
+    )
+}
+
+/// The loader-rescan seam with an explicit scan mode: announcement-path
+/// twins drive `MetadataOnly` through the same production method.
+fn e07_rescan_with_mode(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    context: LoaderContextId,
+    additions: &mut bool,
+    pending: &mut PendingViewRetirements,
+    mode: LoaderScanMode,
+) -> DiscoveryRecordOutcome {
     engine
         .process_validated_loader_scan(
             0,
@@ -42095,7 +42115,7 @@ fn e07_rescan(
             None,
             None,
             &[],
-            LoaderScanMode::Memory,
+            mode,
             session,
             additions,
             pending,
@@ -42113,6 +42133,37 @@ fn e07_active_targets(engine: &Engine) -> BTreeSet<(PinnedObjectId, u64)> {
         .filter(|slot| engine.plan.is_active(slot.index))
         .map(|slot| (slot.object, slot.file_offset))
         .collect()
+}
+
+/// Feed `n` CALL events for `slot` through the real drain/reducer.
+fn feed_slot_calls(state: &mut semantics::State, pid: u32, slot: u32, n: usize) {
+    let process = semantics::ProcessKey::from_pid(pid);
+    for _ in 0..n {
+        let call = || p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::CALL,
+            pid_tgid: u64::from(pid) << 32,
+            session: 7,
+            slot_id: 0,
+            slot,
+            capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::events([call()], usize::MAX),
+            1,
+        );
+        let may_remain = drain.poll(None, |ev| {
+            state.observe_process(process, &ev);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(!may_remain, "the scripted drain consumes its whole script");
+        assert_eq!(drain.malformed(), 0, "the script decodes cleanly");
+    }
+}
+
+/// The reducer's conserved call total across every aggregate cell.
+fn counted_calls(state: &semantics::State) -> u64 {
+    state.cgroups().values().map(|cgroup| cgroup.calls).sum()
 }
 
 /// E07: an unchanged complete loader rescan retires nothing. The direct scan
@@ -42688,6 +42739,7 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
     );
     let before = e07_active_targets(&engine);
     assert!(!before.is_empty(), "the planted table is covered");
+    let indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
 
     provider.retarget_table(provider.second_bootstrap);
     let outcome = e07_rescan(
@@ -42706,6 +42758,357 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
     assert!(
         after.is_disjoint(&before),
         "no stale target stays active: before={before:?} after={after:?}"
+    );
+    assert_eq!(before.len(), 1, "one covered target before: {before:?}");
+    assert_eq!(after.len(), 1, "one covered target after: {after:?}");
+    assert_eq!(
+        after.iter().next().expect("one target after").0,
+        before.iter().next().expect("one target before").0,
+        "the replacement keeps the dependency identity"
+    );
+    let retired: Vec<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        retired,
+        vec![indices[0]],
+        "the replacement submits its exact stale slot identity once"
+    );
+    assert_eq!(
+        session.attached_slots,
+        vec![1, 1],
+        "the replacement attaches exactly its new target"
+    );
+}
+
+/// An incomplete loader rescan must not merge fresh facts into a module
+/// whose retained identity the fresh pins disprove. The retained module
+/// keeps its raw observation but holds a distinct, self-consistent real
+/// file (the forgery shape: its own pins validate); the in-memory table
+/// retargets at the same time. The fresh target must not bind to the
+/// disproved retained module ID.
+#[test]
+fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert!(!before.is_empty(), "the planted table is covered");
+    let module_id = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the provider module is retained")
+        .object;
+    let (dep_id, _) = before.iter().next().copied().expect("one covered target");
+    assert_ne!(
+        module_id, dep_id,
+        "the planted target lives in the dependency"
+    );
+
+    // Craft the collision: the retained provider ID now holds the
+    // dependency's real file. Its own pins still validate (a distinct,
+    // unchanged held file), but a fresh observation of the provider no
+    // longer merges into it.
+    engine.pinned.overwrite_test_entry(module_id, dep_id);
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "the spliced held files still validate"
+    );
+
+    // The contradiction precondition, through the real proof: fresh pins
+    // for the current observation do not reprove the retained identities.
+    let (scan_result, _) = Engine::scan_retained_view(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        false,
+        &mut engine.stage_timings,
+    );
+    let (found, fresh_pins, _) = scan_result.expect("the view still scans");
+    assert!(
+        !engine.pinned.fresh_pins_reprove(&fresh_pins, &found),
+        "the fresh observation disproves the retained module"
+    );
+
+    // Fresh facts arrive under the same raw observation while the scan
+    // itself reports incomplete.
+    provider.retarget_table(provider.second_bootstrap);
+    engine.loader_force_record_scan_incomplete = true;
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+
+    let after = e07_active_targets(&engine);
+    assert_eq!(
+        after, before,
+        "disproved fresh facts must not bind to the retained module: before={before:?} after={after:?}"
+    );
+}
+
+/// The dependency leg of the incomplete-scan refusal: the owning module
+/// still reproves, but a fresh table entry target contradicts its
+/// retained dependency identity. The fresh target must not bind to the
+/// disproved retained dependency ID either.
+#[test]
+fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert!(!before.is_empty(), "the planted table is covered");
+    let module_id = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the provider module is retained")
+        .object;
+    let (dep_id, _) = before.iter().next().copied().expect("one covered target");
+    assert_ne!(
+        module_id, dep_id,
+        "the planted target lives in the dependency"
+    );
+
+    // Craft the dependency collision: the retained dependency ID now
+    // holds the provider's real file, while the owning module is
+    // untouched and still reproves.
+    engine.pinned.overwrite_test_entry(dep_id, module_id);
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "the spliced held files still validate"
+    );
+
+    let (scan_result, _) = Engine::scan_retained_view(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        false,
+        &mut engine.stage_timings,
+    );
+    let (found, fresh_pins, _) = scan_result.expect("the view still scans");
+    assert!(
+        !engine.pinned.fresh_pins_reprove(&fresh_pins, &found),
+        "the fresh observation disproves the retained dependency"
+    );
+
+    provider.retarget_table(provider.second_bootstrap);
+    engine.loader_force_record_scan_incomplete = true;
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+
+    let after = e07_active_targets(&engine);
+    assert_eq!(
+        after, before,
+        "disproved fresh facts must not bind to the retained dependency: before={before:?} after={after:?}"
+    );
+}
+
+/// Positive guard for the incomplete-scan refusal: an incomplete rescan
+/// whose fresh pins agree with the retained identities still retains
+/// (partial evidence keeps the conservative union).
+#[test]
+fn e07_incomplete_rescan_with_agreeing_pins_retains() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+
+    engine.loader_force_record_scan_incomplete = true;
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+
+    assert_eq!(
+        e07_active_targets(&engine),
+        attached,
+        "an agreeing incomplete rescan retains validated endpoints"
+    );
+    assert_eq!(
+        session.detached_slots.iter().sum::<usize>(),
+        0,
+        "retention detaches nothing"
+    );
+    assert_eq!(
+        session.attached_slots.iter().sum::<usize>(),
+        1,
+        "retention attaches nothing new"
+    );
+}
+
+/// An unchanged metadata-only announcement must preserve validated
+/// endpoints: no retirement, no dependency re-pinning, no slot churn.
+/// Memory -> metadata -> memory keeps identical dependency IDs, active
+/// targets and slot indices with zero detach/re-add.
+#[test]
+fn e07_metadata_only_rescan_preserves_validated_endpoints() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let attached = e07_active_targets(&engine);
+    assert!(!attached.is_empty(), "the planted table is covered");
+    let objects: Vec<PinnedObjectId> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view == view_id)
+        .map(|module| module.object)
+        .collect();
+    let slots = engine.plan.slots.len();
+    assert!(slots > 0, "a late load must plan slots");
+    let indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+
+    e07_rescan_with_mode(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+        LoaderScanMode::MetadataOnly,
+    );
+    assert_eq!(
+        e07_active_targets(&engine),
+        attached,
+        "a metadata announcement retires nothing"
+    );
+    let round_objects: Vec<PinnedObjectId> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view == view_id)
+        .map(|module| module.object)
+        .collect();
+    assert_eq!(
+        round_objects, objects,
+        "dependency IDs stay stable across metadata"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots,
+        "no slot rows across a metadata announcement"
+    );
+    let round_indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    assert_eq!(round_indices, indices, "slot indices stay stable");
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .next()
+            .is_none(),
+        "no detach submissions on metadata: {:?}",
+        session.detached_slot_indices
+    );
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert_eq!(
+        e07_active_targets(&engine),
+        attached,
+        "the follow-up memory scan finds the same coverage"
+    );
+    let round_objects: Vec<PinnedObjectId> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view == view_id)
+        .map(|module| module.object)
+        .collect();
+    assert_eq!(
+        round_objects, objects,
+        "dependency IDs stay stable across the round trip"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots,
+        "no slot rows across the round trip"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .next()
+            .is_none(),
+        "zero detach submissions across the round trip: {:?}",
+        session.detached_slot_indices
+    );
+    assert_eq!(
+        session.attached_slots,
+        vec![1, 0, 0],
+        "one attach call per rescan, slots only on the first"
     );
 }
 
@@ -42814,6 +43217,14 @@ fn late_provider_loader_rescans_keep_stable_slots() {
     let attempts = engine.loader_memory_scan_attempts;
     assert_eq!(attempts, 1, "the attach runs the loader seam once");
 
+    // Call conservation: a known CALL script through the real
+    // drain/reducer, synchronized with the evolving plan across the
+    // stable rescans and the retirement below. Two calls before the
+    // stable loop, one per stable round: seven in total.
+    let pid = std::process::id();
+    let mut calls = semantics::State::new(&engine.plan);
+    feed_slot_calls(&mut calls, pid, indices[0], 2);
+
     for round in 0..5 {
         let outcome = e07_rescan(
             &mut engine,
@@ -42847,6 +43258,8 @@ fn late_provider_loader_rescans_keep_stable_slots() {
         );
         let round_indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
         assert_eq!(round_indices, indices, "slot indices stay stable");
+        calls.sync_plan(&engine.plan);
+        feed_slot_calls(&mut calls, pid, indices[0], 1);
     }
     assert_eq!(
         session.attached_slots.iter().sum::<usize>(),
@@ -42854,9 +43267,24 @@ fn late_provider_loader_rescans_keep_stable_slots() {
         "the coverage attaches once"
     );
     assert_eq!(
+        session.attached_slots,
+        vec![1, 0, 0, 0, 0, 0],
+        "one attach call per rescan, slots only on the first"
+    );
+    assert_eq!(
         session.detached_slots.iter().sum::<usize>(),
         0,
         "no detaches while the provider is stable"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .next()
+            .is_none(),
+        "no detach submissions while the provider is stable: {:?}",
+        session.detached_slot_indices
     );
 
     provider.zero_version();
@@ -42874,6 +43302,18 @@ fn late_provider_loader_rescans_keep_stable_slots() {
     );
     let detached: usize = session.detached_slots.iter().sum();
     assert!(detached > 0, "the retirement detaches its slots");
+    let retired: Vec<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        retired,
+        vec![indices[0]],
+        "the retirement submits its exact slot identity once"
+    );
+    calls.sync_plan(&engine.plan);
 
     // Post-retirement rescans re-report `changed` (the plan rebuild drops
     // historical surfaces and the projection restores them): pre-existing
@@ -42906,11 +43346,28 @@ fn late_provider_loader_rescans_keep_stable_slots() {
             slots,
             "post-change rescan {round} adds no slot rows"
         );
+        calls.sync_plan(&engine.plan);
     }
     assert_eq!(
         session.detached_slots.iter().sum::<usize>(),
         detached,
         "no repeat detaches after the retirement"
+    );
+    let retired: Vec<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        retired,
+        vec![indices[0]],
+        "no repeat detach submissions after the retirement"
+    );
+    assert_eq!(
+        counted_calls(&calls),
+        7,
+        "every covered call counts exactly once across rescans and retirement"
     );
 }
 

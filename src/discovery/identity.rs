@@ -1437,6 +1437,21 @@ impl PinnedObjects {
         true
     }
 
+    /// Test-only: overwrite the held entry of `id` with a clone of
+    /// `source`'s entry, keeping every raw mapping. This crafts the
+    /// forgery shape the identity layer defends against: the raw still
+    /// observes its old tuple while the held file behind the ID is a
+    /// distinct, self-consistent real file (its own pins validate).
+    #[cfg(test)]
+    pub(crate) fn overwrite_test_entry(&mut self, id: PinnedObjectId, source: PinnedObjectId) {
+        let entry = self
+            .by_id
+            .get(&source)
+            .expect("a retained source entry")
+            .clone();
+        *self.by_id.get_mut(&id).expect("a retained target entry") = entry;
+    }
+
     pub(crate) fn has_overlay_uncertainty(&self) -> bool {
         self.overlay_uncertain
     }

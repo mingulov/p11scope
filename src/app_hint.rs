@@ -814,6 +814,21 @@ fn sample_for_pid_with_proc(
     pin: &crate::process::PidPin,
     proc_pid: u32,
 ) -> Option<AppHint> {
+    sample_for_pid_with_proc_hook(pid, exe, admitted_start_time, pin, proc_pid, || {})
+}
+
+/// Sample one admission hint, running the one-shot
+/// `after_pre_read_poll` hook after the pre-read liveness poll and
+/// before the numeric reads. Production passes a no-op; tests kill and
+/// reap the original there to model death inside the sample window.
+fn sample_for_pid_with_proc_hook(
+    pid: u32,
+    exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
+    admitted_start_time: Option<u64>,
+    pin: &crate::process::PidPin,
+    proc_pid: u32,
+    mut after_pre_read_poll: impl FnMut(),
+) -> Option<AppHint> {
     // Without the admission pidfd there is no exact reuse check: the
     // start-time comparison below is tick-granular and would accept a
     // same-tick same-binary reuse inside the sample window. Refuse the
@@ -834,6 +849,7 @@ fn sample_for_pid_with_proc(
     if !pin.still_the_same() {
         return None;
     }
+    after_pre_read_poll();
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
@@ -2035,6 +2051,123 @@ mod tests {
             None,
             "a dead original must refuse numeric reads even when a same-exe \
              same-tick replacement passes every numeric comparison"
+        );
+        replacement.kill().ok();
+        let _ = replacement.wait();
+        std::fs::remove_file(&original_script).ok();
+        std::fs::remove_file(&replacement_script).ok();
+    }
+
+    #[test]
+    fn sampler_refuses_when_the_original_dies_mid_sample() {
+        use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::{PidPin, process_start_time};
+        // Death inside the sample window, modelled deterministically:
+        // the original stays alive through the pre-read poll, then a
+        // one-shot hook kills and reaps it before the numeric `/proc`
+        // reads, which are redirected to a live same-exe same-tick
+        // replacement. Every numeric comparison passes, so only the
+        // post-validation liveness poll refuses the label. Births share
+        // a clock tick when both forks land inside one 10 ms window, so
+        // spawn the pair back to back and retry the pair (never one
+        // side: a later fork ticks later) until the start times match.
+        let mut pair = None;
+        for _ in 0..100 {
+            let (mut first, first_pid, first_script, _) =
+                spawn_python_sleeper_stemmed("midsample-orig");
+            let (mut second, second_pid, second_script, second_name) =
+                spawn_python_sleeper_stemmed("midsample-repl");
+            let first_start = process_start_time(first_pid).expect("original start time");
+            let second_start = process_start_time(second_pid).expect("replacement start time");
+            if first_start == second_start {
+                pair = Some((
+                    first,
+                    first_pid,
+                    first_script,
+                    second,
+                    second_pid,
+                    second_script,
+                    second_name,
+                ));
+                break;
+            }
+            first.kill().ok();
+            let _ = first.wait();
+            second.kill().ok();
+            let _ = second.wait();
+            std::fs::remove_file(&first_script).ok();
+            std::fs::remove_file(&second_script).ok();
+        }
+        let (
+            mut original,
+            original_pid,
+            original_script,
+            mut replacement,
+            replacement_pid,
+            replacement_script,
+            replacement_name,
+        ) = pair.expect("a same-tick original/replacement pair");
+        let original_exe = read_exe_identity(original_pid).expect("original exe identity");
+        let admitted = process_start_time(original_pid).expect("original start time");
+        let pin = PidPin::open(original_pid).expect("original pin");
+        assert!(
+            pin.pidfd().is_ok(),
+            "this host must grant pidfds for the sampler twins"
+        );
+        // Healthy control: the live original keeps its argv hint.
+        let control = sample_for_pid(original_pid, Some(&original_exe), Some(admitted), &pin)
+            .expect("the live original keeps its argv hint");
+        assert_eq!(control.source, AppHintSource::Argv);
+        // The reuse model needs identical exe identities and a
+        // replacement whose own reads yield a hint, so a `None`
+        // below comes from the original's death, not unreadable or
+        // unparsed facts.
+        let replacement_exe = read_exe_identity(replacement_pid).expect("replacement exe");
+        assert_eq!(
+            replacement_exe, original_exe,
+            "the reuse model needs identical exe identities"
+        );
+        let replacement_pin = PidPin::open(replacement_pid).expect("replacement pin");
+        let replacement_hint = sample_for_pid(
+            replacement_pid,
+            Some(&replacement_exe),
+            Some(admitted),
+            &replacement_pin,
+        )
+        .expect("the replacement reads yield a hint under their own admission");
+        assert_eq!(replacement_hint.value, replacement_name);
+        // The original is alive at the pre-read poll: the sampler must
+        // pass that poll live and refuse only at the post-validation
+        // poll, after the hook kills and reaps the original.
+        assert!(
+            pin.still_the_same(),
+            "the original must be alive at the pre-read poll"
+        );
+        let mut hook_runs = 0u32;
+        assert_eq!(
+            sample_for_pid_with_proc_hook(
+                original_pid,
+                Some(&original_exe),
+                Some(admitted),
+                &pin,
+                replacement_pid,
+                || {
+                    original.kill().ok();
+                    let _ = original.wait();
+                    hook_runs += 1;
+                },
+            ),
+            None,
+            "an original that dies mid-sample must refuse numeric reads even when a same-exe \
+             same-tick replacement passes every numeric comparison"
+        );
+        assert_eq!(
+            hook_runs, 1,
+            "the mid-sample hook runs once, after the pre-read poll"
+        );
+        assert!(
+            !pin.still_the_same(),
+            "the reaped original's pidfd must poll ready"
         );
         replacement.kill().ok();
         let _ = replacement.wait();

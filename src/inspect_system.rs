@@ -5771,10 +5771,7 @@ mod tests {
         );
         assert!(!text.contains("sudo p11scope"), "{text}");
         let plain = super::empty_explanation(&collection(), 0, &[]);
-        assert!(
-            plain.contains("sudo p11scope inspect --system"),
-            "{plain}"
-        );
+        assert!(plain.contains("sudo p11scope inspect --system"), "{plain}");
     }
 
     fn shared_with(

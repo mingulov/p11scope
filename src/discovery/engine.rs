@@ -609,6 +609,19 @@ pub struct Engine {
     frame_deferred: bool,
     /// Live frames that deferred work (F4): scheduling evidence.
     frame_deferrals: u64,
+    /// Consecutive live frames that ended with work deferred (H-1). A
+    /// deferred frame skips its inventory tick, and a tick whose candidate
+    /// build outlasts the frame budget defers its arming, so a host whose
+    /// record inflow or build cost exceeds one frame's budget would never
+    /// run a complete tick: no newcomer admitted, no late provider armed,
+    /// no settled request freed. Bounded by `MAX_DEFERRED_LIVE_FRAMES`.
+    deferred_live_frames: u64,
+    /// Inventory ticks the starvation bound ran past a deferral (evidence).
+    starvation_ticks: u64,
+    /// Set while a starvation-bound tick runs: views that still-queued
+    /// records name are shielded from refresh and retirement, exactly as
+    /// behind a parked pressure prefix.
+    starvation_tick_active: bool,
     /// Under-cap polling rescans queued (internal evidence).
     polling_rescans_queued: u64,
     /// Pids whose queued refresh is a polling rescan of an unarmed,
@@ -8203,6 +8216,13 @@ pub(crate) const DISCOVERY_HELD_CAP: usize = crate::attach::DiscoveryStage::CAPA
 /// drains are never bounded by it: they must finish their causal work.
 pub(crate) const LIVE_FRAME_WORK_BUDGET_NS: u64 = 100_000_000;
 
+/// Starvation bound for the H-1 frame budget: after this many consecutive
+/// live frames that ended with work deferred, the next frame runs its
+/// inventory tick to completion (deep-scan quantum and admission bound
+/// still apply). Without it a busy host whose record inflow or candidate
+/// build exceeds one frame budget never admits or arms a late provider.
+pub(crate) const MAX_DEFERRED_LIVE_FRAMES: u64 = 2;
+
 /// The one loss an under-cap polling rescan can reveal (F1): a provider-free
 /// process is never armed for loader events, so a provider it loads is found
 /// only by the next poll, and calls to it before then went unobserved. A poll
@@ -11345,6 +11365,9 @@ impl Engine {
             frame_deadline_ns: None,
             frame_deferred: false,
             frame_deferrals: 0,
+            deferred_live_frames: 0,
+            starvation_ticks: 0,
+            starvation_tick_active: false,
             polling_rescans_queued: 0,
             polled_pids: BTreeSet::new(),
             cancel_flag: None,
@@ -22848,7 +22871,9 @@ impl Engine {
     /// while the pass runs, and while its head episode still holds the
     /// parked prefix for another rotation opportunity.
     fn pressure_view_shielded(&self, pid: u32) -> bool {
-        (self.pressure_service_active || self.pressure_rotation_pending)
+        (self.pressure_service_active
+            || self.pressure_rotation_pending
+            || self.starvation_tick_active)
             && (self.pressure_protection.block_all || self.pressure_protection.pids.contains(&pid))
     }
 
@@ -31683,21 +31708,62 @@ impl Engine {
         // episode awaiting another rotation opportunity likewise runs no
         // ordinary whole-scope tick behind its parked prefix: the next
         // opportunity services the next snapshot entry first.
+        // Starvation bound: after `MAX_DEFERRED_LIVE_FRAMES` consecutive
+        // deferring live frames (deferred records, or a tick that deferred
+        // its own arming or export attach), this frame's tick runs anyway
+        // and to completion, past the spent frame budget (its own deep-scan
+        // quantum and admission bound still apply), with every view a
+        // queued record names shielded. Queued records keep their ring
+        // order for the next frame.
+        let live_frame = self.frame_deadline_ns.is_some()
+            && !terminal_dispatch
+            && !self.pause_owned_batch
+            && self.collected_finish_actions.is_none();
+        let tick_blocked = self.frame_deferred || self.pressure_rotation_pending;
+        let starved = live_frame && self.deferred_live_frames >= MAX_DEFERRED_LIVE_FRAMES;
         if self.pending_retirements.is_empty()
             && self.pending_rejected_keys.is_empty()
-            && !self.frame_deferred
-            && !self.pressure_rotation_pending
+            && (!tick_blocked || starved)
         {
             let mut tick_now = crate::attach::monotonic_ns;
-            changed |= self.refresh_inventory(
-                session,
-                &mut additions_allowed,
-                &mut records,
-                &mut pending_views,
-                collect,
-                &mut closure,
-                &mut tick_now,
-            )?;
+            if starved {
+                self.starvation_ticks = self.starvation_ticks.saturating_add(1);
+                let saved_deadline = self.frame_deadline_ns;
+                let saved_protection = self.pressure_protection.clone();
+                let mut protection = self.pressure_protection_for(&records, &[]);
+                protection
+                    .pids
+                    .extend(saved_protection.pids.iter().copied());
+                protection.block_all |= saved_protection.block_all;
+                self.pressure_protection = protection;
+                self.starvation_tick_active = true;
+                // Keep the operator-stop check; lift only the time budget.
+                self.frame_deadline_ns = Some(u64::MAX);
+                let result = self.refresh_inventory(
+                    session,
+                    &mut additions_allowed,
+                    &mut records,
+                    &mut pending_views,
+                    collect,
+                    &mut closure,
+                    &mut tick_now,
+                );
+                self.frame_deadline_ns = saved_deadline;
+                self.starvation_tick_active = false;
+                self.pressure_protection = saved_protection;
+                self.deferred_live_frames = 0;
+                changed |= result?;
+            } else {
+                changed |= self.refresh_inventory(
+                    session,
+                    &mut additions_allowed,
+                    &mut records,
+                    &mut pending_views,
+                    collect,
+                    &mut closure,
+                    &mut tick_now,
+                )?;
+            }
         }
         if !records.is_empty() {
             changed |= self.process_discovery_records(
@@ -31708,6 +31774,13 @@ impl Engine {
                 collect,
                 &mut closure,
             )?;
+        }
+        if live_frame && !starved {
+            self.deferred_live_frames = if self.frame_deferred || self.pressure_rotation_pending {
+                self.deferred_live_frames.saturating_add(1)
+            } else {
+                0
+            };
         }
         self.publish_batch_tail(changed)?;
         Ok(DiscoveryBatchOutcome {

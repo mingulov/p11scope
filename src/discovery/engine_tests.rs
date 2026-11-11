@@ -71834,6 +71834,41 @@ fn startup_split_brackets_every_segment_with_a_marker() {
     }
 }
 
+/// The session-start wall (dominated by BPF program loading) is named by
+/// the `-v` segment marker only: staging it as an Attach leaf span would
+/// charge load time to the discovery-batch stage totals and pin
+/// `longest_op` on every run.
+#[test]
+fn session_start_is_a_marker_not_a_stage_span() {
+    let source = include_str!("engine.rs");
+    let start = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("fn complete_initial_arming(")
+        .expect("completion bounds the start")
+        .0;
+    let session_start = start
+        .split_once("start_retained_with(self")
+        .expect("the retained start exists")
+        .1
+        .split_once("session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;")
+        .expect("the initial stage bounds session start")
+        .0;
+    assert!(
+        session_start.contains("startup_segment_line("),
+        "session start emits its segment marker"
+    );
+    assert!(
+        session_start.contains("\"session_start\""),
+        "the marker names the session_start segment"
+    );
+    assert!(
+        !session_start.contains("stage_timings.span("),
+        "session-start wall is never charged to a stage span"
+    );
+}
+
 /// Startup T3 twin 1a: a non-owned `start_session_with` returns with loader
 /// arming pending instead of arming. The start needs a live session, so the
 /// deferral is pinned statically: no arm call remains in the start, and the

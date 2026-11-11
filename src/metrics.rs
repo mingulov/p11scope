@@ -732,17 +732,28 @@ fn identity_notice_line(control: &KernelControl) -> Option<String> {
     ))
 }
 
-pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
-    let evidence: PerCpuArray<_, u64> =
-        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
-    let read =
-        |index| -> Result<u64> { Ok(saturating_total(evidence.get(&index, 0)?.iter().copied())) };
+/// Kernel control state alone (OWNER_CTL/COOKIE_CTL/ROOT_CTL),
+/// without touching EVIDENCE: the long-run identity-health sync must
+/// survive unrelated evidence-cell failures that fail
+/// [`kernel_evidence`] and would otherwise discard a readable spent
+/// COOKIE_CTL. Missing control maps (Inventory flavors) still read as
+/// default, like the combined read.
+pub fn kernel_control(session: &Session) -> Result<KernelControl> {
     let control = KernelControl::from_cells(
         control_cell::<ThreadOwnerControl>(session, "OWNER_CTL")?,
         control_cell::<ImageIdentityControl>(session, "COOKIE_CTL")?,
         control_cell::<RootAffiliationControl>(session, "ROOT_CTL")?,
     );
     notice_kernel_control(&control);
+    Ok(control)
+}
+
+pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
+    let control = kernel_control(session)?;
+    let evidence: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+    let read =
+        |index| -> Result<u64> { Ok(saturating_total(evidence.get(&index, 0)?.iter().copied())) };
     Ok(KernelEvidence {
         ring_loss: read(EVIDENCE_RING_LOSS)?,
         start_insert_failures: read(EVIDENCE_START_INSERT_FAILURES)?,

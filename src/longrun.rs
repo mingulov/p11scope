@@ -31,6 +31,7 @@ pub const FINDING_LOOP_STALLED: &str = "loop_stalled";
 pub const FINDING_EARLY_EVENT_LOSS: &str = "early_event_loss";
 pub const FINDING_EARLY_DISCOVERY_LOSS: &str = "early_discovery_loss";
 pub const FINDING_IDENTITY_BUDGET_EXHAUSTED: &str = "identity_budget_exhausted";
+pub const FINDING_IDENTITY_HEALTH_UNKNOWN: &str = "identity_health_unknown";
 pub const FINDING_NEWCOMER_QUEUE_STALLED: &str = "newcomer_queue_stalled";
 
 /// A newcomer still waiting past this age at loop end never got
@@ -162,6 +163,7 @@ pub struct LongRunDetector {
     max_gap_ms: Option<u64>,
     first_event_loss: Option<u64>,
     first_discovery_loss: Option<u64>,
+    identity_sampled: bool,
     identity_budget_exhausted: bool,
     identity_unavailable: u64,
     newcomer_pending: u64,
@@ -206,8 +208,11 @@ impl LongRunDetector {
     /// Latest kernel identity health (COOKIE_CTL): whether the
     /// lifetime budget is spent and how many identities were refused.
     /// Replaced, never merged: the loop syncs the latest snapshot,
-    /// with a final read at loop end.
+    /// with a final read at loop end. A sync also marks the health
+    /// sampled; without any sample the verdict reports unknown
+    /// identity health instead of substituting this healthy default.
     pub fn note_identity_budget(&mut self, exhausted: bool, unavailable: u64) {
+        self.identity_sampled = true;
         self.identity_budget_exhausted = exhausted;
         self.identity_unavailable = unavailable;
     }
@@ -266,6 +271,8 @@ impl LongRunDetector {
     /// Totals are the loop-end counters (the same values the scheduling
     /// snapshot publishes); first-drain readings never exceed them.
     /// Bounds are strict: a tick or gap exactly at its bound is clean.
+    /// Identity health without any sample is an unknown finding, never
+    /// a silent healthy default.
     pub fn finish(&self, total_event_loss: u64, total_discovery_loss: u64) -> LongRunReport {
         let mut findings = Vec::new();
         if self.max_tick_ms > self.config.tick_latency_max_ms {
@@ -306,7 +313,13 @@ impl LongRunDetector {
             total_discovery_loss,
         );
         findings.extend(discovery_finding);
-        if self.identity_budget_exhausted || self.identity_unavailable > 0 {
+        if !self.identity_sampled {
+            findings.push(LongRunFinding {
+                code: FINDING_IDENTITY_HEALTH_UNKNOWN,
+                detail: "identity health unknown (no usable kernel identity sample)".to_string(),
+                at_tick: None,
+            });
+        } else if self.identity_budget_exhausted || self.identity_unavailable > 0 {
             let detail = if self.identity_budget_exhausted {
                 format!(
                     "lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent; {} refused",
@@ -361,6 +374,7 @@ mod tests {
         detector.note_gap(2);
         detector.note_gap(45);
         detector.note_first_drain_loss(Some(0), 0);
+        detector.note_identity_budget(false, 0);
         detector
     }
 
@@ -715,7 +729,15 @@ mod tests {
     // default for an unread state.
     #[test]
     fn unread_identity_health_is_a_finding_never_clean() {
-        let mut detector = ordinary_detector();
+        // Built inline, not from `ordinary_detector()`: the helper
+        // carries a healthy identity sample, and this test pins the
+        // detector with no sample at all.
+        let mut detector = LongRunDetector::new(LongRunConfig::default());
+        for tick in 1..=120 {
+            detector.note_tick(tick, 2);
+        }
+        detector.note_gap(45);
+        detector.note_first_drain_loss(Some(0), 0);
         detector.note_newcomer(0, None);
         let report = detector.finish(0, 0);
         assert!(!report.is_clean(), "{report:?}");

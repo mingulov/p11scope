@@ -9303,6 +9303,10 @@ fn capture_profile(
         };
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
+        // Last-good identity sample for the long-run verdict: a tick
+        // whose COOKIE_CTL cell read unknown keeps the previous
+        // sample instead of overwriting it with unread zeros.
+        scheduling.sync_identity_evidence(&kernel_evidence);
 
         if tick_frame.render {
             last_frame = Instant::now();
@@ -9474,12 +9478,15 @@ fn capture_profile(
     );
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
-    // Final identity/newcomer sync for the long-run verdict: the loop
-    // never sampled them per tick, so the detector would otherwise
-    // report clean over a spent budget or a stalled queue. Best
-    // effort: a failed kernel read keeps the last synced state.
-    if let Ok(kernel) = metrics::kernel_evidence(session) {
-        scheduling.sync_identity_health(&kernel.control);
+    // Final identity/newcomer sync for the long-run verdict: the
+    // per-tick samples above are the last good state, and this
+    // independent control read refreshes it without the evidence
+    // cells, so an unrelated cell failure cannot discard a readable
+    // spent budget. Best effort: a failed read keeps the last synced
+    // sample, and a run that never sampled identity health reports it
+    // unknown, never clean.
+    if let Ok(control) = metrics::kernel_control(session) {
+        scheduling.sync_identity_health(&control);
     }
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
@@ -10801,6 +10808,13 @@ fn capture_trace(
                         context.6,
                         context.7,
                     );
+                    // Last-good identity sample for the long-run
+                    // verdict: the trace loop takes no snapshots, so
+                    // the control read stands alone beside the loss
+                    // report. Best effort, like the final sync.
+                    if let Ok(control) = metrics::kernel_control(context.1) {
+                        consumers.scheduling.sync_identity_health(&control);
+                    }
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, phase_start.elapsed());
@@ -10933,10 +10947,12 @@ fn capture_trace(
     );
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     // Final identity/newcomer sync for the long-run verdict, as on
-    // the profile path: without it the detector reports clean over a
-    // spent budget or a stalled queue. Best effort.
-    if let Ok(kernel) = metrics::kernel_evidence(session) {
-        scheduling.sync_identity_health(&kernel.control);
+    // the profile path: the independent control read refreshes the
+    // last-good per-tick sample without the evidence cells. Best
+    // effort: a failed read keeps the last synced sample, and a run
+    // that never sampled identity health reports it unknown.
+    if let Ok(control) = metrics::kernel_control(session) {
+        scheduling.sync_identity_health(&control);
     }
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
@@ -12221,12 +12237,25 @@ impl SchedulingAccumulator {
     /// Carries the kernel identity health (COOKIE_CTL) into the
     /// long-run detector: a spent lifetime budget blinds the capture
     /// to new processes, so the loop-end line must name it. Best
-    /// effort like every sync: a failed read keeps the last state.
+    /// effort like every sync: callers skip the call when the read
+    /// fails, so a failed read keeps the last synced sample, and the
+    /// detector reports unknown when no sample ever landed.
     pub(crate) fn sync_identity_health(&mut self, control: &crate::metrics::KernelControl) {
         self.longrun.note_identity_budget(
             control.identity_budget_exhausted,
             control.identity_unavailable,
         );
+    }
+
+    /// Carries one tick snapshot's identity health into the long-run
+    /// detector, keeping the last good sample: a snapshot whose
+    /// COOKIE_CTL cell read unknown contributes nothing, while
+    /// unrelated unknown EVIDENCE cells never block a readable
+    /// control.
+    pub(crate) fn sync_identity_evidence(&mut self, kernel: &crate::metrics::KernelEvidence) {
+        if kernel.unknown_cells & crate::metrics::LEGACY_UNKNOWN_COOKIE == 0 {
+            self.sync_identity_health(&kernel.control);
+        }
     }
 
     /// Carries the engine's batch-tail publication counters into the
@@ -24631,6 +24660,7 @@ int main(int argc, char **argv) {
         let mut clean = SchedulingAccumulator::default();
         clean.note_longrun_first_loss(Some(0), 0, true);
         clean.note_longrun_tick(1, Duration::from_millis(50));
+        clean.sync_identity_health(&crate::metrics::KernelControl::default());
         clean.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
         assert!(!clean.longrun_has_findings(true));
         let mut loud = SchedulingAccumulator::default();
@@ -24673,6 +24703,7 @@ int main(int argc, char **argv) {
         let start = Instant::now();
         acc.note_longrun_first_loss(Some(0), 0, true);
         acc.note_longrun_tick(1, Duration::from_millis(10));
+        acc.sync_identity_health(&crate::metrics::KernelControl::default());
         acc.note_drain_at(start);
         acc.note_drain_at(start + Duration::from_millis(10_000));
         acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
@@ -27208,7 +27239,9 @@ int main(int argc, char **argv) {
             .unwrap()
             .0;
         assert_eq!(
-            profile.matches("scheduling.sync_identity_evidence(&kernel_evidence)").count(),
+            profile
+                .matches("scheduling.sync_identity_evidence(&kernel_evidence)")
+                .count(),
             1,
             "capture_profile must feed each tick snapshot's readable control to the detector"
         );
@@ -27216,9 +27249,11 @@ int main(int argc, char **argv) {
             .find("metrics::kernel_control(context.1)")
             .expect("capture_trace must read identity health on every tick");
         assert!(
-            trace[tick..].split_once("consumers.scheduling.add_phase(").is_some_and(
-                |(before, _)| before.contains("consumers.scheduling.sync_identity_health(")
-            ),
+            trace[tick..]
+                .split_once("consumers.scheduling.add_phase(")
+                .is_some_and(
+                    |(before, _)| before.contains("consumers.scheduling.sync_identity_health(")
+                ),
             "capture_trace must sync its per-tick control read to the detector"
         );
     }

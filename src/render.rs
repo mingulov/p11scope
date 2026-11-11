@@ -3855,6 +3855,31 @@ fn semantic_state_counter(ev: &Evidence, cause: &str) -> Option<u64> {
     })
 }
 
+/// The concise identity-refusal fragment: the counter counts refusal
+/// attempts — including repeats for one leader — not distinct
+/// processes. Shared by the kernel-control cause and the
+/// missed-provider-load shortcut, so the shortcut never hides a spent
+/// budget behind the pause remedy. `None` while nothing was refused.
+fn identity_refusal_fragment(control: &crate::metrics::KernelControlEvidence) -> Option<String> {
+    if control.identity_unavailable == 0 {
+        return None;
+    }
+    let plain = format!(
+        "{} {}",
+        control.identity_unavailable,
+        if control.identity_unavailable == 1 {
+            "process identity refusal"
+        } else {
+            "process identity refusals"
+        }
+    );
+    Some(if control.identity_budget_exhausted {
+        format!("{plain} (lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent)")
+    } else {
+        plain
+    })
+}
+
 /// One human fragment per verdict cause, stating the count behind it.
 /// Concise text is plain words only; verbose pairs the machine cause
 /// name beside each plain fragment. A cause without a phrase folds
@@ -4241,19 +4266,8 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         "kernel ownership admissions refused",
                     )));
                 }
-                if control.identity_unavailable > 0 {
-                    let plain = count(
-                        control.identity_unavailable,
-                        "process refused an identity",
-                        "processes refused an identity",
-                    );
-                    fragments.push(tag(if control.identity_budget_exhausted {
-                        format!(
-                            "{plain} (lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent)"
-                        )
-                    } else {
-                        plain
-                    }));
+                if let Some(fragment) = identity_refusal_fragment(control) {
+                    fragments.push(tag(fragment));
                 }
                 for reason in &control.root_affiliation_failures {
                     fragments.push(tag(format!("kernel root affiliation failure: {reason}")));
@@ -4363,8 +4377,9 @@ pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
 /// tail: `coverage: complete`; `coverage: partial — counts complete; …`
 /// when names are the only gap (the text states the same PARTIAL verdict
 /// as JSON, with counts complete in plain words); the owned-run
-/// missed-load remedy; or `coverage: partial — <reasons>`. Verbose keeps
-/// the full grouped reasons beside the special cases.
+/// missed-load remedy, with an active identity-refusal fragment
+/// appended at default verbosity; or `coverage: partial — <reasons>`.
+/// Verbose keeps the full grouped reasons beside the special cases.
 pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
     if ev.completeness == "COMPLETE" {
         return "coverage: complete".to_string();
@@ -4373,9 +4388,14 @@ pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
         let mut line = "coverage: partial — the command loaded its provider before probes \
              attached; rerun with --pause auto"
             .to_string();
-        if verbose && let Some(reasons) = verdict_reason_body(ev, true) {
+        if verbose {
+            if let Some(reasons) = verdict_reason_body(ev, true) {
+                line.push_str("; ");
+                line.push_str(&escape_controls(&reasons));
+            }
+        } else if let Some(fragment) = identity_refusal_fragment(&ev.kernel_control) {
             line.push_str("; ");
-            line.push_str(&escape_controls(&reasons));
+            line.push_str(&escape_controls(&fragment));
         }
         return line;
     }

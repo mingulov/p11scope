@@ -123,7 +123,7 @@ far; lifetime budget of 16384 identities spent); ...`; the loop-end
 `p11scope: longrun:` line carries `identity_budget_exhausted[...]` and
 `newcomer_queue_stalled[...]` findings with counts instead of `clean`;
 the stalled `p11scope: timing: newcomer queue:` line prints; the
-coverage line names `N processes refused an identity (lifetime budget
+coverage line names `N process identity refusals (lifetime budget
 of 16384 identities spent)`; the JSON report is PARTIAL with
 `kernel_control.identity_unavailable`,
 `identity_budget_exhausted: true`, and the `newcomer_queue` counts.

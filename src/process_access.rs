@@ -504,4 +504,41 @@ mod tests {
         );
         assert!(stderr_line(&block).starts_with("p11scope: "));
     }
+
+    #[test]
+    fn fix_and_demo_offer_the_one_flag_option_first() {
+        // The one-flag `--security-opt apparmor=unconfined` comes FIRST; the
+        // loaded profile is the hardened option.
+        fn unconfined_first(text: &str, what: &str) {
+            let quick = text
+                .find("apparmor=unconfined")
+                .unwrap_or_else(|| panic!("{what} offers the one-flag option"));
+            let hardened = text
+                .find("apparmor=p11scope-observer")
+                .unwrap_or_else(|| panic!("{what} offers the hardened profile"));
+            assert!(
+                quick < hardened,
+                "{what} offers unconfined first ({quick} vs {hardened})"
+            );
+        }
+        unconfined_first(FIX, "FIX");
+        let sample = AccessSample {
+            attempted: 32,
+            denied: 31,
+        };
+        let check = check_row(Some(LABEL), &sample, true);
+        let Status::Fail(detail) = check.status else {
+            panic!("must fail, got {:?}", check.status);
+        };
+        unconfined_first(&detail, "doctor row");
+        let block = AccessBlock {
+            label: LABEL.to_string(),
+            denied: 31,
+            attempted: 32,
+        };
+        unconfined_first(&stderr_line(&block), "stderr line");
+        unconfined_first(&gap_reason(&block, None), "gap");
+        unconfined_first(&gap_reason(&block, Some(164)), "gap with count");
+        unconfined_first(include_str!("../docs/demo.md"), "docs/demo.md");
+    }
 }

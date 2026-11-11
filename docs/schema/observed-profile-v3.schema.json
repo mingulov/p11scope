@@ -361,7 +361,7 @@
             "additionalProperties": false,
             "required": ["name", "effect", "value"],
             "properties": {
-              "name": {"enum": ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"]},
+              "name": {"enum": ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED", "P11SCOPE_DISABLE_FILE_LEARNING"]},
               "effect": {"type": "string", "minLength": 1},
               "value": {"type": ["string", "null"]}
             }
@@ -580,6 +580,8 @@
                   "file learning reached its 32-file per-capture cap; further provider files were not learned",
                   "file learning was unavailable; short-lived first loads of new provider files were not learned",
                   "a provider file was replaced or deleted before staging; it was not learned",
+                  "file learning was disabled by the operator; short-lived first loads of new provider files were not learned",
+                  "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned",
                   "the owned startup step failed before the capture loop; the report holds what was captured up to the failure",
                   "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure",
                   "the terminal identity recheck failed; provider sameness is unproven",

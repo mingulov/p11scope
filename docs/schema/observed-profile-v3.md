@@ -1033,6 +1033,16 @@ Learned-file gaps file under their own subject. Each record is
   learned`: the drain proved a provider on held bytes, but the held
   file was unlinked (deleted, or replaced by a rename over its path)
   before staging, so it was refused instead of staged.
+- `file learning was disabled by the operator; short-lived first loads
+  of new provider files were not learned`: the operator set
+  `P11SCOPE_DISABLE_FILE_LEARNING=1`, so the drain never started.
+  Ordinary discovery still ran; this names only the learning loss.
+- `file learning cannot see filesystems outside the observer's mount
+  namespace; provider files opened only there were not learned`: the
+  observer's mount namespace differs from pid 1's (for example a
+  `--pid=host` container, or the host watching rootless podman), and
+  filesystem marks are placed from the observer's own mount table
+  only. In-namespace learning still ran.
 
 No path, pid, or executable ever appears in these rows: anything else
 filed under the subject redacts to the generic `discovery subject` /

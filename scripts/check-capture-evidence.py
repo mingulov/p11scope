@@ -251,7 +251,11 @@ NULL_POINTER_REASON = "null pointer"
 # SYSPLAN residual F-01: the only override flag durable evidence may name.
 URETPROBE_OVERRIDE_FLAG = "--allow-uretprobe-on-confined-target"
 # SYSPLAN residual F-26: capture-visible environment switches.
-P11SCOPE_ENV_VARS = {"P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"}
+P11SCOPE_ENV_VARS = {
+    "P11SCOPE_BROAD_ADMIT",
+    "P11SCOPE_LOADER_ENV_SANITIZED",
+    "P11SCOPE_DISABLE_FILE_LEARNING",
+}
 # SYSPLAN residual F-12: machine-readable lane discriminators.
 PROFILE_LANE = "profile"
 METRICS_LANE = "metrics"
@@ -675,12 +679,22 @@ LEARNED_REPLACED_DELETED_REASON = (
     "a provider file was replaced or deleted before staging; "
     "it was not learned"
 )
+LEARNED_DISABLED_REASON = (
+    "file learning was disabled by the operator; short-lived first loads "
+    "of new provider files were not learned"
+)
+LEARNED_MOUNT_NAMESPACE_REASON = (
+    "file learning cannot see filesystems outside the observer's mount "
+    "namespace; provider files opened only there were not learned"
+)
 LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,
     LEARNED_OVERFLOW_REASON,
     LEARNED_CAP_REASON,
     LEARNED_UNAVAILABLE_REASON,
     LEARNED_REPLACED_DELETED_REASON,
+    LEARNED_DISABLED_REASON,
+    LEARNED_MOUNT_NAMESPACE_REASON,
 }
 # Owned-handoff (v0.7.0): a run whose startup step failed after probes
 # attached seals a partial report naming the failed step, with every

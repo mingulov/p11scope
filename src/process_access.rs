@@ -396,6 +396,19 @@ mod tests {
     }
 
     #[test]
+    fn sample_spreads_gates_across_clustered_candidates() {
+        // Kernel threads cluster at low pids: when the first 64 candidates
+        // are all mapsless, the sample must still reach the user processes
+        // behind them.
+        let candidates: Vec<u32> = (1..=200).collect();
+        let has_maps = |pid: u32| pid > 64;
+        let open_mem = |_: u32| Ok(());
+        let sample = sample(&candidates, &has_maps, &open_mem);
+        assert_eq!(sample.attempted, SAMPLE_ATTEMPTS);
+        assert_eq!(sample.denied, 0);
+    }
+
+    #[test]
     fn sample_bounds_the_probe_count() {
         let candidates: Vec<u32> = (1000..1100).collect();
         let probed = std::sync::Mutex::new(0usize);

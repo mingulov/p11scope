@@ -796,6 +796,21 @@ pub(crate) fn sample_for_pid(
     admitted_start_time: Option<u64>,
     pin: &crate::process::PidPin,
 ) -> Option<AppHint> {
+    sample_for_pid_with_proc(pid, exe, admitted_start_time, pin, pid)
+}
+
+/// Sample one admission hint, reading the numeric `/proc` entries of
+/// `proc_pid` while the admission pin still names `pid`. Production
+/// always passes `proc_pid == pid`; tests redirect the numeric reads
+/// to a live replacement to model numeric PID reuse after the
+/// original exits.
+fn sample_for_pid_with_proc(
+    pid: u32,
+    exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
+    admitted_start_time: Option<u64>,
+    pin: &crate::process::PidPin,
+    proc_pid: u32,
+) -> Option<AppHint> {
     // Without the admission pidfd there is no exact reuse check: the
     // start-time comparison below is tick-granular and would accept a
     // same-tick same-binary reuse inside the sample window. Refuse the
@@ -807,13 +822,13 @@ pub(crate) fn sample_for_pid(
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
-    let start_before = crate::process::process_start_time(pid).ok();
+    let start_before = crate::process::process_start_time(proc_pid).ok();
     let comm = match interpreter {
-        Some(interpreter) if comm_eligible(interpreter) => read_comm(pid),
+        Some(interpreter) if comm_eligible(interpreter) => read_comm(proc_pid),
         _ => None,
     };
     let (cmdline, cgroup) = match interpreter {
-        Some(_) => (read_cmdline_prefix(pid), read_cgroup_text(pid)),
+        Some(_) => (read_cmdline_prefix(proc_pid), read_cgroup_text(proc_pid)),
         None => (None, None),
     };
     let hint = app_hint_for(
@@ -824,7 +839,7 @@ pub(crate) fn sample_for_pid(
     )?;
     // TOCTOU close: the sampled facts belong to the admitted image and
     // generation only if neither changed under the reads.
-    let current = crate::discovery::caller_registry::read_exe_identity(pid)?;
+    let current = crate::discovery::caller_registry::read_exe_identity(proc_pid)?;
     if current != *exe {
         return None;
     }
@@ -834,7 +849,10 @@ pub(crate) fn sample_for_pid(
     if admitted_start_time != start_before {
         return None;
     }
-    if !sampled_generation_intact(start_before, crate::process::process_start_time(pid).ok()) {
+    if !sampled_generation_intact(
+        start_before,
+        crate::process::process_start_time(proc_pid).ok(),
+    ) {
         return None;
     }
     Some(hint)
@@ -1807,6 +1825,66 @@ mod tests {
         (child, pid, script, script_name)
     }
 
+    /// Live python sleeper like `spawn_python_sleeper`, but with a
+    /// caller-chosen filename stem (plus a per-process sequence) so one
+    /// test can run two sleepers with distinct script names. Returns
+    /// the child, its pid, the script path, and the script file name;
+    /// the caller kills, waits, and removes the script.
+    fn spawn_python_sleeper_stemmed(
+        stem: &str,
+    ) -> (std::process::Child, u32, std::path::PathBuf, String) {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SLEEPER_SEQ: AtomicU64 = AtomicU64::new(0);
+        let python = {
+            let out = Command::new("sh")
+                .args(["-c", "command -v python3"])
+                .output()
+                .expect("sh runs");
+            assert!(out.status.success(), "python3 is required for this test");
+            String::from_utf8(out.stdout)
+                .expect("utf8 path")
+                .trim()
+                .to_string()
+        };
+        assert!(python.starts_with('/'), "python3 path: {python}");
+        let seq = SLEEPER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let script = std::env::temp_dir().join(format!(
+            "p11scope-app-hint-{stem}-{}-{seq}.py",
+            std::process::id()
+        ));
+        let script_name = script
+            .file_name()
+            .expect("script file name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&script, "import time\ntime.sleep(30)\n").expect("write script");
+        let child = Command::new(&python)
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python sleeper");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline
+                .windows(script_name.len())
+                .any(|window| window == script_name.as_bytes())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "python sleeper never execed its script"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (child, pid, script, script_name)
+    }
+
     #[test]
     fn sampler_refuses_a_hint_without_an_admission_pidfd() {
         use crate::discovery::caller_registry::read_exe_identity;
@@ -1834,6 +1912,140 @@ mod tests {
             None,
             "without an admission pidfd a same-tick reuse would pass \
              the start-time check, so there is no hint"
+        );
+        child.kill().ok();
+        let _ = child.wait();
+        std::fs::remove_file(&script).ok();
+    }
+
+    #[test]
+    fn sampler_refuses_replacement_reads_once_the_original_exited() {
+        use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::{PidPin, process_start_time};
+        // Numeric PID reuse, modelled deterministically: the original
+        // exits and is reaped while its pidfd is held, and the numeric
+        // `/proc` reads are redirected to a live same-exe same-tick
+        // replacement. A held pidfd preserves the old reference, not
+        // the numeric PID's allocation, so every numeric comparison
+        // passes — only the original's liveness refuses the label.
+        // Births share a clock tick when both forks land inside one
+        // 10 ms window, so spawn the pair back to back and retry the
+        // pair (never one side: a later fork ticks later) until the
+        // start times match.
+        let mut pair = None;
+        for _ in 0..100 {
+            let (mut first, first_pid, first_script, _) =
+                spawn_python_sleeper_stemmed("reuse-orig");
+            let (mut second, second_pid, second_script, second_name) =
+                spawn_python_sleeper_stemmed("reuse-repl");
+            let first_start = process_start_time(first_pid).expect("original start time");
+            let second_start = process_start_time(second_pid).expect("replacement start time");
+            if first_start == second_start {
+                pair = Some((
+                    first,
+                    first_pid,
+                    first_script,
+                    second,
+                    second_pid,
+                    second_script,
+                    second_name,
+                ));
+                break;
+            }
+            first.kill().ok();
+            let _ = first.wait();
+            second.kill().ok();
+            let _ = second.wait();
+            std::fs::remove_file(&first_script).ok();
+            std::fs::remove_file(&second_script).ok();
+        }
+        let (
+            mut original,
+            original_pid,
+            original_script,
+            mut replacement,
+            replacement_pid,
+            replacement_script,
+            replacement_name,
+        ) = pair.expect("a same-tick original/replacement pair");
+        let original_exe = read_exe_identity(original_pid).expect("original exe identity");
+        let admitted = process_start_time(original_pid).expect("original start time");
+        let pin = PidPin::open(original_pid).expect("original pin");
+        assert!(
+            pin.pidfd().is_ok(),
+            "this host must grant pidfds for the sampler twins"
+        );
+        // Healthy control: the live original keeps its argv hint.
+        let control = sample_for_pid(original_pid, Some(&original_exe), Some(admitted), &pin)
+            .expect("the live original keeps its argv hint");
+        assert_eq!(control.source, AppHintSource::Argv);
+        // The reuse model needs identical exe identities and a
+        // replacement whose own reads yield a hint, so a `None`
+        // below comes from the original's death, not unreadable or
+        // unparsed facts.
+        let replacement_exe = read_exe_identity(replacement_pid).expect("replacement exe");
+        assert_eq!(
+            replacement_exe, original_exe,
+            "the reuse model needs identical exe identities"
+        );
+        let replacement_pin = PidPin::open(replacement_pid).expect("replacement pin");
+        let replacement_hint = sample_for_pid(
+            replacement_pid,
+            Some(&replacement_exe),
+            Some(admitted),
+            &replacement_pin,
+        )
+        .expect("the replacement reads yield a hint under their own admission");
+        assert_eq!(replacement_hint.value, replacement_name);
+        original.kill().ok();
+        let _ = original.wait();
+        assert!(
+            !pin.still_the_same(),
+            "the reaped original's pidfd must poll ready"
+        );
+        assert_eq!(
+            sample_for_pid_with_proc(
+                original_pid,
+                Some(&original_exe),
+                Some(admitted),
+                &pin,
+                replacement_pid,
+            ),
+            None,
+            "a dead original must refuse numeric reads even when a same-exe \
+             same-tick replacement passes every numeric comparison"
+        );
+        replacement.kill().ok();
+        let _ = replacement.wait();
+        std::fs::remove_file(&original_script).ok();
+        std::fs::remove_file(&replacement_script).ok();
+    }
+
+    #[test]
+    fn sampler_refuses_a_changed_executable_identity() {
+        use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::{PidPin, process_start_time};
+        // The eligible runtime keeps its hint (control); the same
+        // sampler with only the exe inode changed — runtime path and
+        // admitted tick kept — drops it at the exe-identity fence.
+        let (mut child, pid, script, script_name) = spawn_python_sleeper_stemmed("exe-fence");
+        let exe = read_exe_identity(pid).expect("child exe identity");
+        let admitted = process_start_time(pid).expect("child start time");
+        let pin = PidPin::open(pid).expect("child pin");
+        assert!(
+            pin.pidfd().is_ok(),
+            "this host must grant pidfds for the sampler twins"
+        );
+        let hint = sample_for_pid(pid, Some(&exe), Some(admitted), &pin)
+            .expect("the admitted runtime keeps its argv hint");
+        assert_eq!(hint.value, script_name);
+        assert_eq!(hint.source, AppHintSource::Argv);
+        let mut changed = exe.clone();
+        changed.ino = changed.ino.wrapping_add(1);
+        assert_eq!(
+            sample_for_pid(pid, Some(&changed), Some(admitted), &pin),
+            None,
+            "a changed exe identity drops the hint"
         );
         child.kill().ok();
         let _ = child.wait();

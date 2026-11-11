@@ -6285,16 +6285,20 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // The 7.3+ exec-release and 6/7-argument copy_vma variants add one
     // program each; one of each pair loads. The loader gate adds five
     // maps (bank B, select word, gate rows/control) with no new program.
+    // The ring cross-check adds the PRODUCED submitted-counter map to
+    // every object, so every count below is one above its pre-ringcheck
+    // value; the gate count also repairs its birth off-by-one (the
+    // comment always said default plus five, the tuple said 48).
     let (maps, programs) = if gate {
-        (48, 22)
+        (50, 22)
     } else if unsafe_build {
-        (44, 27)
+        (45, 27)
     } else if wide {
-        if marker { (44, 22) } else { (42, 22) }
+        if marker { (45, 22) } else { (43, 22) }
     } else if marker {
-        (44, 22)
+        (45, 22)
     } else {
-        (42, 22)
+        (43, 22)
     };
     let report = run_ok(
         "python3",

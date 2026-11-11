@@ -196,6 +196,99 @@
       "identical": [],
       "lane": "identity ticket budget 262144 (rc-19 integration)",
       "rationale": "Identity native widening on top of the transition above (reviewed IMAGE_IDENTITY_TICKET_LIMIT 16384 to 262144 and IMAGE_IDENTITY_INCARNATION_LIMIT 2^48 to 2^44): code sections are byte-identical to transition 3 (.text +504/+64 B, uprobe +40 B, so no BPF logic growth: the widened limits change immediates only) and only BTF/debug metadata moves (.BTF +36, .debug_abbrev +10, .debug_info +23 on the Detailed object); both Inventory objects keep exactly the transition-3 deltas. Map capacities are load-time userspace .map_max_entries, not object content. No section is added or removed."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "v0.7.0 rc line (measured at 72a9375f535b7529614bcf0c655fa4afa3498f41, CI run 43063165959 bpf-noninterference job; BPF inputs identical from the refused-base produced count through the rc-20 tip; the record pins the run-independent diff shape)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF": 162,
+            ".BTF.ext": 240,
+            ".debug_abbrev": 14,
+            ".debug_addr": 152,
+            ".debug_info": 1839,
+            ".debug_line": 302,
+            ".debug_loclists": 1533,
+            ".debug_rnglists": 102,
+            ".debug_str": 85,
+            ".debug_str_offsets": 16,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 240,
+            ".rel.debug_addr": 304,
+            ".rel.debug_info": 720,
+            ".rel.debug_str_offsets": 64,
+            ".rel.text": 112,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 904,
+            "maps": 28,
+            "uprobe": 184
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 128,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1024,
+            ".debug_line": 97,
+            ".debug_loclists": 383,
+            ".debug_rnglists": 41,
+            ".debug_str": 83,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 128,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 112,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 144,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1058,
+            ".debug_line": 101,
+            ".debug_loclists": 391,
+            ".debug_rnglists": 51,
+            ".debug_str": 72,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 144,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 176,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "ring produced/consumed cross-check (rc-20 integration)",
+      "rationale": "The ring cross-check on top of the transition above (7f873bbdd adds the PRODUCED per-ring submitted map with its bump helper and the emit-site bumps; 5af02efc8 counts the generic refused base the same way): every object gains one 28-byte map definition (maps +28 B) with no added or removed section. The Detailed object grows .text by 400 B (cumulative +904) and uprobe by 144 B (cumulative +184); Inventory and Callers gain the shared discovery bump (each .text +112 B, each uprobe +128 B). Relocation tables, BTF and debug info move with the new calls."
     }
   ],
   "version": 1

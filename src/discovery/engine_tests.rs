@@ -42458,6 +42458,79 @@ fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
     assert!(outcome.changed());
 }
 
+/// Late-route pin revalidation: a complete rescan that finds exactly the
+/// same files (same maps keys) must still replace — not retain — when the
+/// view's pins no longer validate. An in-place rewrite (same inode, new
+/// bytes) keeps the key but fails `check_unchanged`; retaining would
+/// credit the new bytes as the old file.
+#[test]
+fn e07_same_files_with_changed_pins_replaces_stale_identity() {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        !e07_active_targets(&engine).is_empty(),
+        "the provider is attached before the rewrite"
+    );
+    assert!(
+        engine.view_pins_unchanged(view_id),
+        "pins validate before the rewrite"
+    );
+
+    // In-place rewrite: same inode, new bytes. Appending keeps the ELF
+    // parseable so the rescan still finds the same mapping key.
+    let inode_before = std::fs::metadata(&provider.path).unwrap().ino();
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&provider.path)
+            .unwrap();
+        file.write_all(&[0u8; 16]).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&provider.path).unwrap().ino(),
+        inode_before,
+        "the rewrite keeps the file key"
+    );
+    assert!(
+        !engine.view_pins_unchanged(view_id),
+        "the rewritten file fails revalidation"
+    );
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        engine.pinned.check_unchanged().unwrap(),
+        "replaced pins validate; stale identity must retire, not be retained"
+    );
+    assert!(
+        !e07_active_targets(&engine).is_empty(),
+        "the provider stays attached under its fresh identity"
+    );
+}
+
 /// A loader rescan against a stale process generation is an error, never a
 /// retirement: the engine's modules, pins and plan are untouched.
 #[test]

@@ -2586,6 +2586,13 @@ def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
     outcomes = set(module["corroboration"])
     if sources == ["manifest"]:
         return True
+    if sources == ["scan"]:
+        # Controller ruling 00:20 (v0.7.1): scan-only joins follow the
+        # mechanisms ruling — layout evidence (interface linkage, sole
+        # complete table, typed getter export) authorizes the join, the
+        # same ground the verdict rule accepts; a scan-only module
+        # without it stays ineligible.
+        return not scan_only_module_lacks_layout_evidence(module)
     return (
         sources == ["scan", "manifest"]
         and "agreed" in outcomes
@@ -2707,6 +2714,39 @@ def exact_prearm_keys(module):
         )
 
 
+def scan_table_layout_evidence(table):
+    """Whether one scan table carries standard-layout evidence.
+
+    Controller ruling 00:20 (v0.7.1): the scan-only verdict follows the
+    mechanisms ruling — a standard provider admitted by scan with layout
+    evidence (interface linkage, sole complete table, typed getter export)
+    is not PARTIAL on that ground. The oracle sees the JSON evidence
+    only: `interface` linkage IS the interface leg (the provider's own
+    "PKCS 11" record names this table, so no export count is required),
+    while a fully export-verified table on a non-heuristic linkage is the
+    visible proxy for the sole-complete / typed-getter-export legs (a
+    live return outranks `exports` without erasing the agreement behind
+    it). Anything else — heuristic, partial or unwitnessed agreement, an
+    empty table — fails closed: no layout evidence.
+    """
+    if table.get("linkage") == "interface":
+        return True
+    entries = table.get("entries")
+    agreeing = table.get("exports_agreeing")
+    return (
+        table.get("linkage") in ("exports", "live_return")
+        and u64(entries, positive=True)
+        and type(agreeing) is int
+        and agreeing == entries
+    )
+
+
+def scan_only_module_lacks_layout_evidence(module):
+    """Whether a scan-only module has no layout evidence for some table."""
+    tables = [table for table in module["tables"] if table.get("source") == "scan"]
+    return not tables or not all(map(scan_table_layout_evidence, tables))
+
+
 def exact_discovery_semantics(evidence):
     conflicts = 0
     for module in evidence["discovery"]:
@@ -2762,7 +2802,10 @@ def exact_discovery_semantics(evidence):
         evidence["discovery_conflicts"] == conflicts,
         f"discovery_conflicts: want {conflicts}, got {evidence['discovery_conflicts']}",
     )
-    if any(module["sources"] == ["scan"] for module in evidence["discovery"]):
+    if any(
+        module["sources"] == ["scan"] and scan_only_module_lacks_layout_evidence(module)
+        for module in evidence["discovery"]
+    ):
         require(
             evidence["completeness"] == "PARTIAL",
             "scan-only semantic evidence cannot be COMPLETE",
@@ -5428,14 +5471,29 @@ def self_test():
         ),
         "exact agreed scan+manifest must be eligible",
     )
+    # Controller ruling 00:20 (v0.7.1): joins follow the mechanisms
+    # ruling — the export-verified scan-only table is joinable, while a
+    # scan-only table without layout evidence stays ineligible.
+    require(
+        semantic_join_eligible(
+            clean["functions"][0],
+            clean["evidence"]["discovery"][0],
+            has_manifest_object_fallback=False,
+        ),
+        "layout-evidenced scan-only function is semantic-joinable",
+    )
+    bare_scan = copy.deepcopy(clean)
+    bare_scan["evidence"]["discovery"][0]["tables"][0].update(
+        linkage="heuristic", exports_agreeing=0
+    )
     rejected(
         lambda: require(
             semantic_join_eligible(
-                clean["functions"][0],
-                clean["evidence"]["discovery"][0],
+                bare_scan["functions"][0],
+                bare_scan["evidence"]["discovery"][0],
                 has_manifest_object_fallback=False,
             ),
-            "scan-only function is not semantic-joinable",
+            "scan-only function without layout evidence is not semantic-joinable",
         )
     )
     conflict = copy.deepcopy(corroborated)
@@ -7207,9 +7265,18 @@ def self_test():
     bad["evidence"]["discovery"][0]["corroboration"] = ["conflict"]
     bad["evidence"]["discovery_conflicts"] = 0
     semantic_mutations.append(("conflict counter mismatch", bad))
-    bad = copy.deepcopy(clean)
-    bad["evidence"]["completeness"] = "COMPLETE"
-    semantic_mutations.append(("scan-only complete", bad))
+    # Retired by controller ruling 00:20 (v0.7.1): "scan-only complete"
+    # is no longer a rejection — a layout-evidenced scan-only capture may
+    # be COMPLETE. These twins pin both arms.
+    evidenced_complete = copy.deepcopy(clean)
+    evidenced_complete["evidence"]["completeness"] = "COMPLETE"
+    exact_capture_modules(evidenced_complete)
+    bare_complete = copy.deepcopy(clean)
+    bare_complete["evidence"]["discovery"][0]["tables"][0].update(
+        linkage="heuristic", exports_agreeing=0
+    )
+    bare_complete["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_capture_modules(bare_complete))
     bad = copy.deepcopy(clean)
     bad["evidence"]["discovery"][0]["objects"][0]["sources"] = ["bogus"]
     semantic_mutations.append(("unknown object source", bad))

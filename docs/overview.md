@@ -577,8 +577,9 @@ rename). `-o` names a regular file: a directory, a device node such as
 starts, never replaced.
 
 Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
-while scan-only semantic claims remain. P11Lab joins reject scan-only and
-conflict modules; an accepted manifest may authorize only its exact pinned
+while scan-only semantic claims without layout evidence remain. P11Lab joins
+reject scan-only modules without layout evidence, and conflict modules; an
+accepted manifest may authorize only its exact pinned
 object, offset, and canonical function name. `p11scope run` never
 implicitly releases a root child: a non-root observer keeps its UID/GID while
 losing capabilities, and a sudo-root observer requires valid non-root

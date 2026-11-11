@@ -2825,8 +2825,9 @@ implements the ABI role named in its own function table.
 Memory scanning itself is heuristic discovery. Scan-only discovery is
 semantics-unverified and count-only: it retains aggregate
 counts/RVs/latency but creates no semantic interpretation. Live and terminal
-evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
-scan-only and conflict modules. An accepted manifest authorizes only the exact
+evidence are PARTIAL while scan-only semantic claims without layout evidence
+remain. P11Lab joins reject scan-only modules without layout evidence, and
+conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
 attestation.

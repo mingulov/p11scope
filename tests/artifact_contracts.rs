@@ -9758,11 +9758,11 @@ fn operator_docs_preserve_semantic_authority_limits() {
     for (path, statement) in [
         (
             "docs/overview.md",
-            "Live and terminal evidence are PARTIAL while scan-only semantic claims remain",
+            "Live and terminal evidence are PARTIAL while scan-only semantic claims without layout evidence remain",
         ),
         (
             "docs/usage.md",
-            "P11Lab joins reject scan-only and conflict modules",
+            "P11Lab joins reject scan-only modules without layout evidence, and conflict modules",
         ),
         (
             "CHANGELOG.md",

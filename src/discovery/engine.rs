@@ -26507,6 +26507,22 @@ impl Engine {
         // fresh object id on the next build, retiring its whole slot
         // generation and allocating a duplicate one, so its calls would
         // fall in detach/reattach windows and never count.
+        // The complement the replay skips: retained live contexts the
+        // rescan below must settle first (same files keep their pins).
+        // Only a rescan that does not complete falls back to the
+        // conservative cleanup, after it.
+        let rescan_contexts: BTreeSet<_> = context_retirements
+            .iter()
+            .copied()
+            .filter(|view| {
+                !removed.contains(view)
+                    && self
+                        .views
+                        .iter()
+                        .find(|candidate| candidate.id() == *view)
+                        .is_some_and(ProcessView::still_the_same)
+            })
+            .collect();
         let completed_retirements =
             completed_retirement_intent(&removed, &context_retirements, &failed_retirements);
         self.pending_retirements
@@ -26573,6 +26589,19 @@ impl Engine {
         refreshed_scans = rescanned;
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
+        let unscanned_contexts: Vec<_> = rescan_contexts
+            .iter()
+            .filter(|view| !failed_retirements.contains(view) && !refreshed_ok.contains(view))
+            .copied()
+            .collect();
+        if !unscanned_contexts.is_empty() {
+            self.pending_retirements.extend(unscanned_contexts);
+            self.mark_partial(
+                "live inventory transaction",
+                "completed conservative retirement remains queued for a later current-state rebuild",
+            );
+            return Ok(changed);
+        }
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
         let mut candidate = match inventory_candidate_observed(
             session,

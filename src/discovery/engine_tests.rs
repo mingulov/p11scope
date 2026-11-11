@@ -57446,8 +57446,17 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     let (_fixture, mut engine, mut session) = continuity_route();
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
+    // Pinned pressure: the pending-refresh relief evicts only ownerless
+    // departed entries, so pin every filled request to a foreign owner no
+    // view carries. The live EXEC below must still be refused by a
+    // genuinely full queue; departed-fill admission is pinned separately
+    // by late_holder_refresh_queues_past_departed_pending.
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(1)));
+        assert!(engine.request_refresh_consumed_for_view(
+            FAKE_PID_FLOOR + offset,
+            Some(1),
+            ProcessViewId(u32::MAX)
+        ));
     }
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());

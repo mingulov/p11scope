@@ -75499,3 +75499,54 @@ fn learned_unavailable_files_a_named_gap() {
     assert!(pid_engine.file_learner.is_none());
     assert!(pid_engine.counters.object_skips.is_empty());
 }
+
+/// The file-only apply attaches a staged learned file without any
+/// discovery batch or inventory refresh: the plan gains the module in
+/// the same service tick, and the shallow-idle latch discharges.
+#[test]
+fn learned_staging_applies_without_a_discovery_batch() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(
+        !engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.path.contains("seed-provider.so")),
+        "staging alone must not attach yet, or this twin proves nothing"
+    );
+    let mut session = ScriptedSession::with_records([], 0);
+    engine.apply_learned_staging(&mut session);
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.path.contains("seed-provider.so")),
+        "the file-only apply joins the learned provider to the plan"
+    );
+    assert!(
+        engine.discovery_shallow_idle(),
+        "the apply discharges the shallow-idle latch"
+    );
+}

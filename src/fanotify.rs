@@ -312,22 +312,27 @@ fn elf_may_export_entry_points(file: &std::fs::File) -> Result<bool, String> {
     // requiring only the trailing delimiter (NUL or the version `@`).
     // A longer name that merely contains an entry name mid-word still
     // passes this pre-test and is refused by the full parse; the
-    // pre-test must never refuse a real provider.
-    for entry in ENTRY_NAMES {
-        let mut start = 0;
-        while start + entry.len() <= names.len() {
-            let Some(relative) = names[start..]
-                .windows(entry.len())
-                .position(|window| window == entry)
-            else {
-                break;
-            };
-            let at = start + relative;
-            match names.get(at + entry.len()) {
-                None | Some(0) | Some(b'@') => return Ok(true),
-                _ => start = at + 1,
+    // pre-test must never refuse a real provider. One pass over the
+    // shared `C_Get` prefix: the drain runs this on every distinct
+    // ELF a busy system opens, so per-name rescans are too slow.
+    let mut start = 0;
+    while start + 5 <= names.len() {
+        let Some(relative) = names[start..]
+            .windows(5)
+            .position(|window| window == b"C_Get")
+        else {
+            break;
+        };
+        let at = start + relative;
+        for entry in ENTRY_NAMES {
+            if names[at..].starts_with(entry) {
+                match names.get(at + entry.len()) {
+                    None | Some(0) | Some(b'@') => return Ok(true),
+                    _ => {}
+                }
             }
         }
+        start = at + 1;
     }
     Ok(false)
 }

@@ -19586,6 +19586,55 @@ impl Engine {
         }
     }
 
+    /// Attaches a just-staged learned file without waiting for the
+    /// next whole-scope inventory refresh: the pins already absorbed
+    /// into the committed set at staging, so a candidate rebuilt from
+    /// the current pins and modules (the loader-record shape) carries
+    /// exactly the new pre-arm slots as its delta. Event-driven per
+    /// file: a busy host's deferred frames can otherwise hold the
+    /// refresh — and with it this attach — for tens of seconds while
+    /// one-shot runs keep missing. Complex states (a global
+    /// retirement in flight, a pause-owned batch) keep the ordinary
+    /// refresh path; a failure likewise leaves the latch set for it.
+    pub(crate) fn apply_learned_staging(&mut self, session: &mut dyn EngineSession) {
+        if !self.learned_unapplied
+            || self.pending_global_retirement.is_some()
+            || self.pause_owned_batch
+            || self.continuity_deferred
+        {
+            return;
+        }
+        let applied = self.with_live_frame(|engine| {
+            let candidate_pins = engine.pinned.clone();
+            let raw_modules: Vec<_> = engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect();
+            let candidate = engine.live_candidate(candidate_pins, raw_modules, Vec::new())?;
+            let mut additions_allowed = true;
+            let outcome =
+                engine.apply_candidate(session, candidate, &mut additions_allowed, false, &[])?;
+            engine.record_apply_timing(&outcome);
+            let mut pending_views = PendingViewRetirements::new();
+            engine.queue_apply_outcome(&outcome, &mut pending_views);
+            Ok(additions_allowed)
+        });
+        match applied {
+            Ok(true) => {
+                self.learned_unapplied = false;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!(
+                        "p11scope: learned staging apply failed: {error}; the ordinary refresh retries"
+                    );
+                }
+            }
+        }
+    }
+
     fn process_loader_record(
         &mut self,
         queued: QueuedDiscoveryRecord,

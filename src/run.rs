@@ -9412,6 +9412,7 @@ fn capture_profile(
                     // Learned files stage before the pass decision, so a
                     // staging owed this tick can expedite this tick's frame.
                     context.0.service_learned_files();
+                    context.0.apply_learned_staging(context.1);
                     // Fresh every tick: only this tick's backlog pass may
                     // schedule a zero sleep below.
                     consumers.scheduling.note_discovery_backlog(false);
@@ -10972,6 +10973,7 @@ fn capture_trace(
         // Learned files stage before the pass decision, so a staging
         // owed this tick can expedite this tick's frame.
         engine.service_learned_files();
+        engine.apply_learned_staging(session);
         // Fresh every tick: only this tick's backlog pass may
         // schedule a zero sleep below.
         scheduling.note_discovery_backlog(false);

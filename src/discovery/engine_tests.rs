@@ -49150,6 +49150,16 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
             &mut pending,
         );
     }
+    // Pinned pressure: the pending-refresh relief evicts only ownerless
+    // departed entries, so pin every filled request to a foreign owner no
+    // view carries. The live retry below must still be refused by a
+    // genuinely full queue; departed-fill admission is pinned separately
+    // by late_holder_refresh_queues_past_departed_pending.
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+            request.owner = Some(ProcessViewId(u32::MAX));
+        }
+    }
     let requested = engine.refresh_requested.clone();
     for _ in 0..2 {
         assert!(!engine.request_refresh(pid, Some(50)));
@@ -49258,6 +49268,16 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
             &mut pending,
         );
     }
+    // Pinned pressure: the pending-refresh relief evicts only ownerless
+    // departed entries, so pin every filled request to a foreign owner no
+    // view carries. The live retry below must still be refused by a
+    // genuinely full queue; departed-fill admission is pinned separately
+    // by late_holder_refresh_queues_past_departed_pending.
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+            request.owner = Some(ProcessViewId(u32::MAX));
+        }
+    }
     assert!(!engine.request_refresh(pid, Some(50)));
     let before = engine.deep_scans;
     engine
@@ -49312,6 +49332,16 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
             &exec_record_for(FAKE_PID_FLOOR + offset),
             &mut pending,
         );
+    }
+    // Pinned pressure: the pending-refresh relief evicts only ownerless
+    // departed entries, so pin every filled request to a foreign owner no
+    // view carries. The live retry below must still be refused by a
+    // genuinely full queue; departed-fill admission is pinned separately
+    // by late_holder_refresh_queues_past_departed_pending.
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+            request.owner = Some(ProcessViewId(u32::MAX));
+        }
     }
     assert!(!engine.request_refresh(pid, Some(50)));
     assert_eq!(

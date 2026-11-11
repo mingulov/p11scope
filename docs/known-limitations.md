@@ -103,14 +103,12 @@ Owned-provider counts stay exact with zero loss counters; exact
 observation needs a quiescent scope. Initial loader arming also
 finishes after the `capturing:` line on `--system` and `--cgroup`
 captures the observer does not own; the report carries that window as
-a counted gap only when the post-ready completion added coverage (a
-new plan slot or a newly attached dynamic export hook), whose calls
-before it attached were not counted. `--pid` captures arm before the
-`capturing:` line and have no such window. On quiet Docker and
-`--cgroup` scopes the same window can mark a fully counted capture
-PARTIAL: the post-ready completion attached only provider-publication
-hooks, which count no calls, yet the gap fires anyway. All calls are
-counted; only the verdict is wrong. A fix is planned for 0.8.0.
+a counted gap only when the post-ready completion added counting
+coverage (a new plan slot), whose calls before it attached were not
+counted. A completion that only attached dynamic export hooks files
+no gap: those hooks detect provider publication, they count no calls.
+`--pid` captures arm before the `capturing:` line and have no such
+window.
 
 ### Long captures go blind to new processes once the 262,144 identity budget is spent
 

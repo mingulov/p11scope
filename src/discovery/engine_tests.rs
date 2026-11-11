@@ -74570,29 +74570,108 @@ fn complete_initial_arming_services_discovery_between_arms() {
 
 /// Startup B4 twin (positive): a clean wide-scope post-ready completion
 /// with a nonzero arming window names the window as a counted gap when
-/// the completion added coverage — here it attaches the initial dynamic
-/// export hooks, so calls reaching that coverage before it attached were
-/// not counted. The window is forced through the test seam (scripted
-/// arms take microseconds); the gap must reach both the counters and the
-/// published plan skip list.
+/// the completion added counting coverage — here a live export return
+/// surfaces the seed table mid-completion, so a plan slot appears during
+/// it and calls reaching that slot before it attached were not counted.
+/// Export hooks attach before the completion (only their binding matters
+/// here: the scripted return must name one); the slot is the trigger.
+/// The window is forced through the test seam (scripted arms take
+/// microseconds); the gap must reach both the counters and the published
+/// plan skip list.
 #[test]
 fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
-    let (_fixture, mut engine, mut session) = initial_export_route();
+    let (_fixture, mut engine, mut session) =
+        initial_export_route_from_seed(loaded_seed_provider_with_seed_table(false, true));
     engine.scope = Scope::System;
+    session.dynamic_attach_reports_added = true;
+    engine.attach_initial_exports(
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+        &mut PauseClosure::new(true),
+    );
+    let binding = *engine.selection_bindings.values().next().unwrap();
+    // The return below must travel the exhausted-authority path (like the
+    // selection twin it copies) so the fresh table word becomes a slot.
+    let tuple = LiveSelectionTuple {
+        module: binding.provider,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Null,
+            flags: 0,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::Other,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        }),
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for flags in 0..MAX_LIVE_SELECTION_TUPLES {
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                request: SelectionRequest {
+                    flags: flags as u64,
+                    ..tuple.request
+                },
+                ..tuple.clone()
+            });
+    }
+    let provider = engine.pinned.summary(binding.object).unwrap();
+    let file = engine.pinned.file_for(binding.object).unwrap();
+    let offset = ElfSnapshot::read(file)
+        .unwrap()
+        .defined_symbol("seed_selection_table")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let maps = parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
+        .unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| {
+            ObjectKey::of(mapping) == provider.key
+                && offset
+                    .checked_sub(mapping.file_offset)
+                    .is_some_and(|delta| delta < mapping.end - mapping.start)
+        })
+        .unwrap();
+    let address = mapping.start + offset - mapping.file_offset;
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_NULL;
+    record.name_class = DISCOVERY_NAME_OTHER;
+    record.selection_version_class = DISCOVERY_VERSION_OTHER;
+    record.table_ptr = address;
+    record.binding_id = binding.id;
+    assert!(
+        valid_discovery_record(&record),
+        "real opaque transport carries an address, not fabricated prefix words"
+    );
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(11);
-    session.dynamic_attach_reports_added = true;
     assert!(
-        session.dynamic_attach_calls.is_empty(),
-        "no export hook is attached before the completion"
+        engine.plan.slots.is_empty(),
+        "no counting coverage before the completion"
     );
+    session
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(record))));
     engine
         .complete_initial_arming(&mut session, &|| false)
         .expect("healthy completion runs");
     assert_eq!(
-        session.dynamic_attach_calls.len(),
-        3,
-        "the completion attached the initial export hooks"
+        engine.plan.slots.len(),
+        1,
+        "the mid-completion return surfaced one counting slot"
     );
     let gap = engine
         .counters
@@ -74612,6 +74691,76 @@ fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
             .iter()
             .any(|skip| skip.subject == "initial loader arming"),
         "the window gap reaches the published plan skip list"
+    );
+}
+
+/// Startup B4 (export-only negative): a wide-scope completion whose only
+/// added coverage is newly attached dynamic export hooks — every counting
+/// slot already existed before the ready line — files no window gap even
+/// with a long forced window. Export hooks detect provider publication;
+/// they count no calls, so no calls in the window went uncounted. (The
+/// container-exact `--cgroup` leg: 136 probes live since session start,
+/// 227/227 calls counted, yet PARTIAL before this fix.)
+#[test]
+fn complete_initial_arming_files_no_window_gap_when_only_exports_attached() {
+    let (_fixture, mut engine, mut session) = initial_export_route();
+    engine.scope = Scope::System;
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(9000);
+    session.dynamic_attach_reports_added = true;
+    // The seed route binds the provider but reads no tables, so the plan
+    // carries no counting slots; stand one in on the bound module's real
+    // ids for the pre-ready coverage the production scan provides (the
+    // quiet `--cgroup` capture whose probes are live since session start).
+    // B4 judges the slot delta, never slot provenance.
+    assert!(
+        !engine.modules.is_empty() && !engine.plan.modules.is_empty(),
+        "the bound provider predates the completion"
+    );
+    engine.plan.slots.push(plan::Slot {
+        index: 0,
+        descriptor_index: 1,
+        object: engine.modules[0].object,
+        object_path: engine.modules[0].scanned.path.clone(),
+        file_offset: 0x1000,
+        names: vec!["C_Sign".into()],
+        aliased: false,
+        semantics: crate::kinds::DESCRIPTORS[1],
+        semantic_authorized: true,
+        semantic_ambiguous: false,
+        fork_safe: false,
+        module_ids: vec![engine.plan.modules[0].id],
+    });
+    let triples_before: std::collections::BTreeSet<(u32, _, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert!(
+        !session.dynamic_attach_calls.is_empty(),
+        "the completion attached export hooks post-ready"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| triples_before.contains(&(slot.index, slot.object, slot.file_offset))),
+        "no plan slot appeared in the window: {:?}",
+        engine.plan.slots
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "initial loader arming"),
+        "no window gap without added counting coverage: {:?}",
+        engine.counters.object_skips
     );
 }
 
@@ -74692,22 +74841,40 @@ fn complete_initial_arming_files_no_window_gap_for_pid_scope() {
 /// Startup B4 twin (real clock): with no window seam set, a loader attach
 /// that takes real time makes the completion measure a nonzero window on
 /// the monotonic clock and name it — the production clock wiring, not the
-/// forced-milliseconds seam.
+/// forced-milliseconds seam. Two views split the duties: the plain seed
+/// view arms during the completion, and its attach sleeps so the real
+/// clock measures the window; the readable-table view is armed and
+/// export-attached up front, and its scripted export return surfaces a
+/// counting slot mid-completion, which is what names the gap.
 #[test]
 fn complete_initial_arming_measures_the_window_on_the_real_clock() {
-    let (fixture, view, mut module, pins) = loaded_seed_provider();
-    let _fixture = fixture;
-    module.exports = vec![
-        "C_GetFunctionList".into(),
-        "C_GetInterfaceList".into(),
-        "C_GetInterface".into(),
-    ];
+    let (fixture_a, view_a, mut module_a, pins_a) = loaded_seed_provider();
+    let _fixture_a = fixture_a;
+    let (fixture_b, view_b, mut module_b, pins_b) =
+        loaded_seed_provider_with_seed_table(false, true);
+    let _fixture_b = fixture_b;
+    let _view_b = view_b;
+    for module in [&mut module_a, &mut module_b] {
+        module.exports = vec![
+            "C_GetFunctionList".into(),
+            "C_GetInterfaceList".into(),
+            "C_GetInterface".into(),
+        ];
+    }
+    // Distinct view ids: the second child re-opens under id 1, and its
+    // module rides that id so the candidate binds it to the right view.
+    module_b.view = ProcessViewId(1);
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
-    engine.next_view_id = 1;
-    engine.views.push(view);
+    engine.next_view_id = 2;
+    engine.views.push(view_a);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), _fixture_b.child.id()).unwrap());
+    let mut pins = pins_a;
+    let skipped = pins.absorb(pins_b);
     let candidate = engine
-        .live_candidate(pins, vec![module], Vec::new())
+        .live_candidate(pins, vec![module_a, module_b], skipped)
         .unwrap();
     let mut session = ScriptedSession::default();
     session.dynamic_attach_reports_added = true;
@@ -74717,18 +74884,116 @@ fn complete_initial_arming_measures_the_window_on_the_real_clock() {
         .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
         .unwrap();
     assert!(outcome.accepted());
-    // The loader is not pre-armed here: the completion arms it, and the
-    // attach sleeps so the real clock measures the window.
+    // Only the table view arms up front; the plain view's loader stays
+    // unarmed so the completion arms it and the attach sleeps.
+    engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut additions_allowed,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(additions_allowed);
+    // Only the table view's exports attach up front: the scripted return
+    // below must name a live binding. The plain view's exports attach
+    // during the completion like production.
+    let mut pending_views = PendingViewRetirements::new();
+    let mut closure = PauseClosure::new(true);
+    let mut export_incomplete = BTreeSet::new();
+    let outcome =
+        engine.attach_refreshed_exports(ProcessViewId(1), &mut session, &mut additions_allowed);
+    engine.note_export_attach_outcome(
+        ProcessViewId(1),
+        outcome,
+        &mut pending_views,
+        &mut closure,
+        &mut export_incomplete,
+    );
+    let binding = *engine.selection_bindings.values().next().unwrap();
+    // The return below must travel the exhausted-authority path (like the
+    // selection twin it copies) so the fresh table word becomes a slot.
+    let tuple = LiveSelectionTuple {
+        module: binding.provider,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Null,
+            flags: 0,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::Other,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        }),
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for flags in 0..MAX_LIVE_SELECTION_TUPLES {
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                request: SelectionRequest {
+                    flags: flags as u64,
+                    ..tuple.request
+                },
+                ..tuple.clone()
+            });
+    }
+    let provider = engine.pinned.summary(binding.object).unwrap();
+    let file = engine.pinned.file_for(binding.object).unwrap();
+    let offset = ElfSnapshot::read(file)
+        .unwrap()
+        .defined_symbol("seed_selection_table")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let maps = parse_maps(&std::fs::read(format!("/proc/{}/maps", _fixture_b.child.id())).unwrap())
+        .unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| {
+            ObjectKey::of(mapping) == provider.key
+                && offset
+                    .checked_sub(mapping.file_offset)
+                    .is_some_and(|delta| delta < mapping.end - mapping.start)
+        })
+        .unwrap();
+    let address = mapping.start + offset - mapping.file_offset;
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(_fixture_b.child.id()) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_NULL;
+    record.name_class = DISCOVERY_NAME_OTHER;
+    record.selection_version_class = DISCOVERY_VERSION_OTHER;
+    record.table_ptr = address;
+    record.binding_id = binding.id;
+    assert!(
+        valid_discovery_record(&record),
+        "real opaque transport carries an address, not fabricated prefix words"
+    );
     engine.initial_arming_pending = true;
+    assert!(
+        engine.plan.slots.is_empty(),
+        "no counting coverage before the completion"
+    );
     session.before_dynamic_loader_attach = Some(Box::new(|| {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }));
+    session
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(record))));
     engine
         .complete_initial_arming(&mut session, &|| false)
         .expect("healthy completion runs");
-    assert!(
-        !session.dynamic_attach_calls.is_empty(),
-        "the completion attached the initial export hooks"
+    assert_eq!(
+        engine.plan.slots.len(),
+        1,
+        "the mid-completion return surfaced one counting slot"
     );
     let gap = engine
         .counters

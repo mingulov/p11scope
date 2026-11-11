@@ -436,9 +436,10 @@ repeats — prints under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
 On `--system` and `--cgroup` captures the observer does not own, initial
 loader arming finishes after the `capturing:` line. The report carries
 that window as a counted gap only when the post-ready completion added
-coverage — a new plan slot or a newly attached dynamic export hook —
-because calls reaching that coverage before it attached were not
-counted; a completion that added no coverage files no gap. A `--pid`
+counting coverage — a new plan slot — because calls reaching that slot
+before it attached were not counted; a completion that added no slot
+files no gap, even one that attached dynamic export hooks (those hooks
+detect provider publication, they count no calls). A `--pid`
 capture finishes initial arming, and any `--select-endpoint` detail
 window, before the `capturing:` line, so it has no such window.
 `run` on a terminal never clears the screen: the final frame prints once

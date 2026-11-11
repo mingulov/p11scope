@@ -35029,8 +35029,8 @@ impl Engine {
     /// remainder as a counted gap, and a clean wide-scope completion
     /// names its post-ready arming window as a counted gap only when the
     /// window measures above zero milliseconds and the completion added
-    /// coverage (a new plan slot or a newly attached dynamic export
-    /// hook), whose calls before it attached were not counted. No-op
+    /// counting coverage (a new plan slot), whose calls before it attached
+    /// were not counted. No-op
     /// unless a non-owned start pended (owned starts arm inline and
     /// never pend). The capture loops call this around the ready line
     /// and before the first tick, then re-sync their plan consumers: the
@@ -35101,10 +35101,12 @@ impl Engine {
         // outside the window. Stays `None` on the fatal path, which files
         // its own gap instead.
         let mut armed_ns: Option<u64> = None;
-        let mut exports_attached = false;
         if fatal.is_none() {
             let exports_start = crate::attach::monotonic_ns();
-            exports_attached = self.attach_initial_exports(
+            // The return (whether any hook newly attached) does not gate
+            // the B4 window gap below: export hooks detect publication,
+            // they count no calls, so only an added plan slot names it.
+            self.attach_initial_exports(
                 &mut *session,
                 &mut additions_allowed,
                 &mut pending_views,
@@ -35156,13 +35158,17 @@ impl Engine {
         }
         // Startup B4: a clean wide-scope post-ready completion names its
         // arming window as a counted gap only when the completion added
-        // coverage — a plan slot that appeared during it or a dynamic
-        // export hook that attached in it — because calls reaching that
-        // coverage before it attached were not counted. A completion that
-        // added nothing (the common quiet case: every provider already
-        // counted from the start) files no gap. Pid scope completes
-        // before the ready line, so it has no window. Judged here, after
-        // the backlog, so slots the cleanup pass added count too; a stop,
+        // counting coverage — a plan slot that appeared during it —
+        // because calls reaching that slot before it attached were not
+        // counted. Newly attached dynamic export hooks alone file no gap:
+        // they detect provider publication, they count no calls, and every
+        // counting probe was already live since session start — demanding
+        // a gap for them marked every quiet wide-scope capture PARTIAL
+        // over calls that were all counted. A completion that added no
+        // slot (the common quiet case: every provider already counted
+        // from the start) files no gap. Pid scope completes before the
+        // ready line, so it has no window. Judged here, after the
+        // backlog, so slots the cleanup pass added count too; a stop,
         // staging or backlog failure already filed this subject above, so
         // the window stays unfiled then.
         if !arm_failed && !matches!(self.scope, Scope::Pid(_)) {
@@ -35177,7 +35183,7 @@ impl Engine {
                 self.plan.slots.iter().any(|slot| {
                     !slots_before.contains(&(slot.index, slot.object, slot.file_offset))
                 });
-            if (exports_attached || slot_added)
+            if slot_added
                 && let Some(window_ms) = window_ms
                 && !self
                     .counters

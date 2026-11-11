@@ -9262,13 +9262,14 @@ fn capture_profile(
     // from its first call and no post-ready window exists. Wide scopes
     // keep the completion after the ready line (the desktop startup
     // win); their completion names a window gap only when it added
-    // coverage. Failures degrade to named PARTIAL gaps; a stop between
-    // views — Ctrl-C or the `--duration` deadline — ends arming early
-    // the same way, and the loop's own stop path below still writes the
-    // report. Owned runs never pend, so this is a no-op there. The
-    // cleanup pass can change the plan silently, so the semantic state
-    // re-syncs exactly as on a plan-changed tick; nothing has been
-    // observed yet, so the purge is empty.
+    // counting coverage (a new plan slot). Failures degrade to named
+    // PARTIAL gaps; a stop between views — Ctrl-C or the `--duration`
+    // deadline — ends arming early the same way, and the loop's own
+    // stop path below still writes the report. Owned runs never pend,
+    // so this is a no-op there. The cleanup pass can change the plan
+    // silently, so the semantic state re-syncs exactly as on a
+    // plan-changed tick; nothing has been observed yet, so the purge is
+    // empty.
     let arm_before_ready = matches!(scope, Scope::Pid(_));
     if !arm_before_ready {
         emit_capture_diagnostic(&capture_ready_line(
@@ -10874,14 +10875,14 @@ fn capture_trace(
     // on that line is counted from its first call and no post-ready
     // window exists. Wide scopes keep the completion after the ready
     // line (the desktop startup win); their completion names a window
-    // gap only when it added coverage. Failures degrade to named
-    // PARTIAL gaps; a stop between views — Ctrl-C or the `--duration`
-    // deadline — ends arming early the same way, and the loop's own
-    // stop path below still writes the report. Owned runs never pend,
-    // so this is a no-op there. The cleanup pass can change the plan
-    // silently, so the semantic state and the tracer re-sync exactly as
-    // on a plan-changed tick; nothing has been observed yet, so the
-    // purge is empty.
+    // gap only when it added counting coverage (a new plan slot).
+    // Failures degrade to named PARTIAL gaps; a stop between views —
+    // Ctrl-C or the `--duration` deadline — ends arming early the same
+    // way, and the loop's own stop path below still writes the report.
+    // Owned runs never pend, so this is a no-op there. The cleanup pass
+    // can change the plan silently, so the semantic state and the tracer
+    // re-sync exactly as on a plan-changed tick; nothing has been
+    // observed yet, so the purge is empty.
     let arm_before_ready = matches!(scope, Scope::Pid(_));
     if !arm_before_ready {
         emit_capture_diagnostic(&capture_ready_line(

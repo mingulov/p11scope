@@ -740,12 +740,28 @@ MAX_SLOTS = 2112
 # `shared_scope_reserve(MAX_SLOTS)` (src/plan.rs): a quarter of the budget,
 # never under one whole 3.2 function list.
 SHARED_SCOPE_RESERVE = max(MAX_SLOTS * 25 // 100, 104)
+# `SlotSizing` (src/capacity.rs): the host-sized Detailed ceiling
+# disclosure, present only when the STATS budget trimmed the compiled
+# ceiling. The mirror pins the release (wide-detailed-2112) ABI geometry
+# the Rust twins pin in
+# `stats_cost_pins_the_abi_sizes_and_matches_detailed_accounting`:
+# SlotStats 296 bytes, RvKey 16, RV value u64, RV_ENTRIES 8192.
+SLOT_SIZING_KEYS = {
+    "requested_slots", "effective_slots", "possible_cpus",
+    "mem_total_bytes", "budget_bytes", "stats_bytes",
+}
+SLOT_STATS_BYTES = 296
+SLOT_SIZING_RV_ENTRIES = 8192
+SLOT_SIZING_RV_KEY_BYTES = 16
+SLOT_SIZING_RV_VALUE_BYTES = 8
+MIN_SIZED_SLOTS = 512
+STATS_BUDGET_FLOOR_BYTES = 64 * 1024 * 1024
 # What the installed libp11-kit really maps (Task 1.4, refreshed for the
 # first-plan prefix): 67 static CK_FUNCTION_LIST_3_2 closure templates on
 # the lane hosts, 104 entries each, ordinals 65/66 shared by all
 # (67*102+2 = 6836 distinct targets). The reserve-capped heuristic prefix
-# admits the leading 3 tables (any 3 share exactly the 2 family targets:
-# 3*102+2 = 308 distinct, 0 nulls); the other 64 spill as
+# admits the leading 14 tables (any 14 share exactly the 2 family targets:
+# 14*102+2 = 1430 distinct, 0 nulls); the other 53 spill as
 # `discovery_uncorroborated_candidates` — evidence, never slots.
 #
 # Admitted p11-kit template families (audit F8): the 3.x (version, entries)
@@ -1181,6 +1197,13 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "legacy_collection" in evidence:
         wanted.add("legacy_collection")
         exact_legacy_collection(evidence["legacy_collection"])
+    # Host-sized Detailed ceiling disclosure (schema v3 `slot_sizing`):
+    # additive in every current lane that renders it — profile, metrics,
+    # owned-run and terminal trace evidence all flow through here —
+    # while retained v2-metrics documents predate it.
+    if not historical and "slot_sizing" in evidence:
+        wanted.add("slot_sizing")
+        exact_slot_sizing(evidence["slot_sizing"])
     # The refused-pause annotation, additive in every lane that renders
     # it (owned runs only in practice; the key stays absent elsewhere).
     if not historical and "pause_refused" in evidence:
@@ -1273,6 +1296,68 @@ def exact_unmatched_forwarding(value):
     matched no mapped file, in operator order."""
     require(isinstance(value, list) and all(isinstance(item, str) for item in value),
             f"unmatched_forwarding must be a string array: {value!r}")
+
+
+def slot_stats_cost_bytes(slots, possible_cpus):
+    """Mirror of `stats_cost_bytes` (src/capacity.rs) at release geometry:
+    STATS (slots times 296 bytes times CPUs) plus the fixed RV hash (keys
+    plus per-CPU values). Python integers cannot overflow; the producer's
+    u64 saturation is unreachable at real host geometries."""
+    return (
+        slots * SLOT_STATS_BYTES * possible_cpus
+        + SLOT_SIZING_RV_ENTRIES * SLOT_SIZING_RV_KEY_BYTES
+        + SLOT_SIZING_RV_ENTRIES * SLOT_SIZING_RV_VALUE_BYTES * possible_cpus
+    )
+
+
+def exact_slot_sizing(sizing):
+    """The additive host-sized-ceiling disclosure (schema v3 `slot_sizing`):
+    closed six-field shape plus the producer's scalar/budget relationships
+    (`size_detailed_slots`, src/capacity.rs). Present only when the budget
+    trimmed the compiled ceiling, so the effective count sits strictly
+    below the compiled one and never below the 512 floor — the floor binds
+    even when its estimated cost exceeds the budget. Informational only:
+    it never feeds verdicts and never forces PARTIAL."""
+    exact_keys(sizing, SLOT_SIZING_KEYS, "slot_sizing")
+    requested = sizing["requested_slots"]
+    effective = sizing["effective_slots"]
+    cpus = sizing["possible_cpus"]
+    mem = sizing["mem_total_bytes"]
+    budget = sizing["budget_bytes"]
+    stats = sizing["stats_bytes"]
+    uint(requested, U32_MAX, "slot_sizing.requested_slots")
+    uint(effective, U32_MAX, "slot_sizing.effective_slots")
+    uint(cpus, U64_MAX, "slot_sizing.possible_cpus", positive=True)
+    uint(mem, U64_MAX, "slot_sizing.mem_total_bytes")
+    uint(budget, U64_MAX, "slot_sizing.budget_bytes")
+    uint(stats, U64_MAX, "slot_sizing.stats_bytes")
+    require(
+        requested == MAX_SLOTS,
+        f"slot_sizing requested is not the compiled ceiling: {sizing!r}",
+    )
+    require(
+        MIN_SIZED_SLOTS <= effective < requested,
+        f"slot_sizing effective is not a trimmed ceiling: {sizing!r}",
+    )
+    require(
+        budget == max(STATS_BUDGET_FLOOR_BYTES, mem // 100),
+        f"slot_sizing budget is not max(64 MiB, 1% of MemTotal): {sizing!r}",
+    )
+    require(
+        stats == slot_stats_cost_bytes(effective, cpus),
+        f"slot_sizing stats cost is not the effective-count cost: {sizing!r}",
+    )
+    # Exact fit: the next slot up never fits the budget. The fitted cost
+    # fits too — except at the 512 floor, which binds even when its
+    # estimated cost exceeds the budget.
+    require(
+        slot_stats_cost_bytes(effective + 1, cpus) > budget,
+        f"slot_sizing effective is not the largest fitting count: {sizing!r}",
+    )
+    require(
+        stats <= budget or effective == MIN_SIZED_SLOTS,
+        f"slot_sizing over-budget cost above the floor: {sizing!r}",
+    )
 
 
 def exact_counter_bank_gaps(gaps):
@@ -4574,6 +4659,69 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     validate_clean_metrics(clean, {"C_Initialize": 1})
+    # Host-sized ceiling disclosure (schema v3 `slot_sizing`): the
+    # documented downsized shape rides the clean metrics lane, as does the
+    # 512 floor even though its estimated cost exceeds the budget. The key
+    # is informational only: completeness is untouched either way.
+    sized = copy.deepcopy(clean)
+    sized["evidence"]["slot_sizing"] = {
+        "requested_slots": 2112,
+        "effective_slots": 662,
+        "possible_cpus": 256,
+        "mem_total_bytes": 2147483648,
+        "budget_bytes": 67108864,
+        "stats_bytes": 67072000,
+    }
+    validate_clean_metrics(sized, {"C_Initialize": 1})
+    floored = copy.deepcopy(clean)
+    floored["evidence"]["slot_sizing"] = {
+        "requested_slots": 2112,
+        "effective_slots": 512,
+        "possible_cpus": 4096,
+        "mem_total_bytes": 1073741824,
+        "budget_bytes": 67108864,
+        "stats_bytes": 889323520,
+    }
+    validate_clean_metrics(floored, {"C_Initialize": 1})
+    for carrying in (sized, floored):
+        require(
+            carrying["evidence"]["completeness"] == clean["evidence"]["completeness"],
+            "slot_sizing alone must not move completeness",
+        )
+
+    def resize(sizing, effective, cpus=256):
+        sizing["effective_slots"] = effective
+        sizing["stats_bytes"] = slot_stats_cost_bytes(effective, cpus)
+
+    # ... but the pin stays exact: a seventh key, a missing key, a null or
+    # non-object value, an untrimmed or over-wide ceiling, a below-floor
+    # count, zero CPUs, a wrong budget, a wrong cost, a slack count that is
+    # not the largest fitting one, and an over-budget cost above the floor
+    # all fail — as does a lookalike unknown key beside the real one.
+    for mutate in (
+        lambda doc: doc["evidence"]["slot_sizing"].update(note="trimmed"),
+        lambda doc: doc["evidence"]["slot_sizing"].pop("stats_bytes"),
+        lambda doc: doc["evidence"].update(slot_sizing=None),
+        lambda doc: doc["evidence"].update(slot_sizing=[]),
+        lambda doc: doc["evidence"]["slot_sizing"].update(requested_slots=512),
+        lambda doc: resize(doc["evidence"]["slot_sizing"], 2112),
+        lambda doc: resize(doc["evidence"]["slot_sizing"], 511),
+        lambda doc: resize(doc["evidence"]["slot_sizing"], 2113),
+        lambda doc: doc["evidence"]["slot_sizing"].update(
+            possible_cpus=0, stats_bytes=131072
+        ),
+        lambda doc: doc["evidence"]["slot_sizing"].update(budget_bytes=67108865),
+        lambda doc: doc["evidence"]["slot_sizing"].update(stats_bytes=67072001),
+        lambda doc: resize(doc["evidence"]["slot_sizing"], 661),
+        lambda doc: resize(doc["evidence"]["slot_sizing"], 700),
+    ):
+        bad = copy.deepcopy(sized)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    lookalike = copy.deepcopy(clean)
+    lookalike["evidence"]["slot_sizing_note"] = "trimmed"
+    rejected(lambda: validate_clean_metrics(lookalike, {"C_Initialize": 1}))
+    print("slot_sizing rides the metrics lane unchanged and pins its shape: OK")
     historical = document_fixture(
         clean_evidence,
         schema=HISTORICAL_METRICS_SCHEMA,
@@ -4582,6 +4730,11 @@ def self_test():
     )
     exact_historical_metrics_schema(historical)
     rejected(lambda: exact_metrics_schema(historical))
+    retired_sizing = copy.deepcopy(historical)
+    retired_sizing["evidence"]["slot_sizing"] = copy.deepcopy(
+        sized["evidence"]["slot_sizing"]
+    )
+    rejected(lambda: exact_historical_metrics_schema(retired_sizing))
     print("historical v2-metrics fixture remains closed and non-emitted: OK")
     halted = copy.deepcopy(clean)
     halted["evidence"]["kernel_control"].update(
@@ -5721,6 +5874,11 @@ def self_test():
         "selection_truncated": False,
     }
     exact_profile_v3_selection(selection_doc)
+    sized_selection = copy.deepcopy(selection_doc)
+    sized_selection["evidence"]["slot_sizing"] = copy.deepcopy(
+        sized["evidence"]["slot_sizing"]
+    )
+    exact_profile_v3_selection(sized_selection)
     for validator, live_document in (
         (exact_metrics_schema, clean),
         (exact_profile_v3_selection, selection_doc),
@@ -5768,6 +5926,15 @@ def self_test():
         counters_available=True, trace_truncated=False,
     )
     exact_profile_v3_selection(run_trace, terminal=True, run=True)
+    sized_run = copy.deepcopy(run_profile)
+    sized_run["evidence"]["slot_sizing"] = copy.deepcopy(
+        sized["evidence"]["slot_sizing"]
+    )
+    exact_profile_v3_selection(sized_run, run=True)
+    sized_trace = copy.deepcopy(run_trace)
+    sized_trace["slot_sizing"] = copy.deepcopy(sized["evidence"]["slot_sizing"])
+    exact_profile_v3_selection(sized_trace, terminal=True, run=True)
+    print("slot_sizing rides the profile, run, and terminal lanes unchanged: OK")
     external_pid = copy.deepcopy(run_profile)
     rejected(lambda: exact_profile_v3_selection(external_pid, run=False))
     unreadable_match = copy.deepcopy(selection_doc)

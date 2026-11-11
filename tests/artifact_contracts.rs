@@ -12992,6 +12992,123 @@ print("accepted")
     );
 }
 
+/// The downsized producer renders `evidence.slot_sizing`, and the
+/// capture checker admits it: a real rendered sizing object (wide: the
+/// true host-scaled `size_detailed_slots` output; other builds: the same
+/// shape the render twin pins) rides the checker's clean-metrics lane,
+/// as does the 512 floor with its over-budget estimate, while a
+/// malformed object and an untrimmed ceiling are refused.
+#[test]
+fn downsized_renderer_output_satisfies_the_slot_sizing_consumer() {
+    #[cfg(feature = "wide-detailed-2112")]
+    let sizing = p11scope::capacity::size_detailed_slots(256, 2 * 1024 * 1024 * 1024);
+    #[cfg(not(feature = "wide-detailed-2112"))]
+    let sizing = p11scope::capacity::SlotSizing {
+        requested_slots: 2_112,
+        effective_slots: 662,
+        possible_cpus: 256,
+        mem_total_bytes: 2 * 1024 * 1024 * 1024,
+        budget_bytes: 64 * 1024 * 1024,
+        stats_bytes: 67_072_000,
+    };
+    assert!(sizing.downsized());
+    let rendered = serde_json::to_value(sizing).expect("sizing serializes");
+    assert_eq!(rendered["requested_slots"], 2_112);
+    assert_eq!(rendered["effective_slots"], 662);
+    assert_eq!(rendered["possible_cpus"], 256);
+    assert_eq!(rendered["budget_bytes"], 64 * 1024 * 1024);
+    assert_eq!(rendered["stats_bytes"], 67_072_000);
+    #[cfg(feature = "wide-detailed-2112")]
+    let floor = p11scope::capacity::size_detailed_slots(4_096, 1024 * 1024 * 1024);
+    #[cfg(not(feature = "wide-detailed-2112"))]
+    let floor = p11scope::capacity::SlotSizing {
+        requested_slots: 2_112,
+        effective_slots: 512,
+        possible_cpus: 4_096,
+        mem_total_bytes: 1024 * 1024 * 1024,
+        budget_bytes: 64 * 1024 * 1024,
+        stats_bytes: 889_323_520,
+    };
+    assert!(floor.downsized());
+    let rendered_floor = serde_json::to_value(floor).expect("floor sizing serializes");
+    assert_eq!(rendered_floor["effective_slots"], 512);
+    assert_eq!(rendered_floor["stats_bytes"], 889_323_520);
+
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("checker-slot-sizing");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sizing.json");
+    fs::write(&path, serde_json::to_vec(&rendered).unwrap()).unwrap();
+    let floor_path = dir.join("floor.json");
+    fs::write(&floor_path, serde_json::to_vec(&rendered_floor).unwrap()).unwrap();
+
+    // The driver builds the checker's own clean-metrics fixture, injects
+    // the Rust-rendered sizing object (or a mutation of it), and runs the
+    // real consumer lane.
+    let driver = r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("checker", "scripts/check-capture-evidence.py")
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+sizing = json.load(open(sys.argv[1]))
+floor = json.load(open(sys.argv[2]))
+mode = sys.argv[3]
+evidence = checker.evidence_fixture(checker.LEGACY_SURFACES)
+evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
+document = checker.document_fixture(
+    evidence, schema=checker.METRICS_SCHEMA, mode="metrics", privacy="aggregate-only")
+document["functions"] = checker.function_items(
+    [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)])
+if mode == "sized":
+    document["evidence"]["slot_sizing"] = sizing
+elif mode == "floor":
+    document["evidence"]["slot_sizing"] = floor
+elif mode == "broken-keys":
+    broken = dict(sizing)
+    del broken["stats_bytes"]
+    document["evidence"]["slot_sizing"] = broken
+elif mode == "broken-fit":
+    broken = dict(sizing)
+    broken["effective_slots"] = broken["requested_slots"]
+    document["evidence"]["slot_sizing"] = broken
+elif mode != "absent":
+    raise AssertionError(f"unknown driver mode: {mode}")
+checker.validate_clean_metrics(document, {"C_Initialize": 1})
+print("accepted")
+"#;
+    for mode in ["sized", "floor", "absent"] {
+        let accepted = std::process::Command::new("python3")
+            .args(["-c", driver])
+            .arg(&path)
+            .arg(&floor_path)
+            .arg(mode)
+            .output()
+            .expect("running python3");
+        assert!(
+            accepted.status.success(),
+            "the checker refused a real rendered {mode} document:\n{}\n{}",
+            String::from_utf8_lossy(&accepted.stdout),
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&accepted.stdout).contains("accepted"),
+            "the {mode} driver run printed no acceptance marker",
+        );
+    }
+    for mode in ["broken-keys", "broken-fit"] {
+        let refused = std::process::Command::new("python3")
+            .args(["-c", driver])
+            .arg(&path)
+            .arg(&floor_path)
+            .arg(mode)
+            .output()
+            .expect("running python3");
+        assert!(
+            !refused.status.success(),
+            "the checker accepted a {mode} slot_sizing object",
+        );
+    }
+}
+
 /// Task 8 Step 2, "Freeze the consumer map explicitly": metrics and function
 /// attribution use capture aggregate owners; semantic attachment decisions use
 /// active topology; final evidence/discovery and module labels use sanitized

@@ -8702,7 +8702,11 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         )),
     )?;
     evidence.fd_sample("baseline")?;
-    eprintln!("TASK4_PROFILE name=default detailed_slots=512 rv_keys=4096 inventory_budget=2112");
+    eprintln!(
+        "TASK4_PROFILE name=default detailed_slots={} rv_keys={} inventory_budget=2112",
+        p11scope_ebpf_common::MAX_SLOTS,
+        p11scope_ebpf_common::RV_ENTRIES
+    );
     let mut first = crate::attach::Session::start(
         &fixture.plan,
         &Scope::Pid(original.child.id()),
@@ -8814,8 +8818,8 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             Ok(crate::attach::read_map_metadata(name, detailed_map_data(map)?)?.max_entries)
         };
         ensure!(
-            map_max("STATS")? == 512
-                && map_max("RV_COUNTS")? == 4_096
+            map_max("STATS")? == p11scope_ebpf_common::MAX_SLOTS
+                && map_max("RV_COUNTS")? == p11scope_ebpf_common::RV_ENTRIES
                 && map_max("START")? == 16_384
                 && map_max("EVENTS")? >= 4_096
         );

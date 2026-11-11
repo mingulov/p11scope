@@ -2215,8 +2215,15 @@ fn official_build_is_safe_only() {
         !official.contains("cargo +"),
         "official build resolves cargo through the argv[0]-dispatching shim"
     );
+    // The checker legs select the frozen inventory from the build's own
+    // capture mode: full (default features) is wide, p0 (no default
+    // features) is 512. The diagnostic object comes from the canary
+    // feature build, which keeps default features, so it is always wide.
     for marker in [
-        "--policy-inventory \"$OFFICIAL_BPF\" \"$DIAGNOSTIC_BPF\"",
+        "    full) OFFICIAL_VARIANT=wide; JOURNAL_VARIANT=journal-wide ;;",
+        "    p0) OFFICIAL_VARIANT=default; JOURNAL_VARIANT=journal ;;",
+        "--policy-inventory --safe-variant \"$OFFICIAL_VARIANT\" --unsafe-variant wide-diagnostic \"$OFFICIAL_BPF\" \"$DIAGNOSTIC_BPF\"",
+        "--inventory \"$JOURNAL_VARIANT\" \"$1\"",
         "--unsafe-unvalidated-metadata requires a build with",
     ] {
         assert!(official.contains(marker), "official build misses {marker}");

@@ -1162,6 +1162,24 @@ class JournalMarkerInventoryTests(unittest.TestCase):
                               checker.JOURNAL_PROGRAMS, self.journal_symbols())
         self.assertIn("JOURNAL_CTL.value_size: object=25 frozen=24", reason)
 
+    def test_journal_wide_variant_accepts_frozen_inventory(self):
+        self.quiet(checker.validate_inventory, "journal-wide", checker.JOURNAL_WIDE_MAPS,
+                   checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols"):
+            checker.validate_inventory("journal-wide", checker.JOURNAL_WIDE_MAPS,
+                                       checker.JOURNAL_PROGRAMS,
+                                       self.journal_symbols(missing={"JOURNAL_MARKER_CTL"}))
+
+    def test_journal_width_mismatch_refused(self):
+        reason = self.refused(checker.validate_inventory, "journal-wide",
+                              checker.JOURNAL_MAPS, checker.JOURNAL_PROGRAMS,
+                              self.journal_symbols())
+        self.assertIn("STATS.max_entries: object=512 frozen=2112", reason)
+        reason = self.refused(checker.validate_inventory, "journal",
+                              checker.JOURNAL_WIDE_MAPS, checker.JOURNAL_PROGRAMS,
+                              self.journal_symbols())
+        self.assertIn("STATS.max_entries: object=2112 frozen=512", reason)
+
     def marker_fixture(self, name):
         source = Path(self.temp.name) / f"{name}.c"
         obj = Path(self.temp.name) / f"{name}.o"
@@ -1236,6 +1254,105 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "complete unique set"):
             checker.validate_marker_helpers(checker.Elf(obj.read_bytes()))
+
+
+class PolicyInventoryVariantTests(unittest.TestCase):
+    """--policy-inventory checks each release build against its own width."""
+
+    def detailed_symbols(self):
+        return (
+            {"p11_entry"}
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.REQUIRED_GLOBAL_EXE_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+            | {"JOURNAL_MARKER_CTL"}
+        )
+
+    def diagnostic_symbols(self):
+        return (
+            {
+                "p11_decode_params",
+                "p11_walk_template",
+                "p11_walk_template_types",
+                "decode_params-0",
+                "decode_params-1",
+                "walk_template_impl-0",
+                "walk_template_impl-1",
+                "walk_template_types-0",
+                "walk_template_types-1",
+            }
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.REQUIRED_GLOBAL_EXE_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+        )
+
+    def quiet(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            try:
+                func(*args)
+            except RuntimeError as error:
+                raise AssertionError(f"unexpected refusal: {error}") from error
+        return errors.getvalue()
+
+    def refused(self, func, *args):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(RuntimeError):
+            func(*args)
+        return errors.getvalue()
+
+    def test_default_policy_accepts(self):
+        self.quiet(checker.validate_policy_inventory,
+                   (checker.SAFE_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols()),
+                   (checker.UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols()))
+
+    def test_wide_policy_accepts(self):
+        self.quiet(checker.validate_policy_inventory,
+                   (checker.WIDE_MARKER_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols()),
+                   (checker.WIDE_UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols()),
+                   "wide", "wide-diagnostic")
+
+    def test_mixed_p0_policy_accepts(self):
+        # The release p0 mix keeps a 512 safe object next to a wide
+        # diagnostic object (the canary feature build keeps default
+        # features), so each side selects its own width.
+        self.quiet(checker.validate_policy_inventory,
+                   (checker.SAFE_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols()),
+                   (checker.WIDE_UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols()),
+                   "default", "wide-diagnostic")
+
+    def test_cross_width_policy_refused(self):
+        reason = self.refused(checker.validate_policy_inventory,
+                              (checker.SAFE_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols()),
+                              (checker.UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols()),
+                              "wide", "wide-diagnostic")
+        self.assertIn("STATS.max_entries: object=512 frozen=2112", reason)
+        reason = self.refused(checker.validate_policy_inventory,
+                              (checker.WIDE_MARKER_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols()),
+                              (checker.WIDE_UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols()),
+                              "default", "diagnostic")
+        self.assertIn("STATS.max_entries: object=2112 frozen=512", reason)
+
+    def test_unknown_policy_variant_refused(self):
+        safe = (checker.SAFE_MAPS, checker.SAFE_PROGRAMS, self.detailed_symbols())
+        unsafe = (checker.UNSAFE_MAPS, checker.UNSAFE_PROGRAMS, self.diagnostic_symbols())
+        with self.assertRaisesRegex(RuntimeError, "unknown policy safe variant"):
+            checker.validate_policy_inventory(safe, unsafe, "bogus", "diagnostic")
+        with self.assertRaisesRegex(RuntimeError, "unknown policy unsafe variant"):
+            checker.validate_policy_inventory(safe, unsafe, "default", "bogus")
+
+    def test_cli_unknown_policy_variant_refused(self):
+        proc = subprocess.run([sys.executable, "-I", str(ROOT / "scripts/check-bpf-map-defs.py"),
+                               "--policy-inventory", "--safe-variant", "bogus",
+                               "/nonexistent-safe", "/nonexistent-unsafe"],
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unknown policy safe variant", proc.stderr)
 
 
 class JournalMarkerCallSiteTests(unittest.TestCase):

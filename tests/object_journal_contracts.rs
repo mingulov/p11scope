@@ -2465,11 +2465,14 @@ fn object_journal_slot_maps_match_detailed_profile() {
     );
 }
 
-/// Journal/marker inventory policy: the six pure-policy
+/// Journal/marker inventory policy: the pure-policy
 /// `JournalMarkerInventoryTests` cases (marker presence, wide
-/// requirement, variant forbids, journal accept/refusals) run here
-/// by name on every flavor, beside the release-marker twin in
-/// `bpf_map_contracts`.
+/// requirement, variant forbids, journal accept/refusals, wide
+/// journal accept/width refusals) and the six
+/// `PolicyInventoryVariantTests` cases (default/wide/mixed policy
+/// accepts, cross-width and unknown-variant refusals, CLI
+/// unknown-variant refusal) run here by name on every flavor,
+/// beside the release-marker twin in `bpf_map_contracts`.
 #[test]
 fn object_journal_variant_inventory_policy_cases_are_driven() {
     let output = std::process::Command::new("python3")
@@ -2483,6 +2486,14 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
             "JournalMarkerInventoryTests.test_journal_variant_accepts_frozen_inventory",
             "JournalMarkerInventoryTests.test_journal_variant_requires_birth_gap_and_map",
             "JournalMarkerInventoryTests.test_journal_variant_refuses_inventory_map_and_drift",
+            "JournalMarkerInventoryTests.test_journal_wide_variant_accepts_frozen_inventory",
+            "JournalMarkerInventoryTests.test_journal_width_mismatch_refused",
+            "PolicyInventoryVariantTests.test_default_policy_accepts",
+            "PolicyInventoryVariantTests.test_wide_policy_accepts",
+            "PolicyInventoryVariantTests.test_mixed_p0_policy_accepts",
+            "PolicyInventoryVariantTests.test_cross_width_policy_refused",
+            "PolicyInventoryVariantTests.test_unknown_policy_variant_refused",
+            "PolicyInventoryVariantTests.test_cli_unknown_policy_variant_refused",
         ])
         .output()
         .expect("run journal variant inventory policy cases");
@@ -2495,7 +2506,7 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
         output.status.success(),
         "journal variant inventory: {report}"
     );
-    assert!(report.contains("Ran 6 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 14 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped journal proof: {report}");
 }
 

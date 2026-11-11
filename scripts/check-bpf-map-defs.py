@@ -2582,6 +2582,12 @@ def self_test():
     assert WIDE_MARKER_MAPS["JOURNAL_MARKER_CTL"] == SAFE_MAPS["JOURNAL_MARKER_CTL"]
     assert len(WIDE_UNSAFE_MAPS) == 44
     assert len(JOURNAL_MAPS) == 47
+    assert JOURNAL_WIDE_MAPS["STATS"] == map_def(6, 4, 296, 2_112)
+    assert JOURNAL_WIDE_MAPS["RV_COUNTS"] == map_def(5, 16, 8, 8_192)
+    assert JOURNAL_WIDE_MAPS["SLOT_FILE"] == map_def(2, 4, 4, 2_112, 128)
+    assert JOURNAL_WIDE_MAPS["JOURNAL_MARKER_CTL"] == JOURNAL_MAPS["JOURNAL_MARKER_CTL"]
+    assert JOURNAL_WIDE_MAPS["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
+    assert len(JOURNAL_WIDE_MAPS) == 47
     assert len(SAFE_PROGRAMS) == 22
     assert len(UNSAFE_PROGRAMS) == 27
     assert len(JOURNAL_PROGRAMS) == 22
@@ -2615,6 +2621,17 @@ def self_test():
                        {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
                                                                "p11_instance_exec_birth",
                                                                "p11_instance_scope_gap"})
+    # The wide release legs check the wide safe object against "wide" and the
+    # wide diagnostic object against "wide-diagnostic"; the release p0 mix
+    # keeps a 512 safe object next to a wide diagnostic object.
+    wide = (WIDE_MARKER_MAPS, SAFE_PROGRAMS, {"p11_entry"} | marked_helpers)
+    wide_diagnostic = (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
+    validate_policy_inventory(wide, wide_diagnostic, "wide", "wide-diagnostic")
+    validate_policy_inventory(good, wide_diagnostic, "default", "wide-diagnostic")
+    validate_inventory("journal-wide", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
+                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
+                                                               "p11_instance_exec_birth",
+                                                               "p11_instance_scope_gap"})
 
     def rejected(check, *arguments):
         if check is validate_inventory:
@@ -2622,7 +2639,7 @@ def self_test():
             extra = base_helpers
             if prefix[0] in ("default", "wide"):
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
-            elif prefix[0] == "journal":
+            elif prefix[0] in ("journal", "journal-wide"):
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
             arguments = (*prefix, symbols | extra)
         errors = io.StringIO()
@@ -2642,6 +2659,30 @@ def self_test():
         "map removed: JOURNAL_MARKER_CTL",
         "map removed: PID_START_TICK",
     ]
+    # A 512 object is not a wide policy object: each width is compared
+    # against its own freeze.
+    assert rejected(
+        validate_policy_inventory, good, diagnostic, "wide", "wide-diagnostic"
+    ) == [
+        "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_FILE.max_entries: object=512 frozen=2112",
+        "STATS.max_entries: object=512 frozen=2112",
+    ]
+    assert rejected(
+        validate_policy_inventory, wide, wide_diagnostic, "default", "diagnostic"
+    ) == [
+        "RV_COUNTS.max_entries: object=8192 frozen=4096",
+        "SLOT_FILE.max_entries: object=2112 frozen=512",
+        "STATS.max_entries: object=2112 frozen=512",
+    ]
+    for bad_safe, bad_unsafe in [("bogus", "diagnostic"), ("default", "bogus")]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                validate_policy_inventory(good, diagnostic, bad_safe, bad_unsafe)
+        except RuntimeError as error:
+            assert "unknown policy" in str(error), error
+        else:
+            raise AssertionError(f"unknown policy variant accepted: {bad_safe} {bad_unsafe}")
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "map added: JOURNAL_MARKER_CTL",
@@ -2716,6 +2757,20 @@ def self_test():
     assert rejected(validate_inventory, "journal", drifted_journal, JOURNAL_PROGRAMS,
                     {"p11_entry_journal"}) == [
         "JOURNAL_CTL.value_size: object=25 frozen=24"
+    ]
+    # The journal width is part of the freeze: a 512 journal object is not
+    # a wide journal object and vice versa.
+    assert rejected(validate_inventory, "journal-wide", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_FILE.max_entries: object=512 frozen=2112",
+        "STATS.max_entries: object=512 frozen=2112",
+    ]
+    assert rejected(validate_inventory, "journal", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "RV_COUNTS.max_entries: object=8192 frozen=4096",
+        "SLOT_FILE.max_entries: object=2112 frozen=512",
+        "STATS.max_entries: object=2112 frozen=512",
     ]
     # A one-field drift names exactly that field, nothing else (the W3 CONFIG
     # shape: same maps, one max_entries apart).

@@ -53,26 +53,34 @@ pub(crate) struct AccessBlock {
 /// `None` for empty text and for non-AppArmor LSM text (an SELinux context
 /// carries `:`; AppArmor profile names never do).
 pub(crate) fn parse_label(text: &str) -> Option<String> {
-    let _ = text;
-    todo!()
+    let token = text.split_whitespace().next()?;
+    // An SELinux context (`unconfined_u:...`) is not an AppArmor label:
+    // AppArmor profile names never carry `:`.
+    if token.contains(':') {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 /// Whether `label` is the unconfined label.
 pub(crate) fn is_unconfined(label: &str) -> bool {
-    let _ = label;
-    todo!()
+    label == "unconfined"
 }
 
 /// The observer's own AppArmor label, if it has one: the AppArmor attr file
 /// first, the generic LSM attr file behind it.
 pub(crate) fn own_label() -> Option<String> {
-    todo!()
+    let text = std::fs::read_to_string("/proc/self/attr/apparmor/current")
+        .or_else(|_| std::fs::read_to_string("/proc/self/attr/current"))
+        .ok()?;
+    parse_label(&text)
 }
 
 /// Whether `CAP_SYS_PTRACE` is in the observer's current effective set (the
 /// post-shed truth: every live command keeps it when it was granted).
 pub(crate) fn ptrace_held() -> bool {
-    todo!()
+    crate::caps::read_effective()
+        .is_some_and(|mask| mask & (1u64 << crate::caps::CAP_SYS_PTRACE_BIT) != 0)
 }
 
 /// Mem-probe other processes: for each candidate with readable maps content
@@ -84,8 +92,25 @@ where
     M: Fn(u32) -> bool,
     R: Fn(u32) -> std::io::Result<()>,
 {
-    let _ = (candidates, has_maps, open_mem);
-    todo!()
+    let me = std::process::id();
+    let mut attempted = 0usize;
+    let mut denied = 0usize;
+    for &pid in candidates.iter().take(SAMPLE_CANDIDATES) {
+        if attempted >= SAMPLE_ATTEMPTS {
+            break;
+        }
+        if pid == me || !has_maps(pid) {
+            continue;
+        }
+        attempted += 1;
+        match open_mem(pid) {
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                denied += 1;
+            }
+            _ => {}
+        }
+    }
+    AccessSample { attempted, denied }
 }
 
 /// The confinement verdict over one sample: `Some` exactly when the label is
@@ -96,15 +121,58 @@ pub(crate) fn assess(
     sample: &AccessSample,
     ptrace_held: bool,
 ) -> Option<AccessBlock> {
-    let _ = (label, sample, ptrace_held);
-    todo!()
+    let label = label?;
+    if is_unconfined(label) || !ptrace_held {
+        return None;
+    }
+    if sample.attempted < MIN_ATTEMPTED {
+        return None;
+    }
+    // Most means a strict majority: exactly half denied proves nothing.
+    if sample.denied * 2 <= sample.attempted {
+        return None;
+    }
+    Some(AccessBlock {
+        label: label.to_string(),
+        denied: sample.denied,
+        attempted: sample.attempted,
+    })
+}
+
+/// Whether `pid` has maps content to gate on: kernel threads read empty,
+/// zombies and the already-exited fail the open, and foreign-uid processes
+/// fail it for an unprivileged observer. Any of those skips the pid instead
+/// of counting it.
+fn live_has_maps(pid: u32) -> bool {
+    use std::io::Read as _;
+    let mut file = match std::fs::File::open(format!("/proc/{pid}/maps")) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut byte = [0u8; 1];
+    matches!(file.read(&mut byte), Ok(1))
+}
+
+/// The live probe behind [`sample`]: opening `/proc/<pid>/mem` needs
+/// ptrace-mode access, which is exactly what a confining profile denies
+/// while the capabilities are held.
+fn live_open_mem(pid: u32) -> std::io::Result<()> {
+    std::fs::File::open(format!("/proc/{pid}/mem")).map(|_| ())
 }
 
 /// The live detection over enumerated pids: label and capability fast paths
 /// first (no sampling on healthy hosts), then [`sample`] plus [`assess`].
 pub(crate) fn detect(candidates: &[u32]) -> Option<AccessBlock> {
-    let _ = candidates;
-    todo!()
+    let label = own_label();
+    match label.as_deref() {
+        Some(label) if !is_unconfined(label) => {}
+        _ => return None,
+    }
+    if !ptrace_held() {
+        return None;
+    }
+    let sample = sample(candidates, &live_has_maps, &live_open_mem);
+    assess(label.as_deref(), &sample, true)
 }
 
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -112,21 +180,36 @@ static WARNED: AtomicBool = AtomicBool::new(false);
 /// The one plain stderr line, emitted once per process no matter how many
 /// passes detect the block. Returns whether this call emitted.
 pub(crate) fn warn_once(block: &AccessBlock) -> bool {
-    let _ = block;
-    todo!()
+    if WARNED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    // Never `eprintln!`: a closed stderr must not fail the run.
+    let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&stderr_line(block)));
+    true
 }
 
 /// The stderr line text (pure, for tests).
 pub(crate) fn stderr_line(block: &AccessBlock) -> String {
-    let _ = block;
-    todo!()
+    format!(
+        "p11scope: AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable); discovery will see almost nothing — {FIX}",
+        block.label, block.denied, block.attempted
+    )
 }
 
 /// The report gap text (pure): sample counts plus, when the caller already
 /// scanned members, the exact unreadable-selected count.
 pub(crate) fn gap_reason(block: &AccessBlock, unreadable_selected: Option<usize>) -> String {
-    let _ = (block, unreadable_selected);
-    todo!()
+    let mut reason = format!(
+        "AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable",
+        block.label, block.denied, block.attempted
+    );
+    if let Some(unreadable) = unreadable_selected.filter(|count| *count > 0) {
+        reason.push_str(&format!(
+            ", {unreadable} selected processes unreadable this pass"
+        ));
+    }
+    reason.push_str(&format!("); discovery sees almost nothing — {FIX}"));
+    reason
 }
 
 /// The doctor row over an assessed sample (pure): Fail names the label and
@@ -136,13 +219,54 @@ pub(crate) fn check_row(
     sample: &AccessSample,
     ptrace_held: bool,
 ) -> crate::doctor::Check {
-    let _ = (label, sample, ptrace_held);
-    todo!()
+    use crate::doctor::{Check, Status};
+    let status = match label {
+        None => Status::NotApplicable("no AppArmor label (nothing to assess)".to_string()),
+        Some(label) if !ptrace_held => {
+            Status::NotApplicable(format!("label `{label}` needs CAP_SYS_PTRACE to assess"))
+        }
+        Some(label) if sample.attempted == 0 => {
+            Status::NotApplicable(format!("label `{label}` has no other processes to sample"))
+        }
+        Some(label) => match assess(Some(label), sample, true) {
+            Some(block) => Status::Fail(format!(
+                "AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable) — {FIX}",
+                block.label, block.denied, block.attempted
+            )),
+            None if is_unconfined(label) => Status::Ok(format!(
+                "unconfined; {} of {} sampled processes readable",
+                sample.attempted - sample.denied,
+                sample.attempted
+            )),
+            None => Status::Ok(format!(
+                "label `{label}`; {} of {} sampled processes readable",
+                sample.attempted - sample.denied,
+                sample.attempted
+            )),
+        },
+    };
+    Check {
+        name: CHECK_NAME.to_string(),
+        status,
+    }
 }
 
 /// The live doctor probe: enumerate, sample, assess, render.
 pub(crate) fn probe_check() -> crate::doctor::Check {
-    todo!()
+    let empty = AccessSample {
+        attempted: 0,
+        denied: 0,
+    };
+    let Some(label) = own_label() else {
+        return check_row(None, &empty, ptrace_held());
+    };
+    if !ptrace_held() {
+        return check_row(Some(&label), &empty, false);
+    }
+    let scope = crate::attach::Scope::System;
+    let (pids, _) = crate::discovery::engine::scope_pids(&scope);
+    let sample = sample(&pids, &live_has_maps, &live_open_mem);
+    check_row(Some(&label), &sample, true)
 }
 
 #[cfg(test)]
@@ -243,7 +367,7 @@ mod tests {
             103 => Ok(()),
             104 => Err(Error::new(ErrorKind::NotFound, "exited")),
             105 => denied_os(libc::ESRCH),
-            _ => Err(Error::new(ErrorKind::Other, "unreadable")),
+            _ => Err(Error::other("unreadable")),
         };
         let sample = sample(&candidates, &has_maps, &open_mem);
         assert_eq!(

@@ -640,6 +640,13 @@ fn collect_members_identity(
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
     let (pids, unlisted) = scope_pids(&scope);
+    // A confined observer (an AppArmor label without the observer profile)
+    // reads almost nothing past here: sample once, warn once, and let the
+    // named gap below carry the counts. Unconfined hosts skip the sampling.
+    let access_block = crate::process_access::detect(&pids);
+    if let Some(block) = &access_block {
+        crate::process_access::warn_once(block);
+    }
     let proc_list_failed = unlisted
         .iter()
         .any(|skip| skip.reason.contains("no process was discovered"));
@@ -798,6 +805,19 @@ fn collect_members_identity(
         ));
     }
     noise.report();
+    // The confinement gap carries the sample counts plus the exact
+    // unreadable-selected count, so the denied processes are counted as
+    // denied instead of reading as capped or sweep-unavailable.
+    if let Some(block) = &access_block {
+        let unreadable = members
+            .iter()
+            .filter(|member| matches!(member.status, MemberStatus::Unreadable { .. }))
+            .count();
+        scope_gaps.push(PidGap::scope(Skipped {
+            subject: crate::process_access::CHECK_NAME.into(),
+            reason: crate::process_access::gap_reason(block, Some(unreadable)),
+        }));
+    }
     (
         Collection {
             enumerated: pids,
@@ -2783,6 +2803,26 @@ fn assemble(
                 "; {unavailable} processes past the cap had no maps snapshot"
             );
         }
+        // Under confinement the cap is not what limited the pass: say how
+        // many selected processes were unreadable instead of letting the
+        // limit read as the cause. The named gap beside this one carries
+        // the label and the fix.
+        if gaps
+            .iter()
+            .any(|gap| gap.subject == crate::process_access::CHECK_NAME)
+        {
+            let unreadable = collection
+                .members
+                .iter()
+                .filter(|member| matches!(member.status, MemberStatus::Unreadable { .. }))
+                .count();
+            if unreadable > 0 {
+                let _ = write!(
+                    reason,
+                    "; {unreadable} selected processes were unreadable (permission denied) — the scan cap is not what limited this pass"
+                );
+            }
+        }
         gaps.push(PidGap::scope(Skipped {
             subject: "discovery capped".into(),
             reason,
@@ -3095,7 +3135,18 @@ fn empty_explanation(collection: &Collection, matched: usize, skipped: &[PidGap]
         .scope_gaps
         .iter()
         .any(|gap| gap.reason.contains("Permission denied"));
-    if denied {
+    // Under confinement sudo cannot help: the fix is the observer profile,
+    // not privilege. The named gap beside this explanation carries the label.
+    if skipped
+        .iter()
+        .any(|gap| gap.subject == crate::process_access::CHECK_NAME)
+    {
+        parts.push(format!(
+            "some processes could not be read (permission denied); their modules are unknown, \
+             not absent — {}",
+            crate::process_access::FIX
+        ));
+    } else if denied {
         parts.push(
             "some processes could not be read (permission denied); their modules are unknown, \
              not absent — rerun with `sudo p11scope inspect --system` for full coverage"

@@ -7268,6 +7268,19 @@ fn discover_plan(
     let (pids, unlisted) = scope_pids(scope);
     attribution::note_all(&unlisted);
     discovered.base_counters.object_skips.extend(unlisted);
+    // A confined observer reads almost nothing past here: sample once, warn
+    // once, and record the named gap first so the capture-startup line names
+    // the confinement instead of only the sweep that followed it.
+    // Unconfined hosts skip the sampling; a named pid never fills a sample.
+    if let Some(block) = crate::process_access::detect(&pids) {
+        crate::process_access::warn_once(&block);
+        let skipped = Skipped {
+            subject: crate::process_access::CHECK_NAME.into(),
+            reason: crate::process_access::gap_reason(&block, None),
+        };
+        attribution::note(&skipped);
+        discovered.base_counters.object_skips.push(skipped);
+    }
     // The first tick's newcomer baseline: everything enumerated here was
     // observed at discovery, so only truly later arrivals read as newcomers.
     discovered

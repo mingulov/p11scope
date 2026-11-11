@@ -203,6 +203,7 @@ fn probe_with_host(
         setcap_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
         object_capture_check(),
+        process_access_check(),
     ];
     let loads_capture = capture_loads_assessed(host);
     progress.announce(DoctorPhase::BpfSelfProbe);
@@ -894,6 +895,12 @@ fn capabilities_check() -> Check {
     }
 }
 
+/// The confinement row: a Fail names the AppArmor label blocking process
+/// reads and the fix, and gates the verdict like any requested lane.
+fn process_access_check() -> Check {
+    crate::process_access::probe_check()
+}
+
 /// The one-line `setcap` recipe row; `next_line` reads its severity
 /// back to point a deprived operator at the grant instead of root.
 const MINIMAL_SETCAP_ROW: &str = "minimal setcap";
@@ -1573,6 +1580,12 @@ fn is_run_capture_row(name: &str) -> bool {
     name == "run initial-set capture"
 }
 
+/// The confinement row gates the verdict: a confined observer that cannot
+/// read other processes must not report "requested-lane checks passed".
+fn is_process_access_row(name: &str) -> bool {
+    name == crate::process_access::CHECK_NAME
+}
+
 fn scan_pid_suffix(name: &str) -> String {
     name.strip_prefix("/proc/")
         .and_then(|rest| rest.strip_suffix("/mem"))
@@ -1752,6 +1765,7 @@ fn is_requested_lane(name: &str) -> bool {
         || is_cgroup_row(name)
         || is_run_capture_row(name)
         || is_pid_namespace_row(name)
+        || is_process_access_row(name)
 }
 
 /// Explain the existing requested-lane verdict and capability tier before the
@@ -1934,6 +1948,9 @@ fn next_step_for(check: &Check, privileged: bool, caps_lacking: bool) -> String 
     {
         return "grant the minimal capability set (see 'minimal setcap') and retry".into();
     }
+    if is_process_access_row(&check.name) && matches!(check.status, Status::Fail(_)) {
+        return crate::process_access::FIX.into();
+    }
     if is_pid_namespace_row(&check.name) {
         return "use an observer in the initial PID namespace with a matching /proc view".into();
     }
@@ -2063,7 +2080,8 @@ pub fn verdict(checks: &[Check]) -> i32 {
             || is_scan_row(&c.name)
             || is_cgroup_row(&c.name)
             || is_run_capture_row(&c.name)
-            || is_pid_namespace_row(&c.name))
+            || is_pid_namespace_row(&c.name)
+            || is_process_access_row(&c.name))
             && matches!(c.status, Status::Fail(_))
     });
     if gated { 1 } else { 0 }
@@ -3726,9 +3744,9 @@ mod tests {
         // 13 host/target rows, eight §10.1 rows, five finite preflight rows
         // (host, inventory, journal pair, lifecycle, scope), the cgroup
         // version row, the uprobe-multi self-link row, the PID namespace
-        // row, the minimal-setcap recipe row, and the object-attribute
-        // capture build row.
-        assert_eq!(checks.len(), 31, "{checks:?}");
+        // row, the minimal-setcap recipe row, the object-attribute
+        // capture build row, and the process-access confinement row.
+        assert_eq!(checks.len(), 32, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),

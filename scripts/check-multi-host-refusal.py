@@ -14,6 +14,12 @@ on any other marker.
 valid inventory/v1 document that names the unavailable counts); every
 other live row (doctor, profile, counter, run, `inventory --capture
 native`) still refuses before any capture side effect.
+
+With --expect-counter-objects 0 the counter rows expect the exact
+counter-mode omission refusal of a build without counter objects (the
+wide default) instead of the live-capture refusal; every other row is
+unchanged. The build gate fires before any kernel probe, so on a
+pre-Multi host the omission refusal wins over the live-capture one.
 """
 import argparse
 from contextlib import contextmanager
@@ -40,6 +46,9 @@ REFUSAL_LEADS = (
 def refused(output):
     """Whether the observer refused with its finite live-capture refusal."""
     return any(lead in output for lead in REFUSAL_LEADS)
+
+
+COUNTER_OMISSION_REFUSAL = "counter-mode-unavailable-in-build: this build omits counter objects"
 
 
 FALLBACK_GAP_SUBJECT = "native usage feed unavailable"
@@ -89,14 +98,20 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def check_commands(observer, work, progress=None, doctor_timeout=60):
+def check_commands(observer, work, progress=None, doctor_timeout=60,
+                   expect_counter_objects=1):
     """Exercise actual command/sink/workload boundaries; callable unprivileged.
 
     doctor_timeout is a liveness bound only (the refusal oracle is
     unchanged): the old verifiers grind ~65 s through doctor's preflight
     loads (measured 65 s on 5.15, 64 s on 6.1), so refusal guests pass
-    300 there.
+    300 there. expect_counter_objects selects the counter-row oracle:
+    1 demands the live-capture refusal (a build with counter objects),
+    0 demands the exact counter-mode omission refusal (a build without
+    them); every other row is unchanged either way.
     """
+    if expect_counter_objects not in (0, 1):
+        raise ValueError("expect_counter_objects must be 0 or 1")
     rows = []
 
     def complete(case, result, outcome, checks, reason=None):
@@ -172,6 +187,17 @@ def check_commands(observer, work, progress=None, doctor_timeout=60):
                 ("workload_not_run", not sentinel.exists(),
                  "user workload executed before fallback"),
             ], "scan fallback")
+            continue
+        if case.startswith("counter-") and not expect_counter_objects:
+            complete(case, result, "refused", [
+                ("refusal_exit", result.returncode > 0,
+                 "expected nonzero setup refusal"),
+                ("omission_refusal", COUNTER_OMISSION_REFUSAL in output,
+                 "missing counter-mode omission refusal"),
+                ("sink_unchanged", sink_unchanged, "pre-existing sink changed"),
+                ("workload_not_run", not sentinel.exists(),
+                 "user workload executed before refusal"),
+            ], "counter-mode omission refusal")
             continue
         complete(case, result, "refused", [
             ("refusal_exit", result.returncode > 0, "expected nonzero setup refusal"),
@@ -351,6 +377,9 @@ def guest(stage):
     if kernel != expected and not kernel.startswith(expected + "-"):
         raise RuntimeError("wrong guest kernel: " + kernel)
     trust_stage_owner(stage, metadata.get("runner_uid"))
+    counter_objects = metadata.get("counter_objects", 1)
+    if counter_objects not in (0, 1):
+        raise RuntimeError("corrupt counter-object expectation")
     os.umask(0o022)
     context = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
                "runner_uid": metadata["runner_uid"], "euid": os.geteuid(),
@@ -369,7 +398,8 @@ def guest(stage):
                         "doctor_timeout": doctor_timeout})
         (stage / "guest-context.json").write_text(json.dumps(context, indent=2) + "\n")
         rows = check_commands(staged["p11scope"], work, progress=stage / "case-results.json",
-                              doctor_timeout=doctor_timeout)
+                              doctor_timeout=doctor_timeout,
+                              expect_counter_objects=counter_objects)
         if metadata.get("denial") is not None:
             rows.append(check_denial_cell(staged["lib-tests"], work,
                                           metadata["denial"],
@@ -389,6 +419,11 @@ def main():
     parser.add_argument("--denial", default=None,
                         choices=("denied", "eligible"),
                         help="expected identity-cell branch (needs --libtest)")
+    parser.add_argument("--expect-counter-objects", default=1, type=int,
+                        choices=(0, 1),
+                        help="counter rows expect the counter objects (1) "
+                             "or the exact omission refusal of a build "
+                             "without them (0, the wide default)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     if args.guest:
@@ -419,6 +454,7 @@ def main():
                 "sha256": {name: digest(stage / name) for name in names}}
     if args.denial is not None:
         metadata["denial"] = args.denial
+    metadata["counter_objects"] = args.expect_counter_objects
     (stage / "inputs.json").write_text(json.dumps(metadata) + "\n")
     command = shlex.join(["python3", str(stage / "guest.py"), "--guest", str(stage)])
     # Liveness bound only: a healthy 5.15 run needs boot (~111 s) plus

@@ -424,6 +424,7 @@ jobs:
             denial_args=(--libtest "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests" --denial "${{ matrix.denial_branch }}")
           fi
           python3 -I scripts/check-multi-host-refusal.py "${denial_args[@]}" \
+            --expect-counter-objects "$BPF_EXPECT_COUNTER_OBJECTS" \
             "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
             "$GITHUB_WORKSPACE/bpf-load-out/refusal-${{ matrix.kernel }}" "${{ matrix.kernel }}" \
             | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"

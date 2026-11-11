@@ -37,6 +37,8 @@ use crate::attach::capture::{
     ReadWindow, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
+#[cfg(test)]
+use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
     CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ExeResolution,
@@ -32607,7 +32609,7 @@ int main(void) {
     #[test]
     fn unidentified_callers_survive_a_full_gap_table() {
         let (mut native, _) = NativeScene::new();
-        for i in 0..1100u32 {
+        for i in 0..DEFAULT_MAX_GAPS + 1 {
             native
                 .scene
                 .coordinator

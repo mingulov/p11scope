@@ -1268,8 +1268,10 @@ fn assert_costing(engine: &Engine, wall: std::time::Duration, label: &str) {
     );
 }
 
-/// Count-only treatment: no publication evidence ever authorizes
-/// semantics on its own.
+/// Count-only treatment: pure live/heuristic publication evidence never
+/// authorizes semantics on its own in the main plan. Manifest
+/// corroboration, exact interface linkage and sole-complete tables do
+/// (owner 2026-11-11); tests with those use their own assertions.
 fn assert_count_only(engine: &Engine) {
     assert!(
         engine
@@ -3051,6 +3053,8 @@ fn legacy_static_table_scan_manifest_and_live() {
             "called ordinal {ord} is admitted"
         );
     }
+    // Scan-only: five heuristic ls tables plus the heuristic sidecar
+    // (sc_fn_* stubs, no standard exports or interfaces) stay count-only.
     assert_count_only(&engine_a);
 
     // 9b: a stale manifest's exact-target fallback supports all five.
@@ -3148,7 +3152,25 @@ fn legacy_static_table_scan_manifest_and_live() {
         assert_ne!(slot.names[0], "unknown", "manifest authorizes names");
     }
     assert_eq!(engine_b.counters.manifest_fallbacks.len(), 1);
-    assert_count_only(&engine_b);
+    // Owner 2026-11-11: the manifest-bound ls table carries authority
+    // via corroboration; the heuristic sidecar stays count-only.
+    for slot in engine_b.plan().slots.iter() {
+        if slot.object_path.ends_with("ls/provider.so") {
+            assert!(
+                slot.semantic_authorized && slot.descriptor_index != 0,
+                "manifest-bound ls slot carries authority: {slot:?}"
+            );
+        } else {
+            assert!(
+                slot.object_path.contains("sidecar.so"),
+                "slot belongs to ls or sidecar: {slot:?}"
+            );
+            assert!(
+                !slot.semantic_authorized && slot.descriptor_index == 0,
+                "heuristic sidecar slot stays count-only: {slot:?}"
+            );
+        }
+    }
 
     // 9c: a live return merges with its scan instance and bypasses.
     let mut engine_c = engine_over_pids(&[holder.pid]);
@@ -3216,6 +3238,8 @@ fn legacy_static_table_scan_manifest_and_live() {
         0,
         "the merge adds no new slots to attach"
     );
+    // Live return stays subset-only in the main plan, so the ls tables
+    // stay count-only with the heuristic sidecar.
     assert_count_only(&engine_c);
     assert_costing(&engine_c, wall, "t9-ls");
 

@@ -3106,7 +3106,7 @@ fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
         shown.join(", ")
     };
     let remedy = if verbose {
-        " — rerun with --manifest for each mapped provider file"
+        " — rerun with --manifest for each mapped provider file to confirm its table layout for mechanism decoding"
     } else {
         ""
     };
@@ -3854,7 +3854,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
             // Concise points at Coverage for the one remedy; verbose
             // repeats the remedy here beside the fact.
             let remedy = if verbosity == crate::cli::TextVerbosity::Verbose {
-                "; add --manifest for each mapped provider file"
+                "; add --manifest for each mapped provider file to confirm table layouts"
             } else {
                 ""
             };
@@ -4354,11 +4354,15 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "probe re-attach gaps",
             ),
             "semantic_unverified_slots" => {
-                // The names render from the standard table; only a
-                // manifest confirms them. Verbose keeps the slot count
-                // with the machine cause name.
-                const PLAIN: &str = "function names follow the standard PKCS#11 table and were \
-                     not confirmed by a manifest (add --manifest to confirm)";
+                // The names render from the standard table by position, but
+                // the layout was not verified from scan (unknown, vendor or
+                // ambiguous tables stay count-only); a manifest confirms the
+                // positions for mechanism decoding. Verbose keeps the slot
+                // count with the machine cause name. Standard-layout tables
+                // (interface-linked, sole-complete) verify without a manifest
+                // and never reach this hint.
+                const PLAIN: &str = "function names follow the standard PKCS#11 table but their \
+                     layout was not verified from scan (add --manifest to confirm positions for mechanism decoding)";
                 if verbose {
                     fragments.push(format!(
                         "{PLAIN} ({} slots; {cause})",
@@ -8873,8 +8877,8 @@ pub(crate) mod tests {
         assert!(
             out.contains(
                 "→ PARTIAL — names unconfirmed (attribution withheld) \
-                 (function names follow the standard PKCS#11 table and were not confirmed \
-                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots))"
+                 (function names follow the standard PKCS#11 table but their layout was not verified \
+                 from scan (add --manifest to confirm positions for mechanism decoding) (68 slots; semantic_unverified_slots))"
             ),
             "{out}"
         );
@@ -9053,8 +9057,8 @@ pub(crate) mod tests {
         assert!(out.contains("names unconfirmed"), "{out}");
         assert!(
             out.contains(
-                "function names follow the standard PKCS#11 table and were not confirmed \
-                 by a manifest (add --manifest to confirm)"
+                "function names follow the standard PKCS#11 table but their layout was not verified \
+                 from scan (add --manifest to confirm positions for mechanism decoding)"
             ),
             "{out}"
         );
@@ -9574,7 +9578,7 @@ pub(crate) mod tests {
         assert!(
             out.contains(
                 "coverage: partial — counts complete; function names follow the standard PKCS#11 table \
-                 and were not confirmed by a manifest (add --manifest to confirm)"
+                 but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding)"
             ),
             "{out}"
         );
@@ -10286,8 +10290,8 @@ pub(crate) mod tests {
         );
         assert!(
             out.contains(
-                "function names follow the standard PKCS#11 table and were not confirmed \
-                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots)"
+                "function names follow the standard PKCS#11 table but their layout was not verified \
+                 from scan (add --manifest to confirm positions for mechanism decoding) (68 slots; semantic_unverified_slots)"
             ),
             "{out}"
         );
@@ -13165,7 +13169,7 @@ pub(crate) mod tests {
         assert!(
             out.contains(
                 "Mechanisms: none attributed — 212 functions named from the standard table, \
-                 unconfirmed; add --manifest for each mapped provider file (see Coverage)."
+                 unconfirmed; add --manifest for each mapped provider file to confirm table layouts (see Coverage)."
             ),
             "{out}"
         );

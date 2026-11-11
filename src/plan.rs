@@ -5465,13 +5465,19 @@ fn sole_complete_table_authorized(
     true
 }
 
-/// Scan lowering for the no-manifest semantic subset (DEMO-4): when
-/// `scan_authorized`, targets of name-authorized tables whose
-/// publication evidence is interface linkage, a live function-list
-/// return, manifest corroboration, or the sole-complete-table leg
-/// (never export agreement alone) carry semantic authority inside
-/// this lowering only. Every other lowering keeps scan targets
-/// count-only, exactly as before.
+/// Scan lowering with standard-layout semantic authority (owner
+/// 2026-11-11: no manifest needed for standard providers): targets of
+/// name-authorized tables whose standard layout is proven by scan-time
+/// evidence the observer already has — exact interface linkage (the
+/// provider's own "PKCS 11" static data names this table), manifest
+/// corroboration, or the sole-complete-table leg (KO-SOLE) — carry
+/// semantic authority in every lowering, so profile/trace attribute
+/// mechanism ids without --manifest. The subset additionally keeps its
+/// live-return grant for heap-first tables; the main plan does not take
+/// it (descriptors freeze at attach, so a late return cannot upgrade an
+/// attached slot). Exact exports agreement stays names-only here; the
+/// per-ordinal exports leg is a follow-up. Unknown or vendor-shifted
+/// tables stay count-only.
 fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -5512,17 +5518,19 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         );
         let authorized = table_name_authorized(&score);
         // Argument-read (semantic) authority from a scan needs the
-        // table a caller actually reaches: standard interface
-        // linkage, a live function-list return, manifest
-        // corroboration, or the sole-complete-table leg. Export-name
-        // agreement alone proves names, not the table in use, so it
-        // stays count-only here.
-        let scan_semantic = scan_authorized
-            && authorized
+        // table's standard layout proven by scan-time evidence: exact
+        // interface linkage, manifest corroboration, or the
+        // sole-complete-table leg. The live-return grant stays
+        // subset-only (a late return cannot upgrade a frozen slot).
+        // Export-name agreement alone proves names, not the table in
+        // use, so it stays count-only here; the per-ordinal exports
+        // leg is a follow-up. Unknown or vendor-shifted tables stay
+        // count-only: no argument is ever read through an unproven slot.
+        let scan_semantic = authorized
             && (score.linked
-                || score.live_return
                 || score.manifest
-                || sole_complete_table_authorized(module, index, &exports));
+                || sole_complete_table_authorized(module, index, &exports)
+                || (scan_authorized && score.live_return));
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -8231,11 +8239,7 @@ mod tests {
         // semantic authority in the main plan, so profile/trace attribute
         // mechanism ids without --manifest.
         let module = sole_complete_module();
-        let plan = build_from_sources(
-            std::slice::from_ref(&module),
-            &[],
-            &PinnedObjects::empty(),
-        );
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
         assert_eq!(plan.slots.len(), 68);
         assert!(
             plan.slots.iter().all(|slot| slot.semantic_authorized),
@@ -9531,7 +9535,11 @@ mod tests {
 
         assert_eq!(plan.slots.len(), 1);
         assert_eq!(plan.slots[0].names, ["C_Login", "C_Sign"]);
-        assert!(!plan.slots[0].semantic_authorized);
+        // Owner 2026-11-11 (no manifest needed for standard providers):
+        // the linked scan claim is now authorized like the manifest
+        // claim, so both claims are authorized; the dispute still
+        // resolves to count-only through the ambiguous descriptor.
+        assert!(plan.slots[0].semantic_authorized);
         assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
         assert!(plan.slots[0].semantic_ambiguous);
     }

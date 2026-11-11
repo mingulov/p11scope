@@ -5,8 +5,11 @@
 //! named `unknown` throughout. Its own `.dynsym` is a second, independent
 //! witness: when every standard name the object defines (non-IFUNC, in the
 //! same object) sits exactly at the target its ordinal holds, the table's
-//! ordinal names are presented. Presentation only — no slot gains semantic
-//! authority, so argument decoding is unchanged.
+//! ordinal names are presented. Presentation only — export linkage itself
+//! never authorizes semantics. Owner 2026-11-11: sole-complete standard
+//! shapes additionally carry authority via KO-SOLE, so those fixtures now
+//! assert authorized slots; pure exports-only shapes without sole/linked
+//! evidence stay count-only as before.
 //!
 //! Each case compiles a real 2.40 provider, loads it into an owned stopped
 //! child, and drives the production scan → pin → reconcile → plan chain
@@ -465,6 +468,22 @@ fn assert_count_only(plan: &AttachPlan) {
     }
 }
 
+/// Owner 2026-11-11: a sole-complete standard fixture (single 2.x table,
+/// full walk, finished scan) carries semantic authority via KO-SOLE.
+/// Export linkage presents the names; sole-complete authorizes the reads.
+/// No-arg functions (e.g. C_GetInfo) keep a value-equal COUNT_ONLY
+/// descriptor with their own nonzero index; mechanism-bearing Inits carry
+/// the mechanism_arg read.
+fn assert_sole_authorized(plan: &AttachPlan) {
+    for slot in &plan.slots {
+        assert!(
+            slot.semantic_authorized,
+            "sole-complete standard slot carries authority: {slot:?}"
+        );
+        assert_ne!(slot.descriptor_index, 0, "{slot:?}");
+    }
+}
+
 #[test]
 fn export_fixture_keeps_provider_out_of_parent_mappings() {
     let loaded = Loaded::build(Variant::Agreeing);
@@ -570,7 +589,8 @@ fn export_subject_stays_stopped_and_stable_through_parent_changes_and_plan() {
     assert_eq!(plan.modules.len(), 1);
     assert_eq!(plan.modules[0].tables[0].linkage, "exports");
     assert_eq!(plan.slots.len(), LEGACY_ORDINALS);
-    assert_count_only(&plan);
+    // Owner 2026-11-11: sole-complete standard shape carries authority.
+    assert_sole_authorized(&plan);
     assert_eq!(snapshot(), before);
     drop(mapping);
     assert_eq!(snapshot(), before);
@@ -612,8 +632,9 @@ fn export_early_exit_reaps_the_owned_child() {
 }
 
 /// RED (GT-2): the SoftHSM2 shape — every standard name exported, the table
-/// found only heuristically — presents the standard names, publishes
-/// `linkage: "exports"`, and stays count-only.
+/// found only heuristically — presents the standard names and publishes
+/// `linkage: "exports"`. Owner 2026-11-11: the sole-complete shape now
+/// carries authority via KO-SOLE, so mechanisms attribute without a manifest.
 #[test]
 fn exported_standard_names_that_agree_with_every_ordinal_name_the_table() {
     let loaded = Loaded::build(Variant::Agreeing);
@@ -634,7 +655,7 @@ fn exported_standard_names_that_agree_with_every_ordinal_name_the_table() {
         );
         assert!(!slot.aliased, "{slot:?}");
     }
-    assert_count_only(&plan);
+    assert_sole_authorized(&plan);
 }
 
 /// RED (live triage): the Fedora/Chromium shape — a 3.2-stamped table whose
@@ -801,7 +822,10 @@ fn two_ordinals_on_one_exported_stub_are_one_aliased_row() {
         .expect("the shared stub is one slot");
     assert_eq!(slot.names, shared.1);
     assert!(slot.aliased);
-    assert_count_only(&plan);
+    // Owner 2026-11-11: sole-complete authorizes every slot; the aliased
+    // pair shares one signature, so it carries that descriptor (a
+    // conflicting-signature alias would resolve to count-only instead).
+    assert_sole_authorized(&plan);
 }
 
 /// An IFUNC symbol's value is its resolver, never the function. A table

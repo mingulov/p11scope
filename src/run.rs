@@ -3607,12 +3607,17 @@ fn capture_with_host(
     );
     // Kernel file-open learning: the fanotify drain proves opened
     // files on held bytes for system scope; first loads of brand-new
-    // providers stay a named gap, later runs are caught. Armed before
-    // the session starts (and before the post-setup capability shed)
-    // so the group and its filesystem marks exist even if the shed
-    // later takes CAP_SYS_ADMIN; other scopes and an unavailable
+    // providers stay a named gap, later runs are caught. Detailed
+    // policies only: aggregate metrics and counter captures keep
+    // their existing gaps and pay no fanotify cost. Armed before the
+    // session starts so the group and its filesystem marks exist
+    // under the startup grant; the reader thread spawns only after
+    // the post-setup capability shed (below), so it never retains
+    // the transient CAP_SYS_ADMIN. Other scopes and an unavailable
     // drain keep ordinary discovery.
-    engine.start_file_learning();
+    if file_learning_armed(policy) {
+        engine.start_file_learning();
+    }
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     // A named pid that died after scope resolution fails below with the one
@@ -3652,6 +3657,11 @@ fn capture_with_host(
     session
         .drop_post_setup_capabilities(false)
         .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
+    // The learn reader spawns only now, with this thread's post-shed
+    // capability sets: a pre-shed spawn would keep the transient
+    // CAP_SYS_ADMIN for the whole capture (capabilities are
+    // per-thread). Marks were placed at arming and keep delivering.
+    engine.begin_file_learning_drain();
     run_loop(
         &mut engine,
         &mut session,
@@ -3728,6 +3738,17 @@ fn no_profile_duration_notice() -> String {
 /// combination already refused); inventory never reaches this flow.
 pub(crate) fn extensive_effective(track_short_lived: bool, policy: CapturePolicy) -> bool {
     track_short_lived && policy.allows_track_short_lived()
+}
+
+/// Kernel file-open learning arms only under detailed policies:
+/// aggregate metrics and counter captures publish no per-file
+/// discovery records for a learned file to join, so they keep their
+/// existing short-lived gaps and pay no fanotify cost.
+pub(crate) fn file_learning_armed(policy: CapturePolicy) -> bool {
+    matches!(
+        policy,
+        CapturePolicy::Allowlisted | CapturePolicy::UnsafeUnvalidatedMetadata
+    )
 }
 
 /// 7.10b: the owned-`run` extensive-arm decision: whether the flag is
@@ -23139,6 +23160,25 @@ int main(int argc, char **argv) {
             "{error:#}"
         );
         assert_eq!(probes.get(), 1);
+    }
+
+    /// File learning arms under detailed policies only: aggregate
+    /// metrics and every counter mode stay unarmed.
+    #[test]
+    fn file_learning_arms_only_for_detailed_policies() {
+        use p11scope_ebpf_common::CounterMode;
+        assert!(file_learning_armed(CapturePolicy::Allowlisted));
+        assert!(file_learning_armed(
+            CapturePolicy::UnsafeUnvalidatedMetadata
+        ));
+        assert!(!file_learning_armed(CapturePolicy::AggregateOnly));
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            assert!(!file_learning_armed(CapturePolicy::Counter(mode)));
+        }
     }
 
     /// 7.10b widening keeps the documented counter-mode refusal: beside

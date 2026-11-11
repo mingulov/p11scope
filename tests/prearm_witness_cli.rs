@@ -885,6 +885,17 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
 /// calls may be missed, but the run must be shown as a named miss
 /// (provider path + loading program). Round 2 is twenty identical
 /// one-shot runs in the same capture: at least 19 must be counted.
+///
+/// The round boundary is causal, not arithmetic: the staging event is
+/// observed on the capture's stderr *after* the round-1 run and
+/// *before* any round-2 run, and the final record must show
+/// `learned_staged_files >= 1` with `pre_attach_loads == 1` (exactly
+/// the round-1 loader tallied before staging; nothing else opens this
+/// unique-sha copy). A round-1 run caught by ordinary discovery would
+/// be scan-covered and stage nothing. So round 1 is *proven* missed,
+/// and a combined `C_Initialize` of 19..=20 over 21 in-capture runs
+/// isolates round 2 at >=19/20: one caught round-1 run plus 18
+/// round-2 runs cannot satisfy the conjunction.
 #[test]
 #[ignore = "privileged: learned provider second round catches one-shot tools (root, BPF, SoftHSM, pkcs11-tool)"]
 fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
@@ -1054,12 +1065,13 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
             || unknown == Some("loader exe link unreadable"),
         "first loader named or finitely unknown: {first}"
     );
-    assert!(
+    assert_eq!(
         first
             .get("pre_attach_loads")
-            .and_then(|loads| loads.as_u64())
-            .is_some_and(|loads| loads >= 1),
-        "the missed first run is counted: {first}"
+            .and_then(|loads| loads.as_u64()),
+        Some(1),
+        "exactly the round-1 loader was tallied before staging, proving \
+         round 1 missed and isolating the round-2 rate: {first}"
     );
     assert!(
         profile["evidence"]["learned_staged_files"]

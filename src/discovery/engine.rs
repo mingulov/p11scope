@@ -474,6 +474,10 @@ pub struct Engine {
     /// inventory refresh consumed them: shallow-idle frames must not
     /// skip the apply that attaches the new file.
     learned_unapplied: bool,
+    /// The drain was shut down orderly (joined): its channel closing
+    /// afterwards is the expected terminal state, not drain death.
+    /// Genuine loss at shutdown rides the drain's lost-tail report.
+    learned_close_expected: bool,
     prearm: crate::prearm_module::PrearmState,
     /// Pre-arm witness verdicts (WU-13 P-C phase 2): None until a non-run
     /// start_session finalizes the witness; run sessions and failed
@@ -11482,6 +11486,7 @@ impl Engine {
             learned_cap_skipped: 0,
             learned_frame_owed: false,
             learned_unapplied: false,
+            learned_close_expected: false,
             prearm: crate::prearm_module::PrearmState::empty(),
             prearm_witness: None,
             prearm_witness_live: None,
@@ -19238,6 +19243,105 @@ impl Engine {
         }
     }
 
+    /// Spawns the drain thread for an armed learner. The group and its
+    /// marks are created at arming (they need the startup grant), but
+    /// the reader thread must start only once the post-setup
+    /// capability shed has run on the calling thread: capabilities are
+    /// per-thread, and a pre-shed spawn would keep parsing arbitrary
+    /// opened files with the transient `CAP_SYS_ADMIN`. Events between
+    /// marking and this call wait in the finite kernel queue. A spawn
+    /// failure files the unavailable gap, never a silent dead learner.
+    pub(crate) fn begin_file_learning_drain(&mut self) {
+        let Some(learner) = self.file_learner.as_mut() else {
+            return;
+        };
+        if let Err(absent) = learner.begin_drain() {
+            self.file_learner = None;
+            self.learned_rx = None;
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_UNAVAILABLE_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: file learning unavailable: {}; short-lived first loads keep today's gaps",
+                    absent.reason
+                );
+            }
+        }
+    }
+
+    /// Lists every staged learned file the plan never adopted (first
+    /// serviced at capture end, so no apply ran): a bounded terminal
+    /// record per file with its path and first loader, explicitly
+    /// unattached (no objects, no watch, no windows), so the file is
+    /// named in the evidence instead of only counted. Files the plan
+    /// adopted already list through ordinary projection and are
+    /// skipped here.
+    fn publish_terminal_learned_records(&mut self) {
+        if self.learned_notes.is_empty() {
+            return;
+        }
+        let planned: BTreeSet<ObjectKey> = self
+            .plan
+            .modules
+            .iter()
+            .filter_map(|module| self.pinned.summary(module.object).map(|pin| pin.key))
+            .collect();
+        let mut next_id = self
+            .plan
+            .modules
+            .iter()
+            .map(|module| module.id.0)
+            .chain(self.discovery.modules.iter().map(|module| module.id.0))
+            .max()
+            .map(|max| max.saturating_add(1))
+            .unwrap_or(0);
+        for (key, note) in &self.learned_notes {
+            if planned.contains(key) {
+                continue;
+            }
+            if self.discovery.modules.iter().any(|module| {
+                module.dev == (key.device.major, key.device.minor)
+                    && module.ino == key.inode
+                    && module.first_loaded_by.is_some()
+            }) {
+                continue;
+            }
+            let Some(pin) = self.pinned.pinned().find(|pin| pin.key == *key) else {
+                continue;
+            };
+            let (path, sha256, build_id) = (
+                pin.path.to_string(),
+                pin.sha256.to_string(),
+                pin.build_id.map(str::to_string),
+            );
+            let id = plan::ModuleId(next_id);
+            next_id = next_id.saturating_add(1);
+            self.discovery.modules.push(render::DiscoveredModule {
+                id,
+                admission_class: None,
+                dev: (key.device.major, key.device.minor),
+                ino: key.inode,
+                sha256: Some(sha256),
+                path,
+                build_id,
+                layer: None,
+                objects: Vec::new(),
+                sources: vec!["prearm"],
+                corroborated: false,
+                corroboration: vec!["uncorroborated"],
+                tables: Vec::new(),
+                interfaces: 0,
+                skipped: Vec::new(),
+                watch: None,
+                attached_at_ns: Some(None),
+                unobserved_windows: None,
+                first_loaded_by: Some(note.clone()),
+            });
+        }
+    }
+
     /// Drains the learn channel once per tick, before the discovery pass:
     /// tallies loads, stages provider candidates through the pre-arm pin
     /// path, and files the learned gaps. Pins are bounded per tick (the
@@ -19246,15 +19350,21 @@ impl Engine {
     /// 100 ms after learning instead of at the next 1 s boundary.
     pub(crate) fn service_learned_files(&mut self) {
         const PINS_PER_TICK: usize = 8;
+        // Backstop for any flow that reaches the loop without the
+        // explicit post-shed begin: service only runs inside the
+        // capture loop, after the shed, so beginning here keeps the
+        // same capability contract. Idempotent.
+        self.begin_file_learning_drain();
         self.service_learned_files_inner(PINS_PER_TICK);
     }
 
     /// End-of-capture flush: stages everything still queued without the
     /// per-tick pin bound (the per-capture cap still refuses true excess
-    /// loudly), so a late burst still lists with its gap instead of
-    /// vanishing silently at the boundary. Two passes catch stragglers
-    /// the live drain sends mid-flush; anything after that is post-scope
-    /// and correctly excluded.
+    /// loudly), so a late burst is counted with its gap and listed by
+    /// the terminal-record publication in `finish_prearm_capture`
+    /// instead of vanishing silently at the boundary. Two passes catch
+    /// stragglers the live drain sends mid-flush; anything after that
+    /// is post-scope and correctly excluded.
     pub(crate) fn flush_learned_files_at_capture_end(&mut self) {
         self.service_learned_files_inner(usize::MAX);
         self.service_learned_files_inner(usize::MAX);
@@ -19263,13 +19373,15 @@ impl Engine {
     /// Stops file learning at capture end: joins the drain first (no
     /// send is in flight afterwards), stages everything it sent, then
     /// files the lost tail loudly when the drain reports one (an
-    /// unsent message or unread queue contents at shutdown). Idempotent
-    /// and a no-op without a learner.
+    /// unsent message or unread queue contents at shutdown). The
+    /// channel closing after the join is the expected terminal state,
+    /// never drain death. Idempotent and a no-op without a learner.
     pub(crate) fn shutdown_file_learning(&mut self) {
         let mut lost_tail = false;
         if let Some(mut learner) = self.file_learner.take() {
             lost_tail = learner.shutdown_and_join();
         }
+        self.learned_close_expected = true;
         self.flush_learned_files_at_capture_end();
         self.learned_rx = None;
         if lost_tail {
@@ -19306,10 +19418,18 @@ impl Engine {
                 Ok(msg) => msg,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // The drain died unexpectedly: learning stops here.
-                    // Drop the channel so this fires once, and funnel the
-                    // loss into the overflow aggregate (row dedupes).
                     self.learned_rx = None;
+                    if self.learned_close_expected {
+                        // Orderly shutdown: the drain was joined, so
+                        // its sender closing is terminal, not death.
+                        // Queued messages were delivered first (mpsc
+                        // order); real tail loss rides lost_tail.
+                        return;
+                    }
+                    // The drain died unexpectedly: learning stops here.
+                    // The channel is dropped so this fires once, and
+                    // the loss funnels into the overflow aggregate
+                    // (row dedupes).
                     self.learned_event_loss = self.learned_event_loss.saturating_add(1);
                     self.mark_partial(
                         crate::render::LEARNED_SKIP_SUBJECT,
@@ -33666,6 +33786,7 @@ impl Engine {
         ));
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
+        self.publish_terminal_learned_records();
         if !self.prearm.is_empty() {
             // Retire after assembly: deactivation unresolves declared keys,
             // and the stamps are historical facts the assembly must still read.

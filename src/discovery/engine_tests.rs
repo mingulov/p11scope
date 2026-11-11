@@ -75341,6 +75341,197 @@ fn learned_shutdown_stages_unserviced_channel() {
     assert_eq!(engine.learned_event_loss_for_test(), 0);
 }
 
+/// A clean capture-end shutdown is not drain death: production joins
+/// the drain thread first, so by flush time its sender is gone. The
+/// queued candidate still stages and no loss is filed; a dropped
+/// sender during live service (above) stays the death signal.
+#[test]
+fn learned_clean_shutdown_after_drain_join_files_no_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("cleanstop.c");
+    let so = dir.path().join("libcleanstop.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    // The joined drain: its sole sender is gone before the flush.
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.shutdown_file_learning();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the queued candidate stages at shutdown"
+    );
+    assert_eq!(
+        engine.learned_event_loss_for_test(),
+        0,
+        "an orderly joined shutdown files no event loss"
+    );
+}
+
+/// A file first serviced at capture end still publishes: finish lists
+/// it in the discovery evidence with its path and first loader,
+/// explicitly unattached (no objects, no watch), instead of only
+/// counting it in `learned_staged_files`.
+#[test]
+fn learned_terminal_record_publishes_unserviced_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("terminal.c");
+    let so = dir.path().join("libterminal.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    // No tick service at all: finish alone must stage and publish.
+    let session = ScriptedSession::default();
+    engine.finish_prearm_capture(
+        &session,
+        crate::render::PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        None,
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert_eq!(engine.learned_event_loss_for_test(), 0);
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("libterminal.so"))
+        .expect("the terminally learned file is listed");
+    let first = record
+        .first_loaded_by
+        .as_ref()
+        .expect("the terminal record names its first loader");
+    assert_eq!(first.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+    assert!(first.pre_attach_loads >= 1);
+    assert!(
+        record.objects.is_empty(),
+        "terminally learned: listed, never claimed attached"
+    );
+    assert_eq!(record.sources, vec!["prearm"]);
+    assert!(!record.corroborated);
+}
+
+/// A candidate the pin worker refuses after the drain proved it
+/// settles without staging: no note, no staged count, the refusal is
+/// a recorded skip (never silence), and a later load for the same
+/// identity is ignored.
+#[test]
+fn learned_pin_refusal_after_proof_settles_without_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let bogus = dir.path().join("libbogus.so");
+    std::fs::write(&bogus, b"not an ELF provider at all").unwrap();
+    let file = std::fs::File::open(&bogus).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Load {
+        dev,
+        ino,
+        pid: 4242,
+    })
+    .unwrap();
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: bogus.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "a pin-refused candidate never stages"
+    );
+    assert!(
+        engine.learned_notes.is_empty(),
+        "no loader note for a refused file"
+    );
+    assert!(
+        !engine.counters.object_skips.is_empty(),
+        "the pin refusal is recorded, never silent: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "the refused identity settles"
+    );
+    assert!(
+        !engine.learned_load_tally.contains_key(&(dev, ino)),
+        "the tally drops with the refusal"
+    );
+}
+
 /// A learned staging after the plan already stabilized invalidates the
 /// fast paths: `plan_rebuild_stable` clears and the shallow-idle latch
 /// holds, so the next frame rebuilds and attaches the new file instead

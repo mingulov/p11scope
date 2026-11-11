@@ -344,9 +344,10 @@ pub(crate) fn display_path_for(file: &std::fs::File) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Names the loading program from its (reuse-immune, pidfd-derived) pid.
-/// A dead loader resolves to the one finite reason, never to another
-/// process: the caller passes only pids read from a live pidfd's fdinfo.
+/// Names a program from a bare pid. On its own this binds nothing:
+/// production naming goes through `loader_exe_for_pidfd`, which
+/// brackets this read with pidfd liveness so a recycled pid is never
+/// named. A dead loader resolves to the one finite reason.
 pub(crate) fn resolve_loader_exe(pid: u32) -> (Option<String>, Option<&'static str>) {
     if pid == 0 {
         return (None, Some(LOADER_EXE_UNREADABLE_REASON));
@@ -583,18 +584,79 @@ fn close_unread_tail(buf: &[u8], mut offset: usize, len: usize) {
     }
 }
 
+/// Sets `FD_CLOEXEC` explicitly on a kernel-handed fd: the group is
+/// created with `FAN_CLOEXEC`, but event and pid fds must not rely on
+/// propagation through the observer's own `Command::spawn`s (the
+/// discover helper) on every supported kernel.
+fn set_cloexec(fd: std::os::unix::io::RawFd) {
+    // SAFETY: fcntl on a live owned fd; failure only loses the flag.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Whether the task a pidfd pins has exited: a pidfd becomes readable
+/// exactly when its task terminates.
+fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+    let mut polled = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: libc poll on one valid fd with a zero timeout.
+    let ready = unsafe { libc::poll(&mut polled, 1, 0) };
+    ready > 0 && polled.revents & libc::POLLIN != 0
+}
+
+/// Names the loading program through a live pidfd, bracketed: the pid
+/// comes from the pidfd's fdinfo, the exe link is read only while the
+/// pinned task provably still lives, and both are re-checked after
+/// the read, so an exited-and-recycled pid can never be named. The
+/// read happens at event receipt, before the ELF proof. A loader
+/// that already exited — or exec'd a different program between the
+/// open and this read, which no pidfd can exclude — resolves to the
+/// finite unknown or the current image; callers and docs state the
+/// field as the still-live loader's program at learn time.
+pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&'static str>) {
+    let unknown = (None, Some(LOADER_EXE_UNREADABLE_REASON));
+    if pidfd_exited(pidfd) {
+        return unknown;
+    }
+    let Some(pid) = pid_of_pidfd(pidfd) else {
+        return unknown;
+    };
+    let (exe, _) = resolve_loader_exe(pid);
+    let Some(exe) = exe else {
+        return unknown;
+    };
+    if pidfd_exited(pidfd) || pid_of_pidfd(pidfd) != Some(pid) {
+        return unknown;
+    }
+    (Some(exe), None)
+}
+
 /// The drain thread handle, owned by the engine. Drop signals shutdown and
 /// joins (the poll timeout bounds the wait).
 pub(crate) struct FileLearner {
     state: Arc<LearnShutdownState>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Group + sender held between arming and `begin_drain`: the
+    /// reader thread spawns post-shed so it never retains the
+    /// transient startup `CAP_SYS_ADMIN` (capabilities are
+    /// per-thread). `None` once the drain runs.
+    pending: Option<(OwnedFd, SyncSender<LearnMsg>)>,
 }
 
 impl FileLearner {
-    /// Opens the fanotify group, marks every real filesystem, and spawns
-    /// the drain. Needs `CAP_SYS_ADMIN`; without it (or without fanotify
-    /// at all) this returns `LearnAbsent` and the capture keeps today's
-    /// gaps, never a fatal.
+    /// Opens the fanotify group and marks every real filesystem
+    /// (both need the startup `CAP_SYS_ADMIN` grant), but does not
+    /// spawn the reader: call `begin_drain` after the post-setup
+    /// capability shed. Without the grant (or fanotify at all) this
+    /// returns `LearnAbsent` and the capture keeps today's gaps,
+    /// never a fatal.
     pub(crate) fn start() -> Result<(Self, Receiver<LearnMsg>), LearnAbsent> {
         // SAFETY: libc call with flag constants only; the return is
         // checked before any use.
@@ -630,31 +692,59 @@ impl FileLearner {
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_CHANNEL_DEPTH);
         let state = Arc::new(LearnShutdownState::default());
-        let worker_state = Arc::clone(&state);
-        let thread = std::thread::Builder::new()
-            .name("p11scope-learn".to_string())
-            .spawn(move || drain_loop(group, tx, worker_state))
-            .map_err(|error| LearnAbsent {
-                reason: format!("learn thread spawn failed: {error}"),
-            })?;
         Ok((
             Self {
                 state,
-                thread: Some(thread),
+                thread: None,
+                pending: Some((group, tx)),
             },
             rx,
         ))
     }
 
+    /// Spawns the reader thread with the caller's current capability
+    /// sets (post-shed). Idempotent. Re-marking from the drain may
+    /// fail without `CAP_SYS_ADMIN`; the initial marks keep
+    /// delivering, and the drain files unavailable only when no
+    /// event proves the marks alive (its existing blind check).
+    pub(crate) fn begin_drain(&mut self) -> Result<(), LearnAbsent> {
+        if self.thread.is_some() {
+            return Ok(());
+        }
+        let Some((group, tx)) = self.pending.take() else {
+            return Ok(());
+        };
+        let worker_state = Arc::clone(&self.state);
+        match std::thread::Builder::new()
+            .name("p11scope-learn".to_string())
+            .spawn(move || drain_loop(group, tx, worker_state))
+        {
+            Ok(thread) => {
+                self.thread = Some(thread);
+                Ok(())
+            }
+            Err(error) => Err(LearnAbsent {
+                reason: format!("learn thread spawn failed: {error}"),
+            }),
+        }
+    }
+
     /// Stops the drain and joins it, reporting whether a tail was lost:
-    /// an unsent message or unread queue contents at shutdown. The
-    /// engine files that loss loudly (the overflow aggregate).
+    /// an unsent message or unread queue contents at shutdown, or a
+    /// drain thread that panicked. The engine files that loss loudly
+    /// (the overflow aggregate).
     pub(crate) fn shutdown_and_join(&mut self) -> bool {
         self.state.shutdown.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        // A never-begun learner holds the only sender: drop it so the
+        // channel closes terminally instead of dangling.
+        self.pending = None;
+        let mut lost = self.state.lost_tail.load(Ordering::Acquire);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            lost = true;
         }
-        self.state.lost_tail.load(Ordering::Acquire)
+        lost || self.state.lost_tail.load(Ordering::Acquire)
     }
 }
 
@@ -867,7 +957,10 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
             // Take ownership of the pidfd first: every path below closes.
             // SAFETY: the kernel sent an owned pidfd; negatives are not fds.
             let pidfd = match event.pidfd {
-                Some(fd) if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+                Some(fd) if fd >= 0 => {
+                    set_cloexec(fd);
+                    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+                }
                 _ => None,
             };
             if event.overflow {
@@ -882,6 +975,7 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
             if event.fd < 0 {
                 continue;
             }
+            set_cloexec(event.fd);
             // SAFETY: the kernel sent an owned event fd.
             let file = unsafe { std::fs::File::from_raw_fd(event.fd) };
             if event.pid as u32 == self_pid {
@@ -910,6 +1004,10 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
                 continue;
             }
             stats.checked = stats.checked.saturating_add(1);
+            // Name the loader now, at event receipt and bracketed by
+            // pidfd liveness, before the ELF proof spends time a
+            // one-shot loader does not have.
+            let early_loader = pidfd.as_ref().map(loader_exe_for_pidfd);
             let proved = match check_elf_provider(&file) {
                 Ok(proved) => proved,
                 Err(_) => {
@@ -928,10 +1026,8 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
             // unknown reason — the file still stages), and send Load
             // ahead of the candidate so the staged note counts it.
             let tally = tally_pid(&event, pidfd.as_ref());
-            let (loader_exe, loader_unknown_reason) = match pidfd.as_ref().and_then(pid_of_pidfd) {
-                Some(pid) => resolve_loader_exe(pid),
-                None => (None, Some(LOADER_EXE_UNREADABLE_REASON)),
-            };
+            let (loader_exe, loader_unknown_reason) =
+                early_loader.unwrap_or((None, Some(LOADER_EXE_UNREADABLE_REASON)));
             let Some(display_path) = display_path_for(&file) else {
                 // Not cached: a later open retries instead of losing
                 // this proved provider for the whole capture.
@@ -1147,6 +1243,64 @@ mod tests {
         assert_eq!(reason, Some(super::LOADER_EXE_UNREADABLE_REASON));
     }
 
+    /// Opens a pidfd for a child the test owns (pidfd_open, Linux 5.3+).
+    fn test_pidfd(pid: u32) -> std::os::fd::OwnedFd {
+        use std::os::unix::io::FromRawFd as _;
+        // SAFETY: pidfd_open syscall with a plain pid and no flags.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        // SAFETY: the syscall returned an owned fd.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }
+    }
+
+    /// A still-live loader is named through its pidfd bracket; once it
+    /// exits, the same pidfd yields only the finite unknown — an
+    /// exited (potentially recycled) pid is never named.
+    #[test]
+    fn learn_loader_exe_brackets_pidfd_liveness() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pidfd = test_pidfd(child.id());
+        let (exe, reason) = super::loader_exe_for_pidfd(&pidfd);
+        assert_eq!(reason, None, "live loader names without a reason");
+        assert!(
+            exe.as_deref().is_some_and(|exe| exe.ends_with("sleep")),
+            "the live sleeper is named: {exe:?}"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The pidfd turns readable at exit; give the bracket a moment
+        // only if the scheduler has not delivered it yet.
+        for _ in 0..200 {
+            if super::pidfd_exited(&pidfd) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(super::pidfd_exited(&pidfd), "exit makes the pidfd readable");
+        let (exe, reason) = super::loader_exe_for_pidfd(&pidfd);
+        assert_eq!(exe, None, "an exited loader is never named");
+        assert_eq!(reason, Some(super::LOADER_EXE_UNREADABLE_REASON));
+    }
+
+    /// Kernel-handed fds get CLOEXEC explicitly, not by propagation.
+    #[test]
+    fn learn_set_cloexec_sets_the_flag() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let raw = file.as_raw_fd();
+        // SAFETY: fcntl on our own live fd.
+        let before = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(before >= 0);
+        // SAFETY: same fd; clear first so the helper must do the work.
+        unsafe { libc::fcntl(raw, libc::F_SETFD, before & !libc::FD_CLOEXEC) };
+        super::set_cloexec(raw);
+        // SAFETY: same fd.
+        let after = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(after & libc::FD_CLOEXEC != 0, "FD_CLOEXEC set: {after}");
+    }
+
     /// Filesystem marks cover real filesystems; pseudo filesystems are
     /// never marked; mountinfo escapes are decoded for the mark path.
     #[test]
@@ -1276,7 +1430,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let (_learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        let (mut _learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        _learner.begin_drain().expect("spawn drain");
         // A *child* opens the file: the drain skips the observer's own pid.
         let child = std::process::Command::new("cat")
             .arg(&so)
@@ -1304,6 +1459,42 @@ mod tests {
             "loader named or finitely unknown"
         );
         assert_ne!((candidate.dev, candidate.ino), (0, 0));
+        // A long-lived loader is named, not finitely unknown: the
+        // shell opens a second provider and sleeps holding the fd, so
+        // the pidfd bracket reads its exe while it provably lives.
+        let so2 = dir.path().join("liblive2.so");
+        std::fs::copy(&so, &so2).unwrap();
+        let mut holder = std::process::Command::new("sh")
+            .args(["-c", "exec 3< \"$1\"; sleep 30", "sh"])
+            .arg(&so2)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut got = None;
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(super::LearnMsg::Candidate(candidate))
+                    if candidate.display_path.ends_with("liblive2.so") =>
+                {
+                    got = Some(candidate);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let candidate = got.expect("the drain reports the held provider");
+        assert!(
+            candidate
+                .loader_exe
+                .as_deref()
+                .is_some_and(|exe| exe.ends_with("/sh") || exe.ends_with("/dash")),
+            "the still-live holder is named: {:?} / {:?}",
+            candidate.loader_exe,
+            candidate.loader_unknown_reason
+        );
+        holder.kill().unwrap();
+        let _ = holder.wait();
     }
 
     /// Live drain proof across mount namespaces (privileged): a child in
@@ -1330,7 +1521,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let (_learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        let (mut _learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        _learner.begin_drain().expect("spawn drain");
         let child = std::process::Command::new("unshare")
             .args(["-m", "cat"])
             .arg(&so)

@@ -2282,10 +2282,10 @@ class Full512CurationTests(unittest.TestCase):
             result = run_runner("--list", "--full-512", str(binary))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        # DEFAULT 240 minus the 17 wide members, plus both load-gate
+        # DEFAULT 241 minus the 17 wide members, plus both load-gate
         # alternatives the fake lists (a real binary has exactly one);
         # LONG 17 minus the 4 wide members.
-        self.assertIn("default (225)", result.stdout)
+        self.assertIn("default (226)", result.stdout)
         self.assertIn("long (13, --include-long only)", result.stdout)
         for name in WIDE_ONLY_EXPECTED:
             self.assertNotIn(name, result.stdout)

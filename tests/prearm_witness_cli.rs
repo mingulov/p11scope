@@ -925,39 +925,111 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     // The copy really loads (outside the capture: teaches nothing).
     run_tool("pre-capture dlopen check");
 
-    let out = dir.path().join("out.json");
-    let args = vec![
-        "profile".to_string(),
-        "--system".to_string(),
-        "--duration".to_string(),
-        "60".to_string(),
-        "-v".to_string(),
-        "-o".to_string(),
-        out.to_str().expect("utf8 out").to_string(),
-    ];
-    let mut capture = spawn_capture(&args);
-    wait_ready(&mut capture);
-    // Round 1: the first-ever run against this file in the capture.
-    run_tool("round 1");
-    // Wait for the learning event itself (the `-v` staging line names
-    // the copy), then a few ordinary frames for the expedited attach,
-    // so the rate below measures steady-state catching, not arm
-    // latency on a small or loaded host. No line within the harness
-    // deadline fails loud in `next_line`.
-    loop {
-        let line = capture.next_line("learned staging");
-        if line.contains("learned provider") && line.contains("libbrandnew-") {
-            break;
+    // This cell's waits are load-tolerant by construction: a loaded
+    // host's system scan alone can exceed the shared 60 s harness
+    // deadlines, so the capture is spawned and read locally with
+    // chunked reads and explicit long deadlines, diagnostics (not
+    // verbose text) name the staging event, and an operator SIGINT
+    // ends the capture once round 2 is done instead of a fixed
+    // duration racing the arm latency. Every wait still fails loud.
+    fn next_line_within(capture: &mut GuardedChild, what: &str, within: Duration) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(pos) = capture.buf.iter().position(|b| *b == b'\n') {
+                let line = capture.buf.drain(..=pos).collect::<Vec<_>>();
+                return String::from_utf8(line).expect("child speaks UTF-8");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{what} silent for {within:?}");
+            let mut pfd = libc::pollfd {
+                fd: capture.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll on our own pipe end.
+            let ready = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+            assert!(ready > 0, "{what} silent for {within:?}");
+            if pfd.revents & libc::POLLIN == 0 {
+                panic!("{what}: pipe hung up");
+            }
+            let mut chunk = [0u8; 8192];
+            // SAFETY: chunked read into a stack buffer.
+            let got =
+                unsafe { libc::read(capture.fd.as_raw_fd(), chunk.as_mut_ptr().cast(), 8192) };
+            if got == 0 {
+                panic!("{what}: EOF (child status: {:?})", capture.try_wait());
+            }
+            if got < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "{what} read"
+                );
+                continue;
+            }
+            capture.buf.extend_from_slice(&chunk[..got as usize]);
         }
     }
+    fn wait_line(capture: &mut GuardedChild, what: &str, needle: &str) {
+        loop {
+            let line = next_line_within(capture, what, Duration::from_secs(300));
+            if line.contains(needle) {
+                return;
+            }
+        }
+    }
+
+    let out = dir.path().join("out.json");
+    let mut child = Command::new(bin())
+        .args([
+            "profile",
+            "--system",
+            "--duration",
+            "600",
+            "-o",
+            out.to_str().expect("utf8 out"),
+        ])
+        .env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn capture");
+    let stderr = child.stderr.take().expect("capture stderr");
+    let mut capture = GuardedChild::new(child, stderr);
+    wait_line(&mut capture, "capture ready", READY_LINE);
+    // Round 1: the first-ever run against this file in the capture.
+    run_tool("round 1");
+    // Wait for the learning event itself (the diagnostics staging line
+    // names the copy), then a few ordinary frames for the expedited
+    // attach, so the rate below measures steady-state catching, not
+    // arm latency on a small or loaded host.
+    wait_line(&mut capture, "learned staging", "libbrandnew-");
     std::thread::sleep(Duration::from_secs(10));
     // Round 2: twenty one-shot runs, no retry masking the rate.
     for index in 0..20 {
         run_tool(&format!("round 2 run {index}"));
         std::thread::sleep(Duration::from_millis(50));
     }
-    let status = capture.wait_expect("capture");
-    assert!(status.success(), "capture exits clean");
+    // Operator stop: the report must still be written (data-always).
+    // SAFETY: signalling our own capture child.
+    assert_eq!(
+        unsafe { libc::kill(capture.child.id() as i32, libc::SIGINT) },
+        0,
+        "signal capture"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = capture.try_wait() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "capture would not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success() || status.code() == Some(130),
+        "capture exits clean or as an operator interrupt: {status}"
+    );
     let text = std::fs::read_to_string(&out).expect("read profile");
     let profile: serde_json::Value = serde_json::from_str(&text).expect("profile is JSON");
 

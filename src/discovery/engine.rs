@@ -19228,6 +19228,32 @@ impl Engine {
         if self.file_learner.is_some() {
             return;
         }
+        // Operator off switch: learning stays off, named as its own
+        // gap (never a silent absence), and ordinary discovery runs.
+        if crate::fanotify::file_learning_disabled_from_env() {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_DISABLED_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: file learning disabled by {}; short-lived first loads keep today's gaps",
+                    crate::fanotify::DISABLE_FILE_LEARNING_ENV
+                );
+            }
+            return;
+        }
+        // Marks come from the observer's own mount table only: in a
+        // different mount namespace than pid 1 (a `--pid=host`
+        // container, the host watching rootless podman) filesystems
+        // outside it are never marked. Name that scope gap instead
+        // of staying silent; in-namespace learning still runs.
+        if crate::fanotify::observer_mount_namespace_differs_from_init() {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_MOUNT_NAMESPACE_REASON,
+            );
+        }
         match crate::fanotify::FileLearner::start() {
             Ok((learner, rx)) => {
                 self.file_learner = Some(learner);
@@ -19547,12 +19573,38 @@ impl Engine {
     /// the display spelling; doubt refuses (fail-closed).
     fn learned_held_file_gone(candidate: &crate::fanotify::LearnedCandidate) -> bool {
         use std::os::unix::fs::MetadataExt as _;
-        candidate
+        let gone = candidate
             .file
             .metadata()
             .map(|meta| {
                 meta.nlink() == 0 || meta.dev() != candidate.dev || meta.ino() != candidate.ino
             })
+            .unwrap_or(true);
+        gone || Self::learned_held_dentry_unlinked(candidate)
+    }
+
+    /// Whether the dentry the candidate was opened through is
+    /// unlinked: the link count cannot see this when another hard
+    /// link keeps the inode alive (`nlink` stays positive after a
+    /// rename over the opened pathname), but the held descriptor's
+    /// `/proc/self/fd/N` link gains the kernel's ` (deleted)` suffix.
+    /// A file genuinely named with that suffix stats back to the
+    /// held identity at the stripped path and is not gone; the
+    /// pathname stat only ever refuses, never pins.
+    fn learned_held_dentry_unlinked(candidate: &crate::fanotify::LearnedCandidate) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        let Ok(link) = std::fs::read_link(format!("/proc/self/fd/{}", candidate.file.as_raw_fd()))
+        else {
+            return true;
+        };
+        let Some(stripped) = link.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+            return false;
+        };
+        let stripped = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(stripped));
+        std::fs::metadata(&stripped)
+            .map(|meta| meta.dev() != candidate.dev || meta.ino() != candidate.ino)
             .unwrap_or(true)
     }
 

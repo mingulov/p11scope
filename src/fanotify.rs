@@ -86,6 +86,50 @@ pub(crate) struct LearnAbsent {
 /// (it usually already exited).
 pub(crate) const LOADER_EXE_UNREADABLE_REASON: &str = "loader exe link unreadable";
 
+/// Operator off switch for file learning: exactly
+/// `P11SCOPE_DISABLE_FILE_LEARNING=1` disables the fanotify drain (the
+/// capture keeps ordinary discovery and files the disabled-learning
+/// gap). Capture-visible in `evidence.p11scope_env`.
+pub(crate) const DISABLE_FILE_LEARNING_ENV: &str = "P11SCOPE_DISABLE_FILE_LEARNING";
+
+/// Whether an off-switch value disables learning: exactly `"1"`, like
+/// the other `P11SCOPE_*` switches. Pure so tests never mutate the
+/// process environment.
+pub(crate) fn file_learning_disabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// The off switch as set in this process's environment.
+pub(crate) fn file_learning_disabled_from_env() -> bool {
+    file_learning_disabled(std::env::var(DISABLE_FILE_LEARNING_ENV).ok().as_deref())
+}
+
+/// Whether two mount-namespace link texts prove different namespaces:
+/// both must have read and differ. An unreadable link proves nothing
+/// (an unprivileged observer cannot read `/proc/1/ns/mnt`), so it
+/// never files a false scope gap.
+pub(crate) fn mount_namespaces_differ(self_ns: Option<&str>, init_ns: Option<&str>) -> bool {
+    matches!((self_ns, init_ns), (Some(a), Some(b)) if a != b)
+}
+
+/// Whether the observer's mount namespace differs from pid 1's (for
+/// example a `--pid=host` container, or the host watching rootless
+/// podman): filesystem marks are placed from `/proc/self/mountinfo`
+/// only, so filesystems outside this namespace are never marked and
+/// their providers are never learned. The caller files the named
+/// mount-namespace learning gap; learning still runs in-namespace.
+pub(crate) fn observer_mount_namespace_differs_from_init() -> bool {
+    let read = |path: &str| {
+        std::fs::read_link(path)
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    };
+    mount_namespaces_differ(
+        read("/proc/self/ns/mnt").as_deref(),
+        read("/proc/1/ns/mnt").as_deref(),
+    )
+}
+
 /// Kernel identity of the opened file behind a held fd.
 #[cfg(test)]
 pub(crate) fn file_identity(file: &std::fs::File) -> Result<(u64, u64), String> {
@@ -825,7 +869,7 @@ const MARK_COVERAGE_CAP: usize = 8192;
 pub(crate) fn evaluate_mark_coverage(
     previously_covered: &BTreeSet<MountIdentity>,
     visible: &[MountToMark],
-    mut mark: impl FnMut(&std::path::Path) -> bool,
+    mut mark: impl FnMut(&std::path::Path) -> Option<MountIdentity>,
 ) -> (BTreeSet<MountIdentity>, usize) {
     let mut covered = BTreeSet::new();
     let mut uncovered = 0usize;
@@ -835,10 +879,16 @@ pub(crate) fn evaluate_mark_coverage(
         {
             continue;
         }
+        // The callback returns the identity of the mount actually
+        // marked, derived from the held descriptor it marked — never
+        // the snapshot's say-so. An overmount landing between the
+        // mountinfo snapshot and the mark therefore credits nothing:
+        // the snapshot mount stays uncovered (the actually-marked
+        // mount is seen and credited by a later pass).
         let marked = mark(&mount.point);
         match mount.identity {
             Some(identity)
-                if (marked || previously_covered.contains(&identity))
+                if (marked == Some(identity) || previously_covered.contains(&identity))
                     && covered.len() < MARK_COVERAGE_CAP =>
             {
                 covered.insert(identity);
@@ -846,7 +896,7 @@ pub(crate) fn evaluate_mark_coverage(
             // Marked now, but without a parsed identity its coverage
             // cannot be retained for later passes; it is covered for
             // this pass and re-decided (fail-closed) next time.
-            None if marked => {}
+            None if marked.is_some() => {}
             _ => uncovered += 1,
         }
     }
@@ -872,24 +922,63 @@ fn visible_mounts() -> Vec<MountToMark> {
         })
 }
 
-/// Adds one filesystem mark; false when the kernel refuses (for
-/// example without `CAP_SYS_ADMIN` after the capability shed).
-fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> bool {
+/// The mount identity of a held descriptor, from its fdinfo mount id
+/// and its filesystem device: the identity of the object itself, so
+/// a mark placed through this descriptor is credited to the mount
+/// actually marked.
+fn mount_identity_of_fd(fd: &OwnedFd) -> Option<MountIdentity> {
+    let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+    let mount_id = text.lines().find_map(|line| {
+        line.strip_prefix("mnt_id:")
+            .and_then(|value| value.trim().parse().ok())
+    })?;
+    // SAFETY: fstat on our own held descriptor into a zeroed stat.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(MountIdentity {
+        mount_id,
+        dev_major: libc::major(stat.st_dev),
+        dev_minor: libc::minor(stat.st_dev),
+    })
+}
+
+/// Adds one filesystem mark through a held descriptor for the mount
+/// point (the NULL-pathname dirfd form), returning the marked
+/// mount's identity read from that same descriptor. `None` when the
+/// kernel refuses (for example without `CAP_SYS_ADMIN` after the
+/// capability shed) or the identity cannot be read: an uncredited
+/// mark is a named gap, never silent coverage. Marking the held
+/// object — not re-resolving the pathname inside the syscall — is
+/// what binds the credit to the mount actually marked when an
+/// overmount races the mountinfo snapshot.
+fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> Option<MountIdentity> {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(point.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: libc call; the group fd and NUL-terminated path are valid.
+    let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
+    // SAFETY: libc call; the NUL-terminated path is valid.
+    let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh owned descriptor from the open above.
+    let held = unsafe { OwnedFd::from_raw_fd(raw) };
+    let identity = mount_identity_of_fd(&held);
+    // SAFETY: libc call; the group and held descriptors are valid,
+    // and a NULL pathname marks the held descriptor's object.
     let rc = unsafe {
         libc::fanotify_mark(
             group.as_raw_fd(),
             libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
             libc::FAN_OPEN,
-            libc::AT_FDCWD,
-            path.as_ptr(),
+            held.as_raw_fd(),
+            std::ptr::null(),
         )
     };
-    rc == 0
+    if rc != 0 {
+        return None;
+    }
+    identity
 }
 
 /// One (re-)mark pass over the visible filesystems, retaining the
@@ -1207,6 +1296,47 @@ fn drain_loop(
 mod tests {
     use std::os::unix::io::AsRawFd;
 
+    /// The operator off switch disables learning only for exactly
+    /// `P11SCOPE_DISABLE_FILE_LEARNING=1`; unset and every other value
+    /// keep the default (learning on).
+    #[test]
+    fn file_learning_off_switch_requires_exact_one() {
+        assert_eq!(
+            super::DISABLE_FILE_LEARNING_ENV,
+            "P11SCOPE_DISABLE_FILE_LEARNING"
+        );
+        assert!(super::file_learning_disabled(Some("1")));
+        assert!(!super::file_learning_disabled(None));
+        assert!(!super::file_learning_disabled(Some("")));
+        assert!(!super::file_learning_disabled(Some("0")));
+        assert!(!super::file_learning_disabled(Some("true")));
+        assert!(!super::file_learning_disabled(Some(" 1")));
+    }
+
+    /// The mount-namespace scope gap fires only when both namespace
+    /// links read and differ; an unreadable link (an unprivileged
+    /// observer cannot read `/proc/1/ns/mnt`) never files a false gap.
+    #[test]
+    fn mount_namespace_gap_requires_two_readable_different_links() {
+        assert!(super::mount_namespaces_differ(
+            Some("mnt:[4026532000]"),
+            Some("mnt:[4026531832]"),
+        ));
+        assert!(!super::mount_namespaces_differ(
+            Some("mnt:[4026531832]"),
+            Some("mnt:[4026531832]"),
+        ));
+        assert!(!super::mount_namespaces_differ(
+            None,
+            Some("mnt:[4026531832]"),
+        ));
+        assert!(!super::mount_namespaces_differ(
+            Some("mnt:[4026532000]"),
+            None,
+        ));
+        assert!(!super::mount_namespaces_differ(None, None));
+    }
+
     /// A non-ELF open drains and closes: the classifier says no, the file
     /// is recorded by identity only, and the second sighting needs no
     /// check. The cache retains no path (privacy twin).
@@ -1506,7 +1636,7 @@ mod tests {
             visible_mount("/data", 52, 8, 2),
         ];
         // Every add fails now (no CAP_SYS_ADMIN after the shed).
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 0, "retained marks stay covered");
         assert_eq!(next, covered);
     }
@@ -1520,7 +1650,7 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 2)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 1, "the replacement filesystem was never marked");
         assert!(next.is_empty(), "the dead mount's coverage is not retained");
     }
@@ -1533,7 +1663,7 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 1)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 1, "a remount is not the marked mount");
         assert!(next.is_empty());
     }
@@ -1546,7 +1676,7 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/moved/provider", 51, 8, 1)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 0, "the moved mount's mark still delivers");
         assert_eq!(next, covered);
     }
@@ -1562,7 +1692,7 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/mnt/new", 68, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 1, "the unmarked new filesystem is a gap");
         assert_eq!(next, covered, "only the retained filesystem is covered");
     }
@@ -1578,11 +1708,36 @@ mod tests {
             visible_mount("/mnt/new", 68, 8, 2),
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
-            point.as_os_str() == "/mnt/new"
+            (point.as_os_str() == "/mnt/new").then(|| mnt(68, 8, 2))
         });
         assert_eq!(uncovered, 0);
         assert!(next.contains(&mnt(68, 8, 2)));
         assert!(next.contains(&mnt(51, 8, 1)));
+    }
+
+    /// An overmount landing between the mountinfo snapshot and the
+    /// mark must not credit the snapshot mount: the mark callback
+    /// reports the mount actually marked (the overmount), so the
+    /// underlying snapshot mount stays uncovered and owes the gap,
+    /// and a later failed re-mark cannot inherit its identity.
+    #[test]
+    fn learn_overmount_between_snapshot_and_mark_claims_no_coverage() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
+        // The syscall marked the racing overmount (68), not the
+        // snapshot mount (51).
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(68, 8, 2)));
+        assert_eq!(uncovered, 1, "the snapshot mount was never marked");
+        assert!(
+            !next.contains(&mnt(51, 8, 1)),
+            "the unmarked mount claims no retained coverage: {next:?}"
+        );
+        // After the overmount goes away, a failed re-mark of the
+        // reappeared snapshot mount is uncovered, not retained.
+        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        assert_eq!(uncovered, 1);
+        assert!(next.is_empty());
     }
 
     /// With nothing retained, every failed mark is uncovered (the
@@ -1594,7 +1749,7 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/data", 52, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 2);
         assert!(next.is_empty());
     }

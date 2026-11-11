@@ -75812,6 +75812,91 @@ fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
     );
 }
 
+/// A held provider file replaced by a rename over its opened
+/// pathname is refused even when another hard link keeps the old
+/// inode at `nlink == 1`: the link count alone cannot see that the
+/// opened dentry is gone, so staging must also consult the held
+/// descriptor's ` (deleted)` link state.
+#[test]
+fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, ret: u32| {
+        let c = dir.path().join(format!("{name}.c"));
+        let so = dir.path().join(format!("lib{name}.so"));
+        std::fs::write(
+            &c,
+            format!("unsigned long C_GetFunctionList(void **out){{ (void)out; return {ret}; }}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        so
+    };
+    let so = build("linked", 5);
+    let replacement = build("linked_replacement", 6);
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    // A sibling hard link keeps the old inode linked after the
+    // rename over the opened pathname: nlink never reaches zero.
+    std::fs::hard_link(&so, dir.path().join("liblinked-sibling.so")).unwrap();
+    std::fs::rename(&replacement, &so).unwrap();
+    assert_eq!(
+        file.metadata().unwrap().nlink(),
+        1,
+        "the sibling link keeps the held inode at nlink 1"
+    );
+    let display_path = crate::fanotify::display_path_for(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path,
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "a file replaced over its opened pathname must not stage"
+    );
+    assert!(
+        engine.learned_notes.is_empty(),
+        "a refused replaced file keeps no loader note"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was replaced or deleted before staging; \
+                         it was not learned"
+        }),
+        "the replacement files its finite named refusal: {public:?}"
+    );
+}
+
 /// An unavailable-learning signal from the drain files the finite
 /// unavailable row once: membership-style failures are counted named
 /// gaps, never silently dropped.

@@ -264,6 +264,11 @@ pub const P11SCOPE_ENV_VARS: &[(&str, &str)] = &[
         "p11scope-discover loader-environment marker; a forged value is \
          rejected, never trusted",
     ),
+    (
+        "P11SCOPE_DISABLE_FILE_LEARNING",
+        "disables kernel file-open learning under --system; exactly \"1\" \
+         disables it, anything else keeps learning on",
+    ),
 ];
 
 /// One capture-visible environment switch and its active value: `None`
@@ -1796,7 +1801,7 @@ pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
-/// Learned-file gaps file under this subject with five finite reasons
+/// Learned-file gaps file under this subject with seven finite reasons
 /// (schema v3): the staged-file count rides in
 /// `evidence.learned_staged_files`, the loss in
 /// `evidence.learned_event_loss`, the cap excess in
@@ -1812,6 +1817,8 @@ pub(crate) const LEARNED_UNAVAILABLE_REASON: &str =
     "file learning was unavailable; short-lived first loads of new provider files were not learned";
 pub(crate) const LEARNED_REPLACED_DELETED_REASON: &str =
     "a provider file was replaced or deleted before staging; it was not learned";
+pub(crate) const LEARNED_DISABLED_REASON: &str = "file learning was disabled by the operator; short-lived first loads of new provider files were not learned";
+pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
@@ -1900,7 +1907,7 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
-    // Learned-file gaps keep their subject and their five finite
+    // Learned-file gaps keep their subject and their seven finite
     // reasons; the counts ride in the `evidence.learned_*` keys.
     // Anything else under the subject falls through to the fail-closed
     // generic below instead of breaking the closed vocabulary.
@@ -1912,6 +1919,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
                 | LEARNED_CAP_REASON
                 | LEARNED_UNAVAILABLE_REASON
                 | LEARNED_REPLACED_DELETED_REASON
+                | LEARNED_DISABLED_REASON
+                | LEARNED_MOUNT_NAMESPACE_REASON
         )
     {
         return SkippedOut {
@@ -4168,6 +4177,8 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LEARNED_CAP_REASON,
                     LEARNED_UNAVAILABLE_REASON,
                     LEARNED_REPLACED_DELETED_REASON,
+                    LEARNED_DISABLED_REASON,
+                    LEARNED_MOUNT_NAMESPACE_REASON,
                 ] {
                     let hits = ev
                         .skipped
@@ -7317,7 +7328,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Learned gaps project under their own subject with their five
+    /// Learned gaps project under their own subject with their seven
     /// finite reasons; anything else under the subject still redacts to
     /// the generic discovery pair, and no path, pid, or executable ever
     /// reaches output through the row.
@@ -7329,6 +7340,8 @@ pub(crate) mod tests {
             LEARNED_CAP_REASON,
             LEARNED_UNAVAILABLE_REASON,
             LEARNED_REPLACED_DELETED_REASON,
+            LEARNED_DISABLED_REASON,
+            LEARNED_MOUNT_NAMESPACE_REASON,
         ] {
             let projected = capture_skipped_out(&Skipped {
                 subject: LEARNED_SKIP_SUBJECT.into(),

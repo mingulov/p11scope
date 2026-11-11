@@ -587,7 +587,7 @@ Live capture needs root; inspect, inventory diff, inventory cbom and inventory -
 Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head.
 Complete output: --json on inspect/inventory (incl. inventory diff, cbom); -o FILE on profile/run/inventory; trace streams text to -o FILE or -o -; inventory streams --event-log; doctor is text-only.
 --help and --version also answer to -h and -V.
-Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
+Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED, P11SCOPE_DISABLE_FILE_LEARNING; docs/usage.md documents every P11SCOPE_* input.
 
 examples:
   sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
@@ -6510,7 +6510,11 @@ mod tests {
     // listed in --help/usage.
     #[test]
     fn help_lists_every_p11scope_env_switch() {
-        for var in ["P11SCOPE_BROAD_ADMIT", "P11SCOPE_LOADER_ENV_SANITIZED"] {
+        for var in [
+            "P11SCOPE_BROAD_ADMIT",
+            "P11SCOPE_LOADER_ENV_SANITIZED",
+            "P11SCOPE_DISABLE_FILE_LEARNING",
+        ] {
             assert!(USAGE.contains(var), "help never names {var}");
         }
     }

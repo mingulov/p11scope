@@ -877,3 +877,116 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
         serde_json::to_string_pretty(record).unwrap_or_default()
     );
 }
+
+/// Two-round kernel learning (owner acceptance): a brand-new provider
+/// file at a random path, held by no live process and named by no
+/// `--module`/`--prearm-module`/`--manifest`, under one
+/// `profile --system` capture. Round 1 is one one-shot tool run: its
+/// calls may be missed, but the run must be shown as a named miss
+/// (provider path + loading program). Round 2 is twenty identical
+/// one-shot runs in the same capture: at least 19 must be counted.
+#[test]
+#[ignore = "privileged: learned provider second round catches one-shot tools (root, BPF, SoftHSM, pkcs11-tool)"]
+fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
+    let tool = ["/usr/bin/pkcs11-tool", "/usr/local/bin/pkcs11-tool"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("a pkcs11-tool binary must be installed for the cell");
+    let dir = tempfile::tempdir().expect("cell dir");
+    let conf = init_token(dir.path());
+    // Brand-new provider file: random path, new inode, and a sha256 no
+    // ambient system user shares (trailing bytes), so counts for its
+    // sha can only come from this cell's tool runs.
+    let copy = dir.path().join(format!("libbrandnew-{}-{}.so", std::process::id(), "x7learn"));
+    std::fs::copy(softhsm_path(), &copy).expect("copy provider");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&copy)
+            .expect("open copy for append");
+        file.write_all(&[0u8; 256]).expect("append unseen bytes");
+    }
+    let run_tool = |what: &str| {
+        let status = Command::new(&tool)
+            .args(["--module", &copy.to_string_lossy(), "-L"])
+            .env("SOFTHSM2_CONF", &conf)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn pkcs11-tool");
+        assert!(status.success(), "{what}: pkcs11-tool run must succeed");
+    };
+    // The copy really loads (outside the capture: teaches nothing).
+    run_tool("pre-capture dlopen check");
+
+    let out = dir.path().join("out.json");
+    let args = vec![
+        "profile".to_string(),
+        "--system".to_string(),
+        "--duration".to_string(),
+        "45".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+    ];
+    let mut capture = spawn_capture(&args);
+    wait_ready(&mut capture);
+    // Round 1: the first-ever run against this file in the capture.
+    run_tool("round 1");
+    // Learning + attach settle: the staged frame is expedited, but the
+    // cell waits several ordinary frames so the rate below measures
+    // steady-state catching, not the arm latency.
+    std::thread::sleep(Duration::from_secs(8));
+    // Round 2: twenty one-shot runs, no retry masking the rate.
+    for index in 0..20 {
+        run_tool(&format!("round 2 run {index}"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = capture.wait_expect("capture");
+    assert!(status.success(), "capture exits clean");
+    let text = std::fs::read_to_string(&out).expect("read profile");
+    let profile: serde_json::Value = serde_json::from_str(&text).expect("profile is JSON");
+
+    let record = module_record(&profile, &copy);
+    let calls = function_calls(&profile, record_sha256(record));
+    let caught = calls.get("C_Initialize").copied().unwrap_or(0);
+    assert!(
+        (19..=20).contains(&caught),
+        "round 2 must catch >=19/20 one-shot runs and round 1 stays missed; \
+         C_Initialize for the copy = {caught} (all calls: {calls:?})"
+    );
+    // The provider is listed with the program that first loaded it.
+    let first = record
+        .get("first_loaded_by")
+        .unwrap_or_else(|| panic!("learned module names its first loader: {record}"));
+    let exe = first.get("exe").and_then(|exe| exe.as_str());
+    let unknown = first
+        .get("exe_unknown_reason")
+        .and_then(|reason| reason.as_str());
+    assert!(
+        exe.is_some_and(|exe| exe.ends_with("pkcs11-tool"))
+            || unknown == Some("loader exe link unreadable"),
+        "first loader named or finitely unknown: {first}"
+    );
+    assert!(
+        first
+            .get("pre_attach_loads")
+            .and_then(|loads| loads.as_u64())
+            .is_some_and(|loads| loads >= 1),
+        "the missed first run is counted: {first}"
+    );
+    assert!(
+        profile["evidence"]["learned_staged_files"]
+            .as_u64()
+            .is_some_and(|staged| staged >= 1),
+        "learned files counted: {}",
+        profile["evidence"]
+    );
+    // The first run is a named miss, not silent.
+    assert!(
+        text.contains("learned provider file")
+            && text.contains("learned after its first use"),
+        "first run must be a named gap"
+    );
+}

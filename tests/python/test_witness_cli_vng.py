@@ -33,10 +33,11 @@ EXPECTED_CELLS = [
     "privileged_profile_pid_prearm_clean_exact_counts",
     "privileged_profile_cgroup_prearm_clean_exact_counts",
     "privileged_profile_system_prearm_clean_exact_counts",
+    "privileged_profile_system_learned_provider_second_round_catches_oneshots",
     "privileged_profile_metrics_system_prearm_clean_exact_counts",
     "privileged_profile_pid_prearm_twin_exact_window",
     "privileged_trace_system_prearm_clean_exact_counts",
-]
+    ]
 
 # A canned guest: parses --run/--rwdir from the script's vng invocation
 # and writes the artifacts a real guest would, per FAKE_VNG_MODE. Never
@@ -141,7 +142,7 @@ class WitnessCliScriptTests(unittest.TestCase):
                               timeout=120, env=env), out
 
     def test_cells_are_exact_and_curated(self):
-        self.assertEqual(len(EXPECTED_CELLS), 6)
+        self.assertEqual(len(EXPECTED_CELLS), 7)
         curated = integration_witness_cells(CURATION.read_text(encoding="utf-8"))
         self.assertEqual(curated, EXPECTED_CELLS,
                          "the executed set must equal the curated INTEGRATION_TESTS entries")
@@ -187,11 +188,11 @@ class WitnessCliScriptTests(unittest.TestCase):
         for pin in ("vng --run", "--user root", "mount -t tmpfs",
                     'TMPDIR="$T"', "run-witness-cli.sh",
                     "cells-done witness_exit=", '"$OUT/uname.txt"',
-                    "row set is not exactly the six P2-8 cells"):
+                    "row set is not exactly the seven cells"):
             with self.subTest(pin=pin):
                 self.assertIn(pin, self.script_text)
 
-    def test_all_pass_writes_six_qualified_rows_and_exits_zero(self):
+    def test_all_pass_writes_seven_qualified_rows_and_exits_zero(self):
         result, out = self.run_script("v6.6.157")
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [json.loads(line) for line in
@@ -209,7 +210,7 @@ class WitnessCliScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         rows = [json.loads(line) for line in
                 (out / "cells/results.jsonl").read_text().splitlines()]
-        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(rows), 7)
         failed = [row for row in rows if not row["pass"]]
         self.assertEqual([row["cell"] for row in failed], [EXPECTED_CELLS[3]])
         self.assertEqual(failed[0]["qualification"], "failed")

@@ -1623,7 +1623,7 @@ jobs:
           else
             scripts/ci/witness-cli-vng.sh "$WITNESS_TESTBIN" "$out" "${{ matrix.kernel }}"
           fi
-          # The shared closed-set gate: the same 6 cells on every leg,
+          # The shared closed-set gate: the same 7 cells on every leg,
           # all exact-positive.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --require privileged_profile_pid_prearm_clean_exact_counts \
@@ -1631,7 +1631,8 @@ jobs:
             --require privileged_profile_system_prearm_clean_exact_counts \
             --require privileged_profile_metrics_system_prearm_clean_exact_counts \
             --require privileged_profile_pid_prearm_twin_exact_window \
-            --require privileged_trace_system_prearm_clean_exact_counts
+            --require privileged_trace_system_prearm_clean_exact_counts \
+            --require privileged_profile_system_learned_provider_second_round_catches_oneshots
       - name: Upload the witness CLI results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

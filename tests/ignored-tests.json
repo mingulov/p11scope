@@ -2017,6 +2017,12 @@
     },
     {
       "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_system_learned_provider_second_round_catches_oneshots",
+      "reason": "privileged: learned provider two-round cell (root BPF + fanotify capture, SoftHSM copy + pkcs11-tool one-shots, ~45 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
       "path": "privileged_profile_metrics_system_prearm_clean_exact_counts",
       "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
       "cell": "live-kernel"

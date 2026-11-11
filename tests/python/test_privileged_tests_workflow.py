@@ -118,6 +118,28 @@ def check_second_flavor_presence(cells, listed, pending):
     return wanted
 
 
+def check_counter_flavor_presence(cells, listed, pending):
+    """Mirror of the privileged-counter-flavor presence step, for fake-list tests.
+
+    cells is the campaign's counter_flavor cell list, listed the FULL-512
+    build's `--list` output, pending the tolerated-absent set. Returns the
+    wanted list, or raises SystemExit on the same absent-cell failure the
+    workflow reports.
+    """
+    wanted = []
+    for cell in cells:
+        present = (f"\n{cell}\n" in f"\n{listed}\n"
+                   or f"\n{cell} :: " in listed)
+        if present:
+            wanted.append(cell)
+        elif cell in pending:
+            continue
+        else:
+            raise SystemExit(f"expected counter cell absent from the binary: {cell}")
+    assert wanted, "no counter cells present"
+    return wanted
+
+
 def journal_proof_test_names(source):
     """Fully-qualified #[test] names under root_proof_tests, the source of truth.
 
@@ -479,6 +501,83 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         pending = set(second.get("pending", []))
         listed = "\n".join(cells) + "\n"
         self.assertEqual(check_second_flavor_presence(cells, listed, pending), cells)
+
+    def test_counter_flavor_build_and_cells(self):
+        # The wide default build omits counter objects, so the 36
+        # counter/select-endpoint cells refuse there; the FULL-512
+        # counter campaign runs their positive arms from the journal
+        # build (which is FULL capacities with counter objects) on
+        # every push, like the journal flavor. When 0.7.x restores
+        # wide companions, the twins flip back and this campaign stays
+        # as the FULL positive.
+        self.assertIn("privileged-counter-flavor:", self.yml)
+        self.assertIn("privileged-inputs-journal", job_body(self.yml, "privileged-counter-flavor"),
+                      "counter flavor reuses the FULL-512 journal build")
+        self.assertIn("counter_flavor", self.yml)
+        self.assertIn("counter exact-list mismatch", self.yml)
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        counter = campaign["counter_flavor"]
+        self.assertEqual(len(counter["cells"]), 36)
+        # One member per counter group, so a silently dropped group fails.
+        members = (
+            "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",
+            "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
+            "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
+            "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64",
+            "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+            "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+            "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+            "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+            "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+            "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+            "metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64",
+            "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+            "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+            "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+            "metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64",
+            "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64",
+        )
+        for cell in members:
+            with self.subTest(cell=cell):
+                self.assertIn(cell, counter["cells"])
+        self.assertEqual(counter.get("pending", []), [])
+
+    def test_counter_flavor_absent_cell_fails(self):
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        counter = campaign["counter_flavor"]
+        cells = counter["cells"]
+        pending = set(counter.get("pending", []))
+        listed = "\n".join(cells[1:]) + "\n"
+        with self.assertRaisesRegex(SystemExit, "expected counter cell absent"):
+            check_counter_flavor_presence(cells, listed, pending)
+
+    def test_counter_flavor_all_present_passes(self):
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        counter = campaign["counter_flavor"]
+        cells = counter["cells"]
+        pending = set(counter.get("pending", []))
+        listed = "\n".join(cells) + "\n"
+        self.assertEqual(check_counter_flavor_presence(cells, listed, pending), cells)
+
+    def test_counter_flavor_cells_are_default_campaign_twins(self):
+        # Every counter-flavor cell also runs in the default sharded
+        # campaign, where the wide binary takes the exact-refusal twin
+        # arm; the same test name proves the refusal on wide and the
+        # positive on FULL.
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        default = set(campaign["default_cells"])
+        for cell in campaign["counter_flavor"]["cells"]:
+            with self.subTest(cell=cell):
+                self.assertIn(cell, default)
+
+    def test_counter_flavor_verifies_the_full512_curation(self):
+        # Like the journal flavor, the counter run verifies the
+        # FULL-512 curation explicitly, so a silent gating change
+        # fails instead of flipping coverage.
+        counter = job_body(self.yml, "privileged-counter-flavor")
+        self.assertIn("run-privileged-lib-tests.sh \"$in/lib-tests\" "
+                      "\"$out/run\" --full-512", counter,
+                      "counter-flavor run must verify the FULL-512 curation")
 
     def test_journal_proof_build_and_tests(self):
         self.assertIn("P11SCOPE_JOURNAL_PROOF=1", self.yml)

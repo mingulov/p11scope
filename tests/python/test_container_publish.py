@@ -47,7 +47,7 @@ class ContainerPublishTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items()}
         self.env["PATH"] = os.defpath
 
-    def test_workflow_triggers_on_release_published_and_holds_no_attestation_rights(self):
+    def test_workflow_triggers_on_release_published_and_scopes_publish_rights(self):
         self.assertTrue(WORKFLOW.is_file(), "the release publish workflow is missing")
         document = workflow()
         trigger = document.get("on", document.get(True))
@@ -63,9 +63,13 @@ class ContainerPublishTests(unittest.TestCase):
         standard = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         pins = {item["uses"] for job in standard["jobs"].values()
                 for item in job.get("steps", ()) if "uses" in item}
+        # The provenance attestation is publish-only (ci.yml never
+        # attests); its pin is allowlisted here, pinned by full commit
+        # SHA, the same pin package-preview.yml attests files with.
+        pins.add("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8")
         text = WORKFLOW.read_text()
-        self.assertNotIn("id-token", text, "the publish workflow does not attest")
-        self.assertNotIn("attestations", text, "the publish workflow does not attest")
+        self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2",
+                      text, "the attest pin must carry its version comment")
         for name, job in document["jobs"].items():
             self.assertEqual(job["runs-on"], "ubuntu-26.04")
             for item in job["steps"]:
@@ -76,8 +80,10 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertNotIn("permissions", document["jobs"]["build"],
                          "build must inherit the read-only top-level permissions")
         self.assertEqual(document["jobs"]["push"]["permissions"],
-                         {"packages": "write"},
-                         "push holds only the registry write; no checkout, no contents")
+                         {"packages": "write", "id-token": "write",
+                          "attestations": "write"},
+                         "push holds the registry write plus attestation only; "
+                         "no checkout, no contents")
         for item in document["jobs"]["push"]["steps"]:
             self.assertNotIn("checkout", item.get("uses", ""),
                              "push must not check out: it re-identifies the build tarball")
@@ -208,19 +214,54 @@ class ContainerPublishTests(unittest.TestCase):
         env = push_step.get("env", {})
         self.assertEqual(env.get("REGISTRY_TOKEN"), "${{ secrets.GITHUB_TOKEN }}")
         self.assertEqual(env.get("REGISTRY_USER"), "${{ github.actor }}")
+        self.assertEqual(push_step.get("id"), "push",
+                         "the attest step reads the digest from the push step id")
         self.assertIn("GITHUB_REF_NAME", bodies)
         self.assertIn(r'[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]', bodies)
         self.assertIn(r'[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]', bodies)
         self.assertIn("not publishing", bodies)
         self.assertIn("not a version tag", bodies)
+        self.assertIn('echo "digest=$version_digest" >>"$GITHUB_OUTPUT"', bodies,
+                      "the final-tag path must report the pushed digest as a step output")
         load_at = bodies.index("docker load")
         classify_at = bodies.index(r'[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]')
         self.assertLess(load_at, classify_at,
                         "load and image-ID check must precede tag classification")
+        digest_at = bodies.index('echo "digest=$version_digest" >>"$GITHUB_OUTPUT"')
+        self.assertLess(classify_at, digest_at,
+                        "the digest output must sit behind the final-tag gate, "
+                        "so prereleases and refusals report no digest")
+        self.assertLess(bodies.index("not publishing"), digest_at,
+                        "the prerelease exit must precede the digest output")
         uploads = [item for item in push["steps"] if "upload-artifact" in item.get("uses", "")]
         self.assertEqual(len(uploads), 1)
         self.assertEqual(uploads[0]["with"].get("name"), "container-publish-receipt")
         self.assertEqual(uploads[0]["with"].get("if-no-files-found"), "error")
+
+    def test_attest_covers_the_pushed_digest_only_on_final_tags(self):
+        self.assertTrue(WORKFLOW.is_file(), "the release publish workflow is missing")
+        push = workflow()["jobs"]["push"]
+        subjects = [item for item in push["steps"]
+                    if "attest-build-provenance" in item.get("uses", "")]
+        self.assertEqual(len(subjects), 1, "push must attest the published digest once")
+        attest = subjects[0]
+        self.assertEqual(attest["uses"],
+                         "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+                         "the attest step must use the reviewed file-attestation pin")
+        self.assertEqual(attest.get("if"), "${{ steps.push.outputs.digest != '' }}",
+                         "attest must run only when the push reported a digest, "
+                         "never on the prerelease or refusal paths")
+        self.assertEqual(attest["with"].get("subject-name"), "ghcr.io/mingulov/p11scope")
+        self.assertEqual(attest["with"].get("subject-digest"),
+                         "${{ steps.push.outputs.digest }}")
+        self.assertIs(attest["with"].get("push-to-registry"), True,
+                      "the attestation must land in the registry beside the image")
+        self.assertNotIn("subject-path", attest["with"],
+                         "the image attestation names a digest, not a file path")
+        order = [item.get("name", item.get("uses", "")) for item in push["steps"]]
+        push_at = order.index("Push the exact built image on the release tag")
+        attest_at = order.index(attest.get("name"))
+        self.assertLess(push_at, attest_at, "attest must run after the push")
 
     def run_push(self, ref, *, version_digest=VERSION_DIGEST, latest_digest=None,
                  is_latest="true", existing_digest="", probe_error=""):
@@ -299,10 +340,12 @@ class ContainerPublishTests(unittest.TestCase):
         (tools / "docker").chmod(0o700)
         calls = fixture / "calls.log"
         summary = fixture / "summary.md"
+        outputs_path = fixture / "github-output.txt"
         env = {**self.env, "PATH": f"{tools}:/usr/bin:/bin",
                "GITHUB_REF_NAME": ref, "GITHUB_SHA": "c" * 40,
                "REGISTRY_TOKEN": token, "REGISTRY_USER": user,
                "GITHUB_STEP_SUMMARY": str(summary),
+               "GITHUB_OUTPUT": str(outputs_path),
                "FAKE_CALLS": str(calls), "FAKE_IMAGE_ID": IMAGE_ID,
                "FAKE_DIGEST_VERSION": version_digest,
                "FAKE_DIGEST_LATEST": latest_digest,
@@ -314,10 +357,16 @@ class ContainerPublishTests(unittest.TestCase):
                                 capture_output=True, timeout=30)
         logged = calls.read_text().splitlines() if calls.exists() else []
         receipt = incoming / "receipt.txt"
-        return result, logged, receipt, summary
+        outputs = {}
+        if outputs_path.exists():
+            for line in outputs_path.read_text().splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    outputs[key] = value
+        return result, logged, receipt, summary, outputs
 
     def test_final_tag_publishes_the_version_and_latest_tags(self):
-        result, logged, receipt, summary = self.run_push("v0.7.0")
+        result, logged, receipt, summary, outputs = self.run_push("v0.7.0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         pushes = [line for line in logged if line.startswith("docker push ")]
         self.assertEqual(pushes, ["docker push ghcr.io/mingulov/p11scope:0.7.0",
@@ -328,9 +377,11 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertIn(VERSION_DIGEST, text)
         self.assertIn("c" * 40, text)
         self.assertIn("published", summary.read_text())
+        self.assertEqual(outputs, {"digest": VERSION_DIGEST},
+                         "the final-tag path must report the pushed digest for attest")
 
     def test_final_tag_skips_latest_when_a_newer_stable_exists(self):
-        result, logged, receipt, summary = self.run_push("v0.7.0", is_latest="false")
+        result, logged, receipt, summary, outputs = self.run_push("v0.7.0", is_latest="false")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         pushes = [line for line in logged if line.startswith("docker push ")]
         self.assertEqual(pushes, ["docker push ghcr.io/mingulov/p11scope:0.7.0"])
@@ -338,9 +389,11 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertIn("ghcr.io/mingulov/p11scope:0.7.0", text)
         self.assertNotIn(":latest", text)
         self.assertIn(VERSION_DIGEST, text)
+        self.assertEqual(outputs, {"digest": VERSION_DIGEST},
+                         "the version-only path still reports the digest for attest")
 
     def test_prerelease_tag_logs_in_without_publishing(self):
-        result, logged, receipt, summary = self.run_push("v0.7.0-rc1")
+        result, logged, receipt, summary, outputs = self.run_push("v0.7.0-rc1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(line.startswith("docker load ") for line in logged),
                         "prereleases must still load the tarball")
@@ -351,33 +404,38 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertEqual([line for line in logged if "docker push " in line], [])
         self.assertIn("not published", receipt.read_text())
         self.assertIn("not published", summary.read_text())
+        self.assertEqual(outputs, {}, "a prerelease must report no digest, so attest skips")
 
     def test_non_version_tag_refuses_without_publishing(self):
-        result, logged, receipt, _ = self.run_push("vfoo")
+        result, logged, receipt, _, outputs = self.run_push("vfoo")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line for line in logged if "docker push " in line], [])
         self.assertFalse(receipt.exists(), "a refused tag must leave no receipt")
+        self.assertEqual(outputs, {}, "a refused tag must report no digest")
 
     def test_mismatched_push_digests_refuse(self):
-        result, logged, receipt, _ = self.run_push("v0.7.0", latest_digest="sha256:" + "33" * 32)
+        result, logged, receipt, _, outputs = self.run_push("v0.7.0", latest_digest="sha256:" + "33" * 32)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(receipt.exists(), "mismatched digests must leave no receipt")
+        self.assertEqual(outputs, {}, "mismatched digests must report no digest")
 
     def test_existing_version_tag_refuses_before_pushing(self):
-        result, logged, receipt, _ = self.run_push(
+        result, logged, receipt, _, outputs = self.run_push(
             "v0.7.0", existing_digest="sha256:" + "44" * 32)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line for line in logged if "docker push " in line], [],
                          "an existing tag must be refused before any push")
         self.assertFalse(receipt.exists(), "a refused overwrite must leave no receipt")
+        self.assertEqual(outputs, {}, "a refused overwrite must report no digest")
 
     def test_probe_error_fails_closed_without_pushing(self):
-        result, logged, receipt, _ = self.run_push(
+        result, logged, receipt, _, outputs = self.run_push(
             "v0.7.0", probe_error="ERROR: denied: permission_denied: access forbidden")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line for line in logged if "docker push " in line], [],
                          "a failed probe must not be treated as absent")
         self.assertFalse(receipt.exists(), "a failed probe must leave no receipt")
+        self.assertEqual(outputs, {}, "a failed probe must report no digest")
 
     def test_missing_registry_env_fails_the_login(self):
         # Deleting the step env key must fail the test: with no token the
@@ -385,7 +443,7 @@ class ContainerPublishTests(unittest.TestCase):
         push_step = step("Push the exact built image on the release tag", "push")
         self.assertIn("REGISTRY_TOKEN", push_step.get("env", {}),
                       "the push step must carry its registry token in env")
-        result, logged, _, _ = self.run_push("v0.7.0")
+        result, logged, _, _, _ = self.run_push("v0.7.0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any("docker login" in line for line in logged))
         # Re-run with the token removed: the same body must now fail at login.
@@ -410,6 +468,7 @@ class ContainerPublishTests(unittest.TestCase):
                "GITHUB_REF_NAME": "v0.7.0", "GITHUB_SHA": "c" * 40,
                "REGISTRY_TOKEN": "", "REGISTRY_USER": "test-actor",
                "GITHUB_STEP_SUMMARY": str(fixture / "summary.md"),
+               "GITHUB_OUTPUT": str(fixture / "github-output.txt"),
                "FAKE_CALLS": str(calls), "FAKE_IMAGE_ID": IMAGE_ID}
         result = subprocess.run(["bash", "--noprofile", "--norc", "-c", push_step["run"]],
                                 cwd=fixture, env=env, text=True,

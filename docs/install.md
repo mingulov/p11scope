@@ -14,7 +14,8 @@ the 0.7.0 files appear on the
 is published. Download `SHA256SUMS` with the bundle you
 choose. The release will also provide `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
-Every release file carries a GitHub build-provenance attestation.
+Every release file carries a GitHub build-provenance attestation, and
+so does the container image.
 Older bundles remain under their release tags. To build current source
 instead, see [Build locally from source](#build-locally-from-source).
 GitHub's automatic source archive still needs the dependency inputs
@@ -92,6 +93,16 @@ local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
 above. The [offline build guide](build-offline.md) describes an optional
 full export assembled separately.
+
+### Container image
+
+The release publishes `ghcr.io/mingulov/p11scope:0.7.0` (plus `:latest`
+when 0.7.0 is the newest stable). One build-provenance attestation covers
+the pushed digest, so both tags verify with one command:
+
+```sh
+gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 -R mingulov/p11scope
+```
 
 ### Uninstall
 

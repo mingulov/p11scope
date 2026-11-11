@@ -137,6 +137,8 @@ already-running browser, earlier operations are counted in named gaps
 The same demo commands run through `ghcr.io/mingulov/p11scope:latest`
 (the tags appear when the release is published; `:0.7.0` pins the exact
 0.7.0 version), with the documented container flags and no extra mounts.
+The image carries a build-provenance attestation; verify it first with
+`gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 -R mingulov/p11scope`.
 On Ubuntu, use the copy-paste script below — it includes the one
 AppArmor flag the demo needs there:
 

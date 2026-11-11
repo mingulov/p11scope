@@ -9881,6 +9881,151 @@ mod tests {
         ));
     }
 
+    /// The Final candidate may reuse the First build only when the rescan
+    /// produced pin content identical to the first scan's, so the content
+    /// comparison must see through scan-local id assignment (insertion
+    /// order) while catching every identity-relevant difference.
+    #[test]
+    fn same_pin_content_sees_through_id_order_and_catches_each_mutation() {
+        let one = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        let reordered = pin_set(&[(overlay(104), SHA, 9), (overlay(102), SHA, 7)], false);
+        assert!(
+            one.same_pin_content(&one),
+            "a pin set matches its own content"
+        );
+        assert!(
+            one.same_pin_content(&reordered),
+            "scan-local id assignment order is not content"
+        );
+
+        let digest = pin_set(&[(overlay(102), "beefcafe", 7), (overlay(104), SHA, 9)], false);
+        assert!(!one.same_pin_content(&digest), "a digest change is content");
+        let ctime = pin_set(&[(overlay(102), SHA, 8), (overlay(104), SHA, 9)], false);
+        assert!(!one.same_pin_content(&ctime), "a pin ctime change is content");
+        let fewer = pin_set(&[(overlay(102), SHA, 7)], false);
+        assert!(!one.same_pin_content(&fewer), "a missing pin is content");
+
+        let mut rejected = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        rejected.reject_observation(overlay(102));
+        assert!(
+            !one.same_pin_content(&rejected),
+            "a rejected key is content"
+        );
+
+        let mut flagged = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        {
+            let entry = flagged.by_id.values_mut().next().unwrap();
+            entry.witness_fault = true;
+        }
+        assert!(
+            !one.same_pin_content(&flagged),
+            "a witness-flag change is content"
+        );
+
+        let mut exported = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        {
+            let entry = exported.by_id.values_mut().next().unwrap();
+            entry.exports = Arc::from(vec![("C_Initialize".to_string(), 0x1000)]);
+        }
+        assert!(
+            !one.same_pin_content(&exported),
+            "an exports change is content"
+        );
+
+        let mut raw_owned = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        {
+            let raw = raw_owned.raw_to_id.keys().next().unwrap().clone();
+            raw_owned
+                .raw_ownership
+                .entry(ProcessViewId(77))
+                .or_default()
+                .insert(raw);
+        }
+        assert!(
+            !one.same_pin_content(&raw_owned),
+            "a raw-ownership change is content"
+        );
+
+        let mut changed = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        changed.changed.set(true);
+        assert!(
+            !one.same_pin_content(&changed),
+            "a changed-byte latch is content"
+        );
+    }
+
+    /// Seeded property twin for `same_pin_content`: random pin sets always
+    /// match an identical rebuild (any insertion order), and one random
+    /// mutation from the catalog always breaks the match. The generator
+    /// is a fixed-seed xorshift — no new dependency for two properties.
+    #[test]
+    fn same_pin_content_holds_over_random_pin_sets_and_mutations() {
+        fn xorshift(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..200u64 {
+            let count = 1 + (xorshift(&mut state) % 3) as usize;
+            let mut entries: Vec<(ObjectKey, String, i64)> = Vec::new();
+            for i in 0..count {
+                entries.push((
+                    overlay(200 + round * 4 + i as u64),
+                    format!("{:x}", xorshift(&mut state) & 0xffff),
+                    (xorshift(&mut state) % 1000) as i64,
+                ));
+            }
+            let refs: Vec<(ObjectKey, &str, i64)> = entries
+                .iter()
+                .map(|(k, s, c)| (*k, s.as_str(), *c))
+                .collect();
+            let base = pin_set(&refs, false);
+            let mut twin_entries = refs.clone();
+            twin_entries.reverse();
+            let twin = pin_set(&twin_entries, false);
+            assert!(
+                base.same_pin_content(&twin),
+                "round {round}: identical content must match in any order"
+            );
+
+            let mutated = match xorshift(&mut state) % 5 {
+                0 => {
+                    let mut m = pin_set(&refs, false);
+                    m.by_id.values_mut().next().unwrap().sha256.push('x');
+                    m
+                }
+                1 => {
+                    let mut m = pin_set(&refs, false);
+                    m.by_id.values_mut().next().unwrap().pin.ctime.0 += 1;
+                    m
+                }
+                2 => {
+                    let mut m = pin_set(&refs, false);
+                    m.by_id.values_mut().next().unwrap().abi = ElfAbi::Ilp32;
+                    m
+                }
+                3 => {
+                    let mut m = pin_set(&refs, false);
+                    m.reject_observation(refs[0].0);
+                    m
+                }
+                _ => {
+                    let mut extra = refs.clone();
+                    extra.push((overlay(900 + round), "extra", 1));
+                    pin_set(&extra, false)
+                }
+            };
+            assert!(
+                !base.same_pin_content(&mutated),
+                "round {round}: one mutation must break the match"
+            );
+        }
+    }
+
     #[test]
     fn retained_target_charge_is_bounded_before_the_first_copy() {
         let mut pins = test_fixture::real_scan_pin(

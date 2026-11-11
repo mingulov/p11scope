@@ -1744,14 +1744,14 @@ class MatrixContract(unittest.TestCase):
         wrapper.write_text("#!" + sys.executable + "\n" + OBJECT_EXTERNALS); wrapper.chmod(0o755)
         env = os.environ.copy()
         env.update(P11SCOPE_OBJECT_CONTROL=str(config_path), P11SCOPE_CANARY_TARGET_BITS="64")
-        argv = ["-I", "scripts/check-bpf-map-defs.py", "--inventory", "default", str(payload)]
+        argv = ["-I", "scripts/check-bpf-map-defs.py", "--inventory", "wide", str(payload)]
         def run(arguments, selected_env=env):
             return subprocess.run([str(wrapper), *arguments], cwd=source, env=selected_env,
                                   text=True, capture_output=True, timeout=5)
         healthy = run(argv)
         self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
         self.assertIn("controlled inventory preflight mode=full target_bits=64 exit=0", healthy.stdout)
-        self.assertNotIn("inventory default: maps=", healthy.stdout)
+        self.assertNotIn("inventory wide: maps=", healthy.stdout)
         value["failure"] = "inventory"; config_path.write_text(json.dumps(value))
         failed = run(argv)
         self.assertEqual(failed.returncode, 42, failed.stdout + failed.stderr)
@@ -2589,7 +2589,7 @@ if kind == "python3":
     script_index = 1 if args[:1] == ["-I"] else 0
     if len(args) > script_index and pathlib.Path(args[script_index]).name == "check-bpf-map-defs.py":
         try:
-            assert len(args) == 5 and args[0] == "-I" and args[2:4] == ["--inventory", "default"]
+            assert len(args) == 5 and args[0] == "-I" and args[2:4] == ["--inventory", "wide"]
             stage, script, contract = bound_script("check-bpf-map-defs.py")
             selected = [item for item in config["inventory_inputs"] if item["path"] == args[4]]
             assert len(selected) == 1

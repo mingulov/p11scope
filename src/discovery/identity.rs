@@ -12956,6 +12956,13 @@ mod tests {
             Some(libc::ENOENT),
             true
         )));
+        // An unreachable root retries whatever the root comparison
+        // says: ESRCH under a live generation pin is a jail, not an
+        // exit, even when the roots compare equal.
+        assert!(pin_map_files_fallback_triggered(&failure(
+            Some(libc::ESRCH),
+            false
+        )));
         // A genuinely missing file under the observer's own root never
         // retries, and neither does any other errno or a refusal that
         // carries no errno at all.
@@ -13506,6 +13513,141 @@ mod tests {
         );
         let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
         assert_eq!(outcome, Ok(()), "unreadable later ranges skip best-effort");
+    }
+
+    #[test]
+    fn pin_unreadable_opened_range_refuses() {
+        // Failure twin of the best-effort control above: failure to
+        // prove the very file opened must refuse — only later ranges
+        // skip. Every open-family errno refuses the same way.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        // Healthy control: the same shape with a readable opened
+        // range proves, so the refusals below turn on the read error.
+        let healthy: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
+            vec![(&entries[0], Ok(held)), (&entries[1], Ok(held))];
+        assert_eq!(
+            pin_proof_outcome(&held_file, &healthy, 0, &raw),
+            Ok(()),
+            "a readable equal opened range proves"
+        );
+        for errno in [libc::EACCES, libc::EPERM, libc::ENOENT] {
+            let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> = vec![
+                (
+                    &entries[0],
+                    Err(std::io::Error::from_raw_os_error(errno)),
+                ),
+                (&entries[1], Ok(held)),
+            ];
+            let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+            assert!(
+                matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("VMA identity unreadable")),
+                "an unreadable opened range (errno {errno}) refuses unproven: {outcome:?}"
+            );
+        }
+    }
+
+    /// The scan-produced deleted raw instance for `key`: the scanner
+    /// publishes the kernel's ` (deleted)` marker in
+    /// `ScannedModule.path`, and normalization keeps it verbatim.
+    fn pin_deleted_raw(key: ObjectKey) -> (String, RawObjectInstance) {
+        let scanned = module(key);
+        let deleted = format!("{} (deleted)", scanned.path);
+        let raw = RawObjectInstance::scanned(&scanned, key, &deleted).unwrap();
+        assert_eq!(
+            raw.path, deleted,
+            "the scanner's deleted marker survives normalization"
+        );
+        (deleted, raw)
+    }
+
+    #[test]
+    fn pin_deleted_scanned_path_selects_no_fallback_range() {
+        // A replaced file's still-mapped copy must never be opened by
+        // the pin fallback: byte equality between the scan-produced
+        // deleted path and its deleted maps entry is not a selection.
+        let (key, path, raw, _) = pin_proof_setup();
+        let (deleted, raw_deleted) = pin_deleted_raw(key);
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&deleted), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r-xp"),
+        ];
+        assert!(
+            pin_fallback_ranges(&entries, &raw_deleted).is_empty(),
+            "a deleted scanned path opens no fallback range"
+        );
+        // Healthy twin: the ordinary path still selects exactly its
+        // own range (and never the deleted rendering).
+        let ranges = pin_fallback_ranges(&entries, &raw);
+        assert_eq!(ranges.len(), 1, "the ordinary path still selects");
+        assert_eq!(ranges[0].start, 0x2000);
+    }
+
+    #[test]
+    fn pin_deleted_scanned_path_refuses_in_proof() {
+        // Even with a like-for-like equal identity, a deleted raw
+        // path refuses with the replaced-file gap instead of proving.
+        let (key, path, raw, held) = pin_proof_setup();
+        let (deleted, raw_deleted) = pin_deleted_raw(key);
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [pin_proof_entry(0x1000, key, Some(&deleted), b"r--p")];
+        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
+            vec![(&entries[0], Ok(held))];
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw_deleted);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("replaced on disk while running")),
+            "a deleted scanned path refuses with the replaced-file gap: {outcome:?}"
+        );
+        // Healthy twin: the identical shape under the ordinary path
+        // proves.
+        let live = [pin_proof_entry(0x1000, key, Some(&path), b"r--p")];
+        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
+            vec![(&live[0], Ok(held))];
+        assert_eq!(
+            pin_proof_outcome(&held_file, &proof, 0, &raw),
+            Ok(()),
+            "the ordinary-path twin still proves"
+        );
+    }
+
+    #[test]
+    fn pin_deleted_sibling_range_refuses() {
+        // A same-key sibling that now renders deleted stays in the
+        // proof set and refuses the pin on its own evidence, even
+        // when the opened range itself is ordinary and equal.
+        let (key, path, raw, held) = pin_proof_setup();
+        let (deleted, _) = pin_deleted_raw(key);
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x2000, key, Some(&deleted), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(
+            selected.len(),
+            2,
+            "every same-key sibling stays in the proof set"
+        );
+        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
+            vec![(&entries[0], Ok(held)), (&entries[1], Ok(held))];
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("replaced on disk while running")),
+            "a deleted sibling refuses with the replaced-file gap: {outcome:?}"
+        );
     }
 
     #[test]

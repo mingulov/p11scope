@@ -3756,6 +3756,51 @@ fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
     assert_eq!(gaps.len(), 5, "JSON keeps every record: {document}");
 }
 
+/// A pin fallback failure appends ` (map_files fallback: …)` after
+/// the foreign-root suffix; concise must still fold it to one
+/// counted `in root` line naming the fallback outcome, while JSON
+/// keeps the full stored reason.
+#[test]
+fn concise_folds_map_files_fallback_foreign_root_gaps() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    let suffixed = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root) (map_files fallback: the group has no VMA range to open)";
+    for subject in ["/lib/a.so", "/lib/b.so"] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: (*subject).into(),
+            reason: (*suffixed).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("2 ×")
+            && concise.contains("in root /etc/avahi")
+            && concise.contains("map_files fallback")
+            && concise.contains("--json lists each"),
+        "concise folds the fallback-suffixed foreign reasons into one counted line: {concise}"
+    );
+    assert!(
+        !concise.contains("differs from the observer root) (map_files fallback"),
+        "concise never shows the unfolded stored reason: {concise}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = document["gaps"]
+        .as_array()
+        .expect("JSON keeps a gaps array");
+    assert_eq!(gaps.len(), 2, "JSON keeps every record: {document}");
+    assert!(
+        gaps.iter().all(|gap| gap["reason"].as_str() == Some(suffixed)),
+        "JSON keeps the full stored reason: {document}"
+    );
+}
+
 /// Unreachable-process family fold (system demo): ESRCH
 /// retained-root opens across two foreign roots become ONE concise
 /// line naming the outcome with exact object and process counts —

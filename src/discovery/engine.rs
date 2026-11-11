@@ -19539,8 +19539,35 @@ impl Engine {
     /// staging, records the loader note, files the first-run gap, and
     /// owes the expedited frame.
     fn stage_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd;
         let identity = (candidate.dev, candidate.ino);
+        // A held file unlinked since its open (deleted, or replaced by
+        // a rename over its path) is refused at this boundary: the
+        // held descriptor's link count is the authority, never the
+        // display spelling. Settle so later loads drop, and file the
+        // finite replaced/deleted row instead of staging bytes no
+        // pathname names anymore.
+        if candidate
+            .file
+            .metadata()
+            .map(|meta| meta.nlink() == 0)
+            .unwrap_or(false)
+        {
+            self.note_learned_settled(identity);
+            self.learned_load_tally.remove(&identity);
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_REPLACED_DELETED_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: learned provider {} was replaced or deleted before staging; not learned",
+                    candidate.display_path
+                );
+            }
+            return;
+        }
         // The candidate owns its fd for this whole call, so the pin
         // worker's `/proc/self/fd/N` open cannot dangle.
         let open =

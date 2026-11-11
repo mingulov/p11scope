@@ -671,11 +671,16 @@ LEARNED_UNAVAILABLE_REASON = (
     "file learning was unavailable; short-lived first loads "
     "of new provider files were not learned"
 )
+LEARNED_REPLACED_DELETED_REASON = (
+    "a provider file was replaced or deleted before staging; "
+    "it was not learned"
+)
 LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,
     LEARNED_OVERFLOW_REASON,
     LEARNED_CAP_REASON,
     LEARNED_UNAVAILABLE_REASON,
+    LEARNED_REPLACED_DELETED_REASON,
 }
 # Owned-handoff (v0.7.0): a run whose startup step failed after probes
 # attached seals a partial report naming the failed step, with every

@@ -1026,6 +1026,10 @@ Learned-file gaps file under their own subject. Each record is
   provider files were not learned`: fanotify could not start or mark
   any filesystem (or later lost all marks). Ordinary discovery still
   ran; this names only the learning loss.
+- `a provider file was replaced or deleted before staging; it was not
+  learned`: the drain proved a provider on held bytes, but the held
+  file was unlinked (deleted, or replaced by a rename over its path)
+  before staging, so it was refused instead of staged.
 
 No path, pid, or executable ever appears in these rows: anything else
 filed under the subject redacts to the generic `discovery subject` /

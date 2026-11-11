@@ -766,7 +766,12 @@ ADMITTED_SOFTHSM_VERSIONS = {(2, 40), (3, 2)}
 # Live captures parse (N, M) from their own prefix record instead.
 PROXY_TABLES = 67
 PROXY_TABLE_ENTRIES = ADMITTED_PROXY_TABLE_SHAPES[(3, 2)]["entries"]
-PROXY_PREFIX_TABLES = 3
+# The reserve-capped maximal prefix per admitted shape, pinned literally so
+# the next ceiling change breaks the self-test instead of silently passing:
+# 104-entry: 68+14*102+2 = 1498 <= 1584 < 1600 = 68+15*102+2;
+# 92-entry: 68+16*90+2 = 1510 <= 1584 < 1600 = 68+17*90+2.
+PROXY_PREFIX_TABLES = 14
+PROXY_PREFIX_TABLES_92 = 16
 PROXY_PREFIX_SLOTS = PROXY_PREFIX_TABLES * (PROXY_TABLE_ENTRIES - 2) + 2
 PROXY_SPILL = PROXY_TABLES - PROXY_PREFIX_TABLES
 PROXY_DECODED_ENTRIES = PROXY_SPILL * PROXY_TABLE_ENTRIES + PROXY_PREFIX_TABLES * 68
@@ -3385,6 +3390,14 @@ def exact_admitted_growth_skips(evidence, growth_path=None):
 PREFIX_RECORD_RE = re.compile(r"^(\d+) of (\d+) template tables attached")
 
 
+def proxy_prefix_reason(tables, total=PROXY_TABLES):
+    """The canonical prefix record for N leading tables of M decoded."""
+    return (
+        f"{tables} of {total} template tables attached; "
+        "calls through the others are not counted"
+    )
+
+
 def exact_prefix_skips(evidence, prefix_path=None):
     """`modules_skipped` holds exactly the heuristic-prefix record for `prefix_path`.
 
@@ -3427,11 +3440,11 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     (6836 distinct targets over 67 templates) on the lane hosts. The
     late-start closure takes the reserve-capped heuristic prefix: the
     leading N tables attach (N*(entries-2)+2 distinct targets, the 2
-    family targets shared — 308 at 3.2/104) and the other M-N spill as
+    family targets shared — 1430 at 3.2/104) and the other M-N spill as
     `discovery_uncorroborated_candidates` — spill is evidence, never slots
     — so the proxy module carries exactly one prefix record ("N of M
     template tables attached"): SoftHSM2 attaches in full first (68 slots),
-    then the prefix (308 slots at 3.2/104, 376 total), every prefix slot scan-only
+    then the prefix (1430 slots at 3.2/104, 1498 total), every prefix slot scan-only
     `unknown` (1.3 mislabel guard). (N, M) parse from the capture's own
     record; the installed build's shape is pinned only by the self-test
     fixture. `module_path`, when the caller controls it, pins the
@@ -3459,8 +3472,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         f"completeness disagrees with the sealed verdict: {evidence['completeness']!r}",
     )
     # The cause that keeps this lane PARTIAL even behind a proven drain: it
-    # is manifest-free, so no slot's semantics are attested (measured on the
-    # live lane: 478 of 478 slots), and attribution is always withheld.
+    # is manifest-free, so no slot's semantics are attested (every slot
+    # stays unverified), and attribution is always withheld.
     require(
         evidence["semantic_unverified_slots"] == evidence["slots"],
         f"manifest-free proxy lane attested slot semantics: "
@@ -3611,7 +3624,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     )
     # One slot per {object, offset} and two probes per slot. The admitted
     # proxy slots are the distinct targets across the N leading tables of
-    # the observed shape (308 at 3.2/104 with N=3: 3*102+2, ordinals 65/66
+    # the observed shape (1430 at 3.2/104 with N=14: 14*102+2, ordinals 65/66
     # shared, byte-verified, 0 nulls); a target both providers publish is
     # attached exactly once. The prefix is maximal under the reserve cap:
     # N tables fit outside the reserve with the backend admitted first,
@@ -5273,7 +5286,7 @@ def self_test():
     proxy["evidence"]["modules_skipped"] = [
         {
             "name": PROXY_MODULE_FIXTURE["path"],
-            "reason": "3 of 67 template tables attached; calls through the others are not counted",
+            "reason": proxy_prefix_reason(PROXY_PREFIX_TABLES),
         }
     ]
     settle_fixture_verdict(proxy)
@@ -5325,12 +5338,10 @@ def self_test():
     # for the proxy path only, is accepted and forces PARTIAL; an
     # admitted-growth record, a whole-module refusal, a record for
     # SoftHSM2, or COMPLETE beside the record is refused (I2).
-    prefix_reason = (
-        "3 of 67 template tables attached; calls through the others are not counted"
-    )
+    prefix_reason = proxy_prefix_reason(PROXY_PREFIX_TABLES)
     growth_reason = (
-        "admitted module needs 6120 more; only 512 attach slots are available; 376 are in use "
-        "(376 active, 0 retired) — 6120 endpoints not attached; kept its 308 attached endpoints"
+        "admitted module needs 5406 more; only 2112 attach slots are available; 1498 are in use "
+        "(1498 active, 0 retired) — 5406 endpoints not attached; kept its 1430 attached endpoints"
     )
     proxy_path = PROXY_MODULE_FIXTURE["path"]
     grown = copy.deepcopy(proven_proxy)
@@ -5347,13 +5358,20 @@ def self_test():
         {"name": proxy_path, "reason": growth_reason.removeprefix("admitted ")},
         {"name": soft_path, "reason": prefix_reason},
         {"name": proxy_path, "reason": "stale shape"},
+        # An N+1 claim contradicts the decoded tables (only N short-accept),
+        # an underfilled N-1 claim contradicts them the other way, and a
+        # wrong total contradicts the decoded table count.
         {
             "name": proxy_path,
-            "reason": "4 of 67 template tables attached; calls through the others are not counted",
+            "reason": proxy_prefix_reason(PROXY_PREFIX_TABLES + 1),
         },
         {
             "name": proxy_path,
-            "reason": "3 of 64 template tables attached; calls through the others are not counted",
+            "reason": proxy_prefix_reason(PROXY_PREFIX_TABLES - 1),
+        },
+        {
+            "name": proxy_path,
+            "reason": proxy_prefix_reason(PROXY_PREFIX_TABLES, PROXY_TABLES - 3),
         },
     ):
         bad = copy.deepcopy(grown)
@@ -5435,24 +5453,50 @@ def self_test():
     # implies.
     for shape in ((3, 0), (3, 1)):
         entries = ADMITTED_PROXY_TABLE_SHAPES[shape]["entries"]
-        admitted = PROXY_PREFIX_TABLES * (entries - 2) + 2
+        prefix_tables = PROXY_PREFIX_TABLES_92
+        spill = PROXY_TABLES - prefix_tables
+        admitted = prefix_tables * (entries - 2) + 2
         older = copy.deepcopy(proxy)
         for index, table in enumerate(older["evidence"]["discovery"][1]["tables"]):
             table["version"] = list(shape)
             table["entries"] = (
-                SHORT_PREFIX_SLOTS if index < PROXY_PREFIX_TABLES else entries
+                SHORT_PREFIX_SLOTS if index < prefix_tables else entries
             )
-        for surface in older["evidence"]["surfaces"][1:]:
-            if surface["walk"] == "full":
-                surface["functions"] = entries
-            surface["source"] = surface["source"].replace("table 3.2", f"table {shape[0]}.{shape[1]}")
+        label = f"table {shape[0]}.{shape[1]}"
+        older["evidence"]["surfaces"] = [older["evidence"]["surfaces"][0]] + [
+            {
+                "walk": "full",
+                "functions": entries,
+                "acquisition": "ok",
+                "source": f"{PROXY_MODULE_FIXTURE['path']} {label}",
+            }
+            for _ in range(spill)
+        ] + [
+            {
+                "walk": "known_prefix",
+                "functions": SHORT_PREFIX_SLOTS,
+                "acquisition": "ok",
+                "source": f"{PROXY_MODULE_FIXTURE['path']} {label}",
+            }
+            for _ in range(prefix_tables)
+        ]
         older["evidence"].update(
-            table_entries=68 + PROXY_SPILL * entries + PROXY_PREFIX_TABLES * 68,
+            table_entries=68 + spill * entries + prefix_tables * 68,
             slots=68 + admitted,
             attached_probes=2 * (68 + admitted),
+            discovery_uncorroborated_candidates=spill,
             semantic_unverified_slots=68 + admitted,
+            modules_skipped=[
+                {
+                    "name": PROXY_MODULE_FIXTURE["path"],
+                    "reason": proxy_prefix_reason(prefix_tables),
+                }
+            ],
         )
-        older["functions"] = older["functions"][: 68 + admitted]
+        older["functions"] = older["functions"][:68] + function_items(
+            [(["unknown"], 1)] + [(["unknown"], 0)] * (admitted - 1),
+            identity=proxy_id,
+        )
         settle_fixture_verdict(older)
         validate_proxy_capacity_fallback(older)
         # ... but the pin stays exact per shape: a mixed build, a version

@@ -2561,14 +2561,30 @@ fn foreign_fold_display(stored: &str, group: &[&GapView]) -> (String, String) {
 
 /// The concise cause and target root behind a foreign-root stored
 /// reason. Without a fallback attempt the cause is the target open's
-/// own error; with one it is the host-root fallback's outcome (the
-/// last attempt; JSON and verbose keep both halves). `None` when the
+/// own error; with one it is that fallback's outcome (the last
+/// attempt; JSON and verbose keep every half). A pin fallback
+/// appends its ` (map_files fallback: …)` after the foreign-root
+/// suffix, so that trailing outcome is peeled first. `None` when the
 /// stored text does not parse.
 fn foreign_fold_parts(stored: &str) -> Option<(String, String)> {
-    let (before, after) = stored.split_once(" (target root ")?;
+    const MAP_FILES_MARKER: &str = " (map_files fallback: ";
+    let (core, map_files_detail) = match stored.rfind(MAP_FILES_MARKER) {
+        Some(at) if stored.ends_with(')') => (
+            &stored[..at],
+            Some(&stored[at + MAP_FILES_MARKER.len()..stored.len() - 1]),
+        ),
+        _ => (stored, None),
+    };
+    let (before, after) = core.split_once(" (target root ")?;
     let root = after.strip_suffix(" differs from the observer root)")?;
     if root.is_empty() {
         return None;
+    }
+    if let Some(detail) = map_files_detail {
+        if detail.is_empty() || !before.starts_with("opening object within retained target root:") {
+            return None;
+        }
+        return Some((format!("map_files fallback {detail}"), root.to_string()));
     }
     if let Some((target, fallback)) = before.split_once(" (host-root fallback: ") {
         if !target.starts_with("opening object within retained target root:") {

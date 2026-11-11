@@ -29,8 +29,11 @@ pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "identify")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MappingFileKey {
-    /// The fd's mount identity from `/proc/self/fdinfo`. Zero only for lexical
-    /// map-derived values that have no opened fd and are therefore not comparable.
+    /// The fd's mount identity from `/proc/self/fdinfo`. Zero for lexical
+    /// map-derived values that have no opened fd and are therefore not
+    /// comparable, and for a proven opened fd whose mount row is
+    /// unresolvable (an honestly unknown id); never compare mount ids
+    /// across that boundary.
     pub mount_id: u64,
     pub device_major: u64,
     pub device_minor: u64,

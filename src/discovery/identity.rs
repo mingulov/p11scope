@@ -8602,18 +8602,44 @@ enum PinMapFilesRefusal {
     Refused(String),
 }
 
+/// Whether a pathname carries the kernel's replaced-file marker: the
+/// scanner publishes a still-mapped replaced copy's rendering
+/// verbatim in `ScannedModule.path`, so a scan-produced raw path can
+/// end in ` (deleted)` exactly like its maps entry. Mirrors the
+/// scan's own classification: such a path names an unlinked file,
+/// never a live pathname to open.
+fn path_is_deleted_marker(path: &str) -> bool {
+    path.ends_with(" (deleted)")
+}
+
+/// Whether a fresh maps entry renders its file as replaced.
+fn entry_is_deleted_marker(entry: &MapEntry) -> bool {
+    entry
+        .raw_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with(b" (deleted)".as_slice()))
+}
+
 /// The live VMA ranges of `entries` that name `raw`: same maps key and
 /// same kernel-rendered pathname bytes, in maps order. Byte-exact on
-/// purpose: a ` (deleted)` rendering never matches a pinned path
-/// (replaced files keep their own route), and the open below re-reads
-/// under the view's generation pin, so a racing VMA fails closed there
-/// instead of joining under a stale key.
+/// purpose, and never a deletion guard by itself: a scan-produced
+/// deleted path byte-matches its own deleted maps entry, so deleted
+/// markers on either side select nothing (a replaced file refuses
+/// with its named gap in [`pin_proof_outcome`] and in
+/// [`pin_map_files_fallback`] instead of opening the still-mapped old
+/// copy). The open below re-reads under the view's generation pin, so
+/// a racing VMA fails closed there instead of joining under a stale
+/// key.
 fn pin_fallback_ranges<'a>(entries: &'a [MapEntry], raw: &RawObjectInstance) -> Vec<&'a MapEntry> {
+    if path_is_deleted_marker(&raw.path) {
+        return Vec::new();
+    }
     entries
         .iter()
         .filter(|entry| {
             ObjectKey::of(entry) == raw.key
                 && entry.raw_path.as_deref() == Some(raw.path.as_bytes())
+                && !entry_is_deleted_marker(entry)
         })
         .collect()
 }
@@ -8649,6 +8675,19 @@ fn pin_proof_outcome(
 ) -> Result<(), PinMapFilesRefusal> {
     use crate::discovery::scan::RangeProofVerdict;
     use PinMapFilesRefusal::{Refused, Unproven};
+    // A replaced file never proves here, however equal its still-
+    // mapped copy reads: a deleted marker on the scanned path or on
+    // any same-key proof range (kept in the set above) refuses with
+    // the scan's named replaced-file gap.
+    if path_is_deleted_marker(&raw.path)
+        || proof
+            .iter()
+            .any(|(entry, _)| entry_is_deleted_marker(entry))
+    {
+        return Err(Refused(
+            crate::discovery::scan::REPLACED_PROVIDER_REASON.into(),
+        ));
+    }
     let Some((first, ranged)) = proof.get(opened) else {
         return Err(Unproven("the group has no VMA range to open".into()));
     };
@@ -8768,6 +8807,14 @@ fn pin_map_files_fallback(
     budget: &mut CaptureWorkBudget,
 ) -> Result<(std::fs::File, MappingFileKey), PinMapFilesRefusal> {
     use PinMapFilesRefusal::{Refused, Unproven};
+    // A scan-produced deleted path names a replaced file: refuse it
+    // with the named gap before any maps read, so the fallback can
+    // never open the still-mapped old copy the ordinary pin refuses.
+    if path_is_deleted_marker(&raw.path) {
+        return Err(Refused(
+            crate::discovery::scan::REPLACED_PROVIDER_REASON.into(),
+        ));
+    }
     let maps = view
         .with_filesystem(budget, |filesystem, _| {
             filesystem.open_maps().map_err(|error| error.to_string())
@@ -13540,10 +13587,7 @@ mod tests {
         );
         for errno in [libc::EACCES, libc::EPERM, libc::ENOENT] {
             let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> = vec![
-                (
-                    &entries[0],
-                    Err(std::io::Error::from_raw_os_error(errno)),
-                ),
+                (&entries[0], Err(std::io::Error::from_raw_os_error(errno))),
                 (&entries[1], Ok(held)),
             ];
             let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
@@ -13601,8 +13645,7 @@ mod tests {
             fs_magic: Some(0xef53),
         };
         let entries = [pin_proof_entry(0x1000, key, Some(&deleted), b"r--p")];
-        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
-            vec![(&entries[0], Ok(held))];
+        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> = vec![(&entries[0], Ok(held))];
         let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw_deleted);
         assert!(
             matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("replaced on disk while running")),
@@ -13611,8 +13654,7 @@ mod tests {
         // Healthy twin: the identical shape under the ordinary path
         // proves.
         let live = [pin_proof_entry(0x1000, key, Some(&path), b"r--p")];
-        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> =
-            vec![(&live[0], Ok(held))];
+        let proof: Vec<(&MapEntry, std::io::Result<FileIdentity>)> = vec![(&live[0], Ok(held))];
         assert_eq!(
             pin_proof_outcome(&held_file, &proof, 0, &raw),
             Ok(()),

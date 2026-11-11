@@ -3766,7 +3766,7 @@ fn concise_folds_map_files_fallback_foreign_root_gaps() {
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();
     presentation.gaps_suppressed = 0;
-    let suffixed = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root) (map_files fallback: the group has no VMA range to open)";
+    let suffixed = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root) (map_files fallback: unproven)";
     for subject in ["/lib/a.so", "/lib/b.so"] {
         presentation.gaps.push(GapView {
             caller: None,
@@ -3796,7 +3796,8 @@ fn concise_folds_map_files_fallback_foreign_root_gaps() {
         .expect("JSON keeps a gaps array");
     assert_eq!(gaps.len(), 2, "JSON keeps every record: {document}");
     assert!(
-        gaps.iter().all(|gap| gap["reason"].as_str() == Some(suffixed)),
+        gaps.iter()
+            .all(|gap| gap["reason"].as_str() == Some(suffixed)),
         "JSON keeps the full stored reason: {document}"
     );
 }

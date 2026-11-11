@@ -3605,6 +3605,14 @@ fn capture_with_host(
         policy,
         None,
     );
+    // Kernel file-open learning: the fanotify drain proves opened
+    // files on held bytes for system scope; first loads of brand-new
+    // providers stay a named gap, later runs are caught. Armed before
+    // the session starts (and before the post-setup capability shed)
+    // so the group and its filesystem marks exist even if the shed
+    // later takes CAP_SYS_ADMIN; other scopes and an unavailable
+    // drain keep ordinary discovery.
+    engine.start_file_learning();
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     // A named pid that died after scope resolution fails below with the one
@@ -9401,6 +9409,9 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
+                    // Learned files stage before the pass decision, so a
+                    // staging owed this tick can expedite this tick's frame.
+                    context.0.service_learned_files();
                     // Fresh every tick: only this tick's backlog pass may
                     // schedule a zero sleep below.
                     consumers.scheduling.note_discovery_backlog(false);
@@ -9611,7 +9622,7 @@ fn capture_profile(
         request_profile_recovery_frame(
             &mut last_frame,
             drain,
-            engine.take_immediate_exec_recovery_frame(),
+            engine.take_immediate_exec_recovery_frame() | engine.take_learned_frame(),
             Instant::now,
         );
         request_fast_discovery_frame(
@@ -10958,6 +10969,9 @@ fn capture_trace(
             observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
             break Ok(CaptureEnd::Signal);
         }
+        // Learned files stage before the pass decision, so a staging
+        // owed this tick can expedite this tick's frame.
+        engine.service_learned_files();
         // Fresh every tick: only this tick's backlog pass may
         // schedule a zero sleep below.
         scheduling.note_discovery_backlog(false);
@@ -11133,7 +11147,7 @@ fn capture_trace(
         request_profile_recovery_frame(
             &mut last_frame,
             drain,
-            engine.take_immediate_exec_recovery_frame(),
+            engine.take_immediate_exec_recovery_frame() | engine.take_learned_frame(),
             Instant::now,
         );
         request_fast_discovery_frame(
@@ -13610,6 +13624,9 @@ pub(crate) fn evidence_for(
         object_capture,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
+        learned_staged_files: engine.learned_staged_files(),
+        learned_event_loss: engine.learned_event_loss(),
+        learned_cap_skipped: engine.learned_cap_skipped(),
         // 6.14 Option B: `None` unless extensive mode armed; the JSON
         // key is then omitted, never null.
         gap_exe_hints: engine.gap_exe_hints().copied(),

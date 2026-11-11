@@ -1899,6 +1899,7 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(plain.modules.len(), 1);
     assert_eq!(plain.modules[0].layer, None);
@@ -1908,6 +1909,7 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(
         marked.modules[0].layer,
@@ -1965,6 +1967,7 @@ fn discovery_pair_rows_share_the_merge_view_key() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(evidence.modules.len(), 2);
     let upper_row = evidence
@@ -2000,6 +2003,7 @@ fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
 
     assert_eq!(evidence.modules[0].objects.len(), 1);
@@ -17537,6 +17541,9 @@ fn evidence_verdict(
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        learned_staged_files: 0,
+        learned_event_loss: 0,
+        learned_cap_skipped: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,
@@ -17548,6 +17555,7 @@ fn evidence_verdict(
             pinned,
             counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         ),
         scheduling: render::SchedulingEvidence::default(),
         stop_quiescence: Default::default(),
@@ -22579,6 +22587,7 @@ fn optional_export_absence_is_complete_independently_of_table_version() {
                 &[],
                 &engine.counters,
                 &crate::prearm_module::PrearmState::empty(),
+                &BTreeMap::new(),
             )
             .unwrap();
         let exports = engine.interface_selection().standard_exports;
@@ -22638,6 +22647,7 @@ fn capture_history_preserves_the_effective_short_manifest_walk() {
             &[0],
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .unwrap();
     let surfaces = facts.history.surfaces.values().collect::<Vec<_>>();
@@ -32197,6 +32207,7 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
         &candidate.pinned,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert!(
         evidence
@@ -32264,6 +32275,7 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
         &candidate.pinned,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(evidence.modules.len(), 1);
 
@@ -38236,6 +38248,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         &pinned,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     let mut evidence = render::Evidence {
         table_entries: plan.entries_seen,
@@ -38313,6 +38326,9 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        learned_staged_files: 0,
+        learned_event_loss: 0,
+        learned_cap_skipped: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,
@@ -38457,6 +38473,7 @@ fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
             &[],
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .unwrap();
     facts
@@ -38468,6 +38485,7 @@ fn p2_refusal_occurrences_survive_history_and_sanitized_duplicates() {
             &[],
             &DiscoveryCounters::default(),
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .unwrap();
     facts.apply_to_plan(&mut plan);
@@ -38715,6 +38733,7 @@ fn a_partial_capacity_refusal_is_reported_and_only_an_empty_one_is_fatal() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(evidence.modules_skipped.len(), 1);
     assert_eq!(evidence.modules_skipped[0].name, "/opt/big0.so");
@@ -38770,6 +38789,7 @@ fn the_module_record_says_which_corroboration_outcome_it_got() {
             &pins,
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         );
         assert_eq!(evidence.modules[0].corroboration, vec![label]);
     }
@@ -38780,6 +38800,7 @@ fn the_module_record_says_which_corroboration_outcome_it_got() {
         &pins,
         &DiscoveryCounters::default(),
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
     assert_eq!(evidence.modules[0].corroboration, vec!["single_source"]);
     assert_eq!(evidence.modules[0].sources, vec!["scan"]);
@@ -38806,6 +38827,7 @@ fn late_collision_invalidates_fallback_evidence_without_discovery_evidence_panic
         &pins,
         &counters,
         &crate::prearm_module::PrearmState::empty(),
+        &BTreeMap::new(),
     );
 
     assert!(
@@ -39204,7 +39226,8 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
             &plan,
             &scan_pins,
             &counters,
-            &crate::prearm_module::PrearmState::empty()
+            &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new()
         )
         .conflicts,
         1,
@@ -39551,6 +39574,7 @@ fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
         watch: None,
         attached_at_ns: None,
         unobserved_windows: None,
+        first_loaded_by: None,
     }
 }
 
@@ -44342,6 +44366,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             &mode.ordinals,
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         ) {
             Ok(()) => panic!("{}: the merge must fail", mode.name),
             Err(error) => error.to_string(),
@@ -44361,6 +44386,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             &[],
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         ) {
             panic!("{}: facts stay usable after failure: {error:#}", mode.name);
         }
@@ -44410,6 +44436,7 @@ fn merge_preflight_success_implies_identical_merge_results() {
             &inputs.4,
             &inputs.5,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .expect("the merge accepts real candidate inputs");
     let mut second = engine.capture_facts.clone();
@@ -44422,6 +44449,7 @@ fn merge_preflight_success_implies_identical_merge_results() {
             &inputs.4,
             &inputs.5,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .expect("the merge is repeatable");
     assert_eq!(
@@ -70866,6 +70894,7 @@ fn stamped_legacy_publishers(
             &[],
             &counters,
             &crate::prearm_module::PrearmState::empty(),
+            &BTreeMap::new(),
         )
         .unwrap_or_else(|error| panic!("{tag}: merge failed: {error}"));
     let engine = facts
@@ -74896,4 +74925,577 @@ fn review_relief_admits_live_group_after_leader_exit() {
         "relief replaces exactly one entry, the queue stays bounded"
     );
     group.call_three();
+}
+
+/// A fanotify-learned candidate stages through the pre-arm path: the pin
+/// opens the held fd (`/proc/self/fd/N`), the record carries the readlink
+/// display path and the loading program, one first-run gap is filed, and
+/// the expedited frame is owed so attach lands before the next run.
+#[test]
+fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    // Two opens by one loader plus one by another: the note counts
+    // distinct loaders (dupes collapse), like the drain's Load tally.
+    for pid in [4242, 4242, 4243] {
+        tx.send(crate::fanotify::LearnMsg::Load { dev, ino, pid })
+            .unwrap();
+    }
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    // The drain stays alive for the whole service: dropping `tx` here
+    // would model unexpected drain death (tested separately below).
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the learned file stages"
+    );
+    let notes: Vec<_> = engine.learned_notes.values().collect();
+    assert_eq!(notes.len(), 1, "one loader note per staged file");
+    assert_eq!(notes[0].exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+    assert_eq!(
+        notes[0].pre_attach_loads, 2,
+        "the note counts distinct pre-stage loaders"
+    );
+    assert!(
+        engine
+            .prearm_input
+            .iter()
+            .flat_map(|input| input.inputs.iter())
+            .any(|entry| entry.path.ends_with("seed-provider.so")),
+        "the staged record carries the display path"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "staging files the named first-run gap: {public:?}"
+    );
+    assert!(
+        engine.learned_frame_owed_for_test(),
+        "staging owes the expedited frame"
+    );
+}
+
+/// A fanotify queue overflow files one aggregate gap: some short-lived
+/// loads may not have been learned, counted but never per-file.
+#[test]
+fn learned_overflow_files_an_aggregate_gap() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::QueueOverflow).unwrap();
+    // The drain stays alive for the whole service: dropping `tx` here
+    // would model unexpected drain death (tested separately below).
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(engine.learned_event_loss_for_test(), 1);
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "file-learning events were lost; \
+                         some provider files may not have been learned"
+        }),
+        "overflow files the aggregate gap: {public:?}"
+    );
+}
+
+/// An unexpectedly dead drain funnels into the same loss aggregate:
+/// a dropped sender (the drain thread owns it alone) counts once and
+/// files the aggregate gap, then the channel is dropped so it fires once.
+#[test]
+fn learned_drain_death_files_event_loss_once() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    drop(tx);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    engine.service_learned_files();
+    assert_eq!(engine.learned_event_loss_for_test(), 1);
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "file-learning events were lost; \
+                         some provider files may not have been learned"
+        }),
+        "drain death files the aggregate gap: {public:?}"
+    );
+}
+
+/// A scan-covered file stays unstaged and silent: its calls are already
+/// observed, so learning it would file a misleading gap. No note, no
+/// count, no row.
+#[test]
+fn learned_scan_covered_file_stays_unstaged_and_silent() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned.absorb(pins);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    assert!(engine.learned_notes.is_empty());
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "no learned gap for a scan-covered file: {public:?}"
+    );
+}
+
+/// The per-capture learned-file cap names its excess once: the 33rd file
+/// is refused loudly, the first 32 are unaffected.
+#[test]
+fn learned_cap_names_the_excess_once() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    // The drain stays alive for the whole service: dropping `tx` here
+    // would model unexpected drain death (tested separately below).
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    for ordinal in 0..crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+        engine.learned_notes.insert(
+            ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: ordinal as u64,
+            },
+            render::FirstLoadedBy {
+                exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                exe_unknown_reason: None,
+                pre_attach_loads: 1,
+            },
+        );
+    }
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    assert_eq!(engine.learned_cap_skipped_for_test(), 1);
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "file learning reached its 32-file per-capture cap; \
+                         further provider files were not learned"
+        }),
+        "the cap names its excess once: {public:?}"
+    );
+}
+
+/// Learned pins are bounded per tick: nine queued candidates stage eight
+/// on the first service and the ninth on the next, so a provider storm
+/// cannot stall a tick.
+#[test]
+fn learned_service_bounds_pins_per_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut libraries = Vec::new();
+    for ordinal in 0..9 {
+        let c = dir.path().join(format!("bound{ordinal}.c"));
+        let so = dir.path().join(format!("libbound{ordinal}.so"));
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        libraries.push(so);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    for so in &libraries {
+        let file = std::fs::File::open(so).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: so.to_string_lossy().into_owned(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+            },
+        ))
+        .unwrap();
+    }
+    // The drain stays alive for the whole service: dropping `tx` here
+    // would model unexpected drain death (tested separately below).
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        8,
+        "eight pins per tick"
+    );
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        9,
+        "the ninth stages next tick"
+    );
+}
+
+/// Capture end flushes pending candidates without the per-tick bound:
+/// nothing the drain proved vanishes silently at the boundary.
+#[test]
+fn learned_capture_end_flushes_pending_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut libraries = Vec::new();
+    for ordinal in 0..9 {
+        let c = dir.path().join(format!("flush{ordinal}.c"));
+        let so = dir.path().join(format!("libflush{ordinal}.so"));
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        libraries.push(so);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    for so in &libraries {
+        let file = std::fs::File::open(so).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: so.to_string_lossy().into_owned(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+            },
+        ))
+        .unwrap();
+    }
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        8,
+        "eight pins per tick"
+    );
+    assert_eq!(engine.pending_learned.len(), 1);
+    engine.flush_learned_files_at_capture_end();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        9,
+        "the flush stages the rest"
+    );
+    assert!(engine.pending_learned.is_empty());
+}
+
+/// Capture-end shutdown stages everything still queued even with no
+/// prior tick service: the drain's whole channel flushes once the
+/// thread is joined.
+#[test]
+fn learned_shutdown_stages_unserviced_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("shutdown.c");
+    let so = dir.path().join("libshutdown.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: so.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.shutdown_file_learning();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "shutdown stages the queued candidate"
+    );
+    // Idempotent: a second shutdown neither restages nor files loss.
+    engine.shutdown_file_learning();
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert_eq!(engine.learned_event_loss_for_test(), 0);
+}
+
+/// A learned staging after the plan already stabilized invalidates the
+/// fast paths: `plan_rebuild_stable` clears and the shallow-idle latch
+/// holds, so the next frame rebuilds and attaches the new file instead
+/// of reusing the unchanged candidate.
+#[test]
+fn learned_staging_invalidates_a_stable_plan() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan_rebuild_stable = true;
+    assert!(engine.discovery_shallow_idle());
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(
+        !engine.plan_rebuild_stable,
+        "staging must invalidate the unchanged-candidate fast path"
+    );
+    assert!(
+        !engine.discovery_shallow_idle(),
+        "staging must block the shallow-idle frame skip until a refresh consumes it"
+    );
+    // The staged file joins the plan on the next apply and stays after
+    // its only mapper exits (the pin holds the file).
+    let mut session = ScriptedSession::with_records([], 0);
+    engine
+        .apply_discovery_batch(&mut session, Vec::new(), 0)
+        .unwrap();
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.path.contains("seed-provider.so")),
+        "the learned provider joins the plan"
+    );
+    drop(fixture);
+    let mut session = ScriptedSession::with_records([], 0);
+    engine
+        .apply_discovery_batch(&mut session, Vec::new(), 0)
+        .unwrap();
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.path.contains("seed-provider.so")),
+        "the learned provider stays attached after its only mapper exits"
+    );
+}
+
+/// A replaced file at the same display path stages as fresh: identity
+/// is the pinned key, never the spelling, so the new inode's first use
+/// is its own named gap and the old slots are untouched.
+#[test]
+fn learned_replaced_file_at_same_path_stages_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, ret: u32| {
+        let c = dir.path().join(format!("{name}.c"));
+        let so = dir.path().join(format!("lib{name}.so"));
+        std::fs::write(
+            &c,
+            format!("unsigned long C_GetFunctionList(void **out){{ (void)out; return {ret}; }}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        so
+    };
+    let first = build("replaced_one", 5);
+    let second = build("replaced_two", 6);
+    let display = "/opt/vendor/libprovider.so".to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    for so in [&first, &second] {
+        let file = std::fs::File::open(so).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: display.clone(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+            },
+        ))
+        .unwrap();
+    }
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        2,
+        "same spelling, new identity: both stage"
+    );
+    assert_eq!(engine.learned_notes.len(), 2);
+}
+
+/// An unavailable-learning signal from the drain files the finite
+/// unavailable row once: membership-style failures are counted named
+/// gaps, never silently dropped.
+#[test]
+fn learned_unavailable_files_a_named_gap() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Unavailable).unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "file learning was unavailable; short-lived first loads \
+                         of new provider files were not learned"
+        }),
+        "unavailable learning files its named gap: {public:?}"
+    );
+    // Other scopes never arm the drain.
+    let mut pid_engine = Engine::empty();
+    pid_engine.scope = Scope::Pid(1);
+    pid_engine.start_file_learning();
+    assert!(pid_engine.file_learner.is_none());
+    assert!(pid_engine.counters.object_skips.is_empty());
 }

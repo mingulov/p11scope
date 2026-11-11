@@ -12748,6 +12748,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         watch: None,
         attached_at_ns: None,
         unobserved_windows: None,
+        first_loaded_by: None,
         interfaces: 0,
         skipped: vec![],
     };
@@ -12852,6 +12853,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         object_capture: p11scope::render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        learned_staged_files: 0,
+        learned_event_loss: 0,
+        learned_cap_skipped: 0,
         gap_exe_hints: None,
         target_exec_hints: None,
         instance_reload_not_excluded: None,

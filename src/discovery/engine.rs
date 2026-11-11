@@ -439,6 +439,41 @@ pub struct Engine {
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
     prearm_input: Option<PrearmInput>,
+    /// Kernel file-open learning: the fanotify drain handle, armed for
+    /// system scope only. `None` before arming, when the scope is not
+    /// system, or when fanotify is unavailable (then the capture keeps
+    /// ordinary discovery and files the unavailable-learning gap).
+    file_learner: Option<crate::fanotify::FileLearner>,
+    /// Drain-to-engine channel. `None` exactly when no learner runs.
+    learned_rx: Option<std::sync::mpsc::Receiver<crate::fanotify::LearnMsg>>,
+    /// Staged learned files' loader notes, keyed by the stable pin
+    /// identity (never the capture-local object id, which rebuilds
+    /// renumber): the render join for `first_loaded_by`. Presence also
+    /// enforces the per-capture learned-file cap.
+    learned_notes: BTreeMap<ObjectKey, render::FirstLoadedBy>,
+    /// Distinct loader pids per unstaged learned identity: the staged
+    /// note's opens-before-staging count. Taken at staging; capped.
+    learned_load_tally: BTreeMap<(u64, u64), BTreeSet<u32>>,
+    /// Learned identities past staging-or-refusal: later `Load`
+    /// tallies for these drop (their runs are covered, not missed).
+    /// Bounded: past the cap new identities are simply not retained
+    /// (a re-staged candidate dedupes by pinned identity instead).
+    learned_settled: BTreeSet<(u64, u64)>,
+    /// Candidates past the per-tick pin bound: staged first next tick.
+    pending_learned: Vec<crate::fanotify::LearnedCandidate>,
+    /// Provider files the fanotify drain staged for attachment.
+    learned_staged_files: u64,
+    /// Learning loss: queue overflows, lost tails, drain deaths.
+    learned_event_loss: u64,
+    /// Learned candidates refused by the per-capture file cap.
+    learned_cap_skipped: u64,
+    /// A learned staging owes an expedited discovery frame so attach
+    /// lands promptly instead of at the next cadence boundary.
+    learned_frame_owed: bool,
+    /// A learned staging mutated the pre-arm inputs since the last
+    /// inventory refresh consumed them: shallow-idle frames must not
+    /// skip the apply that attaches the new file.
+    learned_unapplied: bool,
     prearm: crate::prearm_module::PrearmState,
     /// Pre-arm witness verdicts (WU-13 P-C phase 2): None until a non-run
     /// start_session finalizes the witness; run sessions and failed
@@ -2470,6 +2505,7 @@ impl CaptureFacts {
         manifest_ordinals: &[u32],
         counters: &DiscoveryCounters,
         prearm: &crate::prearm_module::PrearmState,
+        learned: &BTreeMap<ObjectKey, render::FirstLoadedBy>,
     ) -> Result<()> {
         // Proves the fallible surface before cloning: same checks, same
         // order, same first failure as the interleaved checks below.
@@ -2477,7 +2513,7 @@ impl CaptureFacts {
         let mut history = self.visible_history().clone();
         let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
         prune_selection_inventory(&mut history, &live_views);
-        let current = discovery_evidence(plan, pinned, counters, prearm);
+        let current = discovery_evidence(plan, pinned, counters, prearm, learned);
 
         // §4.12 by capture end. Each fresh reading replaces the retained one;
         // a publication with nothing to read keeps what the capture already
@@ -3207,6 +3243,11 @@ fn merge_discovered_module(
     }
     if incoming.unobserved_windows.is_some() {
         retained.unobserved_windows = incoming.unobserved_windows;
+    }
+    // The loader note only moves forward into set, like the attach keys:
+    // a learned module stays learned however many snapshots merge.
+    if incoming.first_loaded_by.is_some() {
+        retained.first_loaded_by = incoming.first_loaded_by;
     }
 }
 
@@ -8024,6 +8065,7 @@ fn discovery_evidence(
     pinned: &PinnedObjects,
     counters: &DiscoveryCounters,
     prearm: &crate::prearm_module::PrearmState,
+    learned: &BTreeMap<ObjectKey, render::FirstLoadedBy>,
 ) -> render::DiscoveryEvidence {
     let summary_of = |id, path: &str| {
         let pin = pinned
@@ -8086,6 +8128,9 @@ fn discovery_evidence(
                 watch: prearm.get(m.object).map(|watch| watch.render()),
                 attached_at_ns: None,
                 unobserved_windows: None,
+                first_loaded_by: pinned
+                    .summary(m.object)
+                    .and_then(|pin| learned.get(&pin.key).cloned()),
             }
         })
         .collect();
@@ -9425,7 +9470,14 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         crate::attach::monotonic_ns(),
     );
     let evidence_start = crate::attach::monotonic_ns();
-    let discovery = discovery_evidence(&plan, &pinned, &counters, &discovered.prearm);
+    // The initial build predates any learning: no module carries a note.
+    let discovery = discovery_evidence(
+        &plan,
+        &pinned,
+        &counters,
+        &discovered.prearm,
+        &BTreeMap::new(),
+    );
     discovered.stage_timings.span(
         crate::timing::StageKind::Projection,
         "build_initial_evidence",
@@ -11419,6 +11471,17 @@ impl Engine {
             scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
             prearm_input: None,
+            file_learner: None,
+            learned_rx: None,
+            learned_notes: BTreeMap::new(),
+            learned_load_tally: BTreeMap::new(),
+            learned_settled: BTreeSet::new(),
+            pending_learned: Vec::new(),
+            learned_staged_files: 0,
+            learned_event_loss: 0,
+            learned_cap_skipped: 0,
+            learned_frame_owed: false,
+            learned_unapplied: false,
             prearm: crate::prearm_module::PrearmState::empty(),
             prearm_witness: None,
             prearm_witness_live: None,
@@ -12789,6 +12852,28 @@ impl Engine {
     /// Extensive-mode static-hint split, present only when armed. Like
     /// the gap counter it never moves calls or attribution; unlike it,
     /// the split is `None` (key omitted) unless armed.
+    /// Provider files the fanotify drain staged for attachment
+    /// (informational: the first-run gap row carries the verdict).
+    pub(crate) fn learned_staged_files(&self) -> u64 {
+        self.learned_staged_files
+    }
+
+    /// Learning loss: queue overflows, lost tails, drain deaths.
+    pub(crate) fn learned_event_loss(&self) -> u64 {
+        self.learned_event_loss
+    }
+
+    /// Learned candidates refused by the per-capture file cap.
+    pub(crate) fn learned_cap_skipped(&self) -> u64 {
+        self.learned_cap_skipped
+    }
+
+    /// Consume the learned-staging expedited-frame hint (scheduling
+    /// only, never admission authority).
+    pub(crate) fn take_learned_frame(&mut self) -> bool {
+        std::mem::take(&mut self.learned_frame_owed)
+    }
+
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
         self.extensive
             .gap_active()
@@ -15002,6 +15087,7 @@ impl Engine {
             &self.manifest_ordinals,
             &self.counters,
             &self.prearm,
+            &self.learned_notes,
         );
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
@@ -15148,8 +15234,13 @@ impl Engine {
         } else if self.capture_facts.history.modules.is_empty()
             && self.capture_facts.history.decoded.is_empty()
         {
-            self.discovery =
-                discovery_evidence(&self.plan, &self.pinned, &self.counters, &self.prearm);
+            self.discovery = discovery_evidence(
+                &self.plan,
+                &self.pinned,
+                &self.counters,
+                &self.prearm,
+                &self.learned_notes,
+            );
         } else {
             self.project_capture_facts();
         }
@@ -19110,6 +19201,389 @@ impl Engine {
             }
         }
         Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
+    }
+
+    /// Arms kernel file-open learning for system scope: the fanotify
+    /// drain proves opened files on held bytes and hands providers to
+    /// [`Self::service_learned_files`]. Other scopes never arm (a pid or
+    /// cgroup capture must not stage files strangers opened). An
+    /// unavailable drain is a `-v` line, never a fatal: the capture
+    /// keeps today's gaps.
+    pub(crate) fn start_file_learning(&mut self) {
+        if !matches!(self.scope, Scope::System) {
+            return;
+        }
+        if self.file_learner.is_some() {
+            return;
+        }
+        match crate::fanotify::FileLearner::start() {
+            Ok((learner, rx)) => {
+                self.file_learner = Some(learner);
+                self.learned_rx = Some(rx);
+            }
+            Err(absent) => {
+                // Unavailable learning is a counted named gap, never
+                // silent and never fatal: ordinary discovery continues.
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    crate::render::LEARNED_UNAVAILABLE_REASON,
+                );
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!(
+                        "p11scope: file learning unavailable: {}; short-lived first loads keep today's gaps",
+                        absent.reason
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drains the learn channel once per tick, before the discovery pass:
+    /// tallies loads, stages provider candidates through the pre-arm pin
+    /// path, and files the learned gaps. Pins are bounded per tick (the
+    /// rest wait in `pending_learned`); tallies and loss are never
+    /// deferred. Staging owes the expedited frame, so attach lands about
+    /// 100 ms after learning instead of at the next 1 s boundary.
+    pub(crate) fn service_learned_files(&mut self) {
+        const PINS_PER_TICK: usize = 8;
+        self.service_learned_files_inner(PINS_PER_TICK);
+    }
+
+    /// End-of-capture flush: stages everything still queued without the
+    /// per-tick pin bound (the per-capture cap still refuses true excess
+    /// loudly), so a late burst still lists with its gap instead of
+    /// vanishing silently at the boundary. Two passes catch stragglers
+    /// the live drain sends mid-flush; anything after that is post-scope
+    /// and correctly excluded.
+    pub(crate) fn flush_learned_files_at_capture_end(&mut self) {
+        self.service_learned_files_inner(usize::MAX);
+        self.service_learned_files_inner(usize::MAX);
+    }
+
+    /// Stops file learning at capture end: joins the drain first (no
+    /// send is in flight afterwards), stages everything it sent, then
+    /// files the lost tail loudly when the drain reports one (an
+    /// unsent message or unread queue contents at shutdown). Idempotent
+    /// and a no-op without a learner.
+    pub(crate) fn shutdown_file_learning(&mut self) {
+        let mut lost_tail = false;
+        if let Some(mut learner) = self.file_learner.take() {
+            lost_tail = learner.shutdown_and_join();
+        }
+        self.flush_learned_files_at_capture_end();
+        self.learned_rx = None;
+        if lost_tail {
+            self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_OVERFLOW_REASON,
+            );
+        }
+    }
+
+    fn service_learned_files_inner(&mut self, pin_budget: usize) {
+        const TALLY_PIDS_PER_FILE: usize = 1024;
+        let mut staged_this_tick = 0usize;
+        let pending = std::mem::take(&mut self.pending_learned);
+        for candidate in pending {
+            if self.learned_notes.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+                self.refuse_learned_candidate(candidate);
+                continue;
+            }
+            if staged_this_tick >= pin_budget {
+                self.pending_learned.push(candidate);
+                continue;
+            }
+            self.stage_learned_candidate(candidate);
+            staged_this_tick += 1;
+        }
+        loop {
+            let msg = match self.learned_rx.as_ref() {
+                Some(rx) => rx.try_recv(),
+                None => return,
+            };
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The drain died unexpectedly: learning stops here.
+                    // Drop the channel so this fires once, and funnel the
+                    // loss into the overflow aggregate (row dedupes).
+                    self.learned_rx = None;
+                    self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                    self.mark_partial(
+                        crate::render::LEARNED_SKIP_SUBJECT,
+                        crate::render::LEARNED_OVERFLOW_REASON,
+                    );
+                    return;
+                }
+            };
+            match msg {
+                crate::fanotify::LearnMsg::Load { dev, ino, pid } => {
+                    if self.learned_settled.contains(&(dev, ino)) {
+                        continue;
+                    }
+                    // Bounded bookkeeping: tallies for unstaged files
+                    // cap out; the candidate still stages with at
+                    // least its own first load counted.
+                    if !self.learned_load_tally.contains_key(&(dev, ino))
+                        && self.learned_load_tally.len() >= 128
+                    {
+                        continue;
+                    }
+                    let tally = self.learned_load_tally.entry((dev, ino)).or_default();
+                    if tally.len() < TALLY_PIDS_PER_FILE {
+                        tally.insert(pid);
+                    }
+                }
+                crate::fanotify::LearnMsg::Unavailable => {
+                    self.mark_partial(
+                        crate::render::LEARNED_SKIP_SUBJECT,
+                        crate::render::LEARNED_UNAVAILABLE_REASON,
+                    );
+                }
+                crate::fanotify::LearnMsg::QueueOverflow => {
+                    self.learned_event_loss = self.learned_event_loss.saturating_add(1);
+                    self.mark_partial(
+                        crate::render::LEARNED_SKIP_SUBJECT,
+                        crate::render::LEARNED_OVERFLOW_REASON,
+                    );
+                }
+                crate::fanotify::LearnMsg::Candidate(candidate) => {
+                    if self
+                        .learned_settled
+                        .contains(&(candidate.dev, candidate.ino))
+                    {
+                        continue;
+                    }
+                    // No spelling pre-check here: a file the witness or
+                    // the operator staged first still gains the loader
+                    // note (post-pin classification below), and a
+                    // replaced file shares only the spelling. Each
+                    // identity pins at most once (settled above).
+                    if self.learned_notes.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+                        self.refuse_learned_candidate(candidate);
+                        continue;
+                    }
+                    if staged_this_tick >= pin_budget {
+                        if self.pending_learned.len()
+                            >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+                        {
+                            // Pending is bounded like staging: a provider
+                            // storm refuses loudly instead of holding fds
+                            // without bound.
+                            self.refuse_learned_candidate(candidate);
+                        } else {
+                            self.pending_learned.push(candidate);
+                        }
+                        continue;
+                    }
+                    self.stage_learned_candidate(candidate);
+                    staged_this_tick += 1;
+                }
+            }
+        }
+    }
+
+    /// Records one settled learned identity under a hard bound: past
+    /// the cap the identity is not retained (a re-sent candidate then
+    /// dedupes by pinned identity at staging, and a re-refused one
+    /// re-files the deduped cap row), so bookkeeping never grows with
+    /// the number of distinct files a storm opens.
+    fn note_learned_settled(&mut self, identity: (u64, u64)) {
+        const LEARNED_SETTLED_CAP: usize = 8192;
+        if self.learned_settled.len() < LEARNED_SETTLED_CAP
+            || self.learned_settled.contains(&identity)
+        {
+            self.learned_settled.insert(identity);
+        }
+    }
+
+    /// Refuses one candidate against the per-capture file cap: settled
+    /// so later loads drop, counted, and named by the aggregate cap row
+    /// (marks dedupe, so the excess names itself once per capture).
+    fn refuse_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
+        self.note_learned_settled((candidate.dev, candidate.ino));
+        self.learned_load_tally
+            .remove(&(candidate.dev, candidate.ino));
+        self.learned_cap_skipped = self.learned_cap_skipped.saturating_add(1);
+        self.mark_partial(
+            crate::render::LEARNED_SKIP_SUBJECT,
+            crate::render::LEARNED_CAP_REASON,
+        );
+    }
+
+    /// Stages one drain-proved file: pins through the held fd (the
+    /// `/proc/self/fd/N` open, never a pathname re-resolve), joins the
+    /// pre-arm inputs and the committed pins exactly like a witness
+    /// staging, records the loader note, files the first-run gap, and
+    /// owes the expedited frame.
+    fn stage_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
+        use std::os::unix::io::AsRawFd;
+        let identity = (candidate.dev, candidate.ino);
+        // The candidate owns its fd for this whole call, so the pin
+        // worker's `/proc/self/fd/N` open cannot dangle.
+        let open =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", candidate.file.as_raw_fd()));
+        let prior_objects: usize = self
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned().count())
+            .sum::<usize>()
+            .saturating_add(
+                self.prearm_input
+                    .iter()
+                    .map(|input| input.pins.pinned().count())
+                    .sum(),
+            );
+        let prior_bytes: u64 = self
+            .manifest_inputs
+            .iter()
+            .map(|input| input.pins.pinned_object_bytes())
+            .fold(0u64, |total, bytes| total.saturating_add(bytes))
+            .saturating_add(
+                self.prearm_input
+                    .iter()
+                    .map(|input| input.pins.pinned_object_bytes())
+                    .fold(0u64, |total, bytes| total.saturating_add(bytes)),
+            );
+        let request = crate::discovery::identity::PrearmPinRequest::open_with_display(
+            open,
+            candidate.display_path.clone(),
+        );
+        let pinning = match crate::discovery::identity::pin_prearm_requests_in_views_with_budget(
+            std::slice::from_ref(&request),
+            &[],
+            None,
+            prior_objects,
+            prior_bytes,
+            &mut self.budget,
+        ) {
+            Ok(pinning) => pinning,
+            Err(error) => {
+                // Whole-budget refusal: settle so later loads drop, and
+                // file the refusal loudly (the finite pre-arm reason,
+                // never silent); the file stays learnable through
+                // ordinary scans.
+                let skip = Skipped {
+                    subject: candidate.display_path.clone(),
+                    reason: format!("prearm object unavailable: {}", error.problems().join("; ")),
+                };
+                attribution::note(&skip);
+                self.counters.object_skips.push(skip);
+                self.note_learned_settled(identity);
+                self.learned_load_tally.remove(&identity);
+                return;
+            }
+        };
+        for skip in &pinning.skipped {
+            attribution::note(skip);
+            self.counters.object_skips.push(skip.clone());
+        }
+        if pinning.inputs.is_empty() {
+            self.note_learned_settled(identity);
+            self.learned_load_tally.remove(&identity);
+            return;
+        }
+        let loads = self
+            .learned_load_tally
+            .remove(&identity)
+            .map(|tally| tally.len() as u64)
+            .unwrap_or(0)
+            .max(1);
+        let note = render::FirstLoadedBy {
+            exe: candidate.loader_exe.clone(),
+            exe_unknown_reason: candidate.loader_unknown_reason,
+            pre_attach_loads: loads,
+        };
+        // Classify each pinned input against the current sets, before
+        // this staging joins them: a prearm duplicate (the witness or
+        // the operator staged the same key and spelling first) keeps
+        // its input and only gains the loader note; a scan-covered key
+        // needs nothing at all (its calls are already observed, so a
+        // first-run gap for it would mislead); only genuinely new keys
+        // stage, count, and file the gap. A replaced file (same path,
+        // new key) always stages as new.
+        let scan_covered = self.pinned.sweep_match_keys();
+        let mut fresh = 0usize;
+        {
+            let staged = self.prearm_input.get_or_insert_with(|| PrearmInput {
+                pins: PinnedObjects::empty(),
+                inputs: Vec::new(),
+            });
+            // Join the committed set too: live candidates clone it, so
+            // without this join the pieces below never resolve outside
+            // the initial build. Mirrors the witness staging join.
+            let committed = pinning.pins.clone();
+            let absorbed = staged.pins.absorb(pinning.pins);
+            attribution::note_all(&absorbed);
+            self.counters.object_skips.extend(absorbed);
+            let joined = self.pinned.absorb(committed);
+            attribution::note_all(&joined);
+            self.counters.object_skips.extend(joined);
+            for input in pinning.inputs {
+                if staged
+                    .inputs
+                    .iter()
+                    .any(|entry| entry.key == input.key && entry.path == input.path)
+                {
+                    // The witness or the operator staged this exact
+                    // key and spelling first: keep their input, and
+                    // only add the loader note the drain observed.
+                    self.learned_notes
+                        .entry(input.key)
+                        .or_insert_with(|| note.clone());
+                    if crate::run::capture_diagnostics_on() {
+                        eprintln!(
+                            "p11scope: learned provider {} already staged; loader note added",
+                            candidate.display_path
+                        );
+                    }
+                    continue;
+                }
+                if scan_covered.contains_key(&input.key) {
+                    if crate::run::capture_diagnostics_on() {
+                        eprintln!(
+                            "p11scope: learned provider {} already scan-covered; not staged",
+                            candidate.display_path
+                        );
+                    }
+                    continue;
+                }
+                staged.inputs.push(input.clone());
+                self.learned_notes.insert(input.key, note.clone());
+                fresh += 1;
+            }
+        }
+        self.note_learned_settled(identity);
+        if fresh == 0 {
+            return;
+        }
+        // The first runs are a named, counted gap ("learned after first
+        // use"), never silent: their calls ran before any probe watched
+        // this file. One fixed row per capture (marks dedupe); the file
+        // count rides in `learned_staged_files`, the per-file loads in
+        // the module's `first_loaded_by`. No path, pid, or executable:
+        // the render boundary passes only the finite row through.
+        self.mark_partial(
+            crate::render::LEARNED_SKIP_SUBJECT,
+            crate::render::LEARNED_FIRST_RUN_REASON,
+        );
+        self.learned_staged_files = self.learned_staged_files.saturating_add(fresh as u64);
+        self.plan_rebuild_stable = false;
+        self.learned_unapplied = true;
+        self.learned_frame_owed = true;
+        if crate::run::capture_diagnostics_on() {
+            let loader = note
+                .exe
+                .as_deref()
+                .or(note.exe_unknown_reason)
+                .unwrap_or("unknown loader");
+            eprintln!(
+                "p11scope: learned provider {} (first loaded by {loader}): {loads} earlier loads missed; attached for later runs",
+                candidate.display_path
+            );
+        }
     }
 
     fn process_loader_record(
@@ -26211,6 +26685,11 @@ impl Engine {
         if let Some(span) = diagnostic_span {
             span.finish_result(&result);
         }
+        if result.is_ok() {
+            // This refresh consumed any learned staging into its
+            // candidate; the shallow-idle latch it set is discharged.
+            self.learned_unapplied = false;
+        }
         result
     }
 
@@ -27679,6 +28158,8 @@ impl Engine {
             && self.pending_leader_exit_views.is_empty()
             && self.refresh_requested.is_empty()
             && self.capture_facts.staged.is_none()
+            && !self.learned_unapplied
+            && self.pending_learned.is_empty()
     }
 
     /// A framed discovery pass: the ring always drains, and any records,
@@ -33009,6 +33490,10 @@ impl Engine {
         owned_run: bool,
         release_ns: Option<u64>,
     ) {
+        // Shut down learning before assembly: the drain joins first so
+        // no send is in flight, everything it sent stages now, and a
+        // lost tail files loudly instead of vanishing silently.
+        self.shutdown_file_learning();
         // Generic attach/window assembly is independent of the optional
         // pre-arm watch transitions below: a capture without pre-arm
         // watches still gets its late-discovery windows assembled.
@@ -35377,6 +35862,31 @@ impl Engine {
             .retirement_intents
             .insert(view_id, RetirementCause::ExecRefresh);
         (engine, context)
+    }
+
+    pub(crate) fn learned_staged_files_for_test(&self) -> u64 {
+        self.learned_staged_files
+    }
+
+    pub(crate) fn learned_event_loss_for_test(&self) -> u64 {
+        self.learned_event_loss
+    }
+
+    pub(crate) fn learned_cap_skipped_for_test(&self) -> u64 {
+        self.learned_cap_skipped
+    }
+
+    pub(crate) fn learned_frame_owed_for_test(&self) -> bool {
+        self.learned_frame_owed
+    }
+
+    /// Installs a scripted drain channel: the twins drive production
+    /// staging without fanotify privilege.
+    pub(crate) fn set_learned_rx_for_test(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<crate::fanotify::LearnMsg>,
+    ) {
+        self.learned_rx = Some(rx);
     }
 
     pub(crate) fn terminal_batch_for_test(&self) -> Option<&TerminalBatch> {

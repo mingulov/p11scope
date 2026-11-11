@@ -636,7 +636,11 @@ impl PrearmState {
             let Some(attached_at) = attached_at else {
                 continue;
             };
-            let mapped = record.sources.contains(&"scan");
+            // A learned file counts as mapped whether or not a live scan
+            // saw it: the drain observed its short-lived load, so calls
+            // may have run before attach and the window is owed. Only an
+            // operator pre-arm no scan ever mapped stays undisclosed.
+            let mapped = record.sources.contains(&"scan") || record.first_loaded_by.is_some();
             let never_mapped_prearm = watch.is_some() && !mapped;
             let mut windows = Vec::new();
             let proof_matches = object.is_some_and(|object| {
@@ -985,6 +989,7 @@ mod tests {
             watch: None,
             attached_at_ns: None,
             unobserved_windows: None,
+            first_loaded_by: None,
         }
     }
 
@@ -1169,5 +1174,42 @@ mod tests {
         );
         assert_eq!(records[0].attached_at_ns, Some(Some(900)));
         assert_eq!(records[0].unobserved_windows, None);
+    }
+
+    #[test]
+    fn assembly_learned_never_mapped_module_discloses_late_window() {
+        let declared = key(7, 0x1000);
+        let mut plan = crate::plan::AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3)]);
+        plan.modules = vec![module(3, 7)];
+        let mut state = PrearmState::empty();
+        state.set_scope_start_ns(Some(50));
+        state
+            .watches
+            .insert(PinnedObjectId(7), watched(BTreeSet::from([declared])));
+        // A learned file counts as mapped: the drain saw its short-lived
+        // load, so the missed first use is a named window even though no
+        // live scan ever mapped it.
+        let mut learned = record(3, vec!["prearm"]);
+        learned.first_loaded_by = Some(crate::render::FirstLoadedBy {
+            exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            exe_unknown_reason: None,
+            pre_attach_loads: 1,
+        });
+        let mut records = vec![learned];
+        state.assemble(
+            &mut records,
+            &plan,
+            &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(records[0].attached_at_ns, Some(Some(900)));
+        assert_eq!(
+            records[0].unobserved_windows,
+            Some(vec![UnobservedWindow {
+                start_ns: 50,
+                end_ns: 900,
+                reason: UnobservedReason::LateDiscovery,
+            }]),
+        );
     }
 }

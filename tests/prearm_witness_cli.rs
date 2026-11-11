@@ -898,7 +898,11 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     // Brand-new provider file: random path, new inode, and a sha256 no
     // ambient system user shares (trailing bytes), so counts for its
     // sha can only come from this cell's tool runs.
-    let copy = dir.path().join(format!("libbrandnew-{}-{}.so", std::process::id(), "x7learn"));
+    let copy = dir.path().join(format!(
+        "libbrandnew-{}-{}.so",
+        std::process::id(),
+        "x7learn"
+    ));
     std::fs::copy(softhsm_path(), &copy).expect("copy provider");
     {
         use std::io::Write as _;
@@ -985,8 +989,7 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     );
     // The first run is a named miss, not silent.
     assert!(
-        text.contains("learned provider file")
-            && text.contains("learned after its first use"),
+        text.contains("learned provider file") && text.contains("learned after its first use"),
         "first run must be a named gap"
     );
 }

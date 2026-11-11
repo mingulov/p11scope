@@ -1030,6 +1030,25 @@ pub enum ModuleLayer {
     PreCopyUp,
 }
 
+/// Who first loaded a learned provider file: the drain's reuse-immune
+/// `/proc/<loader>/exe` read at first sight, or the finite reason it
+/// could not be read, plus how many distinct loader processes were
+/// observed opening the file before it staged. Exactly one of `exe` /
+/// `exe_unknown_reason` is non-null. Learned modules only; absent on
+/// the wire for every ordinary module. No PID number is carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FirstLoadedBy {
+    /// Loading program's executable path, lossy UTF-8 from the exe link.
+    pub exe: Option<String>,
+    /// Finite reason when `exe` is `None`, else `None`.
+    pub exe_unknown_reason: Option<&'static str>,
+    /// Distinct loader processes observed opening this file before it
+    /// was staged for attach (saturating). Loads between staging and
+    /// attach are covered by the unobserved window, not this count;
+    /// the count is not a bound on missed calls.
+    pub pre_attach_loads: u64,
+}
+
 /// One module discovery found, with everything known about how it was found.
 /// Same path caveat as `ObjectSummary`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1098,6 +1117,10 @@ pub struct DiscoveredModule {
     /// explicitly empty list reads as exact only with an R2-D1-6 proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unobserved_windows: Option<Vec<UnobservedWindow>>,
+    /// Who first loaded this file, learned modules only. `None` — and
+    /// absent on the wire — for every module no learn event staged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_loaded_by: Option<FirstLoadedBy>,
 }
 
 /// One ring's cross-check account: the kernel's submitted (`produced`)
@@ -1367,6 +1390,16 @@ pub struct Evidence {
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
     pub multi_rebuild_gaps: u64,
+    /// Provider files the fanotify drain staged (informational: the
+    /// learned first-run row carries the verdict, never this count).
+    #[serde(skip)]
+    pub learned_staged_files: u64,
+    /// Learning loss: queue overflows, lost drain tails, drain deaths.
+    #[serde(skip)]
+    pub learned_event_loss: u64,
+    /// Learned candidates refused by the per-capture file cap.
+    #[serde(skip)]
+    pub learned_cap_skipped: u64,
     /// 6.14 Option B extensive-mode split of the novel unmatched-exit
     /// subpopulation, `None` unless armed. Manually serialized beside
     /// the gap counts; never part of shares or verdicts.
@@ -1763,6 +1796,20 @@ pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
+/// Learned-file gaps file under this subject with four finite reasons
+/// (schema v3): the staged-file count rides in
+/// `evidence.learned_staged_files`, the loss in
+/// `evidence.learned_event_loss`, the cap excess in
+/// `evidence.learned_cap_skipped`, never in the reason.
+pub(crate) const LEARNED_SKIP_SUBJECT: &str = "learned provider file";
+pub(crate) const LEARNED_FIRST_RUN_REASON: &str =
+    "a provider file was learned after its first use; its earlier calls were not observed";
+pub(crate) const LEARNED_OVERFLOW_REASON: &str =
+    "file-learning events were lost; some provider files may not have been learned";
+pub(crate) const LEARNED_CAP_REASON: &str =
+    "file learning reached its 32-file per-capture cap; further provider files were not learned";
+pub(crate) const LEARNED_UNAVAILABLE_REASON: &str =
+    "file learning was unavailable; short-lived first loads of new provider files were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
@@ -1844,6 +1891,24 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         && matches!(
             s.reason.as_str(),
             RUN_TREE_SURVIVORS | RUN_TREE_DEGRADED | RUN_TREE_MEMBERSHIP_UNKNOWN
+        )
+    {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
+    // Learned-file gaps keep their subject and their four finite
+    // reasons; the counts ride in the `evidence.learned_*` keys.
+    // Anything else under the subject falls through to the fail-closed
+    // generic below instead of breaking the closed vocabulary.
+    if s.subject == LEARNED_SKIP_SUBJECT
+        && matches!(
+            s.reason.as_str(),
+            LEARNED_FIRST_RUN_REASON
+                | LEARNED_OVERFLOW_REASON
+                | LEARNED_CAP_REASON
+                | LEARNED_UNAVAILABLE_REASON
         )
     {
         return SkippedOut {
@@ -4066,6 +4131,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 {
                     if skip.name == DISCOVERY_SUBJECT {
                         subjects += 1;
+                    } else if skip.name == LEARNED_SKIP_SUBJECT {
+                        // Named by the histogram below with its count,
+                        // not as a skipped function.
                     } else {
                         functions += 1;
                     }
@@ -4092,6 +4160,10 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
+                    LEARNED_FIRST_RUN_REASON,
+                    LEARNED_OVERFLOW_REASON,
+                    LEARNED_CAP_REASON,
+                    LEARNED_UNAVAILABLE_REASON,
                 ] {
                     let hits = ev
                         .skipped
@@ -4972,6 +5044,12 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     );
     object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
     object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
+    object.insert(
+        "learned_staged_files".into(),
+        ev.learned_staged_files.into(),
+    );
+    object.insert("learned_event_loss".into(), ev.learned_event_loss.into());
+    object.insert("learned_cap_skipped".into(), ev.learned_cap_skipped.into());
     // 6.14 Option B: present if and only if extensive mode armed. The
     // label and scope ride every publication (Row C); the counts never
     // feed shares, verdicts, or completeness.
@@ -6022,6 +6100,9 @@ pub(crate) mod tests {
             object_capture: ObjectCaptureEvidence::for_build(false),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
+            learned_staged_files: 0,
+            learned_event_loss: 0,
+            learned_cap_skipped: 0,
             gap_exe_hints: None,
             target_exec_hints: None,
             instance_reload_not_excluded: None,
@@ -7172,6 +7253,7 @@ pub(crate) mod tests {
             watch: None,
             attached_at_ns: None,
             unobserved_windows: None,
+            first_loaded_by: None,
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),
                 entries: 68,
@@ -7182,6 +7264,92 @@ pub(crate) mod tests {
             }],
             interfaces: 1,
             skipped: vec![],
+        }
+    }
+
+    /// A learned module carries who loaded it first and how many loads ran
+    /// before staging: exe path plus the missed-load count, no pid, no
+    /// address, no file bytes.
+    #[test]
+    fn learned_module_carries_first_loader_without_addresses() {
+        let mut module = discovered_fixture();
+        module.first_loaded_by = Some(FirstLoadedBy {
+            exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            exe_unknown_reason: None,
+            pre_attach_loads: 1,
+        });
+        let json = serde_json::to_value(&module).unwrap();
+        assert_eq!(
+            json["first_loaded_by"]["exe"],
+            serde_json::json!("/usr/bin/pkcs11-tool")
+        );
+        assert_eq!(
+            json["first_loaded_by"]["pre_attach_loads"],
+            serde_json::json!(1)
+        );
+        assert!(json["first_loaded_by"]["exe_unknown_reason"].is_null());
+        let text = serde_json::to_string(&json["first_loaded_by"]).unwrap();
+        assert!(!text.contains("pid"), "{text}");
+        assert!(!text.contains("0x"), "{text}");
+        let mut unknown = discovered_fixture();
+        unknown.first_loaded_by = Some(FirstLoadedBy {
+            exe: None,
+            exe_unknown_reason: Some("loader exe link unreadable"),
+            pre_attach_loads: 2,
+        });
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json["first_loaded_by"]["exe"].is_null());
+        assert_eq!(
+            json["first_loaded_by"]["exe_unknown_reason"],
+            serde_json::json!("loader exe link unreadable")
+        );
+        let plain = discovered_fixture();
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("first_loaded_by")
+                .is_none(),
+            "ordinary modules carry no key"
+        );
+    }
+
+    /// Learned gaps project under their own subject with their four
+    /// finite reasons; anything else under the subject still redacts to
+    /// the generic discovery pair, and no path, pid, or executable ever
+    /// reaches output through the row.
+    #[test]
+    fn learned_gaps_project_named_without_target_data() {
+        for reason in [
+            LEARNED_FIRST_RUN_REASON,
+            LEARNED_OVERFLOW_REASON,
+            LEARNED_CAP_REASON,
+            LEARNED_UNAVAILABLE_REASON,
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: LEARNED_SKIP_SUBJECT.into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, LEARNED_SKIP_SUBJECT);
+            assert_eq!(projected.reason, *reason);
+        }
+        assert!(
+            LEARNED_CAP_REASON.contains("32"),
+            "the cap names which limit was hit: {LEARNED_CAP_REASON}"
+        );
+        for reason in [
+            "provider /opt/vendor/libx.so was first seen loaded by /usr/bin/pkcs11-tool; its earlier calls were not observed",
+            "file learning is unavailable: fanotify_init failed (os error 1)",
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: LEARNED_SKIP_SUBJECT.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{reason}");
+            assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+            let json = serde_json::to_string(&projected).unwrap();
+            assert!(!json.contains("/opt/vendor/libx.so"), "{json}");
+            assert!(!json.contains("pkcs11-tool"), "{json}");
+            assert!(!json.contains("os error"), "{json}");
         }
     }
 

@@ -101,9 +101,12 @@ unavailable}` skips: that verdict is true (newcomers the observer
 never admitted, or discovery deferred by racing exits), not noise.
 Owned-provider counts stay exact with zero loss counters; exact
 observation needs a quiescent scope. Initial loader arming also
-finishes after the `capturing:` line on captures the observer does not
-own, so calls made before a provider armed are not counted and the
-report carries that window as a counted gap.
+finishes after the `capturing:` line on `--system` and `--cgroup`
+captures the observer does not own; the report carries that window as
+a counted gap only when the post-ready completion added coverage (a
+new plan slot or a newly attached dynamic export hook), whose calls
+before it attached were not counted. `--pid` captures arm before the
+`capturing:` line and have no such window.
 
 ### Long captures go blind to new processes once the 262,144 identity budget is spent
 

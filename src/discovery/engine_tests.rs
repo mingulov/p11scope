@@ -20670,7 +20670,7 @@ fn two_view_selection_claims_retire_independently() {
             &mut PendingViewRetirements::new(),
         )
         .unwrap();
-    let (retire, complete, skipped) =
+    let (retire, complete, skipped, _) =
         engine.attach_refreshed_exports(second_view_id, &mut session, &mut true);
     assert!(!retire && complete && !skipped);
     let second_binding = *engine

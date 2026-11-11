@@ -9227,28 +9227,40 @@ fn capture_profile(
         }
         Scope::Cgroup { .. } | Scope::System => None,
     };
-    emit_capture_diagnostic(&capture_ready_line(
-        session.attached_probes(),
-        owned.is_some(),
-    ));
-    // Startup T3: finish the deferred initial arming (loader hooks,
-    // exports, backlog) now that the probes are live. Failures degrade
-    // to named PARTIAL gaps; a stop between views ends arming early the
-    // same way, and the loop's own stop path below still writes the
+    // Per-scope arming order: a `--pid` capture finishes the deferred
+    // initial arming (and the endpoint selection below) before the
+    // `capturing:` line, so a workload gated on that line is counted
+    // from its first call and no post-ready window exists. Wide scopes
+    // keep the completion after the ready line (the desktop startup
+    // win); their completion names a window gap only when it added
+    // coverage. Failures degrade to named PARTIAL gaps; a stop between
+    // views — Ctrl-C or the `--duration` deadline — ends arming early
+    // the same way, and the loop's own stop path below still writes the
     // report. Owned runs never pend, so this is a no-op there. The
     // cleanup pass can change the plan silently, so the semantic state
     // re-syncs exactly as on a plan-changed tick; nothing has been
     // observed yet, so the purge is empty.
-    engine.complete_initial_arming(&mut *session, &|| interrupted.interrupted())?;
+    let arm_before_ready = matches!(scope, Scope::Pid(_));
+    if !arm_before_ready {
+        emit_capture_diagnostic(&capture_ready_line(
+            session.attached_probes(),
+            owned.is_some(),
+        ));
+    }
+    engine.complete_initial_arming(&mut *session, &|| {
+        interrupted.interrupted() || duration.is_some_and(|limit| clock.elapsed() >= limit)
+    })?;
     state.sync_plan(engine.plan());
     // 6.15: resolve the CLI endpoint selection once, against the live
     // broad plan, before the loop, and open the K0 detail window over
     // a resolution with the selection-time broad read. The attempt —
     // resolved slot or named refusal — records into the additive
     // ledger the report composes; aggregate capture is untouched on
-    // every path. Startup T3 resolves it here, after the deferred
-    // initial arming completes, so it reads the post-completion plan
-    // exactly as when the start armed inline.
+    // every path. It resolves here, after the deferred initial arming
+    // completes, so it reads the post-completion plan exactly as when
+    // the start armed inline — and under `--pid` that is still before
+    // the `capturing:` line, so the detail window is open before a
+    // gated workload can call.
     let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
     let mut k0_window: Option<metrics::selected_detail_driver::K0Window> = None;
     if let Some(name) = select_endpoint
@@ -9292,6 +9304,12 @@ fn capture_profile(
                 owned.is_some(),
             ),
         );
+    }
+    if arm_before_ready {
+        emit_capture_diagnostic(&capture_ready_line(
+            session.attached_probes(),
+            owned.is_some(),
+        ));
     }
     // The loader-hook recount is gated on diagnostics and deferred past
     // the ready line (startup T2): the off path never touches the engine.
@@ -10815,26 +10833,42 @@ fn capture_trace(
         }
         Scope::Cgroup { .. } | Scope::System => None,
     };
-    emit_capture_diagnostic(&capture_ready_line(
-        session.attached_probes(),
-        owned.is_some(),
-    ));
-    // Startup T3: finish the deferred initial arming (loader hooks,
-    // exports, backlog) now that the probes are live. Failures degrade
-    // to named PARTIAL gaps; a stop between views ends arming early the
-    // same way, and the loop's own stop path below still writes the
-    // report. Owned runs never pend, so this is a no-op there. The
-    // cleanup pass can change the plan silently, so the semantic state
-    // and the tracer re-sync exactly as on a plan-changed tick; nothing
-    // has been observed yet, so the purge is empty.
-    engine.complete_initial_arming(&mut *session, &|| interrupted.interrupted())?;
+    // Per-scope arming order: a `--pid` capture finishes the deferred
+    // initial arming before the `capturing:` line, so a workload gated
+    // on that line is counted from its first call and no post-ready
+    // window exists. Wide scopes keep the completion after the ready
+    // line (the desktop startup win); their completion names a window
+    // gap only when it added coverage. Failures degrade to named
+    // PARTIAL gaps; a stop between views — Ctrl-C or the `--duration`
+    // deadline — ends arming early the same way, and the loop's own
+    // stop path below still writes the report. Owned runs never pend,
+    // so this is a no-op there. The cleanup pass can change the plan
+    // silently, so the semantic state and the tracer re-sync exactly as
+    // on a plan-changed tick; nothing has been observed yet, so the
+    // purge is empty.
+    let arm_before_ready = matches!(scope, Scope::Pid(_));
+    if !arm_before_ready {
+        emit_capture_diagnostic(&capture_ready_line(
+            session.attached_probes(),
+            owned.is_some(),
+        ));
+    }
+    engine.complete_initial_arming(&mut *session, &|| {
+        interrupted.interrupted() || duration.is_some_and(|limit| clock.elapsed() >= limit)
+    })?;
     state.sync_plan(engine.plan());
     tracer.sync_plan(engine.plan());
+    if arm_before_ready {
+        emit_capture_diagnostic(&capture_ready_line(
+            session.attached_probes(),
+            owned.is_some(),
+        ));
+    }
     // One header assembly point (capture, identity, zone, and the
     // unverified note when the plan watches any): no per-line marker
-    // repeats it. Startup T3 assembles it here, after the deferred
-    // initial arming completes, so the unverified note reads the
-    // post-completion plan exactly as when the start armed inline.
+    // repeats it. It assembles here, after the deferred initial arming
+    // completes, so the unverified note reads the post-completion plan
+    // exactly as when the start armed inline.
     let header = trace::header(policy, engine.plan());
     if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
         return Err(finish_capture_error(

@@ -18878,7 +18878,7 @@ impl Engine {
             required_complete = false;
         }
         if terminal_owner.is_none() && outcome.accepted() {
-            let (retire, dynamic_complete, _) = self.attach_export_work(
+            let (retire, dynamic_complete, _, _) = self.attach_export_work(
                 self.views[position].id(),
                 &collected.dynamic,
                 session,
@@ -20453,16 +20453,19 @@ impl Engine {
     }
 
     /// Attaches one view's dynamic export work. Returns
-    /// `(retire, complete, skipped)`: `skipped` is true only when closed
-    /// additions skipped unattached work, distinguishing it from an ordinary
-    /// open-tick failure, which leaves `complete` false with `skipped` false.
+    /// `(retire, complete, skipped, attached)`: `skipped` is true only when
+    /// closed additions skipped unattached work, distinguishing it from an
+    /// ordinary open-tick failure, which leaves `complete` false with
+    /// `skipped` false; `attached` is true when at least one hook newly
+    /// attached, so the startup completion can tell whether it added
+    /// coverage.
     fn attach_export_work(
         &mut self,
         view: ProcessViewId,
         work: &[DynamicExportWork],
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
-    ) -> (bool, bool, bool) {
+    ) -> (bool, bool, bool, bool) {
         let Some(pid) = self
             .views
             .iter()
@@ -20470,11 +20473,12 @@ impl Engine {
             .map(ProcessView::pid)
         else {
             lose_unperformed_dynamic_work(&mut self.timings, work);
-            return (true, false, false);
+            return (true, false, false, false);
         };
         let mut retire = false;
         let mut complete = true;
         let mut skipped = false;
+        let mut attached = false;
         for work in work {
             if work.already_attached {
                 continue;
@@ -20515,6 +20519,7 @@ impl Engine {
             );
             match attach {
                 GenerationMutation::Committed(Ok((added, completed))) => {
+                    attached |= added;
                     if let Some(mut binding) = work.selection_binding {
                         binding.attached = true;
                         self.selection_bindings.insert(binding.id, binding);
@@ -20539,7 +20544,8 @@ impl Engine {
                         "a fixed-purpose dynamic export attachment failed",
                     );
                 }
-                GenerationMutation::PostcheckFailed(Ok((_added, _))) => {
+                GenerationMutation::PostcheckFailed(Ok((added, _))) => {
+                    attached |= added;
                     if let Some(mut binding) = work.selection_binding {
                         binding.attached = true;
                         self.selection_bindings.insert(binding.id, binding);
@@ -20570,7 +20576,7 @@ impl Engine {
                 }
             }
         }
-        (retire, complete, skipped)
+        (retire, complete, skipped, attached)
     }
 
     fn attach_refreshed_exports(
@@ -20578,7 +20584,7 @@ impl Engine {
         view: ProcessViewId,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
-    ) -> (bool, bool, bool) {
+    ) -> (bool, bool, bool, bool) {
         let modules: Vec<_> = self
             .modules
             .iter()
@@ -20586,7 +20592,7 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         if modules.is_empty() {
-            return (false, true, false);
+            return (false, true, false, false);
         }
         let contexts: Vec<_> = self
             .loader_registry
@@ -20605,17 +20611,18 @@ impl Engine {
                 "live export hook",
                 "a refreshed provider had no unique attached loader context",
             );
-            return (false, false, false);
+            return (false, false, false, false);
         };
         let pinned = self.pinned.clone();
         let collected =
             self.collect_dynamic_export_work(*context, &modules, &pinned, session, false, &[]);
-        let (retire, complete, skipped) =
+        let (retire, complete, skipped, attached) =
             self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
         (
             retire,
             complete && collected.required_seed_complete,
             skipped,
+            attached,
         )
     }
 
@@ -20627,12 +20634,12 @@ impl Engine {
     fn note_export_attach_outcome(
         &mut self,
         view: ProcessViewId,
-        outcome: (bool, bool, bool),
+        outcome: (bool, bool, bool, bool),
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
         incomplete: &mut BTreeSet<ProcessViewId>,
     ) {
-        let (retire, complete, skipped) = outcome;
+        let (retire, complete, skipped, _) = outcome;
         if retire {
             self.queue_stale_views(&[view].into_iter().collect(), pending_views);
         }
@@ -20664,17 +20671,21 @@ impl Engine {
         }
     }
 
+    /// Attaches every initial view's dynamic exports; returns whether any
+    /// hook newly attached, i.e. whether this pass added coverage.
     fn attach_initial_exports(
         &mut self,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
-    ) {
+    ) -> bool {
         let views: Vec<_> = self.views.iter().map(ProcessView::id).collect();
         let mut export_incomplete = BTreeSet::new();
+        let mut attached_any = false;
         for view in views {
             let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
+            attached_any |= outcome.3;
             self.note_export_attach_outcome(
                 view,
                 outcome,
@@ -20690,6 +20701,7 @@ impl Engine {
         if !*additions_allowed {
             self.request_skipped_export_views(&export_incomplete);
         }
+        attached_any
     }
 
     /// True only when `/proc/PID/exe` provably has no target — `read_link`
@@ -33753,20 +33765,24 @@ impl Engine {
         Ok(session)
     }
 
-    /// Startup T3: finishes a non-owned start after the ready line. Runs
-    /// exactly the moved start block — initial loader arming, the initial
-    /// exports attach, the second discovery staging, the backlog cleanup
-    /// pass and the first publication — with three semantic conversions: a
-    /// fatal arm error or any other `Err` from the block degrades to a
-    /// named `initial loader arming` PARTIAL gap instead of failing the
-    /// capture, a stop between views ends the arming early with the
-    /// unvisited remainder as a counted gap, and a clean completion names
-    /// its post-ready arming window as a counted gap when the window
-    /// measures above zero milliseconds and at least one loader arm ran
-    /// in it. No-op unless a non-owned start pended (owned starts arm
-    /// inline and never pend). The capture loops call this between the
-    /// ready line and the first tick, then re-sync their plan consumers:
-    /// the cleanup pass can change the plan silently, with no plan-changed
+    /// Startup T3: finishes a non-owned start. Wide scopes (`--system`,
+    /// `--cgroup`) call this after the ready line; `--pid` calls it before
+    /// the ready line, so it has no post-ready window. Runs exactly the
+    /// moved start block — initial loader arming, the initial exports
+    /// attach, the second discovery staging, the backlog cleanup pass and
+    /// the first publication — with three semantic conversions: a fatal
+    /// arm error or any other `Err` from the block degrades to a named
+    /// `initial loader arming` PARTIAL gap instead of failing the capture,
+    /// a stop between views ends the arming early with the unvisited
+    /// remainder as a counted gap, and a clean wide-scope completion
+    /// names its post-ready arming window as a counted gap only when the
+    /// window measures above zero milliseconds and the completion added
+    /// coverage (a new plan slot or a newly attached dynamic export
+    /// hook), whose calls before it attached were not counted. No-op
+    /// unless a non-owned start pended (owned starts arm inline and
+    /// never pend). The capture loops call this around the ready line
+    /// and before the first tick, then re-sync their plan consumers: the
+    /// cleanup pass can change the plan silently, with no plan-changed
     /// tick to carry it.
     pub(crate) fn complete_initial_arming(
         &mut self,
@@ -33783,6 +33799,15 @@ impl Engine {
             (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
             _ => None,
         };
+        // Coverage added by the completion is judged against the plan as
+        // it stands now: a slot appearing only during the completion was
+        // not counting calls before it appeared.
+        let slots_before: BTreeSet<(u32, PinnedObjectId, u64)> = self
+            .plan
+            .slots
+            .iter()
+            .map(|slot| (slot.index, slot.object, slot.file_offset))
+            .collect();
         let mut additions_allowed = true;
         let mut records = Vec::new();
         let mut pending_views = PendingViewRetirements::new();
@@ -33819,17 +33844,21 @@ impl Engine {
         // the outcome afterwards.
         let arm_failed = fatal.is_some();
         // The arming window ends when the export attach settles: after that
-        // every initial provider's hooks are live. Stays `None` on the
-        // fatal path, which files its own gap instead.
+        // every initial provider's hooks are live. The discovery staging
+        // below is bookkeeping a provider call cannot race, so it stays
+        // outside the window. Stays `None` on the fatal path, which files
+        // its own gap instead.
         let mut armed_ns: Option<u64> = None;
+        let mut exports_attached = false;
         if fatal.is_none() {
             let exports_start = crate::attach::monotonic_ns();
-            self.attach_initial_exports(
+            exports_attached = self.attach_initial_exports(
                 &mut *session,
                 &mut additions_allowed,
                 &mut pending_views,
                 &mut closure,
             );
+            armed_ns = crate::attach::monotonic_ns();
             // Stage what the export attach let accumulate; the first
             // batch applies it in ring order (RB-2). Anything past the
             // shared allowance waits in the ring for the next staging
@@ -33838,7 +33867,6 @@ impl Engine {
             if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
                 self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
             }
-            armed_ns = crate::attach::monotonic_ns();
             // No stage span here: the export attach records its own
             // Attach spans inside, and stages never overlap.
             if crate::run::capture_diagnostics_on() {
@@ -33852,40 +33880,6 @@ impl Engine {
             }
         } else if let Some(error) = fatal {
             self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
-        }
-        // Startup B4: a clean post-ready completion names its arming window
-        // as a counted gap — calls into providers armed in that window
-        // before their arming completed were not counted. Filed only when
-        // the window measures above zero milliseconds and at least one
-        // loader arm ran in it; a stop or a staging failure already filed
-        // this subject above, so the window stays unfiled then (a later
-        // backlog or publish failure still files its own distinct entry).
-        if !arm_failed {
-            #[cfg(test)]
-            let window_ms = self
-                .initial_arming_window_ms_for_test
-                .or_else(|| ms(arming_start, armed_ns))
-                .filter(|window| *window > 0);
-            #[cfg(not(test))]
-            let window_ms = ms(arming_start, armed_ns).filter(|window| *window > 0);
-            if arming_counts.attempted > 0
-                && let Some(window_ms) = window_ms
-                && !self
-                    .counters
-                    .object_skips
-                    .iter()
-                    .any(|skip| skip.subject == INITIAL_ARMING_SUBJECT)
-            {
-                self.mark_partial(
-                    INITIAL_ARMING_SUBJECT,
-                    &format!(
-                        "initial loader arming finished {window_ms}ms after the capturing: line; calls made before a provider armed were not counted"
-                    ),
-                );
-                if crate::run::capture_diagnostics_on() {
-                    eprintln!("{}", Self::startup_post_ready_window_line(window_ms));
-                }
-            }
         }
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
@@ -33907,6 +33901,48 @@ impl Engine {
             &mut closure,
         ) {
             self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
+        }
+        // Startup B4: a clean wide-scope post-ready completion names its
+        // arming window as a counted gap only when the completion added
+        // coverage — a plan slot that appeared during it or a dynamic
+        // export hook that attached in it — because calls reaching that
+        // coverage before it attached were not counted. A completion that
+        // added nothing (the common quiet case: every provider already
+        // counted from the start) files no gap. Pid scope completes
+        // before the ready line, so it has no window. Judged here, after
+        // the backlog, so slots the cleanup pass added count too; a stop,
+        // staging or backlog failure already filed this subject above, so
+        // the window stays unfiled then.
+        if !arm_failed && !matches!(self.scope, Scope::Pid(_)) {
+            #[cfg(test)]
+            let window_ms = self
+                .initial_arming_window_ms_for_test
+                .or_else(|| ms(arming_start, armed_ns))
+                .filter(|window| *window > 0);
+            #[cfg(not(test))]
+            let window_ms = ms(arming_start, armed_ns).filter(|window| *window > 0);
+            let slot_added =
+                self.plan.slots.iter().any(|slot| {
+                    !slots_before.contains(&(slot.index, slot.object, slot.file_offset))
+                });
+            if (exports_attached || slot_added)
+                && let Some(window_ms) = window_ms
+                && !self
+                    .counters
+                    .object_skips
+                    .iter()
+                    .any(|skip| skip.subject == INITIAL_ARMING_SUBJECT)
+            {
+                self.mark_partial(
+                    INITIAL_ARMING_SUBJECT,
+                    &format!(
+                        "initial loader arming finished {window_ms}ms after the capturing: line; calls made before a provider armed were not counted"
+                    ),
+                );
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!("{}", Self::startup_post_ready_window_line(window_ms));
+                }
+            }
         }
         record_object_skips(
             &mut self.plan,

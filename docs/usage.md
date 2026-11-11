@@ -421,9 +421,14 @@ detail — per-second cleanup progress, the detach estimate, per-pass lines
 after the first, per-PID chatter, loader readiness, clean long-run
 reports, the `p11scope: discovery:` completion summary, per-module
 repeats — prints under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
-On captures the observer does not own, initial loader arming finishes
-after the `capturing:` line, so calls made before a provider armed are
-not counted and the report carries that window as a counted gap.
+On `--system` and `--cgroup` captures the observer does not own, initial
+loader arming finishes after the `capturing:` line. The report carries
+that window as a counted gap only when the post-ready completion added
+coverage — a new plan slot or a newly attached dynamic export hook —
+because calls reaching that coverage before it attached were not
+counted; a completion that added no coverage files no gap. A `--pid`
+capture finishes initial arming, and any `--select-endpoint` detail
+window, before the `capturing:` line, so it has no such window.
 `run` on a terminal never clears the screen: the final frame prints once
 after the command exits.
 

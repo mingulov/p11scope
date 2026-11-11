@@ -33062,12 +33062,18 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
-        self.stage_timings.span(
-            crate::timing::StageKind::Attach,
-            "session_start",
-            session_start_ns,
-            crate::attach::monotonic_ns(),
-        );
+        // Session-start wall is dominated by BPF program loading, so it is
+        // named by the segment marker only: charging it to a stage span
+        // would mis-attribute load time to the discovery-batch totals.
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "{}",
+                Self::startup_segment_line(
+                    "session_start",
+                    ms(session_start_ns, crate::attach::monotonic_ns())
+                )
+            );
+        }
         if let Some(budget) = counter_budget
             && let Err(error) = self.restore_counters_policy_after_retain(budget)
         {

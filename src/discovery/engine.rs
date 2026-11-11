@@ -26865,10 +26865,35 @@ impl Engine {
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                // Completeness is intentionally unused here: a new view has
+                // Completeness is otherwise unused here: a new view has
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
-                Ok((modules, pins, _complete)) => {
+                Ok((modules, pins, complete)) => {
+                    // Provider-proven slot priority: a complete scan that
+                    // proves provider-freedom must not consume the last
+                    // free slot while later newcomers still wait in this
+                    // window — the freed slot reaches them in the same
+                    // tick instead of refilling with whichever ambient
+                    // process attempted first. Completes like the
+                    // probationary capacity path; the pid re-enters via
+                    // enumeration as a rotation candidate when slots are
+                    // no longer contested. Partial scans prove nothing
+                    // and keep the ordinary admission above.
+                    let fills_last_slot = self.inventory.is_none()
+                        && max_scan_pids > 0
+                        && self.views.len() + new_views.len() + 1 >= max_scan_pids;
+                    if complete
+                        && modules.is_empty()
+                        && fills_last_slot
+                        && !unprocessed.as_slice().is_empty()
+                    {
+                        self.release_view_id(view.id());
+                        self.newcomer_first_seen.remove(&pid);
+                        self.newcomer_counted.remove(&pid);
+                        self.probationary_completions =
+                            self.probationary_completions.saturating_add(1);
+                        continue;
+                    }
                     self.note_scan_observed(view.id(), view.view_admission(), &modules);
                     self.scheduler.note_admitted(pid);
                     new_views.push((view, modules, pins));

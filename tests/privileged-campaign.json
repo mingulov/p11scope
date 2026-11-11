@@ -145,6 +145,8 @@
     "discovery::pause::tests::privileged_pause_default_flags_count_fast_child_exact_lp64",
     "discovery::pause::tests::privileged_pause_sigint_during_hold_still_writes_report_lp64",
     "discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executable",
+    "fanotify::tests::learn_live_drain_reports_opened_provider",
+    "fanotify::tests::learn_live_drain_reports_opened_provider_across_mount_ns",
     "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",

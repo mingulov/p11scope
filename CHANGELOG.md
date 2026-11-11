@@ -95,6 +95,9 @@ versioned separately and are opaque, exact dispatch keys.
   instead of minutes (about 3.6 hours at 20 new processes/s). Tickets
   are still never reused; a spent budget is still disclosed with counts
   on every surface (`identity_budget_exhausted`, `identity_unavailable`).
+  Packing trade-off: the identity cookie now packs 262,144-valued tickets
+  with 44-bit incarnations (was 16,384-valued tickets with 48-bit
+  incarnations); 2^44 incarnations per ticket is not reachable in practice.
 - The semantic-state key budget is **262,144 keys per capture** (was
   16,384): churn-heavy nodes keep per-pod attribution (a kind churn
   cell admitted only 98 of 451 pods before). Live-state keys (open

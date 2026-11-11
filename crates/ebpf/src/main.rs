@@ -5061,9 +5061,11 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
             // owned. Copy it before discard; the unfilled object tail is
             // never read, and the original failing stamps remain unchanged.
             || {
-                EVENTS
-                    .output::<EventRecord>(unsafe { &(*raw).base }, 0)
-                    .is_ok()
+                let ok = EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok();
+                if ok {
+                    bump_produced(PRODUCED_EVENTS);
+                }
+                ok
             },
         );
         entry.discard(0);

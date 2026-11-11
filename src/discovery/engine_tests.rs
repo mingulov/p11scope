@@ -2554,6 +2554,56 @@ fn pin_moves_force_a_full_rebuild_on_the_next_tick() {
     );
 }
 
+fn queued_record_with_case(case_id: u8) -> QueuedDiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.case_id = case_id;
+    QueuedDiscoveryRecord {
+        record,
+        terminal_owner: None,
+        terminal_exports: Vec::new(),
+    }
+}
+
+/// Restoring a backlog quantum to the head of the pending queue must keep
+/// exact FIFO order: the restored prefix first, in its own order, then the
+/// records that were already waiting. The one-move prepend must agree
+/// with inserting the prefix one record at a time at position 0.
+#[test]
+fn prepend_queued_records_keeps_exact_fifo_order() {
+    for (front_cases, queue_cases) in [
+        (vec![], vec![]),
+        (vec![], vec![10, 11]),
+        (vec![1, 2, 3], vec![]),
+        (vec![1], vec![10]),
+        (vec![1, 2, 3], vec![10, 11, 12, 13]),
+    ] {
+        let front: Vec<QueuedDiscoveryRecord> = front_cases
+            .iter()
+            .map(|case| queued_record_with_case(*case))
+            .collect();
+        let mut naive: Vec<QueuedDiscoveryRecord> = queue_cases
+            .iter()
+            .map(|case| queued_record_with_case(*case))
+            .collect();
+        front_cases
+            .iter()
+            .rev()
+            .for_each(|case| naive.insert(0, queued_record_with_case(*case)));
+
+        let mut queue: Vec<QueuedDiscoveryRecord> = queue_cases
+            .iter()
+            .map(|case| queued_record_with_case(*case))
+            .collect();
+        prepend_queued_records(&mut queue, front);
+
+        assert_eq!(
+            queue.iter().map(|q| q.record.case_id).collect::<Vec<_>>(),
+            naive.iter().map(|q| q.record.case_id).collect::<Vec<_>>(),
+            "front {front_cases:?} ahead of queue {queue_cases:?}"
+        );
+    }
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

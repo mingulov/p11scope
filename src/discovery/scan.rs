@@ -10,7 +10,9 @@
 use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, file_inodes_are_unique, pin_of};
+use crate::discovery::identity::{
+    ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique, pin_of,
+};
 #[cfg(test)]
 use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
 use crate::discovery::overlay_witness::{
@@ -4607,6 +4609,54 @@ fn opened_key_mismatch(actual: ObjectKey, expected: ObjectKey) -> String {
     )
 }
 
+/// What one range's `map_files` identity proves against the held
+/// file: the per-range verdict shared by the scan-side
+/// [`mapped_file_guard`] and the pin-side `map_files` fallback, so the
+/// two can never diverge again on witness, stranger or
+/// best-effort-skip handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeProofVerdict {
+    /// The range is the held file and needs no witness.
+    Proven,
+    /// An equal caller range that still needs the original-file
+    /// witness before it may join.
+    NeedsWitness,
+    /// The range is proven another file.
+    Stranger(FileIdentity),
+    /// The range identity was unreadable (or the capability lacking):
+    /// best effort keeps the path open and key match as the proof.
+    Skipped,
+}
+
+/// One range's verdict against the held file: equality proves, a
+/// proven different file is a stranger, and an unreadable range — or
+/// a refused capability, named once before the proof falls back to
+/// mountinfo — skips best-effort. An equal caller range on overlayfs
+/// (or an unproven filesystem) still needs the original-file witness,
+/// since equality alone cannot tell a stale lower mapping from the
+/// fresh upper file.
+pub(crate) fn range_proof_verdict(
+    held: &MappedFile,
+    entry: &MapEntry,
+    mapped: &std::io::Result<FileIdentity>,
+) -> RangeProofVerdict {
+    match mapped {
+        Ok(identity) if *identity == held.identity => {
+            if is_caller_range(entry) && original_file_witness_required(held, identity) {
+                RangeProofVerdict::NeedsWitness
+            } else {
+                RangeProofVerdict::Proven
+            }
+        }
+        Ok(identity) => RangeProofVerdict::Stranger(*identity),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+            crate::caps::note_lacking(&crate::caps::MAP_FILES_BITS);
+            RangeProofVerdict::Skipped
+        }
+        Err(_) => RangeProofVerdict::Skipped,
+    }
+}
+
 /// Physical proof that the opened path is the mapped file. A maps key is
 /// not one file — on btrfs every subvolume renders the filesystem-wide
 /// device while inode numbers repeat across subvolumes — so
@@ -4658,16 +4708,14 @@ pub(crate) fn mapped_file_guard(
         ));
     }
     for (entry, mapped) in group.iter().zip(identities) {
-        match mapped {
-            Ok(identity) if identity == expected => {
-                if unproven.is_none()
-                    && is_caller_range(entry)
-                    && original_file_witness_required(&held, &identity)
-                {
+        match range_proof_verdict(&held, entry, &mapped) {
+            RangeProofVerdict::Proven | RangeProofVerdict::Skipped => {}
+            RangeProofVerdict::NeedsWitness => {
+                if unproven.is_none() {
                     unproven = Some((entry.start, entry.end));
                 }
             }
-            Ok(identity) => {
+            RangeProofVerdict::Stranger(identity) => {
                 return Err(format!(
                     "mapped range {:x}-{:x} is another file (st_dev {} st_ino {}) than the opened \
                      object (st_dev {} st_ino {}): maps key {}:{} inode {} names more than one file",
@@ -4682,13 +4730,6 @@ pub(crate) fn mapped_file_guard(
                     key.inode
                 ));
             }
-            // An access refusal here is the map_files proof falling
-            // back to mountinfo: name the capability once, then skip
-            // the entry exactly as before.
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
-                crate::caps::note_lacking(&crate::caps::MAP_FILES_BITS);
-            }
-            Err(_) => {}
         }
     }
     Ok(match unproven {

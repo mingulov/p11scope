@@ -27,14 +27,16 @@ use p11scope_manifest::identity::{
     mapping_file_key_in_mountinfo, open_object, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
-use p11scope_manifest::maps::{Device, ObjectKey};
+use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
-    read_mountinfo, standard_function_names,
+    read_maps_or_refuse, read_mountinfo, standard_function_names,
 };
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
-use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
+use crate::process::{
+    MappedOpenError, MountNamespaceId, MountTableCache, ProcessView, ProcessViewId,
+};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
 };
@@ -8378,6 +8380,343 @@ pub fn reconcile_scanned_modules(
     (reconciled, collapsed, lost)
 }
 
+/// Whether a pin path-open failure retries through the VMA's own
+/// `map_files` link: an unreachable root (`ESRCH` under a live
+/// generation pin — a sandboxed process jailed in a dead helper's
+/// `/proc/<pid>/fdinfo`, not an exit), or a file the retained root
+/// cannot see (`ENOENT` under a foreign root — a chrooted daemon whose
+/// foreign mount namespace correctly refuses the host fallback, not an
+/// exit either). `ENOENT` under the observer's own root is a genuinely
+/// missing file and never retries, and neither does any other errno.
+fn pin_map_files_fallback_triggered(failure: &MappedOpenError) -> bool {
+    failure.errno == Some(libc::ESRCH)
+        || (failure.errno == Some(libc::ENOENT) && failure.foreign_target_root.is_some())
+}
+
+/// How the pin-side `map_files` open-and-prove failed, before the caller
+/// maps it to its own gap vocabulary: an attempt that never produced
+/// a provable file (the open, the metadata, or either identity
+/// unreadable) keeps the caller's own failure record, while a served
+/// file refused on its own evidence (non-regular, over the shared
+/// size cap, or a proven stranger) refuses with its own reason. The
+/// `Unproven` detail is the `(map_files fallback: …)` text.
+#[derive(Debug, PartialEq, Eq)]
+enum PinMapFilesRefusal {
+    Unproven(String),
+    Refused(String),
+}
+
+/// The live VMA ranges of `entries` that name `raw`: same maps key and
+/// same kernel-rendered pathname bytes, in maps order. Byte-exact on
+/// purpose: a ` (deleted)` rendering never matches a pinned path
+/// (replaced files keep their own route), and the open below re-reads
+/// under the view's generation pin, so a racing VMA fails closed there
+/// instead of joining under a stale key.
+fn pin_fallback_ranges<'a>(entries: &'a [MapEntry], raw: &RawObjectInstance) -> Vec<&'a MapEntry> {
+    entries
+        .iter()
+        .filter(|entry| {
+            ObjectKey::of(entry) == raw.key
+                && entry.raw_path.as_deref() == Some(raw.path.as_bytes())
+        })
+        .collect()
+}
+
+/// The complete same-key proof set for the pin-side `map_files`
+/// fallback: every fresh range under the maps key, whatever pathname
+/// spelling it carries — the scan's candidate group for this key, not
+/// just the range the exact-path selection opened. A same-key range at
+/// another pathname with a different physical identity must refuse
+/// this pin (a conflicting alias introduced after the scan), exactly
+/// as the scan-side guard refuses it.
+fn pin_proof_ranges<'a>(entries: &'a [MapEntry], raw: &RawObjectInstance) -> Vec<&'a MapEntry> {
+    entries
+        .iter()
+        .filter(|entry| ObjectKey::of(entry) == raw.key)
+        .collect()
+}
+
+/// The pin-side proof over the complete same-key group: the opened
+/// range (at `opened`) must be the held file — the first
+/// held-versus-range inequality refusal — and then every proof range,
+/// the opened one included, runs the scan's per-range verdict, so a
+/// proven stranger refuses and a caller range whose equality needs the
+/// original-file witness stays unproven (the pin cannot spend the
+/// scan's per-scan witness). Reads nothing: the caller supplies the
+/// fresh `map_files` identities it read under the generation pin, so
+/// unit tests script every shape deterministically.
+fn pin_proof_outcome(
+    held_file: &MappedFile,
+    proof: &[(&MapEntry, std::io::Result<FileIdentity>)],
+    opened: usize,
+    raw: &RawObjectInstance,
+) -> Result<(), PinMapFilesRefusal> {
+    use crate::discovery::scan::RangeProofVerdict;
+    use PinMapFilesRefusal::{Refused, Unproven};
+    let Some((first, ranged)) = proof.get(opened) else {
+        return Err(Unproven("the group has no VMA range to open".into()));
+    };
+    let ranged = match ranged {
+        Ok(ranged) => ranged,
+        Err(error) => {
+            return Err(Unproven(format!("VMA identity unreadable: {error}")));
+        }
+    };
+    if held_file.identity != *ranged {
+        return Err(Refused(format!(
+            "map_files range {:x}-{:x} is another file (st_dev {} st_ino {}) than the \
+             opened VMA file (st_dev {} st_ino {}): maps key {}:{} inode {} was refused \
+             without a proven file",
+            first.start,
+            first.end,
+            ranged.dev,
+            ranged.ino,
+            held_file.identity.dev,
+            held_file.identity.ino,
+            raw.key.device.major,
+            raw.key.device.minor,
+            raw.key.inode
+        )));
+    }
+    for (entry, mapped) in proof {
+        match crate::discovery::scan::range_proof_verdict(held_file, entry, mapped) {
+            RangeProofVerdict::Proven | RangeProofVerdict::Skipped => {}
+            RangeProofVerdict::NeedsWitness => {
+                return Err(Unproven(format!(
+                    "map_files range {:x}-{:x} needs the original-file witness; the pin cannot spend it",
+                    entry.start, entry.end
+                )));
+            }
+            RangeProofVerdict::Stranger(identity) => {
+                return Err(Refused(format!(
+                    "mapped range {:x}-{:x} is another file (st_dev {} st_ino {}) than the opened \
+                     object (st_dev {} st_ino {}): maps key {}:{} inode {} names more than one file",
+                    entry.start,
+                    entry.end,
+                    identity.dev,
+                    identity.ino,
+                    held_file.identity.dev,
+                    held_file.identity.ino,
+                    raw.key.device.major,
+                    raw.key.device.minor,
+                    raw.key.inode
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One assembled pin proof: every same-key range in maps order with
+/// its fresh `map_files` identity read.
+type PinProof<'a> = Vec<(&'a MapEntry, std::io::Result<FileIdentity>)>;
+
+/// Splice the opened range's already-read identity into its maps-order
+/// position among the sibling proofs: the fallback reads the opened
+/// VMA range first (it must open before proving), then every other
+/// same-key range, and the proof must run in maps order with the
+/// opened index known. Verifies the threading instead of trusting it:
+/// `opened` must address `first` in `group`, and `siblings` must be
+/// exactly the group's other ranges in order (pointer identity on
+/// both sides). `None` fails the caller closed to `Unproven` — a
+/// racing VMA that left its group, never a misordered proof.
+fn pin_proof_assembly<'a>(
+    group: &[&'a MapEntry],
+    opened: usize,
+    first: &'a MapEntry,
+    ranged: std::io::Result<FileIdentity>,
+    siblings: PinProof<'a>,
+) -> Option<(PinProof<'a>, usize)> {
+    if !group
+        .get(opened)
+        .is_some_and(|entry| std::ptr::eq(*entry, first))
+    {
+        return None;
+    }
+    if siblings.len() != group.len().saturating_sub(1) {
+        return None;
+    }
+    let mut rest = siblings.iter();
+    for (index, entry) in group.iter().enumerate() {
+        if index == opened {
+            continue;
+        }
+        match rest.next() {
+            Some((sibling, _)) if std::ptr::eq(*sibling, *entry) => {}
+            _ => return None,
+        }
+    }
+    let mut proof = siblings;
+    proof.insert(opened, (first, ranged));
+    Some((proof, opened))
+}
+
+/// Open the pinned object's VMA file through `/proc/<pid>/map_files`
+/// when the target root cannot serve it (see
+/// [`pin_map_files_fallback_triggered`]): the pin twin of the scan-side
+/// join, so a view the scan examined through the VMA's own link stays
+/// pinnable instead of poisoning its whole raw-key group. The served fd
+/// is proven like-for-like (its self-mapped `vm_file` against the
+/// range's `map_files` stat — kernel identities on both sides, never
+/// `fstat` vs maps), every same-key range must prove the same file, and
+/// the served file runs the ordinary mount-table guard — or, under a
+/// kernel-empty table that makes resolution impossible rather than
+/// failed, the kernel-rendering comparison against the maps key. Only a
+/// fully proven file joins; anything else keeps a named gap, and a view
+/// that proves nothing still refuses exactly as before.
+fn pin_map_files_fallback(
+    view: &ProcessView,
+    raw: &RawObjectInstance,
+    mounts: &mut MountTableCache,
+    pinned_identity: ReadPinnedIdentity<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(std::fs::File, MappingFileKey), PinMapFilesRefusal> {
+    use PinMapFilesRefusal::{Refused, Unproven};
+    let maps = view
+        .with_filesystem(budget, |filesystem, _| {
+            filesystem.open_maps().map_err(|error| error.to_string())
+        })
+        .map_err(Unproven)?;
+    let entries =
+        read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns).map_err(Unproven)?;
+    let ranges = pin_fallback_ranges(&entries, raw);
+    let Some(first) = ranges.first() else {
+        return Err(Unproven("the group has no VMA range to open".into()));
+    };
+    let (start, end) = (first.start, first.end);
+    let pid = view.pid();
+    let file = view
+        .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/map_files/{start:x}-{end:x}")))
+        .map_err(Unproven)?
+        .map_err(|error| Unproven(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Unproven(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(Refused(format!(
+            "map_files range {start:x}-{end:x} is not a regular file; refused"
+        )));
+    }
+    // The shared object size cap applies to the served file exactly as
+    // to a root-opened one: same limit, same wording, never lowered.
+    let size = metadata.len();
+    let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
+    if size > limit {
+        return Err(Refused(format!("object is {size} bytes; limit is {limit}")));
+    }
+    // The like-for-like proof, read fresh on both sides: the served
+    // fd's self-mapped `vm_file` against this range's `map_files`
+    // stat. Only a proven same file joins.
+    let held_file = budget
+        .retained_mapped_identity(&file)
+        .or_else(|| pinned_identity(&file).ok());
+    let Some(held_file) = held_file else {
+        return Err(Unproven(
+            "the opened file has no readable vm_file identity".into(),
+        ));
+    };
+    let ranged = view
+        .run_while_same(|| map_files_identity(pid, start, end))
+        .map_err(Unproven)?;
+    // Every same-key range must prove the same file (the scan-side
+    // `mapped_file_guard` parity): one btrfs-clone range among VMA
+    // siblings refuses the join. Best effort by design: without the
+    // privilege, or for a range unmapped since, the path open and key
+    // match stay the proof; only a proven different file refuses. A
+    // range that needs the original-file witness stays unproven: the pin
+    // cannot spend the scan's per-scan witness, so that shape still
+    // refuses exactly as before. [`pin_proof_outcome`] runs the verdict
+    // over the identities read here.
+    //
+    // The proof set is the entire fresh same-key group
+    // ([`pin_proof_ranges`]), while the exact-path `first` above stays
+    // the range to open: a same-key range at another pathname with a
+    // different physical identity refuses this pin, exactly as the
+    // scan-side guard refuses it.
+    let group = pin_proof_ranges(&entries, raw);
+    let Some(opened) = group.iter().position(|entry| std::ptr::eq(*entry, *first)) else {
+        return Err(Unproven("the opened VMA range left its maps group".into()));
+    };
+    let mut siblings = Vec::with_capacity(group.len().saturating_sub(1));
+    for (index, entry) in group.iter().enumerate() {
+        if index == opened {
+            continue;
+        }
+        let identity = view
+            .run_while_same(|| map_files_identity(pid, entry.start, entry.end))
+            .map_err(Unproven)?;
+        siblings.push((*entry, identity));
+    }
+    let Some((proof, opened)) = pin_proof_assembly(&group, opened, first, ranged, siblings) else {
+        return Err(Unproven("the opened VMA range left its maps group".into()));
+    };
+    pin_proof_outcome(&held_file, &proof, opened, raw)?;
+    // The mount-table guard below resolves through the target's mount
+    // table; a sandboxed target's table reads kernel-empty (its dangling
+    // root breaks path rendering), so resolution is impossible rather
+    // than failed. Exempt only then: the proof above already bound this
+    // fd to the VMA. An unreadable table, or a table that reads anything
+    // at all, keeps the guard — a failed resolution there still refuses.
+    let mountinfo_empty = matches!(
+        view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget),
+        Ok(((), text)) if text.is_empty()
+    );
+    if mountinfo_empty {
+        // The exemption skips the mount-table guard — the only
+        // fd-key-vs-maps-key check — so bind the proven file to the maps
+        // key here instead: re-stat the served fd and compare what the
+        // kernel renders for it against the maps key (never raw fstat vs
+        // maps: a btrfs subvolume file stats its anonymous device while
+        // maps renders the filesystem device). A VMA that raced between
+        // the maps read and the proof — the proof bound the current file
+        // while the record keeps the stale key — refuses by name instead
+        // of examining under the wrong key.
+        let restated = file.metadata().map_err(|error| {
+            Unproven(format!(
+                "the proven file could not be re-stated for the maps-key check: {error}"
+            ))
+        })?;
+        let fd_key = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(restated.dev())),
+                minor: u64::from(libc::minor(restated.dev())),
+            },
+            inode: restated.ino(),
+        };
+        if !unresolved_fd_matches_maps(&file, fd_key, raw.key, budget) {
+            return Err(Refused(format!(
+                "opened object identity {}:{} inode {} does not match mapped object {}:{} inode {}",
+                fd_key.device.major,
+                fd_key.device.minor,
+                fd_key.inode,
+                raw.key.device.major,
+                raw.key.device.minor,
+                raw.key.inode
+            )));
+        }
+        // No mount row names this fd: the maps key (just proven) is the
+        // identity, with an honestly-unknown mount id. Merges never
+        // consult the mount id, so a proven sibling still merges; a lone
+        // entry stays conservative wherever the full opened identity
+        // compares. The caller's `opened_file_matches_maps` then passes
+        // by construction; the binding proof is the unresolved
+        // comparison above.
+        let found = MappingFileKey {
+            mount_id: 0,
+            device_major: raw.key.device.major,
+            device_minor: raw.key.device.minor,
+            inode: raw.key.inode,
+        };
+        return Ok((file, found));
+    }
+    let ((), mountinfo) = view
+        .open_then_cached_mountinfo(|_| Ok(()), mounts, budget)
+        .map_err(Unproven)?;
+    let first = identity_of_in_mountinfo(&file, mountinfo);
+    let found = identity_in_cached_table(view, &file, first, mounts, budget).map_err(Unproven)?;
+    Ok((file, found))
+}
+
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
@@ -8432,18 +8771,31 @@ fn pin_scanned_object(
             (file, found)
         }
         None => {
-            let (file, mountinfo) = view.open_then_cached_mountinfo(
-                |filesystem| {
-                    filesystem
-                        .open_mapped_object(Path::new(&raw.path))
-                        .map_err(|failure| failure.gap_reason())
-                },
+            let (open, mountinfo) = view.open_then_cached_mountinfo(
+                |filesystem| Ok(filesystem.open_mapped_object(Path::new(&raw.path))),
                 mounts,
                 budget,
             )?;
-            let first = identity_of_in_mountinfo(&file, mountinfo);
-            let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
-            (file, found)
+            match open {
+                Ok(file) => {
+                    let first = identity_of_in_mountinfo(&file, mountinfo);
+                    let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
+                    (file, found)
+                }
+                Err(failure) if pin_map_files_fallback_triggered(&failure) => {
+                    match pin_map_files_fallback(view, &raw, mounts, pinned_identity, budget) {
+                        Ok(served) => served,
+                        Err(PinMapFilesRefusal::Unproven(detail)) => {
+                            return Err(format!(
+                                "{} (map_files fallback: {detail})",
+                                failure.gap_reason()
+                            ));
+                        }
+                        Err(PinMapFilesRefusal::Refused(reason)) => return Err(reason),
+                    }
+                }
+                Err(failure) => return Err(failure.gap_reason()),
+            }
         }
     };
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately carry
@@ -12169,6 +12521,807 @@ mod tests {
                 .iter()
                 .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
             "no collision ambiguity for one proven file: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_map_files_trigger_fires_only_for_unreachable_or_foreign_roots() {
+        let failure = |errno: Option<i32>, foreign: bool| MappedOpenError {
+            reason: "opening object within retained target root: probe".into(),
+            foreign_target_root: foreign.then(|| "/proc/1/fdinfo".into()),
+            errno,
+        };
+        // Healthy: an unreachable root retries, and so does a file the
+        // retained root cannot see under a foreign root.
+        assert!(pin_map_files_fallback_triggered(&failure(
+            Some(libc::ESRCH),
+            true
+        )));
+        assert!(pin_map_files_fallback_triggered(&failure(
+            Some(libc::ENOENT),
+            true
+        )));
+        // A genuinely missing file under the observer's own root never
+        // retries, and neither does any other errno or a refusal that
+        // carries no errno at all.
+        assert!(!pin_map_files_fallback_triggered(&failure(
+            Some(libc::ENOENT),
+            false
+        )));
+        assert!(!pin_map_files_fallback_triggered(&failure(
+            Some(libc::EACCES),
+            true
+        )));
+        assert!(!pin_map_files_fallback_triggered(&failure(None, true)));
+        assert!(!pin_map_files_fallback_triggered(&failure(None, false)));
+    }
+
+    #[test]
+    fn pin_fallback_ranges_match_key_and_path_bytes_exactly() {
+        use p11scope_manifest::maps::MapEntry;
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let module = test_fixture::module(key);
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let entry = |start: u64, end: u64, key: ObjectKey, path: Option<&str>| MapEntry {
+            start,
+            end,
+            file_offset: 0,
+            permissions: *b"r--p",
+            device: key.device,
+            inode: key.inode,
+            raw_path: path.map(|path| path.as_bytes().to_vec()),
+        };
+        let same = entry(0x1000, 0x2000, key, Some(&module.path));
+        let other_key = entry(
+            0x2000,
+            0x3000,
+            ObjectKey {
+                device: key.device,
+                inode: key.inode + 1,
+            },
+            Some(&module.path),
+        );
+        let other_path = entry(0x3000, 0x4000, key, Some("/lib/other.so"));
+        let deleted = entry(
+            0x4000,
+            0x5000,
+            key,
+            Some(&format!("{} (deleted)", module.path)),
+        );
+        let anonymous = entry(0x5000, 0x6000, key, None);
+        let entries = [same, other_key, other_path, deleted, anonymous];
+        let ranges = pin_fallback_ranges(&entries, &raw);
+        assert_eq!(
+            ranges.len(),
+            1,
+            "only the same-key same-path range opens: {ranges:?}"
+        );
+        assert_eq!((ranges[0].start, ranges[0].end), (0x1000, 0x2000));
+        assert!(
+            pin_fallback_ranges(&entries[1..], &raw).is_empty(),
+            "no match without the same-key same-path range"
+        );
+    }
+
+    /// One fresh-maps VMA range for the pin-proof tests: `key` selects
+    /// the same-key group, `path` the exact-path open choice, and
+    /// `permissions` the caller rule (`r-xp` on a `.so` path is a
+    /// caller range).
+    fn pin_proof_entry(
+        start: u64,
+        key: ObjectKey,
+        path: Option<&str>,
+        permissions: &[u8; 4],
+    ) -> MapEntry {
+        MapEntry {
+            start,
+            end: start + 0x1000,
+            file_offset: 0,
+            permissions: *permissions,
+            device: key.device,
+            inode: key.inode,
+            raw_path: path.map(|path| path.as_bytes().to_vec()),
+        }
+    }
+
+    /// A proven different file beside `held`: another device, another inode.
+    fn pin_stranger(held: FileIdentity) -> FileIdentity {
+        FileIdentity {
+            dev: held.dev + 0x100,
+            ino: held.ino + 1,
+        }
+    }
+
+    /// The scanned raw instance and held identity for the pin-proof
+    /// tests: the fixture provider path under an 8:1 key.
+    fn pin_proof_setup() -> (ObjectKey, String, RawObjectInstance, FileIdentity) {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let module = module(key);
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let held = FileIdentity {
+            dev: 0x801,
+            ino: INODE,
+        };
+        (key, module.path, raw, held)
+    }
+
+    /// The fallback's proof-set selector under test: the complete
+    /// fresh same-key group the pin proof must prove (the exact-path
+    /// selection only chooses the range to open).
+    fn proof_selection<'a>(entries: &'a [MapEntry], raw: &RawObjectInstance) -> Vec<&'a MapEntry> {
+        pin_proof_ranges(entries, raw)
+    }
+
+    /// One scripted fresh `map_files` read for a proof range.
+    #[derive(Clone, Copy)]
+    enum ScriptedRead {
+        /// The range serves this `vm_file` identity.
+        Identity(FileIdentity),
+        /// The read fails `EACCES`: a capability refusal skips best-effort.
+        AccessDenied,
+        /// The read fails generically: a range unmapped since skips too.
+        Unmapped,
+    }
+
+    /// Script every selected range's fresh `map_files` identity. Every
+    /// selected start needs a script; a missing one fails loud so a
+    /// proof range can never pass by default.
+    fn pin_scripted_proof<'a>(
+        selected: &[&'a MapEntry],
+        reads: &std::collections::BTreeMap<u64, ScriptedRead>,
+    ) -> Vec<(&'a MapEntry, std::io::Result<FileIdentity>)> {
+        selected
+            .iter()
+            .map(|entry| {
+                let read = reads.get(&entry.start).unwrap_or_else(|| {
+                    panic!(
+                        "no scripted identity for range {:x}-{:x}",
+                        entry.start, entry.end
+                    )
+                });
+                let served = match read {
+                    ScriptedRead::Identity(identity) => Ok(*identity),
+                    ScriptedRead::AccessDenied => {
+                        Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                    }
+                    ScriptedRead::Unmapped => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "scripted unmapped range",
+                    )),
+                };
+                (*entry, served)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pin_single_executable_overlay_range_needs_witness() {
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        };
+        let entries = [pin_proof_entry(0x1000, key, Some(&path), b"r-xp")];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 1, "the opened range is the proof set");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([(0x1000, ScriptedRead::Identity(held))]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness")),
+            "a lone equal overlay caller stays unproven like the scan guard: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_single_executable_unknown_filesystem_needs_witness() {
+        let (key, path, raw, held) = pin_proof_setup();
+        // No `statfs` magic: an unproven filesystem fails closed like overlayfs.
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: None,
+        };
+        let entries = [pin_proof_entry(0x1000, key, Some(&path), b"r-xp")];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 1, "the opened range is the proof set");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([(0x1000, ScriptedRead::Identity(held))]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness")),
+            "a lone equal caller on an unproven filesystem stays unproven: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_first_executable_overlay_range_needs_witness() {
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness") && reason.contains("1000-2000")),
+            "the first range meets the same witness rule as a later one: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_first_executable_unknown_filesystem_needs_witness() {
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: None,
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness") && reason.contains("1000-2000")),
+            "the first range on an unproven filesystem stays unproven: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_later_executable_overlay_range_needs_witness() {
+        // Control: a witness-requiring caller at a later position was
+        // already refused; the fix must keep refusing it.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness") && reason.contains("2000-3000")),
+            "a later equal overlay caller stays unproven: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_non_overlay_equal_group_proves() {
+        // Control: equality still proves off overlayfs, first range included.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert_eq!(outcome, Ok(()), "an equal group off overlayfs proves");
+    }
+
+    #[test]
+    fn pin_different_path_stranger_refuses() {
+        // A same-key range at another pathname with a different physical
+        // identity refuses the pin, like the scan-side guard refuses it.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some("/lib/other.so"), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-key ranges prove");
+        let opened = selected
+            .iter()
+            .position(|entry| entry.start == 0x1000)
+            .unwrap();
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(pin_stranger(held))),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, opened, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("names more than one file")),
+            "a different-path stranger refuses the whole key: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_earlier_different_path_stranger_refuses() {
+        // The contradictory range may sort before the opened one in maps
+        // order; the proof still inspects it.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some("/lib/other.so"), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-key ranges prove");
+        let opened = selected
+            .iter()
+            .position(|entry| entry.start == 0x2000)
+            .unwrap();
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(pin_stranger(held))),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, opened, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("names more than one file")),
+            "an earlier different-path stranger refuses the whole key: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_different_path_witness_requiring_caller_needs_witness() {
+        // A same-key caller at another pathname whose equality needs the
+        // original-file witness stays unproven; the opened data range
+        // alone cannot prove it.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x2000, key, Some("/lib/other.so"), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-key ranges prove");
+        let opened = selected
+            .iter()
+            .position(|entry| entry.start == 0x1000)
+            .unwrap();
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, opened, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Unproven(reason)) if reason.contains("needs the original-file witness") && reason.contains("2000-3000")),
+            "a different-path overlay caller stays unproven: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_same_path_stranger_refuses() {
+        // Control: a same-path stranger was already refused; the fix
+        // must keep refusing it with the same wording.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(pin_stranger(held))),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("names more than one file")),
+            "a same-path stranger refuses the whole key: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_healthy_same_file_alias_proves() {
+        // Control: two pathnames over one file still prove together.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some("/lib/other.so"), b"r-xp"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        let opened = selected
+            .iter()
+            .position(|entry| entry.start == 0x1000)
+            .unwrap();
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, opened, &raw);
+        assert_eq!(outcome, Ok(()), "one file under two pathnames proves");
+    }
+
+    #[test]
+    fn pin_opened_stranger_refuses_without_proven_file() {
+        // The first held-versus-range inequality refusal: when the
+        // opened range itself is another file, the pin refuses with its
+        // own wording instead of proving anything.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 2, "both same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(pin_stranger(held))),
+                (0x2000, ScriptedRead::Identity(held)),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert!(
+            matches!(&outcome, Err(PinMapFilesRefusal::Refused(reason)) if reason.contains("was refused without a proven file")),
+            "an opened stranger refuses without a proven file: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pin_proof_ranges_cover_every_same_key_range() {
+        // The proof set is every fresh range under the maps key,
+        // whatever pathname spelling it carries — the scan's candidate
+        // group for this key. Only another key stays out.
+        let (key, path, raw, _) = pin_proof_setup();
+        let other_key = ObjectKey {
+            device: key.device,
+            inode: key.inode + 1,
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some("/lib/other.so"), b"r-xp"),
+            pin_proof_entry(0x3000, key, Some(&format!("{path} (deleted)")), b"r--p"),
+            pin_proof_entry(0x4000, other_key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x5000, key, None, b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        let starts: Vec<u64> = selected.iter().map(|entry| entry.start).collect();
+        assert_eq!(
+            starts,
+            vec![0x1000, 0x2000, 0x3000, 0x5000],
+            "the proof set is every same-key range: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn pin_unreadable_later_range_keeps_best_effort_proof() {
+        // Control: an unreadable later range — a refused capability or
+        // a range unmapped since — still skips best-effort, exactly as
+        // the scan-side guard skips it.
+        let (key, path, raw, held) = pin_proof_setup();
+        let held_file = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x3000, key, Some(&path), b"r--p"),
+        ];
+        let selected = proof_selection(&entries, &raw);
+        assert_eq!(selected.len(), 3, "all same-path ranges prove");
+        let proof = pin_scripted_proof(
+            &selected,
+            &std::collections::BTreeMap::from([
+                (0x1000, ScriptedRead::Identity(held)),
+                (0x2000, ScriptedRead::AccessDenied),
+                (0x3000, ScriptedRead::Unmapped),
+            ]),
+        );
+        let outcome = pin_proof_outcome(&held_file, &proof, 0, &raw);
+        assert_eq!(outcome, Ok(()), "unreadable later ranges skip best-effort");
+    }
+
+    #[test]
+    fn pin_range_verdict_matches_scan_guard_arms() {
+        // The per-range verdict shared with the scan-side guard: equal
+        // callers on overlayfs (or an unproven filesystem) need the
+        // witness, equality proves elsewhere, a proven different file
+        // is a stranger, and unreadable ranges skip best-effort.
+        use crate::discovery::scan::{RangeProofVerdict, range_proof_verdict};
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let held = FileIdentity {
+            dev: 0x801,
+            ino: INODE,
+        };
+        let caller = pin_proof_entry(0x1000, key, Some("/lib/prov.so"), b"r-xp");
+        let data = pin_proof_entry(0x2000, key, Some("/lib/prov.so"), b"r--p");
+        let text = pin_proof_entry(0x3000, key, Some("/lib/plain"), b"r-xp");
+        let overlay = MappedFile {
+            identity: held,
+            fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        };
+        let unknown = MappedFile {
+            identity: held,
+            fs_magic: None,
+        };
+        let ext4 = MappedFile {
+            identity: held,
+            fs_magic: Some(0xef53),
+        };
+        let equal: std::io::Result<FileIdentity> = Ok(held);
+        let stranger: std::io::Result<FileIdentity> = Ok(pin_stranger(held));
+        let denied: std::io::Result<FileIdentity> =
+            Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        let unmapped: std::io::Result<FileIdentity> = Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "scripted unmapped range",
+        ));
+        assert_eq!(
+            range_proof_verdict(&overlay, &caller, &equal),
+            RangeProofVerdict::NeedsWitness,
+            "an equal overlay caller needs the witness"
+        );
+        assert_eq!(
+            range_proof_verdict(&unknown, &caller, &equal),
+            RangeProofVerdict::NeedsWitness,
+            "an equal caller on an unproven filesystem needs the witness"
+        );
+        assert_eq!(
+            range_proof_verdict(&ext4, &caller, &equal),
+            RangeProofVerdict::Proven,
+            "equality proves off overlayfs"
+        );
+        assert_eq!(
+            range_proof_verdict(&overlay, &data, &equal),
+            RangeProofVerdict::Proven,
+            "a non-caller range needs no witness"
+        );
+        assert_eq!(
+            range_proof_verdict(&overlay, &text, &equal),
+            RangeProofVerdict::Proven,
+            "an executable non-provider mapping is not a caller"
+        );
+        assert_eq!(
+            range_proof_verdict(&ext4, &caller, &stranger),
+            RangeProofVerdict::Stranger(pin_stranger(held)),
+            "a proven different file is a stranger"
+        );
+        assert_eq!(
+            range_proof_verdict(&overlay, &caller, &denied),
+            RangeProofVerdict::Skipped,
+            "a refused capability skips best-effort"
+        );
+        assert_eq!(
+            range_proof_verdict(&overlay, &caller, &unmapped),
+            RangeProofVerdict::Skipped,
+            "an unreadable range skips best-effort"
+        );
+    }
+
+    #[test]
+    fn unresolved_fd_comparison_accepts_equal_keys_and_refuses_strangers() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fd_key = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        // Equal keys accept without consulting the probe.
+        assert!(unresolved_fd_matches_maps(
+            &file,
+            fd_key,
+            fd_key,
+            &mut budget
+        ));
+        // A maps key the kernel never renders this fd at refuses: the
+        // probe runs and reports no match.
+        let stranger = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 999,
+            },
+            inode: INODE,
+        };
+        assert!(!unresolved_fd_matches_maps(
+            &file,
+            fd_key,
+            stranger,
+            &mut budget
+        ));
+    }
+
+    #[test]
+    fn pin_proof_assembly_splices_the_opened_range_in_maps_order() {
+        // The fallback reads the opened range first, then every sibling;
+        // the proof must run in maps order with the opened index known.
+        // Opened middle: the already-read identity lands back at its
+        // maps position, siblings keep theirs.
+        let (key, path, _, held) = pin_proof_setup();
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x3000, key, Some("/lib/other.so"), b"r-xp"),
+        ];
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let first: &MapEntry = group[1];
+        let marker = pin_stranger(held);
+        let siblings = vec![(group[0], Ok(held)), (group[2], Ok(held))];
+        let (proof, opened) =
+            pin_proof_assembly(&group, 1, first, Ok(marker), siblings).expect("maps order splices");
+        assert_eq!(opened, 1, "the opened index survives the splice");
+        let starts: Vec<u64> = proof.iter().map(|(entry, _)| entry.start).collect();
+        assert_eq!(starts, vec![0x1000, 0x2000, 0x3000], "maps order restored");
+        for (slot, entry) in proof.iter().zip(group.iter()) {
+            assert!(
+                std::ptr::eq(slot.0, *entry),
+                "slot {:x} keeps its range",
+                entry.start
+            );
+        }
+        assert_eq!(
+            proof[opened].1.as_ref().ok(),
+            Some(&marker),
+            "the already-read identity lands at the opened slot"
+        );
+    }
+
+    #[test]
+    fn pin_proof_assembly_holds_at_first_and_last_positions() {
+        // Opened first splices at the head, opened last appends: no
+        // off-by-one at either end.
+        let (key, path, _, held) = pin_proof_setup();
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let (head, opened) =
+            pin_proof_assembly(&group, 0, group[0], Ok(held), vec![(group[1], Ok(held))])
+                .expect("opened-first splices");
+        assert_eq!(opened, 0);
+        assert_eq!(head.len(), 2);
+        assert!(std::ptr::eq(head[0].0, group[0]));
+        assert!(std::ptr::eq(head[1].0, group[1]));
+        let (tail, opened) =
+            pin_proof_assembly(&group, 1, group[1], Ok(held), vec![(group[0], Ok(held))])
+                .expect("opened-last splices");
+        assert_eq!(opened, 1);
+        assert_eq!(tail.len(), 2);
+        assert!(std::ptr::eq(tail[0].0, group[0]));
+        assert!(std::ptr::eq(tail[1].0, group[1]));
+    }
+
+    #[test]
+    fn pin_proof_assembly_rejects_an_opened_range_outside_its_group() {
+        // A racing VMA that left its group — or a wrong opened index —
+        // fails closed instead of proving under a stale key.
+        let (key, path, _, held) = pin_proof_setup();
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+        ];
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        // Same values, another allocation: pointer identity decides.
+        let elsewhere = [pin_proof_entry(0x2000, key, Some(&path), b"r--p")];
+        let foreign: &MapEntry = &elsewhere[0];
+        assert!(
+            pin_proof_assembly(&group, 1, foreign, Ok(held), vec![(group[0], Ok(held))]).is_none(),
+            "a foreign range pointer fails closed"
+        );
+        assert!(
+            pin_proof_assembly(&group, 0, group[1], Ok(held), vec![(group[1], Ok(held))]).is_none(),
+            "an opened index that misses its range fails closed"
+        );
+        assert!(
+            pin_proof_assembly(&group, 7, group[0], Ok(held), vec![(group[1], Ok(held))]).is_none(),
+            "an out-of-range opened index fails closed"
+        );
+    }
+
+    #[test]
+    fn pin_proof_assembly_rejects_misordered_or_short_siblings() {
+        // The splice trusts no caller threading: siblings must be
+        // exactly the group's other ranges in order.
+        let (key, path, _, held) = pin_proof_setup();
+        let entries = [
+            pin_proof_entry(0x1000, key, Some(&path), b"r-xp"),
+            pin_proof_entry(0x2000, key, Some(&path), b"r--p"),
+            pin_proof_entry(0x3000, key, Some("/lib/other.so"), b"r-xp"),
+        ];
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        assert!(
+            pin_proof_assembly(
+                &group,
+                1,
+                group[1],
+                Ok(held),
+                vec![(group[2], Ok(held)), (group[0], Ok(held))]
+            )
+            .is_none(),
+            "swapped siblings fail closed"
+        );
+        assert!(
+            pin_proof_assembly(&group, 1, group[1], Ok(held), vec![(group[0], Ok(held))]).is_none(),
+            "a dropped sibling fails closed"
         );
     }
 

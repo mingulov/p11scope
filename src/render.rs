@@ -3394,8 +3394,7 @@ pub fn live_scoped_with_caller(
     logins: &BTreeMap<u32, u64>,
 ) -> String {
     let frame = live_scoped_with_verbosity_and_sessions(
-        reports, ev, elapsed, module, mode, policy, scope, mechanisms, verbosity,
-        sessions, logins,
+        reports, ev, elapsed, module, mode, policy, scope, mechanisms, verbosity, sessions, logins,
     );
     let Some(line) = caller_text_line(caller) else {
         return frame;

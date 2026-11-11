@@ -29339,6 +29339,10 @@ impl LoaderPlanningFixture {
             let mut pins = real_scan_pin(&path, Some(loader.key), minor + 1, OVERLAY_SHA);
             let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader), &mut pins);
             assert!(skips.is_empty());
+            // Production scans attach scan ownership at pin time; the live
+            // rebind restores the scan pin layer from it, so the fixture
+            // carries the same row or full-path ticks drop the loader view.
+            record_scan_ownership(&mut pins, loader.view, loader.key, &loader.path);
             let local = pins
                 .id_for_scanned(&loader, loader.key, &loader.path)
                 .unwrap();
@@ -30468,6 +30472,14 @@ fn loader_pin_reuse_adds_a_view_to_an_existing_exact_loader() {
     );
     let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut pins);
     assert!(skips.is_empty());
+    // Same production-shape scan ownership as the fixture loaders: the
+    // reference full-path rebind restores scan pins from this row.
+    record_scan_ownership(
+        &mut pins,
+        loader_module.view,
+        loader_module.key,
+        &loader_module.path,
+    );
     let local = pins
         .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         .unwrap();

@@ -18597,6 +18597,17 @@ impl Engine {
                 }
                 raw_modules.extend(retained);
             }
+            // The fast path must not skip ownership cleanup: pins no
+            // surviving module references (retired by an earlier metadata
+            // step, or otherwise unowned) are reclaimed here rather than
+            // cloned again, or a later mutation of an unloaded file
+            // poisons capture-wide revalidation.
+            let surviving: Vec<ScannedModule> = raw_modules
+                .iter()
+                .filter(|module| module.view == view_id)
+                .cloned()
+                .collect();
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
             // A metadata scan pinned its modules before their tables
@@ -18610,8 +18621,10 @@ impl Engine {
             // match their pins, pin newly observed modules fresh, and
             // retire only the contradicted or changed ones. A
             // retained module a complete scan no longer observes
-            // retires with its facts; its pins stay held until the
-            // deferred memory scan reconciles ownership.
+            // retires with its facts, and its pins are pruned with
+            // them below: leaving them held would let the deferred
+            // memory scan's fast path clone the same obsolete
+            // ownership again.
             let retained: Vec<ScannedModule> = self
                 .modules
                 .iter()
@@ -18666,6 +18679,16 @@ impl Engine {
                 }
                 raw_modules.extend(kept_retained);
             }
+            // Reconcile pin ownership with the retired facts atomically:
+            // kept modules keep their exact retained identities, while
+            // contradicted, changed or unobserved modules lose their pins
+            // here instead of lingering until a replacing scan.
+            let surviving: Vec<ScannedModule> = raw_modules
+                .iter()
+                .filter(|module| module.view == view_id)
+                .cloned()
+                .collect();
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();

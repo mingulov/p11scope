@@ -1836,6 +1836,91 @@ impl PinnedObjects {
         skipped
     }
 
+    /// Drops one view's scan-owned raws that no surviving module references —
+    /// neither as its own file nor as a table-entry dependency — and reclaims
+    /// the pins left with no owner, with the same custody as
+    /// `replace_view_pins` (`by_id`, `raw_to_id`, per-view claims). Loader,
+    /// manifest/pre-arm and other-view ownership is preserved: only scan
+    /// raws owned by `view` outside `surviving` (and outside `preserve`)
+    /// are removed, and the global prune keeps every raw another view, a
+    /// manifest or a pre-arm alias still owns. Kept modules keep their
+    /// exact retained identities; only already-retired facts lose pins, so
+    /// a later mutation of an unloaded file cannot poison the
+    /// capture-wide `check_unchanged`.
+    pub(crate) fn prune_view_pins_to_modules(
+        &mut self,
+        view: ProcessViewId,
+        surviving: &[ScannedModule],
+        preserve: &[PinnedObjectId],
+    ) {
+        self.bump_revision();
+        let mut live: BTreeSet<RawObjectInstance> = BTreeSet::new();
+        for module in surviving {
+            if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
+                live.insert(own);
+            }
+            for entry in module.tables.iter().flat_map(|table| &table.entries) {
+                if let Some(target) =
+                    RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+                {
+                    live.insert(target);
+                }
+            }
+        }
+        let preserved: BTreeSet<PinnedObjectId> = preserve.iter().copied().collect();
+        let doomed: Vec<RawObjectInstance> = self
+            .raw_ownership
+            .get(&view)
+            .into_iter()
+            .flatten()
+            .filter(|raw| {
+                raw.mount_namespace.is_some()
+                    && !live.contains(raw)
+                    && !self
+                        .raw_to_id
+                        .get(raw)
+                        .is_some_and(|id| preserved.contains(id))
+            })
+            .cloned()
+            .collect();
+        if let Some(owned) = self.raw_ownership.get_mut(&view) {
+            for raw in &doomed {
+                owned.remove(raw);
+            }
+        }
+        let retained_raws: BTreeSet<_> = self
+            .raw_ownership
+            .values()
+            .flatten()
+            .cloned()
+            .chain(
+                self.raw_to_id
+                    .keys()
+                    .filter(|raw| raw.mount_namespace.is_none())
+                    .cloned(),
+            )
+            .collect();
+        self.raw_to_id.retain(|raw, _| retained_raws.contains(raw));
+        let retained_ids: BTreeSet<_> = self.raw_to_id.values().copied().collect();
+        let dropped: BTreeSet<_> = self
+            .by_id
+            .keys()
+            .copied()
+            .filter(|id| !retained_ids.contains(id))
+            .collect();
+        self.by_id.retain(|id, _| retained_ids.contains(id));
+        // Dropping entries must not strand their claimants: scrub ownership
+        // claims and owned raws for the dropped ids, mirroring remove_view.
+        if !dropped.is_empty() {
+            for claims in self.ownership.values_mut() {
+                claims.remove(&dropped);
+            }
+            for raws in self.raw_ownership.values_mut() {
+                raws.retain(|raw| self.raw_to_id.contains_key(raw));
+            }
+        }
+    }
+
     /// Clears plan-derived table/target claims before the canonical raw module
     /// set is rebound. Opened pin ownership remains intact.
     pub(crate) fn reset_derived_claims(&mut self) {

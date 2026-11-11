@@ -376,7 +376,11 @@ the registered `CKM_*` registry read through such a slot is counted only
 (`mechanism value not in the registry (names unconfirmed): N`), never
 published as a number. Tables without that layout proof stay count-only
 without an accepted manifest: use their aggregate counts, return values
-and latency. Standard names require a typed legacy return, an
+and latency. A `C_GetFunctionList`/`C_GetInterface`/`C_GetInterfaceList`
+slot forwarded into another provider's object by ordinary linker
+interposition (as under p11-kit-proxy) keeps the proof when that object's
+own `.dynsym` defines the same name at that exact offset; the forwarded
+slot itself stays count-only. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
 the provider's own `.dynsym` and every retained non-NULL target
 (`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's

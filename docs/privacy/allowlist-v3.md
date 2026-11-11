@@ -114,7 +114,11 @@ Semantic authority comes from exactly one of three sources:
   export-name agreement alone never grants it; and
   every required key lives in the provider's own object (a provider whose
   table entries point into another object, such as the p11-kit trust shim,
-  is refused). A non-full walk or an unpinned affecting entry refuses the
+  is refused — except a `C_GetFunctionList`/`C_GetInterface`/
+  `C_GetInterfaceList` entry forwarded by verified linker interposition,
+  where the other object's own `.dynsym` defines that same name at that
+  exact offset; the forwarded slot itself stays count-only). A non-full
+  walk or an unpinned affecting entry refuses the
   provider whole; a rival, aliased or degraded entry, including one reached
   only through an exports-only table, stays count-only at that entry, with
   no argument reads there; or
@@ -140,7 +144,10 @@ Semantic authority comes from exactly one of three sources:
   `C_FindObjects`, `C_EncryptInit`, `C_DecryptInit`, `C_DigestKey`,
   `C_SignInit`, `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
   `C_GenerateKey`, `C_GenerateKeyPair`, `C_WrapKey`, `C_UnwrapKey`,
-  `C_DeriveKey`, `C_SetOperationState`) non-NULL and in own code; (d) the
+  `C_DeriveKey`, `C_SetOperationState`) non-NULL and in own code, except a
+  `C_GetFunctionList` entry forwarded by verified linker interposition
+  (the other object's own `.dynsym` defines that same name at that exact
+  offset), which keeps the proof while staying count-only itself; (d) the
   object exports `C_GetFunctionList`; (e) the provider file has a single
   load in the process, not a proxy's multi-table closure array. A rival,
   aliased or degraded entry stays count-only at that entry, as above.

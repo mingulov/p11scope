@@ -31,7 +31,7 @@
 //! merge rules rather than two that can drift.
 
 use crate::discovery::identity::{
-    GraphRefusal, GraphStep, PinnedObjectId, PinnedObjects, ReconciledModule,
+    GraphRefusal, GraphStep, PinnedObjectId, PinnedObjects, ReconciledModule, forwardable_getter,
 };
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
@@ -5674,12 +5674,26 @@ fn standard_layout_shape(table: &ScannedTable) -> bool {
 /// into the provider's own object, and no non-NULL slot was moved
 /// aside unpinned — clause 1 constrains every non-NULL slot, so an
 /// unusable or unreconciled target the retained-entry proof never
-/// covered refuses the whole table, exactly as the sole-complete
-/// and getter-export legs already refuse it inside their stricter
-/// predicates. The interface-linkage and live-return legs prove
-/// it here, so no leg can grant argument-read authority on
-/// linkage or return evidence alone. A refusal keeps the usable
+/// covered refuses the whole table. The sole-complete and
+/// getter-export legs re-prove this core inside their stricter
+/// predicates; the interface-linkage and live-return legs prove it
+/// here, so no leg can grant argument-read authority on linkage
+/// or return evidence alone. A refusal keeps the usable
 /// observations count-only; NULL holes stay admissible.
+///
+/// Amendment 22:45 2026-11-11: one exemption — a
+/// `C_GetFunctionList`/`C_GetInterface`/`C_GetInterfaceList` entry
+/// resolving outside the provider's own object keeps the proof.
+/// Both bind paths refuse a cross-object forward the pinned
+/// target's own `.dynsym` does not define at that exact offset
+/// (see `forwarded_bootstrap_verified`), so a retained forward was
+/// resolved by name: ordinary linker interposition when a provider
+/// loads first and globally visible (p11-kit-proxy loads
+/// `libp11-kit.so` first). The exempted slots are getter
+/// descriptors, so they stay count-only and never read arguments;
+/// only proven own-object slots gain authority. Any other foreign
+/// entry, or a wrong-offset forward (bind moves it to `unpinned`,
+/// which refuses above), still refuses the whole table.
 fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
     let scanned = &module.scanned;
     let table = &scanned.tables[index];
@@ -5694,7 +5708,10 @@ fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
             .entries
             .iter()
             .zip(objects.iter())
-            .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
+            .all(|(entry, object)| {
+                (entry.object == scanned.key && *object == module.object)
+                    || (entry.object != scanned.key && forwardable_getter(entry.name))
+            })
 }
 
 /// Typed-getter-export leg (controller ruling 2026-11-11 clause 1): the
@@ -5742,25 +5759,15 @@ fn getter_export_authorized(
     if published_walk(index, &scanned.tables, &scanned.interfaces, exports) != "full" {
         return false;
     }
-    if !standard_layout_shape(table) || module.witness_fault || !table.unpinned.is_empty() {
+    // The clause-1 core, re-proven inside this stricter predicate so
+    // the verified-forward exemption lives in exactly one place.
+    if module.witness_fault || !standard_layout_core(module, index) {
         return false;
     }
     // A 3.x getter beside a 2.x table refutes the legacy-prefix reading
     // (a wider table may be reachable through it); beside a full 3.x
     // table the table's own extent answers that concern.
     if module.getter_present && table.version.0 == 2 {
-        return false;
-    }
-    let Some(objects) = module.entry_objects.get(index) else {
-        return false;
-    };
-    if objects.len() != table.entries.len()
-        || !table
-            .entries
-            .iter()
-            .zip(objects.iter())
-            .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
-    {
         return false;
     }
     let present: BTreeSet<&str> = table.entries.iter().map(|entry| entry.name).collect();
@@ -5840,21 +5847,10 @@ fn sole_complete_table_authorized(
     if module.getter_present || module.witness_fault {
         return false;
     }
-    if !table.unpinned.is_empty() {
-        return false;
-    }
-    let Some(objects) = module.entry_objects.get(index) else {
-        return false;
-    };
-    if objects.len() != table.entries.len() {
-        return false;
-    }
-    if !table
-        .entries
-        .iter()
-        .zip(objects.iter())
-        .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
-    {
+    // The clause-1 core, re-proven inside this stricter predicate so
+    // the verified-forward exemption lives in exactly one place. The
+    // 68-slot shape above implies the core's shape check.
+    if !standard_layout_core(module, index) {
         return false;
     }
     let present: BTreeSet<&str> = table.entries.iter().map(|entry| entry.name).collect();
@@ -10436,7 +10432,15 @@ mod tests {
     }
 
     #[test]
-    fn sole_complete_cross_object_bootstrap_refuses() {
+    fn sole_complete_verified_forward_exempts() {
+        // Amendment 22:45 2026-11-11: a `C_GetFunctionList` entry
+        // resolving outside the provider's own object keeps the layout
+        // proof — bind kept it, so the pinned target's own `.dynsym`
+        // defines that same name at that exact offset (ordinary linker
+        // interposition under p11-kit-proxy). The 67 own-object slots
+        // gain authority; the forwarded bootstrap slot itself stays
+        // count-only (a getter descriptor never reads arguments), and
+        // every mechanism-published slot stays own-object + unambiguous.
         let mut module = sole_complete_module();
         let table = &mut module.scanned.tables[0];
         let position = table
@@ -10452,9 +10456,53 @@ mod tests {
         table.entries[position].object_path = "/opt/other.so".into();
         module.entry_objects[0][position] = PinnedObjectId(43);
         assert!(
-            !sole_scan_semantic(&module),
-            "a forwarded bootstrap refuses the own-code sole-table grant"
+            sole_scan_semantic(&module),
+            "a verified forwarded bootstrap keeps the sole-table grant"
         );
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "the main plan carries the exempted grant for mechanism attribution"
+        );
+        let (forwarded, local): (Vec<_>, Vec<_>) = plan
+            .slots
+            .iter()
+            .partition(|slot| slot.names == ["C_GetFunctionList"]);
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded[0].semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            "the exempted bootstrap slot never reads arguments"
+        );
+        assert_eq!(forwarded[0].object, PinnedObjectId(43));
+        assert_eq!(local.len(), 67);
+        for slot in &local {
+            assert_eq!(
+                slot.object, module.object,
+                "every mechanism-published slot stays own-object: {slot:?}"
+            );
+            assert!(
+                !slot.aliased,
+                "every mechanism-published slot stays unambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn sole_complete_unverified_forward_refuses() {
+        // The unverified twin: bind refuses a forward the pinned
+        // target's own `.dynsym` does not define at the forwarded
+        // offset, moving it aside unpinned — and an unpinned non-NULL
+        // slot refuses the whole table, exactly as before.
+        let mut module = sole_complete_module();
+        move_entry_aside(&mut module, "C_GetFunctionList", true);
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unverified (bind-refused) forward refuses the sole-table grant"
+        );
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "unverified forward");
     }
 
     #[test]

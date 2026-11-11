@@ -664,6 +664,9 @@ fn exported_standard_names_that_agree_with_every_ordinal_name_the_table() {
 /// `exports`) and publishes the proven-complete prefix as a full walk.
 /// The unanimous 67 same-object agreements prove the layout; the forwarded
 /// bootstrap keeps its ABI-definitional name instead of poisoning the table.
+/// Amendment 22:45 2026-11-11: the verified forward additionally keeps the
+/// layout proof, so the 67 own-object slots carry authority while the
+/// forwarded bootstrap slot itself stays count-only.
 #[test]
 fn interposed_bootstrap_names_the_table_and_publishes_full_walk() {
     let (loaded, preload) = Loaded::build_interposed();
@@ -678,7 +681,11 @@ fn interposed_bootstrap_names_the_table_and_publishes_full_walk() {
         "the preload exports the bootstrap"
     );
     let (_, preload_offset) = &preload_offsets[0];
-    let plan = loaded.plan();
+    let (reconciled, _pinned, lost) = loaded.reconciled_with_loss();
+    assert!(lost.is_empty(), "the verified forward binds: {lost:?}");
+    assert_eq!(reconciled.len(), 1);
+    let provider = reconciled[0].object;
+    let plan = build_from_reconciled_modules(&reconciled);
 
     let tables = &plan.modules[0].tables;
     assert_eq!(tables.len(), 1);
@@ -714,7 +721,35 @@ fn interposed_bootstrap_names_the_table_and_publishes_full_walk() {
     assert_eq!(surface.walk, "full", "{surface:?}");
     assert_eq!(surface.acquisition, "ok", "{surface:?}");
     assert_eq!(surface.functions, LEGACY_ORDINALS, "{surface:?}");
-    assert_count_only(&plan);
+    assert_sole_authorized(&plan);
+    // Slot-level invariant: the 67 mechanism-published slots stay
+    // own-object and unambiguous; the exempted bootstrap slot targets
+    // the preload and never reads arguments.
+    let (forwarded, local): (Vec<_>, Vec<_>) = plan
+        .slots
+        .iter()
+        .partition(|slot| slot.names == ["C_GetFunctionList"]);
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(
+        forwarded[0].semantics,
+        SlotSemantics::COUNT_ONLY,
+        "the exempted bootstrap slot stays count-only"
+    );
+    assert_ne!(
+        forwarded[0].object, provider,
+        "the bootstrap slot targets the preload"
+    );
+    assert_eq!(local.len(), LEGACY_ORDINALS - 1);
+    for slot in &local {
+        assert_eq!(
+            slot.object, provider,
+            "every mechanism-published slot stays own-object: {slot:?}"
+        );
+        assert!(
+            !slot.aliased,
+            "every mechanism-published slot stays unambiguous: {slot:?}"
+        );
+    }
 }
 
 /// RED (fix round): a bootstrap slot forwarded to a *wrong* offset —

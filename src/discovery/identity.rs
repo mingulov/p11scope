@@ -5489,7 +5489,9 @@ mod conservative_copy {
                                         ENTRY_MISSING
                                             .len()
                                             .max(ENTRY_ABI.len())
-                                            .max(UNVERIFIED_FORWARD_REFUSAL.len()),
+                                            .max(UNVERIFIED_FORWARD_REFUSAL.len())
+                                            .max(UNVERIFIED_INTERFACE_FORWARD_REFUSAL.len())
+                                            .max(UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL.len()),
                                     )
                                 })
                                 .ok_or(GraphRefusal::Overflow)?;
@@ -6191,16 +6193,16 @@ mod conservative_copy {
                         if compatible {
                             let id = candidate.ok_or(GraphRefusal::Identity)?;
                             // Same forward check as `bind_scanned_modules`:
-                            // a cross-object bootstrap forward must resolve
+                            // a cross-object getter forward must resolve
                             // by name in the pinned target's own exports.
                             let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
                             let module_key =
                                 self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
                             if entry.object != module_key
-                                && entry.name == "C_GetFunctionList"
+                                && forwardable_getter(entry.name)
                                 && !forwarded_bootstrap_verified(entry, &pins.exports_for(id))
                             {
-                                self.skip_reason = UNVERIFIED_FORWARD_REFUSAL;
+                                self.skip_reason = unverified_forward_refusal(entry.name);
                                 self.phase = BindPhase::EntrySkip;
                                 return Ok(());
                             }
@@ -8624,21 +8626,59 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
 pub(crate) const UNVERIFIED_FORWARD_REFUSAL: &str =
     " does not define C_GetFunctionList at the forwarded offset; entry was not attached";
 
-/// Whether a `C_GetFunctionList` entry forwarded out of its module is a
-/// genuine linker interposition: the pinned target object's own `.dynsym`
-/// definitions must define `C_GetFunctionList` exactly at the entry's file
-/// offset. The dynamic linker resolves that relocation by name, so a
-/// genuine forward always satisfies this; a wrong export, a stale mapping,
-/// or a non-provider target (no standard exports) stays unproven and the
-/// entry is refused at bind time, keeping export agreement fail-closed.
-/// Pure over caller-held pin evidence — no I/O. Both bind paths
+/// Refusal suffix for a forwarded `C_GetInterface` the pinned target does
+/// not define, appended to the target path. Shared by both bind paths.
+const UNVERIFIED_INTERFACE_FORWARD_REFUSAL: &str =
+    " does not define C_GetInterface at the forwarded offset; entry was not attached";
+
+/// Refusal suffix for a forwarded `C_GetInterfaceList` the pinned target
+/// does not define, appended to the target path. Shared by both bind paths.
+const UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL: &str =
+    " does not define C_GetInterfaceList at the forwarded offset; entry was not attached";
+
+/// The refusal suffix for a cross-object forward of `name` the pinned
+/// target does not define. Call only with a [`forwardable_getter`] name;
+/// any other name reads as the bootstrap refusal.
+pub(crate) fn unverified_forward_refusal(name: &str) -> &'static str {
+    match name {
+        "C_GetInterface" => UNVERIFIED_INTERFACE_FORWARD_REFUSAL,
+        "C_GetInterfaceList" => UNVERIFIED_INTERFACE_LIST_FORWARD_REFUSAL,
+        _ => UNVERIFIED_FORWARD_REFUSAL,
+    }
+}
+
+/// Whether `name` is a typed getter whose slot may legitimately forward
+/// out of its module by ordinary linker interposition: every provider
+/// exports `C_GetFunctionList`, and 3.x providers export the interface
+/// getters, so the first one loaded wins the relocation by name (seen
+/// live under p11-kit-proxy). Only these three names ever verify as
+/// forwards; any other cross-object entry is kept without proof and can
+/// never satisfy the layout exemption.
+pub(crate) fn forwardable_getter(name: &str) -> bool {
+    matches!(
+        name,
+        "C_GetFunctionList" | "C_GetInterface" | "C_GetInterfaceList"
+    )
+}
+
+/// Whether a getter entry forwarded out of its module is a genuine linker
+/// interposition: the pinned target object's own `.dynsym` definitions
+/// must define that SAME name exactly at the entry's file offset. The
+/// dynamic linker resolves that relocation by name, so a genuine forward
+/// always satisfies this; a wrong export, a stale mapping, or a
+/// non-provider target (no standard exports) stays unproven and the entry
+/// is refused at bind time, keeping export agreement fail-closed. Pure
+/// over caller-held pin evidence — no I/O. Both bind paths
 /// ([`bind_scanned_modules`] and the conservative cursor's `EntryResolve`)
-/// apply it identically.
+/// apply it identically. Amendment 22:45 2026-11-11: generalized past
+/// `C_GetFunctionList` to the two 3.x interface getters, which interpose
+/// the same way; the standard-layout core exempts only forwards verified
+/// here.
 pub(crate) fn forwarded_bootstrap_verified(
     entry: &ScannedEntry,
     target_exports: &[(String, u64)],
 ) -> bool {
-    entry.name == "C_GetFunctionList"
+    forwardable_getter(entry.name)
         && target_exports
             .iter()
             .any(|(name, offset)| name == entry.name && *offset == entry.file_offset)
@@ -8687,19 +8727,20 @@ pub fn bind_scanned_modules(
                             (Some(target), Some(provider)) if target == provider
                         ) =>
                     {
-                        // A cross-object bootstrap forward must resolve by
+                        // A cross-object getter forward must resolve by
                         // name in the pinned target's own exports; anything
                         // else is refused, keeping export agreement
                         // fail-closed (see `forwarded_bootstrap_verified`).
                         if entry.object != module.key
-                            && entry.name == "C_GetFunctionList"
+                            && forwardable_getter(entry.name)
                             && !forwarded_bootstrap_verified(&entry, &pinned.exports_for(id))
                         {
                             let skip = Skipped {
                                 subject: entry.name.to_string(),
                                 reason: format!(
-                                    "{}{UNVERIFIED_FORWARD_REFUSAL}",
-                                    entry.object_path
+                                    "{}{}",
+                                    entry.object_path,
+                                    unverified_forward_refusal(entry.name)
                                 ),
                             };
                             table.unpinned.push(skip.clone());
@@ -10073,6 +10114,116 @@ mod tests {
             &entry,
             &[("C_Login".to_string(), 0x30)]
         ));
+    }
+
+    #[test]
+    fn forwarded_interface_getter_verifies_only_the_named_definition_at_its_offset() {
+        // Amendment 22:45 2026-11-11: the verified-forward check
+        // generalizes past `C_GetFunctionList` to the two 3.x interface
+        // getters, which interpose the same way under p11-kit-proxy.
+        for name in ["C_GetInterface", "C_GetInterfaceList"] {
+            let entry = ScannedEntry {
+                name,
+                object: ObjectKey {
+                    device: Device { major: 8, minor: 1 },
+                    inode: 43,
+                },
+                object_path: "/opt/dep.so".into(),
+                file_offset: 0xebe0,
+            };
+            // Exact definition: genuine interposition.
+            assert!(
+                forwarded_bootstrap_verified(&entry, &[(name.to_string(), 0xebe0)]),
+                "{name} verifies at its own definition"
+            );
+            // Right name, wrong offset: a stale mapping or hostile craft.
+            assert!(
+                !forwarded_bootstrap_verified(&entry, &[(name.to_string(), 0x20)]),
+                "{name} refuses a wrong offset"
+            );
+            // Right offset, another getter's name: a decoy export sits there.
+            let other = if name == "C_GetInterface" {
+                "C_GetInterfaceList"
+            } else {
+                "C_GetInterface"
+            };
+            assert!(
+                !forwarded_bootstrap_verified(&entry, &[(other.to_string(), 0xebe0)]),
+                "{name} refuses another getter's definition"
+            );
+            // Non-provider target: no standard exports at all.
+            assert!(
+                !forwarded_bootstrap_verified(&entry, &[]),
+                "{name} refuses an export-less target"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_verifies_cross_object_interface_getter_forwards() {
+        // The REQUIRED companion: bind refuses a cross-object
+        // `C_GetInterface`/`C_GetInterfaceList` forward the pinned
+        // target's own `.dynsym` does not define at the forwarded
+        // offset, and keeps a verified one — exactly like the
+        // `C_GetFunctionList` bootstrap. Without this, the layout
+        // exemption would trust decoy interface getters.
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const MISDIRECTED_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterface",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterfaceList",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: MISDIRECTED_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        // The pinned target defines the interface getter at the
+        // verified offset only; the misdirected offset is unproven.
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_GetInterface".to_string(), VERIFIED_OFFSET)]);
+
+        let (bound, skipped) = bind_scanned_modules(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| {
+                entry.name == "C_GetInterface" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the verified interface forward binds: {entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.name == "C_GetInterfaceList"),
+            "the misdirected interface-list forward never binds: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the misdirected forward refuses");
+        assert_eq!(skipped[0].subject, "C_GetInterfaceList");
+        assert!(
+            skipped[0].reason.contains("C_GetInterfaceList")
+                && skipped[0].reason.contains("not attached"),
+            "the refusal names the check and the outcome: {}",
+            skipped[0].reason
+        );
     }
 
     /// The Final candidate may reuse the First build only when the rescan
@@ -16710,10 +16861,13 @@ mod tests {
         let target = source
             .id_for_scanned(&raw[1], raw[1].key, &raw[1].path)
             .expect("the second provider is pinned");
-        source.by_id.get_mut(&target).unwrap().exports =
-            Arc::from(vec![("C_GetFunctionList".to_string(), VERIFIED_OFFSET)]);
+        source.by_id.get_mut(&target).unwrap().exports = Arc::from(vec![
+            ("C_GetFunctionList".to_string(), VERIFIED_OFFSET),
+            ("C_GetInterface".to_string(), VERIFIED_OFFSET),
+        ]);
         // A cross-object forward pair out of the first module: one
-        // genuine interposition (binds), one wrong offset (refused).
+        // genuine interposition (binds), one wrong offset (refused) —
+        // plus the interface-getter twins, which verify the same way.
         let forward_key = raw[1].key;
         let forward_path = raw[1].path.clone();
         assert_ne!(forward_key, raw[0].key);
@@ -16725,6 +16879,18 @@ mod tests {
         });
         raw[0].tables[0].entries.push(ScannedEntry {
             name: "C_GetFunctionList",
+            object: forward_key,
+            object_path: forward_path.clone(),
+            file_offset: MISDIRECTED_OFFSET,
+        });
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterface",
+            object: forward_key,
+            object_path: forward_path.clone(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterfaceList",
             object: forward_key,
             object_path: forward_path,
             file_offset: MISDIRECTED_OFFSET,
@@ -16761,6 +16927,26 @@ mod tests {
             }),
             "the wrong offset refuses with the shared reason: {expected_skips:?}"
         );
+        assert!(
+            expected_entries.iter().any(|entry| {
+                entry.name == "C_GetInterface" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the verified interface forward binds: {expected_entries:?}"
+        );
+        assert!(
+            !expected_entries
+                .iter()
+                .any(|entry| entry.name == "C_GetInterfaceList"),
+            "the misdirected interface-list forward never binds: {expected_entries:?}"
+        );
+        assert!(
+            expected_skips.iter().any(|skip| {
+                skip.subject == "C_GetInterfaceList"
+                    && skip.reason.contains("C_GetInterfaceList")
+                    && skip.reason.contains("not attached")
+            }),
+            "the misdirected interface list refuses naming the check: {expected_skips:?}"
+        );
         // The cursor must reach the same binding over finite credits.
         let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
         let held = pool.snapshot().charged_bytes;
@@ -16788,6 +16974,21 @@ mod tests {
                     && skip.reason.contains(UNVERIFIED_FORWARD_REFUSAL)
             }),
             "the cursor refuses the wrong offset: {:?}",
+            rebind.skipped().unwrap()
+        );
+        assert!(
+            actual_entries.iter().any(|entry| {
+                entry.name == "C_GetInterface" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the cursor binds the verified interface forward: {actual_entries:?}"
+        );
+        assert!(
+            rebind.skipped().unwrap().iter().any(|skip| {
+                skip.subject == "C_GetInterfaceList"
+                    && skip.reason.contains("C_GetInterfaceList")
+                    && skip.reason.contains("not attached")
+            }),
+            "the cursor refuses the misdirected interface list: {:?}",
             rebind.skipped().unwrap()
         );
         // Byte accounting covers the new refusal suffix.

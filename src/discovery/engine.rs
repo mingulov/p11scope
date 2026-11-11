@@ -26674,9 +26674,10 @@ impl Engine {
         // remember the set the first build starts from.
         let saved_rejected_keys = self.pending_rejected_keys.clone();
         // First-candidate reuse fences: the inputs the First build is
-        // about to consume and the pin-set generation it clones. The
-        // Final build may reuse the First candidate only if every fence
-        // still matches there.
+        // about to consume, the pin-set generation it clones, and the
+        // changed-latch flags it clones (a `Cell` latch bumps no
+        // version). The Final build may reuse the First candidate only
+        // if every fence still matches there.
         #[cfg(not(test))]
         let reuse_enabled = true;
         #[cfg(test)]
@@ -26685,6 +26686,7 @@ impl Engine {
         let first_declined = declined.clone();
         let first_new_view_ids: Vec<_> = new_views.iter().map(|(view, _, _)| view.id()).collect();
         let first_pinned_fence = (self.pinned.revision(), self.pinned.copy_version());
+        let first_pinned_changed = self.pinned.changed_flags_snapshot();
         let (candidate, first_direct) = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::First,
@@ -27093,10 +27095,11 @@ impl Engine {
         // Reuse the First candidate as the Final one only when the Final
         // build would consume identical inputs against identical state:
         // same removed/declined/new-view sets, rescans with identical
-        // module and pin content, an unchanged committed plan, pin set,
-        // facts revision and counters, and no selection state for the
-        // candidate tail to re-derive against the live loader registry.
-        // Anything else rebuilds exactly as before.
+        // module and pin content, an unchanged committed plan, pin set
+        // and changed-latch flags, facts revision and counters, and no
+        // selection state for the candidate tail to re-derive against
+        // the live loader registry. Anything else rebuilds exactly as
+        // before.
         let reuse_first = reusable_first.is_some()
             && !self.force_full_candidate
             && removed == first_removed
@@ -27106,6 +27109,7 @@ impl Engine {
                 .map(|(view, _, _)| view.id())
                 .eq(first_new_view_ids.iter().copied())
             && (self.pinned.revision(), self.pinned.copy_version()) == first_pinned_fence
+            && self.pinned.changed_flags_snapshot() == first_pinned_changed
             && first_plan_fence.is_some_and(|fence| fence.check(&self.plan).is_ok())
             && (
                 self.capture_facts.next_module_id,

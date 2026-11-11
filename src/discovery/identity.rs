@@ -1410,6 +1410,32 @@ impl PinnedObjects {
         })
     }
 
+    /// Cheap snapshot of the changed-latch flags: the global
+    /// `provider_changed` bit plus every entry's per-object bit in
+    /// capture-local id order. The First-candidate reuse fence compares
+    /// this across the tick's two builds: `check_unchanged` latches
+    /// through `Cell`s without bumping any version, so the
+    /// revision/copy-version fence cannot see a between-builds latch.
+    pub(crate) fn changed_flags_snapshot(&self) -> (bool, Vec<(PinnedObjectId, bool)>) {
+        (
+            self.changed.get(),
+            self.by_id
+                .iter()
+                .map(|(id, entry)| (*id, entry.changed.get()))
+                .collect(),
+        )
+    }
+
+    /// Whether two pin sets carry identical changed-latch flags: the
+    /// global bit and every entry's per-object bit, matched by
+    /// capture-local id. Membership or id differences compare unequal
+    /// (fail closed: the caller rebuilds instead of reusing). Test-only:
+    /// production compares `changed_flags_snapshot` across the tick.
+    #[cfg(test)]
+    pub(crate) fn same_changed_flags(&self, other: &Self) -> bool {
+        self.changed_flags_snapshot() == other.changed_flags_snapshot()
+    }
+
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.bump_copy_version();
@@ -10072,6 +10098,68 @@ mod tests {
         assert!(
             !one.same_pin_content(&changed),
             "a changed-byte latch is content"
+        );
+    }
+
+    /// The reuse fence compares the committed changed-latch flags across
+    /// the tick's two builds, so the comparison must catch a global or a
+    /// per-entry latch on either side — including a newly latched entry
+    /// under an already-true global — while identical latches match.
+    #[test]
+    fn same_changed_flags_catches_global_and_per_entry_latches() {
+        let one = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        assert!(
+            one.same_changed_flags(&one),
+            "a pin set matches its own flags"
+        );
+        let clean = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        assert!(one.same_changed_flags(&clean), "two clean pin sets match");
+
+        let latched = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        latched.changed.set(true);
+        assert!(
+            !one.same_changed_flags(&latched),
+            "a global latch breaks the match"
+        );
+        one.changed.set(true);
+        assert!(
+            one.same_changed_flags(&latched),
+            "identical global latches match"
+        );
+        one.changed.set(false);
+
+        let entry_latched = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        entry_latched
+            .by_id
+            .values()
+            .next()
+            .unwrap()
+            .changed
+            .set(true);
+        assert!(
+            !one.same_changed_flags(&entry_latched),
+            "a per-entry latch breaks the match"
+        );
+        one.by_id.values().next().unwrap().changed.set(true);
+        assert!(
+            one.same_changed_flags(&entry_latched),
+            "identical per-entry latches match"
+        );
+
+        // A newly latched entry under an already-true global: the global
+        // bit alone cannot see it, the per-entry bits must.
+        entry_latched.changed.set(true);
+        let both_global = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        both_global.changed.set(true);
+        assert!(
+            !entry_latched.same_changed_flags(&both_global),
+            "a per-entry difference under identical globals breaks the match"
+        );
+
+        let fewer = pin_set(&[(overlay(102), SHA, 7)], false);
+        assert!(
+            !one.same_changed_flags(&fewer),
+            "membership differences fail closed"
         );
     }
 

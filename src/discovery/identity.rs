@@ -8091,6 +8091,33 @@ impl PrearmPinError {
 /// the already-pinned manifest inputs (`prior_objects`/`prior_bytes`
 /// against the same 512-object/512-MiB caps); admission caps are unchanged
 /// and no new knobs are added.
+/// One pre-arm pin request: the filesystem path to open plus the
+/// spelling the record carries. Operator pins open and record the same
+/// spelling; learned files open a held fd (`/proc/self/fd/N`) and record
+/// the readlink display path. Identity always comes from the opened
+/// file; the display is messages and records only, never identity.
+#[derive(Debug, Clone)]
+pub(crate) struct PrearmPinRequest {
+    open: PathBuf,
+    display: String,
+}
+
+impl PrearmPinRequest {
+    /// Opens and records one spelling (operator pins).
+    pub(crate) fn path(path: PathBuf) -> Self {
+        Self {
+            display: path.to_string_lossy().into_owned(),
+            open: path,
+        }
+    }
+
+    /// Opens `open`, records `display` (learned files: the held fd plus
+    /// the readlink spelling).
+    pub(crate) fn open_with_display(open: PathBuf, display: String) -> Self {
+        Self { open, display }
+    }
+}
+
 pub(crate) fn pin_prearm_objects_in_views_with_budget(
     paths: &[PathBuf],
     views: &[ProcessView],
@@ -8099,8 +8126,31 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
     prior_bytes: u64,
     budget: &mut CaptureWorkBudget,
 ) -> Result<PrearmPinning, PrearmPinError> {
+    let requests: Vec<PrearmPinRequest> =
+        paths.iter().cloned().map(PrearmPinRequest::path).collect();
+    pin_prearm_requests_in_views_with_budget(
+        &requests,
+        views,
+        named_pid,
+        prior_objects,
+        prior_bytes,
+        budget,
+    )
+}
+
+/// Pins pre-arm requests: same worker discipline as
+/// [`pin_prearm_objects_in_views_with_budget`], except each request opens
+/// its `open` path and records its `display` spelling.
+pub(crate) fn pin_prearm_requests_in_views_with_budget(
+    requests: &[PrearmPinRequest],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+) -> Result<PrearmPinning, PrearmPinError> {
     let mut skipped: Vec<Skipped> = Vec::new();
-    if prior_objects.saturating_add(paths.len()) > MAX_OBJECTS {
+    if prior_objects.saturating_add(requests.len()) > MAX_OBJECTS {
         return Err(PrearmPinError::Fatal(vec![format!(
             "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
         )]));
@@ -8109,11 +8159,12 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
     // while good paths continue (never-stop).
     let mut opened = Vec::new();
     let mut total_object_bytes = prior_bytes;
-    for path in paths {
-        let spelling = path.to_string_lossy().into_owned();
+    for request in requests {
+        let spelling = request.open.to_string_lossy().into_owned();
+        let display = request.display.clone();
         if normalize_target_path(&spelling).is_none() {
             skipped.push(Skipped {
-                subject: spelling.clone(),
+                subject: display.clone(),
                 reason: "prearm object unavailable: --prearm-module paths must be absolute".into(),
             });
             continue;
@@ -8130,7 +8181,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         let root = match retained_view_for_manifest_locator(&spelling, views) {
             Ok(Some(view)) => PrearmRoot::NamedView {
                 view,
-                open: path.clone(),
+                open: request.open.clone(),
             },
             Ok(None) => match named_pid {
                 Some(pid) => match views.iter().find(|view| view.pid() == pid) {
@@ -8141,7 +8192,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                     },
                     None => {
                         skipped.push(Skipped {
-                            subject: spelling.clone(),
+                            subject: display.clone(),
                             reason: format!(
                                 "prearm object unavailable: no exact retained process view exists for pid {pid}"
                             ),
@@ -8149,11 +8200,13 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                         continue;
                     }
                 },
-                None => PrearmRoot::Observer { open: path.clone() },
+                None => PrearmRoot::Observer {
+                    open: request.open.clone(),
+                },
             },
             Err(binding_error) => {
                 skipped.push(Skipped {
-                    subject: spelling.clone(),
+                    subject: display.clone(),
                     reason: format!("prearm object unavailable: {binding_error}"),
                 });
                 continue;
@@ -8167,7 +8220,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                     Ok((located, mountinfo)) => (located, Some(mountinfo)),
                     Err(error) => {
                         skipped.push(Skipped {
-                            subject: spelling.clone(),
+                            subject: display.clone(),
                             reason: format!("prearm object unavailable: {error}"),
                         });
                         continue;
@@ -8180,7 +8233,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
             ManifestLocatorOpen::Opened(file) => file,
             ManifestLocatorOpen::Stale => {
                 skipped.push(Skipped {
-                    subject: spelling.clone(),
+                    subject: display.clone(),
                     reason:
                         "prearm object unavailable: the pre-arm file locator no longer resolves"
                             .into(),
@@ -8189,7 +8242,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
             }
             ManifestLocatorOpen::Fatal(error) => {
                 skipped.push(Skipped {
-                    subject: spelling.clone(),
+                    subject: display.clone(),
                     reason: format!("prearm object unavailable: {error}"),
                 });
                 continue;
@@ -8205,7 +8258,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                     Ok(table) => table,
                     Err(error) => {
                         skipped.push(Skipped {
-                            subject: spelling.clone(),
+                            subject: display.clone(),
                             reason: format!("prearm object unavailable: {error}"),
                         });
                         continue;
@@ -8218,7 +8271,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
             Ok(pin) => pin,
             Err(error) => {
                 skipped.push(Skipped {
-                    subject: spelling.clone(),
+                    subject: display.clone(),
                     reason: format!("prearm object unavailable: {error}"),
                 });
                 continue;
@@ -8226,14 +8279,14 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         };
         let Some(total) = total_object_bytes.checked_add(pin.size) else {
             skipped.push(Skipped {
-                subject: spelling.clone(),
+                subject: display.clone(),
                 reason: "prearm object unavailable: total object size overflowed u64".into(),
             });
             continue;
         };
         if total > MAX_TOTAL_OBJECT_BYTES {
             skipped.push(Skipped {
-                subject: spelling.clone(),
+                subject: display.clone(),
                 reason: format!(
                     "prearm object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
                 ),
@@ -8241,7 +8294,7 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
             continue;
         }
         total_object_bytes = total;
-        opened.push((spelling, file, pin, mountinfo));
+        opened.push((display, file, pin, mountinfo));
     }
 
     // Phase 2: identify, hash, bracket and file every opened object.
@@ -19244,5 +19297,41 @@ mod tests {
         assert_eq!(pinning.pins.pinned().count(), 2);
         assert_eq!(pinning.inputs.len(), 2);
         assert!(pinning.skipped.is_empty());
+    }
+
+    /// A learned file pins through its held fd (`/proc/self/fd/N`) while
+    /// the record carries the readlink display path: the open never
+    /// re-resolves a pathname, and identity still resolves under the
+    /// display spelling.
+    #[test]
+    fn prearm_pin_request_opens_fd_path_but_records_display() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("learned.so");
+        std::fs::copy("/bin/sh", &library).unwrap();
+        let held = std::fs::File::open(&library).unwrap();
+        let open = std::path::PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+        let display = library.to_string_lossy().into_owned();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let pinning = pin_prearm_requests_in_views_with_budget(
+            &[PrearmPinRequest::open_with_display(open, display.clone())],
+            &[],
+            None,
+            0,
+            0,
+            &mut budget,
+        )
+        .expect("the held fd pins");
+        assert!(pinning.skipped.is_empty(), "{:?}", pinning.skipped);
+        assert_eq!(pinning.inputs.len(), 1);
+        assert_eq!(pinning.inputs[0].path, display);
+        let object = pinning
+            .pins
+            .id_for_prearm(pinning.inputs[0].key, &pinning.inputs[0].path)
+            .expect("identity resolves under the display spelling");
+        let pin = pinning.pins.summary(object).expect("pinned");
+        let held_meta = held.metadata().unwrap();
+        assert_eq!(pin.key.inode, held_meta.ino());
     }
 }

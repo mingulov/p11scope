@@ -276,7 +276,7 @@ class InitialProducerTest(unittest.TestCase):
         path = Path(directory)
         source = next(path.glob("*.ledger.jsonl"))
         backend = argv[argv.index("--attach-backend") + 1]
-        owner = self.real_spawn(owners, [sys.executable, "-c", OBSERVER, str(source), argv[-1],
+        owner = self.real_spawn(owners, [sys.executable, "-c", OBSERVER, str(source), argv[argv.index("-o") + 1],
             backend, "yes" if "--system" in argv else "no"], os.getuid(), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
         self.spawned.append(owner)

@@ -204,7 +204,13 @@ the five. **Do not simply drop `SYS_ADMIN`** without adding
 needs `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` (without either,
 those callers are reported as `map_files_unavailable`). Prove a node
 with `--command doctor`: `uprobe attach (self) ... ok` and `verdict:
-capture available`.
+capture available`. Pod Security Admission still demands the
+`privileged` level for the narrow set (measured 2026-11-11 on kind
+0.33, Kubernetes v1.37: `restricted` forbids the pods naming
+`hostPID`, all five capabilities, the `hostPath` volume and
+`runAsNonRoot`; `baseline` forbids the capabilities, `hostPID` and
+the `hostPath` volume; `privileged` runs 1/1 for both sets), so the
+namespace label in `00-namespace.yaml` stays as is.
 
 ### Blast radius
 

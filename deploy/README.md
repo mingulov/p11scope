@@ -24,6 +24,11 @@
 - [`seccomp-p11scope.json`](seccomp-p11scope.json) — the vendored Docker
   default seccomp profile plus one `bpf()` allow rule, for engines whose
   default cannot be used and for Kubernetes `Localhost` profiles (below).
+- [`apparmor-p11scope`](apparmor-p11scope) — the Docker default AppArmor
+  profile plus one `ptrace (read, trace) peer=unconfined` rule, for
+  AppArmor-enforcing hosts (below). Load once per host with
+  `apparmor_parser -r deploy/apparmor-p11scope`, then pass
+  `--security-opt apparmor=p11scope-observer`.
 
 The observer image is published on releases as
 `ghcr.io/mingulov/p11scope:<version>` (see `RELEASING.md`); the holder image
@@ -41,8 +46,10 @@ docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
   ghcr.io/mingulov/p11scope:latest doctor
 ```
 
-(On AppArmor hosts add `--security-opt apparmor=unconfined`; on
-SELinux-enforcing hosts `--security-opt label=disable`. The example tag is
+(On AppArmor hosts load [`apparmor-p11scope`](apparmor-p11scope) and
+add `--security-opt apparmor=p11scope-observer` (`apparmor=unconfined`
+also works but drops the confinement); on SELinux-enforcing hosts no
+extra flag is needed (measured 2026-11-11, below). The example tag is
 published with the 0.7.0 release; before that, substitute a locally built
 image tag from the recipe below.)
 
@@ -88,6 +95,45 @@ allow rule for `bpf()`; the vendored 31 groups are byte-identical to
 upstream. `perf_event_open()` stays at the default (conditional),
 proven unneeded on the default uprobe-multi lane. The same five-cap
 matrix is exact with this file on Docker 29.7/29.8/29.9.
+
+Mandatory access control and kernel knobs (measured 2026-11-11):
+
+- SELinux (Fedora, Enforcing, Docker 29.7/29.9): both capability sets
+  capture exactly with the engine's default labeling — no
+  `--security-opt label` flag, no policy module. `--pid=host`
+  containers run as `system_u:system_r:spc_t:s0` (bisected: plain and
+  five-cap-only containers get `container_t` with MCS categories;
+  adding `--pid=host` switches to `spc_t`), under which BPF,
+  perf-event, ptrace-mode and `/proc` reads are allowed; the audit
+  log held zero AVC denials across every run. Rootful Podman 5.8
+  behaves the same (`doctor` exits 0, `capture available`, `spc_t`,
+  no AVCs). Confined *target* workloads keep working: the observer
+  reads a `container_t` victim's maps and counts it exactly (bind
+  mounts into a confined victim need the usual `:z` suffix).
+- AppArmor (Ubuntu 26.04, enforcing, Docker 29.8.1): the stock
+  `docker-default` profile blinds the host observer — it lacks
+  `ptrace read` to `unconfined` peers, so `/proc` scans see almost
+  nothing (`inventory --system` exits 0 with 2 callers and 0
+  providers while `doctor` still passes). [`apparmor-p11scope`]
+  (apparmor-p11scope) is that default plus exactly one rule,
+  `ptrace (read, trace) peer=unconfined` (maps snapshots need
+  read; `/proc/<pid>/mem` scans and profile attach need trace),
+  and restores the five-cap matrix: `doctor` `capture available`,
+  ledgered `profile --pid` multiset-exact, `inventory --system`
+  back to host visibility (142 callers, 5 providers vs 2/0 under
+  `docker-default`). Confined peers (snap, cups, chronyd) stay
+  unreadable by design and degrade with named gaps.
+- Kernel knobs: `doctor` already reports `lockdown`,
+  `kernel.perf_event_paranoid`, `kernel.yama.ptrace_scope` and
+  `cgroup version` rows. The default uprobe-multi lane attaches
+  through links that `perf_event_paranoid` does not gate (measured
+  exact at paranoid 2 on Fedora and 4 on Ubuntu); only the
+  `--attach-backend singles` fallback opens per-probe perf events.
+  `kernel.unprivileged_bpf_disabled` is not reported because the
+  observer always loads BPF with a BPF-capable capability held, so
+  the unprivileged gate never applies. cgroup v1 is not supported
+  (`doctor` fails the `cgroup version` row without a unified
+  hierarchy); all measured hosts run cgroup v2.
 
 To rebuild the development image from this tree instead
 (`scripts/kind-e2e.sh` shows the exact steps, repeatable but not

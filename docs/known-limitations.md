@@ -36,6 +36,16 @@ The following limits are new or changed in v0.7.0. Limits from
 [Known limitations in 0.6.0](#known-limitations-in-060) below still
 apply unless a subsection here says otherwise.
 
+### Host-run observer cannot scan confined containers on SELinux hosts
+
+On SELinux-enforcing hosts, an unconfined host process gets EACCES
+reading `/proc/<pid>/maps` of `container_t` processes (measured
+2026-11-11 on Fedora; the denial is dontaudit-silent, so no AVC is
+logged), which covers the maps snapshots a host-run observer takes
+of container targets. Prefer the container recipe on SELinux hosts:
+`--pid=host` observer containers run as `spc_t`, which reads confined
+maps and counts a confined victim exactly.
+
 ### Counter and journal companions at the wide profile
 
 Detailed per-call capture now plans 2,112 attach slots, but its counter

@@ -146,7 +146,9 @@ docker run --rm $FLAGS $IMG inventory --system --duration 15s
 docker run --rm $FLAGS $IMG profile --system --duration 30s
 ```
 
-(Add `--security-opt apparmor=unconfined` where AppArmor is enforcing.)
+(Where AppArmor is enforcing, load `deploy/apparmor-p11scope` once
+with `apparmor_parser -r` and add
+`--security-opt apparmor=p11scope-observer`.)
 
 Least privilege (measured 2026-11-11; no `--privileged`, no
 `CAP_SYS_ADMIN`) captures the same demo exactly with the narrow
@@ -180,7 +182,11 @@ AppArmor opt. Without the opt, `inventory` still exits 0 but sees almost
 nothing (2 callers, 0 providers), while `doctor` still passes — so where
 AppArmor is enforcing, the opt is what makes captures see processes.
 The least-privilege set behaves the same (measured 2026-11-11: 188
-callers with the opt, 2 without).
+callers with the opt, 2 without). The opt used to be
+`apparmor=unconfined`; the shipped [`apparmor-p11scope`](../deploy/apparmor-p11scope)
+profile (the Docker default plus one `ptrace (read, trace)` rule)
+keeps the confinement and measures the same (142 callers, 5
+providers, ledgered `profile --pid` multiset-exact).
 
 Rootless Docker or Podman cannot work: BPF loading and uprobes need real
 host capabilities, which a rootless container cannot grant. Use rootful

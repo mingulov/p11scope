@@ -61,6 +61,15 @@ versioned separately and are opaque, exact dispatch keys.
   one `bpf()` allow) for older engines, custom daemon defaults and
   Kubernetes `Localhost` profiles. The shipped `SYS_ADMIN` default is
   unchanged. <!-- lane: nosysadmin -->
+- AppArmor-enforcing hosts get `deploy/apparmor-p11scope` (the Docker
+  default profile plus one `ptrace (read, trace) peer=unconfined`
+  rule), which captures the least-privilege matrix exactly without
+  `apparmor=unconfined`; SELinux-enforcing hosts need no extra flag
+  (`--pid=host` containers run as `spc_t`, measured exact with zero
+  AVCs), and Pod Security Admission keeps demanding the `privileged`
+  level for both capability sets (measured denials name hostPID, the
+  capabilities and the hostPath volume).
+  <!-- lane: nosysadmin -->
 
 ### Changed
 

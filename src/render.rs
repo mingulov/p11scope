@@ -15850,6 +15850,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn profile_json_cgroup_mechanism_rows_carry_attribution_basis() {
+        // Per-cgroup rows disclose the same attribution basis as the
+        // root rows, from that cgroup's own observations: a consumer
+        // splitting by cgroup must not have to borrow the merged
+        // root authority. This plan's slot is confirmed, so both
+        // levels read "manifest".
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut event = init_event(0, 0x0D, 0, 0, 0, 0);
+        event.cgroup_id = 111;
+        state.observe(&event);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+        assert_eq!(v["mechanisms"][0]["attribution_basis"], "manifest");
+        let rows = v["cgroups"][0]["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["attribution_basis"], "manifest");
+    }
+
+    #[test]
     fn profile_json_cgroup_rows_carry_workload_labels() {
         use std::os::unix::fs::MetadataExt as _;
         // Churn twin at the JSON seam: the pod's cgroup existed at

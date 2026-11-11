@@ -8786,6 +8786,88 @@ mod tests {
         assert_eq!(plan.standard_layout_slot_count(), 68);
     }
 
+    fn move_entry_aside(module: &mut ReconciledModule, name: &str, unpinned: bool) {
+        // Move one retained entry out of `entries` the way decode /
+        // reconciliation does: the decoded slot count is preserved
+        // (entries + NULL holes + unpinned), only its disposition
+        // changes.
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .expect("entry to move aside");
+        let entry = table.entries.remove(position);
+        module.entry_objects[0].remove(position);
+        if unpinned {
+            table.unpinned.push(Skipped {
+                subject: entry.name.to_string(),
+                reason: "target not pinned to a comparable object".into(),
+            });
+        } else {
+            table.null_entries.push(entry.name);
+        }
+        assert_eq!(
+            module.scanned.tables[0].decoded_slot_count(),
+            68,
+            "the decoded extent is preserved either way"
+        );
+    }
+
+    #[test]
+    fn interface_linked_table_with_unpinned_nonnull_stays_count_only() {
+        // Ruling clause 1 requires every non-NULL slot to point into
+        // the provider's own executable text. An unpinned record is
+        // a non-NULL target that proof never covered, so dropping it
+        // cannot establish whole-table layout evidence for its
+        // neighbors: the linked leg refuses like sole/getter do.
+        let mut module = interface_linked_module();
+        move_entry_aside(&mut module, "C_GetInfo", true);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(
+            plan.slots.len(),
+            67,
+            "the usable observations remain available"
+        );
+        assert_plan_count_only(&plan, "linked table with an unpinned non-NULL entry");
+    }
+
+    #[test]
+    fn live_return_subset_table_with_unpinned_nonnull_stays_count_only() {
+        // The live-return leg carries the same whole-table core: an
+        // unusable non-NULL target in the returned extent refuses
+        // semantic authority for the remaining slots.
+        let mut module = live_return_module();
+        move_entry_aside(&mut module, "C_GetInfo", true);
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            plan.slots.len(),
+            67,
+            "the usable observations remain available"
+        );
+        assert_plan_count_only(&plan, "live-return table with an unpinned non-NULL entry");
+    }
+
+    #[test]
+    fn interface_linked_table_with_null_hole_keeps_standard_authority() {
+        // A NULL hole is not an unproven non-NULL target: clause 1
+        // only constrains non-NULL slots, so the remaining own-text
+        // entries keep standard-layout authority (OD35).
+        let mut module = interface_linked_module();
+        move_entry_aside(&mut module, "C_GetInfo", false);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 67);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a NULL hole does not refuse the linked grant"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 67);
+    }
+
     fn observed_event(slot: u32, mechanism: u64, capture: u32) -> p11scope_ebpf_common::Event {
         p11scope_ebpf_common::Event {
             ts_ns: 100,

@@ -1080,6 +1080,44 @@ class SchemaOracleAgreement(unittest.TestCase):
             set(evidence_schema()["required"]), set(CHECKER["BASE_EVIDENCE_KEYS"])
         )
 
+    def test_unregistered_standard_layout_mechanisms_registered(self):
+        """The producer's always-emitted withheld-count field is a
+        required, informational u64 in the closed evidence shape: zero
+        and nonzero pass without moving completeness, malformed values
+        and historical documents carrying it are refused, and the
+        machine schema names it beside the other base counters."""
+        field = "unregistered_standard_layout_mechanisms"
+        for value in (0, 3):
+            with self.subTest(value=value):
+                document = self.metrics_document()
+                document["evidence"][field] = value
+                CHECKER["exact_metrics_schema"](document)
+                self.assertEqual(
+                    document["evidence"]["completeness"],
+                    self.metrics_document()["evidence"]["completeness"])
+        for value in (-1, True, 2**64, "3", None):
+            with self.subTest(value=value):
+                document = self.metrics_document()
+                document["evidence"][field] = value
+                with self.assertRaisesRegex(AssertionError, field):
+                    CHECKER["exact_metrics_schema"](document)
+        missing = self.metrics_document()
+        missing["evidence"].pop(field, None)
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}),
+            schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn(field, historical["evidence"])
+        historical["evidence"][field] = 0
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+        self.assertIn(field, evidence_schema()["required"])
+        self.assertEqual(
+            evidence_schema()["properties"][field],
+            {"type": "integer", "minimum": 0})
+
     def test_profile_branch_requires_versioned_only_fields(self):
         """The lane==profile branch requires exactly the 4 versioned-only
         fields; the metrics branch forbids them plus the profile-only

@@ -51,8 +51,11 @@ companions at the wide profile is 0.7.x work.
 A retired attach slot revives only when the same provider target
 returns: same-file churn reuses its slot, but a different newcomer
 still consumes fresh lifetime budget, so distinct-file churn can
-starve at the cap. General slot reuse across different targets is
-0.7.x work.
+starve at the cap. A true retire-to-revive live cell (map, all
+mappers exit, remap with same-index reuse) has not been run; 0.7.0
+accepts the quarantine/revival probe plus unit twins as revival
+evidence. General slot reuse across different targets is 0.7.1
+work.
 
 ### Changed-evidence revival at a full budget drops ticks
 

@@ -72062,3 +72062,149 @@ fn complete_initial_arming_stops_between_views_with_a_named_gap() {
         gap.reason
     );
 }
+
+/// Startup B4 twin (positive): a clean post-ready completion with a nonzero
+/// arming window names the window as a counted gap — calls into providers
+/// armed in that window before their hooks attached were not counted. The
+/// window is forced through the test seam (scripted arms take
+/// microseconds); the gap must reach both the counters and the published
+/// plan skip list.
+#[test]
+fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(11);
+    let mut session = ScriptedSession::default();
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    let gap = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "initial loader arming")
+        .expect("the post-ready window names its gap");
+    assert!(
+        gap.reason.contains("11ms") && gap.reason.contains("were not counted"),
+        "the gap names the window and the uncounted calls: {}",
+        gap.reason
+    );
+    assert!(
+        engine
+            .plan
+            .skipped
+            .iter()
+            .any(|skip| skip.subject == "initial loader arming"),
+        "the window gap reaches the published plan skip list"
+    );
+}
+
+/// Startup B4 twin (negative): gated views arm nothing post-ready, so even
+/// a long forced window files no gap — no provider armed in it whose early
+/// calls could have been missed.
+#[test]
+fn complete_initial_arming_files_no_window_gap_when_nothing_armed() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    // Provider-free views under system scope stay exploratory: the arming
+    // gate skips them, so the completion attempts no arm.
+    engine.scope = Scope::System;
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(9000);
+    let mut session = ScriptedSession::default();
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("gated completion runs");
+    assert_eq!(engine.loader_arms(), 0, "no arm is attempted");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "initial loader arming"),
+        "no window gap without a post-ready arm: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Startup B4 twin (negative): a zero-millisecond window files no gap even
+/// with armed providers — below the clock's millisecond there is no window
+/// to name.
+#[test]
+fn complete_initial_arming_files_no_window_gap_when_arming_instant() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(0);
+    let mut session = ScriptedSession::default();
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert!(
+        engine.loader_arms() > 0,
+        "the completion armed providers post-ready"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "initial loader arming"),
+        "no window gap for an instant arming: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Startup B4 twin (no double count): a stop during the completion already
+/// names the unvisited remainder, so the window gap stays unfiled — one
+/// `initial loader arming` gap per capture, never two stacked entries.
+#[test]
+fn complete_initial_arming_stop_files_a_single_initial_arming_gap() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    engine.initial_arming_window_ms_for_test = Some(11);
+    let mut session = ScriptedSession::default();
+    let stop = std::rc::Rc::new(Cell::new(false));
+    session.before_dynamic_loader_attach = Some(Box::new({
+        let stop = std::rc::Rc::clone(&stop);
+        move || stop.set(true)
+    }));
+    engine
+        .complete_initial_arming(&mut session, &|| stop.get())
+        .expect("a stop during arming is not an error");
+    let gaps: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "initial loader arming")
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "exactly one initial-arming gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        gaps[0].reason.contains("not visited"),
+        "the single gap is the stop remainder: {}",
+        gaps[0].reason
+    );
+    assert!(
+        !gaps[0].reason.contains("were not counted"),
+        "the stop gap does not stack the window wording: {}",
+        gaps[0].reason
+    );
+}

@@ -973,6 +973,12 @@ pub struct Engine {
     /// without a matching allocation.
     #[cfg(test)]
     view_log: Vec<ViewLogEntry>,
+    /// Test-only: force the post-ready initial-arming window to this many
+    /// milliseconds. `None` measures the real clock. Scripted completions
+    /// arm in microseconds, so the window twin pins a nonzero window
+    /// through this seam instead of racing the clock.
+    #[cfg(test)]
+    initial_arming_window_ms_for_test: Option<u64>,
 }
 
 /// Consecutive drops that keep serviced requests queued for retry
@@ -11459,6 +11465,8 @@ impl Engine {
             names_inspected: Cell::new(0),
             #[cfg(test)]
             view_log: Vec::new(),
+            #[cfg(test)]
+            initial_arming_window_ms_for_test: None,
         }
     }
 

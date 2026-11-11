@@ -648,20 +648,14 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         # The decided no-witness shape qualifies on every leg, so the
         # uniform inline gate must not list inventory-cgroup in
         # expected_cells — while still requiring the cell itself.
-        # The wide default build additionally lists the 9
-        # counter/select-endpoint cells as expected failures.
+        # The wide default build carries counter objects, so the 9
+        # counter/select-endpoint cells run positive and stay out.
         job = job_body(self.yml, "public-cli")
         gate = re.search(r"expected_cells = \{(.*?)\}", job, re.S)
         self.assertIsNotNone(gate, "public-cli has no expected_cells gate")
         self.assertEqual(set(re.findall(r'"([^"]+)"', gate.group(1))),
                          {"profile-cgroup", "trace-cgroup",
-                          "profile-pid-ia32", "run-ia32",
-                          "counter-latency-mt",
-                          "counter-counts-pid", "counter-timestamps-pid",
-                          "counter-latency-pid", "counter-counts-system",
-                          "counter-timestamps-system",
-                          "counter-latency-system",
-                          "select-endpoint-pid", "select-endpoint-system"})
+                          "profile-pid-ia32", "run-ia32"})
         need = re.search(r"need = \{(.*?)\}", job, re.S)
         self.assertIsNotNone(need, "public-cli has no need set")
         self.assertIn("inventory-cgroup", need.group(1),

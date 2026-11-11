@@ -48004,7 +48004,7 @@ fn deferring_frames_still_admit_a_late_provider_within_the_bound() {
                 .iter()
                 .any(|module| module.scanned.path == late_provider)
     };
-    let mut frame = |engine: &mut Engine, offset: u32| {
+    let frame = |engine: &mut Engine, offset: u32| {
         let mut session = ScriptedSession::default();
         session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
             exec_record_for(FAKE_PID_FLOOR + 300 + offset),

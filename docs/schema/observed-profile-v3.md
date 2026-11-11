@@ -594,11 +594,15 @@ absent means undisclosed, and an explicitly empty list reads as exact only
 with an R2-D1-6 proof behind it. Key presence never proves exactness.
 Modules the fanotify drain staged also carry `first_loaded_by`:
 `{exe, exe_unknown_reason, pre_attach_loads}`. `exe` is the loading
-program's `/proc/<pid>/exe` link text read at first sight (lossy
-UTF-8), resolved from a reuse-immune pidfd handle;
-`exe_unknown_reason` is exactly `loader exe link unreadable` when the
-link could not be read (the loader usually already exited). Exactly
-one of the two is non-null. `pre_attach_loads` is a saturating u64
+program's `/proc/<pid>/exe` link text (lossy UTF-8), read at event
+receipt from the pid in the event pidfd's fdinfo and bracketed by
+pidfd liveness, so an exited-and-recycled pid is never named; a
+loader that exec'd a different program between the open and the read
+can be named by its new image, and one-shot loaders usually exit
+first and read unknown instead. `exe_unknown_reason` is exactly
+`loader exe link unreadable` in those cases. Exactly one of the two
+is non-null. A file first staged at capture end publishes the same
+record explicitly unattached (no objects, no watch). `pre_attach_loads` is a saturating u64
 count of distinct loader processes observed opening the file before
 it staged; loads between staging and attach are covered by the
 module's unobserved window, not this count, and the count is not a

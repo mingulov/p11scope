@@ -71,7 +71,9 @@ which publishes the implemented per-caller parentage below,
 and [pid-scope caller executable](#pid-scope-caller-executable-v070),
 which names the pid-scope target exe in profile/metrics below,
 and [foreign target root path in gap reasons](#foreign-target-root-path-in-gap-reasons-v070),
-which documents the implemented chroot/container gap publication below; owner approval pending.**
+which documents the implemented chroot/container gap publication below; owner approval pending,
+and [learned provider file first loader](#learned-provider-file-first-loader-v070),
+which names the fanotify-learned file's first loading program below (owner direction 2026-11-11: program paths publish).**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -2143,3 +2145,28 @@ owner sign-off. Allowlist-v1 bytes are unchanged.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Target root path in foreign-root gap reasons (`(target root … differs from the observer root)` suffix) | The `/proc/<pid>/root` link text (readlink) of a process view whose root differs from the observer's, read at most once per failed mapping open and only when the root is already known foreign. The link is display-only: no file is opened through it, and the open's identity guards (mount-table resolution, the self-mapping probe, `mapped_file_guard`) still verify the held descriptor against the maps key. A container target's root renders as `/`; a chroot's as its chroot path. | Public in per-object gap reasons (JSON reports and `-v` text list every object with its suffix), in concise folded lines (one counted line per distinct reason naming the root, with a `--json lists each` pointer), and in the verbose-only discovery-noise sample (first scrubbed sample per class on stderr). The suffix appears only on retained-root open failures. A size-cap or precondition refusal at the target root carries no root; a host-fallback refusal stays part of its retained-root failure and carries it. No retention beyond the gap record itself. | An unreadable link publishes `(target root unreadable: … differs from the observer root)` and never blocks the scan. No PID, argv, environ, PIN, key or payload value reaches output. Required evidence: per-object JSON/`-v` completeness twins, concise-fold twins, and size-cap/precondition separation twins at the scan and rendering seams. |
+
+## Learned provider file first loader (v0.7.0)
+
+**Status: IMPLEMENTED in v0.7.0 for detailed `profile --system` and
+`trace --system` (owner direction 2026-11-11: the learned file's listing
+names its path and the program that first loaded it; program paths may
+publish). Allowlist-v1 and v2 bytes are unchanged; this section
+authorizes the one new disclosure below and no other.** A fanotify drain
+proves opened files from their held bytes (ELF header/dynamic-string
+prefilter, then the shared export parse); only provider-positive files
+are retained, by pinned identity. The drain reads no target memory,
+argv, environ, PIN, key, or payload bytes; file bytes that fail the
+provider proof leave no record (no path, no name) beyond counts.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| First loading program (`first_loaded_by.exe`) on a learned provider module record | The `/proc/<pid>/exe` link text (readlink, lossy UTF-8) of the process whose `FAN_OPEN` the drain received, where the pid comes from the event pidfd's fdinfo and the read is bracketed by pidfd liveness (not exited before, same pid and not exited after), read at event receipt before the ELF proof. No pid number, argv, environ, cwd, comm, payload, key, or PIN is read or retained. The exe is program identity only; it proves no operator attestation and no trust. | Public as `first_loaded_by: {exe, exe_unknown_reason, pre_attach_loads}` on the learned module's discovery record, exactly one of exe / reason non-null, plus the distinct-loader opens count before staging. The learned file's own path publishes as the module path (existing module-path disclosure). Files first staged at capture end publish the same record explicitly unattached. | A loader already exited, unreadable, or lost to the bracket reads the finite `loader exe link unreadable` reason and the file still stages. A recycled pid is never named (bracket). Residual: a loader that exec's a different program between the open and the drain's read can be named by its new image; one-shot loaders usually exit first and read unknown. Required evidence: live/exited pidfd-bracket twins, pin-refusal twin, terminal-record twin, and the two-round system cell. |
+
+Capture cost is bounded and disclosed: finite fanotify queue and marks,
+a per-capture learned-file cap, bounded decision cache, tallies, channel
+and per-tick pins; overload, an unavailable drain, a lost shutdown tail,
+and the cap each file a finite counted gap. The drain thread spawns after
+the post-setup capability shed, so it holds no transient `CAP_SYS_ADMIN`;
+re-marking a filesystem first mounted mid-capture may then fail, which
+the no-events check turns into the unavailable gap instead of silence.

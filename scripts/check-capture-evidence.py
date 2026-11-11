@@ -4882,6 +4882,43 @@ def self_test():
     # back is refused like any other newer base key.
     historical_evidence = copy.deepcopy(clean_evidence)
     historical_evidence.pop("ring_accounting", None)
+    # Learned-file first loader (schema v3 `first_loaded_by`): the closed
+    # object validates in both arms and rejects extra keys (an injected
+    # argv must never ride), both/neither naming, a bad reason, a
+    # non-string exe, and a non-u64 load count.
+    learned_module = dict(discovery_fixture(("prearm",))[0])
+    for good in (
+        {"exe": "/usr/bin/pkcs11-tool", "exe_unknown_reason": None, "pre_attach_loads": 1},
+        {
+            "exe": None,
+            "exe_unknown_reason": "loader exe link unreadable",
+            "pre_attach_loads": 3,
+        },
+    ):
+        exact_prearm_keys(dict(learned_module, first_loaded_by=good))
+    for bad in (
+        {
+            "exe": "/usr/bin/pkcs11-tool",
+            "exe_unknown_reason": None,
+            "pre_attach_loads": 1,
+            "argv": ["-L"],
+        },
+        {"exe": "/usr/bin/pkcs11-tool", "exe_unknown_reason": None},
+        {
+            "exe": "/usr/bin/pkcs11-tool",
+            "exe_unknown_reason": "loader exe link unreadable",
+            "pre_attach_loads": 1,
+        },
+        {"exe": None, "exe_unknown_reason": None, "pre_attach_loads": 1},
+        {"exe": None, "exe_unknown_reason": "gone", "pre_attach_loads": 1},
+        {"exe": 7, "exe_unknown_reason": None, "pre_attach_loads": 1},
+        {"exe": "/usr/bin/pkcs11-tool", "exe_unknown_reason": None, "pre_attach_loads": -1},
+        {"exe": "/usr/bin/pkcs11-tool", "exe_unknown_reason": None, "pre_attach_loads": "1"},
+    ):
+        rejected(
+            lambda bad=bad: exact_prearm_keys(dict(learned_module, first_loaded_by=bad))
+        )
+    print("first_loaded_by closed shape validates both arms and rejects extras: OK")
     historical = document_fixture(
         historical_evidence,
         schema=HISTORICAL_METRICS_SCHEMA,

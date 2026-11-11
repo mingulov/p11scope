@@ -75733,6 +75733,85 @@ fn learned_deleted_held_file_is_refused_not_staged() {
     );
 }
 
+/// A held provider file deleted after the entry link-count check but
+/// before the pin completes is still refused, not staged: the pin
+/// worker would see a stable already-unlinked inode and its hash
+/// bracket would pass, so staging must revalidate the held fd after
+/// pinning, before anything is absorbed or published.
+#[test]
+fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("racing.c");
+    let so = dir.path().join("libracing.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    assert!(
+        file.metadata().unwrap().nlink() > 0,
+        "the file is alive at candidate entry, so the entry check passes"
+    );
+    let display_path = crate::fanotify::display_path_for(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path,
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    // The unlink lands inside staging, past the entry check and
+    // before the pin: exactly the window the entry check cannot see.
+    engine.learned_unlink_before_pin_for_test = Some(so.clone());
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert!(!so.exists(), "the in-staging unlink really fired");
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "a file deleted between check and pin must not stage"
+    );
+    assert!(
+        engine.learned_notes.is_empty(),
+        "a refused deleted file keeps no loader note"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was replaced or deleted before staging; \
+                         it was not learned"
+        }),
+        "the in-window deletion files its finite named refusal: {public:?}"
+    );
+}
+
 /// An unavailable-learning signal from the drain files the finite
 /// unavailable row once: membership-style failures are counted named
 /// gaps, never silently dropped.

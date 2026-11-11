@@ -1012,6 +1012,11 @@ pub struct Engine {
     /// budget counts as spent.
     #[cfg(test)]
     isolation_trial_budget_for_test: Option<usize>,
+    /// Test-only one-shot: unlink this path inside learned staging,
+    /// after the entry link-count check and before the pin, modelling
+    /// a deletion (or rename-over) inside that window.
+    #[cfg(test)]
+    learned_unlink_before_pin_for_test: Option<std::path::PathBuf>,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Test-only one-shot: force the next record-path loader scan to
@@ -11667,6 +11672,8 @@ impl Engine {
             #[cfg(test)]
             isolation_trial_budget_for_test: None,
             #[cfg(test)]
+            learned_unlink_before_pin_for_test: None,
+            #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
             loader_force_record_scan_incomplete: false,
@@ -19567,6 +19574,10 @@ impl Engine {
                 );
             }
             return;
+        }
+        #[cfg(test)]
+        if let Some(path) = self.learned_unlink_before_pin_for_test.take() {
+            let _ = std::fs::remove_file(path);
         }
         // The candidate owns its fd for this whole call, so the pin
         // worker's `/proc/self/fd/N` open cannot dangle.

@@ -376,6 +376,22 @@ running can, intermittently, end without per-key operation tracking
 (reported as `bootstrap_unavailable`). Its calls and counts are still
 recorded. The fix is planned for 0.7.1.
 
+### Warm Firefox already open: its token calls can go uncounted
+
+If Firefox is already running when a `--system` capture starts, its
+sandboxed children can make the softokn provider's identity ambiguous:
+the scan sees a second physical identity for `libsoftokn3.so` through
+a jailed child view, the collision group is refused (`physical
+identity is ambiguous; the collision group was not attached`), the
+module never attaches (verbose: `module has no comparable pinned
+identity; it was not attached`), and the capture counts 0 calls on
+it. Measured: the release candidate counts 0 softokn calls with
+Firefox already open, while the same workload counts about 1,280
+calls without the defect. The run still reports PARTIAL with the
+named gaps. Workaround: start the capture before opening Firefox; a
+Firefox started after the capture begins attaches normally. A fix is
+in review; if it misses this release it lands in 0.7.1.
+
 ### Main thread exits first: a later library load can go unreported
 
 p11scope watches library loads per process. When a program's main

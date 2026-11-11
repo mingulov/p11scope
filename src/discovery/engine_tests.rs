@@ -43458,6 +43458,172 @@ fn e07_metadata_contradiction_in_one_provider_preserves_the_other() {
     );
 }
 
+/// A metadata retirement must release the omitted provider's pins: after a
+/// real `dlclose`, a complete metadata scan retires the unloaded module's
+/// facts, and the deferred complete memory rescans must not keep cloning
+/// its ownership. A later mutation of only the unloaded file must not
+/// poison the capture-wide pin revalidation that gates loader records,
+/// loader catch-up and interface selection for the surviving provider.
+#[test]
+fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
+    let first = E07Provider::dlopen();
+    let second = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![first.path.clone(), second.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert_eq!(before.len(), 2, "both providers are covered: {before:?}");
+    let first_path = first.path.clone();
+    let first_path_text = first_path.display().to_string();
+    let first_module = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id && module.scanned.path == first_path_text)
+        .expect("the first provider module is retained")
+        .clone();
+    let old_id = first_module.object;
+
+    // A real unmap whose file outlives its mapping: dlclose both of the
+    // first provider's handles while its directory and file stay on disk.
+    // SAFETY: both handles are live dlopen results owned by this test.
+    unsafe {
+        libc::dlclose(first.handle);
+        libc::dlclose(first.interposer_handle);
+    }
+    let _keep_first_files = {
+        let no_drop = std::mem::ManuallyDrop::new(first);
+        // SAFETY: `no_drop` is never dropped, so moving the directory
+        // guard out transfers its cleanup without a double dlclose.
+        unsafe { std::ptr::read(&no_drop._dir) }
+    };
+
+    // A complete metadata snapshot now observes only the survivor.
+    let (scan_result, _) = Engine::scan_retained_view_without_memory(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        false,
+        &mut engine.stage_timings,
+    );
+    let (found, _, complete) = scan_result.expect("the metadata snapshot scans");
+    assert!(complete, "the metadata snapshot is complete");
+    assert_eq!(
+        found.len(),
+        1,
+        "only the surviving provider is observed: {found:?}"
+    );
+    assert_eq!(found[0].path, second.path.display().to_string());
+
+    e07_rescan_with_mode(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+        LoaderScanMode::MetadataOnly,
+    );
+    let surviving = e07_active_targets(&engine);
+    assert_eq!(
+        surviving.len(),
+        1,
+        "the surviving provider keeps its target: {surviving:?}"
+    );
+    assert!(
+        engine.modules.iter().all(|module| {
+            module.scanned.view != view_id || module.scanned.path != first_path_text
+        }),
+        "the metadata step retires the unloaded module's facts"
+    );
+
+    // A complete memory snapshot agrees, and the deferred memory rescans
+    // keep the survivor covered.
+    let (scan_result, _) = Engine::scan_retained_view(
+        &engine.views[0],
+        &engine.module_hints,
+        &engine.hooks,
+        &mut engine.budget,
+        false,
+        &mut engine.stage_timings,
+    );
+    let (found, _, complete) = scan_result.expect("the memory snapshot scans");
+    assert!(complete, "the memory snapshot is complete");
+    assert_eq!(
+        found.len(),
+        1,
+        "the memory snapshot omits the unloaded file"
+    );
+    for _ in 0..3 {
+        e07_rescan(
+            &mut engine,
+            &mut session,
+            context,
+            &mut additions,
+            &mut pending,
+        );
+    }
+    assert_eq!(
+        e07_active_targets(&engine),
+        surviving,
+        "the deferred memory rescans keep the survivor covered"
+    );
+
+    // The omitted provider's pins are reclaimed: its object leaves the
+    // pin set and its file leaves discovery[].
+    assert!(
+        engine.pinned.summary(old_id).is_none(),
+        "old_id={old_id:?} must be reclaimed after the deferred memory rescans"
+    );
+    assert!(
+        engine
+            .pinned
+            .id_for_scanned(
+                &first_module.scanned,
+                first_module.scanned.key,
+                &first_module.scanned.path
+            )
+            .is_none(),
+        "the unloaded module's raw must no longer resolve"
+    );
+    assert!(
+        !engine
+            .pinned
+            .pinned()
+            .any(|pinned| pinned.path == first_path_text.as_str()),
+        "the unloaded file must leave discovery[]"
+    );
+    assert!(
+        engine.pinned.check_unchanged().expect("pins revalidate"),
+        "pins validate before the unloaded file changes"
+    );
+
+    // Mutating only the unloaded file must not poison global validation.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&first_path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(b"mutated-after-unload")
+        })
+        .expect("the unloaded file appends");
+    assert!(
+        engine.pinned.check_unchanged().expect("pins revalidate"),
+        "changing the unloaded file must not fail global revalidation"
+    );
+}
+
 /// A complete same-file rescan lowers proof it disproves: after one of two
 /// same-file loads goes away, the retained load count drops back to one
 /// instead of keeping the union maximum.

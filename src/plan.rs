@@ -8857,6 +8857,26 @@ mod tests {
     }
 
     #[test]
+    fn interface_linked_table_with_foreign_entry_object_stays_count_only() {
+        // The other identity domain of the own-object conjunction:
+        // the pinned entry_objects agree, but the entry's own raw
+        // object key names a different file. Both domains must
+        // prove the provider's own object (spark r3 F1 twin).
+        let mut module = interface_linked_module();
+        let position = module.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        module.scanned.tables[0].entries[position].object = ObjectKey {
+            inode: 43,
+            ..TEST_OBJECT
+        };
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "linked table with a foreign entry object key");
+    }
+
+    #[test]
     fn interface_linked_table_with_null_hole_keeps_standard_authority() {
         // A NULL hole is not an unproven non-NULL target: clause 1
         // only constrains non-NULL slots, so the remaining own-text

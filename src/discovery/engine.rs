@@ -26714,11 +26714,44 @@ impl Engine {
         let mut new_views = Vec::new();
         let mut failed_refresh_pids = BTreeSet::new();
         let mut skipped = Vec::new();
+        // A provider-free head that would fill the last slot while a
+        // pending waiter follows in this window: held aside until the
+        // next pid's quantum check proves the waiter is actually
+        // attempted this tick (see the scan-success arm below). At most
+        // one is ever staged: every staging resolves at the very next
+        // loop-top, and the last admitted pid never stages (empty tail).
+        let mut staged_yield: Option<(u32, InventoryNewView)> = None;
         let mut unprocessed = admitted.into_iter();
         while let Some(pid) = unprocessed.next() {
             // The tick quantum stops admissions before another scan: this
-            // pid and the rest defer with their requests retained.
-            if self.scheduler.tick_expired(tick_now()) {
+            // pid and the rest defer with their requests retained. This
+            // poll stays first: injected clocks count polls, so no
+            // earlier poll may shift the attempt budget.
+            let quantum_expired = self.scheduler.tick_expired(tick_now());
+            if let Some((staged_pid, (staged_view, staged_modules, staged_pins))) =
+                staged_yield.take()
+            {
+                if quantum_expired {
+                    // The tail is never attempted: the head keeps the
+                    // slot it proved, exactly as without the yield.
+                    self.note_scan_observed(
+                        staged_view.id(),
+                        staged_view.view_admission(),
+                        &staged_modules,
+                    );
+                    self.scheduler.note_admitted(staged_pid);
+                    new_views.push((staged_view, staged_modules, staged_pins));
+                } else {
+                    // The waiter is attempted: the provider-free head
+                    // completes without a view (the probationary outcome),
+                    // so the freed slot reaches the waiter in this tick.
+                    self.release_view_id(staged_view.id());
+                    self.newcomer_first_seen.remove(&staged_pid);
+                    self.newcomer_counted.remove(&staged_pid);
+                    self.probationary_completions = self.probationary_completions.saturating_add(1);
+                }
+            }
+            if quantum_expired {
                 // Fresh-class windowed but never attempted: keep fresh
                 // priority for the next scarce tick.
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
@@ -26870,28 +26903,38 @@ impl Engine {
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, pins, complete)) => {
                     // Provider-proven slot priority: a complete scan that
-                    // proves provider-freedom must not consume the last
-                    // free slot while later newcomers still wait in this
-                    // window — the freed slot reaches them in the same
-                    // tick instead of refilling with whichever ambient
-                    // process attempted first. Completes like the
-                    // probationary capacity path; the pid re-enters via
-                    // enumeration as a rotation candidate when slots are
-                    // no longer contested. Partial scans prove nothing
-                    // and keep the ordinary admission above.
+                    // proves provider-freedom yields the last free slot
+                    // when a pending waiter follows in this window — the
+                    // freed slot reaches the waiter in the same tick
+                    // instead of refilling with whichever ambient process
+                    // attempted first. The yield stages here and resolves
+                    // at the next pid's quantum check (see the loop-top):
+                    // an attempted waiter takes the slot while this pid
+                    // completes like the probationary capacity path (it
+                    // re-enters via enumeration as a rotation candidate
+                    // when slots are no longer contested); an expired
+                    // quantum attempts no waiter, so this pid keeps the
+                    // slot it proved. A rotation-only tail holds no
+                    // pending request and never stages, so the ordered
+                    // head keeps its eviction-freed slot ahead of
+                    // rotation. Partial scans prove nothing and keep the
+                    // ordinary admission below.
                     let fills_last_slot = self.inventory.is_none()
                         && max_scan_pids > 0
                         && self.views.len() + new_views.len() + 1 >= max_scan_pids;
-                    if complete
+                    let waiter_follows = complete
                         && modules.is_empty()
                         && fills_last_slot
-                        && !unprocessed.as_slice().is_empty()
-                    {
-                        self.release_view_id(view.id());
-                        self.newcomer_first_seen.remove(&pid);
-                        self.newcomer_counted.remove(&pid);
-                        self.probationary_completions =
-                            self.probationary_completions.saturating_add(1);
+                        && unprocessed
+                            .as_slice()
+                            .iter()
+                            .any(|tail_pid| self.refresh_requested.contains_key(tail_pid));
+                    if waiter_follows {
+                        debug_assert!(
+                            staged_yield.is_none(),
+                            "the previous staging resolved at this pid's loop-top"
+                        );
+                        staged_yield = Some((pid, (view, modules, pins)));
                         continue;
                     }
                     self.note_scan_observed(view.id(), view.view_admission(), &modules);
@@ -26915,6 +26958,24 @@ impl Engine {
                     ));
                 }
             }
+        }
+        // Unreachable: every staging resolves at the next loop-top, the
+        // loop only exits via a resolving loop-top (`break`) or an
+        // exhausted tail (the last pid never stages), and this function
+        // has no early return. Committing keeps the proved slot rather
+        // than dropping a retained view.
+        debug_assert!(
+            staged_yield.is_none(),
+            "a staged slot yield survived the admission loop"
+        );
+        if let Some((staged_pid, (staged_view, staged_modules, staged_pins))) = staged_yield {
+            self.note_scan_observed(
+                staged_view.id(),
+                staged_view.view_admission(),
+                &staged_modules,
+            );
+            self.scheduler.note_admitted(staged_pid);
+            new_views.push((staged_view, staged_modules, staged_pins));
         }
         (new_views, failed_refresh_pids, skipped)
     }

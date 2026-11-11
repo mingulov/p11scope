@@ -513,6 +513,12 @@ pub struct Engine {
     /// follows the process-wide environment variable the gate reads).
     #[cfg(test)]
     candidate_reuse_for_test: Option<bool>,
+    /// Test-only staging: latch the committed pin-set changed flags between
+    /// the tick's First and Final candidate builds, exactly as a
+    /// between-builds `check_unchanged` detection would. The reuse twin
+    /// arms this on both engines to prove the fence sees the latch.
+    #[cfg(test)]
+    latch_pinned_changed_between_builds_for_test: bool,
     /// Whether the committed plan, modules, pins and evidence equal what a
     /// full rebuild would produce, as verified by comparison at the last
     /// commit. The rebuild reads committed-plan reuse state, so a commit can
@@ -11422,6 +11428,8 @@ impl Engine {
             disable_publish_deferral_for_test: false,
             #[cfg(test)]
             candidate_reuse_for_test: None,
+            #[cfg(test)]
+            latch_pinned_changed_between_builds_for_test: false,
             plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
@@ -24847,6 +24855,11 @@ impl Engine {
         self.candidate_reuse_for_test = Some(enabled);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_latch_pinned_changed_between_builds_for_test(&mut self, enabled: bool) {
+        self.latch_pinned_changed_between_builds_for_test = enabled;
+    }
+
     /// Records object skips into the capture counters exactly once each
     /// (the merge's skip-recording side effect, shared by the full,
     /// unchanged and reused candidate paths).
@@ -27068,6 +27081,15 @@ impl Engine {
             return Ok(changed);
         }
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
+        // Test-only staging for the reuse twin: latch the committed
+        // changed flags here, after the First build cloned clean pins
+        // and before the Final build (or its reuse) reads them —
+        // exactly where a between-builds `check_unchanged` detection
+        // would land. The fence below must see this latch.
+        #[cfg(test)]
+        if self.latch_pinned_changed_between_builds_for_test {
+            self.pinned.latch_changed_for_test();
+        }
         // Reuse the First candidate as the Final one only when the Final
         // build would consume identical inputs against identical state:
         // same removed/declined/new-view sets, rescans with identical

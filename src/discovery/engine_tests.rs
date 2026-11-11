@@ -72506,6 +72506,67 @@ fn changed_inputs_between_builds_disable_candidate_reuse() {
     );
 }
 
+/// A `check_unchanged` latch staged between the First build and the
+/// Final build (a between-builds check seeing a changed provider file
+/// while the tick is otherwise stable) must disable reuse: the First
+/// candidate cloned clean pins, so reusing it would drop the latch and
+/// commit clean pins on unproven identity. Both twins latch
+/// identically; the reuse engine must take the full path and commit
+/// the same latched pins as the full twin.
+#[test]
+fn between_builds_pinned_latch_disables_candidate_reuse() {
+    let mut child = spawn_sleep();
+    let pid = child.id();
+    let (mut reused, _dir_a) = engine_over_cgroup_naming(&[pid]);
+    let (mut full, _dir_b) = engine_over_cgroup_naming(&[pid]);
+    reused.set_enable_candidate_reuse_for_test(true);
+    full.set_enable_candidate_reuse_for_test(false);
+    reused.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    full.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session_a = ScriptedSession::with_records([], 0);
+    let mut session_b = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+    apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+    assert_eq!(reused.views.len(), 1);
+    assert_eq!(full.views.len(), 1);
+    assert!(
+        !reused.pinned.provider_changed() && !full.pinned.provider_changed(),
+        "the first tick commits clean pins"
+    );
+
+    // Stage an identical between-builds latch on both engines: the next
+    // tick's First build clones clean pins, then the latch fires before
+    // the Final build, exactly as a between-builds detection would.
+    reused.set_latch_pinned_changed_between_builds_for_test(true);
+    full.set_latch_pinned_changed_between_builds_for_test(true);
+    let reused_calls = reused.inventory_candidate_calls_for_test;
+    let full_calls = full.inventory_candidate_calls_for_test;
+    assert!(reused.request_refresh(pid, None));
+    assert!(full.request_refresh(pid, None));
+    apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
+    apply_ordinary_batch(&mut full, &mut session_b, vec![]).unwrap();
+    assert_eq!(
+        reused.inventory_candidate_calls_for_test - reused_calls,
+        2,
+        "a between-builds latch rebuilds First and Final"
+    );
+    assert_eq!(
+        full.inventory_candidate_calls_for_test - full_calls,
+        2,
+        "the full twin still builds First and Final"
+    );
+    assert!(
+        reused.pinned.provider_changed(),
+        "reuse commits the latched pins, not the clean First clone"
+    );
+    assert!(
+        full.pinned.provider_changed(),
+        "the full twin commits the latched pins"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 /// Property twin (oracle = full rebuild): twin engines driven through
 /// the same seeded random delta sequence — spawn a sleeper, kill one,
 /// refresh a live pid, empty tick — must commit identical plans,

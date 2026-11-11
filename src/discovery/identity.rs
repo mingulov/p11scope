@@ -2683,6 +2683,19 @@ impl PinnedObjects {
         self.changed.set(true);
     }
 
+    /// Test-only: latch the changed flags exactly as a detecting
+    /// `check_unchanged` would (one entry plus the global bit), without
+    /// needing a real on-disk change. The candidate-reuse twin stages a
+    /// between-builds latch with this.
+    #[cfg(test)]
+    pub(crate) fn latch_changed_for_test(&self) {
+        if let Some(entry) = self.by_id.values().next() {
+            entry.changed.set(true);
+            entry.detected_ns.set(crate::attach::monotonic_ns());
+        }
+        self.changed.set(true);
+    }
+
     /// Per-object held-fd `(ino, size, ctime)` check (packet 6.13, R2-D1-8):
     /// `Ok(true)` when this one object still matches its pin. Unlike the
     /// all-objects sticky bool, this attributes a change to one module.

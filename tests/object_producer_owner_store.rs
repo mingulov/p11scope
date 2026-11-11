@@ -976,6 +976,39 @@ fn object_owner_sweep_adjacent_lookup_preserves_custody() {
     );
 }
 
+/// Independent birth-marker expectation from the switch requests and
+/// the build inputs, never from the build's own output: the marker
+/// follows the journal decision, and the journal ships in FULL, wide
+/// and P0 builds (never SMALL, unsafe, proof or counter-artifact
+/// configurations).
+fn frames_expected_marker_enabled() -> bool {
+    fn small_requested() -> bool {
+        option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+                .is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+                .is_some_and(|value| value == "1" || value == "true")
+    }
+    let journal_selected = match option_env!("P11SCOPE_JOURNAL") {
+        None => {
+            !cfg!(feature = "unsafe-unvalidated-metadata")
+                && !small_requested()
+                && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+                && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+                && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1")
+        }
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    };
+    match option_env!("P11SCOPE_BIRTH_MARKER") {
+        None => journal_selected,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_BIRTH_MARKER request {other:?}"),
+    }
+}
+
 #[test]
 fn object_producer_compiled_frames_are_bounded() {
     let directory = tempfile::tempdir().expect("temporary object custody frame check");
@@ -984,15 +1017,19 @@ fn object_producer_compiled_frames_are_bounded() {
     // is the map-allocation and frame/instruction measurement record.
     // The checker validates the object against the frozen inventory for
     // its exact profile: capacity (wide or default) crossed with
-    // metadata (diagnostic or plain).
+    // metadata (diagnostic or plain), and the marker set where the
+    // build carries it.
+    let marker = frames_expected_marker_enabled();
     let mode = match (
         cfg!(feature = "wide-detailed-2112"),
         cfg!(feature = "unsafe-unvalidated-metadata"),
+        marker,
     ) {
-        (true, true) => "frames-wide-diagnostic",
-        (true, false) => "frames-wide",
-        (false, true) => "frames-diagnostic",
-        (false, false) => "frames",
+        (true, true, _) => "frames-wide-diagnostic",
+        (true, false, true) => "frames-wide-marker",
+        (true, false, false) => "frames-wide",
+        (false, true, _) => "frames-diagnostic",
+        (false, false, _) => "frames",
     };
     let report = run_object_checker(&object, mode);
     println!("{report}");
@@ -1695,7 +1732,7 @@ def longest_chain(raws, bodies, relocations, offsets, root):
     return visit(root, ())
 
 
-def check_maps(report, diagnostic=False, wide=False):
+def check_maps(report, diagnostic=False, wide=False, marker=False):
     allowed = checker.DIAGNOSTIC_GLOBAL_HELPERS if diagnostic else frozenset()
     maps, programs, symbols = checker.inspect(sys.argv[1], allowed)
     variant = None
@@ -1703,8 +1740,13 @@ def check_maps(report, diagnostic=False, wide=False):
         # Explicit feature mode: allow only its exact decoder helpers, then
         # require the entire frozen map/program/symbol inventory for the
         # exact capacity/metadata profile. Plain 'frames' keeps its
-        # object-relative checks below with no frozen comparison.
-        variant = ('wide-' if wide else '') + ('diagnostic' if diagnostic else 'default')
+        # object-relative checks below with no frozen comparison. The
+        # wide release object carries the marker set; marker-off wide
+        # builds keep the marker-free variant.
+        if wide and not diagnostic:
+            variant = 'wide' if marker else 'wide-default'
+        else:
+            variant = ('wide-' if wide else '') + ('diagnostic' if diagnostic else 'default')
     if variant:
         checker.validate_inventory(variant, maps, programs, symbols)
     for name in ('OBJECT_START', 'OBJECT_DESCRIPTORS', 'OBJECT_ZERO'):
@@ -1884,8 +1926,8 @@ def fault_calls_to(data, root_name):
     return calls
 
 
-def check_frames(data, report, diagnostic=False, wide=False):
-    check_maps(report, diagnostic, wide)
+def check_frames(data, report, diagnostic=False, wide=False, marker=False):
+    check_maps(report, diagnostic, wide, marker)
     leaves = check_leaves(data, report)
     check_roots(data, report)
 
@@ -2201,8 +2243,10 @@ def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
     report = []
-    if mode in ('frames', 'frames-diagnostic', 'frames-wide', 'frames-wide-diagnostic'):
-        check_frames(data, report, diagnostic='diagnostic' in mode, wide='wide' in mode)
+    if mode in ('frames', 'frames-diagnostic', 'frames-wide', 'frames-wide-marker',
+                'frames-wide-diagnostic'):
+        check_frames(data, report, diagnostic='diagnostic' in mode, wide='wide' in mode,
+                     marker=mode == 'frames-wide-marker')
     elif mode == 'function-abis':
         check_function_abis(data, report)
     elif mode in ('scalar-globals', 'scalar-globals-p0'):

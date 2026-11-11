@@ -2604,6 +2604,65 @@ fn prepend_queued_records_keeps_exact_fifo_order() {
     }
 }
 
+/// Kernel-found work that only a frame can service — admitting a
+/// newcomer pid, running a deferred loader memory scan — asks for an
+/// early frame instead of waiting out the drain interval. Work the
+/// engine queued itself (polling rescans, retries) never does: it keeps
+/// the ordinary cadence, so a busy desktop cannot turn the request into
+/// a render storm.
+#[test]
+fn kernel_found_frame_work_requests_a_fast_frame_and_queued_work_does_not() {
+    let mut engine = Engine::empty();
+    assert!(!engine.take_fast_discovery_frame(), "nothing requested yet");
+
+    // A polling/retry refresh (not record-consumed) keeps the cadence.
+    assert!(engine.request_refresh(424_242, None));
+    assert!(
+        !engine.take_fast_discovery_frame(),
+        "a self-queued refresh must not promote a frame"
+    );
+    engine.refresh_requested.clear();
+
+    // A consumed record for a pid with no retained view: only the frame's
+    // inventory pass can admit it, so it promotes exactly one fast frame.
+    assert!(engine.request_refresh_consumed(424_243, None));
+    assert!(
+        engine.take_fast_discovery_frame(),
+        "a newcomer admission promotes a fast frame"
+    );
+    assert!(
+        !engine.take_fast_discovery_frame(),
+        "the request is consumed once"
+    );
+
+    // Renewing the still-pending request does not promote again: the
+    // fast frame it already requested (or the ordinary next frame)
+    // services the same queued work.
+    assert!(engine.request_refresh_consumed(424_243, None));
+    assert!(
+        !engine.take_fast_discovery_frame(),
+        "a renewal of pending work must not promote a second fast frame"
+    );
+
+    // A newly deferred loader memory scan is frame-only work too.
+    let key = PendingLoaderScanKey {
+        view: ProcessViewId(41),
+        context: LoaderContextId::from_case_id(3),
+    };
+    engine.defer_loader_memory_scan(key, 1_000, 1);
+    assert!(
+        engine.take_fast_discovery_frame(),
+        "a newly deferred loader scan promotes a fast frame"
+    );
+    // Touching the same key again only moves its timestamp: no new work,
+    // no new promotion.
+    engine.defer_loader_memory_scan(key, 900, 1);
+    assert!(
+        !engine.take_fast_discovery_frame(),
+        "re-deferring a pending scan must not promote again"
+    );
+}
+
 /// An EXEC can use the last work in a frame while loader hits from that
 /// same batch still name its old context. Retirement must wait for those
 /// already-collected hits; deferral cannot invalidate their authority.

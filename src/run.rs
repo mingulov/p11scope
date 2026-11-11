@@ -25525,6 +25525,80 @@ int main(int argc, char **argv) {
         assert!(!frame.fresh_snapshot && !frame.render);
     }
 
+    #[test]
+    fn fast_discovery_request_schedules_a_frame_within_the_minimum_interval() {
+        let drain = PROFILE_CADENCE;
+        let rendered = Instant::now();
+
+        // No request: the ordinary cadence stands, and no clock is read.
+        let mut last_frame = rendered;
+        request_fast_discovery_frame(&mut last_frame, drain, false, || {
+            panic!("an unrequested fast frame reads no clock")
+        });
+        assert_eq!(last_frame, rendered);
+
+        // Requested well past the minimum interval since the last render:
+        // the very next tick is a whole frame.
+        let late = rendered + Duration::from_millis(500);
+        request_fast_discovery_frame(&mut last_frame, drain, true, || late);
+        let frame = profile_frame_decisions(|| late.duration_since(last_frame), drain);
+        assert_eq!(
+            discovery_due(frame.since_frame, drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+        assert!(frame.fresh_snapshot && frame.render);
+
+        // Requested just after a render: the frame lands at the minimum
+        // interval after that render, not immediately and not a full drain
+        // later.
+        let mut last_frame = rendered;
+        let early = rendered + Duration::from_millis(10);
+        request_fast_discovery_frame(&mut last_frame, drain, true, || early);
+        let before = profile_frame_decisions(
+            || {
+                (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL - Duration::from_millis(1))
+                    .duration_since(last_frame)
+            },
+            drain,
+        );
+        assert_eq!(
+            discovery_due(before.since_frame, drain, || false, || false),
+            None
+        );
+        let at = profile_frame_decisions(
+            || {
+                (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL)
+                    .duration_since(last_frame)
+            },
+            drain,
+        );
+        assert_eq!(
+            discovery_due(at.since_frame, drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+
+        // A drain shorter than the minimum interval keeps its own cadence:
+        // a fast request never makes a frame later.
+        let short_drain = Duration::from_millis(50);
+        let mut last_frame = rendered;
+        request_fast_discovery_frame(&mut last_frame, short_drain, true, || early);
+        let ordinary = profile_frame_decisions(
+            || (rendered + short_drain).duration_since(last_frame),
+            short_drain,
+        );
+        assert_eq!(
+            discovery_due(ordinary.since_frame, short_drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+
+        // Already overdue: the clock does not move at all.
+        let mut last_frame = rendered;
+        request_fast_discovery_frame(&mut last_frame, drain, true, || {
+            rendered + Duration::from_secs(2)
+        });
+        assert_eq!(last_frame, rendered);
+    }
+
     /// One scripted profile tick, offset from the loop's first tick.
     #[derive(Clone, Copy)]
     struct ScriptedTick {

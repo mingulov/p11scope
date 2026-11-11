@@ -34,6 +34,9 @@ which implements the ratified D-transitive hint contract below, as
 widened by 7.10b,
 and [unregistered mechanism id publication](#unregistered-mechanism-id-publication-owner-2026-11-03),
 which publishes unregistered mechanism ids with counts only,
+and [standard-layout mechanism attribution](#standard-layout-mechanism-attribution-controller-ruling-2026-11-11),
+which attributes registered mechanism ids through standard-layout scan
+tables without a manifest and counts every other value without its number,
 and [pre-arm mapping-instant witness](#pre-arm-mapping-instant-witness-v060),
 which loads the short-lived kernel witness behind `--prearm-module` and
 publishes no new field,
@@ -1745,6 +1748,29 @@ processes. On 64-bit processes it withholds pointers and any word with a
 nonzero upper half, but not short zero-padded values. The v1
 function-name rule is untouched: function words still reach output only
 by exact membership in the 104 published names.
+
+## Standard-layout mechanism attribution (controller ruling, 2026-11-11)
+
+**Status: IMPLEMENTED in v0.7.0 by controller ruling 2026-11-11 (owner
+15:20: mechanisms without `--manifest` for standard providers).**
+Mechanism ids are public constants (KG-1/KG-2). When scan-time layout
+evidence the observer already holds proves a scanned table is a standard
+`CK_FUNCTION_LIST`/`CK_FUNCTION_LIST_3_0` — exact `"PKCS 11"` interface
+linkage, the sole-complete-table leg, or a typed-getter export with full
+per-ordinal export agreement over a version-matched, own-object table —
+the existing mechanism-id read at `C_*Init`/`C_GenerateKey*`/`C_DeriveKey`/
+`C_WrapKey`/`C_UnwrapKey`/`C_Message*Init`/`C_Encapsulate`/`C_Decapsulate`
+slots carries semantic authority without a manifest. No call into the
+module and no new argument kind is read; parameters are never decoded
+beyond the existing rules. Allowlist-v1 bytes are unchanged.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Registered mechanism id through a standard-layout slot (`attribution_basis: "standard_layout"`) | The same guarded return-time `CK_MECHANISM.mechanism` word as a manifest-confirmed publication, read only through a slot whose standard layout is proven by the scan evidence above. Publication additionally requires exact membership in the registered `CKM_*` registry (standard ids plus the listed vendor ids): the value must resolve to a registered name, mirroring the v1 function-name membership rule. | `mechanisms[]` rows as for a confirmed slot, with `attribution_basis: "standard_layout"` when every observation came through standard-layout slots (`"manifest"` when a confirmed slot contributed); profile text shows the MECHANISM table by default with one plain note, `mechanism names from the standard table (layout evidence: …)`. | A value outside the registry through a standard-layout slot is never published as a number and keeps no row or cell; it counts only in `evidence.unregistered_standard_layout_mechanisms` and renders as `mechanism value not in the registry (names unconfirmed): N`. Unknown or vendor-shifted tables stay count-only: no argument is read through an unproven slot. Required evidence: registered-row, garbage-count-only and vendor-shifted twins at the plan/semantic seam, plus a live SoftHSM/NSS capture without `--manifest`. |
+
+With a manifest/confirmed table the previous behaviour stays: vendor and
+unknown 32-bit ids publish by number under
+[unregistered mechanism id publication](#unregistered-mechanism-id-publication-owner-2026-11-03).
 
 ## Pre-arm mapping-instant witness (v0.6.0)
 

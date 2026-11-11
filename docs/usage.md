@@ -362,9 +362,21 @@ inode number, can still match. Prefer bare names for container targets.
 `--forwarding-module` is refused beside a matching `--exclude-module`,
 and is not accepted by scan-only `inspect`.
 
-The commands above begin with **passive diagnostics**. Without an accepted
-manifest, scanned function slots are count-only: use their aggregate counts,
-return values and latency. Standard names require a typed legacy return, an
+The commands above begin with **passive diagnostics**. A scanned table
+whose standard layout the scan itself proves — an exact `"PKCS 11"`
+interface record naming the table, a sole complete table, or a typed
+getter export (`C_GetFunctionList`/`C_GetInterface`) with exact agreement
+between the provider's own `.dynsym` and every retained non-NULL target
+over a version-matched table — needs no manifest: its function slots
+carry semantics and the MECHANISM table attributes registered `CKM_*`
+mechanism ids by default (profile text notes
+`mechanism names from the standard table (layout evidence: …)`; JSON rows
+carry `attribution_basis: "standard_layout"`). A mechanism value outside
+the registered `CKM_*` registry read through such a slot is counted only
+(`mechanism value not in the registry (names unconfirmed): N`), never
+published as a number. Tables without that layout proof stay count-only
+without an accepted manifest: use their aggregate counts, return values
+and latency. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
 the provider's own `.dynsym` and every retained non-NULL target
 (`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's

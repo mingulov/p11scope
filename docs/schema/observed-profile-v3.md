@@ -234,6 +234,18 @@ revision; historical v2 documents list registered ids only and lack
 the `registered` key. `cgroups[].mechanisms[]` rows carry the same
 `registered` flag with the same meaning.
 
+Every `mechanisms[]` row also carries `attribution_basis`:
+`"standard_layout"` when every observation of the id came through a
+slot authorized by standard-layout scan evidence only (no manifest;
+controller ruling 2026-11-11), `"manifest"` when a manifest/confirmed
+slot contributed. Through a standard-layout slot only exact members of
+the registered `CKM_*` registry (standard ids plus the listed vendor
+ids) publish; any other value counts only in
+`evidence.unregistered_standard_layout_mechanisms` and never appears as
+a number. With a manifest/confirmed table, vendor and unknown 32-bit
+ids publish by number as before. Like `registered` and `name`, this is
+a v3-additive disclosure with no new schema revision.
+
 Every `mechanisms[]` and `cgroups[].mechanisms[]` row also carries
 `name`: the `CKM_*` name when the id is a known standard or listed
 vendor mechanism, else null, never guessed. Naming is a display-only

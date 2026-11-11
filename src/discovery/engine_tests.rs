@@ -14584,6 +14584,63 @@ impl DiscoveryLifecycleFixture {
     }
 }
 
+/// A provider first mapped by an already-running holder after capture
+/// start must keep one stable set of active slots across inventory
+/// refreshes of the unchanged holder view: each refresh that re-pins the
+/// same file under a fresh object id retires the whole slot generation
+/// (detaching its probes) and allocates a duplicate one, so the holder's
+/// calls land in detach/reattach windows and are never counted.
+#[test]
+fn late_provider_keeps_single_active_slots_across_refreshes() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_scan_only_before_load();
+    fixture.load();
+    engine.request_refresh(fixture.child.pid(), None);
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+    let slots_first = engine.plan().slots.len();
+    assert!(
+        slots_first > 0,
+        "a late load must plan slots, got {slots_first}"
+    );
+    assert_eq!(
+        engine.plan().active_slot_count(),
+        slots_first,
+        "late slots start active"
+    );
+    let targets_first: Vec<(PinnedObjectId, u64)> = engine
+        .plan()
+        .slots
+        .iter()
+        .map(|slot| (slot.object, slot.file_offset))
+        .collect();
+    for _ in 0..5 {
+        engine.request_refresh(fixture.child.pid(), None);
+        refresh_inventory_once(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+    }
+    assert_eq!(
+        engine.plan().slots.len(),
+        slots_first,
+        "no duplicate slot rows across refreshes of the unchanged holder"
+    );
+    assert_eq!(
+        engine.plan().active_slot_count(),
+        slots_first,
+        "the late provider stays active while its holder lives"
+    );
+    let targets_last: Vec<(PinnedObjectId, u64)> = engine
+        .plan()
+        .slots
+        .iter()
+        .map(|slot| (slot.object, slot.file_offset))
+        .collect();
+    assert_eq!(
+        targets_last, targets_first,
+        "the same pinned objects stay attached across refreshes"
+    );
+}
+
 /// Unlike the synthetic corroboration unit tests, these regressions acquire
 /// their manifest and scanned table independently from a real shared object.
 /// Calling refresh requests service; only accepted tables plus publication

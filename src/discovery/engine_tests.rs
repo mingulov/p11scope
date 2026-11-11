@@ -72208,3 +72208,13 @@ fn complete_initial_arming_stop_files_a_single_initial_arming_gap() {
         gaps[0].reason
     );
 }
+
+/// Startup B4: the post-ready window line names the milliseconds and the
+/// uncounted calls in one `-v` line.
+#[test]
+fn startup_post_ready_window_line_names_ms_and_uncounted_calls() {
+    assert_eq!(
+        Engine::startup_post_ready_window_line(11327),
+        "p11scope: post-ready arming window: initial loader arming finished 11327ms after capturing:; calls made before a provider armed were not counted"
+    );
+}

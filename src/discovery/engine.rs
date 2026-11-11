@@ -998,6 +998,10 @@ const HELD_BACK_REASON: &str =
 /// them every tick and the end-of-run sweep counts leftovers.
 const CAPACITY_NO_VICTIM_SUBJECT: &str = "live process admission";
 const CAPACITY_NO_VICTIM_REASON: &str = "capture process-view capacity was exhausted with no evictable view; a live newcomer waited for admission";
+/// Named gap for the startup initial loader arming (T3): every completion
+/// path — a fatal arm, a stop, a staging/backlog/publish failure, and the
+/// clean post-ready window — files under this one subject.
+const INITIAL_ARMING_SUBJECT: &str = "initial loader arming";
 /// Retry delay for a held-back process, in inventory passes; doubles per
 /// repeated isolation up to `HELD_BACK_RETRY_BASE_PASSES << 6`.
 const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
@@ -32691,7 +32695,7 @@ impl Engine {
                 let done = position as u64;
                 let remaining = views.saturating_sub(done);
                 self.mark_partial(
-                    "initial loader arming",
+                    INITIAL_ARMING_SUBJECT,
                     &format!(
                         "capture stop arrived during initial loader arming after {done} of {views} views; {remaining} views not visited"
                     ),
@@ -32992,6 +32996,18 @@ impl Engine {
         )
     }
 
+    /// The post-ready arming-window line (startup B4, `-v`-only): names the
+    /// window between the `capturing:` line and the end of initial arming,
+    /// with the measured milliseconds and the uncounted-calls disclosure.
+    /// The JSON report carries the same window as its counted
+    /// `initial loader arming` gap (projected to the closed
+    /// `discovery unavailable` reason); this line keeps the milliseconds.
+    fn startup_post_ready_window_line(window_ms: u64) -> String {
+        format!(
+            "p11scope: post-ready arming window: initial loader arming finished {window_ms}ms after capturing:; calls made before a provider armed were not counted"
+        )
+    }
+
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,
@@ -33272,15 +33288,18 @@ impl Engine {
     /// Startup T3: finishes a non-owned start after the ready line. Runs
     /// exactly the moved start block — initial loader arming, the initial
     /// exports attach, the second discovery staging, the backlog cleanup
-    /// pass and the first publication — with two semantic conversions: a
+    /// pass and the first publication — with three semantic conversions: a
     /// fatal arm error or any other `Err` from the block degrades to a
     /// named `initial loader arming` PARTIAL gap instead of failing the
-    /// capture, and a stop between views ends the arming early with the
-    /// unvisited remainder as a counted gap. No-op unless a non-owned
-    /// start pended (owned starts arm inline and never pend). The capture
-    /// loops call this between the ready line and the first tick, then
-    /// re-sync their plan consumers: the cleanup pass can change the plan
-    /// silently, with no plan-changed tick to carry it.
+    /// capture, a stop between views ends the arming early with the
+    /// unvisited remainder as a counted gap, and a clean completion names
+    /// its post-ready arming window as a counted gap when the window
+    /// measures above zero milliseconds and at least one loader arm ran
+    /// in it. No-op unless a non-owned start pended (owned starts arm
+    /// inline and never pend). The capture loops call this between the
+    /// ready line and the first tick, then re-sync their plan consumers:
+    /// the cleanup pass can change the plan silently, with no plan-changed
+    /// tick to carry it.
     pub(crate) fn complete_initial_arming(
         &mut self,
         session: &mut dyn EngineSession,
@@ -33328,6 +33347,13 @@ impl Engine {
             crate::first_use_probe::DiscoveryStage::LoaderArmingFinished,
             &*session,
         );
+        // The fatal arm moves out of `fatal` below; the window gap needs
+        // the outcome afterwards.
+        let arm_failed = fatal.is_some();
+        // The arming window ends when the export attach settles: after that
+        // every initial provider's hooks are live. Stays `None` on the
+        // fatal path, which files its own gap instead.
+        let mut armed_ns: Option<u64> = None;
         if fatal.is_none() {
             let exports_start = crate::attach::monotonic_ns();
             self.attach_initial_exports(
@@ -33342,8 +33368,9 @@ impl Engine {
             // call after that batch.
             let held = self.discovery_held_len();
             if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
-                self.mark_partial("initial loader arming", &format!("{error:#}"));
+                self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
             }
+            armed_ns = crate::attach::monotonic_ns();
             // No stage span here: the export attach records its own
             // Attach spans inside, and stages never overlap.
             if crate::run::capture_diagnostics_on() {
@@ -33356,7 +33383,41 @@ impl Engine {
                 );
             }
         } else if let Some(error) = fatal {
-            self.mark_partial("initial loader arming", &format!("{error:#}"));
+            self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
+        }
+        // Startup B4: a clean post-ready completion names its arming window
+        // as a counted gap — calls into providers armed in that window
+        // before their arming completed were not counted. Filed only when
+        // the window measures above zero milliseconds and at least one
+        // loader arm ran in it; a stop or a staging failure already filed
+        // this subject above, so the window stays unfiled then (a later
+        // backlog or publish failure still files its own distinct entry).
+        if !arm_failed {
+            #[cfg(test)]
+            let window_ms = self
+                .initial_arming_window_ms_for_test
+                .or_else(|| ms(arming_start, armed_ns))
+                .filter(|window| *window > 0);
+            #[cfg(not(test))]
+            let window_ms = ms(arming_start, armed_ns).filter(|window| *window > 0);
+            if arming_counts.attempted > 0
+                && let Some(window_ms) = window_ms
+                && !self
+                    .counters
+                    .object_skips
+                    .iter()
+                    .any(|skip| skip.subject == INITIAL_ARMING_SUBJECT)
+            {
+                self.mark_partial(
+                    INITIAL_ARMING_SUBJECT,
+                    &format!(
+                        "initial loader arming finished {window_ms}ms after the capturing: line; calls made before a provider armed were not counted"
+                    ),
+                );
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!("{}", Self::startup_post_ready_window_line(window_ms));
+                }
+            }
         }
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
@@ -33377,7 +33438,7 @@ impl Engine {
             &mut collect,
             &mut closure,
         ) {
-            self.mark_partial("initial loader arming", &format!("{error:#}"));
+            self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
         }
         record_object_skips(
             &mut self.plan,
@@ -33385,7 +33446,7 @@ impl Engine {
             &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
         );
         if let Err(error) = self.publish_current_capture_facts() {
-            self.mark_partial("initial loader arming", &format!("{error:#}"));
+            self.mark_partial(INITIAL_ARMING_SUBJECT, &format!("{error:#}"));
         }
         // No stage span here: the batch records its own spans inside,
         // and stages never overlap.

@@ -8892,6 +8892,315 @@ mod tests {
         assert_eq!(plan.standard_layout_slot_count(), 67);
     }
 
+    fn getter_export_module() -> ReconciledModule {
+        // Only the typed-getter-export leg can grant here: a full
+        // 3.0 table (92 slots) refuses the 68-slot sole leg, no
+        // interface record links it, and nothing returns it live.
+        // This is the ordinary-provider shape (OpenSC, p11-kit
+        // modules, vendor libraries) publishing only the typed
+        // getter: the scanned table agrees per-ordinal with the
+        // provider's own exports.
+        let key = TEST_OBJECT;
+        let object = PinnedObjectId(key.inode as u32);
+        let entries: Vec<ScannedEntry> = (0..92)
+            .map(|ordinal| ScannedEntry {
+                name: pkcs11_module::function_name(ordinal)
+                    .expect("3.0 ordinals have standard names"),
+                object: key,
+                object_path: "/opt/p11-3x.so".into(),
+                file_offset: 0x1000 + (ordinal as u64) * 8,
+            })
+            .collect();
+        let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+            entries
+                .iter()
+                .map(|entry| (entry.name.to_string(), entry.file_offset))
+                .collect::<Vec<_>>(),
+        );
+        ReconciledModule {
+            exports,
+            getter_present: true,
+            witness_fault: false,
+            object,
+            entry_objects: vec![vec![object; entries.len()]],
+            scanned: ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                pre_copy_up: None,
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11-3x.so".into(),
+                tables_scan_finished: true,
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (3, 0),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                }],
+                interfaces: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn getter_export_standard_table_publishes_mechanism_names() {
+        // Controller override (2026-11-11 20:40): the getter-export
+        // leg is the route for ordinary providers that publish only
+        // C_GetFunctionList, so a standard 3.x table reached through
+        // it carries standard-layout authority and publishes
+        // registered mechanism names without a manifest.
+        let module = getter_export_module();
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 92);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "getter-export table slots carry semantic authority"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 92);
+        assert_eq!(plan.standard_layout_evidence(), ["typed getter export"]);
+        let sign_init = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot");
+        assert!(plan.is_standard_layout_slot(sign_init.index));
+        let mut state = crate::semantics::State::new(&plan);
+        state.observe(&p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism: 0x40, // CKM_SHA256_RSA_PKCS
+            rv: 0,
+            slot: sign_init.index,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        });
+        assert_eq!(
+            state.mechanisms().get(&0x40).map(|stat| stat.calls),
+            Some(1),
+            "a registered mechanism read through the getter-export table publishes by name"
+        );
+    }
+
+    #[test]
+    fn getter_export_table_with_version_mismatch_stays_count_only() {
+        // Behind the hoisted core: a 3.2 label over a 92-slot extent
+        // is not a standard layout (3.2 lays out 104), so the
+        // getter-export leg refuses and every slot stays count-only.
+        let mut module = getter_export_module();
+        module.scanned.tables[0].version = (3, 2);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 92);
+        assert_plan_count_only(&plan, "getter-export table with a version/count mismatch");
+    }
+
+    #[test]
+    fn getter_export_table_with_unpinned_nonnull_stays_count_only() {
+        let mut module = getter_export_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetInfo")
+            .expect("C_GetInfo entry");
+        let entry = table.entries.remove(position);
+        module.entry_objects[0].remove(position);
+        module.scanned.tables[0].unpinned.push(Skipped {
+            subject: entry.name.to_string(),
+            reason: "target not pinned to a comparable object".into(),
+        });
+        assert_eq!(module.scanned.tables[0].decoded_slot_count(), 92);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(
+            plan.slots.len(),
+            91,
+            "the usable observations remain available"
+        );
+        assert_plan_count_only(&plan, "getter-export table with an unpinned non-NULL entry");
+    }
+
+    #[test]
+    fn getter_export_table_with_foreign_entry_stays_count_only() {
+        // An entry outside the provider's own text refuses the
+        // getter-export grant like every other leg.
+        let mut module = getter_export_module();
+        let position = module.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "getter-export table with a foreign entry");
+    }
+
+    #[test]
+    fn conservative_rebuild_preserves_standard_layout_basis() {
+        // N1: the removal-only rebuild copies old slots one-for-one
+        // by position, so the standard-layout basis and its evidence
+        // labels must survive the install — losing them would read
+        // every gated slot as manifest-confirmed.
+        use crate::discovery::identity::GraphStep;
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let module = sole_complete_module();
+        let old = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(old.standard_layout_slot_count(), 68);
+        let expected: BTreeMap<AttachKey, bool> = old
+            .slots
+            .iter()
+            .map(|slot| (AttachKey::of(slot), old.is_standard_layout_slot(slot.index)))
+            .collect();
+        let surviving = [module];
+        let pins = PinnedObjects::empty();
+        let mut stable = |object: PinnedObjectId| Some(ModuleId(object.0));
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let mut cursor = ConservativePlanCursor::new();
+        let mut ready = false;
+        for _ in 0..10_000 {
+            let sources = ConservativePlanSources::new(&surviving, &[], &pins, false);
+            match old
+                .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 256)
+                .expect("conservative rebuild of a surviving module")
+            {
+                GraphStep::Ready => {
+                    ready = true;
+                    break;
+                }
+                GraphStep::Advanced | GraphStep::Yielded => {}
+            }
+        }
+        assert!(ready, "the conservative rebuild reaches Ready");
+        let rebuilt = cursor.plan().expect("ready cursor holds the rebuilt plan");
+        assert_eq!(rebuilt.slots.len(), old.slots.len());
+        for slot in &rebuilt.slots {
+            assert_eq!(
+                rebuilt.is_standard_layout_slot(slot.index),
+                expected[&AttachKey::of(slot)],
+                "basis follows the slot through the conservative rebuild"
+            );
+        }
+        assert_eq!(rebuilt.standard_layout_slot_count(), 68);
+        assert_eq!(
+            rebuilt.standard_layout_evidence(),
+            old.standard_layout_evidence()
+        );
+    }
+
+    #[test]
+    fn tail_excision_remaps_standard_layout_basis() {
+        // N1: excising a tail cell renumbers the survivors; the
+        // position-keyed basis set must move with them and drop the
+        // excised cell's entry.
+        let fixture = counter_history_plan(3);
+        let mut base =
+            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed())
+                .unwrap();
+        base.modules = fixture.modules;
+        let tail_key = AttachKey::of(&base.slots[2]);
+
+        let mut plan = base.clone();
+        plan.standard_layout_slots = BTreeSet::from([2]);
+        plan.deactivate(1);
+        assert_eq!(
+            plan.excise_unlinked_tail_cells(1, &BTreeSet::from([0, 1, 99])),
+            [0, u32::MAX, 1]
+        );
+        assert_eq!(AttachKey::of(&plan.slots[1]), tail_key);
+        assert!(
+            plan.is_standard_layout_slot(1),
+            "the basis follows the renumbered slot"
+        );
+        assert!(!plan.is_standard_layout_slot(0));
+        assert_eq!(plan.standard_layout_slot_count(), 1);
+
+        let mut excised_only = base.clone();
+        excised_only.standard_layout_slots = BTreeSet::from([1]);
+        excised_only.deactivate(1);
+        excised_only.excise_unlinked_tail_cells(1, &BTreeSet::from([1]));
+        assert_eq!(
+            excised_only.standard_layout_slot_count(),
+            0,
+            "an excised cell leaves no stale basis behind"
+        );
+        assert!(!excised_only.is_standard_layout_slot(1));
+    }
+
+    #[test]
+    fn tail_withdrawal_drops_standard_layout_basis_of_withdrawn_cells() {
+        let fixture = counter_history_plan(3);
+        let mut plan =
+            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed())
+                .unwrap();
+        plan.modules = fixture.modules;
+        plan.standard_layout_slots = BTreeSet::from([2]);
+        plan.deactivate(1);
+        plan.deactivate(2);
+        plan.withdraw_unlinked_additions(1);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(
+            plan.standard_layout_slot_count(),
+            0,
+            "a withdrawn cell leaves no stale basis for a later occupant"
+        );
+    }
+
+    #[test]
+    fn sync_plan_basis_only_change_keeps_mechanism_rows() {
+        // N1: the publication gate is evaluated on every observation
+        // and rows carry their own basis flags, so a basis-only plan
+        // change must not purge semantic state.
+        let module = sole_complete_module();
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        let sign_init = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot")
+            .index;
+        let mut state = crate::semantics::State::new(&plan);
+        state.observe(&p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism: 0x40, // CKM_SHA256_RSA_PKCS
+            rv: 0,
+            slot: sign_init,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        });
+        assert_eq!(state.mechanisms().get(&0x40).map(|stat| stat.calls), Some(1));
+        let mut flipped = plan.clone();
+        flipped.standard_layout_slots.clear();
+        state.sync_plan(&flipped);
+        assert_eq!(
+            state.mechanisms().get(&0x40).map(|stat| stat.calls),
+            Some(1),
+            "a basis-only sync keeps the mechanism rows"
+        );
+    }
+
     fn observed_event(slot: u32, mechanism: u64, capture: u32) -> p11scope_ebpf_common::Event {
         p11scope_ebpf_common::Event {
             ts_ns: 100,

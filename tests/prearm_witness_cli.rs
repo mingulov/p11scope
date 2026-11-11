@@ -878,6 +878,41 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
     );
 }
 
+/// The two-round cell's verdict, factored out so its negative
+/// controls run unprivileged: the counted `C_Initialize` total for
+/// the copy's sha, the record's opens-before-staging tally, and the
+/// staged learned-file count.
+fn learned_second_round_accepts(
+    caught: u64,
+    pre_attach_loads: Option<u64>,
+    staged: Option<u64>,
+) -> bool {
+    (19..=20).contains(&caught)
+        && pre_attach_loads == Some(1)
+        && staged.is_some_and(|staged| staged >= 1)
+}
+
+/// Negative controls for the verdict above: only a complete second
+/// round may pass. In particular the combined total 19 — reachable
+/// as one first-round call counted after a mid-run attach plus only
+/// 18 of 20 second-round calls — must be rejected, as must every
+/// schedule that misses even one second-round call.
+#[test]
+fn learned_second_round_oracle_requires_every_second_round_call() {
+    assert!(learned_second_round_accepts(20, Some(1), Some(1)));
+    assert!(
+        !learned_second_round_accepts(19, Some(1), Some(1)),
+        "first=1 plus second=18 must not pass"
+    );
+    assert!(!learned_second_round_accepts(18, Some(1), Some(1)));
+    assert!(!learned_second_round_accepts(21, Some(1), Some(1)));
+    assert!(!learned_second_round_accepts(20, Some(0), Some(1)));
+    assert!(!learned_second_round_accepts(20, Some(2), Some(1)));
+    assert!(!learned_second_round_accepts(20, None, Some(1)));
+    assert!(!learned_second_round_accepts(20, Some(1), Some(0)));
+    assert!(!learned_second_round_accepts(20, Some(1), None));
+}
+
 /// Two-round kernel learning (owner acceptance): a brand-new provider
 /// file at a random path, held by no live process and named by no
 /// `--module`/`--prearm-module`/`--manifest`, under one
@@ -1047,11 +1082,6 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     let record = module_record(&profile, &copy);
     let calls = function_calls(&profile, record_sha256(record));
     let caught = calls.get("C_Initialize").copied().unwrap_or(0);
-    assert!(
-        (19..=20).contains(&caught),
-        "round 2 must catch >=19/20 one-shot runs and round 1 stays missed; \
-         C_Initialize for the copy = {caught} (all calls: {calls:?})"
-    );
     // The provider is listed with the program that first loaded it.
     let first = record
         .get("first_loaded_by")
@@ -1065,19 +1095,14 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
             || unknown == Some("loader exe link unreadable"),
         "first loader named or finitely unknown: {first}"
     );
-    assert_eq!(
-        first
-            .get("pre_attach_loads")
-            .and_then(|loads| loads.as_u64()),
-        Some(1),
-        "exactly the round-1 loader was tallied before staging, proving \
-         round 1 missed and isolating the round-2 rate: {first}"
-    );
+    let pre_attach_loads = first.get("pre_attach_loads").and_then(|loads| loads.as_u64());
+    let staged = profile["evidence"]["learned_staged_files"].as_u64();
     assert!(
-        profile["evidence"]["learned_staged_files"]
-            .as_u64()
-            .is_some_and(|staged| staged >= 1),
-        "learned files counted: {}",
+        learned_second_round_accepts(caught, pre_attach_loads, staged),
+        "every round-2 call must be counted and round 1 stays a named \
+         miss; C_Initialize for the copy = {caught} (all calls: \
+         {calls:?}), pre_attach_loads = {pre_attach_loads:?}, staged = \
+         {staged:?} (evidence: {})",
         profile["evidence"]
     );
     // The first run is a named miss, not silent.

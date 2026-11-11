@@ -25739,3 +25739,343 @@ fn joint_machine_observer_first_exec_birth_idle_waits_as_future_input() {
     assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
+
+/// A wholly Joint-held duplicate birth must never re-offer, even when
+/// per-key witness storage is short: the validated AlreadySelected
+/// decision resolves before any per-key witness allocation. Covers
+/// ample room, batch-wide failure, partial room reaching the per-key
+/// arm, and the fresh-key failure control. Requires zero re-offers
+/// and zero observation losses for the wholly Joint-held duplicate;
+/// the fresh control proves each pressure arm fires and re-offers.
+#[test]
+fn joint_birth_per_key_resource_skips_healthy_joint_duplicate() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstance;
+    use crate::inventory_semantics::RetainedJointBirths;
+    use crate::semantics_objects::journal::BirthKind;
+
+    const AMPLE: usize = 1_048_576;
+    const PER_KEY_ROOMS: [usize; 4] = [512, 768, 1024, 1536];
+
+    struct Trial {
+        installed: usize,
+        reoffers: usize,
+        caller_bound: Vec<bool>,
+        consumes: usize,
+        refusals: Vec<String>,
+        deferred: Vec<String>,
+        accepted: Vec<bool>,
+        losses: usize,
+        loss_ids: usize,
+        joint_feeds: usize,
+    }
+
+    let run = |room: usize, joint: bool| -> Trial {
+        let (mut scene, ingested, attached, _) = prepared_birth_originals(1, false, false);
+        {
+            let coordinator = &mut scene.real.scene.coordinator;
+            let (key, caller) = {
+                let batch = coordinator.prepared_semantic_batch().unwrap();
+                let input = batch.admissions().next().expect("one admission");
+                (input.instance_key_for_test(), input.journal_binding().3)
+            };
+            if joint {
+                let proof = {
+                    coordinator
+                        .prepared_semantic_batch()
+                        .unwrap()
+                        .claims()
+                        .map(|(_, result)| *result)
+                        .next()
+                        .expect("one claim")
+                        .expect("claim ok")
+                };
+                let receipt = BootstrapReceipt::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    0,
+                    attached.generation(),
+                );
+                assert!(
+                    coordinator
+                        .registry_mut()
+                        .install_joint_receipt(key.clone(), receipt),
+                    "the grant installs"
+                );
+                coordinator
+                    .registry_mut()
+                    .note_instance(AdmittedInstance::scripted(key.clone(), caller));
+                coordinator.registry_mut().publish();
+                assert_eq!(
+                    coordinator.registry().joint_feeds(),
+                    1,
+                    "the duplicate's feed is installed Joint"
+                );
+                let start = coordinator.registry().begin_joint_registrations();
+                coordinator
+                    .registry_mut()
+                    .note_instance(AdmittedInstance::scripted(key, caller));
+                coordinator.restage_prepared_registrations_for_test(start);
+            }
+        }
+        let minted_before = scene.real.h0.0.borrow().capture.router.instances_minted();
+        assert!(
+            minted_before >= 1,
+            "room {room} joint {joint}: the collecting capture holds an observation to evict"
+        );
+        let prior = scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .capture
+            .router
+            .take_observation_losses();
+        assert!(
+            prior.is_empty(),
+            "room {room} joint {joint}: no losses before the birth decision"
+        );
+        let (installed, reoffer_keys, caller_bound, consumes, refusals, deferred, joint_feeds) = {
+            let coordinator = &mut scene.real.scene.coordinator;
+            coordinator
+                .registry()
+                .clamp_semantic_resource_room_for_test(room);
+            let mut births = RetainedJointBirths::new();
+            let mut consumes = 0;
+            let disposition = coordinator
+                .prepare_joint_births(
+                    &ingested,
+                    &scene.producers,
+                    &mut births,
+                    |_, _, _, _, _, _| {
+                        consumes += 1;
+                        Err(crate::attach::BirthObservationRefusal::RowUnreadable)
+                    },
+                )
+                .unwrap();
+            let refusals = staged_birth_refusals(coordinator);
+            let deferred: Vec<String> = coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .into_iter()
+                .filter(|(subject, _)| {
+                    subject == "Joint birth deferred; retained S1 until re-offer"
+                })
+                .map(|(_, reason)| reason)
+                .collect();
+            let joint_feeds = coordinator.registry().joint_feeds();
+            let installed = disposition.installed;
+            let caller_bound: Vec<bool> = disposition
+                .reoffers
+                .iter()
+                .map(|r| r.caller.is_some())
+                .collect();
+            let reoffer_keys: Vec<(p11scope_ebpf_common::ImageIdentity, u32)> = disposition
+                .reoffers
+                .iter()
+                .map(|r| (r.image, r.file))
+                .collect();
+            let reoffers = reoffer_keys.len();
+            assert_eq!(
+                reoffers,
+                disposition.reoffers.len(),
+                "room {room} joint {joint}: re-offer census"
+            );
+            (
+                installed,
+                reoffer_keys,
+                caller_bound,
+                consumes,
+                refusals,
+                deferred,
+                joint_feeds,
+            )
+        };
+        let mut accepted = Vec::new();
+        for (image, file) in &reoffer_keys {
+            let ok = scene
+                .real
+                .h0
+                .0
+                .borrow_mut()
+                .capture
+                .reoffer_birth_for(*image, *file);
+            accepted.push(ok);
+        }
+        let losses = scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .capture
+            .router
+            .take_observation_losses();
+        let loss_ids: usize = losses.iter().map(|loss| loss.ids.len()).sum();
+        Trial {
+            installed,
+            reoffers: reoffer_keys.len(),
+            caller_bound,
+            consumes,
+            refusals,
+            deferred,
+            accepted,
+            losses: losses.len(),
+            loss_ids,
+            joint_feeds,
+        }
+    };
+
+    // Ample room: the healthy duplicate stays final AlreadySelected
+    // with no re-offer, no consume and no loss; the fresh control
+    // reaches the native callback.
+    let ample_joint = run(AMPLE, true);
+    assert_eq!(ample_joint.installed, 0, "ample joint: installs nothing");
+    assert_eq!(ample_joint.reoffers, 0, "ample joint: never re-offers");
+    assert_eq!(ample_joint.consumes, 0, "ample joint: never consumes");
+    assert_eq!(
+        ample_joint.refusals,
+        ["joint_birth_registration_AlreadySelected"],
+        "ample joint: final duplicate verdict"
+    );
+    assert!(
+        ample_joint.deferred.is_empty(),
+        "ample joint: no delay for a final duplicate"
+    );
+    assert_eq!(ample_joint.losses, 0, "ample joint: no observation loss");
+    assert_eq!(ample_joint.loss_ids, 0, "ample joint: no lost ids");
+    assert_eq!(ample_joint.joint_feeds, 1, "ample joint: healthy feed kept");
+    let ample_fresh = run(AMPLE, false);
+    assert_eq!(ample_fresh.consumes, 1, "ample fresh: reaches native");
+    assert_eq!(
+        ample_fresh.installed, 0,
+        "ample fresh: native refusal installs nothing"
+    );
+    assert_eq!(
+        ample_fresh.reoffers, 0,
+        "ample fresh: native refusal is final"
+    );
+    assert_eq!(
+        ample_fresh.refusals,
+        ["joint_birth_native_RowUnreadable"],
+        "ample fresh: native verdict"
+    );
+    assert!(
+        ample_fresh.deferred.is_empty(),
+        "ample fresh: no delay past the capacity arms"
+    );
+
+    // Batch-wide failure: the healthy duplicate is skipped with no
+    // delay; the fresh control defers caller-less.
+    let empty_joint = run(0, true);
+    assert_eq!(empty_joint.installed, 0, "batch joint: installs nothing");
+    assert_eq!(empty_joint.reoffers, 0, "batch joint: never re-offers");
+    assert_eq!(empty_joint.consumes, 0, "batch joint: never consumes");
+    assert!(
+        empty_joint.refusals.is_empty(),
+        "batch joint: no permanent refusal for a skipped duplicate"
+    );
+    assert!(
+        empty_joint.deferred.is_empty(),
+        "batch joint: no delay when nothing was delayed"
+    );
+    assert_eq!(empty_joint.losses, 0, "batch joint: no observation loss");
+    assert_eq!(empty_joint.joint_feeds, 1, "batch joint: healthy feed kept");
+    let empty_fresh = run(0, false);
+    assert_eq!(empty_fresh.installed, 0, "batch fresh: installs nothing");
+    assert_eq!(empty_fresh.reoffers, 1, "batch fresh: defers its birth");
+    assert_eq!(
+        empty_fresh.caller_bound,
+        [false],
+        "batch fresh: batch-wide re-offers name no caller"
+    );
+    assert_eq!(empty_fresh.consumes, 0, "batch fresh: refuses before New");
+    assert!(
+        empty_fresh.refusals.is_empty(),
+        "batch fresh: no permanent refusal for a deferred birth"
+    );
+    assert_eq!(
+        empty_fresh.deferred,
+        ["joint_birth_deferred_resource_capacity"],
+        "batch fresh: counted delay gap"
+    );
+    assert_eq!(
+        empty_fresh.accepted,
+        [true],
+        "batch fresh: re-offer applies"
+    );
+    assert_eq!(
+        empty_fresh.losses, 1,
+        "batch fresh: eviction loss disclosed"
+    );
+    assert_eq!(empty_fresh.loss_ids, 1, "batch fresh: one lost id");
+
+    // Partial room reaching the per-key arm: the healthy duplicate
+    // still stays final with zero re-offers and zero losses; the
+    // fresh control re-offers caller-bound through the same arm.
+    for room in PER_KEY_ROOMS {
+        let joint_trial = run(room, true);
+        assert_eq!(
+            joint_trial.installed, 0,
+            "room {room} joint: installs nothing"
+        );
+        assert_eq!(
+            joint_trial.reoffers, 0,
+            "room {room} joint: per-key capacity never re-offers a healthy duplicate"
+        );
+        assert_eq!(joint_trial.consumes, 0, "room {room} joint: never consumes");
+        assert_eq!(
+            joint_trial.refusals,
+            ["joint_birth_registration_AlreadySelected"],
+            "room {room} joint: final duplicate verdict"
+        );
+        assert!(
+            joint_trial.deferred.is_empty(),
+            "room {room} joint: no delay for a final duplicate"
+        );
+        assert_eq!(
+            joint_trial.losses, 0,
+            "room {room} joint: no observation loss"
+        );
+        assert_eq!(joint_trial.loss_ids, 0, "room {room} joint: no lost ids");
+        assert_eq!(
+            joint_trial.joint_feeds, 1,
+            "room {room} joint: healthy feed kept"
+        );
+        let fresh_trial = run(room, false);
+        assert_eq!(
+            fresh_trial.installed, 0,
+            "room {room} fresh: installs nothing"
+        );
+        assert_eq!(
+            fresh_trial.reoffers, 1,
+            "room {room} fresh: per-key pressure re-offers"
+        );
+        assert_eq!(
+            fresh_trial.caller_bound,
+            [true],
+            "room {room} fresh: per-key re-offers are caller-bound"
+        );
+        assert_eq!(
+            fresh_trial.consumes, 0,
+            "room {room} fresh: refuses before New"
+        );
+        assert!(
+            fresh_trial.refusals.is_empty(),
+            "room {room} fresh: no permanent refusal for a deferred birth"
+        );
+        assert_eq!(
+            fresh_trial.deferred,
+            ["joint_birth_deferred_resource_capacity"],
+            "room {room} fresh: counted delay gap"
+        );
+        assert_eq!(
+            fresh_trial.accepted,
+            [true],
+            "room {room} fresh: re-offer applies"
+        );
+        assert_eq!(
+            fresh_trial.losses, 1,
+            "room {room} fresh: eviction loss disclosed"
+        );
+        assert_eq!(fresh_trial.loss_ids, 1, "room {room} fresh: one lost id");
+    }
+}

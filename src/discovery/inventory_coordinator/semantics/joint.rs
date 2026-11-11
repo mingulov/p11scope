@@ -1195,6 +1195,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Test fixtures restage a duplicate registration window with the
+    /// actual begin/end methods: the caller begins before staging the
+    /// duplicate `NoteInstance`, then this ends and assigns the window.
+    /// Production windows are built once at conversion; this repoints
+    /// the prepared batch at honestly staged rows for the duplicate.
+    #[cfg(test)]
+    pub(crate) fn restage_prepared_registrations_for_test(
+        &mut self,
+        start: crate::discovery::caller_registry::instance_input::JointRegistrationStart,
+    ) {
+        let window = self.registry.end_joint_registrations(start);
+        let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        else {
+            panic!("a prepared batch owns the registration window");
+        };
+        batch.registrations = window;
+    }
+
     pub(crate) fn prepared_semantic_batch(&self) -> Option<&PreparedSemanticBatch> {
         match self
             .semantic_finalizer

@@ -2729,6 +2729,8 @@ impl AttachPlan {
         }
         self.slots.truncate(accepted);
         self.aggregate_owners.truncate(accepted);
+        self.standard_layout_slots
+            .retain(|position| (*position as usize) < accepted);
         self.retired_slots.retain(|position| *position < accepted);
         self.retired_keys.retain(|_, position| *position < accepted);
         self.revivable.retain(|_, position| *position < accepted);
@@ -2804,6 +2806,17 @@ impl AttachPlan {
             .filter_map(|position| {
                 let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
                 (new != u32::MAX).then_some(new as usize)
+            })
+            .collect();
+        self.standard_layout_slots = self
+            .standard_layout_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new
+                    .get(*position as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new)
             })
             .collect();
         for memory in [&mut self.retired_keys, &mut self.revivable] {
@@ -5747,30 +5760,30 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // Manifest corroboration is confirmed authority, not
         // standard-layout. Unknown or vendor-shifted tables stay
         // count-only: no argument is ever read through an unproven slot.
-        // Every leg also satisfies the clause-1 core
+        // Every leg is gated once by the clause-1 core
         // (`standard_layout_core`: version-consistent slot count,
         // every retained entry in the provider's own object, and no
-        // unpinned non-NULL slot). The
-        // sole-complete and getter-export predicates include it in
-        // their stricter checks; an interface record naming the
-        // table or a live getter return proves neither the shape
-        // nor the entry destinations, so those legs check the core
-        // explicitly. The getter-export leg generalizes the sole
-        // leg past 68 slots under the same ambient guards (see
+        // unpinned non-NULL slot), hoisted into the first condition
+        // below so no present or future leg can grant authority on
+        // its evidence alone; the sole-complete and getter-export
+        // predicates additionally re-prove it inside their stricter
+        // checks. The getter-export leg generalizes the sole leg
+        // past 68 slots under the same ambient guards (see
         // `getter_export_authorized`).
-        let standard_layout_evidence = if !authorized || score.manifest {
-            None
-        } else if score.linked && standard_layout_core(module, index) {
-            Some("interface linkage")
-        } else if sole_complete_table_authorized(module, index, &exports) {
-            Some("sole complete table")
-        } else if getter_export_authorized(module, index, &exports, &score) {
-            Some("typed getter export")
-        } else if scan_authorized && score.live_return && standard_layout_core(module, index) {
-            Some("typed getter return")
-        } else {
-            None
-        };
+        let standard_layout_evidence =
+            if !authorized || score.manifest || !standard_layout_core(module, index) {
+                None
+            } else if score.linked {
+                Some("interface linkage")
+            } else if sole_complete_table_authorized(module, index, &exports) {
+                Some("sole complete table")
+            } else if getter_export_authorized(module, index, &exports, &score) {
+                Some("typed getter export")
+            } else if scan_authorized && score.live_return {
+                Some("typed getter return")
+            } else {
+                None
+            };
         let scan_semantic = authorized && (score.manifest || standard_layout_evidence.is_some());
         tables.push(TableSummary {
             version: table.version,
@@ -7724,6 +7737,12 @@ impl ConservativePlanCursor {
             }
         }
         out.revivable = old.revivable.clone();
+        // The derive stage copied old slots one-for-one by position,
+        // so the position-keyed standard-layout basis carries over
+        // unchanged; losing it would read every gated slot as
+        // manifest-confirmed after the install.
+        out.standard_layout_slots = old.standard_layout_slots.clone();
+        out.standard_layout_evidence = old.standard_layout_evidence.clone();
         out.aggregate_owners = std::mem::take(&mut self.output_owners);
         out.entries_seen = self.entries_seen;
         out.module_ambiguous = self.ambiguous_count;
@@ -9112,8 +9131,7 @@ mod tests {
         // excised cell's entry.
         let fixture = counter_history_plan(3);
         let mut base =
-            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed())
-                .unwrap();
+            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed()).unwrap();
         base.modules = fixture.modules;
         let tail_key = AttachKey::of(&base.slots[2]);
 
@@ -9148,8 +9166,7 @@ mod tests {
     fn tail_withdrawal_drops_standard_layout_basis_of_withdrawn_cells() {
         let fixture = counter_history_plan(3);
         let mut plan =
-            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed())
-                .unwrap();
+            AttachPlan::from_slots_with_policy(fixture.slots, AdmissionPolicy::detailed()).unwrap();
         plan.modules = fixture.modules;
         plan.standard_layout_slots = BTreeSet::from([2]);
         plan.deactivate(1);
@@ -9190,7 +9207,10 @@ mod tests {
             target_function: p11scope_ebpf_common::FUNCTION_NONE,
             ..p11scope_ebpf_common::Event::default()
         });
-        assert_eq!(state.mechanisms().get(&0x40).map(|stat| stat.calls), Some(1));
+        assert_eq!(
+            state.mechanisms().get(&0x40).map(|stat| stat.calls),
+            Some(1)
+        );
         let mut flipped = plan.clone();
         flipped.standard_layout_slots.clear();
         state.sync_plan(&flipped);

@@ -2950,12 +2950,16 @@ fn slot_semantics_changed(previous: &SlotMeta, next: Option<&SlotMeta>) -> bool 
     // nothing and is not a reconciliation (F-5).
     let count_only = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
     let presentation_only = previous.semantics == count_only && next.semantics == count_only;
+    // The standard-layout basis is deliberately not compared: it
+    // gates publication per observation and rows/bindings carry the
+    // basis that read each value, so a basis flip invalidates no
+    // recorded state — purging on it would let a lost or shifted
+    // basis entry wipe every mechanism/login/cgroup row.
     previous.semantics != next.semantics
         || (!presentation_only && previous.function_id != next.function_id)
         || previous.fork_safe != next.fork_safe
         || previous.module != next.module
         || previous.module_ids != next.module_ids
-        || previous.standard_layout != next.standard_layout
 }
 
 impl State {

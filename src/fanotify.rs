@@ -792,8 +792,7 @@ pub(crate) fn evaluate_mark_coverage(
         if covered.contains(point) {
             continue;
         }
-        if (mark(point) || previously_covered.contains(point))
-            && covered.len() < MARK_COVERAGE_CAP
+        if (mark(point) || previously_covered.contains(point)) && covered.len() < MARK_COVERAGE_CAP
         {
             covered.insert(point.clone());
         } else {
@@ -1401,8 +1400,10 @@ mod tests {
     /// filesystems file no gap.
     #[test]
     fn learn_retained_mark_failure_is_not_a_coverage_gap() {
-        let covered: std::collections::BTreeSet<std::path::PathBuf> =
-            ["/", "/data"].iter().map(std::path::PathBuf::from).collect();
+        let covered: std::collections::BTreeSet<std::path::PathBuf> = ["/", "/data"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
         let visible: Vec<std::path::PathBuf> = covered.iter().cloned().collect();
         // Every add fails now (no CAP_SYS_ADMIN after the shed).
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
@@ -1436,10 +1437,9 @@ mod tests {
             std::path::PathBuf::from("/"),
             std::path::PathBuf::from("/mnt/new"),
         ];
-        let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |point| {
-                point.as_os_str() == "/mnt/new"
-            });
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
+            point.as_os_str() == "/mnt/new"
+        });
         assert_eq!(uncovered, 0);
         assert!(next.contains(std::path::Path::new("/mnt/new")));
         assert!(next.contains(std::path::Path::new("/")));

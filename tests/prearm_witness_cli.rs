@@ -1119,7 +1119,9 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
             || unknown == Some("loader exe link unreadable"),
         "first loader named or finitely unknown: {first}"
     );
-    let pre_attach_loads = first.get("pre_attach_loads").and_then(|loads| loads.as_u64());
+    let pre_attach_loads = first
+        .get("pre_attach_loads")
+        .and_then(|loads| loads.as_u64());
     let staged = profile["evidence"]["learned_staged_files"].as_u64();
     assert!(
         learned_second_round_accepts(caught, pre_attach_loads, staged),

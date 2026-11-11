@@ -5125,6 +5125,7 @@ fn cgroups_out_with_live_root(
                     .map(|(&mechanism, m)| CgroupMechOut {
                         mechanism,
                         mechanism_hex: format!("0x{mechanism:x}"),
+                        name: mechanism_name(mechanism),
                         registered: !m.unregistered,
                         calls: m.calls,
                         errors: m.errors,

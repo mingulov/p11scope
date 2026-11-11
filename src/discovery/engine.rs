@@ -19540,39 +19540,49 @@ impl Engine {
         );
     }
 
+    /// Whether the held candidate file is gone from the namespace:
+    /// unlinked since its open (deleted, or replaced by a rename over
+    /// its path), no longer the identity the drain proved, or not
+    /// stat-able at all. The held descriptor is the authority, never
+    /// the display spelling; doubt refuses (fail-closed).
+    fn learned_held_file_gone(candidate: &crate::fanotify::LearnedCandidate) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        candidate
+            .file
+            .metadata()
+            .map(|meta| {
+                meta.nlink() == 0 || meta.dev() != candidate.dev || meta.ino() != candidate.ino
+            })
+            .unwrap_or(true)
+    }
+
+    /// Refuses a gone held file: settle so later loads drop, and file
+    /// the finite replaced/deleted row instead of staging bytes no
+    /// pathname names anymore.
+    fn refuse_learned_gone_file(&mut self, identity: (u64, u64), display_path: &str) {
+        self.note_learned_settled(identity);
+        self.learned_load_tally.remove(&identity);
+        self.mark_partial(
+            crate::render::LEARNED_SKIP_SUBJECT,
+            crate::render::LEARNED_REPLACED_DELETED_REASON,
+        );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: learned provider {display_path} was replaced or deleted before staging; not learned"
+            );
+        }
+    }
+
     /// Stages one drain-proved file: pins through the held fd (the
     /// `/proc/self/fd/N` open, never a pathname re-resolve), joins the
     /// pre-arm inputs and the committed pins exactly like a witness
     /// staging, records the loader note, files the first-run gap, and
     /// owes the expedited frame.
     fn stage_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
-        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd;
         let identity = (candidate.dev, candidate.ino);
-        // A held file unlinked since its open (deleted, or replaced by
-        // a rename over its path) is refused at this boundary: the
-        // held descriptor's link count is the authority, never the
-        // display spelling. Settle so later loads drop, and file the
-        // finite replaced/deleted row instead of staging bytes no
-        // pathname names anymore.
-        if candidate
-            .file
-            .metadata()
-            .map(|meta| meta.nlink() == 0)
-            .unwrap_or(false)
-        {
-            self.note_learned_settled(identity);
-            self.learned_load_tally.remove(&identity);
-            self.mark_partial(
-                crate::render::LEARNED_SKIP_SUBJECT,
-                crate::render::LEARNED_REPLACED_DELETED_REASON,
-            );
-            if crate::run::capture_diagnostics_on() {
-                eprintln!(
-                    "p11scope: learned provider {} was replaced or deleted before staging; not learned",
-                    candidate.display_path
-                );
-            }
+        if Self::learned_held_file_gone(&candidate) {
+            self.refuse_learned_gone_file(identity, &candidate.display_path);
             return;
         }
         #[cfg(test)]
@@ -19634,6 +19644,16 @@ impl Engine {
                 return;
             }
         };
+        // Revalidate on the held fd after pinning, before anything is
+        // absorbed or published: a deletion between the entry check
+        // and the pin leaves the worker a stable already-unlinked
+        // inode whose hash bracket passes, so only this second look
+        // at the held descriptor can refuse it. The pinning result
+        // is discarded whole.
+        if Self::learned_held_file_gone(&candidate) {
+            self.refuse_learned_gone_file(identity, &candidate.display_path);
+            return;
+        }
         for skip in &pinning.skipped {
             attribution::note(skip);
             self.counters.object_skips.push(skip.clone());

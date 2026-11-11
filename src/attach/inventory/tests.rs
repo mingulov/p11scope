@@ -91,6 +91,15 @@ fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>
         ("EVIDENCE", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 9, 0),
         ("COUNTERS", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 5, 0),
         (
+            "PRODUCED",
+            K::PerCpuArray,
+            MapType::PerCpuArray,
+            4,
+            8,
+            PRODUCED_CELLS,
+            0,
+        ),
+        (
             "DISCOVERY",
             K::RingBuf,
             MapType::RingBuf,

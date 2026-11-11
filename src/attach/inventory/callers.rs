@@ -87,7 +87,7 @@ pub(super) fn validate_caller_maps(
         .map(String::as_str)
         .eq(expected.keys().copied())
     {
-        bail!("caller Inventory map names differ from exact 21-map manifest");
+        bail!("caller Inventory map names differ from exact 22-map manifest");
     }
     for (name, (kind, metadata)) in expected {
         let (actual_kind, actual_metadata) = actual[name];

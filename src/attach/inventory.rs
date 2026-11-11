@@ -17,7 +17,7 @@ use aya::{Ebpf, EbpfLoader};
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
     INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION, ImageIdentityControl, InventoryUsageConfig,
-    ThreadOwnerControl,
+    PRODUCED_CELLS, ThreadOwnerControl,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -475,6 +475,13 @@ fn inventory_maps(
             "COUNTERS",
             K::PerCpuArray,
             map_metadata(MapType::PerCpuArray, 4, 8, 5, 0),
+        ),
+        // Per-ring submitted records: the kernel half of the ring
+        // cross-check. Tracks ebpf-common PRODUCED_CELLS.
+        (
+            "PRODUCED",
+            K::PerCpuArray,
+            map_metadata(MapType::PerCpuArray, 4, 8, PRODUCED_CELLS, 0),
         ),
         (
             "DISCOVERY",

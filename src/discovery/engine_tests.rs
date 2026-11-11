@@ -67651,17 +67651,16 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         .push(ProcessView::open(ProcessViewId(1), head_pid).unwrap());
     engine.next_view_id = 2;
     assert!(engine.request_refresh_consumed(selected, Some(1_200)));
-    // Pinned pressure: the pending-refresh relief evicts only ownerless
-    // departed entries, so pin every filled request to a foreign owner no
-    // view carries. The live heads below must still be refused by a
-    // genuinely full queue; departed-fill admission is pinned separately
-    // by late_holder_refresh_queues_past_departed_pending.
+    // Departed pressure: every filled request is ownerless and departed,
+    // so during live operation relief could evict one for the live heads
+    // below (pinned by late_holder_refresh_queues_past_departed_pending).
+    // Under the collected finish no refresh service runs, so relief must
+    // not admit: each head is refused with its loss record instead.
     for offset in 0..255u32 {
-        assert!(engine.request_refresh_consumed_for_view(
-            FAKE_PID_FLOOR + offset,
-            Some(2_000 + u64::from(offset)),
-            ProcessViewId(u32::MAX)
-        ));
+        assert!(
+            engine
+                .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
+        );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     engine.collected_finish_actions = Some(64);

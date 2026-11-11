@@ -15808,7 +15808,7 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(ev.completeness, "PARTIAL");
         let line = coverage_line(&ev, false);
-        assert!(line.contains("7 processes refused an identity"), "{line}");
+        assert!(line.contains("7 process identity refusals"), "{line}");
         assert!(line.contains("262144"), "{line}");
         assert!(!line.contains("other gap"), "{line}");
         let verbose = coverage_line(&ev, true);
@@ -15825,7 +15825,7 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(ev.completeness, "PARTIAL");
         let line = coverage_line(&ev, false);
-        assert!(line.contains("3 processes refused an identity"), "{line}");
+        assert!(line.contains("3 process identity refusals"), "{line}");
         assert!(!line.contains("262144"), "{line}");
     }
 
@@ -15855,6 +15855,47 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(coverage_line(&ev, false), "coverage: complete");
         assert!(!coverage_line(&ev, false).contains("identity"));
+    }
+
+    // Identity refusals (RED): the counter counts refusal attempts —
+    // including repeats for one leader — not distinct processes, so
+    // the fragment says refusals in both numbers.
+    #[test]
+    fn coverage_line_counts_identity_refusal_attempts() {
+        let mut ev = evidence();
+        ev.kernel_control.identity_unavailable = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("1 process identity refusal"), "{line}");
+        assert!(!line.contains("refusals"), "{line}");
+    }
+
+    // Identity budget (RED): the missed-provider-load shortcut keeps
+    // its pause remedy but still names active identity refusals at
+    // default verbosity instead of hiding the spent budget.
+    #[test]
+    fn identity_refusals_survive_the_missed_provider_summary() {
+        let subject = || SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        };
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.skipped = vec![subject(), subject()];
+        ev.kernel_control.identity_unavailable = 7;
+        ev.kernel_control.identity_budget_exhausted = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains("rerun with --pause auto"), "{line}");
+        assert!(line.contains("7 process identity refusals"), "{line}");
+        assert!(line.contains("262144"), "{line}");
     }
 
     /// OD34/E1: the 256 process-view limit is named in the user's report.

@@ -24522,6 +24522,106 @@ int main(int argc, char **argv) {
         assert!(acc.longrun_line(true).contains("clean"));
     }
 
+    // Identity health (RED): a failed final identity-health read with
+    // no earlier sample — successful loss/tick samples, quiet newcomer
+    // queue — never yields "clean": the line names the unread state
+    // and warns on default stderr.
+    #[test]
+    fn failed_final_identity_sample_is_not_clean() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_has_findings(true));
+        let line = acc.longrun_line(true);
+        assert!(line.contains("identity_health_unknown"), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (twin): a spent sample synced from an earlier
+    // tick survives a failed final read — the caller simply syncs
+    // nothing — instead of degrading to unknown or clean.
+    #[test]
+    fn spent_identity_sample_survives_a_failed_final_read() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl {
+            identity_unavailable: 7,
+            identity_budget_exhausted: true,
+            ..Default::default()
+        });
+        // The final read failed: no second sync lands.
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_has_findings(true));
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{line}"
+        );
+        assert!(line.contains('7'), "{line}");
+        assert!(!line.contains("identity_health_unknown"), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (RED): a per-tick snapshot whose COOKIE_CTL cell
+    // read unknown contributes nothing — the last good sample stands —
+    // instead of overwriting it with unread zeros.
+    #[test]
+    fn unknown_cookie_cell_keeps_the_last_good_sample() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl {
+            identity_unavailable: 7,
+            identity_budget_exhausted: true,
+            ..Default::default()
+        });
+        acc.sync_identity_evidence(&crate::metrics::KernelEvidence {
+            control: crate::metrics::KernelControl::default(),
+            unknown_cells: crate::metrics::LEGACY_UNKNOWN_COOKIE,
+            ..Default::default()
+        });
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{line}"
+        );
+        assert!(line.contains('7'), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (RED twin): a readable spent COOKIE_CTL applies
+    // beside unrelated unknown EVIDENCE cells — only the cookie bit
+    // gates the sync.
+    #[test]
+    fn readable_cookie_cell_applies_beside_unrelated_evidence_gaps() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_evidence(&crate::metrics::KernelEvidence {
+            control: crate::metrics::KernelControl {
+                identity_unavailable: 7,
+                identity_budget_exhausted: true,
+                ..Default::default()
+            },
+            unknown_cells: crate::metrics::LEGACY_UNKNOWN_RING_LOSS,
+            ..Default::default()
+        });
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{line}"
+        );
+        assert!(line.contains('7'), "{line}");
+    }
+
     /// CLI text: only a detector with findings warns on default
     /// stderr; a clean or unavailable detector stays diagnostics.
     #[test]
@@ -27041,6 +27141,86 @@ int main(int argc, char **argv) {
             }
             assert_eq!(selected.get(), 2);
         }
+    }
+
+    /// Identity health (RED): both loops refresh the long-run
+    /// identity sample from the independent control read at loop end,
+    /// so an unrelated EVIDENCE-cell failure cannot discard a readable
+    /// spent COOKIE_CTL. The loops only run live, so the wiring is
+    /// pinned statically like the shared finish helpers below.
+    #[test]
+    fn both_capture_loops_sync_identity_health_from_the_control_read() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                body.matches("metrics::kernel_control(session)").count(),
+                1,
+                "{function} must take its final identity sample from the control read"
+            );
+            let sync = body
+                .find("metrics::kernel_control(session)")
+                .expect("final control read");
+            assert!(
+                body[..sync].ends_with("if let Ok(control) = "),
+                "{function} must sync the control read best-effort"
+            );
+            assert!(
+                !body.contains("sync_identity_health(&kernel.control)"),
+                "{function} must not sync identity through the all-or-nothing evidence read"
+            );
+        }
+    }
+
+    /// Identity health (RED): both loops keep a last-good identity
+    /// sample on every tick — profile from its snapshot's readable
+    /// control, trace from an independent control read beside its loss
+    /// report — so a failed final read retains known findings instead
+    /// of reporting clean. Pinned statically like the final sync above.
+    #[test]
+    fn both_capture_loops_keep_a_last_good_identity_sample_per_tick() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        assert_eq!(
+            profile.matches("scheduling.sync_identity_evidence(&kernel_evidence)").count(),
+            1,
+            "capture_profile must feed each tick snapshot's readable control to the detector"
+        );
+        let tick = trace
+            .find("metrics::kernel_control(context.1)")
+            .expect("capture_trace must read identity health on every tick");
+        assert!(
+            trace[tick..].split_once("consumers.scheduling.add_phase(").is_some_and(
+                |(before, _)| before.contains("consumers.scheduling.sync_identity_health(")
+            ),
+            "capture_trace must sync its per-tick control read to the detector"
+        );
     }
 
     #[test]

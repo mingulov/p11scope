@@ -709,6 +709,42 @@ mod tests {
         assert!(!newcomer_stalled(0, None));
     }
 
+    // Identity health (RED): no usable COOKIE_CTL sample — the final
+    // read failed and no tick sampled one — is a named finding, never
+    // a clean line. The detector must not substitute its healthy
+    // default for an unread state.
+    #[test]
+    fn unread_identity_health_is_a_finding_never_clean() {
+        let mut detector = ordinary_detector();
+        detector.note_newcomer(0, None);
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "identity_health_unknown")
+            .expect("identity_health_unknown finding");
+        assert_eq!(finding.at_tick, None);
+        let line = report.report_line();
+        assert!(line.contains("identity_health_unknown"), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (twin): one healthy sample clears the unread
+    // state and keeps the clean line.
+    #[test]
+    fn sampled_healthy_identity_keeps_the_clean_line() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(false, 0);
+        detector.note_newcomer(0, None);
+        let report = detector.finish(0, 0);
+        assert!(report.is_clean(), "{report:?}");
+        assert!(
+            report.report_line().contains("p11scope: longrun: clean"),
+            "{report:?}"
+        );
+    }
+
     // T2 (RED): thresholds come from the config, not the constants.
     #[test]
     fn custom_config_moves_thresholds() {

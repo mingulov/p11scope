@@ -1142,6 +1142,31 @@ mod tests {
         assert_eq!(identity_notice_line(&KernelControl::default()), None);
     }
 
+    // Identity health (RED): the loop-end control read touches only
+    // the three control cells, so an unrelated EVIDENCE-cell failure
+    // cannot discard a readable spent COOKIE_CTL. A live Session with
+    // maps needs attached BPF, so the independence is pinned
+    // statically: adding any EVIDENCE read to `kernel_control`
+    // reddens this test.
+    #[test]
+    fn kernel_control_read_ignores_evidence_cells() {
+        let source = include_str!("metrics.rs");
+        let body = source
+            .split_once("pub fn kernel_control(session: &Session) -> Result<KernelControl> {")
+            .expect("the independent control read")
+            .1
+            .split_once("\n}\n")
+            .expect("the control read end")
+            .0;
+        for cell in ["OWNER_CTL", "COOKIE_CTL", "ROOT_CTL"] {
+            assert!(body.contains(cell), "the control read maps {cell}");
+        }
+        assert!(
+            !body.contains("EVIDENCE"),
+            "the control read must not touch evidence cells"
+        );
+    }
+
     #[test]
     fn owner_poison_names_match_the_native_header_bits() {
         // The published names are keyed by the native bits: every #define in

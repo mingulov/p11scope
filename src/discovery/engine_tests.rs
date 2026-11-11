@@ -3857,9 +3857,16 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
             &mut pending,
         );
     }
+    // Hermetic newcomer: the overflowing EXEC must name an impossible pid
+    // (no /proc entry on any host), so relief can never admit it.
+    let overflow_pid = 4_001_000u32;
+    assert!(
+        overflow_pid >= FAKE_PID_FLOOR,
+        "the overflow newcomer must sit above every real pid"
+    );
     engine.dispatch_lifecycle_record(
         &mut ScriptedSession::default(),
-        &exec_record_for(4_001_000),
+        &exec_record_for(overflow_pid),
         &mut pending,
     );
     assert_eq!(engine.discovery_truncated, 1);
@@ -12432,7 +12439,15 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
 fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
     let mut pending = PendingViewRetirements::new();
-    for pid in 1..=(MAX_PENDING_REFRESH as u32 + 44) {
+    // Hermetic fill: every fill pid must be an impossible pid (no /proc
+    // entry on any host), so relief can never admit an overflow newcomer
+    // no matter which pids are alive on the test host.
+    let fill_base = 1u32;
+    assert!(
+        fill_base >= FAKE_PID_FLOOR,
+        "the overflow fill must sit above every real pid"
+    );
+    for pid in fill_base..=(fill_base + MAX_PENDING_REFRESH as u32 + 43) {
         engine.dispatch_lifecycle_record(
             &mut ScriptedSession::default(),
             &exec_record_for(pid),
@@ -12454,7 +12469,7 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
         engine.counters.object_skips
     );
     // Re-requesting a queued pid is a no-op, not more overflow.
-    engine.request_refresh(1, None);
+    engine.request_refresh(fill_base, None);
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
 }
@@ -45685,9 +45700,16 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
     }
     let requested = engine.refresh_requested.clone();
 
+    // Hermetic newcomer: the overflowing EXEC must name an impossible pid
+    // (no /proc entry on any host), so relief can never admit it.
+    let overflow_pid = 4_001_000u32;
+    assert!(
+        overflow_pid >= FAKE_PID_FLOOR,
+        "the overflow newcomer must sit above every real pid"
+    );
     engine.dispatch_lifecycle_record(
         &mut ScriptedSession::default(),
-        &exec_record_for(4_001_000),
+        &exec_record_for(overflow_pid),
         &mut pending,
     );
 
@@ -47083,12 +47105,21 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     // Past the queue cap the excess request drops with its loss marker
     // and its dropped age (here clock-unknown: the diff never marked it).
     let queued = engine.refresh_requested.len();
+    // Hermetic fill: the fill range and the overflow newcomer must be
+    // impossible pids (no /proc entry on any host), so the excess request
+    // drops with its loss marker on every host.
+    let fill_base = 50_000u32;
+    let overflow_pid = 60_000u32;
+    assert!(
+        fill_base >= FAKE_PID_FLOOR && overflow_pid >= FAKE_PID_FLOOR,
+        "the overflow fill and newcomer must sit above every real pid"
+    );
     for pid in 0..(MAX_PENDING_REFRESH - queued) as u32 {
-        engine.request_refresh(50_000 + pid, Some(4_000_000_000));
+        engine.request_refresh(fill_base + pid, Some(4_000_000_000));
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     let truncated_before = engine.discovery_truncated;
-    engine.request_refresh_consumed(60_000, Some(4_001_000_000));
+    engine.request_refresh_consumed(overflow_pid, Some(4_001_000_000));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, truncated_before + 1);
     let stats = engine.newcomer_stats(Some(4_002_000_000));

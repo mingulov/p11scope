@@ -461,7 +461,7 @@ report format.
   the capture. A refusal names what holds the slots; in such a shared capture
   it also names the reserve and suggests `--module`. The terminal report names
   every refused or partially covered module with its reason.
-- Kernel-side state has fixed limits too: a lifetime budget of 16,384 process
+- Kernel-side state has fixed limits too: a lifetime budget of 262,144 process
   identities per `profile`/`trace` capture (under `--cgroup` and `--system`
   every process created in scope spends them) and 16,448 concurrent in-flight
   call owners. Exhaustion, and any in-kernel accounting fault that halts

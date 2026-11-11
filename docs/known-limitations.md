@@ -389,8 +389,10 @@ it. Measured: the release candidate counts 0 softokn calls with
 Firefox already open, while the same workload counts about 1,280
 calls without the defect. The run still reports PARTIAL with the
 named gaps. Workaround: start the capture before opening Firefox; a
-Firefox started after the capture begins attaches normally. A fix is
-in review; if it misses this release it lands in 0.7.1.
+Firefox started after the capture begins attaches and its calls count
+normally (the per-key tracking gap above can still leave it without
+per-key operation tracking). A fix is in review; if it misses this
+release it lands in 0.7.1.
 
 ### Main thread exits first: a later library load can go unreported
 
@@ -710,7 +712,7 @@ be compared (a time namespace offset, or a kernel without the time
 namespace files) refuses the selection as `promotion_scope_unsupported`.
 
 A capture follows at most 256 provider loads and tracks at most
-16,384 program images; past either limit the report carries a named
+262,144 program images; past either limit the report carries a named
 gap and reads PARTIAL (full entries below). Stopping a very large
 capture can refuse its fixed 384 MiB graph pool: the stop ends as a
 finite incomplete stop, with retired objects still reported attached
@@ -1327,7 +1329,7 @@ profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build).
 
 A capture follows at most 256 provider loads and tracks at most
-16,384 program images; past either limit the report carries a named
+262,144 program images; past either limit the report carries a named
 gap and reads PARTIAL (full entries below). Stopping a very large
 capture can refuse its fixed 384 MiB graph pool: the stop ends as a
 finite incomplete stop, with retired objects still reported attached

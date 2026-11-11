@@ -1760,7 +1760,7 @@ mod tests {
 
     fn bank_control(next_ticket: u64) -> ImageIdentityControl {
         ImageIdentityControl {
-            limit: 16_384,
+            limit: IMAGE_IDENTITY_TICKET_LIMIT,
             next_ticket,
             unavailable: 0,
             create_failures: 0,
@@ -1975,7 +1975,7 @@ mod tests {
         let good = Some(bank_control(10));
         // A watermark past the budget or a wrong limit fails closed.
         for bad in [
-            bank_control(16_385),
+            bank_control(IMAGE_IDENTITY_TICKET_LIMIT + 1),
             bank_control(u64::MAX),
             ImageIdentityControl {
                 limit: 0,

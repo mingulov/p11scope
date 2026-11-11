@@ -195,6 +195,16 @@ PY
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
+REASON_COUNTER_WIDE="counter modes unavailable in the wide build (the build omits counter objects); product fix lane: 0.7.x companion restore"
+# The documented build-gate refusal, byte-exact without the p11scope prefix
+# (src/attach/counter_banks.rs check_counter_build; FULL builds emit the
+# objects and can never print it). The probe and the per-cell arm share it.
+COUNTER_BUILD_REFUSAL="counter-mode-unavailable-in-build: this build omits counter objects"
+# No kernel can hold this pid (2^31 - 1 exceeds every pid_max), so the
+# probe and the refusal arm never attach: the build gate fires first on
+# builds without counter objects, and anything else fails later for
+# another reason (bogus pid, privilege), which is the healthy arm.
+COUNTER_BOGUS_PID=2147483647
 asuser_conf() {
   local conf=$1; shift
   if [ "$CONTROL" = 1 ]; then SOFTHSM2_CONF="$conf" exec "$@"; fi
@@ -380,6 +390,65 @@ gated() {
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
   case "$cell" in inventory-mt-*) publish_output "$cell.eventlog.jsonl" || { result "$cell" 0 'event-log copy failed' failed; return 1; };; esac
   judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
+}
+# Counter-build probe, once per campaign (CONTROL modes skip it: they run
+# no counter cell and their fake observers answer nothing here). 0 when
+# the observer passes the counter gate (FULL build: the bogus pid fails
+# later for another reason), 1 when it refuses with the exact documented
+# build reason (wide default), 64 when the outcome is inconclusive (an
+# observer that captures against a bogus pid, or refuses noisily, fails
+# loud before any cell runs).
+counter_build_supported() {
+  local probe_out=$OUT/counter-build-probe.json rc=0
+  rm -f -- "$probe_out" "$OUT/counter-build-probe.stdout" "$OUT/counter-build-probe.stderr"
+  "$P" profile --mode metrics --counter-mode counts --pid "$COUNTER_BOGUS_PID" --duration 1 -o "$probe_out" \
+    >"$OUT/counter-build-probe.stdout" 2>"$OUT/counter-build-probe.stderr" || rc=$?
+  if [ "$rc" = 1 ] && [ ! -e "$probe_out" ] && [ ! -s "$OUT/counter-build-probe.stdout" ] \
+      && printf 'p11scope: %s\n' "$COUNTER_BUILD_REFUSAL" | cmp -s - "$OUT/counter-build-probe.stderr"; then
+    return 1
+  fi
+  if [ "$rc" != 0 ] && ! grep -qF "$COUNTER_BUILD_REFUSAL" "$OUT/counter-build-probe.stderr"; then
+    return 0
+  fi
+  echo "counter build probe inconclusive rc=$rc" >&2
+  return 64
+}
+# Exact-refusal control for one counter/select-endpoint cell on a build
+# without counter objects: run the cell's observer args (pid cells take
+# the same bogus pid the probe used — the build gate fires before pid
+# validation, so no workload is needed) and require exit 1, silent
+# stdout, the exact documented refusal on stderr, and no output file.
+# Emits expected-failure on the exact refusal; anything else stays failed.
+counter_refused() {
+  local cell=$1; shift
+  local args=() out="" prev="" arg
+  for arg in "$@"; do
+    if [ "$prev" = -o ]; then out=$arg; fi
+    prev=$arg
+    case $arg in @PID@) args+=("$COUNTER_BOGUS_PID");; *) args+=("$arg");; esac
+  done
+  [ -n "$out" ] || { result "$cell" 0 "refusal control without -o target" failed; return 1; }
+  rm -f -- "$out" "$cell.stderr" "$cell.stdout"
+  local rc=0
+  "$P" "${args[@]}" >"$cell.stdout" 2>"$cell.stderr" || rc=$?
+  if [ "$rc" = 1 ] && [ ! -e "$out" ] && [ ! -s "$cell.stdout" ] \
+      && printf 'p11scope: %s\n' "$COUNTER_BUILD_REFUSAL" | cmp -s - "$cell.stderr"; then
+    result "$cell" 0 "$REASON_COUNTER_WIDE: [$cell] exit=1 refusal=$COUNTER_BUILD_REFUSAL" expected-failure
+    return 0
+  fi
+  result "$cell" 0 "expected the documented counter-build refusal, got rc=$rc stderr=$(head -c 200 "$cell.stderr" | tr '\n' ' ')" failed
+  return 1
+}
+# Counter/select-endpoint cells branch on the build: FULL builds capture
+# through the ordinary gated lifecycle; builds without counter objects
+# prove the exact refusal instead.
+counter_cell() {
+  local cell=$1 scope=$2 fixture=$3; shift 3
+  if [ "$COUNTER_SUPPORTED" = 1 ]; then
+    gated "$cell" "$scope" "$fixture" "$@"
+    return $?
+  fi
+  counter_refused "$cell" "$@"
 }
 system_cell() {
   gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
@@ -1014,6 +1083,17 @@ sh -c 'kill -HUP $$' >/dev/null 2>&1; status=$?
 [ "$status" = 129 ] || { echo "SIGHUP positive control failed rc=$status" >&2; exit 65; }
 env --default-signal=INT sh -c 'kill -INT $$' >/dev/null 2>&1 & wait $!
 [ $? = 130 ] || { echo 'SIGINT positive control failed' >&2; exit 65; }
+# Counter support is a build property: probe once, before any campaign
+# branch (the subset branch can select counter-latency-mt). CONTROL
+# modes run no counter cell, so they skip the probe and their fake
+# observers. Placed after every function definition it needs.
+COUNTER_SUPPORTED=1
+if [ "$CONTROL" = 0 ]; then
+  if counter_build_supported; then COUNTER_SUPPORTED=1
+  elif [ $? = 1 ]; then COUNTER_SUPPORTED=0
+  else exit 64
+  fi
+fi
 # Filtered subset (names validated above): run only the requested gated
 # cells through the same lifecycles and judge exactly that set.
 # scripts/ci/legacy32-shape.sh selects 'profile-pid system'.
@@ -1032,7 +1112,7 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       mt-shared) gated mt-shared pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-shared.json" ;;
       mt-churn) gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.json" ;;
       mt-trace) gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt" ;;
-      counter-latency-mt) gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
+      counter-latency-mt) counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
       mt-system) gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json" ;;
       inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 12 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
       inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 25 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
@@ -1090,7 +1170,7 @@ gated mt-errors pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-errors.
 gated mt-shared pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-shared.json"
 gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.json"
 gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt"
-gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json"
+counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json"
 gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json"
 # Inventory MT-exact cells: the held workload keeps its process alive across
 # inventory passes; per-edge usage and the event-log stream are judged exact.
@@ -1138,14 +1218,14 @@ cgroup_capture metrics-cgroup metrics
 cgroup_capture trace-cgroup trace
 cgroup_capture inventory-cgroup inventory
 # WP-4 breadth: counter modes and select-endpoint (S6).
-gated counter-counts-pid pid "$GATED" profile --mode metrics --counter-mode counts --pid @PID@ --duration 12 -o "$OUT/counter-counts-pid.json"
-gated counter-timestamps-pid pid "$GATED" profile --mode metrics --counter-mode timestamps --pid @PID@ --duration 12 -o "$OUT/counter-timestamps-pid.json"
-gated counter-latency-pid pid "$GATED" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-pid.json"
-gated counter-counts-system system "$GATED" profile --mode metrics --counter-mode counts --system --module "$MODULE" --duration 25 -o "$OUT/counter-counts-system.json"
-gated counter-timestamps-system system "$GATED" profile --mode metrics --counter-mode timestamps --system --module "$MODULE" --duration 25 -o "$OUT/counter-timestamps-system.json"
-gated counter-latency-system system "$GATED" profile --mode metrics --counter-mode latency --system --module "$MODULE" --duration 25 -o "$OUT/counter-latency-system.json"
-gated select-endpoint-pid pid "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --pid @PID@ --duration 12 -o "$OUT/select-endpoint-pid.json"
-gated select-endpoint-system system "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --system --duration 25 -o "$OUT/select-endpoint-system.json"
+counter_cell counter-counts-pid pid "$GATED" profile --mode metrics --counter-mode counts --pid @PID@ --duration 12 -o "$OUT/counter-counts-pid.json"
+counter_cell counter-timestamps-pid pid "$GATED" profile --mode metrics --counter-mode timestamps --pid @PID@ --duration 12 -o "$OUT/counter-timestamps-pid.json"
+counter_cell counter-latency-pid pid "$GATED" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-pid.json"
+counter_cell counter-counts-system system "$GATED" profile --mode metrics --counter-mode counts --system --module "$MODULE" --duration 25 -o "$OUT/counter-counts-system.json"
+counter_cell counter-timestamps-system system "$GATED" profile --mode metrics --counter-mode timestamps --system --module "$MODULE" --duration 25 -o "$OUT/counter-timestamps-system.json"
+counter_cell counter-latency-system system "$GATED" profile --mode metrics --counter-mode latency --system --module "$MODULE" --duration 25 -o "$OUT/counter-latency-system.json"
+counter_cell select-endpoint-pid pid "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --pid @PID@ --duration 12 -o "$OUT/select-endpoint-pid.json"
+counter_cell select-endpoint-system system "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --system --duration 25 -o "$OUT/select-endpoint-system.json"
 # WP-4 breadth: ia32 through the public command (S12). IA32_MODULE allows an
 # unpacked i386 copy (apt i386 cannot coexist with amd64 in the main job); the
 # ia32-only job (P11SCOPE_PUBLIC_CLI_ONLY_IA32=1 above) installs via apt.

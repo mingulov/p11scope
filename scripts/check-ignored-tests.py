@@ -88,6 +88,13 @@ WRAP_FIXTURE_LIST = "WRAP_FIXTURE_TESTS"
 # Btrfs provisioning for expected failures, not a campaign list either:
 # the xfail members that also need the loop-mounted btrfs TMPDIR.
 BTRFS_XFAIL_LIST = "BTRFS_TMPDIR_XFAIL_TESTS"
+# Wide-only membership, not a campaign list either: the DEFAULT_TESTS
+# and LONG_TESTS members that exist only in a wide-detailed-2112
+# binary. Sized in the counts line; the --full-512 runner mode proves
+# a FULL-512 binary lacks exactly these. Every member must stay a
+# default/long campaign member (checked below); the suite pins the set
+# against the cfg gates.
+WIDE_ONLY_LIST = "WIDE_ONLY_TESTS"
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
 COUNTER_PROOF_LIST = "COUNTER_BANK_PROOF_TESTS"
@@ -114,6 +121,7 @@ COUNT_LISTS = (
     FIXTURE_LIST,
     WRAP_FIXTURE_LIST,
     BTRFS_XFAIL_LIST,
+    WIDE_ONLY_LIST,
     *(name for _, name, _ in OWNER_LISTS),
     INTEGRATION_LIST,
 )
@@ -629,6 +637,14 @@ def check(root=ROOT, inventory=None, runner=None):
     skip_paths = lists.get("SKIP_TESTS", set())
     wide = lists.get(WIDE_LIST, set())
     integration = lists.get(INTEGRATION_LIST, set())
+    wide_only = lists.get(WIDE_ONLY_LIST, set())
+    campaign = (lists.get("DEFAULT_TESTS", set())
+                | lists.get("LONG_TESTS", set()))
+    for member in sorted(wide_only):
+        if member not in campaign:
+            failures.append(f"FAIL runner: {WIDE_ONLY_LIST} member "
+                            f"{member} is not a default/long campaign "
+                            "member")
     current = current_version(root)
     if current is None:
         failures.append(f"FAIL {root / DEFAULT_MANIFEST}: cannot read "

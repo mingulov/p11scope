@@ -888,6 +888,39 @@ WIDE_DETAILED_2112_TESTS=(
 # no members: promoted to DEFAULT_TESTS above
 )
 
+# Wide-only curation (checker-sized, never executed by itself): the
+# DEFAULT_TESTS and LONG_TESTS members that exist only in a
+# wide-detailed-2112 binary (cfg wide, no FULL twin). A FULL-512 binary
+# (--no-default-features, the journal flavor) must lack exactly these;
+# --list and run modes with --full-512 verify that instead of the
+# default exact cover. Pinned against the cfg gates by
+# tests/python/test_ignored_tests.py; a gate change must update this
+# list (17 default + 4 long members, in campaign order).
+# shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
+WIDE_ONLY_TESTS=(
+attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec
+attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_detailed_physical_identity_controls
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2049_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_n511_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_n512_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_n513_lp64
+attach::inventory::activation::privileged_tests::privileged_task4_inventory_physical_identity_controls
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64
+)
+
 # Counter-build curation (checker-enforced, never executed by this
 # script): the ignored integration tests that exist only in dedicated
 # counter builds. COUNTER_ARTIFACTS_TESTS members run with
@@ -951,10 +984,11 @@ tests/trace_pid_target.rs:privileged_trace_pid_names_target_on_stderr
 usage() {
     cat <<EOF
 usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [--include-btrfs]
-           [--include-overlay] [--include-expected-failures] [SELECTOR...]
+           [--include-overlay] [--include-expected-failures] [--full-512] [SELECTOR...]
        $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
        $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
+       $PROG --list --full-512 LIB_TEST_BINARY
        $PROG --list-integration TEST_BINARY_DIR
        $PROG --help
 
@@ -972,9 +1006,14 @@ the run as XPASS).
 --wide-detailed-2112 is accepted as a no-op alias: 2,112 slots are the
 default profile since v0.7.0, so the wide-Detailed cells run in the
 default campaign. Kept for one release.
+--full-512 verifies a FULL-512 binary (--no-default-features, the
+journal flavor): the wide-only cells must be absent, every other
+curated cell present, and no uncurated ignored test may exist. A
+binary that contains a wide-only cell is refused, never graded.
 --list prints the curated default, long, skipped-with-reason, btrfs,
 overlay, and expected-failure lists and verifies them against
-the binary, without running anything.
+the binary, without running anything. With --full-512 it prints and
+verifies only the FULL-512 curation (wide-only members dropped).
 --list-integration prints the curated integration-test selectors and
 verifies each against the built test binaries in TEST_BINARY_DIR
 (exactly one binary and exactly one selected test per entry), without
@@ -1085,11 +1124,16 @@ private_image_proof_name() {
 
 check_curation() {
     check_skip_alignment || return 1
-    local bin=$1 workdir bin_list cur_list missing_bin missing_cur proof_present=0 name
+    # $2 selects the binary profile: empty for the default (wide) exact
+    # cover, "full512" for a FULL-512 binary (the wide-only members must
+    # be absent instead of present; everything else stays exact).
+    local bin=$1 flavor=${2:-} workdir bin_list cur_list missing_bin missing_cur proof_present=0 name
     local -A proof_curated=()
     for name in "${SKIP_TESTS[@]}"; do
         if private_image_proof_name "$name"; then proof_curated["$name"]=1; fi
     done
+    local -A wide_only=()
+    for name in "${WIDE_ONLY_TESTS[@]}"; do wide_only["$name"]=1; done
     workdir=$(mktemp -d) || { echo "$PROG: cannot create temp dir" >&2; return 1; }
     bin_list=$workdir/bin.txt
     cur_list=$workdir/cur.txt
@@ -1132,6 +1176,11 @@ check_curation() {
             if [ "$proof_present" -eq 0 ] && [ -n "${proof_curated[$aname]+present}" ]; then
                 continue
             fi
+            # FULL-512 binaries never carry the wide-only members; any
+            # other curated-but-absent member still fails below.
+            if [ "$flavor" = full512 ] && [ -n "${wide_only[$aname]+present}" ]; then
+                continue
+            fi
             local is_alt=0 alt
             for alt in "${ALTERNATIVE_TESTS[@]}"; do
                 [ "$aname" = "$alt" ] && is_alt=1
@@ -1142,8 +1191,20 @@ $aname"; fi
         done <<<"$missing_bin"
         missing_bin=$rest
     fi
+    # A FULL-512 binary must lack every wide-only member: a present one
+    # means the flavor flag is grading the wrong binary (or a gate
+    # silently flipped), never a quieter pass.
+    local present_wide=
+    if [ "$flavor" = full512 ]; then
+        for name in "${WIDE_ONLY_TESTS[@]}"; do
+            if grep -qxF "$name" "$bin_list"; then
+                if [ -z "$present_wide" ]; then present_wide=$name; else present_wide="$present_wide
+$name"; fi
+            fi
+        done
+    fi
     rm -rf "$workdir"
-    if [ -n "$missing_bin" ] || [ -n "$missing_cur" ]; then
+    if [ -n "$missing_bin" ] || [ -n "$missing_cur" ] || [ -n "$present_wide" ]; then
         local -a names
         {
             echo "$PROG: curation drift against $bin"
@@ -1155,6 +1216,11 @@ $aname"; fi
             [ -n "$missing_cur" ] && {
                 echo "ignored in the binary but not curated (new test?):"
                 mapfile -t names <<<"$missing_cur"
+                printf '  %s\n' "${names[@]}"
+            }
+            [ -n "$present_wide" ] && {
+                echo "FULL-512 binary $bin unexpectedly contains wide-only cells (expected absent):"
+                mapfile -t names <<<"$present_wide"
                 printf '  %s\n' "${names[@]}"
             }
         } >&2
@@ -1208,9 +1274,13 @@ check_wide_curation() {
 
 # --list mode: curated lists plus a verification footer. Unprivileged-safe.
 list_mode() {
-    local bin name i wide=0
+    local bin name i wide=0 full512=0
     if [ "${1:-}" = "--wide-detailed-2112" ]; then
         echo "$PROG: note: wide-detailed-2112 is the default profile since v0.7.0; the flag is ignored" >&2
+        shift
+    fi
+    if [ "${1:-}" = "--full-512" ]; then
+        full512=1
         shift
     fi
     [ $# -eq 1 ] || { usage >&2; return 2; }
@@ -1226,11 +1296,21 @@ list_mode() {
         fi
         return 1
     fi
+    local -A wide_only=()
+    for name in "${WIDE_ONLY_TESTS[@]}"; do wide_only["$name"]=1; done
     # The receipt stays per-binary exact: resolve the feature-alternative
     # load gate against this binary and list the present member (if any) as
     # a default-campaign cell. The drift check below still refuses a binary
-    # with zero or two members.
-    default_all=("${DEFAULT_TESTS[@]}")
+    # with zero or two members. A FULL-512 listing drops the wide-only
+    # members from the default and long sections (they cannot exist in
+    # that binary), with truthful counts; every other section is shared.
+    default_all=()
+    for name in "${DEFAULT_TESTS[@]}"; do
+        if [ "$full512" -eq 1 ] && [ -n "${wide_only[$name]+present}" ]; then
+            continue
+        fi
+        default_all+=("$name")
+    done
     for name in "${ALTERNATIVE_TESTS[@]}"; do
         if binary_has_ignored "$bin" "$name"; then
             default_all+=("$name")
@@ -1249,8 +1329,15 @@ list_mode() {
             *) echo "$name" ;;
         esac
     done
-    echo "long (${#LONG_TESTS[@]}, --include-long only)"
-    printf '%s\n' "${LONG_TESTS[@]}"
+    long_all=()
+    for name in "${LONG_TESTS[@]}"; do
+        if [ "$full512" -eq 1 ] && [ -n "${wide_only[$name]+present}" ]; then
+            continue
+        fi
+        long_all+=("$name")
+    done
+    echo "long (${#long_all[@]}, --include-long only)"
+    printf '%s\n' "${long_all[@]}"
     echo "skipped (${#SKIP_TESTS[@]})"
     for i in "${!SKIP_TESTS[@]}"; do
         echo "${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}"
@@ -1263,6 +1350,15 @@ list_mode() {
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         echo "${EXPECTED_FAILURE_TESTS[$i]} :: ${XFAIL_REASONS[$i]} [sig: ${XFAIL_SIGNATURES[$i]}] [owner: ${XFAIL_OWNERS[$i]}]"
     done
+    if [ "$full512" -eq 1 ]; then
+        if check_curation "$bin" full512; then
+            local actual_count
+            actual_count=$(binary_ignored_list "$bin" | wc -l) || return 1
+            echo "verify: full-512 curation matches the binary ($actual_count tests)"
+            return 0
+        fi
+        return 1
+    fi
     if check_curation "$bin"; then
         local actual_count
         actual_count=$(binary_ignored_list "$bin" | wc -l) || return 1
@@ -1353,7 +1449,7 @@ cleanup_btrfs_mount() {
 }
 
 main() {
-    local bin outdir include_long=0 include_btrfs=0 include_overlay=0 include_xfail=0 wide=0
+    local bin outdir include_long=0 include_btrfs=0 include_overlay=0 include_xfail=0 wide=0 full512=0
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
@@ -1391,6 +1487,7 @@ main() {
             --include-overlay) include_overlay=1 ;;
             --include-expected-failures) include_xfail=1 ;;
             --wide-detailed-2112) echo "$PROG: note: wide-detailed-2112 is the default profile since v0.7.0; the flag is ignored" >&2 ;;
+            --full-512) full512=1 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
             *) SELECTORS+=("$arg") ;;
         esac
@@ -1414,8 +1511,14 @@ main() {
     outdir=$(CDPATH='' cd "$outdir" && pwd) || return 1
 
     # Fail fast when the curation no longer covers the binary exactly.
+    # A FULL-512 run verifies the FULL-512 curation and never selects a
+    # wide-only cell (it cannot exist in that binary).
+    local -A wide_only_run=()
+    for name in "${WIDE_ONLY_TESTS[@]}"; do wide_only_run["$name"]=1; done
     if [ "$wide" -eq 1 ]; then
         check_wide_curation "$bin" || return 1
+    elif [ "$full512" -eq 1 ]; then
+        check_curation "$bin" full512 || return 1
     else
         check_curation "$bin" || return 1
     fi
@@ -1429,6 +1532,9 @@ main() {
         done
     else
         for name in "${DEFAULT_TESTS[@]}"; do
+            if [ "$full512" -eq 1 ] && [ -n "${wide_only_run[$name]+present}" ]; then
+                continue
+            fi
             if selected "$name"; then
                 selected_runnable+=("$name")
             fi
@@ -1441,6 +1547,9 @@ main() {
         done
         if [ "$include_long" -eq 1 ]; then
             for name in "${LONG_TESTS[@]}"; do
+                if [ "$full512" -eq 1 ] && [ -n "${wide_only_run[$name]+present}" ]; then
+                    continue
+                fi
                 if selected "$name"; then
                     selected_runnable+=("$name")
                 fi

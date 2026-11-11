@@ -715,7 +715,7 @@ def run_counter_shell(body, *, cwd):
     funcs = extract_functions("result", "counter_refused",
                               "counter_build_supported")
     const = subprocess.run(
-        ["grep", "^COUNTER_BUILD_REFUSAL=", str(QUAL)],
+        ["grep", "-E", "^COUNTER_(BUILD_REFUSAL|BOGUS_PID)=", str(QUAL)],
         capture_output=True, text=True, timeout=5)
     script = funcs + "\n" + const.stdout + "\n" + body
     return subprocess.run(
@@ -824,16 +824,16 @@ class CounterRefusalTests(unittest.TestCase):
                     "--mode metrics --counter-mode counts --pid 999 "
                     f"--duration 12 -o {out}")
             proc = run_counter_shell(body, cwd=tmp)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        rows = [json.loads(line) for line in
-                (tmp / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(len(rows), 1, rows)
-        row = rows[0]
-        self.assertEqual(row["cell"], "counter-counts-pid")
-        self.assertFalse(row["pass"])
-        self.assertEqual(row["qualification"], "expected-failure")
-        self.assertIn("0.7.x", row["detail"])
-        self.assertFalse(out.exists())
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            rows = [json.loads(line) for line in
+                    (tmp / "results.jsonl").read_text().splitlines()]
+            self.assertEqual(len(rows), 1, rows)
+            row = rows[0]
+            self.assertEqual(row["cell"], "counter-counts-pid")
+            self.assertFalse(row["pass"])
+            self.assertEqual(row["qualification"], "expected-failure")
+            self.assertIn("0.7.x", row["detail"])
+            self.assertFalse(out.exists())
 
     def test_refused_cell_fails_a_full_style_error(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -846,10 +846,10 @@ class CounterRefusalTests(unittest.TestCase):
                     "--mode metrics --counter-mode counts --pid 999 "
                     f"--duration 12 -o {out}")
             proc = run_counter_shell(body, cwd=tmp)
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        rows = [json.loads(line) for line in
-                (tmp / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(rows[0]["qualification"], "failed")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            rows = [json.loads(line) for line in
+                    (tmp / "results.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["qualification"], "failed")
 
     def test_refused_cell_fails_an_unexpected_success(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -862,10 +862,10 @@ class CounterRefusalTests(unittest.TestCase):
                     "--mode metrics --counter-mode counts --pid 999 "
                     f"--duration 12 -o {out}")
             proc = run_counter_shell(body, cwd=tmp)
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        rows = [json.loads(line) for line in
-                (tmp / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(rows[0]["qualification"], "failed")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            rows = [json.loads(line) for line in
+                    (tmp / "results.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["qualification"], "failed")
 
     def test_refused_cell_fails_stdout_noise(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -879,10 +879,10 @@ class CounterRefusalTests(unittest.TestCase):
                     "--mode metrics --counter-mode counts --pid 999 "
                     f"--duration 12 -o {out}")
             proc = run_counter_shell(body, cwd=tmp)
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        rows = [json.loads(line) for line in
-                (tmp / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(rows[0]["qualification"], "failed")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            rows = [json.loads(line) for line in
+                    (tmp / "results.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["qualification"], "failed")
 
 
 if __name__ == "__main__":

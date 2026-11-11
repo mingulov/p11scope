@@ -356,6 +356,7 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("COUNTER_FIXTURE_TESTS", []),
             ("WRAP_FIXTURE_TESTS", []),
             ("BTRFS_TMPDIR_XFAIL_TESTS", []),
+            ("WIDE_ONLY_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
             ("INTEGRATION_TESTS", integration_registered),
             ("COUNTER_BANK_PROOF_TESTS", counter_proof_registered),
@@ -1849,6 +1850,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "EXPECTED_FAILURE_TESTS=0 SKIP_TESTS=0 "
             "COUNTER_FIXTURE_TESTS=0 WRAP_FIXTURE_TESTS=0 "
             "BTRFS_TMPDIR_XFAIL_TESTS=0 "
+            "WIDE_ONLY_TESTS=0 "
             "WIDE_DETAILED_2112_TESTS=1 "
             "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
             "DISCOVER_BTRFS_SUBVOL_TESTS=0 "
@@ -1870,6 +1872,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_FIXTURE_TESTS=27",
             "WRAP_FIXTURE_TESTS=7",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",
+            "WIDE_ONLY_TESTS=21",
             "WIDE_DETAILED_2112_TESTS=0",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

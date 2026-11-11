@@ -15,8 +15,9 @@ name: privileged-tests
 # - privileged-build compiles the lib-test executable and the observer
 #   (default features, no P11SCOPE_SMALL_*), lists the curated default
 #   cells with scripts/run-privileged-lib-tests.sh --list, and ships all
-#   three as a 1-day artifact. The default build also builds
-#   P11SCOPE_JOURNAL_PROOF=1 and runs the two root_proof_tests
+#   three as a 1-day artifact. The default job also builds
+#   P11SCOPE_JOURNAL_PROOF=1 at FULL capacities (--no-default-features,
+#   the proof refuses WIDE) and runs the two root_proof_tests
 #   (unprivileged, cached after the first run);
 # - privileged-build-journal compiles the same pair with
 #   P11SCOPE_JOURNAL=1 for the journal-only cells, as a separate job so
@@ -185,7 +186,11 @@ jobs:
           toolchain=$(cat .release-rust-version)
           # Separate target dir: the proof build must not poison the default
           # target/debug cache the next run restores.
-          P11SCOPE_JOURNAL_PROOF=1 cargo +"$toolchain" test --locked --offline --lib \
+          # The private proof builds at FULL (512-slot) capacities only
+          # (build.rs refuses SMALL/WIDE/unsafe/P0); the wide default
+          # carries no journal object to prove, so the proof step builds
+          # --no-default-features while the product stays wide.
+          P11SCOPE_JOURNAL_PROOF=1 cargo +"$toolchain" test --locked --offline --no-default-features --lib \
             --target-dir target/proof --no-run --message-format=json >"$RUNNER_TEMP/proof-build.jsonl"
           lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/proof-build.jsonl" | grep -v '^null$' | tail -1)
           test -x "$lib"
@@ -269,7 +274,10 @@ jobs:
           mkdir -p "$out/bin"
           cp -p "$lib" "$out/lib-tests"
           cp -p target/debug/p11scope target/debug/p11scope-discover "$out/bin/"
-          scripts/run-privileged-lib-tests.sh --list "$out/lib-tests" >"$out/list.txt"
+          # FULL-512 binary: the 21 wide-only cells do not exist here, so
+          # verify the FULL-512 curation explicitly (a silent gating
+          # change fails instead of flipping coverage).
+          scripts/run-privileged-lib-tests.sh --list --full-512 "$out/lib-tests" >"$out/list.txt"
           # Journal flavor runs six exact cells in privileged-second-flavor,
           # not the sharded campaign; keep the list for the presence check.
           awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
@@ -518,7 +526,7 @@ jobs:
           header=/usr/include/p11-kit-1/p11-kit
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
-            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${cells[@]}" || rc=$?
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -1026,6 +1034,11 @@ jobs:
               --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
               --expected-failure profile-cgroup --expected-failure trace-cgroup \
               --expected-failure profile-pid-ia32 --expected-failure run-ia32 \
+              --expected-failure counter-latency-mt \
+              --expected-failure counter-counts-pid --expected-failure counter-timestamps-pid \
+              --expected-failure counter-latency-pid --expected-failure counter-counts-system \
+              --expected-failure counter-timestamps-system --expected-failure counter-latency-system \
+              --expected-failure select-endpoint-pid --expected-failure select-endpoint-system \
               --require doctor --require profile-pid --require names-pid --require verdict-pid \
               --require metrics-pid --require trace-pid --require run-short --require run-cover \
               --require mt-exact --require system --require sigint --require second-sigint \
@@ -1100,8 +1113,18 @@ jobs:
           # qualified now that their observation gaps closed. The harness
           # emits expected only on the known signatures, qualified on pass.
           smoke_cells = {"trace-pid", "mt-trace"}
+          # The wide default build omits counter objects, so the 9
+          # counter/select-endpoint cells refuse with the documented
+          # build reason (the qualifier records expected-failure only
+          # on that exact refusal); restore is 0.7.x work.
           expected_cells = {"profile-cgroup", "trace-cgroup",
-                            "profile-pid-ia32", "run-ia32"}
+                            "profile-pid-ia32", "run-ia32",
+                            "counter-latency-mt",
+                            "counter-counts-pid", "counter-timestamps-pid",
+                            "counter-latency-pid", "counter-counts-system",
+                            "counter-timestamps-system",
+                            "counter-latency-system",
+                            "select-endpoint-pid", "select-endpoint-system"}
           actual_expected = set()
           actual_smoke = set()
           for row in rows:

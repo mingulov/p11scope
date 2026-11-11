@@ -73426,9 +73426,151 @@ fn late_holder_refresh_queues_past_departed_pending() {
         assert!(fake < 4_200_000, "enough unused pids to fill the queue");
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let queued: BTreeSet<u32> = engine.refresh_requested.keys().copied().collect();
     assert!(
         engine.request_refresh(holder, Some(2_000_000)),
         "a live holder queues past departed pending"
     );
     assert!(engine.refresh_requested.contains_key(&holder));
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "relief replaces exactly one entry, the queue stays bounded"
+    );
+    let evicted: Vec<u32> = queued
+        .iter()
+        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .copied()
+        .collect();
+    assert_eq!(
+        evicted.len(),
+        1,
+        "relief evicts exactly one departed entry: {evicted:?}"
+    );
+    assert!(
+        (4_000_000..4_200_000).contains(&evicted[0]) && evicted[0] != holder,
+        "the evicted entry is a departed filler pid: {evicted:?}"
+    );
+}
+
+/// Relief selectivity: a live holder's consumed refresh evicts exactly one
+/// departed ownerless entry while every protected request keeps its full
+/// value (owner-bearing, view-bearing, live /proc) and the bound holds.
+#[test]
+fn late_holder_relief_preserves_protected_requests_and_bound() {
+    let guards = e06_spawn_sleeps(2);
+    let holder = guards[0].pid();
+    let live = guards[1].pid();
+    assert_ne!(holder, live);
+    assert!(
+        holder < FAKE_PID_FLOOR && live < FAKE_PID_FLOOR,
+        "real pids sort below the fake fill range"
+    );
+    let mut engine = Engine::empty();
+    // Live /proc entry with no view and no owner: protected by liveness.
+    assert!(engine.request_refresh_consumed(live, Some(100)));
+    // Owner-bearing departed entry: protected by its retained owner.
+    let owned = FAKE_PID_FLOOR;
+    assert!(
+        engine.request_refresh_consumed_for_view(owned, Some(200), ProcessViewId(7)),
+        "the owner-bearing filler queues"
+    );
+    // View-bearing departed entry: a reaped pid whose retained view still
+    // names it is protected by the view alone (no owner, no /proc).
+    let mut reaped = std::process::Command::new("sleep")
+        .arg("60")
+        .die_with_parent()
+        .spawn()
+        .expect("spawn reaped peer");
+    let reaped_pid = reaped.id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), reaped_pid).unwrap());
+    engine.next_view_id = 2;
+    reaped.kill().unwrap();
+    reaped.wait().unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{reaped_pid}")).exists(),
+        "the reaped pid stays absent"
+    );
+    assert!(
+        engine.request_refresh(reaped_pid, Some(300)),
+        "the view-bearing departed pid queues"
+    );
+    assert_eq!(
+        engine.refresh_requested[&reaped_pid].owner, None,
+        "the reaped view confers no owner, only view protection"
+    );
+    let mut offset = 1u32;
+    while engine.refresh_requested.len() < MAX_PENDING_REFRESH {
+        assert!(
+            engine.request_refresh(FAKE_PID_FLOOR + offset, Some(400)),
+            "the queue accepts departed pid {} while filling",
+            FAKE_PID_FLOOR + offset
+        );
+        offset += 1;
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let before = engine.refresh_requested.clone();
+    assert!(
+        engine.request_refresh_consumed(holder, Some(500)),
+        "a live holder's consumed refresh evicts one departed entry"
+    );
+    assert!(engine.refresh_requested.contains_key(&holder));
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "relief replaces exactly one entry, the queue stays bounded"
+    );
+    for pid in [live, owned, reaped_pid] {
+        assert_eq!(
+            engine.refresh_requested.get(&pid),
+            before.get(&pid),
+            "the protected request for {pid} keeps its full value"
+        );
+    }
+    let evicted: Vec<u32> = before
+        .keys()
+        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .copied()
+        .collect();
+    assert_eq!(
+        evicted.len(),
+        1,
+        "relief evicts exactly one departed entry: {evicted:?}"
+    );
+    assert!(
+        evicted[0] >= FAKE_PID_FLOOR && evicted[0] != owned,
+        "the evicted entry is an ownerless departed filler: {evicted:?}"
+    );
+}
+
+/// Relief refusal: when every queued entry carries a retained owner, a
+/// live arrival is still refused and the queue is left untouched.
+#[test]
+fn late_holder_relief_refuses_when_every_entry_is_protected() {
+    let guards = e06_spawn_sleeps(1);
+    let holder = guards[0].pid();
+    let mut engine = Engine::empty();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh_consumed_for_view(
+                FAKE_PID_FLOOR + offset,
+                Some(1_000 + u64::from(offset)),
+                ProcessViewId(u32::MAX)
+            ),
+            "the owner-bearing filler queues"
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let before = engine.refresh_requested.clone();
+    assert!(
+        !engine.request_refresh(holder, Some(2_000)),
+        "a live arrival is refused when every entry is protected"
+    );
+    assert_eq!(
+        engine.refresh_requested, before,
+        "a refused arrival mutates nothing"
+    );
+    assert!(!engine.refresh_requested.contains_key(&holder));
 }

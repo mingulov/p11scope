@@ -5434,6 +5434,20 @@ struct QueuedDiscoveryRecord {
     terminal_exports: Vec<DynamicExportIdentity>,
 }
 
+/// Restore `front` at the head of `queue` in its original order with
+/// one bulk move instead of one front insertion per record (each
+/// insertion memmoves the whole queue).
+fn prepend_queued_records(
+    queue: &mut Vec<QueuedDiscoveryRecord>,
+    mut front: Vec<QueuedDiscoveryRecord>,
+) {
+    if front.is_empty() {
+        return;
+    }
+    front.append(queue);
+    *queue = front;
+}
+
 #[derive(Clone)]
 pub(crate) struct TerminalAuthority {
     pub(crate) owner: LoaderContextId,
@@ -31929,9 +31943,8 @@ impl Engine {
     /// Restore records at the head of the pending FIFO in their original
     /// order with one bulk move instead of one front insertion per record
     /// (each insertion memmoves the whole queue).
-    fn prepend_pending_records(&mut self, mut front: Vec<QueuedDiscoveryRecord>) {
-        front.append(&mut self.pending_discovery_records);
-        self.pending_discovery_records = front;
+    fn prepend_pending_records(&mut self, front: Vec<QueuedDiscoveryRecord>) {
+        prepend_queued_records(&mut self.pending_discovery_records, front);
     }
 
     pub(crate) fn service_backlog_quantum(

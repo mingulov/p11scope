@@ -72441,6 +72441,9 @@ fn stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin() {
     let (mut full, _dir_b) = engine_over_cgroup_naming(&[pid]);
     reused.set_enable_candidate_reuse_for_test(true);
     full.set_enable_candidate_reuse_for_test(false);
+    // Deterministic admission under load, like the other tick twins.
+    reused.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    full.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session_a = ScriptedSession::with_records([], 0);
     let mut session_b = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();
@@ -72529,6 +72532,8 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
         let (mut full, _dir_b) = engine_over_cgroup_naming(&pids);
         reused.set_enable_candidate_reuse_for_test(true);
         full.set_enable_candidate_reuse_for_test(false);
+        reused.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        full.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
         let mut session_a = ScriptedSession::with_records([], 0);
         let mut session_b = ScriptedSession::with_records([], 0);
         apply_ordinary_batch(&mut reused, &mut session_a, vec![]).unwrap();

@@ -212,6 +212,74 @@ def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
     return problems
 
 
+def check_companion_pins(bpf_text):
+    """The default build's companion selection is pinned once and every
+    consumer reads the pin: both object-gate proof steps assert the
+    build emitted exactly the pinned selection (counter objects and
+    production journal present or exactly absent), and the counter and
+    journal load legs run the matching load proof or exact-refusal
+    control. A silent build-side companion change fails the build
+    step instead of flipping the legs."""
+    problems = []
+    pins = {}
+    for name in ("BPF_EXPECT_COUNTER_OBJECTS", "BPF_EXPECT_JOURNAL"):
+        found = re.findall(rf"^\s*{name}:\s*\"?([01])\"?\s*$",
+                           bpf_text, re.M)
+        if not found:
+            problems.append(f"bpf-kernels.yml defines no {name}")
+        else:
+            pins[name] = found[0]
+            if len(found) > 1:
+                problems.append(f"bpf-kernels.yml defines {name} twice: "
+                                f"{found}")
+    for step in ("Prove the default object carries no gate",
+                 "Prove the gate-1 object carries the gate"):
+        body = step_body(bpf_text, step)
+        if body is None:
+            problems.append(f"bpf-kernels.yml lost the {step} step")
+            continue
+        for name in ("BPF_EXPECT_COUNTER_OBJECTS", "BPF_EXPECT_JOURNAL"):
+            if name not in body:
+                problems.append(f"{step} does not read {name}")
+    if '--expect-counter-objects "$BPF_EXPECT_COUNTER_OBJECTS"' not in bpf_text:
+        problems.append("no counter leg passes --expect-counter-objects "
+                        "from BPF_EXPECT_COUNTER_OBJECTS")
+    if '--expect-journal "$BPF_EXPECT_JOURNAL"' not in bpf_text:
+        problems.append("no journal leg passes --expect-journal "
+                        "from BPF_EXPECT_JOURNAL")
+    return problems
+
+
+def step_body(bpf_text, step_name):
+    """The shell body of one `- name:` step, or None when absent."""
+    prefix = f"- name: {step_name}\n"
+    start = bpf_text.find(prefix)
+    if start < 0:
+        return None
+    rest = bpf_text[start:]
+    match = re.search(r"\n      - ", rest[len(prefix):])
+    if not match:
+        return rest
+    return rest[:len(prefix) + match.start()]
+
+
+def check_driver_absence_flag(driver_text, flag, refusal, loads_gate,
+                              name):
+    """A load driver honors an explicit companion-absence expectation:
+    it parses the flag, pins the exact documented refusal for the
+    omitted build, and gates on zero loads in the absent arm."""
+    problems = []
+    if flag not in driver_text:
+        problems.append(f"{name} parses no {flag} option")
+    if refusal not in driver_text:
+        problems.append(f"{name} never requires the exact refusal "
+                        f"{refusal!r}")
+    if loads_gate not in driver_text:
+        problems.append(f"{name} never gates the absent arm on "
+                        f"{loads_gate!r}")
+    return problems
+
+
 def check_no_tag_triggers(text):
     """Tag pushes trigger nothing; every branch push and PR still does.
 
@@ -398,6 +466,80 @@ class BpfKernelsContractTests(unittest.TestCase):
         budgets = json.loads((ROOT / "tests/bpf-verifier-budgets.json").read_text(
             encoding="ascii"))
         self.assertIn("prearm-witness/p11_pw_migrate", budgets["programs"])
+
+    def test_companion_selection_is_pinned_once_and_read_everywhere(self):
+        self.assertEqual([], check_companion_pins(self.bpf))
+
+    def test_companion_pin_check_catches_a_dropped_leg(self):
+        # Negative control: a leg that stops reading the pin must fail
+        # the check while the pinned definition stays put.
+        dropped = self.bpf.replace(
+            '--expect-counter-objects "$BPF_EXPECT_COUNTER_OBJECTS"',
+            '--expect-counter-objects 1')
+        self.assertNotEqual(dropped, self.bpf)
+        self.assertIn("no counter leg passes --expect-counter-objects "
+                      "from BPF_EXPECT_COUNTER_OBJECTS",
+                      check_companion_pins(dropped))
+
+    def test_counter_legs_honor_an_absence_expectation(self):
+        driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()
+        self.assertEqual(
+            [], check_driver_absence_flag(
+                driver, "--expect-counter-objects",
+                "counter-mode-unavailable-in-build: "
+                "this build omits counter objects",
+                "refused counter-mode-unavailable-in-build; "
+                "no counter loads",
+                "check-bpf-load-kernels.sh"))
+        # The absent arm is a control on the same command, never a
+        # hollowed leg: the positive counter command stays put.
+        self.assertIn("--attach-backend multi --counter-mode $MODE",
+                      driver)
+
+    def test_counter_absence_check_catches_a_dropped_gate(self):
+        driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()
+        dropped = driver.replace(
+            "refused counter-mode-unavailable-in-build; no counter loads",
+            "counter leg passed")
+        self.assertNotEqual(dropped, driver)
+        self.assertIn("check-bpf-load-kernels.sh never gates the absent "
+                      "arm on 'refused counter-mode-unavailable-in-build; "
+                      "no counter loads'",
+                      check_driver_absence_flag(
+                          dropped, "--expect-counter-objects",
+                          "counter-mode-unavailable-in-build: "
+                          "this build omits counter objects",
+                          "refused counter-mode-unavailable-in-build; "
+                          "no counter loads",
+                          "check-bpf-load-kernels.sh"))
+
+    def test_journal_legs_honor_an_absence_expectation(self):
+        driver = (ROOT / "scripts/check-bpf-load-journal.sh").read_text()
+        self.assertEqual(
+            [], check_driver_absence_flag(
+                driver, "--expect-journal",
+                "journal-pair-unavailable-in-build: this build omits "
+                "the production journal object",
+                "refused journal-pair-unavailable-in-build; "
+                "no journal loads",
+                "check-bpf-load-journal.sh"))
+
+    def test_journal_absence_check_catches_a_dropped_gate(self):
+        driver = (ROOT / "scripts/check-bpf-load-journal.sh").read_text()
+        dropped = driver.replace(
+            "refused journal-pair-unavailable-in-build; no journal loads",
+            "journal leg passed")
+        self.assertNotEqual(dropped, driver)
+        self.assertIn("check-bpf-load-journal.sh never gates the absent "
+                      "arm on 'refused journal-pair-unavailable-in-build; "
+                      "no journal loads'",
+                      check_driver_absence_flag(
+                          dropped, "--expect-journal",
+                          "journal-pair-unavailable-in-build: this build "
+                          "omits the production journal object",
+                          "refused journal-pair-unavailable-in-build; "
+                          "no journal loads",
+                          "check-bpf-load-journal.sh"))
 
 
 if __name__ == "__main__":

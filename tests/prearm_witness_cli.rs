@@ -930,7 +930,7 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
         "profile".to_string(),
         "--system".to_string(),
         "--duration".to_string(),
-        "90".to_string(),
+        "60".to_string(),
         "-v".to_string(),
         "-o".to_string(),
         out.to_str().expect("utf8 out").to_string(),

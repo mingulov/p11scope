@@ -4,7 +4,7 @@
 # Load the real observer's BPF programs inside throwaway vng guests and
 # report every program's verifier cost per kernel.
 #
-# Usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]
+# Usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] [--expect-counter-objects 0|1] OBSERVER PROBE OUTDIR [KERNEL...]
 #
 # OBSERVER is the prebuilt observer under test, PROBE the verifier-stats
 # probe built by `measure-verifier-headroom.py build`, OUTDIR a directory
@@ -15,8 +15,14 @@
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json
 # when that file exists, so a budgeted program with no probe row FAILs
 # without any flag. --counter-budgets defaults to the checked-in
-# tests/counter-bpf-verifier-budgets.json the same way. Exits 0 only when
-# every kernel passes; a timeout, a missing count or a nonzero report
+# tests/counter-bpf-verifier-budgets.json the same way.
+# --expect-counter-objects defaults to 1 (each counter leg is a load
+# proof); 0 turns each counter leg into an exact-refusal control for a
+# build that omits the counter objects (the wide default): the same
+# command must refuse with counter-mode-unavailable-in-build, exit 1,
+# load no counter programs and crash nothing. A load, a different
+# outcome or a crash is FAIL, never a skip. Exits 0 only when every
+# kernel passes; a timeout, a missing count or a nonzero report
 # is FAIL.
 #
 # Per kernel six throwaway guests run one command each under the probe:
@@ -86,6 +92,7 @@ set -eu
 
 BUDGETS=""
 COUNTER_BUDGETS=""
+EXPECT_COUNTER_OBJECTS=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --budgets)
@@ -106,6 +113,15 @@ while [ $# -gt 0 ]; do
             COUNTER_BUDGETS="${1#--counter-budgets=}"
             shift
             ;;
+        --expect-counter-objects)
+            [ $# -ge 2 ] || { echo "missing value for --expect-counter-objects" >&2; exit 2; }
+            EXPECT_COUNTER_OBJECTS="$2"
+            shift 2
+            ;;
+        --expect-counter-objects=*)
+            EXPECT_COUNTER_OBJECTS="${1#--expect-counter-objects=}"
+            shift
+            ;;
         --)
             shift
             break
@@ -119,8 +135,12 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+case "$EXPECT_COUNTER_OBJECTS" in
+    0|1) ;;
+    *) echo "check-bpf-load-kernels.sh: --expect-counter-objects must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ $# -lt 3 ]; then
-    echo "usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] OBSERVER PROBE OUTDIR [KERNEL...]" >&2
+    echo "usage: check-bpf-load-kernels.sh [--budgets FILE] [--counter-budgets FILE] [--expect-counter-objects 0|1] OBSERVER PROBE OUTDIR [KERNEL...]" >&2
     exit 2
 fi
 OBSERVER=$1
@@ -171,6 +191,16 @@ fi
 # Single-quote a path for the guest shell.
 q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Accumulate one counter-leg refusal-control reason, like add_reason in
+# the journal driver.
+counter_reason() {
+    if [ -z "$C_REASONS" ]; then
+        C_REASONS="$1"
+    else
+        C_REASONS="$C_REASONS; $1"
+    fi
 }
 
 # Guest release match, shared with the journal driver: sourced from
@@ -398,6 +428,56 @@ for KERNEL in "$@"; do
             continue
         fi
         C_RC=$(grep '^counter-rc=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
+        if [ "$EXPECT_COUNTER_OBJECTS" = 0 ]; then
+            # Omitted-build refusal control: the same command must
+            # refuse with the exact finite reason, exit 1, load no
+            # counter programs and crash nothing. A load, a different
+            # outcome or a crash is FAIL. (Wide default; flip
+            # --expect-counter-objects when 0.7.x restores the
+            # companions.)
+            C_REASONS=""
+            if [ ! -f "$C_TXT" ] || ! grep -q 'counter-mode-unavailable-in-build: this build omits counter objects' "$C_TXT"; then
+                counter_reason "exact counter-mode-unavailable-in-build refusal missing"
+            fi
+            case "$C_RC" in
+                1) ;;
+                *) counter_reason "observer exited rc=$C_RC, want 1" ;;
+            esac
+            C_LOADED="?"
+            if [ -f "$C_PROBE_JSON" ]; then
+                C_LOADED=$(python3 - "$C_PROBE_JSON" <<'PY'
+import json,sys
+count = 0
+try:
+    with open(sys.argv[1], encoding="ascii") as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get("record") == "load" and row.get("loaded") is True:
+                count += 1
+except (OSError, ValueError):
+    print("?")
+else:
+    print(count)
+PY
+) || C_LOADED="?"
+            fi
+            case "$C_LOADED" in
+                0) ;;
+                "?") counter_reason "probe rows unreadable" ;;
+                *) counter_reason "$C_LOADED counter programs loaded although the build omits them" ;;
+            esac
+            if [ ! -f "$C_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$C_TXT"; then
+                counter_reason "observer crashed or left no log"
+            fi
+            if [ -z "$C_REASONS" ]; then
+                echo "# counter-$MODE $KERNEL: PASS (refused counter-mode-unavailable-in-build; no counter loads; rc=$C_RC)"
+            else
+                echo "# counter-$MODE $KERNEL: FAIL ($C_REASONS)"
+                [ -f "$C_TXT" ] && tail -n 20 "$C_TXT" | sed 's/^/#   /'
+                FAILED=1
+            fi
+            continue
+        fi
         # A failed counter run still falls through to per-program
         # scoring like inventory does: the probe rows name the
         # refused program. Only infrastructure failures above skip

@@ -4,7 +4,7 @@
 # Load the journal object in throwaway vng guests and score its verifier cost.
 #
 # Usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1]
-#        OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]
+#        [--expect-journal 0|1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]
 #
 # OBSERVER is the prebuilt observer under test (a build with the journal
 # object; it must live on the vng shared filesystem, never under /var/tmp
@@ -22,6 +22,13 @@
 # journal object (P11SCOPE_LOADER_GATE=1 gates every Detailed flavor,
 # the journal object included) against journal-gate1/ keys instead;
 # the object's BTF groups are the same, only the key prefix differs.
+# --expect-journal defaults to 1 (each load kernel is a load proof);
+# 0 turns each load kernel into an exact-refusal control for a build
+# that omits the journal object (the wide default): the same command
+# must refuse with journal-pair-unavailable-in-build, run its ordinary
+# retry to rc 0, load no journal roots and crash nothing. A load, a
+# different outcome or a crash is FAIL, never a skip. Pre-Multi kernels
+# keep the refusal control below either way.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
 # `inventory -v --system --capture native --key-operations --manifest
@@ -70,6 +77,7 @@ set -eu
 
 BUDGETS=""
 OBJECT=journal
+EXPECT_JOURNAL=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --budgets)
@@ -90,6 +98,15 @@ while [ $# -gt 0 ]; do
             OBJECT="${1#--object=}"
             shift
             ;;
+        --expect-journal)
+            [ $# -ge 2 ] || { echo "missing value for --expect-journal" >&2; exit 2; }
+            EXPECT_JOURNAL="$2"
+            shift 2
+            ;;
+        --expect-journal=*)
+            EXPECT_JOURNAL="${1#--expect-journal=}"
+            shift
+            ;;
         --)
             shift
             break
@@ -104,12 +121,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ $# -lt 4 ]; then
-    echo "usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
+    echo "usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1] [--expect-journal 0|1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
     exit 2
 fi
 case "$OBJECT" in
     journal|journal-gate1) ;;
     *) echo "check-bpf-load-journal.sh: unknown object $OBJECT" >&2; exit 2 ;;
+esac
+case "$EXPECT_JOURNAL" in
+    0|1) ;;
+    *) echo "check-bpf-load-journal.sh: --expect-journal must be 0 or 1" >&2; exit 2 ;;
 esac
 OBSERVER=$1
 PROBE=$2
@@ -515,6 +536,37 @@ PY
                 "refused live-capture; no journal loads; rc=$J_RC"
         else
             echo "# control $KERNEL: FAIL ($REASONS)"
+            emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
+            FAILED=1
+        fi
+        continue
+    fi
+    if [ "$EXPECT_JOURNAL" = 0 ]; then
+        # Omitted-build refusal control: the same linked command must
+        # refuse with the exact finite reason, run its ordinary retry
+        # to rc 0, load no journal roots and crash nothing. A load, a
+        # different outcome or a crash is FAIL. (Wide default; flip
+        # --expect-journal when 0.7.x restores the companion.)
+        REASONS=""
+        if [ ! -f "$J_TXT" ] || ! grep -q 'journal-pair-unavailable-in-build: this build omits the production journal object' "$J_TXT"; then
+            add_reason "exact journal-pair-unavailable-in-build refusal missing"
+        fi
+        case "$J_RC" in
+            0) ;;
+            *) add_reason "observer exited rc=$J_RC, want 0" ;;
+        esac
+        if [ "$PAIR_ANY" = 1 ]; then
+            add_reason "journal pair loaded although the build omits the object"
+        fi
+        if [ ! -f "$J_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
+            add_reason "observer crashed or left no log"
+        fi
+        if [ -z "$REASONS" ]; then
+            echo "# omitted $KERNEL: PASS (refused journal-pair-unavailable-in-build; no journal loads; rc=$J_RC)"
+            emit_row "journal-load-$KERNEL" 1 qualified \
+                "refused journal-pair-unavailable-in-build; no journal loads; rc=$J_RC"
+        else
+            echo "# omitted $KERNEL: FAIL ($REASONS)"
             emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
             FAILED=1
         fi

@@ -51,6 +51,16 @@ concurrency:
 env:
   CI_TOOL_BPF_LINKER: 0.10.4
   CI_VNG_VERSION: "1.41"
+  # Companion selection the default build must emit: the wide profile
+  # omits the counter objects and the production journal (CHANGELOG,
+  # "Counter and journal companions at the wide profile"); flip a pin
+  # to "1" when 0.7.x restores that companion. The object-gate proof
+  # steps assert the build emitted exactly the pinned selection, and
+  # the counter/journal load legs consume the same pins, so a silent
+  # build-side companion change fails the build instead of flipping
+  # the legs.
+  BPF_EXPECT_COUNTER_OBJECTS: "0"
+  BPF_EXPECT_JOURNAL: "0"
 jobs:
   # The canary: prove /dev/kvm is usable, print the host facts the guest
   # jobs depend on, and boot one v6.6.157 guest with uname -r, timed.
@@ -222,15 +232,61 @@ jobs:
             fi
           done
           echo "default Detailed object carries no gate maps"
-          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
-          test "${#journal[@]}" -ge 1
-          for obj in "${journal[@]}"; do
-            if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
-              echo "refusing: gate maps in the default journal object: $obj" >&2
-              exit 1
+          # The companion set follows the build's own emitted selection,
+          # pinned by BPF_EXPECT_*: the wide default omits the counter
+          # objects and the journal, so those globs must match nothing; a
+          # FULL build emits them, and then every one must exist. The
+          # freshest build-script output is the unit cargo just validated
+          # or wrote; stale fingerprint dirs from other feature sets may
+          # linger in a warm cache. Only the observer package has a build
+          # script, so every p11scope-*/output is its own.
+          outputs=(target/debug/build/p11scope-*/output)
+          test "${#outputs[@]}" -ge 1
+          freshest="${outputs[0]}"
+          for output in "${outputs[@]}"; do
+            if [ "$output" -nt "$freshest" ]; then
+              freshest="$output"
             fi
           done
-          echo "default journal object carries no gate maps"
+          echo "fresh build-script output: $freshest"
+          counter_enabled=$(sed -n 's/^cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_ENABLED=//p' "$freshest" | tail -1)
+          journal_enabled=$(sed -n 's/^cargo:rustc-env=P11SCOPE_JOURNAL_ENABLED=//p' "$freshest" | tail -1)
+          test "$counter_enabled" = "$BPF_EXPECT_COUNTER_OBJECTS" || { echo "refusing: emitted counter selection '$counter_enabled', pinned '$BPF_EXPECT_COUNTER_OBJECTS'" >&2; exit 1; }
+          test "$journal_enabled" = "$BPF_EXPECT_JOURNAL" || { echo "refusing: emitted journal selection '$journal_enabled', pinned '$BPF_EXPECT_JOURNAL'" >&2; exit 1; }
+          fresh_out="$(dirname "$freshest")/out"
+          counter_outputs=$(sed -n 's/^cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_OUTPUTS=//p' "$freshest" | tail -1)
+          journal_outputs=$(sed -n 's/^cargo:rustc-env=P11SCOPE_JOURNAL_OUTPUTS=//p' "$freshest" | tail -1)
+          if [ "$counter_enabled" = 1 ]; then
+            test -n "$counter_outputs" || { echo "refusing: counter objects enabled with empty outputs" >&2; exit 1; }
+            counter=("$fresh_out"/counter-bank-growth-v2/p11scope-ebpf-*-bank-growth-v2)
+            test "${#counter[@]}" -eq 3 || { echo "refusing: expected 3 counter objects, found ${#counter[@]}" >&2; exit 1; }
+            for mode in counts latency timestamps; do
+              test -f "$fresh_out/counter-bank-growth-v2/p11scope-ebpf-$mode-bank-growth-v2" || { echo "refusing: missing selected counter object for $mode" >&2; exit 1; }
+            done
+            echo "default counter objects present exactly as selected"
+          else
+            test -z "$counter_outputs" || { echo "refusing: counter outputs emitted while disabled: $counter_outputs" >&2; exit 1; }
+            counter=("$fresh_out"/counter-bank-growth-v2/*)
+            test "${#counter[@]}" -eq 0 || { echo "refusing: counter objects emitted while disabled: ${counter[*]}" >&2; exit 1; }
+            echo "default build omits the counter objects exactly as selected"
+          fi
+          if [ "$journal_enabled" = 1 ]; then
+            test "$journal_outputs" = "journal-v1" || { echo "refusing: unexpected journal outputs: $journal_outputs" >&2; exit 1; }
+            journal=("$fresh_out"/journal-v1/p11scope-ebpf-journal-v1)
+            test "${#journal[@]}" -ge 1
+            for obj in "${journal[@]}"; do
+              if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
+                echo "refusing: gate maps in the default journal object: $obj" >&2
+                exit 1
+              fi
+            done
+            echo "default journal object carries no gate maps"
+          else
+            test -z "$journal_outputs" || { echo "refusing: journal outputs emitted while disabled: $journal_outputs" >&2; exit 1; }
+            journal=("$fresh_out"/journal-v1/*)
+            test "${#journal[@]}" -eq 0 || { echo "refusing: journal objects emitted while disabled: ${journal[*]}" >&2; exit 1; }
+            echo "default build omits the journal exactly as selected"
+          fi
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -344,6 +400,7 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
           mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
           scripts/check-bpf-load-kernels.sh \
+            --expect-counter-objects "$BPF_EXPECT_COUNTER_OBJECTS" \
             "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
             "$GITHUB_WORKSPACE/bpf-load-inputs/verifier-stats-probe.so" \
             "$GITHUB_WORKSPACE/bpf-load-out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
@@ -474,6 +531,7 @@ jobs:
           # script's gate flag in its output and the gate maps in the
           # OUT_DIR Detailed object.
           grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=1' target/debug/build/p11scope-*/output
+          shopt -s nullglob
           detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
           test "${#detailed[@]}" -ge 1
           for obj in "${detailed[@]}"; do
@@ -481,15 +539,61 @@ jobs:
             nm "$obj" | grep -q ' TASK_COOKIE_B$'
           done
           echo "gate-1 Detailed object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+          # The companion set follows the build's own emitted selection,
+          # pinned by BPF_EXPECT_*: the wide default omits the counter
+          # objects and the journal, so those globs must match nothing; a
+          # FULL build emits them, and then every one must exist. The
+          # freshest build-script output is the unit cargo just validated
+          # or wrote; stale fingerprint dirs from other feature sets may
+          # linger in a warm cache. Only the observer package has a build
+          # script, so every p11scope-*/output is its own.
+          outputs=(target/debug/build/p11scope-*/output)
+          test "${#outputs[@]}" -ge 1
+          freshest="${outputs[0]}"
+          for output in "${outputs[@]}"; do
+            if [ "$output" -nt "$freshest" ]; then
+              freshest="$output"
+            fi
+          done
+          echo "fresh build-script output: $freshest"
+          counter_enabled=$(sed -n 's/^cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_ENABLED=//p' "$freshest" | tail -1)
+          journal_enabled=$(sed -n 's/^cargo:rustc-env=P11SCOPE_JOURNAL_ENABLED=//p' "$freshest" | tail -1)
+          test "$counter_enabled" = "$BPF_EXPECT_COUNTER_OBJECTS" || { echo "refusing: emitted counter selection '$counter_enabled', pinned '$BPF_EXPECT_COUNTER_OBJECTS'" >&2; exit 1; }
+          test "$journal_enabled" = "$BPF_EXPECT_JOURNAL" || { echo "refusing: emitted journal selection '$journal_enabled', pinned '$BPF_EXPECT_JOURNAL'" >&2; exit 1; }
+          fresh_out="$(dirname "$freshest")/out"
+          counter_outputs=$(sed -n 's/^cargo:rustc-env=P11SCOPE_COUNTER_OBJECTS_OUTPUTS=//p' "$freshest" | tail -1)
+          journal_outputs=$(sed -n 's/^cargo:rustc-env=P11SCOPE_JOURNAL_OUTPUTS=//p' "$freshest" | tail -1)
+          if [ "$counter_enabled" = 1 ]; then
+            test -n "$counter_outputs" || { echo "refusing: counter objects enabled with empty outputs" >&2; exit 1; }
+            counter=("$fresh_out"/counter-bank-growth-v2/p11scope-ebpf-*-bank-growth-v2)
+            test "${#counter[@]}" -eq 3 || { echo "refusing: expected 3 counter objects, found ${#counter[@]}" >&2; exit 1; }
+            for mode in counts latency timestamps; do
+              test -f "$fresh_out/counter-bank-growth-v2/p11scope-ebpf-$mode-bank-growth-v2" || { echo "refusing: missing selected counter object for $mode" >&2; exit 1; }
+            done
+            echo "gate-1 counter objects present exactly as selected"
+          else
+            test -z "$counter_outputs" || { echo "refusing: counter outputs emitted while disabled: $counter_outputs" >&2; exit 1; }
+            counter=("$fresh_out"/counter-bank-growth-v2/*)
+            test "${#counter[@]}" -eq 0 || { echo "refusing: counter objects emitted while disabled: ${counter[*]}" >&2; exit 1; }
+            echo "gate-1 build omits the counter objects exactly as selected"
+          fi
           # The production journal object is a Detailed flavor, so a
           # gate-1 build gates it too; system sessions load it.
-          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
-          test -f "${journal[0]}"
-          for obj in "${journal[@]}"; do
-            nm "$obj" | grep -q ' IMAGE_BANK_SELECT$'
-            nm "$obj" | grep -q ' TASK_COOKIE_B$'
-          done
-          echo "gate-1 journal object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+          if [ "$journal_enabled" = 1 ]; then
+            test "$journal_outputs" = "journal-v1" || { echo "refusing: unexpected journal outputs: $journal_outputs" >&2; exit 1; }
+            journal=("$fresh_out"/journal-v1/p11scope-ebpf-journal-v1)
+            test "${#journal[@]}" -ge 1
+            for obj in "${journal[@]}"; do
+              nm "$obj" | grep -q ' IMAGE_BANK_SELECT$' || { echo "refusing: gate-1 journal object lacks IMAGE_BANK_SELECT: $obj" >&2; exit 1; }
+              nm "$obj" | grep -q ' TASK_COOKIE_B$' || { echo "refusing: gate-1 journal object lacks TASK_COOKIE_B: $obj" >&2; exit 1; }
+            done
+            echo "gate-1 journal object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+          else
+            test -z "$journal_outputs" || { echo "refusing: journal outputs emitted while disabled: $journal_outputs" >&2; exit 1; }
+            journal=("$fresh_out"/journal-v1/*)
+            test "${#journal[@]}" -eq 0 || { echo "refusing: journal objects emitted while disabled: ${journal[*]}" >&2; exit 1; }
+            echo "gate-1 build omits the journal exactly as selected"
+          fi
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -512,10 +616,12 @@ jobs:
   # flavor alone (Inventory and counter objects are byte-identical to
   # gate-0, proven host-side by scripts/check-gate0-identity.py): doctor
   # loads the Detailed object, scored as detailed-gate1/<root>, and a
-  # linked system inventory loads the production journal object (also
-  # a Detailed flavor, so gated too), scored as journal-gate1/<root>. A
-  # guest that cannot boot, a refused load, a missing table or a
-  # nonzero doctor exit is a FAIL, never a skip.
+  # linked system inventory exercises the production journal leg
+  # (also a Detailed flavor, so gated too), scored as
+  # journal-gate1/<root>: a load proof when BPF_EXPECT_JOURNAL is 1,
+  # an exact-refusal control when the wide default omits it. A guest
+  # that cannot boot, a refused load, a missing table or a nonzero
+  # doctor exit is a FAIL, never a skip.
   bpf-load-gate1-kernels:
     needs: bpf-load-gate1-build
     runs-on: ubuntu-26.04
@@ -614,6 +720,7 @@ jobs:
           "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope-discover" --module "$module" \
             -o "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json"
           scripts/check-bpf-load-journal.sh --object journal-gate1 \
+            --expect-journal "$BPF_EXPECT_JOURNAL" \
             "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope" \
             "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/verifier-stats-probe.so" \
             "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json" \

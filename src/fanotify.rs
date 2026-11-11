@@ -691,12 +691,7 @@ pub(crate) struct FileLearner {
     /// The bool records that the startup pass left a visible
     /// filesystem uncovered, which the drain files as the finite
     /// unavailable-learning gap as soon as it runs.
-    pending: Option<(
-        OwnedFd,
-        SyncSender<LearnMsg>,
-        BTreeSet<MountIdentity>,
-        bool,
-    )>,
+    pending: Option<(OwnedFd, SyncSender<LearnMsg>, BTreeSet<MountIdentity>, bool)>,
 }
 
 impl FileLearner {

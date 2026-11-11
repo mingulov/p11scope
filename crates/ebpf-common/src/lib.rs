@@ -2326,7 +2326,8 @@ mod tests {
         for (position, index) in indices.iter().enumerate() {
             assert_eq!(*index as usize, position);
         }
-        assert_eq!(EVIDENCE_CELLS, indices.len() as u32);
+        // RED: the submitted counter (cell 9) lands with the accounting.
+        assert_eq!(EVIDENCE_CELLS, indices.len() as u32 + 1);
     }
 
     #[test]
@@ -3194,7 +3195,8 @@ mod tests {
         assert_eq!(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, 2);
         assert_eq!(DISCOVERY_COUNTER_LOADER_HITS, 3);
         assert_eq!(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, 4);
-        assert_eq!(DISCOVERY_COUNTER_CELLS, 5);
+        // RED: the submitted counter (cell 5) lands with the accounting.
+        assert_eq!(DISCOVERY_COUNTER_CELLS, 6);
     }
 
     fn discovery_record(kind: u8) -> DiscoveryRecord {

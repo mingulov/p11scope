@@ -13358,6 +13358,9 @@ pub(crate) fn evidence_for(
         // Run-only like the child flag beside it: `Some` exactly when an
         // owned context exists, carrying the measured survivor count.
         run_tree_handed_back: child_still_running.map(|_| engine.run_tree_handed_back()),
+        // RED stub: the accounting implementation computes this from the
+        // facts' ring readings.
+        ring_accounting: render::RingAccountingEvidence::unknown(),
         discovery_ring_loss,
         discovery_state_failures,
         discovery_read_failures,
@@ -29748,6 +29751,106 @@ int main(int argc, char **argv) {
             assert_eq!(document["discovery_read_failures"], 3);
             assert_eq!(document["discovery_truncated"], 4);
             assert_eq!(document["task_uprobe_link_losses"], 5);
+            assert_eq!(document["completeness"], "PARTIAL");
+        }
+    }
+
+    /// RED twin: stashed ring readings reach the facts, and the facts'
+    /// readings reach every renderer's `ring_accounting` with produced,
+    /// consumed, dropped, still-queued and unexplained per ring.
+    #[test]
+    fn evidence_for_reports_each_rings_cross_check_across_all_renderers() {
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        engine.note_ring_reading(
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(90),
+                events: Some(180),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((9280, 0)),
+                events: Some((500, 500)),
+            },
+        );
+        let mut facts = engine.capture_facts();
+        assert_eq!(
+            facts.ring_readings().discovery.consumed,
+            Some(90),
+            "stashed discovery consumed reaches the facts"
+        );
+        assert_eq!(
+            facts.ring_readings().discovery.queued,
+            Some(10),
+            "stashed discovery positions divide into queued records"
+        );
+        assert_eq!(
+            facts.ring_readings().events.queued,
+            Some(0),
+            "an empty events ring queues nothing"
+        );
+        // The kernel produced/dropped totals ride the facts beside them.
+        facts.ring_readings.discovery.produced = 100;
+        facts.ring_readings.discovery.dropped = 7;
+        facts.ring_readings.events.produced = 200;
+        facts.ring_readings.events.dropped = 0;
+        let state = semantics::State::new(engine.plan());
+        let evidence = evidence_for(
+            &engine,
+            facts,
+            0,
+            false,
+            false,
+            Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            0,
+            None,
+            None,
+            false,
+            render::SchedulingEvidence::default(),
+            None,
+            None,
+            None,
+            0,
+        );
+        let capture = render::CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "test",
+            policy: CapturePolicy::Allowlisted,
+            scope: "pid",
+            caller: None,
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
+        };
+        let profile = render::versioned_evidence(&evidence);
+        let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();
+        let terminal: serde_json::Value = serde_json::from_str(
+            trace::evidence_line(&evidence, CapturePolicy::Allowlisted)
+                .strip_prefix("EVIDENCE ")
+                .unwrap(),
+        )
+        .unwrap();
+        for document in [&profile, &metrics, &terminal] {
+            let discovery = &document["ring_accounting"]["discovery"];
+            assert_eq!(discovery["produced"], 100);
+            assert_eq!(discovery["consumed"], 90);
+            assert_eq!(discovery["dropped"], 7);
+            assert_eq!(discovery["still_queued"], 10);
+            assert_eq!(discovery["unexplained"], 0);
+            let events = &document["ring_accounting"]["events"];
+            assert_eq!(events["produced"], 200);
+            assert_eq!(events["consumed"], 180);
+            assert_eq!(events["dropped"], 0);
+            assert_eq!(events["still_queued"], 0);
+            assert_eq!(events["unexplained"], 20);
             assert_eq!(document["completeness"], "PARTIAL");
         }
     }

@@ -640,6 +640,11 @@ pub struct Engine {
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
     counter_snapshot: CounterSnapshot,
+    /// Userspace ring readings stashed by the capture loop from the
+    /// session's drains (consumed totals, ring positions) for the
+    /// per-ring cross-check. Unknown until the first note.
+    ring_consumed: crate::ring_accounting::RingConsumed,
+    ring_positions: crate::ring_accounting::RingPositions,
     malformed_discovery: u64,
     /// Requests retain their original age; each consumed-record renewal gets
     /// a unique serial so an older inventory pass cannot complete newer work.
@@ -11406,6 +11411,8 @@ impl Engine {
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
             counter_snapshot: CounterSnapshot::default(),
+            ring_consumed: crate::ring_accounting::RingConsumed::default(),
+            ring_positions: crate::ring_accounting::RingPositions::default(),
             malformed_discovery: 0,
             refresh_requested: BTreeMap::new(),
             last_refresh_serial: 0,
@@ -12511,6 +12518,19 @@ impl Engine {
     /// the plan's current active set and can shrink or reach zero while the
     /// rest of this snapshot stays exactly what the capture accepted (see
     /// `AttachPlan::active_slot_count`).
+    /// Stashes the session's ring readings (consumed totals, ring
+    /// positions) for the per-ring cross-check. The capture loop calls
+    /// this from the live drains before it reads [`Self::capture_facts`];
+    /// until the first note every reading is unknown.
+    pub fn note_ring_reading(
+        &mut self,
+        consumed: crate::ring_accounting::RingConsumed,
+        positions: crate::ring_accounting::RingPositions,
+    ) {
+        self.ring_consumed = consumed;
+        self.ring_positions = positions;
+    }
+
     pub fn capture_facts(&self) -> render::CaptureFacts {
         // One accumulator, each source feeding it once (design §9.1).
         let discovery_truncated = self
@@ -12560,6 +12580,9 @@ impl Engine {
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+            // RED stub: the accounting implementation builds this from
+            // the counter snapshot and the stashed ring readings.
+            ring_readings: crate::ring_accounting::RingReadings::default(),
             task_uprobe_link_losses: self.task_uprobe_link_losses,
             discovery_truncated,
             // The exit-ended subset of the truncation total above: K0

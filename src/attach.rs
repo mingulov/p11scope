@@ -2832,6 +2832,12 @@ pub(crate) struct CounterSnapshot {
     pub(crate) loader_hits: u64,
     pub(crate) loader_state_read_failures: u64,
     pub(crate) abi_refusals: u64,
+    /// DISCOVERY records the kernel submitted: the produced half of the
+    /// discovery cross-check (COUNTERS cell 5).
+    pub(crate) discovery_submitted: u64,
+    /// EVENTS records the kernel submitted: the produced half of the
+    /// events cross-check (EVIDENCE cell 9).
+    pub(crate) events_submitted: u64,
 }
 
 impl CounterSnapshot {
@@ -2841,7 +2847,9 @@ impl CounterSnapshot {
             && next.export_bounded_read_failures >= self.export_bounded_read_failures
             && next.loader_hits >= self.loader_hits
             && next.loader_state_read_failures >= self.loader_state_read_failures
-            && next.abi_refusals >= self.abi_refusals;
+            && next.abi_refusals >= self.abi_refusals
+            && next.discovery_submitted >= self.discovery_submitted
+            && next.events_submitted >= self.events_submitted;
         if nondecreasing {
             *self = next;
         }
@@ -2852,6 +2860,7 @@ impl CounterSnapshot {
 fn counter_snapshot_with(
     mut read: impl FnMut(u32) -> Result<u64>,
     abi_refusals: u64,
+    _events_submitted: u64,
 ) -> Result<CounterSnapshot> {
     Ok(CounterSnapshot {
         ring_loss: read(DISCOVERY_COUNTER_RING_LOSS)?,
@@ -2860,6 +2869,11 @@ fn counter_snapshot_with(
         loader_hits: read(DISCOVERY_COUNTER_LOADER_HITS)?,
         loader_state_read_failures: read(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES)?,
         abi_refusals,
+        // RED stubs: the produced cells are wired by the accounting
+        // implementation; until then the snapshot reports zero and the
+        // cross-check tests below fail on the scripted values.
+        discovery_submitted: 0,
+        events_submitted: 0,
     })
 }
 
@@ -8178,7 +8192,9 @@ impl Session {
             .iter()
             .copied()
             .fold(0u64, u64::saturating_add);
-        counter_snapshot_with(read, abi_refusals)
+        // RED stub: the EVENTS submitted cell is read by the accounting
+        // implementation.
+        counter_snapshot_with(read, abi_refusals, 0)
     }
 
     /// One gate-1 `Array` cell, when this build carries the gate and the
@@ -19608,6 +19624,7 @@ mod tests {
                     .fold(0u64, u64::saturating_add))
             },
             2,
+            0,
         )
         .unwrap();
         assert_eq!(first.ring_loss, 3);
@@ -19629,6 +19646,7 @@ mod tests {
                     .fold(0u64, u64::saturating_add))
             },
             3,
+            0,
         )
         .unwrap();
         assert!(retained.replace_with(next));
@@ -19651,6 +19669,39 @@ mod tests {
             retained, next,
             "a regressing cell retains the prior authority"
         );
+    }
+
+    /// RED twin: the snapshot carries each ring's produced total — the
+    /// kernel half of the cross-check — from its new counter cell, and a
+    /// regressing produced total fails closed like every other cell.
+    #[test]
+    fn counter_snapshot_carries_each_rings_produced_total() {
+        let cells: [&[u64]; 6] = [&[1], &[0], &[0], &[0], &[0], &[40, 2]];
+        let snapshot = counter_snapshot_with(
+            |index| {
+                Ok(cells[index as usize]
+                    .iter()
+                    .copied()
+                    .fold(0u64, u64::saturating_add))
+            },
+            0,
+            7,
+        )
+        .unwrap();
+        assert_eq!(snapshot.discovery_submitted, 42);
+        assert_eq!(snapshot.events_submitted, 7);
+
+        let mut retained = CounterSnapshot::default();
+        assert!(retained.replace_with(snapshot));
+        assert!(!retained.replace_with(CounterSnapshot {
+            discovery_submitted: snapshot.discovery_submitted - 1,
+            ..snapshot
+        }));
+        assert!(!retained.replace_with(CounterSnapshot {
+            events_submitted: snapshot.events_submitted - 1,
+            ..snapshot
+        }));
+        assert_eq!(retained, snapshot);
     }
 
     #[test]

@@ -808,6 +808,15 @@ impl<S: BoundedRecordSource> EventDrain<StagedEvents<S>> {
     ) -> EventsStageOutcome {
         self.source.stage(quantum, stop)
     }
+
+    /// Records that left the ring through this drain, whether already
+    /// popped by a poll or still sitting in the staging queue: the exact
+    /// ring-exit total for the cross-check. Staging moves the ring cursor
+    /// without polling, so `consumed` alone would lag by the queue.
+    pub(crate) fn ring_exited(&self) -> u64 {
+        self.consumed
+            .saturating_add(u64::try_from(self.source.staged_len()).unwrap_or(u64::MAX))
+    }
 }
 
 pub(crate) const ROOT_TAIL_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1066,6 +1075,11 @@ pub struct EventDrain<S> {
     source: S,
     malformed: u64,
     malformed_reported: u64,
+    /// Records taken off the ring through any poll path, malformed ones
+    /// included: the userspace half of the per-ring cross-check. Staged
+    /// queue pops count on consumption (see `ring_exited` for the
+    /// ring-exit total while items sit staged).
+    consumed: u64,
     domain: Option<EventsDomain>,
     trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
     object_transport: Option<ObjectTransportRows>,
@@ -1219,6 +1233,7 @@ impl OwnedDrain {
             source: StagedEvents::with_caps(ring, EVENTS_STAGE_ENTRIES, EVENTS_STAGE_BYTES),
             malformed: 0,
             malformed_reported: 0,
+            consumed: 0,
             domain: Some(domain.clone()),
             trace_tap: None,
             object_transport: None,
@@ -1260,6 +1275,7 @@ impl<S: RecordSource> EventDrain<S> {
             source,
             malformed: 0,
             malformed_reported: 0,
+            consumed: 0,
             domain: None,
             trace_tap: None,
             object_transport: None,
@@ -1282,6 +1298,7 @@ impl<S: RecordSource> EventDrain<S> {
             source,
             malformed: 0,
             malformed_reported: 0,
+            consumed: 0,
             domain: Some(domain),
             trace_tap: None,
             object_transport: None,
@@ -1298,6 +1315,14 @@ impl<S: RecordSource> EventDrain<S> {
     }
     pub(crate) fn domain_id(&self) -> u64 {
         self.domain.as_ref().map_or(0, EventsDomain::id)
+    }
+
+    /// Records this drain's polls took off the ring so far, malformed
+    /// ones included. Queue pops count on consumption; items still
+    /// sitting in the staging queue left the ring but are not counted
+    /// here yet (see `ring_exited`).
+    pub(crate) fn consumed(&self) -> u64 {
+        self.consumed
     }
 
     /// Drains up to `quantum` records without blocking; `None` reads the
@@ -2132,6 +2157,11 @@ pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>
 
 pub(crate) struct DiscoveryDrain<S> {
     source: S,
+    /// Records taken off the DISCOVERY ring through `dequeue` or the
+    /// bounded poll, malformed ones included: the userspace half of the
+    /// per-ring cross-check. Session staging pops via `dequeue`, so
+    /// staged-but-unapplied items are already counted here.
+    consumed: u64,
     _domain: Option<DiscoveryDomain>,
     trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
     pid_lifecycle_tap: Option<crate::attach::PidLifecycleTap>,
@@ -2158,6 +2188,7 @@ impl OwnedDiscoveryDrain {
         let ring = aya::maps::RingBuf::try_from(Map::from_map_data(data)?)?;
         Ok(Self {
             source: ring,
+            consumed: 0,
             _domain: Some(domain.clone()),
             trace_tap: None,
             pid_lifecycle_tap: None,
@@ -2213,6 +2244,7 @@ impl<S: RecordSource> DiscoveryDrain<S> {
     pub(crate) fn over_domain(source: S, domain: DiscoveryDomain) -> Self {
         Self {
             source,
+            consumed: 0,
             _domain: Some(domain),
             trace_tap: None,
             pid_lifecycle_tap: None,
@@ -2223,6 +2255,7 @@ impl<S: RecordSource> DiscoveryDrain<S> {
     pub(crate) fn over(source: S) -> Self {
         Self {
             source,
+            consumed: 0,
             _domain: None,
             trace_tap: None,
             pid_lifecycle_tap: None,
@@ -2237,6 +2270,13 @@ impl<S: RecordSource> DiscoveryDrain<S> {
     #[cfg(test)]
     pub(crate) fn domain_id(&self) -> u64 {
         self._domain.as_ref().map_or(0, DiscoveryDomain::id)
+    }
+
+    /// Records this drain took off the DISCOVERY ring so far, malformed
+    /// ones included. Session staging pops via `dequeue`, so staged but
+    /// unapplied items are already counted.
+    pub(crate) fn consumed(&self) -> u64 {
+        self.consumed
     }
 
     pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem>
@@ -5671,6 +5711,224 @@ mod tests {
         assert_eq!(drain.source().remaining(), 0);
         assert!(drain.dequeue().is_none());
         assert!(drain.dequeue().is_none());
+    }
+
+    fn consumed_discovery_record(pid_tgid: u64) -> Vec<u8> {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = pid_tgid;
+        discovery_bytes(&record)
+    }
+
+    /// RED twin: every discovery dequeue counts toward the cross-check,
+    /// valid and malformed alike; empty reads count nothing.
+    #[test]
+    fn discovery_dequeue_counts_every_taken_record() {
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records(
+            [
+                consumed_discovery_record(7u64 << 32),
+                vec![7u8; 3],
+                consumed_discovery_record(11u64 << 32),
+            ],
+            3,
+        ));
+        assert_eq!(drain.consumed(), 0);
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_))));
+        assert_eq!(drain.consumed(), 1);
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert_eq!(drain.consumed(), 2);
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_))));
+        assert_eq!(drain.consumed(), 3);
+        assert!(drain.dequeue().is_none());
+        assert!(drain.dequeue().is_none());
+        assert_eq!(drain.consumed(), 3);
+    }
+
+    /// RED twin: the bounded discovery poll counts each delivered item,
+    /// including the one a breaking callback already took.
+    #[test]
+    fn discovery_bounded_poll_counts_delivered_items() {
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records(
+            [
+                consumed_discovery_record(7u64 << 32),
+                consumed_discovery_record(11u64 << 32),
+            ],
+            2,
+        ));
+        let (post_q, backlog) =
+            poll_discovery_to_position(&mut drain, 16, Some(8), |_| ControlFlow::Continue(()))
+                .unwrap();
+        assert_eq!((post_q, backlog), (false, false));
+        assert_eq!(drain.consumed(), 2);
+
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records(
+            [
+                consumed_discovery_record(7u64 << 32),
+                consumed_discovery_record(11u64 << 32),
+            ],
+            2,
+        ));
+        let (post_q, backlog) =
+            poll_discovery_to_position(&mut drain, 16, Some(8), |_| ControlFlow::Break(()))
+                .unwrap();
+        assert_eq!((post_q, backlog), (false, true));
+        assert_eq!(drain.consumed(), 1);
+    }
+
+    fn consumed_event(slot: u32) -> Vec<u8> {
+        event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot,
+            ..Default::default()
+        })
+    }
+
+    /// RED twin: the live poll counts every taken record — valid,
+    /// malformed, and the one a breaking callback already took.
+    #[test]
+    fn events_poll_counts_valid_malformed_and_break() {
+        let mut drain = EventDrain::over(ScriptedRecords::records(
+            [consumed_event(1), vec![7u8; 3], consumed_event(2)],
+            3,
+        ));
+        assert!(!drain.poll(Some(8), |_| ControlFlow::Continue(())));
+        assert_eq!(drain.malformed(), 1);
+        assert_eq!(drain.consumed(), 3);
+
+        let mut drain = EventDrain::over(ScriptedRecords::records(
+            [consumed_event(1), consumed_event(2)],
+            2,
+        ));
+        assert!(drain.poll(Some(8), |_| ControlFlow::Break(())));
+        assert_eq!(drain.consumed(), 1);
+    }
+
+    /// RED twin: the whole-record poll counts like the live poll.
+    #[test]
+    fn events_poll_records_counts() {
+        let mut drain = EventDrain::over(ScriptedRecords::records(
+            [consumed_event(1), vec![7u8; 3]],
+            2,
+        ));
+        assert!(!drain.poll_records(Some(8), |_| ControlFlow::Continue(())));
+        assert_eq!(drain.consumed(), 2);
+    }
+
+    /// RED twin: the object poll counts every taken record; decode
+    /// failures still spent the take.
+    #[test]
+    fn events_poll_object_records_counts() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let mut drain = EventDrain::over(ScriptedRecords::records([vec![7u8; 3]], 1));
+        assert!(!drain.poll_object_records(Some(8), &rows, |_| ControlFlow::Continue(())));
+        assert_eq!(drain.consumed(), 1);
+    }
+
+    /// RED twin: the dispatch poll counts every taken record once.
+    #[test]
+    fn events_poll_dispatched_quantum_counts() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let mut drain = EventDrain::over(ScriptedRecords::records(
+            [consumed_event(1), vec![7u8; 3]],
+            2,
+        ));
+        let outcome = drain.poll_dispatched_quantum(
+            Some(8),
+            &rows,
+            |_| ControlFlow::Continue(()),
+            |_| ControlFlow::Continue(()),
+        );
+        assert!(!outcome.backlog);
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(drain.consumed(), 2);
+    }
+
+    /// RED twin: the root-tail poll counts every reduced record.
+    #[test]
+    fn events_root_tail_counts_reduced_records() {
+        let domain = EventsDomain::test_standin(0xc011);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([consumed_event(1), consumed_event(2)], 2),
+            domain.clone(),
+        );
+        let (progress, seen) = root_tail_to_end(&mut drain, domain);
+        assert_eq!(progress.unwrap(), RootTailProgress::Reached);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(drain.consumed(), 2);
+    }
+
+    /// RED twin: every bounded terminal poll counts what it delivers.
+    #[test]
+    fn events_bounded_polls_count_delivered_items() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        for route in 0..4u8 {
+            let mut drain = EventDrain::over_test_domain(
+                ScriptedRecords::records([consumed_event(1), vec![7u8; 3]], 2),
+                0xc0de,
+            );
+            match route {
+                0 => {
+                    let (post_q, backlog) =
+                        poll_events_to_position(&mut drain, 16, Some(8), |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    assert_eq!((post_q, backlog), (false, false));
+                }
+                1 => {
+                    let (post_q, backlog) =
+                        poll_records_to_position(&mut drain, 16, Some(8), |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    assert_eq!((post_q, backlog), (false, false));
+                }
+                2 => {
+                    let (post_q, backlog) =
+                        poll_object_records_to_position(&mut drain, 16, Some(8), &rows, |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    assert_eq!((post_q, backlog), (false, false));
+                }
+                _ => {
+                    let (post_q, backlog) = poll_dispatched_records_to_position(
+                        &mut drain,
+                        16,
+                        Some(8),
+                        &rows,
+                        |_| ControlFlow::Continue(()),
+                        |_| ControlFlow::Continue(()),
+                    )
+                    .unwrap();
+                    assert_eq!((post_q, backlog), (false, false));
+                }
+            }
+            assert_eq!(drain.consumed(), 2, "route {route} undercounts");
+        }
+    }
+
+    /// RED twin: staged-but-unpopped items left the ring, so the
+    /// ring-exit total counts them while `consumed` waits for the pop.
+    #[test]
+    fn staged_ring_exited_counts_queue_before_the_pop() {
+        let pushed = vec![consumed_event(1), consumed_event(2), consumed_event(3)];
+        let mut drain = staged_script(pushed, 3, 1024, 1024 * 1024);
+        assert_eq!(drain.consumed(), 0);
+        assert_eq!(drain.ring_exited(), 0);
+        let outcome = drain.stage_events(2, None);
+        assert_eq!(outcome.staged, 2);
+        assert_eq!(drain.consumed(), 0);
+        assert_eq!(drain.ring_exited(), 2);
+        assert!(drain.poll(Some(2), |_| ControlFlow::Continue(())));
+        assert_eq!(drain.consumed(), 2);
+        assert_eq!(drain.ring_exited(), 2);
+        assert!(!drain.poll(Some(2), |_| ControlFlow::Continue(())));
+        assert_eq!(drain.consumed(), 3);
+        assert_eq!(drain.ring_exited(), 3);
     }
 }
 

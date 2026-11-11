@@ -328,6 +328,9 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
+    /// Raw per-ring cross-check inputs (kernel produced/dropped plus
+    /// userspace consumed/queued). The report computes the accounts.
+    pub(crate) ring_readings: crate::ring_accounting::RingReadings,
     /// The exit-ended subset of `discovery_truncated`: loader scans
     /// and loader rejects settled at a proven process exit. Not a
     /// fifth loss lane — K0 subtracts it from the total when it
@@ -388,6 +391,11 @@ impl CaptureFacts {
             self.discovery_read_failures,
             self.discovery_truncated,
         ]
+    }
+
+    /// Raw per-ring cross-check inputs for the report's accounts.
+    pub fn ring_readings(&self) -> crate::ring_accounting::RingReadings {
+        self.ring_readings
     }
 
     /// Loader scans and loader rejects settled at a proven process
@@ -1092,6 +1100,45 @@ pub struct DiscoveredModule {
     pub unobserved_windows: Option<Vec<UnobservedWindow>>,
 }
 
+/// One ring's cross-check account: the kernel's submitted (`produced`)
+/// and refused (`dropped`) totals against userspace's drained (`consumed`)
+/// total and the queued remainder. `still_queued`/`unexplained` are absent
+/// exactly when the remainder is structurally unknowable (a live EVENTS
+/// ring); a measured nonzero `unexplained` is loss the reserve-failure
+/// counter never saw, reported as a named gap.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RingAccountEvidence {
+    pub produced: u64,
+    pub consumed: u64,
+    pub dropped: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub still_queued: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unexplained: Option<u64>,
+}
+
+/// Both rings' cross-check accounts. A ring is absent when it has no
+/// counters in this build or mode (EVENTS under inventory or metrics,
+/// which never drain it): unknown, never zero.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RingAccountingEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<RingAccountEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<RingAccountEvidence>,
+}
+
+impl RingAccountingEvidence {
+    /// No ring has counters: the unknown account, for modes that drain
+    /// no ring.
+    pub fn unknown() -> Self {
+        Self {
+            discovery: None,
+            events: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Evidence {
     /// Function records discovery decoded across every walked surface, whether
@@ -1260,6 +1307,10 @@ pub struct Evidence {
     /// the paired `run process tree` skip, which carries the verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_tree_handed_back: Option<u64>,
+    /// Per-ring cross-check accounts (kernel produced/dropped against
+    /// userspace consumed plus the queued remainder). A ring is absent
+    /// when it has no counters in this build or mode.
+    pub ring_accounting: RingAccountingEvidence,
     /// Failed `DISCOVERY` ring reservations across loader, exec, and export
     /// records — from the BPF counter, never derived from received records.
     pub discovery_ring_loss: u64,
@@ -5902,6 +5953,7 @@ pub(crate) mod tests {
             snapshot_failure: None,
             child_still_running: None,
             run_tree_handed_back: None,
+            ring_accounting: RingAccountingEvidence::unknown(),
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
             discovery_read_failures: 0,
@@ -8602,6 +8654,99 @@ pub(crate) mod tests {
         assert!(out.contains("end of capture not fully confirmed"), "{out}");
         let out = frame(|_| {}, false);
         assert!(out.trim_end().ends_with("→ COMPLETE"), "{out}");
+    }
+
+    fn ring_unexplained_fixture() -> (Evidence, Evidence) {
+        let mut discovery = evidence();
+        discovery.ring_accounting.discovery = Some(RingAccountEvidence {
+            produced: 100,
+            consumed: 80,
+            dropped: 3,
+            still_queued: Some(10),
+            unexplained: Some(7),
+        });
+        let mut events = evidence();
+        events.ring_accounting.events = Some(RingAccountEvidence {
+            produced: 200,
+            consumed: 190,
+            dropped: 0,
+            still_queued: Some(0),
+            unexplained: Some(10),
+        });
+        (discovery, events)
+    }
+
+    /// RED twin: a measured nonzero unexplained remainder is a named
+    /// observation gap on its ring and forces PARTIAL, like any loss.
+    #[test]
+    fn unexplained_ring_remainder_is_a_named_gap() {
+        let (mut discovery, mut events) = ring_unexplained_fixture();
+        discovery.verdict();
+        assert_eq!(discovery.completeness, "PARTIAL");
+        assert!(
+            discovery
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"discovery_ring_unexplained"),
+            "{:?}",
+            discovery.gap_classes.observation.causes
+        );
+        events.verdict();
+        assert_eq!(events.completeness, "PARTIAL");
+        assert!(
+            events
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"events_ring_unexplained"),
+            "{:?}",
+            events.gap_classes.observation.causes
+        );
+        // Control: a balanced account gaps nothing.
+        let mut clean = evidence();
+        clean.ring_accounting.discovery = Some(RingAccountEvidence {
+            produced: 100,
+            consumed: 90,
+            dropped: 0,
+            still_queued: Some(10),
+            unexplained: Some(0),
+        });
+        clean.ring_accounting.events = Some(RingAccountEvidence {
+            produced: 50,
+            consumed: 50,
+            dropped: 0,
+            still_queued: Some(0),
+            unexplained: Some(0),
+        });
+        clean.verdict();
+        assert_eq!(clean.completeness, "COMPLETE");
+    }
+
+    /// RED twin: -v names each ring's unexplained remainder with its
+    /// cause, so the loss is found without opening the JSON.
+    #[test]
+    fn verbose_view_names_each_rings_unexplained_remainder() {
+        let (discovery, events) = ring_unexplained_fixture();
+        for (mut ev, cause) in [
+            (discovery, "discovery_ring_unexplained"),
+            (events, "events_ring_unexplained"),
+        ] {
+            ev.verdict();
+            let out = live_scoped_with_verbosity(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
+            );
+            assert!(out.contains(cause), "{out}");
+            assert!(out.contains("unexplained"), "{out}");
+        }
     }
 
     #[test]

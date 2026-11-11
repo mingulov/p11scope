@@ -87,6 +87,7 @@ pub(crate) mod prearm_module;
 pub mod process;
 pub(crate) mod process_access;
 pub mod render;
+pub(crate) mod ring_accounting;
 pub(crate) mod run;
 pub mod scope;
 pub(crate) mod semantic_capture;

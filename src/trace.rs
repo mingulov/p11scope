@@ -1318,6 +1318,7 @@ mod tests {
             snapshot_failure: None,
             child_still_running: None,
             run_tree_handed_back: None,
+            ring_accounting: render::RingAccountingEvidence::unknown(),
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
             discovery_read_failures: 0,

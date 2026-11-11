@@ -13806,9 +13806,19 @@ mod tests {
             744,
         );
         coordinator.commit_batch(false).unwrap();
-        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        // The module-detail statement lives in verbose Details; the concise
+        // summary states the same bound as unattributed-use calls (pinned by
+        // the singular/plural summary twins).
+        let text = render_text_with_verbosity(
+            &coordinator,
+            "pid:7",
+            90,
+            130,
+            2,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(
-            text.contains("at least 744 entries"),
+            text.contains("unidentified use: at least 744 entries observed (1 caller image)"),
             "module detail states the unbound lower bound:\n{text}"
         );
     }

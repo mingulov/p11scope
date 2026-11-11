@@ -50,6 +50,8 @@ if mode=='writes-sink' and '-o' in a:pathlib.Path(a[a.index('-o')+1]).write_text
 if mode=='runs-child' and a[0]=='run':
     import subprocess
     subprocess.run(a[a.index('--')+1:],check=True)
+if mode=='omits-counter-objects' and '--counter-mode' in a:
+    print('p11scope: counter-mode-unavailable-in-build: this build omits counter objects',file=sys.stderr);sys.exit(1)
 print('different-refusal' if mode=='wrong-reason' else 'live capture unavailable: test refuses at link',file=sys.stderr)
 sys.exit(1)
 '''
@@ -102,6 +104,71 @@ class CombinedRefusalTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "refusal"):
                 self.check(self.observer, self.work)
 
+    def test_omitted_counter_objects_refuse_by_name(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "omits-counter-objects"}):
+            rows = self.check(self.observer, self.work, expect_counter_objects=0)
+        by_case = {row["case"]: row for row in rows}
+        for mode in ("counts", "timestamps", "latency"):
+            with self.subTest(mode=mode):
+                self.assertEqual(by_case["counter-" + mode]["outcome"], "refused")
+                self.assertEqual(by_case["counter-" + mode]["reason"],
+                                 "counter-mode omission refusal")
+        self.assertEqual(by_case["doctor"]["reason"], "live-capture refusal")
+
+    def test_omitted_counter_objects_demand_the_exact_refusal(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "healthy"}):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "missing counter-mode omission refusal"):
+                self.check(self.observer, self.work, expect_counter_objects=0)
+
+    def test_present_counter_objects_keep_the_live_gate(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "omits-counter-objects"}):
+            with self.assertRaisesRegex(RuntimeError, "missing live-capture refusal"):
+                self.check(self.observer, self.work, expect_counter_objects=1)
+
+    def test_guest_forwards_the_counter_object_expectation(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        guest = namespace["guest"]
+        observer = self.work / "p11scope"
+        observer.write_text(FAKE)
+        observer.chmod(0o700)
+        metadata = {"kernel": "v" + os.uname().release,
+                    "runner_uid": self.work.stat().st_uid,
+                    "sha256": {"p11scope": namespace["digest"](observer)},
+                    "counter_objects": 0}
+        (self.work / "inputs.json").write_text(json.dumps(metadata))
+        seen = {}
+
+        def check(observer, work, progress=None, doctor_timeout=60,
+                  expect_counter_objects=1):
+            seen["expect_counter_objects"] = expect_counter_objects
+            return []
+
+        with patch("os.geteuid", return_value=0), \
+                patch.dict(guest.__globals__, {"check_commands": check,
+                                              "guest_disk_work": self.simulated_guest_disk}):
+            guest(self.work)
+        self.assertEqual(seen, {"expect_counter_objects": 0})
+        self.remove_guest_bindir(self.work)
+
+    def test_guest_rejects_a_corrupt_counter_object_expectation(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        guest = namespace["guest"]
+        observer = self.work / "p11scope"
+        observer.write_text(FAKE)
+        observer.chmod(0o700)
+        metadata = {"kernel": "v" + os.uname().release,
+                    "runner_uid": self.work.stat().st_uid,
+                    "sha256": {"p11scope": namespace["digest"](observer)},
+                    "counter_objects": 7}
+        (self.work / "inputs.json").write_text(json.dumps(metadata))
+        with patch("os.geteuid", return_value=0), \
+                patch.dict(guest.__globals__,
+                           {"check_commands": lambda *a, **k: [],
+                            "guest_disk_work": self.simulated_guest_disk}):
+            with self.assertRaisesRegex(RuntimeError, "corrupt counter-object expectation"):
+                guest(self.work)
+
     def test_fallback_document_must_name_the_gap(self):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "bad-fallback-doc"}):
             with self.assertRaisesRegex(RuntimeError, "fallback"):
@@ -151,7 +218,8 @@ class CombinedRefusalTests(unittest.TestCase):
                     "sha256": {"p11scope": namespace["digest"](observer)}}
         (self.work / "inputs.json").write_text(json.dumps(metadata))
 
-        def check(observer, work, progress=None, doctor_timeout=60):
+        def check(observer, work, progress=None, doctor_timeout=60,
+                  expect_counter_objects=1):
             self.assertEqual(doctor_timeout, 300)
             self.assertNotEqual(work.parent, self.work, "product work must leave the 9p stage")
             self.assertEqual(work.stat().st_mode & 0o777, 0o700)
@@ -160,7 +228,8 @@ class CombinedRefusalTests(unittest.TestCase):
                 self.assertEqual(os.environ["SUDO_UID"], str(metadata["runner_uid"]))
             else:
                 self.assertNotIn("SUDO_UID", os.environ)
-            return self.check(observer, work, progress=progress)
+            return self.check(observer, work, progress=progress,
+                              expect_counter_objects=expect_counter_objects)
 
         run = subprocess.run
 
@@ -333,7 +402,8 @@ class CombinedRefusalTests(unittest.TestCase):
         namespace = runpy.run_path(str(SCRIPT))
         seen = {}
 
-        def check(observer, work, progress=None, doctor_timeout=60):
+        def check(observer, work, progress=None, doctor_timeout=60,
+                  expect_counter_objects=1):
             seen["doctor_timeout"] = doctor_timeout
             return []
 

@@ -247,6 +247,16 @@ def check_companion_pins(bpf_text):
     if '--expect-journal "$BPF_EXPECT_JOURNAL"' not in bpf_text:
         problems.append("no journal leg passes --expect-journal "
                         "from BPF_EXPECT_JOURNAL")
+    refusal = step_body(
+        bpf_text,
+        "Check each stock pre-Multi host falls back or refuses without "
+        "side effects")
+    if refusal is None:
+        problems.append("bpf-kernels.yml lost the pre-Multi refusal step")
+    elif '--expect-counter-objects "$BPF_EXPECT_COUNTER_OBJECTS"' not in refusal:
+        problems.append("the pre-Multi refusal control does not pass "
+                        "--expect-counter-objects from "
+                        "BPF_EXPECT_COUNTER_OBJECTS")
     return problems
 
 
@@ -540,6 +550,31 @@ class BpfKernelsContractTests(unittest.TestCase):
                           "refused journal-pair-unavailable-in-build; "
                           "no journal loads",
                           "check-bpf-load-journal.sh"))
+
+    def test_premulti_control_honors_an_absence_expectation(self):
+        driver = (ROOT / "scripts/check-multi-host-refusal.py").read_text()
+        self.assertEqual(
+            [], check_driver_absence_flag(
+                driver, "--expect-counter-objects",
+                "counter-mode-unavailable-in-build: "
+                "this build omits counter objects",
+                "missing counter-mode omission refusal",
+                "check-multi-host-refusal.py"))
+
+    def test_premulti_absence_check_catches_a_dropped_gate(self):
+        driver = (ROOT / "scripts/check-multi-host-refusal.py").read_text()
+        dropped = driver.replace("missing counter-mode omission refusal",
+                                 "counter case passed")
+        self.assertNotEqual(dropped, driver)
+        self.assertIn("check-multi-host-refusal.py never gates the "
+                      "absent arm on 'missing counter-mode omission "
+                      "refusal'",
+                      check_driver_absence_flag(
+                          dropped, "--expect-counter-objects",
+                          "counter-mode-unavailable-in-build: "
+                          "this build omits counter objects",
+                          "missing counter-mode omission refusal",
+                          "check-multi-host-refusal.py"))
 
 
 if __name__ == "__main__":

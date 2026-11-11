@@ -49,8 +49,7 @@ fn small_build_requested() -> bool {
 }
 
 fn expected_journal_selected() -> bool {
-    let carriable = !cfg!(feature = "wide-detailed-2112")
-        && !cfg!(feature = "unsafe-unvalidated-metadata")
+    let carriable = !cfg!(feature = "unsafe-unvalidated-metadata")
         && !small_build_requested()
         && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
         && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
@@ -597,7 +596,6 @@ fn journal_switch_refuses_before_tools_or_outputs() {
     }
     for setting in [
         ("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA", "1"),
-        ("CARGO_FEATURE_WIDE_DETAILED_2112", "1"),
         ("P11SCOPE_SMALL_RING", "1"),
         ("P11SCOPE_SMALL_RING", "true"),
         ("P11SCOPE_SMALL_STATE_MAPS", "1"),
@@ -673,12 +671,12 @@ fn journal_permits_existing_independent_counter_selection() {
 }
 
 /// Default-on tri-state: unset selects exactly the builds that can carry
-/// the production journal (default FULL capacities, no SMALL/WIDE/unsafe,
-/// no private proof or counter-artifact configuration); incompatible builds
-/// omit silently. Explicit `=1` keeps today's refusal; `=0` is off. An
-/// unset marker follows the journal decision; `=1` keeps today's meaning
-/// on any Detailed build. Both selections stay observable in the
-/// preflight stdout before the compiler tripwire.
+/// the production journal (FULL and wide release capacities, no
+/// SMALL/unsafe, no private proof or counter-artifact configuration);
+/// incompatible builds omit silently. Explicit `=1` keeps today's
+/// refusal; `=0` is off. An unset marker follows the journal decision;
+/// `=1` keeps today's meaning on any Detailed build. Both selections
+/// stay observable in the preflight stdout before the compiler tripwire.
 #[test]
 fn journal_unset_selects_exactly_carriable_builds() {
     fn selection_of(output: &std::process::Output, key: &str) -> String {
@@ -701,13 +699,13 @@ fn journal_unset_selects_exactly_carriable_builds() {
     assert_eq!(entries, ["preserved"]);
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
     assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
-    // Unset with SMALL, WIDE, unsafe or a private proof/counter
-    // configuration: omitted silently, never refused.
+    // Unset with SMALL, unsafe or a private proof/counter
+    // configuration: omitted silently, never refused. Unset with WIDE
+    // selects: the wide release build carries the wide journal object.
     for setting in [
         ("P11SCOPE_SMALL_RING", "1"),
         ("P11SCOPE_SMALL_STATE_MAPS", "1"),
         ("P11SCOPE_SMALL_DISCOVERY_RING", "1"),
-        ("CARGO_FEATURE_WIDE_DETAILED_2112", "1"),
         ("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA", "1"),
         ("P11SCOPE_IMAGE_BANK_PROOF", "1"),
         ("P11SCOPE_COUNTER_ARTIFACTS", "1"),
@@ -747,19 +745,22 @@ fn journal_unset_selects_exactly_carriable_builds() {
         assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
         assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     }
-    // Explicit =1 with WIDE keeps today's refusal.
-    let (output, reached, entries) = preflight_switch(
-        "P11SCOPE_JOURNAL",
-        Some(OsStr::new("1")),
-        &[("CARGO_FEATURE_WIDE_DETAILED_2112", "1")],
-    );
-    assert!(!reached, "=1 with WIDE must keep today's refusal");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("production journal"),
-        "=1 with WIDE keeps today's refusal: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(entries, ["preserved"]);
+    // Unset and explicit =1 with WIDE select the wide journal object.
+    for value in [None, Some(OsStr::new("1"))] {
+        let (output, reached, entries) = preflight_switch(
+            "P11SCOPE_JOURNAL",
+            value,
+            &[("CARGO_FEATURE_WIDE_DETAILED_2112", "1")],
+        );
+        assert!(
+            reached,
+            "{value:?} WIDE preflight refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(entries, ["preserved"]);
+        assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
+        assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
+    }
     // Explicit =0 is off in every build.
     for settings in [Vec::new(), vec![("CARGO_FEATURE_WIDE_DETAILED_2112", "1")]] {
         let (output, reached, _) =
@@ -781,7 +782,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
     );
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
     assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
-    // ... and =1 keeps today's meaning on a build the journal cannot carry.
+    // ... and =1 keeps today's meaning on a journal build.
     let (output, reached, _) = preflight_switch(
         "P11SCOPE_BIRTH_MARKER",
         Some(OsStr::new("1")),
@@ -792,7 +793,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
         "marker =1 keeps today's meaning on WIDE: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "0");
+    assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
     assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     // Marker =0 is off even when the journal is on.
     let (output, reached, _) =

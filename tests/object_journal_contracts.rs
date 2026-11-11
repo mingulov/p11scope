@@ -1391,8 +1391,7 @@ fn small_build_requested() -> bool {
 }
 
 fn expected_journal_selected() -> bool {
-    let carriable = !cfg!(feature = "wide-detailed-2112")
-        && !cfg!(feature = "unsafe-unvalidated-metadata")
+    let carriable = !cfg!(feature = "unsafe-unvalidated-metadata")
         && !small_build_requested()
         && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
         && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
@@ -2348,7 +2347,7 @@ fn object_journal_marker_wired_detailed_only() {
 fn object_journal_elf_matches_detailed_attribute_capture() {
     if !expected_journal_selected() {
         eprintln!(
-            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, WIDE, \
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, \
              unsafe, proof or counter build): no journal ELF to compare"
         );
         return;
@@ -4064,7 +4063,7 @@ fn object_journal_end_writer_refuses_unknown_flags_without_writing() {
 fn object_journal_exec_birth_present_in_journal_object() {
     if !expected_journal_selected() {
         eprintln!(
-            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, WIDE, \
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, \
              unsafe, proof or counter build): no journal ELF to check"
         );
         return;

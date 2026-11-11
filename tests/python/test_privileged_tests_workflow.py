@@ -805,12 +805,11 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                       "\"$out/run\" --full-512", second,
                       "second-flavor run must verify the FULL-512 curation")
 
-    def test_counter_cells_are_expected_failures_on_the_wide_build(self):
-        # The wide default build omits counter objects, so the 9
-        # counter/select-endpoint cells refuse with the documented
-        # build reason; the qualifier records them as expected
-        # failures, and both the host template leg and the shared
-        # workflow judge must declare exactly those 9.
+    def test_counter_cells_are_required_positives_on_the_wide_build(self):
+        # The wide default build carries counter objects, so the 9
+        # counter/select-endpoint cells run positive: neither the host
+        # template leg nor the shared workflow judge may declare them
+        # as expected failures.
         cells = ("counter-latency-mt",
                  "counter-counts-pid", "counter-timestamps-pid",
                  "counter-latency-pid", "counter-counts-system",
@@ -820,14 +819,16 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         host_leg = job.split("qualify-public-cli-vng.sh")[0]
         for cell in cells:
             with self.subTest(cell=cell):
-                self.assertIn(f"--expected-failure {cell}", host_leg,
-                              f"host template leg must declare {cell}")
+                self.assertNotIn(f"--expected-failure {cell}", host_leg,
+                                 f"host template leg must not excuse {cell}")
         expected = re.search(r"expected_cells = \{(.*?)\}", job, re.S)
         self.assertIsNotNone(expected, "workflow judge expected_cells set")
         for cell in cells:
             with self.subTest(cell=cell):
-                self.assertIn(f'"{cell}"', expected.group(1),
-                              f"workflow judge must declare {cell}")
+                self.assertNotIn(f'"{cell}"', expected.group(1),
+                                 f"workflow judge must not excuse {cell}")
+        self.assertIn("--require counter-latency-mt", host_leg,
+                      "host template leg must require the mt counter cell")
 
 
 if __name__ == "__main__":

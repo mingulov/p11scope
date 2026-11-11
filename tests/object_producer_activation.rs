@@ -136,8 +136,10 @@ const COUNTER_BANK_MODES: [(&str, &str, u64, u64); 3] = [
     ),
 ];
 
-/// The ordinary FULL build embeds all three bank objects. `=0`, SMALL and
-/// WIDE omit them (empty outputs); anything else fails the build before work.
+/// The ordinary FULL build and the wide release build embed all three
+/// bank objects (fixed bank geometry, independent of the Detailed slot
+/// profile). `=0` and SMALL omit them (empty outputs); anything else
+/// fails the build before work.
 #[test]
 fn counter_objects_switch_matches_emitted_contract() {
     let requested = match option_env!("P11SCOPE_COUNTER_OBJECTS") {
@@ -151,17 +153,16 @@ fn counter_objects_switch_matches_emitted_contract() {
             option_env!("P11SCOPE_SMALL_DISCOVERY_RING"),
             Some("1" | "true")
         );
-    let wide = cfg!(feature = "wide-detailed-2112");
-    // An explicit `=1` with SMALL/WIDE never builds (build.rs panics); only
+    // An explicit `=1` with SMALL never builds (build.rs panics); only
     // unset omits silently, and `=0` omits explicitly.
-    if small || wide {
+    if small {
         assert_ne!(
             option_env!("P11SCOPE_COUNTER_OBJECTS"),
             Some("1"),
-            "explicit counter objects with SMALL/WIDE must fail the build"
+            "explicit counter objects with SMALL must fail the build"
         );
     }
-    let enabled = requested && !small && !wide;
+    let enabled = requested && !small;
     assert_eq!(counter_objects_enabled(), enabled);
     assert_eq!(
         env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),

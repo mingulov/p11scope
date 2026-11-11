@@ -10037,10 +10037,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Counter objects are omitted from the wide default build (see the
-    /// v0.7.0 release notes); this pins the 512-slot counter build until
-    /// the companions are restored at the wide profile.
-    #[cfg(not(feature = "wide-detailed-2112"))]
+    /// Bank geometry is fixed and profile-independent: every release
+    /// build carries the same format2 bank objects.
     #[test]
     fn format2_preparation_rejects_mixed_profiles_before_lifecycle() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
@@ -10122,10 +10120,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Counter objects are omitted from the wide default build (see the
-    /// v0.7.0 release notes); this pins the 512-slot counter build until
-    /// the companions are restored at the wide profile.
-    #[cfg(not(feature = "wide-detailed-2112"))]
+    /// Bank geometry is fixed and profile-independent: every release
+    /// build carries the same format2 bank objects.
     #[test]
     fn format2_preparation_charges_custody_and_payload_together() {
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
@@ -10561,10 +10557,16 @@ pub(crate) mod tests {
 
     #[cfg(feature = "wide-detailed-2112")]
     #[test]
-    fn counter_preparation_refuses_on_wide_build() {
+    fn counter_preparation_stays_healthy_on_wide_build() {
         use super::super::{AttachBackend, BpfLoopVerdict};
-        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "0");
-        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        assert!(!crate::EBPF_COUNTER_COUNTS_OBJECT.is_empty());
+        // The build gate passes; garbage bytes fail at object parsing or the
+        // embedded pin, never with a build or kernel token.
         let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
         let envelope = BankReservation {
             retained_bytes: 1024 * 1024,
@@ -10572,25 +10574,24 @@ pub(crate) mod tests {
             metadata_bytes: 64 * 1024,
             file_descriptors: 1024,
         };
-        for verdict in [
-            BpfLoopVerdict::Available,
-            BpfLoopVerdict::Unavailable("needs Linux 5.17+".into()),
-        ] {
-            let Err(refusal) = CounterPreparation::new_with_backend_and_probe(
-                b"not an object",
-                envelope,
-                &pool.reserver(),
-                AttachBackend::Singles,
-                || verdict.clone(),
-            ) else {
-                panic!("wide builds must refuse preparation");
-            };
-            let message = format!("{refusal:#}");
-            assert!(
-                message.contains("counter-mode-unavailable-in-build"),
-                "{message}"
-            );
-        }
+        let Err(error) = CounterPreparation::new_with_backend_and_probe(
+            b"not an object",
+            envelope,
+            &pool.reserver(),
+            AttachBackend::Singles,
+            || BpfLoopVerdict::Available,
+        ) else {
+            panic!("garbage bytes must fail");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("counter-mode-unavailable-in-build"),
+            "wide must stay healthy: {text}"
+        );
+        assert!(
+            !text.contains("counter-mode-unavailable-on-kernel"),
+            "wide must stay healthy: {text}"
+        );
     }
 
     #[cfg(feature = "stub-object-attributes")]
@@ -11011,10 +11012,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Counter objects are omitted from the wide default build (see the
-    /// v0.7.0 release notes); this pins the 512-slot counter build until
-    /// the companions are restored at the wide profile.
-    #[cfg(not(feature = "wide-detailed-2112"))]
+    /// Bank geometry is fixed and profile-independent: every release
+    /// build carries the same format2 bank objects.
     #[test]
     fn counter_preparation_refuses_when_bpf_loop_is_absent() {
         use super::super::{AttachBackend, BpfLoopVerdict};

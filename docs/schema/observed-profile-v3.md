@@ -217,8 +217,10 @@ Under the default `allowlisted` policy, every emitted mechanism has
 absent when `params` is an array. The diagnostic
 parameter/template representations in the inherited schema are not default
 capture promises. Missing metadata is not evidence that the application used
-none. Scan-only function slots remain semantics-unverified/count-only; an
-accepted explicit manifest attests only its exact object/name/offset claims.
+none. Scan-only function slots whose table layout is not proven
+standard (see `attribution_basis` below) remain
+semantics-unverified/count-only; an accepted explicit manifest attests
+only its exact object/name/offset claims.
 
 Every `mechanisms[]` entry carries `registered`: `true` for an id the
 BPF return path found in `MECH_SHAPE`, `false` for an unregistered
@@ -248,10 +250,14 @@ a v3-additive disclosure with no new schema revision.
 
 Every `mechanisms[]` and `cgroups[].mechanisms[]` row also carries
 `name`: the `CKM_*` name when the id is a known standard or listed
-vendor mechanism, else null, never guessed. Naming is a display-only
-layer over the generic per-number counts: removing the vendor table
-would change only the displayed name, never counts, publication or
-row presence. Profile text shows the `CKM_*` name for known standard
+vendor mechanism, else null, never guessed. For values admitted
+through a manifest/confirmed slot, naming is a display-only layer
+over the generic per-number counts: removing the vendor table would
+change only the displayed name, never counts, publication or row
+presence. Through a standard-layout slot the same registry
+(standard ids plus the listed vendor ids) is additionally the
+publication gate described above, so there membership decides
+publish-by-name versus count-only. Profile text shows the `CKM_*` name for known standard
 and listed vendor ids, else `vendor-defined 0x…` (ids at or above
 `0x80000000`) or `unknown 0x…` (other unknown ids), with counts; the
 JSON rows carry the numeric id (`mechanism`) beside the name. Like

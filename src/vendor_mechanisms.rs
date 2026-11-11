@@ -5,11 +5,16 @@
 //! Every observed mechanism id is counted and published by number
 //! through the generic path: the BPF return path publishes ids at or
 //! below `0xFFFFFFFF` with counts, and the userspace per-id table keys
-//! rows by the exact id. No table gates any of that — this module is
-//! only a naming layer on top. Removing it must change only the
-//! displayed name, never counts, publication or JSON presence (pinned
-//! by the render invariance test and the label test in
-//! `mechanism_names`).
+//! rows by the exact id. For values admitted through a
+//! manifest/confirmed slot no table gates any of that — this module
+//! is only a naming layer on top, and removing it must change only
+//! the displayed name, never counts, publication or JSON presence
+//! (pinned by the render invariance test and the label test in
+//! `mechanism_names`). Through a standard-layout-only slot the
+//! registry these names join (standard ids plus these listed vendor
+//! ids) is also the publication gate (controller ruling 2026-11-11
+//! clause 2): there, membership decides publish-by-name versus a
+//! count with no number.
 //!
 //! Catalog rules (deliberate, reviewable): an id enters the table only
 //! from an authoritative public vendor source (the vendor's public

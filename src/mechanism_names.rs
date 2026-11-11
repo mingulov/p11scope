@@ -11,8 +11,11 @@
 //! table (`vendor_mechanisms::VENDOR_MECHANISMS`: NSS `CKM_NSS_*`
 //! plus the AWS CloudHSM `CKM_CLOUDHSM_*`, Yubico `CKM_YUBICO_*`
 //! and Thales Luna key-creation/derivation/wrap ids) resolve
-//! through the fallthrough below; naming never affects counts,
-//! publication or row presence. Every other id outside those two
+//! through the fallthrough below. For values admitted through a
+//! manifest/confirmed slot, naming never affects counts,
+//! publication or row presence; through a standard-layout-only
+//! slot, resolution through this registry is the publication gate
+//! (controller ruling 2026-11-11 clause 2). Every other id outside those two
 //! lists — vendor ids (`>= 0x8000_0000`) and unregistered ids —
 //! has no name and renders with its exact number (see
 //! [`mechanism_label`]), never guessed.

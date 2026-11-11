@@ -738,6 +738,46 @@ pub(crate) fn counter_object_for_mode(mode: CounterMode) -> &'static [u8] {
     }
 }
 
+/// Wide-build twin for privileged counter cells: builds that omit
+/// counter objects (WIDE, SMALL) pin the exact documented build refusal
+/// instead of running the positive path. The FULL-512 counter campaign
+/// (`privileged-counter-flavor`) runs the positive arms on every push;
+/// when 0.7.x restores wide companions, the `!= "1"` guards fall through
+/// and these cells flip back to positive without edits.
+#[cfg(test)]
+pub(crate) fn assert_counter_build_omitted_twin(cell: &str) {
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+        "0",
+        "{cell}: an omitted build emits ENABLED=0"
+    );
+    assert_eq!(
+        env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        "",
+        "{cell}: an omitted build emits no counter outputs"
+    );
+    for mode in [
+        CounterMode::Counts,
+        CounterMode::Timestamps,
+        CounterMode::Latency,
+    ] {
+        assert!(
+            counter_object_for_mode(mode).is_empty(),
+            "{cell}: {mode:?} must be omitted when disabled"
+        );
+    }
+    assert_eq!(
+        check_counter_build(
+            env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"),
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+        )
+        .unwrap_err(),
+        "counter-mode-unavailable-in-build: this build omits counter objects",
+        "{cell}: the omitted build refuses with its exact finite reason"
+    );
+    eprintln!("COUNTER_OMITTED cell={cell}");
+}
+
 struct StagedExtent {
     transaction: NonZeroU64,
     commit: CountsBankCommit,
@@ -10636,6 +10676,12 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires the default build with embedded counter objects, BPF privilege and LP64 map/program load"]
     fn counter_bank_mode_objects_load_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            super::assert_counter_build_omitted_twin(
+                "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
+            );
+            return;
+        }
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
@@ -10833,6 +10879,12 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "privileged: counter preflight loads every counter object through Session preparation"]
     fn counter_object_preflight_loads_all_modes() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            super::assert_counter_build_omitted_twin(
+                "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",
+            );
+            return;
+        }
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         for mode in [
             CounterMode::Counts,

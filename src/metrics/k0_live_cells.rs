@@ -605,6 +605,12 @@ fn spawn_observer(
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count"]
 fn k0_live_detail_matches_ledger_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build(&module)?;
@@ -685,6 +691,12 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window"]
 fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build(&module)?;
@@ -756,6 +768,12 @@ fn spawn_run_observer(
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count"]
 fn k0_live_run_detail_matches_ledger_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build_owned(&module)?;
@@ -984,6 +1002,12 @@ fn require_exit_outcome(document: &serde_json::Value) -> Result<()> {
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts whose owned child does four C_Sign calls and exits inside the window"]
 fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build_owned(&module)?;
@@ -1009,6 +1033,12 @@ fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a gate-less short owned child that signs four times and exits at once"]
 fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build_owned(&module)?;
@@ -1229,6 +1259,12 @@ fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -
 #[test]
 #[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --pid --select-endpoint counts whose target does four C_Sign calls and exits before the duration ends"]
 fn k0_live_pid_exit_in_window_counts_lp64() -> Result<()> {
+    if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+        crate::attach::counter_banks::assert_counter_build_omitted_twin(
+            "metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64",
+        );
+        return Ok(());
+    }
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build(&module)?;

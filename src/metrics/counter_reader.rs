@@ -3145,12 +3145,24 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures and authorized native attach"]
     fn counter_bank_session_old_return_survives_append_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
+            );
+            return;
+        }
         old_return_survives_append_with_mode(CounterMode::Counts);
     }
 
     #[test]
     #[ignore = "requires explicitly prebuilt LP64 counter-banks fixtures, validated timestamps and latency format2 objects, and authorized native attach; runs a counts-null twin first"]
     fn counter_bank_session_timing_old_return_survives_append_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64",
+            );
+            return;
+        }
         for mode in [
             CounterMode::Counts,
             CounterMode::Timestamps,
@@ -4832,24 +4844,48 @@ mod tests {
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and authorized 513-endpoint native attachment"]
     fn counter_bank_session_boundary_511_512_counts_growth_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64",
+            );
+            return;
+        }
         native_growth_population(513);
     }
 
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, proven kernel Multi PID filtering, and authorized 513-endpoint native Multi attachment"]
     fn counter_bank_session_boundary_511_512_counts_growth_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend(513, crate::attach::AttachBackend::Multi);
     }
 
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures and separate FD/memory/native admission for 8192 distinct endpoints after the boundary pilot"]
     fn counter_bank_session_useful_8192_counts_growth_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64",
+            );
+            return;
+        }
         native_growth_population(8192);
     }
 
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures, selected format2 object, and separate FD/memory/native admission for 8192 distinct endpoints after the qualified Multi513 pilot"]
     fn counter_bank_session_useful_8192_counts_growth_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend(8192, crate::attach::AttachBackend::Multi);
     }
 
@@ -5147,6 +5183,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven first-512 Counts staging"]
     fn counter_engine_stages_first_512_counts_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+            );
+            return;
+        }
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine = engine_over_counter_fixture(&mut parts, first);
@@ -5177,6 +5219,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_over_ceiling_refuses_atomically_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64",
+            );
+            return;
+        }
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine = engine_over_counter_fixture(&mut parts, first);
@@ -5292,6 +5340,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, a cgroup v2 hierarchy, and authorized native Multi staging as root: Engine-driven cgroup growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_cgroup_counts_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64",
+            );
+            return;
+        }
         let group =
             OwnedCounterCgroup::create().expect("cgroup v2 hierarchy for the counter cgroup cell");
         let mut parts = engine_counter_fixture();
@@ -5370,6 +5424,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven system growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_system_counts_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64",
+            );
+            return;
+        }
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine =
@@ -5540,6 +5600,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate"]
     fn counter_singles_stop_prints_detach_estimate_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+            );
+            return;
+        }
         // Singles growth is backend selection, not a separate code path:
         // the same Engine seams stage and grow, and the stop reuses the
         // existing detach drive with no new machinery.
@@ -5608,6 +5674,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven Multi stop prints no one-at-a-time detach estimate"]
     fn counter_multi_stop_prints_no_detach_estimate_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64",
+            );
+            return;
+        }
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine = engine_over_counter_fixture(&mut parts, first);
@@ -5640,6 +5712,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Singles staging as root: a second stop signal abandons a Singles counter detach promptly with the typed interruption"]
     fn counter_singles_stop_second_signal_abandons_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64",
+            );
+            return;
+        }
         // The run_abandon_report harness shape at session level: the drive
         // runs on this thread while a second signal arrives from another,
         // and the drive returns the typed interruption instead of joining
@@ -5781,6 +5859,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven timestamps growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_timestamps_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64",
+            );
+            return;
+        }
         engine_timing_growth_cell(
             CounterMode::Timestamps,
             "COUNTER_ENGINE_TIMESTAMPS_GROWTH published=8192 over_ceiling_partials=1",
@@ -5790,6 +5874,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: Engine-driven latency growth to 8192, then an atomic over-ceiling refusal"]
     fn counter_engine_growth_latency_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+            );
+            return;
+        }
         engine_timing_growth_cell(
             CounterMode::Latency,
             "COUNTER_ENGINE_LATENCY_GROWTH published=8192 over_ceiling_partials=1",
@@ -6024,6 +6114,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, authorized native Multi staging as root, and a high hard RLIMIT_NOFILE: soft-1024 start raises through the Engine path"]
     fn counter_start_raises_nofile_from_soft_1024_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+            );
+            return;
+        }
         const TEST: &str =
             "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64";
         let hard = hard_nofile();
@@ -6067,6 +6163,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native BPF as root: soft-1024 direct preparation without the raise hits FD exhaustion"]
     fn counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64",
+            );
+            return;
+        }
         use crate::attach::counter_banks::{BankPublication, BankRefusal, BankReservation};
         const TEST: &str = "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64";
         let hard = hard_nofile();
@@ -6133,6 +6235,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures and authorized native Multi staging as root: counter collection reads live and terminal rows"]
     fn counter_collection_reads_live_and_terminal_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+            );
+            return;
+        }
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..512].to_vec();
         let mut engine = engine_over_counter_fixture(&mut parts, first);
@@ -6577,24 +6685,48 @@ mod tests {
     #[test]
     #[ignore = "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_counts_matches_workload_ledger_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64",
+            );
+            return;
+        }
         counter_cli_capture_cell_with_selection_owned(CounterMode::Counts, None);
     }
 
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode timestamps to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_timestamps_matches_workload_ledger_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64",
+            );
+            return;
+        }
         counter_cli_capture_cell(CounterMode::Timestamps);
     }
 
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode latency to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_latency_matches_workload_ledger_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64",
+            );
+            return;
+        }
         counter_cli_capture_cell(CounterMode::Latency);
     }
 
     #[test]
     #[ignore = "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail"]
     fn selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+            );
+            return;
+        }
         counter_cli_capture_cell_with_selection_owned(
             CounterMode::Counts,
             Some("counter_bank_growth_e0007"),
@@ -6604,6 +6736,12 @@ mod tests {
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures as root: 6.15 selection stage against the live plan refuses system scope by name"]
     fn selected_detail_system_scope_refuses_live_plan_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+            );
+            return;
+        }
         // The system neighbor: the same live plan the positive
         // resolves against refuses a system scope by name — no slot,
         // no original, aggregate untouched (there is no capture here
@@ -6724,6 +6862,12 @@ mod tests {
     #[test]
     #[ignore = "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON"]
     fn counter_cli_run_counts_with_owned_child_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+            );
+            return;
+        }
         let mode = CounterMode::Counts;
         let id = std::process::id();
         let out_path = std::env::temp_dir().join(format!("p11scope-counter-run-{id}.json"));
@@ -6837,6 +6981,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, validated timestamps format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
     fn counter_bank_session_boundary_511_512_timestamps_growth_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend_and_mode(
             513,
             crate::attach::AttachBackend::Multi,
@@ -6847,6 +6997,12 @@ mod tests {
     #[test]
     #[ignore = "requires LP64 counter-bank-growth fixtures, validated latency format2 object, functional kernel Multi attachment, and authorized native Multi staging"]
     fn counter_bank_session_boundary_511_512_latency_growth_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend_and_mode(
             513,
             crate::attach::AttachBackend::Multi,
@@ -6857,6 +7013,12 @@ mod tests {
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures, validated timestamps format2 object, and separate FD/memory/native admission for 8192 distinct timestamp endpoints after the boundary pilot"]
     fn counter_bank_session_useful_8192_timestamps_growth_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend_and_mode(
             8192,
             crate::attach::AttachBackend::Multi,
@@ -6867,6 +7029,12 @@ mod tests {
     #[test]
     #[ignore = "requires prebuilt LP64 growth fixtures, validated latency format2 object, and separate FD/memory/native admission for 8192 distinct latency endpoints after the boundary pilot"]
     fn counter_bank_session_useful_8192_latency_growth_multi_lp64() {
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") != "1" {
+            crate::attach::counter_banks::assert_counter_build_omitted_twin(
+                "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+            );
+            return;
+        }
         native_growth_population_with_backend_and_mode(
             8192,
             crate::attach::AttachBackend::Multi,

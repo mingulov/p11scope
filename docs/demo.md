@@ -178,15 +178,20 @@ cgroup mount names pod cgroups from the node view. Details:
 A user in the `docker` group needs no sudo: on this dev host (Ubuntu
 26.04.1, rootful Docker, AppArmor enforcing) `doctor` exited 0 and
 `inventory --system` scanned 175 callers with the flags above plus the
-AppArmor opt. Without the opt, `inventory` still exits 0 but sees almost
-nothing (2 callers, 0 providers), while `doctor` still passes — so where
-AppArmor is enforcing, the opt is what makes captures see processes.
+AppArmor opt. Without the opt, `doctor` fails its `process access`
+check (naming the confining label and the fix) and `inventory` still
+exits 0 but sees almost nothing (2 callers, 0 providers), with a
+one-line stderr hint and a `process access` gap — so where AppArmor is
+enforcing, the opt is what makes captures see processes.
 The least-privilege set behaves the same (measured 2026-11-11: 188
 callers with the opt, 2 without). The opt used to be
 `apparmor=unconfined`; the shipped [`apparmor-p11scope`](../deploy/apparmor-p11scope)
 profile (the Docker default plus one `ptrace (read, trace)` rule)
 keeps the confinement and measures the same (142 callers, 5
 providers, ledgered `profile --pid` multiset-exact).
+Snap-confined apps (e.g. snap Firefox) stay unreadable from a
+container even with the shipped profile (their per-process
+`unreadable` gaps name them); run natively for those.
 
 Rootless Docker or Podman cannot work: BPF loading and uprobes need real
 host capabilities, which a rootless container cannot grant. Use rootful

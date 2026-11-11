@@ -3859,7 +3859,7 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
     }
     // Hermetic newcomer: the overflowing EXEC must name an impossible pid
     // (no /proc entry on any host), so relief can never admit it.
-    let overflow_pid = 4_001_000u32;
+    let overflow_pid = FAKE_PID_FLOOR + 10_000;
     assert!(
         overflow_pid >= FAKE_PID_FLOOR,
         "the overflow newcomer must sit above every real pid"
@@ -12431,6 +12431,21 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     }
 }
 
+/// Hermeticity foundation: the fake-pid range used by overflow and
+/// pressure fills must start above every pid the kernel can allocate
+/// (64-bit PID_MAX_LIMIT), so those fills can never collide with a real
+/// /proc entry on any host.
+#[test]
+fn fake_pid_floor_exceeds_pid_max_limit() {
+    // Compile-time pin: a lowered floor must break the build, not one host's run.
+    const {
+        assert!(
+            FAKE_PID_FLOOR > 4_194_304,
+            "FAKE_PID_FLOOR must exceed PID_MAX_LIMIT"
+        );
+    }
+}
+
 /// Task 3.1b: lifecycle/loader refresh requests enqueue bounded work. Past
 /// the cap, excess requests are dropped with explicit truncation evidence —
 /// never an unbounded userspace queue — while a re-request for an already
@@ -12442,7 +12457,7 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     // Hermetic fill: every fill pid must be an impossible pid (no /proc
     // entry on any host), so relief can never admit an overflow newcomer
     // no matter which pids are alive on the test host.
-    let fill_base = 1u32;
+    let fill_base = FAKE_PID_FLOOR;
     assert!(
         fill_base >= FAKE_PID_FLOOR,
         "the overflow fill must sit above every real pid"
@@ -45702,7 +45717,7 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
 
     // Hermetic newcomer: the overflowing EXEC must name an impossible pid
     // (no /proc entry on any host), so relief can never admit it.
-    let overflow_pid = 4_001_000u32;
+    let overflow_pid = FAKE_PID_FLOOR + 10_000;
     assert!(
         overflow_pid >= FAKE_PID_FLOOR,
         "the overflow newcomer must sit above every real pid"
@@ -47108,8 +47123,8 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     // Hermetic fill: the fill range and the overflow newcomer must be
     // impossible pids (no /proc entry on any host), so the excess request
     // drops with its loss marker on every host.
-    let fill_base = 50_000u32;
-    let overflow_pid = 60_000u32;
+    let fill_base = FAKE_PID_FLOOR;
+    let overflow_pid = FAKE_PID_FLOOR + 10_000;
     assert!(
         fill_base >= FAKE_PID_FLOOR && overflow_pid >= FAKE_PID_FLOOR,
         "the overflow fill and newcomer must sit above every real pid"

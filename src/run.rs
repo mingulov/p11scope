@@ -25590,10 +25590,7 @@ int main(int argc, char **argv) {
             None
         );
         let at = profile_frame_decisions(
-            || {
-                (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL)
-                    .duration_since(last_frame)
-            },
+            || (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL).duration_since(last_frame),
             drain,
         );
         assert_eq!(

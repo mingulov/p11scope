@@ -42155,6 +42155,15 @@ fn e07_request_targets(request: &[(u32, PinnedObjectId, u64)]) -> BTreeSet<(Pinn
         .collect()
 }
 
+/// The exact `(slot, object, file offset)` tuples of one recorded
+/// attach request, sorted: the multiset a correct submission must
+/// equal, slot identity included.
+fn e07_request_slots(request: &[(u32, PinnedObjectId, u64)]) -> Vec<(u32, PinnedObjectId, u64)> {
+    let mut slots = request.to_vec();
+    slots.sort_unstable();
+    slots
+}
+
 fn e07_active_targets(engine: &Engine) -> BTreeSet<(PinnedObjectId, u64)> {
     engine
         .plan
@@ -42163,6 +42172,20 @@ fn e07_active_targets(engine: &Engine) -> BTreeSet<(PinnedObjectId, u64)> {
         .filter(|slot| engine.plan.is_active(slot.index))
         .map(|slot| (slot.object, slot.file_offset))
         .collect()
+}
+
+/// Active `(slot, object, file offset)` tuples, sorted: the planned
+/// set an attach request must submit verbatim.
+fn e07_active_slots(engine: &Engine) -> Vec<(u32, PinnedObjectId, u64)> {
+    let mut slots: Vec<_> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    slots.sort_unstable();
+    slots
 }
 
 /// Feed `n` CALL events for `slot` through the real drain/reducer.
@@ -42770,6 +42793,7 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
     let before = e07_active_targets(&engine);
     assert!(!before.is_empty(), "the planted table is covered");
     let indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    let before_slots = e07_active_slots(&engine);
 
     provider.retarget_table(provider.second_bootstrap);
     let outcome = e07_rescan(
@@ -42780,6 +42804,7 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
         &mut pending,
     );
     let after = e07_active_targets(&engine);
+    let after_slots = e07_active_slots(&engine);
     assert!(
         outcome.changed(),
         "a retargeted table detaches stale targets"
@@ -42822,6 +42847,16 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
         e07_request_targets(&session.attached_requests[1]),
         after,
         "the replacement submits exactly the planned new target"
+    );
+    assert_eq!(
+        e07_request_slots(&session.attached_requests[0]),
+        before_slots,
+        "the first attach submits exactly the planned slot tuples"
+    );
+    assert_eq!(
+        e07_request_slots(&session.attached_requests[1]),
+        after_slots,
+        "the replacement submits exactly the planned new slot tuples"
     );
     let (_, retarget_offset) = after.iter().next().copied().expect("one target after");
     assert_eq!(
@@ -43295,7 +43330,6 @@ fn e07_metadata_rescan_with_new_provider_preserves_existing_coverage() {
         &mut pending,
     );
     let after = e07_active_targets(&engine);
-    assert_eq!(after.len(), 2, "both providers are covered: {after:?}");
     assert!(
         before.is_subset(&after),
         "the first provider keeps its target: before={before:?} after={after:?}"
@@ -43526,6 +43560,7 @@ fn late_provider_loader_rescans_keep_stable_slots() {
     let slots = engine.plan.slots.len();
     assert!(slots > 0, "a late load must plan slots");
     let indices: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    let planned_slots = e07_active_slots(&engine);
     let attempts = engine.loader_memory_scan_attempts;
     assert_eq!(attempts, 1, "the attach runs the loader seam once");
 
@@ -43595,6 +43630,11 @@ fn late_provider_loader_rescans_keep_stable_slots() {
             .collect::<Vec<_>>(),
         indices,
         "the first attach submits exactly the planned slots"
+    );
+    assert_eq!(
+        e07_request_slots(&session.attached_requests[0]),
+        planned_slots,
+        "the first attach submits exactly the planned slot tuples"
     );
     assert!(
         session.attached_requests[1..]

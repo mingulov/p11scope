@@ -5722,6 +5722,61 @@ mod tests {
         );
     }
 
+    /// Under confinement the empty explanation names the observer-profile
+    /// fix instead of sudo; without the named gap the sudo advice stays.
+    #[test]
+    fn empty_explanation_prefers_the_confinement_fix_to_sudo() {
+        fn collection() -> super::Collection {
+            super::Collection {
+                enumerated: vec![1001, 1002],
+                selected: vec![1001],
+                cap: 256,
+                cap_hit: false,
+                members: vec![super::MemberResult {
+                    pid: 1001,
+                    view: super::ProcessViewId(0),
+                    status: super::MemberStatus::Unreadable {
+                        reason: "the process generation could not be pinned: Permission denied (os error 13)".into(),
+                    },
+                    generation: None,
+                    complete_scan: None,
+                    application: super::InspectApplicationResult::Unknown(
+                        super::InspectIdentityUnknown::NotExamined,
+                    ),
+                    mapping_scan_completed: false,
+                    hints_examined: false,
+                    modules: Vec::new(),
+                    examined: Vec::new(),
+                    pins: super::PinnedObjects::empty(),
+                    gaps: Vec::new(),
+                    scan_ms: 0,
+                }],
+                scope_gaps: Vec::new(),
+                proc_list_failed: false,
+                sweep: Vec::new(),
+                sweep_unavailable: std::collections::BTreeSet::new(),
+                budget: crate::discovery::scan::CaptureWorkBudget::default(),
+                digests: std::collections::BTreeMap::new(),
+                generations: std::collections::BTreeMap::new(),
+            }
+        }
+        let confined = vec![super::PidGap::scope(super::Skipped {
+            subject: crate::process_access::CHECK_NAME.into(),
+            reason: "confinement (the named gap carries the label)".into(),
+        })];
+        let text = super::empty_explanation(&collection(), 0, &confined);
+        assert!(
+            text.contains("--security-opt apparmor=p11scope-observer"),
+            "{text}"
+        );
+        assert!(!text.contains("sudo p11scope"), "{text}");
+        let plain = super::empty_explanation(&collection(), 0, &[]);
+        assert!(
+            plain.contains("sudo p11scope inspect --system"),
+            "{plain}"
+        );
+    }
+
     fn shared_with(
         selection: IdentityBackendSelection,
         checks: ScriptedIdentityChecks,

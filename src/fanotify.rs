@@ -1386,12 +1386,54 @@ mod tests {
              42 1 0:37 / /dev tmpfs rw,nosuid,relatime - tmpfs tmpfs rw\n\
              43 1 0:38 / /mnt/with\\040space rw,relatime - tmpfs tmpfs rw\n\
              99 1 0:99 / /mnt/ovl rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n";
-        let mut marks: Vec<String> = super::mount_points_for_marks(table)
+        let mut marks: Vec<String> = super::mounts_for_marks(table)
             .iter()
-            .map(|point| point.to_string_lossy().into_owned())
+            .map(|mount| mount.point.to_string_lossy().into_owned())
             .collect();
         marks.sort();
         assert_eq!(marks, vec!["/", "/dev", "/mnt/ovl", "/mnt/with space"]);
+    }
+
+    fn mnt(mount_id: u64, dev_major: u32, dev_minor: u32) -> super::MountIdentity {
+        super::MountIdentity {
+            mount_id,
+            dev_major,
+            dev_minor,
+        }
+    }
+
+    fn visible_mount(
+        point: &str,
+        mount_id: u64,
+        dev_major: u32,
+        dev_minor: u32,
+    ) -> super::MountToMark {
+        super::MountToMark {
+            point: std::path::PathBuf::from(point),
+            identity: Some(mnt(mount_id, dev_major, dev_minor)),
+        }
+    }
+
+    /// The mark parser carries mount identity (mount id + filesystem
+    /// device) beside each point, and an overmounted point keeps the
+    /// topmost (last) mount's identity: the path resolves there.
+    #[test]
+    fn learn_mount_marks_carry_mount_identity() {
+        let table = "51 1 8:1 / /mnt/provider rw,relatime - ext4 /dev/sda1 rw\n\
+             68 1 8:2 / /mnt/provider rw,relatime - ext4 /dev/sda2 rw\n\
+             70 1 0:40 / /data rw,relatime - tmpfs tmpfs rw\n";
+        let mounts = super::mounts_for_marks(table);
+        assert_eq!(mounts.len(), 2, "the overmount shadows the lower mount");
+        let provider = mounts
+            .iter()
+            .find(|mount| mount.point.as_os_str() == "/mnt/provider")
+            .expect("provider mount parsed");
+        assert_eq!(provider.identity, Some(mnt(68, 8, 2)));
+        let data = mounts
+            .iter()
+            .find(|mount| mount.point.as_os_str() == "/data")
+            .expect("data mount parsed");
+        assert_eq!(data.identity, Some(mnt(70, 0, 40)));
     }
 
     /// A failed re-mark of an already covered filesystem is not a
@@ -1400,14 +1442,55 @@ mod tests {
     /// filesystems file no gap.
     #[test]
     fn learn_retained_mark_failure_is_not_a_coverage_gap() {
-        let covered: std::collections::BTreeSet<std::path::PathBuf> = ["/", "/data"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
-        let visible: Vec<std::path::PathBuf> = covered.iter().cloned().collect();
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1), mnt(52, 8, 2)].into_iter().collect();
+        let visible = vec![
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/data", 52, 8, 2),
+        ];
         // Every add fails now (no CAP_SYS_ADMIN after the shed).
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
         assert_eq!(uncovered, 0, "retained marks stay covered");
+        assert_eq!(next, covered);
+    }
+
+    /// A different filesystem mounted at an already covered path does
+    /// not inherit the old mark: the old mark died with the unmounted
+    /// superblock, so a failed re-mark of the replacement (new mount
+    /// id, new device, same path) is uncovered and owes the gap.
+    #[test]
+    fn learn_replacement_filesystem_at_covered_path_is_uncovered() {
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let visible = vec![visible_mount("/mnt/provider", 68, 8, 2)];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 1, "the replacement filesystem was never marked");
+        assert!(next.is_empty(), "the dead mount's coverage is not retained");
+    }
+
+    /// The same device remounted at the same path is a new mount: its
+    /// predecessor's mark died at unmount, so device equality alone
+    /// must not inherit coverage either.
+    #[test]
+    fn learn_remount_of_same_device_is_uncovered() {
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let visible = vec![visible_mount("/mnt/provider", 68, 8, 1)];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 1, "a remount is not the marked mount");
+        assert!(next.is_empty());
+    }
+
+    /// The very same mount (same mount id and device) seen at a new
+    /// path after a move keeps its retained mark: identity, not the
+    /// path spelling, is what coverage keys on.
+    #[test]
+    fn learn_same_mount_at_new_path_stays_covered() {
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let visible = vec![visible_mount("/moved/provider", 51, 8, 1)];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 0, "the moved mount's mark still delivers");
         assert_eq!(next, covered);
     }
 
@@ -1416,11 +1499,11 @@ mod tests {
     /// the retained-mark set, never from traffic elsewhere.
     #[test]
     fn learn_failed_new_filesystem_mark_is_uncovered() {
-        let covered: std::collections::BTreeSet<std::path::PathBuf> =
-            ["/"].iter().map(std::path::PathBuf::from).collect();
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![
-            std::path::PathBuf::from("/"),
-            std::path::PathBuf::from("/mnt/new"),
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/mnt/new", 68, 8, 2),
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
         assert_eq!(uncovered, 1, "the unmarked new filesystem is a gap");
@@ -1431,18 +1514,18 @@ mod tests {
     /// covered set with no gap.
     #[test]
     fn learn_successful_new_filesystem_mark_covers_it() {
-        let covered: std::collections::BTreeSet<std::path::PathBuf> =
-            ["/"].iter().map(std::path::PathBuf::from).collect();
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![
-            std::path::PathBuf::from("/"),
-            std::path::PathBuf::from("/mnt/new"),
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/mnt/new", 68, 8, 2),
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
             point.as_os_str() == "/mnt/new"
         });
         assert_eq!(uncovered, 0);
-        assert!(next.contains(std::path::Path::new("/mnt/new")));
-        assert!(next.contains(std::path::Path::new("/")));
+        assert!(next.contains(&mnt(68, 8, 2)));
+        assert!(next.contains(&mnt(51, 8, 1)));
     }
 
     /// With nothing retained, every failed mark is uncovered (the
@@ -1451,8 +1534,8 @@ mod tests {
     fn learn_no_retained_marks_counts_every_failure() {
         let covered = std::collections::BTreeSet::new();
         let visible = vec![
-            std::path::PathBuf::from("/"),
-            std::path::PathBuf::from("/data"),
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/data", 52, 8, 2),
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
         assert_eq!(uncovered, 2);

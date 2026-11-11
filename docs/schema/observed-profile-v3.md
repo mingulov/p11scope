@@ -240,7 +240,9 @@ Every `mechanisms[]` row also carries `attribution_basis`:
 `"standard_layout"` when every observation of the id came through a
 slot authorized by standard-layout scan evidence only (no manifest;
 controller ruling 2026-11-11), `"manifest"` when a manifest/confirmed
-slot contributed. Through a standard-layout slot only exact members of
+slot contributed. `cgroups[].mechanisms[]` rows carry the same key
+with the same rule applied to that cgroup's own observations, so a
+per-cgroup consumer never borrows the merged root authority. Through a standard-layout slot only exact members of
 the registered `CKM_*` registry (standard ids plus the listed vendor
 ids) publish; any other value counts only in
 `evidence.unregistered_standard_layout_mechanisms` and never appears as

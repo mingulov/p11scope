@@ -9015,6 +9015,57 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_mechanism_cells_carry_their_own_attribution_basis() {
+        // Per-cgroup basis (review F3): the same mechanism observed
+        // through a standard-layout Init in one cgroup and a
+        // confirmed Init in another keeps each cgroup's own
+        // authority; the merged root row cannot substitute for it.
+        let module = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        let slot_named = |plan: &AttachPlan, name: &str| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.names == [name])
+                .unwrap_or_else(|| panic!("{name} slot"))
+                .index
+        };
+        let sign_init = slot_named(&plan, "C_SignInit");
+        let encrypt_init = slot_named(&plan, "C_EncryptInit");
+        assert!(plan.is_standard_layout_slot(sign_init));
+        plan.standard_layout_slots.remove(&encrypt_init);
+        assert!(
+            !plan.is_standard_layout_slot(encrypt_init),
+            "confirmed Init"
+        );
+        let mut state = crate::semantics::State::new(&plan);
+        let mut standard_ev = observed_event(
+            sign_init,
+            0x40, // CKM_SHA256_RSA_PKCS
+            p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        );
+        standard_ev.cgroup_id = 111;
+        state.observe(&standard_ev);
+        let mut confirmed_ev = observed_event(
+            encrypt_init,
+            0x40,
+            p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        );
+        confirmed_ev.cgroup_id = 222;
+        state.observe(&confirmed_ev);
+        let standard_cell = state.cgroups()[&111].mechanisms[&0x40];
+        assert!(standard_cell.attributed_standard_layout);
+        assert!(!standard_cell.attributed_confirmed);
+        let confirmed_cell = state.cgroups()[&222].mechanisms[&0x40];
+        assert!(confirmed_cell.attributed_confirmed);
+        assert!(!confirmed_cell.attributed_standard_layout);
+        let root = &state.mechanisms()[&0x40];
+        assert!(root.attributed_standard_layout && root.attributed_confirmed);
+    }
+
+    #[test]
     fn late_verified_frozen_slots_report_as_unverified() {
         // Review F2 (option (c)): a table verified only after probes
         // linked keeps its frozen count-only cookie, so no mechanism

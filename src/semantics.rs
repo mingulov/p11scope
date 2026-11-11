@@ -2451,6 +2451,15 @@ pub struct MechCallStat {
     /// the capture-wide row, so a scoped breakdown names registry
     /// membership too.
     pub unregistered: bool,
+    /// At least one observation in this partition arrived through
+    /// a standard-layout-only slot — the same sticky flags as the
+    /// capture-wide row, scoped to the partition, so a per-cgroup
+    /// breakdown names its own attribution basis instead of
+    /// borrowing the merged root authority.
+    pub attributed_standard_layout: bool,
+    /// At least one observation in this partition arrived through
+    /// a manifest/confirmed slot.
+    pub attributed_confirmed: bool,
 }
 
 /// Aggregate stats for one `cgroup_id` — a directory inode number
@@ -3450,12 +3459,16 @@ impl State {
             mechanism,
             ev.rv,
             ev.capture & capture::MECHANISM_UNREGISTERED != 0,
+            meta.standard_layout,
+            !meta.standard_layout,
         );
         self.record_module_mechanism(
             mechanism,
             meta.module,
             ev.rv,
             ev.capture & capture::MECHANISM_UNREGISTERED != 0,
+            meta.standard_layout,
+            !meta.standard_layout,
         );
     }
 
@@ -3546,7 +3559,14 @@ impl State {
             // exactly as before.
             let is_new = !self.mechanisms.contains_key(&mechanism);
             if is_new && !self.admit(1) {
-                self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
+                self.record_cgroup_mechanism(
+                    ev.cgroup_id,
+                    mechanism,
+                    ev.rv,
+                    unregistered,
+                    from_standard_layout,
+                    from_confirmed,
+                );
                 // No module cell here, unlike the cgroup cell: the
                 // breakdown renders inside its row, so a cell without a
                 // row could never reach output.
@@ -3557,8 +3577,22 @@ impl State {
             stat.attributed_standard_layout |= from_standard_layout;
             stat.attributed_confirmed |= from_confirmed;
             record_call(stat, ev);
-            self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
-            self.record_module_mechanism(mechanism, meta.module, ev.rv, unregistered);
+            self.record_cgroup_mechanism(
+                ev.cgroup_id,
+                mechanism,
+                ev.rv,
+                unregistered,
+                from_standard_layout,
+                from_confirmed,
+            );
+            self.record_module_mechanism(
+                mechanism,
+                meta.module,
+                ev.rv,
+                unregistered,
+                from_standard_layout,
+                from_confirmed,
+            );
         }
 
         let retain = match meta.semantics.transition {
@@ -4113,6 +4147,8 @@ impl State {
         mechanism: u64,
         rv: u64,
         unregistered: bool,
+        from_standard_layout: bool,
+        from_confirmed: bool,
     ) {
         let Some(cgroup) = self.cgroups.get(&cgroup_id) else {
             return;
@@ -4129,6 +4165,8 @@ impl State {
             .entry(mechanism)
             .or_default();
         stat.unregistered |= unregistered;
+        stat.attributed_standard_layout |= from_standard_layout;
+        stat.attributed_confirmed |= from_confirmed;
         stat.calls += 1;
         if rv != CkRv::OK.0 && rv != CkRv::PENDING.0 {
             stat.errors += 1;
@@ -4151,6 +4189,8 @@ impl State {
         module: ModuleId,
         rv: u64,
         unregistered: bool,
+        from_standard_layout: bool,
+        from_confirmed: bool,
     ) {
         if module == MODULE_UNRESOLVED {
             return;
@@ -4167,6 +4207,8 @@ impl State {
         if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
             let cell = stat.by_module.entry(module).or_default();
             cell.unregistered |= unregistered;
+            cell.attributed_standard_layout |= from_standard_layout;
+            cell.attributed_confirmed |= from_confirmed;
             cell.calls += 1;
             if rv != 0 {
                 cell.errors += 1;

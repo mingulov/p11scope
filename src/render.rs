@@ -5379,6 +5379,11 @@ struct CgroupMechOut {
     /// same flag as the top-level `mechanisms[]` rows, independent of
     /// the display-only name above.
     registered: bool,
+    /// Attribution basis for this cgroup's observations of the id,
+    /// with the root-row rule: `"standard_layout"` when every
+    /// observation in this cgroup came through a standard-layout
+    /// slot, `"manifest"` when a confirmed slot contributed here.
+    attribution_basis: &'static str,
     calls: u64,
     errors: u64,
 }
@@ -5454,6 +5459,13 @@ fn cgroups_out_with_live_root(
                         mechanism_hex: format!("0x{mechanism:x}"),
                         name: mechanism_name(mechanism),
                         registered: !m.unregistered,
+                        attribution_basis: if m.attributed_standard_layout
+                            && !m.attributed_confirmed
+                        {
+                            "standard_layout"
+                        } else {
+                            "manifest"
+                        },
                         calls: m.calls,
                         errors: m.errors,
                     })

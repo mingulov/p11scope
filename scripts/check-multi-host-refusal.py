@@ -16,8 +16,8 @@ other live row (doctor, profile, counter, run, `inventory --capture
 native`) still refuses before any capture side effect.
 
 With --expect-counter-objects 0 the counter rows expect the exact
-counter-mode omission refusal of a build without counter objects (the
-wide default) instead of the live-capture refusal; every other row is
+counter-mode omission refusal of a build without counter objects (a
+SMALL build) instead of the live-capture refusal; every other row is
 unchanged. The build gate fires before any kernel probe, so on a
 pre-Multi host the omission refusal wins over the live-capture one.
 """
@@ -423,7 +423,7 @@ def main():
                         choices=(0, 1),
                         help="counter rows expect the counter objects (1) "
                              "or the exact omission refusal of a build "
-                             "without them (0, the wide default)")
+                             "without them (0, a SMALL build)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     if args.guest:

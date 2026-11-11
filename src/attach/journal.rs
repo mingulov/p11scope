@@ -8,9 +8,11 @@
 //!
 //! The production journal object is a Detailed object whose entry/return
 //! roots are replaced by the journal pair (`p11_entry_journal` /
-//! `p11_return_journal`) plus the four journal maps. FULL and P0 builds
-//! carry it by default (`P11SCOPE_JOURNAL=0`, SMALL, WIDE and unsafe builds
-//! omit it); only `inventory --key-operations` loads it. It carries both
+//! `p11_return_journal`) plus the four journal maps. FULL, wide and P0
+//! builds carry it by default (`P11SCOPE_JOURNAL=0`, SMALL and unsafe
+//! builds omit it); only `inventory --key-operations` loads it. The
+//! wide journal object carries the wide Detailed geometry (2,112
+//! slots), matching the host's Detailed planning. It carries both
 //! marker writers (READY exec birth and DIRTY gap), active only after
 //! closure in an opted-in session. The private proof ELF is never selected
 //! or embedded here. `journal_linked` is derived from the actually loaded

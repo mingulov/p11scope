@@ -197,8 +197,9 @@ REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
 REASON_COUNTER_WIDE="counter modes unavailable in the wide build (the build omits counter objects); product fix lane: 0.7.x companion restore"
 # The documented build-gate refusal, byte-exact without the p11scope prefix
-# (src/attach/counter_banks.rs check_counter_build; FULL builds emit the
-# objects and can never print it). The probe and the per-cell arm share it.
+# (src/attach/counter_banks.rs check_counter_build; release builds emit
+# the objects and can never print it). The probe and the per-cell arm
+# share it.
 COUNTER_BUILD_REFUSAL="counter-mode-unavailable-in-build: this build omits counter objects"
 # No kernel can hold this pid (2^31 - 1 exceeds every pid_max), so the
 # probe and the refusal arm never attach: the build gate fires first on
@@ -393,9 +394,9 @@ gated() {
 }
 # Counter-build probe, once per campaign (CONTROL modes skip it: they run
 # no counter cell and their fake observers answer nothing here). 0 when
-# the observer passes the counter gate (FULL build: the bogus pid fails
+# the observer passes the counter gate (release build: the bogus pid fails
 # later for another reason), 1 when it refuses with the exact documented
-# build reason (wide default), 64 when the outcome is inconclusive (an
+# build reason (SMALL build), 64 when the outcome is inconclusive (an
 # observer that captures against a bogus pid, or refuses noisily, fails
 # loud before any cell runs).
 counter_build_supported() {
@@ -439,9 +440,9 @@ counter_refused() {
   result "$cell" 0 "expected the documented counter-build refusal, got rc=$rc stderr=$(head -c 200 "$cell.stderr" | tr '\n' ' ')" failed
   return 1
 }
-# Counter/select-endpoint cells branch on the build: FULL builds capture
-# through the ordinary gated lifecycle; builds without counter objects
-# prove the exact refusal instead.
+# Counter/select-endpoint cells branch on the build: builds with counter
+# objects capture through the ordinary gated lifecycle; builds without
+# them prove the exact refusal instead.
 counter_cell() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   if [ "$COUNTER_SUPPORTED" = 1 ]; then

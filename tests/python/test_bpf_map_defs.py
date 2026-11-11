@@ -1015,6 +1015,15 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         self.quiet(checker.validate_inventory, "default", checker.SAFE_MAPS,
                    checker.SAFE_PROGRAMS, self.detailed_symbols())
 
+    def test_release_wide_variant_requires_marker(self):
+        self.quiet(checker.validate_inventory, "wide", checker.WIDE_MARKER_MAPS,
+                   checker.SAFE_PROGRAMS, self.detailed_symbols())
+        with self.assertRaisesRegex(RuntimeError,
+                                    "lacks required birth marker symbols"):
+            checker.validate_inventory(
+                "wide", checker.WIDE_MARKER_MAPS, checker.SAFE_PROGRAMS,
+                self.detailed_symbols(missing={"JOURNAL_MARKER_CTL"}))
+
     def test_gate_variant_accepts_gate_maps_with_markers(self):
         # The loader-gate object carries the five gate maps with the
         # default programs and symbols; like default it requires the

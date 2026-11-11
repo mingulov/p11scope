@@ -6168,8 +6168,7 @@ fn artifact_expected_marker_enabled() -> bool {
     }
     let journal_selected = match option_env!("P11SCOPE_JOURNAL") {
         None => {
-            !cfg!(feature = "wide-detailed-2112")
-                && !cfg!(feature = "unsafe-unvalidated-metadata")
+            !cfg!(feature = "unsafe-unvalidated-metadata")
                 && !small_requested()
                 && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
                 && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
@@ -6226,8 +6225,10 @@ fn frozen_policy_inventory_matches_embedded_object() {
         .expect("parse embedded object for gate selection")
         .maps
         .contains_key("TASK_COOKIE_B");
-    if marker && (wide || unsafe_build) {
-        eprintln!("explicit-marker test shape on a journalless build; no frozen variant covers it");
+    if marker && unsafe_build {
+        eprintln!(
+            "explicit-marker test shape on a journalless unsafe build; no frozen variant covers it"
+        );
         return;
     }
     if gate && (wide || unsafe_build) {
@@ -6241,7 +6242,8 @@ fn frozen_policy_inventory_matches_embedded_object() {
             (false, false) if marker => ("default", "diagnostic", "wide-default"),
             (false, false) => ("default-no-marker", "default", "wide-default"),
             (false, true) => ("diagnostic", "default", "wide-diagnostic"),
-            (true, false) => ("wide-default", "wide-diagnostic", "default"),
+            (true, false) if marker => ("wide", "wide-default", "default"),
+            (true, false) => ("wide-default", "wide", "default"),
             (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
         }
     };
@@ -6262,7 +6264,7 @@ fn frozen_policy_inventory_matches_embedded_object() {
     } else if unsafe_build {
         (44, 27)
     } else if wide {
-        (42, 22)
+        if marker { (44, 22) } else { (42, 22) }
     } else if marker {
         (44, 22)
     } else {

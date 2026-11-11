@@ -46,16 +46,6 @@ of container targets. Prefer the container recipe on SELinux hosts:
 `--pid=host` observer containers run as `spc_t`, which reads confined
 maps and counts a confined victim exactly.
 
-### Counter and journal companions at the wide profile
-
-Detailed per-call capture now plans 2,112 attach slots, but its counter
-banks and production journal are still built at the 512-slot profile:
-`--counter-mode` selections refuse with the documented "builds without
-counter objects" reason, and journal-lane captures refuse
-`journal-pair-unavailable-in-build` (`doctor` shows the pair as
-unavailable). Profile and trace captures are unaffected. Restoring the
-companions at the wide profile is 0.7.x work.
-
 ### Slot revival is same-target only
 
 A retired attach slot revives only when the same provider target

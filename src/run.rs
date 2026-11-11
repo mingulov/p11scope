@@ -3772,7 +3772,7 @@ pub(crate) fn capture_policy(
                 mode.name()
             );
         }
-        // Builds without counter objects (WIDE, SMALL) refuse here by
+        // Builds without counter objects (SMALL) refuse here by
         // name: the statics are empty there, and preparation never runs
         // to refuse instead.
         if let Err(refusal) = crate::attach::counter_banks::check_counter_build(
@@ -22974,7 +22974,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_capture_setup() {
-        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // Builds without counter objects (SMALL) refuse every mode
         // by name at the policy gate instead of reaching setup.
         let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [
@@ -23008,7 +23008,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_modes_pass_the_cli_gate_into_owned_run_setup() {
-        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // Builds without counter objects (SMALL) refuse every mode
         // by name at the policy gate instead of reaching setup.
         let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [
@@ -23044,7 +23044,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn counter_modes_select_counter_policies_through_capture_policy() {
-        // Builds without counter objects (WIDE, SMALL) refuse every mode
+        // Builds without counter objects (SMALL) refuse every mode
         // by name instead of selecting it.
         let objects = env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1";
         for mode in [

@@ -80,9 +80,9 @@ versioned separately and are opaque, exact dispatch keys.
   and `p11-kit-trust.so` — instead of refusing them for slots. The wider
   profile costs about 5.7 MiB more locked kernel memory at 12 CPUs (about
   7.5 MB of per-CPU counters in all). `--no-default-features` still builds
-  the 512-slot comparison profile. Counter modes and the production journal
-  are unavailable in the wide build for now (they refuse with a named gap);
-  see the release notes.
+  the 512-slot comparison profile. Counter modes ship in the wide build
+  on their fixed bank geometry, and the production journal ships at the
+  wide Detailed geometry.
 - Retired attach slots are reused once their occupant is gone and its
   counts are final: a provider that leaves and returns reoccupies its own
   slots, so process churn no longer burns the lifetime budget. A provider

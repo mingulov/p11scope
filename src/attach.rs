@@ -21345,7 +21345,7 @@ mod tests {
     /// objects (they carry no return adapter): this pins why counter
     /// sessions need their own flavor check. What that check consumes —
     /// unsafe-decoder absence from the parsed object — holds on every
-    /// embedded bank object. Omitted-object builds (WIDE, SMALL) carry
+    /// embedded bank object. Omitted-object builds (SMALL) carry
     /// empty statics and skip.
     #[test]
     fn counter_objects_lack_the_detailed_flavor_adapter() {

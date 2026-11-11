@@ -2293,8 +2293,9 @@ _DETAILED_BASE_MAPS = {
     }.items()
 }
 # The birth-marker control row and the PID-scope birth witness ship in
-# default FULL/P0 objects. Builds that cannot carry the journal (unsafe,
-# wide) omit them, so only the default variant requires them.
+# default FULL/P0 objects and in wide release objects. Builds that
+# cannot carry the journal (unsafe) omit them, so only the default and
+# wide variants require them.
 SAFE_MAPS = _DETAILED_BASE_MAPS | {
     "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
     "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
@@ -2318,6 +2319,13 @@ WIDE_MAPS = _DETAILED_BASE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
     "SLOT_FILE": map_def(2, 4, 4, 2_112, 128),
+}
+# The wide release object: wide slot capacities plus the birth-marker
+# control row and the PID-scope birth witness. Marker-off wide builds
+# (P11SCOPE_JOURNAL=0, P11SCOPE_BIRTH_MARKER=0) keep WIDE_MAPS.
+WIDE_MARKER_MAPS = WIDE_MAPS | {
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
 }
 WIDE_UNSAFE_MAPS = WIDE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
@@ -2422,6 +2430,7 @@ FROZEN_INVENTORY = {
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
     "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
+    "wide": (WIDE_MARKER_MAPS, SAFE_PROGRAMS),
     "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
 }
 
@@ -2442,6 +2451,7 @@ FROZEN_SYMBOLS = {
     "diagnostic": (True, True, True, 2, 2, 2),
     "wide-default": (False, False, False, 0, 0, 0),
     "wide-diagnostic": (True, True, True, 2, 2, 2),
+    "wide": (False, False, False, 0, 0, 0),
     "journal": (False, False, False, 0, 0, 0),
 }
 
@@ -2483,7 +2493,7 @@ def validate_inventory(variant, maps, programs, symbols):
             raise RuntimeError(f"journal object lacks required marker symbols: {sorted(missing)}")
     elif not inventory:
         markers = symbols & (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"})
-        if variant in ("default", "default-gate"):
+        if variant in ("default", "default-gate", "wide"):
             missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
             if missing:
                 raise RuntimeError(f"{variant} object lacks required birth marker symbols: {sorted(missing)}")
@@ -2549,7 +2559,7 @@ def self_test():
     assert "JOURNAL_MARKER_CTL" not in UNSAFE_MAPS
     assert "JOURNAL_MARKER_CTL" not in WIDE_MAPS
     assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
-    for variant_maps in (SAFE_MAPS, JOURNAL_MAPS):
+    for variant_maps in (SAFE_MAPS, JOURNAL_MAPS, WIDE_MARKER_MAPS):
         assert variant_maps["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
     for variant_maps in (_DETAILED_BASE_MAPS, UNSAFE_MAPS, WIDE_MAPS):
         assert "PID_START_TICK" not in variant_maps
@@ -2568,6 +2578,8 @@ def self_test():
     assert len(SAFE_MAPS) == 44
     assert len(UNSAFE_MAPS) == 44
     assert len(WIDE_MAPS) == 42
+    assert len(WIDE_MARKER_MAPS) == 44
+    assert WIDE_MARKER_MAPS["JOURNAL_MARKER_CTL"] == SAFE_MAPS["JOURNAL_MARKER_CTL"]
     assert len(WIDE_UNSAFE_MAPS) == 44
     assert len(JOURNAL_MAPS) == 47
     assert len(SAFE_PROGRAMS) == 22
@@ -2596,6 +2608,7 @@ def self_test():
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
+    validate_inventory("wide", WIDE_MARKER_MAPS, SAFE_PROGRAMS, {"p11_entry"} | marked_helpers)
     validate_inventory("wide-diagnostic", WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
     validate_inventory("default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
     validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
@@ -2607,7 +2620,7 @@ def self_test():
         if check is validate_inventory:
             *prefix, symbols = arguments
             extra = base_helpers
-            if prefix[0] == "default":
+            if prefix[0] in ("default", "wide"):
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
             elif prefix[0] == "journal":
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
@@ -2643,27 +2656,37 @@ def self_test():
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
+    assert rejected(validate_inventory, "wide", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_FILE.max_entries: object=512 frozen=2112",
+        "STATS.max_entries: object=512 frozen=2112",
+    ]
+    assert rejected(validate_inventory, "wide", WIDE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map removed: JOURNAL_MARKER_CTL",
+        "map removed: PID_START_TICK",
+    ]
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
         "map added: ATTR_BOOL_BITS",
         "map added: PAIR_CALLS",
         "map removed: JOURNAL_MARKER_CTL",
         "map removed: PID_START_TICK",
     ]
-    # The default object requires the marker set; the other Detailed
-    # variants forbid any of it; the journal requires the same marker set
-    # (control map plus birth and gap bodies).
-    for extra, missing in [
-        (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
-        ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
-    ]:
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                validate_inventory("default", SAFE_MAPS, SAFE_PROGRAMS,
-                                   {"p11_entry"} | base_helpers | extra)
-        except RuntimeError as error:
-            assert str(error) == f"default object lacks required birth marker symbols: {missing}", error
-        else:
-            raise AssertionError(f"default accepted a markerless object with {sorted(extra)}")
+    # The default and wide objects require the marker set; the other
+    # Detailed variants forbid any of it; the journal requires the same
+    # marker set (control map plus birth and gap bodies).
+    for variant, variant_maps in (("default", SAFE_MAPS), ("wide", WIDE_MARKER_MAPS)):
+        for extra, missing in [
+            (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
+            ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
+        ]:
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    validate_inventory(variant, variant_maps, SAFE_PROGRAMS,
+                                       {"p11_entry"} | base_helpers | extra)
+            except RuntimeError as error:
+                assert str(error) == f"{variant} object lacks required birth marker symbols: {missing}", error
+            else:
+                raise AssertionError(f"{variant} accepted a markerless object with {sorted(extra)}")
     assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS,
                     {"p11_entry", "JOURNAL_MARKER_CTL"}) == [
         "release object contains forbidden birth marker symbols: ['JOURNAL_MARKER_CTL']"
@@ -2826,7 +2849,7 @@ def usage():
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
         "--inventory VARIANT BPF_ELF (default, default-no-marker, diagnostic, "
         "inventory[-small-discovery], inventory-callers[-small-discovery], "
-        "wide-default, wide-diagnostic, journal) | "
+        "wide, wide-default, wide-diagnostic, journal) | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 

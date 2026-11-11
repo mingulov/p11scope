@@ -2393,10 +2393,83 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     );
 }
 
-/// Journal/marker inventory policy: the five pure-policy
-/// `JournalMarkerInventoryTests` cases (marker presence, variant
-/// forbids, journal accept/refusals) run here by name on every
-/// flavor, beside the release-marker twin in `bpf_map_contracts`.
+/// Slot-sized map equality behind the profile pin: STATS, RV_COUNTS and
+/// START carry identical shapes in both ELFs.
+fn slot_maps_match(
+    detailed: &std::collections::HashMap<String, aya_obj::Map>,
+    journal: &std::collections::HashMap<String, aya_obj::Map>,
+) -> bool {
+    ["STATS", "RV_COUNTS", "START"].iter().all(|name| {
+        match (detailed.get(*name), journal.get(*name)) {
+            (Some(left), Some(right)) => {
+                (
+                    left.map_type(),
+                    left.key_size(),
+                    left.value_size(),
+                    left.max_entries(),
+                    left.map_flags(),
+                ) == (
+                    right.map_type(),
+                    right.key_size(),
+                    right.value_size(),
+                    right.max_entries(),
+                    right.map_flags(),
+                )
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Slot-profile pin: the production journal object is a Detailed object
+/// at the build's own slot profile, so its slot-sized maps match the
+/// Detailed ELF exactly, at this build's absolute profile sizes. A 512
+/// journal under a wide host would shed slots silently at the shared
+/// entry bound, so the tamper twin below must mismatch on the same
+/// ELFs, proving the comparison is live rather than vacuous.
+#[test]
+fn object_journal_slot_maps_match_detailed_profile() {
+    if !expected_journal_selected() {
+        eprintln!(
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, \
+             unsafe, proof or counter build): no journal ELF to compare"
+        );
+        return;
+    }
+    let out = std::path::Path::new(env!("OUT_DIR"));
+    let detailed = std::fs::read(out.join("p11scope-ebpf")).expect("read Detailed ELF");
+    let journal = std::fs::read(out.join("journal-v1/p11scope-ebpf-journal-v1"))
+        .expect("read production journal ELF");
+    let detailed = aya_obj::Object::parse(&detailed).expect("parse Detailed ELF");
+    let journal = aya_obj::Object::parse(&journal).expect("parse journal ELF");
+    assert!(
+        slot_maps_match(&detailed.maps, &journal.maps),
+        "journal slot maps differ from the Detailed profile"
+    );
+    assert_eq!(
+        journal.maps["STATS"].max_entries(),
+        p11scope_ebpf_common::MAX_SLOTS
+    );
+    assert_eq!(
+        journal.maps["RV_COUNTS"].max_entries(),
+        p11scope_ebpf_common::RV_ENTRIES
+    );
+    let mut tampered = journal.maps.clone();
+    let aya_obj::Map::Legacy(stats) = tampered.get_mut("STATS").expect("journal STATS") else {
+        panic!("journal STATS is not a legacy map");
+    };
+    stats.def.max_entries += 1;
+    assert!(
+        !slot_maps_match(&detailed.maps, &tampered),
+        "a one-entry STATS drift must mismatch"
+    );
+}
+
+/// Journal/marker inventory policy: the six pure-policy
+/// `JournalMarkerInventoryTests` cases (marker presence, wide
+/// requirement, variant forbids, journal accept/refusals) run here
+/// by name on every flavor, beside the release-marker twin in
+/// `bpf_map_contracts`.
 #[test]
 fn object_journal_variant_inventory_policy_cases_are_driven() {
     let output = std::process::Command::new("python3")
@@ -2405,6 +2478,7 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
             "-I",
             "tests/python/test_bpf_map_defs.py",
             "JournalMarkerInventoryTests.test_release_detailed_marker_presence_accepts",
+            "JournalMarkerInventoryTests.test_release_wide_variant_requires_marker",
             "JournalMarkerInventoryTests.test_release_diagnostic_and_wide_variants_forbid_marker",
             "JournalMarkerInventoryTests.test_journal_variant_accepts_frozen_inventory",
             "JournalMarkerInventoryTests.test_journal_variant_requires_birth_gap_and_map",
@@ -2421,7 +2495,7 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
         output.status.success(),
         "journal variant inventory: {report}"
     );
-    assert!(report.contains("Ran 5 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 6 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped journal proof: {report}");
 }
 

@@ -191,8 +191,8 @@ jobs:
           # Separate target dir: the proof build must not poison the default
           # target/debug cache the next run restores.
           # The private proof builds at FULL (512-slot) capacities only
-          # (build.rs refuses SMALL/WIDE/unsafe/P0); the wide default
-          # carries no journal object to prove, so the proof step builds
+          # (build.rs refuses SMALL/WIDE/unsafe/P0): its pins were
+          # validated at FULL, so the proof step builds
           # --no-default-features while the product stays wide.
           P11SCOPE_JOURNAL_PROOF=1 cargo +"$toolchain" test --locked --offline --no-default-features --lib \
             --target-dir target/proof --no-run --message-format=json >"$RUNNER_TEMP/proof-build.jsonl"
@@ -1131,11 +1131,6 @@ jobs:
               --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
               --expected-failure profile-cgroup --expected-failure trace-cgroup \
               --expected-failure profile-pid-ia32 --expected-failure run-ia32 \
-              --expected-failure counter-latency-mt \
-              --expected-failure counter-counts-pid --expected-failure counter-timestamps-pid \
-              --expected-failure counter-latency-pid --expected-failure counter-counts-system \
-              --expected-failure counter-timestamps-system --expected-failure counter-latency-system \
-              --expected-failure select-endpoint-pid --expected-failure select-endpoint-system \
               --require doctor --require profile-pid --require names-pid --require verdict-pid \
               --require metrics-pid --require trace-pid --require run-short --require run-cover \
               --require mt-exact --require system --require sigint --require second-sigint \
@@ -1210,18 +1205,11 @@ jobs:
           # qualified now that their observation gaps closed. The harness
           # emits expected only on the known signatures, qualified on pass.
           smoke_cells = {"trace-pid", "mt-trace"}
-          # The wide default build omits counter objects, so the 9
-          # counter/select-endpoint cells refuse with the documented
-          # build reason (the qualifier records expected-failure only
-          # on that exact refusal); restore is 0.7.x work.
+          # The wide default build carries counter objects, so the 9
+          # counter/select-endpoint cells run positive (a SMALL-build
+          # refusal would record expected-failure, undeclared here).
           expected_cells = {"profile-cgroup", "trace-cgroup",
-                            "profile-pid-ia32", "run-ia32",
-                            "counter-latency-mt",
-                            "counter-counts-pid", "counter-timestamps-pid",
-                            "counter-latency-pid", "counter-counts-system",
-                            "counter-timestamps-system",
-                            "counter-latency-system",
-                            "select-endpoint-pid", "select-endpoint-system"}
+                            "profile-pid-ia32", "run-ia32"}
           actual_expected = set()
           actual_smoke = set()
           for row in rows:

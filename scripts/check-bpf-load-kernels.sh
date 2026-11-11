@@ -18,7 +18,7 @@
 # tests/counter-bpf-verifier-budgets.json the same way.
 # --expect-counter-objects defaults to 1 (each counter leg is a load
 # proof); 0 turns each counter leg into an exact-refusal control for a
-# build that omits the counter objects (the wide default): the same
+# build that omits the counter objects (a SMALL build): the same
 # command must refuse with counter-mode-unavailable-in-build, exit 1,
 # load no counter programs and crash nothing. A load, a different
 # outcome or a crash is FAIL, never a skip. Exits 0 only when every
@@ -432,9 +432,8 @@ for KERNEL in "$@"; do
             # Omitted-build refusal control: the same command must
             # refuse with the exact finite reason, exit 1, load no
             # counter programs and crash nothing. A load, a different
-            # outcome or a crash is FAIL. (Wide default; flip
-            # --expect-counter-objects when 0.7.x restores the
-            # companions.)
+            # outcome or a crash is FAIL. (SMALL builds omit the
+            # objects; release builds carry them.)
             C_REASONS=""
             if [ ! -f "$C_TXT" ] || ! grep -q 'counter-mode-unavailable-in-build: this build omits counter objects' "$C_TXT"; then
                 counter_reason "exact counter-mode-unavailable-in-build refusal missing"

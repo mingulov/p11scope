@@ -2083,7 +2083,7 @@ const BUILD_LIMIT_ROWS: [(&str, &[&str]); 5] = [
     ("run initial-set capture", &["none"]),
     ("object-attribute capture", &[OBJECT_CAPTURE_P0]),
     // A build that omits the production journal object (`P11SCOPE_JOURNAL=0`,
-    // or a SMALL, WIDE or unsafe build) reports this one token on every
+    // or a SMALL or unsafe build) reports this one token on every
     // host; only this exact value is exempt.
     (JOURNAL_PAIR_ROW, &[JOURNAL_UNAVAILABLE_IN_BUILD]),
 ];

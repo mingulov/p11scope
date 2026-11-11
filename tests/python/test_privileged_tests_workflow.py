@@ -776,11 +776,11 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("name: container-image", job)
 
     def test_journal_proof_builds_at_full_capacities(self):
-        # The private proof refuses SMALL/WIDE/unsafe/P0 (build.rs); the
-        # wide default carries no journal object to prove, so the proof
-        # step builds FULL (--no-default-features) in its own target dir
-        # while the product stays wide. The proof configuration itself
-        # never changes: the same filter must select the same 2 tests.
+        # The private proof refuses SMALL/WIDE/unsafe/P0 (build.rs): its
+        # pins were validated at FULL, so the proof step builds FULL
+        # (--no-default-features) in its own target dir while the
+        # product stays wide. The proof configuration itself never
+        # changes: the same filter must select the same 2 tests.
         step = re.search(
             r"Build P11SCOPE_JOURNAL_PROOF=1 and run root_proof_tests"
             r"[\s\S]*?test result: ok\. 2 passed",

@@ -146,10 +146,11 @@ pub static EBPF_INVENTORY_OBJECT: &[u8] =
 pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory-callers"));
 
-/// Counter bank objects, built and embedded by the ordinary FULL build
-/// (`P11SCOPE_COUNTER_OBJECTS` unset or `1`). `=0`, SMALL and WIDE builds
-/// omit them; the statics below are then empty and preparation refuses
-/// every mode with `counter-mode-unavailable-in-build` before any work.
+/// Counter bank objects, built and embedded by FULL and wide release
+/// builds (`P11SCOPE_COUNTER_OBJECTS` unset or `1`). `=0` and SMALL
+/// builds omit them; the statics below are then empty and preparation
+/// refuses every mode with `counter-mode-unavailable-in-build` before
+/// any work.
 #[cfg(p11scope_counter_objects)]
 pub static EBPF_COUNTER_COUNTS_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
     env!("OUT_DIR"),
@@ -172,10 +173,11 @@ pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = &[];
 #[cfg(not(p11scope_counter_objects))]
 pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = &[];
 
-/// Production journal object, built and embedded by default in FULL and P0
-/// builds that can carry it (P0 stubs its attribute capture, like its
-/// Detailed object). `P11SCOPE_JOURNAL=0` omits it, as do SMALL, WIDE and
-/// unsafe builds silently; the static below is then empty and journal
+/// Production journal object, built and embedded by default in FULL,
+/// wide and P0 builds that can carry it (P0 stubs its attribute
+/// capture, like its Detailed object; wide carries the wide Detailed
+/// geometry). `P11SCOPE_JOURNAL=0` omits it, as do SMALL and unsafe
+/// builds silently; the static below is then empty and journal
 /// preparation refuses with `journal-pair-unavailable-in-build` before any
 /// work. Explicit `P11SCOPE_JOURNAL=1` with an incompatible build refuses
 /// instead of omitting the object. The private journal-proof ELF is never

@@ -128,11 +128,12 @@ fn journal_proof_requested() -> bool {
 }
 
 // The production journal stays behind P11SCOPE_JOURNAL. Unset selects it
-// exactly when the build can carry it (default capacities, no SMALL/WIDE,
-// no unsafe, no private proof or counter-artifact configuration); P0
-// carries it with attribute capture stubbed, like its Detailed object.
-// Other builds omit it silently, like the counter objects below. Explicit
-// =1 with an incompatible build keeps its refusal; =0 is off.
+// exactly when the build can carry it (FULL and wide release
+// capacities, no SMALL, no unsafe, no private proof or counter-artifact
+// configuration); P0 carries it with attribute capture stubbed, like
+// its Detailed object. Other builds omit it silently, like the counter
+// objects below. Explicit =1 with an incompatible build keeps its
+// refusal; =0 is off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JournalRequest {
     Unset,
@@ -240,9 +241,8 @@ fn main() {
     // Explicit =1 keeps today's refusals; unset omits silently where the
     // build cannot carry the production journal.
     assert!(
-        journal_request != JournalRequest::Enabled
-            || !(small_build || wide_detailed || unsafe_unvalidated),
-        "production journal requires default FULL capacities without SMALL, WIDE or unsafe"
+        journal_request != JournalRequest::Enabled || !(small_build || unsafe_unvalidated),
+        "production journal requires FULL or wide release capacities without SMALL or unsafe"
     );
     assert!(
         !(journal_request == JournalRequest::Enabled && (image_bank_proof || counter_artifacts)),
@@ -253,7 +253,6 @@ fn main() {
         JournalRequest::Disabled => false,
         JournalRequest::Unset => {
             !(small_build
-                || wide_detailed
                 || unsafe_unvalidated
                 || journal_proof
                 || image_bank_proof
@@ -389,19 +388,20 @@ fn main() {
         !(journal_proof && (image_bank_proof || counter_artifacts)),
         "private journal proof requires a separate configuration from image proof and counter artifacts"
     );
-    // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
-    // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
-    // here, before any compiler work. P0 and unsafe-compiled builds embed
-    // identical bytes (counter flavors never take those features below).
-    // The fixed-512 artifacts are a separate private control and coexist.
-    if counter_objects_request == CounterObjectsRequest::Enabled && (small_build || wide_detailed) {
-        panic!("P11SCOPE_COUNTER_OBJECTS=1 with SMALL or WIDE refuses: unset omits silently");
+    // FULL and wide release builds embed the three bank objects (fixed
+    // bank geometry, independent of the Detailed slot profile). SMALL
+    // omits them silently only when unset; an explicit `=1` with SMALL
+    // fails here, before any compiler work. P0 and unsafe-compiled
+    // builds embed identical bytes (counter flavors never take those
+    // features below). The fixed-512 artifacts are a separate private
+    // control and coexist.
+    if counter_objects_request == CounterObjectsRequest::Enabled && small_build {
+        panic!("P11SCOPE_COUNTER_OBJECTS=1 with SMALL refuses: unset omits silently");
     }
     let counter_objects = matches!(
         counter_objects_request,
         CounterObjectsRequest::Unset | CounterObjectsRequest::Enabled
-    ) && !small_build
-        && !wide_detailed;
+    ) && !small_build;
     // Private discovery for the real early-refusal driver. This records the
     // actual independent selection used below, before any compiler is called.
     println!(
@@ -511,14 +511,19 @@ fn main() {
         );
     }
     if production_journal {
-        // The journal object takes the build's own attribute-capture
-        // selection: P0 stubs it exactly like its Detailed object.
+        // The journal object takes the build's own Detailed geometry:
+        // wide builds carry the wide journal (STATS 2112, RV 8192,
+        // native slot bounds 2112), matching the host's Detailed
+        // planning, and P0 stubs attribute capture exactly like its
+        // Detailed object. A 512 journal under a wide host would shed
+        // slots silently at the shared entry bound, so per-object
+        // 512 inside a wide build is not an option.
         build_variant_with_proof(
             BpfFlavor::Detailed,
             false,
             false,
             false,
-            false,
+            wide_detailed,
             stub_object_attributes,
             BankProof::Journal,
             true,
@@ -799,7 +804,10 @@ fn build_variant_with_proof(
         } else if small_state_maps && !matches!(*unit, "image_identity" | "image_identity_fork") {
             compile.arg("-DP11SCOPE_SMALL_STATE_MAPS");
         }
-        if !inventory && wide_detailed && *unit == "task_owner" {
+        // The journal roots read the same owner bound through
+        // object_journal.c, so the wide journal object widens that
+        // unit with task_owner; every other unit keeps its bound.
+        if !inventory && wide_detailed && matches!(*unit, "task_owner" | "object_journal") {
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
         }
         if flavor.counters() && *unit == "task_owner" {

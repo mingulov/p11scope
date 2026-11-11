@@ -24,7 +24,7 @@
 # the object's BTF groups are the same, only the key prefix differs.
 # --expect-journal defaults to 1 (each load kernel is a load proof);
 # 0 turns each load kernel into an exact-refusal control for a build
-# that omits the journal object (the wide default): the same command
+# that omits the journal object (a SMALL build): the same command
 # must refuse with journal-pair-unavailable-in-build, run its ordinary
 # retry to rc 0, load no journal roots and crash nothing. A load, a
 # different outcome or a crash is FAIL, never a skip. Pre-Multi kernels
@@ -545,8 +545,8 @@ PY
         # Omitted-build refusal control: the same linked command must
         # refuse with the exact finite reason, run its ordinary retry
         # to rc 0, load no journal roots and crash nothing. A load, a
-        # different outcome or a crash is FAIL. (Wide default; flip
-        # --expect-journal when 0.7.x restores the companion.)
+        # different outcome or a crash is FAIL. (SMALL builds omit the
+        # object; release builds carry it.)
         REASONS=""
         if [ ! -f "$J_TXT" ] || ! grep -q 'journal-pair-unavailable-in-build: this build omits the production journal object' "$J_TXT"; then
             add_reason "exact journal-pair-unavailable-in-build refusal missing"

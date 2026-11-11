@@ -1497,6 +1497,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Captured while the receipt sits at `current`: the
             // re-offer key if a capacity arm below refuses.
             let reoffer_key = (receipt.image(), receipt.endpoint().file_slot);
+            // A validated healthy duplicate resolves before any per-key
+            // witness allocation: AlreadySelected stays final with no
+            // deferral, no re-offer and no eviction. All other keys —
+            // pristine upgrades, drained S1Only rows, genuine pressure —
+            // keep the witness-first order below.
+            if registrations.peek_healthy_duplicate(input, &batch.registrations) {
+                association[first].refusal = Some((
+                    caller,
+                    BirthRefusal::Registration(
+                        crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal::AlreadySelected,
+                    ),
+                ));
+                continue;
+            }
             let Ok(mut slot) = births.reserve_for_current(&reserve, receipt) else {
                 association[first].refusal = Some((caller, BirthRefusal::Resource));
                 association[first].deferred = Some(reoffer_key);

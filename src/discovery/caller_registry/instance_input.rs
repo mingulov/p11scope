@@ -178,11 +178,14 @@ pub(crate) struct JointRegistrationPlan<'a> {
 }
 
 impl JointRegistrationPlan<'_> {
-    fn position(
-        &mut self,
+    /// Validated staging position plus its fits bit: subject, window,
+    /// key, caller and original guards only. Read-only; the duplicate
+    /// verdict and the fits gate below decide on this position.
+    fn validated_position(
+        &self,
         input: &AdmittedInstanceCall,
         window: &JointRegistrationWindow,
-    ) -> Result<usize, JointReceiptInstallRefusal> {
+    ) -> Result<(usize, bool), JointReceiptInstallRefusal> {
         if self.staged_len != self.registry.staged.len()
             || self.records != self.registry.instance_state.records.len()
             || self.limit != self.registry.instance_state.limit
@@ -216,14 +219,42 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
+        Ok((position, row.fits))
+    }
+
+    /// Whether this validated input names a healthy duplicate: the key
+    /// already holds an installed non-S1Only feed and can no longer
+    /// upgrade. Call only after `validated_position` succeeds.
+    fn is_healthy_duplicate(&self, input: &AdmittedInstanceCall) -> bool {
+        self.registry.held_feed_is_not_s1only(input)
+            && !self.registry.joint_upgrade_eligible(&input.key)
+    }
+
+    /// Read-only healthy-duplicate probe for the coordinator: true only
+    /// when the full validated guards pass and the key is a healthy
+    /// duplicate that `position` would name AlreadySelected. No latch,
+    /// no storage, no state change — the per-key path calls this before
+    /// any witness allocation so a duplicate never re-offers.
+    pub(crate) fn peek_healthy_duplicate(
+        &self,
+        input: &AdmittedInstanceCall,
+        window: &JointRegistrationWindow,
+    ) -> bool {
+        self.validated_position(input, window).is_ok() && self.is_healthy_duplicate(input)
+    }
+
+    fn position(
+        &mut self,
+        input: &AdmittedInstanceCall,
+        window: &JointRegistrationWindow,
+    ) -> Result<usize, JointReceiptInstallRefusal> {
+        let (position, fits) = self.validated_position(input, window)?;
         // A birth offer for a key already holding an installed
         // non-S1Only feed is a healthy duplicate: name it
         // AlreadySelected exactly, never as capacity — the
         // coordinator leaves it final, with no deferral, no
         // re-offer and no eviction of the healthy feed.
-        if self.registry.held_feed_is_not_s1only(input)
-            && !self.registry.joint_upgrade_eligible(&input.key)
-        {
+        if self.is_healthy_duplicate(input) {
             return Err(JointReceiptInstallRefusal::AlreadySelected);
         }
         // An untouched registered row holds its slot already: its
@@ -236,7 +267,7 @@ impl JointRegistrationPlan<'_> {
         // through it, a trip, a degraded feed) could never
         // consume the grant its late birth would reserve — its
         // birth defers for a bounded re-offer instead.
-        if !row.fits && !self.registry.joint_upgrade_eligible(&input.key) {
+        if !fits && !self.registry.joint_upgrade_eligible(&input.key) {
             // Latch genuine capacity walls only: a held row refuses
             // for drain state (it needs no slot), so it must not
             // occupy the first-arm diagnostic slot and mask a later

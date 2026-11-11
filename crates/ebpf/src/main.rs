@@ -128,7 +128,8 @@ use p11scope_ebpf_common::{
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
     FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
-    PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
+    PAUSE_REQUESTED, PRODUCED_CELLS, PRODUCED_DISCOVERY, PRODUCED_EVENTS, PauseKey, RING_BYTES,
+    RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
     START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, StartKey,
     StartState, StateKey, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
     TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, capture, classify_exec_task,
@@ -333,6 +334,12 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 
 #[map]
 static EVIDENCE: PerCpuArray<u64> = PerCpuArray::with_max_entries(EVIDENCE_CELLS, 0);
+
+/// Per-ring submitted records: the kernel half of the ring cross-check.
+/// Bumped on every successful ring submit, beside the reserve-failure
+/// counters, so a ring loss the failure counter missed is still found.
+#[map]
+static PRODUCED: PerCpuArray<u64> = PerCpuArray::with_max_entries(PRODUCED_CELLS, 0);
 
 #[cfg(feature = "inventory-only")]
 #[map]
@@ -724,6 +731,12 @@ fn bump_discovery_counter(index: u32) {
     }
 }
 
+fn bump_produced(index: u32) {
+    if let Some(value) = PRODUCED.get_ptr_mut(index) {
+        counter_add(value, 1);
+    }
+}
+
 /// One source-bounded reservation/initializer path for every private
 /// discovery record. The object checker proves that this always-inlined region
 /// becomes 115 aligned u64 zero stores before any field use or submit.
@@ -925,6 +938,7 @@ fn finish_discovery_record(
         );
     }
     entry.submit(0);
+    bump_produced(PRODUCED_DISCOVERY);
 }
 // PAUSE_WRITER_END
 
@@ -4701,6 +4715,7 @@ fn ordinary_return(
                 let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
             }
             e.submit(0);
+            bump_produced(PRODUCED_EVENTS);
             0
         }
         None => {
@@ -4848,7 +4863,13 @@ fn object_return_ordinary(
             // every byte of this 368-byte base while the reservation was
             // owned. Copy it before discard; the unfilled object tail is
             // never read, and the original failing stamps remain unchanged.
-            || EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok(),
+            || {
+                let ok = EVENTS.output::<EventRecord>(unsafe { &(*raw).base }, 0).is_ok();
+                if ok {
+                    bump_produced(PRODUCED_EVENTS);
+                }
+                ok
+            },
         );
         entry.discard(0);
         if outcome == RefusedBaseOutcome::OutputFailed {
@@ -4901,6 +4922,7 @@ fn object_return_ordinary(
         return 0;
     }
     entry.submit(0);
+    bump_produced(PRODUCED_EVENTS);
     0
 }
 
@@ -5130,6 +5152,7 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         return 0;
     }
     entry.submit(0);
+    bump_produced(PRODUCED_EVENTS);
     0
 }
 
@@ -5191,6 +5214,7 @@ pub unsafe extern "C" fn p11_link_emit_fork(
                 continuity: InstanceContinuity::default(),
             });
             event.submit(0);
+            bump_produced(PRODUCED_EVENTS);
         }
         None => bump_evidence(EVIDENCE_RING_LOSS),
     }

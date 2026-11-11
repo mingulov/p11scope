@@ -643,7 +643,8 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
         self.discarded_consumed = self.discarded_consumed.saturating_add(delta);
     }
 
-    #[cfg(test)]
+    /// Queue entries that left the ring but no poll popped yet. The
+    /// ring-exit total adds these to the polled count.
     pub(crate) fn staged_len(&self) -> usize {
         self.fifo.len()
     }
@@ -814,7 +815,7 @@ impl<S: BoundedRecordSource> EventDrain<StagedEvents<S>> {
     /// ring-exit total for the cross-check. Staging moves the ring cursor
     /// without polling, so `consumed` alone would lag by the queue.
     pub(crate) fn ring_exited(&self) -> u64 {
-        self.consumed
+        self.consumed()
             .saturating_add(u64::try_from(self.source.staged_len()).unwrap_or(u64::MAX))
     }
 }
@@ -1011,6 +1012,7 @@ impl<S: RecordSource> EventDrain<S> {
             for _ in 0..quantum {
                 let progress = match self.source.bounded_record(p.producer)? {
                     BoundedRecord::Item(item) => {
+                        self.consumed = self.consumed.saturating_add(1);
                         match decode_transport_record(&item, self.object_transport.as_deref())
                             .map(|record| record.event)
                         {
@@ -1347,6 +1349,7 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
+            self.consumed = self.consumed.saturating_add(1);
             match decode_transport_record(&item, self.object_transport.as_deref())
                 .map(|record| record.event)
             {
@@ -1388,6 +1391,7 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
+            self.consumed = self.consumed.saturating_add(1);
             match decode_transport_record(&item, self.object_transport.as_deref()) {
                 Some(record) => {
                     if let Some(tap) = &self.trace_tap {
@@ -1430,6 +1434,7 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
+            self.consumed = self.consumed.saturating_add(1);
             match decode_object_record(&item, descriptors) {
                 Some(record) => {
                     if let Some(tap) = &self.trace_tap {
@@ -1500,6 +1505,7 @@ impl<S: RecordSource> EventDrain<S> {
                 *left -= 1;
             }
             attempted = attempted.saturating_add(1);
+            self.consumed = self.consumed.saturating_add(1);
             let delivered = match item.len() {
                 JOURNAL_BEGIN_BYTES
                 | JOURNAL_END_FULL_BYTES
@@ -1645,6 +1651,7 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                drain.consumed = drain.consumed.saturating_add(1);
                 match event {
                     Some(event) => {
                         if let Some(tap) = &drain.trace_tap {
@@ -1725,6 +1732,7 @@ pub(crate) fn poll_records_to_position<S: BoundedRecordSource>(
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                drain.consumed = drain.consumed.saturating_add(1);
                 match record {
                     Some(record) => {
                         if let Some(tap) = &drain.trace_tap {
@@ -1797,6 +1805,7 @@ pub(crate) fn poll_object_records_to_position<S: BoundedRecordSource>(
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                drain.consumed = drain.consumed.saturating_add(1);
                 match record {
                     Some(record) => {
                         if let Some(tap) = &drain.trace_tap {
@@ -1897,6 +1906,7 @@ pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                drain.consumed = drain.consumed.saturating_add(1);
                 match delivered {
                     Delivered::Ordinary(record) => {
                         if let Some(tap) = &drain.trace_tap {
@@ -2302,6 +2312,9 @@ impl<S: RecordSource> DiscoveryDrain<S> {
                 Some(record) => DiscoveryItem::Record(record),
                 None => DiscoveryItem::Malformed,
             });
+        if decoded.is_some() {
+            self.consumed = self.consumed.saturating_add(1);
+        }
         let empty_positions = if decoded.is_none()
             && (self.pid_lifecycle_tap.is_some() || self.trace_tap.is_some())
         {
@@ -2407,6 +2420,7 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                drain.consumed = drain.consumed.saturating_add(1);
                 if let Some(tap) = &drain.trace_tap {
                     match &item {
                         DiscoveryItem::Record(record) => tap.observe_discovery(record),

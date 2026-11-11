@@ -5323,6 +5323,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             .is_some(),
         context.session.lifecycle_tracking_unavailable().is_some(),
     );
+    note_session_ring_reading(&mut *context.engine, &*context.session);
     let mut ev = evidence_for(
         context.engine,
         context.engine.capture_facts(),
@@ -5748,6 +5749,7 @@ fn seal_owned_handoff_trace(context: &mut HandoffReportContext) -> Result<()> {
             .is_some(),
         context.session.lifecycle_tracking_unavailable().is_some(),
     );
+    note_session_ring_reading(&mut *context.engine, &*context.session);
     let mut ev = evidence_for(
         context.engine,
         context.engine.capture_facts(),
@@ -8149,6 +8151,17 @@ fn loop_end_discovery_loss(fresh: Result<u64>, cached: u64) -> u64 {
     fresh.map_or(cached, |fresh| fresh.max(cached))
 }
 
+/// Stashes the session's ring readings in the engine for the per-ring
+/// cross-check: kernel submitted totals plus userspace consumed totals
+/// and ring positions, read together so the triple is contemporaneous.
+/// Best effort like every diagnostic read: a failed produced read keeps
+/// the prior stash instead of zeroing it.
+fn note_session_ring_reading(engine: &mut Engine, session: &Session) {
+    if let Ok(produced) = session.produced_snapshot() {
+        engine.note_ring_reading(produced, session.ring_consumed(), session.ring_positions());
+    }
+}
+
 /// Staged DISCOVERY items as the terminal batch's leading records and its
 /// malformed count.
 fn split_staged_discovery(
@@ -9362,6 +9375,7 @@ fn capture_profile(
             scheduling.sync_engine_stages(engine);
             scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
             scheduling.sync_tail_stats(engine);
+            note_session_ring_reading(engine, session);
             let mut ev = evidence_for(
                 engine,
                 engine.capture_facts(),
@@ -9512,6 +9526,7 @@ fn capture_profile(
     } else {
         Some(0)
     };
+    note_session_ring_reading(engine, session);
     scheduling.note_loop_end(
         loop_event_loss.unwrap_or(0),
         loop_end_discovery_loss(
@@ -9536,8 +9551,17 @@ fn capture_profile(
     scheduling.sync_identity_health_result(metrics::kernel_control(session));
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
-    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
+    // Measured ring loss always warns too: produced/consumed/dropped are
+    // never silent.
+    let ring_accounts = engine.capture_facts().ring_readings().accounts();
+    if capture_diagnostics_on()
+        || scheduling.longrun_has_findings(loop_event_loss.is_some())
+        || ring_accounts.has_loss()
+    {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+        if let Some(line) = crate::ring_accounting::loop_end_line(&ring_accounts) {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
     // K0: snapshot the exec witness while the tap is still live.
     // Quiescence invalidates the PID lifecycle tap (and the later
@@ -10151,6 +10175,7 @@ fn capture_profile(
                 &mut owned.still_running,
             );
         }
+        note_session_ring_reading(context.0, &*context.1);
         let mut ev = evidence_for(
             context.0,
             context.0.capture_facts(),
@@ -11011,6 +11036,7 @@ fn capture_trace(
         Err(_) => render::LOOP_END_ERROR,
     };
     let loop_event_loss = metrics::lost_events(session).ok();
+    note_session_ring_reading(engine, session);
     scheduling.note_loop_end(
         loop_event_loss.unwrap_or(0),
         loop_end_discovery_loss(
@@ -11032,8 +11058,17 @@ fn capture_trace(
     scheduling.sync_identity_health_result(metrics::kernel_control(session));
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
-    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
+    // Measured ring loss always warns too: produced/consumed/dropped are
+    // never silent.
+    let ring_accounts = engine.capture_facts().ring_readings().accounts();
+    if capture_diagnostics_on()
+        || scheduling.longrun_has_findings(loop_event_loss.is_some())
+        || ring_accounts.has_loss()
+    {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+        if let Some(line) = crate::ring_accounting::loop_end_line(&ring_accounts) {
+            let _ = crate::sink::try_stderr_line(&line);
+        }
     }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
@@ -11492,6 +11527,7 @@ fn capture_trace(
                     }
                     // The frozen consumer map pins the single-line coordinator
                     // projections below; keep them byte-stable for the marker.
+                    note_session_ring_reading(context.0, &*context.1);
                     #[rustfmt::skip]
                     let mut evidence =
                         evidence_for(
@@ -13358,9 +13394,10 @@ pub(crate) fn evidence_for(
         // Run-only like the child flag beside it: `Some` exactly when an
         // owned context exists, carrying the measured survivor count.
         run_tree_handed_back: child_still_running.map(|_| engine.run_tree_handed_back()),
-        // RED stub: the accounting implementation computes this from the
-        // facts' ring readings.
-        ring_accounting: render::RingAccountingEvidence::unknown(),
+        ring_accounting: render::RingAccountingEvidence::from_readings(
+            &facts.ring_readings(),
+            kernel_evidence.ring_loss,
+        ),
         discovery_ring_loss,
         discovery_state_failures,
         discovery_read_failures,
@@ -29762,6 +29799,10 @@ int main(int argc, char **argv) {
     fn evidence_for_reports_each_rings_cross_check_across_all_renderers() {
         let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
         engine.note_ring_reading(
+            crate::attach::ProducedSnapshot {
+                discovery: 100,
+                events: 200,
+            },
             crate::ring_accounting::RingConsumed {
                 discovery: Some(90),
                 events: Some(180),
@@ -29772,6 +29813,11 @@ int main(int argc, char **argv) {
             },
         );
         let mut facts = engine.capture_facts();
+        assert_eq!(
+            facts.ring_readings().discovery.produced,
+            100,
+            "stashed discovery produced reaches the facts"
+        );
         assert_eq!(
             facts.ring_readings().discovery.consumed,
             Some(90),
@@ -29787,10 +29833,8 @@ int main(int argc, char **argv) {
             Some(0),
             "an empty events ring queues nothing"
         );
-        // The kernel produced/dropped totals ride the facts beside them.
-        facts.ring_readings.discovery.produced = 100;
+        // The kernel dropped totals ride the facts beside them.
         facts.ring_readings.discovery.dropped = 7;
-        facts.ring_readings.events.produced = 200;
         facts.ring_readings.events.dropped = 0;
         let state = semantics::State::new(engine.plan());
         let evidence = evidence_for(

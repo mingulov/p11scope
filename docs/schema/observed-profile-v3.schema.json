@@ -53,7 +53,8 @@
         "pause_confirmed", "pause_engine_incomplete_retirements", "pause_partial",
         "pause_unavailable", "pending_at_end",
         "process_tracking_evictions", "process_tracking_failures",
-        "process_tracking_fallbacks", "provider_changed", "rv_update_failures",
+        "process_tracking_fallbacks", "provider_changed", "ring_accounting",
+        "rv_update_failures",
         "scan_ms", "scan_unavailable", "scheduling",
         "semantic_capture_failures", "semantic_history_drops",
         "semantic_key_budget",
@@ -388,6 +389,14 @@
           "required": ["observer", "kernel_pids", "proc_pids"]
         },
         "provider_changed": {"type": "boolean"},
+        "ring_accounting": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "discovery": {"$ref": "#/$defs/ring_account"},
+            "events": {"$ref": "#/$defs/ring_account"}
+          }
+        },
         "run_tree_handed_back": {"type": "integer", "minimum": 0},
         "rv_update_failures": {"type": "integer", "minimum": 0},
         "scan_ms": {"type": "integer", "minimum": 0},
@@ -1187,6 +1196,19 @@
     }
   ],
   "$defs": {
+    "ring_account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["produced", "consumed", "dropped"],
+      "description": "One ring's cross-check account: kernel submitted (produced) and refused (dropped) totals against the userspace drained (consumed) total and the queued remainder. still_queued/unexplained are absent exactly when the remainder is structurally unknowable (a live EVENTS ring).",
+      "properties": {
+        "produced": {"type": "integer", "minimum": 0},
+        "consumed": {"type": "integer", "minimum": 0},
+        "dropped": {"type": "integer", "minimum": 0},
+        "still_queued": {"type": "integer", "minimum": 0},
+        "unexplained": {"type": "integer", "minimum": 0}
+      }
+    },
     "resource_sample": {
       "type": "object",
       "additionalProperties": false,

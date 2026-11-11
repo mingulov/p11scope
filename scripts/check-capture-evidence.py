@@ -336,6 +336,14 @@ SNAPSHOT_FAILURES = COUNTER_COLLECTION_FAILURES | {
 # The additive per-bank gap object inside `counter_collection`: counts and
 # finite flags only. Present only when the acquisition was partial.
 BANK_GAPS_KEYS = {"failed_slots", "health_failed", "kernel_failed"}
+# Per-ring cross-check accounts (schema v3 `ring_accounting`): each
+# present ring carries produced/consumed/dropped, with still_queued and
+# unexplained exactly when the queued remainder is measurable. A ring is
+# absent when it has no counters in the build or mode (unknown, never
+# zero); an empty object is the unknown account both rings share.
+RING_ACCOUNT_REQUIRED = {"produced", "consumed", "dropped"}
+RING_ACCOUNT_OPTIONAL = {"still_queued", "unexplained"}
+RING_ACCOUNTING_RINGS = {"discovery", "events"}
 # The additive legacy gap object beside `counter_collection`: counts and
 # finite cell names only. Present only when the legacy read was partial.
 LEGACY_COLLECTION_KEYS = {"unread_stats", "rv_failed", "unknown_evidence"}
@@ -490,6 +498,7 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "pause_engine_incomplete_retirements",
     "loader_discovery", "templates_truncated", "provider_changed",
     "scheduling",
+    "ring_accounting",
     "completeness",
     *RESIDUAL_EVIDENCE_KEYS,
     # Informational, not a COUNTER: spilling heuristic lookalikes past the
@@ -1010,6 +1019,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     exact_scheduling_evidence(evidence)
     exact_kernel_control(evidence)
     exact_task_uprobe_link_losses(evidence)
+    exact_ring_accounting(evidence["ring_accounting"])
     exact_terminal_verdict(evidence)
     missing = PROFILE_V3_FIELDS - set(evidence)
     require(not missing, f"missing profile-v3 evidence: {sorted(missing)}")
@@ -1189,6 +1199,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.discard("kernel_control")
         wanted.discard("attach_backend")
         wanted.discard("object_capture")
+        wanted.discard("ring_accounting")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -1323,6 +1334,49 @@ def slot_stats_cost_bytes(slots, possible_cpus):
         + SLOT_SIZING_RV_ENTRIES * SLOT_SIZING_RV_KEY_BYTES
         + SLOT_SIZING_RV_ENTRIES * SLOT_SIZING_RV_VALUE_BYTES * possible_cpus
     )
+
+
+def ring_unexplained(evidence, ring):
+    """One ring's measured unexplained remainder, or 0 when the ring has
+    no account or the remainder is unmeasured. Mirrors
+    `render::ring_unexplained`: unknown is unknown, never a gap."""
+    accounting = evidence.get("ring_accounting") or {}
+    account = accounting.get(ring) or {}
+    unexplained = account.get("unexplained")
+    return unexplained if isinstance(unexplained, int) and unexplained > 0 else 0
+
+
+def exact_ring_accounting(accounting):
+    """Closed per-ring cross-check shape plus the producer's counter
+    relationship (`unexplained = produced - consumed - still_queued`
+    whenever the remainder is measured): a remainder that does not match
+    its own inputs is a misattribution, not evidence."""
+    require(
+        isinstance(accounting, dict) and set(accounting) <= RING_ACCOUNTING_RINGS,
+        f"ring_accounting key set: {accounting!r}",
+    )
+    for ring in sorted(accounting):
+        account = accounting[ring]
+        label = f"ring_accounting.{ring}"
+        require(
+            isinstance(account, dict)
+            and RING_ACCOUNT_REQUIRED <= set(account)
+            and set(account) <= RING_ACCOUNT_REQUIRED | RING_ACCOUNT_OPTIONAL,
+            f"{label} key set: {account!r}",
+        )
+        for key in RING_ACCOUNT_REQUIRED | RING_ACCOUNT_OPTIONAL:
+            if key in account:
+                uint(account[key], U64_MAX, f"{label}.{key}")
+        if "still_queued" in account or "unexplained" in account:
+            require(
+                "still_queued" in account and "unexplained" in account,
+                f"{label} carries a half remainder: {account!r}",
+            )
+            require(
+                account["unexplained"]
+                == max(0, account["produced"] - account["consumed"] - account["still_queued"]),
+                f"{label} unexplained disagrees with its inputs: {account!r}",
+            )
 
 
 def exact_slot_sizing(sizing):
@@ -1827,6 +1881,7 @@ def exact_metrics_schema(document, *, run=False):
     exact_scheduling_evidence(document["evidence"])
     exact_kernel_control(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
+    exact_ring_accounting(document["evidence"]["ring_accounting"])
     exact_terminal_verdict(document["evidence"])
 
 
@@ -2173,6 +2228,8 @@ def expected_gap_classes(evidence):
             ("proc_namespace_mismatch", evidence["pid_namespace"].get("proc_pids") != "observer"),
             ("unprotected_live_windows", evidence["unprotected_live_windows"] > 0),
             ("discovery_ring_loss", evidence["discovery_ring_loss"] > 0),
+            ("discovery_ring_unexplained", ring_unexplained(evidence, "discovery") > 0),
+            ("events_ring_unexplained", ring_unexplained(evidence, "events") > 0),
             ("discovery_state_failures", evidence["discovery_state_failures"] > 0),
             ("discovery_read_failures", evidence["discovery_read_failures"] > 0),
             ("discovery_truncated", evidence["discovery_truncated"] > 0),
@@ -4573,6 +4630,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "semantic_key_budget": SEMANTIC_KEY_BUDGET,
         "templates_truncated": False,
         "provider_changed": False,
+        "ring_accounting": {},
         "scheduling": scheduling_fixture(),
         "kernel_control": kernel_control_fixture(),
         "completeness": "PARTIAL",
@@ -4623,6 +4681,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         if schema == HISTORICAL_METRICS_SCHEMA:
             evidence.pop("attach_backend", None)
             evidence.pop("object_capture", None)
+            evidence.pop("ring_accounting", None)
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
@@ -4756,8 +4815,13 @@ def self_test():
     lookalike["evidence"]["slot_sizing_note"] = "trimmed"
     rejected(lambda: validate_clean_metrics(lookalike, {"C_Initialize": 1}))
     print("slot_sizing rides the metrics lane unchanged and pins its shape: OK")
+    # Retained v2-metrics documents predate the ring cross-check: the
+    # historical fixture carries no `ring_accounting` key, and one added
+    # back is refused like any other newer base key.
+    historical_evidence = copy.deepcopy(clean_evidence)
+    historical_evidence.pop("ring_accounting", None)
     historical = document_fixture(
-        clean_evidence,
+        historical_evidence,
         schema=HISTORICAL_METRICS_SCHEMA,
         mode="metrics",
         privacy="aggregate-only",
@@ -4769,7 +4833,45 @@ def self_test():
         sized["evidence"]["slot_sizing"]
     )
     rejected(lambda: exact_historical_metrics_schema(retired_sizing))
+    retired_accounting = copy.deepcopy(historical)
+    retired_accounting["evidence"]["ring_accounting"] = {}
+    rejected(lambda: exact_historical_metrics_schema(retired_accounting))
     print("historical v2-metrics fixture remains closed and non-emitted: OK")
+    # Per-ring cross-check accounts: the unknown account ({}), a measured
+    # ring, and a live ring with unmeasured remainders are accepted; a
+    # foreign ring, a missing counter, a half remainder, a remainder that
+    # disagrees with its inputs, and a non-u64 counter are refused.
+    exact_ring_accounting({})
+    exact_ring_accounting(
+        {
+            "discovery": {
+                "produced": 100,
+                "consumed": 90,
+                "dropped": 7,
+                "still_queued": 3,
+                "unexplained": 7,
+            },
+            "events": {"produced": 200, "consumed": 180, "dropped": 0},
+        }
+    )
+    good = {
+        "produced": 100,
+        "consumed": 90,
+        "dropped": 7,
+        "still_queued": 3,
+        "unexplained": 7,
+    }
+    for bad in (
+        {"journal": dict(good)},
+        {"discovery": {k: v for k, v in good.items() if k != "dropped"}},
+        {"discovery": {**good, "extra": 1}},
+        {"discovery": {k: v for k, v in good.items() if k != "still_queued"}},
+        {"discovery": {**good, "unexplained": 8}},
+        {"discovery": {**good, "produced": -1}},
+        {"discovery": {**good, "consumed": True}},
+    ):
+        rejected(lambda bad=bad: exact_ring_accounting(bad))
+    print("ring_accounting pins its closed shape and remainder identity: OK")
     halted = copy.deepcopy(clean)
     halted["evidence"]["kernel_control"].update(
         capture_halted=True, owner_poison=["refund_failed"])

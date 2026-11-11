@@ -12824,6 +12824,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         snapshot_failure: None,
         child_still_running: None,
         run_tree_handed_back: None,
+        ring_accounting: p11scope::render::RingAccountingEvidence::unknown(),
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
         discovery_read_failures: 0,

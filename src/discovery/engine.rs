@@ -11,9 +11,9 @@ use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as Di
 use crate::attach::{
     BackendSelection, CapturePolicy, CollectedFinishQ, CollectedRetirementState,
     CollectedRetirementTicket, CounterSnapshot, DeferralProgress, DetachOutcome,
-    DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome,
-    RetainedInputMeasure, RetainedRetirementInput, RetirementPoll, RetirementProgress,
-    RetirementTicket, Scope, Session,
+    DynamicExportIdentity, DynamicLoaderAttachFailure, OwnedPauseGeneration, ProducedSnapshot,
+    ReplacementOutcome, RetainedInputMeasure, RetainedRetirementInput, RetirementPoll,
+    RetirementProgress, RetirementTicket, Scope, Session,
 };
 use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
@@ -640,6 +640,9 @@ pub struct Engine {
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
     counter_snapshot: CounterSnapshot,
+    /// Per-ring submitted totals from the `PRODUCED` map, stashed beside
+    /// the userspace readings: the kernel half of the ring cross-check.
+    produced: ProducedSnapshot,
     /// Userspace ring readings stashed by the capture loop from the
     /// session's drains (consumed totals, ring positions) for the
     /// per-ring cross-check. Unknown until the first note.
@@ -11411,6 +11414,7 @@ impl Engine {
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
             counter_snapshot: CounterSnapshot::default(),
+            produced: ProducedSnapshot::default(),
             ring_consumed: crate::ring_accounting::RingConsumed::default(),
             ring_positions: crate::ring_accounting::RingPositions::default(),
             malformed_discovery: 0,
@@ -12518,15 +12522,19 @@ impl Engine {
     /// the plan's current active set and can shrink or reach zero while the
     /// rest of this snapshot stays exactly what the capture accepted (see
     /// `AttachPlan::active_slot_count`).
-    /// Stashes the session's ring readings (consumed totals, ring
-    /// positions) for the per-ring cross-check. The capture loop calls
-    /// this from the live drains before it reads [`Self::capture_facts`];
-    /// until the first note every reading is unknown.
-    pub fn note_ring_reading(
+    /// Stashes the session's ring readings (kernel submitted totals,
+    /// userspace consumed totals, ring positions) for the per-ring
+    /// cross-check. The capture loop calls this from the live drains
+    /// before it reads [`Self::capture_facts`]; until the first note
+    /// every reading is unknown. Produced totals replace monotonically:
+    /// a regressing read keeps the prior snapshot, like the counters.
+    pub(crate) fn note_ring_reading(
         &mut self,
+        produced: ProducedSnapshot,
         consumed: crate::ring_accounting::RingConsumed,
         positions: crate::ring_accounting::RingPositions,
     ) {
+        self.produced.replace_with(produced);
         self.ring_consumed = consumed;
         self.ring_positions = positions;
     }
@@ -12580,9 +12588,30 @@ impl Engine {
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
-            // RED stub: the accounting implementation builds this from
-            // the counter snapshot and the stashed ring readings.
-            ring_readings: crate::ring_accounting::RingReadings::default(),
+            ring_readings: crate::ring_accounting::RingReadings {
+                discovery: crate::ring_accounting::RingReading {
+                    produced: self.produced.discovery,
+                    consumed: self.ring_consumed.discovery,
+                    dropped: self.counter_snapshot.ring_loss,
+                    queued: self.ring_positions.discovery.and_then(|positions| {
+                        crate::ring_accounting::queued_records(
+                            positions,
+                            Some(crate::ring_accounting::DISCOVERY_RING_RECORD_BYTES),
+                        )
+                    }),
+                },
+                events: crate::ring_accounting::RingReading {
+                    produced: self.produced.events,
+                    consumed: self.ring_consumed.events,
+                    // The EVENTS reserve-failure total lives in kernel
+                    // evidence, which the report merges (see
+                    // `evidence_for`); the engine never sees it.
+                    dropped: 0,
+                    queued: self.ring_positions.events.and_then(|positions| {
+                        crate::ring_accounting::queued_records(positions, None)
+                    }),
+                },
+            },
             task_uprobe_link_losses: self.task_uprobe_link_losses,
             discovery_truncated,
             // The exit-ended subset of the truncation total above: K0

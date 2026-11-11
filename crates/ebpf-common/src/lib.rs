@@ -601,6 +601,15 @@ pub const DISCOVERY_COUNTER_LOADER_HITS: u32 = 3;
 pub const DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES: u32 = 4;
 pub const DISCOVERY_COUNTER_CELLS: u32 = 5;
 
+/// Per-ring submitted records, in their own `PRODUCED` per-CPU map — the
+/// kernel half of the ring cross-check, incremented on every successful
+/// ring submit. Deliberately not a cell of `COUNTERS`/`EVIDENCE`: those
+/// maps are failure evidence with all-zero-healthy checks, and a success
+/// counter there would break every one of them.
+pub const PRODUCED_DISCOVERY: u32 = 0;
+pub const PRODUCED_EVENTS: u32 = 1;
+pub const PRODUCED_CELLS: u32 = 2;
+
 pub const PAUSE_ARMED: u64 = 1;
 pub const PAUSE_REQUESTED: u64 = 2;
 pub const COALESCED_NO_HELPER_RC: i64 = i64::MIN;
@@ -2326,8 +2335,7 @@ mod tests {
         for (position, index) in indices.iter().enumerate() {
             assert_eq!(*index as usize, position);
         }
-        // RED: the submitted counter (cell 9) lands with the accounting.
-        assert_eq!(EVIDENCE_CELLS, indices.len() as u32 + 1);
+        assert_eq!(EVIDENCE_CELLS, indices.len() as u32);
     }
 
     #[test]
@@ -3195,8 +3203,10 @@ mod tests {
         assert_eq!(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, 2);
         assert_eq!(DISCOVERY_COUNTER_LOADER_HITS, 3);
         assert_eq!(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, 4);
-        // RED: the submitted counter (cell 5) lands with the accounting.
-        assert_eq!(DISCOVERY_COUNTER_CELLS, 6);
+        assert_eq!(DISCOVERY_COUNTER_CELLS, 5);
+        assert_eq!(PRODUCED_DISCOVERY, 0);
+        assert_eq!(PRODUCED_EVENTS, 1);
+        assert_eq!(PRODUCED_CELLS, 2);
     }
 
     fn discovery_record(kind: u8) -> DiscoveryRecord {

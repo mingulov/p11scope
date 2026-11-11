@@ -89,6 +89,23 @@ whenever this object is present. Like `counter_collection`, it adds
 with `verdict_detail: "concrete_gap"`. This is a v3-additive disclosure
 that introduces no new schema revision.
 
+Every new v3 evidence carries a required `ring_accounting` object with
+the per-ring cross-check accounts (`discovery`, `events`; a ring is
+absent when it has no counters in the build or mode, which is unknown,
+never zero; documents written before this disclosure predate the key
+like any newer base key).
+Each present ring carries `produced` (kernel submitted
+records), `consumed` (userspace drained records), `dropped` (kernel
+reserve failures), and, when the queued remainder is measurable,
+`still_queued` and `unexplained = produced - consumed - still_queued`.
+A live EVENTS ring omits both remainders (mixed record sizes make the
+remainder unknowable until the terminal drain verifies the ring empty);
+the terminal account is always exact. A measured nonzero `unexplained`
+adds `discovery_ring_unexplained` or `events_ring_unexplained` to the
+observation gap causes and requires `PARTIAL`: loss the reserve-failure
+counter never saw is a named gap, never zero loss. This is a
+v3-additive disclosure that introduces no new schema revision.
+
 When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),
 the terminal evidence also contains an optional additive `selected_detail`
 envelope. Captures without the flag omit it. Its keys are `selection` (the

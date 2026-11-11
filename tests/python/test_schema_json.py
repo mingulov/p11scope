@@ -937,6 +937,23 @@ class SchemaOracleAgreement(unittest.TestCase):
         with self.assertRaises(AssertionError):
             CHECKER["exact_historical_metrics_schema"](historical)
 
+    def test_current_metrics_requires_ring_accounting_but_historical_shape_excludes_it(self):
+        current = self.metrics_document()
+        self.assertEqual(current["evidence"].get("ring_accounting"), {})
+        CHECKER["exact_metrics_schema"](current)
+        missing = copy.deepcopy(current)
+        missing["evidence"].pop("ring_accounting")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn("ring_accounting", historical["evidence"])
+        CHECKER["exact_historical_metrics_schema"](historical)
+        historical["evidence"]["ring_accounting"] = {}
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
     def test_metrics_backend_shape_and_scope_twins(self):
         document = self.metrics_document()
         document["evidence"]["attach_backend"] = {

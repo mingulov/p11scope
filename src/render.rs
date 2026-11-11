@@ -394,7 +394,7 @@ impl CaptureFacts {
     }
 
     /// Raw per-ring cross-check inputs for the report's accounts.
-    pub fn ring_readings(&self) -> crate::ring_accounting::RingReadings {
+    pub(crate) fn ring_readings(&self) -> crate::ring_accounting::RingReadings {
         self.ring_readings
     }
 
@@ -1135,6 +1135,30 @@ impl RingAccountingEvidence {
         Self {
             discovery: None,
             events: None,
+        }
+    }
+
+    /// Computes both rings' accounts from the facts' raw readings. The
+    /// EVENTS reserve-failure total rides kernel evidence (the engine
+    /// never sees that map), so the caller merges it here; every other
+    /// input comes from the facts.
+    pub(crate) fn from_readings(
+        readings: &crate::ring_accounting::RingReadings,
+        events_dropped: u64,
+    ) -> Self {
+        let mut readings = *readings;
+        readings.events.dropped = events_dropped;
+        let accounts = readings.accounts();
+        let convert = |account: crate::ring_accounting::RingAccount| RingAccountEvidence {
+            produced: account.produced,
+            consumed: account.consumed,
+            dropped: account.dropped,
+            still_queued: account.still_queued,
+            unexplained: account.unexplained,
+        };
+        Self {
+            discovery: accounts.discovery.map(convert),
+            events: accounts.events.map(convert),
         }
     }
 }
@@ -2208,6 +2232,16 @@ impl Evidence {
             self.unprotected_live_windows > 0,
         );
         cause(o, "discovery_ring_loss", self.discovery_ring_loss > 0);
+        cause(
+            o,
+            "discovery_ring_unexplained",
+            ring_unexplained(&self.ring_accounting.discovery) > 0,
+        );
+        cause(
+            o,
+            "events_ring_unexplained",
+            ring_unexplained(&self.ring_accounting.events) > 0,
+        );
         cause(
             o,
             "discovery_state_failures",
@@ -3937,6 +3971,17 @@ fn identity_refusal_fragment(control: &crate::metrics::KernelControlEvidence) ->
     })
 }
 
+/// One ring's measured unexplained remainder: records the kernel
+/// submitted that userspace neither consumed nor finds queued. Zero
+/// when the ring has no account or the remainder is unmeasured: an
+/// unknown remainder is unknown, never a gap.
+fn ring_unexplained(account: &Option<RingAccountEvidence>) -> u64 {
+    account
+        .as_ref()
+        .and_then(|account| account.unexplained)
+        .unwrap_or(0)
+}
+
 /// One human fragment per verdict cause, stating the count behind it.
 /// Concise text is plain words only; verbose pairs the machine cause
 /// name beside each plain fragment. A cause without a phrase folds
@@ -4164,6 +4209,16 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 ev.discovery_truncated,
                 "discovery record truncated",
                 "discovery records truncated",
+            ),
+            "discovery_ring_unexplained" => count(
+                ring_unexplained(&ev.ring_accounting.discovery),
+                "submitted discovery record unaccounted for",
+                "submitted discovery records unaccounted for",
+            ),
+            "events_ring_unexplained" => count(
+                ring_unexplained(&ev.ring_accounting.events),
+                "submitted call record unaccounted for",
+                "submitted call records unaccounted for",
             ),
             "task_uprobe_link_losses" => count(
                 ev.task_uprobe_link_losses,

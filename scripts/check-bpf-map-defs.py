@@ -2252,6 +2252,10 @@ _DETAILED_BASE_MAPS = {
         # rates. Tracks ebpf-common RING_BYTES; change both together.
         "EVENTS": (27, 0, 0, 33_554_432),
         "EVIDENCE": (6, 4, 8, 9),
+        # Per-ring submitted records (ebpf-common PRODUCED_CELLS): the
+        # kernel half of the ring cross-check, beside the failure
+        # counters. Tracks the constant; change both together.
+        "PRODUCED": (6, 4, 8, 2),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
         "PAUSE_PIDS": (1, 16, 8, 1),
         "PID_FILTER": (1, 4, 8, 1_024, 128),
@@ -2394,7 +2398,7 @@ JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
 
 INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "STACK_GUARD", "EVIDENCE",
-    "COUNTERS", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
+    "COUNTERS", "PRODUCED", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
 )} | {
     # Inventory-only objects carry no journal words: 544 B, not 560 B.
     "THREAD_OWNER": map_def(29, 4, 544, 0, 1),
@@ -2578,6 +2582,8 @@ def self_test():
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
+    assert SAFE_MAPS["PRODUCED"] == map_def(6, 4, 8, 2)
+    assert INVENTORY_MAPS["PRODUCED"] == SAFE_MAPS["PRODUCED"]
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
     assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
@@ -2601,19 +2607,19 @@ def self_test():
     assert JOURNAL_MAPS["JOURNAL_CTL"] == map_def(2, 4, 24, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_CLASSES"] == map_def(2, 4, 4, 105, 128)
-    assert len(SAFE_MAPS) == 44
-    assert len(UNSAFE_MAPS) == 44
-    assert len(WIDE_MAPS) == 42
-    assert len(WIDE_MARKER_MAPS) == 44
+    assert len(SAFE_MAPS) == 45
+    assert len(UNSAFE_MAPS) == 45
+    assert len(WIDE_MAPS) == 43
+    assert len(WIDE_MARKER_MAPS) == 45
     assert WIDE_MARKER_MAPS["JOURNAL_MARKER_CTL"] == SAFE_MAPS["JOURNAL_MARKER_CTL"]
-    assert len(WIDE_UNSAFE_MAPS) == 44
-    assert len(JOURNAL_MAPS) == 47
+    assert len(WIDE_UNSAFE_MAPS) == 45
+    assert len(JOURNAL_MAPS) == 48
     assert JOURNAL_WIDE_MAPS["STATS"] == map_def(6, 4, 296, 2_112)
     assert JOURNAL_WIDE_MAPS["RV_COUNTS"] == map_def(5, 16, 8, 8_192)
     assert JOURNAL_WIDE_MAPS["SLOT_FILE"] == map_def(2, 4, 4, 2_112, 128)
     assert JOURNAL_WIDE_MAPS["JOURNAL_MARKER_CTL"] == JOURNAL_MAPS["JOURNAL_MARKER_CTL"]
     assert JOURNAL_WIDE_MAPS["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
-    assert len(JOURNAL_WIDE_MAPS) == 47
+    assert len(JOURNAL_WIDE_MAPS) == 48
     assert len(SAFE_PROGRAMS) == 22
     assert len(UNSAFE_PROGRAMS) == 27
     assert len(JOURNAL_PROGRAMS) == 22

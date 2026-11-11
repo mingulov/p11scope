@@ -363,7 +363,13 @@ pub(super) mod program {
             let outcome = preserve_refused_base(
                 || remove(&key, true, JOURNAL_REASON_IDENTITY_REFUSED) == 0,
                 || unsafe { p11_object_fault() },
-                || EVENTS.output::<EventRecord>(unsafe { &*raw }, 0).is_ok(),
+                || {
+                    let ok = EVENTS.output::<EventRecord>(unsafe { &*raw }, 0).is_ok();
+                    if ok {
+                        bump_produced(PRODUCED_EVENTS);
+                    }
+                    ok
+                },
             );
             entry.discard(0);
             if outcome == RefusedBaseOutcome::OutputFailed {
@@ -393,6 +399,7 @@ pub(super) mod program {
             return 0;
         }
         entry.submit(0);
+        bump_produced(PRODUCED_EVENTS);
         0
     }
 }

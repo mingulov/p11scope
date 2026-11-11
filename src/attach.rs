@@ -27,9 +27,10 @@ use p11scope_ebpf_common::{
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
     IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
-    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE,
-    RootAffiliationControl, SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT, ThreadOwnerControl, attach_cookie,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PRODUCED_DISCOVERY, PRODUCED_EVENTS,
+    PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
+    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
+    ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2832,12 +2833,6 @@ pub(crate) struct CounterSnapshot {
     pub(crate) loader_hits: u64,
     pub(crate) loader_state_read_failures: u64,
     pub(crate) abi_refusals: u64,
-    /// DISCOVERY records the kernel submitted: the produced half of the
-    /// discovery cross-check (COUNTERS cell 5).
-    pub(crate) discovery_submitted: u64,
-    /// EVENTS records the kernel submitted: the produced half of the
-    /// events cross-check (EVIDENCE cell 9).
-    pub(crate) events_submitted: u64,
 }
 
 impl CounterSnapshot {
@@ -2847,9 +2842,7 @@ impl CounterSnapshot {
             && next.export_bounded_read_failures >= self.export_bounded_read_failures
             && next.loader_hits >= self.loader_hits
             && next.loader_state_read_failures >= self.loader_state_read_failures
-            && next.abi_refusals >= self.abi_refusals
-            && next.discovery_submitted >= self.discovery_submitted
-            && next.events_submitted >= self.events_submitted;
+            && next.abi_refusals >= self.abi_refusals;
         if nondecreasing {
             *self = next;
         }
@@ -2860,7 +2853,6 @@ impl CounterSnapshot {
 fn counter_snapshot_with(
     mut read: impl FnMut(u32) -> Result<u64>,
     abi_refusals: u64,
-    _events_submitted: u64,
 ) -> Result<CounterSnapshot> {
     Ok(CounterSnapshot {
         ring_loss: read(DISCOVERY_COUNTER_RING_LOSS)?,
@@ -2869,11 +2861,32 @@ fn counter_snapshot_with(
         loader_hits: read(DISCOVERY_COUNTER_LOADER_HITS)?,
         loader_state_read_failures: read(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES)?,
         abi_refusals,
-        // RED stubs: the produced cells are wired by the accounting
-        // implementation; until then the snapshot reports zero and the
-        // cross-check tests below fail on the scripted values.
-        discovery_submitted: 0,
-        events_submitted: 0,
+    })
+}
+
+/// Per-ring submitted totals from the `PRODUCED` map: the kernel half of
+/// the ring cross-check. A separate snapshot from [`CounterSnapshot`],
+/// whose failure-evidence cells keep their all-zero-healthy checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProducedSnapshot {
+    pub(crate) discovery: u64,
+    pub(crate) events: u64,
+}
+
+impl ProducedSnapshot {
+    pub(crate) fn replace_with(&mut self, next: Self) -> bool {
+        let nondecreasing = next.discovery >= self.discovery && next.events >= self.events;
+        if nondecreasing {
+            *self = next;
+        }
+        nondecreasing
+    }
+}
+
+fn produced_snapshot_with(mut read: impl FnMut(u32) -> Result<u64>) -> Result<ProducedSnapshot> {
+    Ok(ProducedSnapshot {
+        discovery: read(PRODUCED_DISCOVERY)?,
+        events: read(PRODUCED_EVENTS)?,
     })
 }
 
@@ -6717,6 +6730,14 @@ fn validate_runtime_maps(ebpf: &Ebpf, discovery_bytes: u32) -> Result<()> {
         8,
         p11scope_ebpf_common::DISCOVERY_COUNTER_CELLS,
     )?;
+    validate_runtime_map(
+        ebpf,
+        "PRODUCED",
+        MapType::PerCpuArray,
+        4,
+        8,
+        p11scope_ebpf_common::PRODUCED_CELLS,
+    )?;
     validate_runtime_map(ebpf, "PAUSE_PIDS", MapType::Hash, 16, 8, 1)
 }
 
@@ -8192,9 +8213,22 @@ impl Session {
             .iter()
             .copied()
             .fold(0u64, u64::saturating_add);
-        // RED stub: the EVENTS submitted cell is read by the accounting
-        // implementation.
-        counter_snapshot_with(read, abi_refusals, 0)
+        counter_snapshot_with(read, abi_refusals)
+    }
+
+    /// Per-ring submitted totals from the `PRODUCED` map: the kernel
+    /// half of the ring cross-check. Read beside [`Self::counter_snapshot`];
+    /// a missing or malformed map errors like every other control read.
+    pub(crate) fn produced_snapshot(&self) -> Result<ProducedSnapshot> {
+        let produced: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("PRODUCED").context("PRODUCED map")?)?;
+        produced_snapshot_with(|index| {
+            Ok(produced
+                .get(&index, 0)?
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
     }
 
     /// One gate-1 `Array` cell, when this build carries the gate and the
@@ -10741,6 +10775,39 @@ impl Session {
     /// Staged DISCOVERY items currently held in the session FIFO.
     pub(crate) fn staged_discovery_len(&self) -> usize {
         self.discovery_staged.len()
+    }
+
+    /// Userspace consumed totals per ring: what each retained drain took
+    /// off its ring. `None` per ring without a drain (never drained in
+    /// this session): unknown, never zero. Read-only: it never creates a
+    /// reader, so a second consumer can never desynchronize the cursor.
+    pub(crate) fn ring_consumed(&self) -> crate::ring_accounting::RingConsumed {
+        crate::ring_accounting::RingConsumed {
+            discovery: self
+                .discovery_consumer
+                .as_ref()
+                .map(|drain| drain.consumed()),
+            events: self
+                .events_consumer
+                .as_ref()
+                .map(|drain| drain.ring_exited()),
+        }
+    }
+
+    /// Live ring positions per ring (`producer`, `consumer` byte offsets)
+    /// from the retained drains. `None` per ring without a drain. Like
+    /// [`Self::ring_consumed`] this never creates a reader.
+    pub(crate) fn ring_positions(&self) -> crate::ring_accounting::RingPositions {
+        crate::ring_accounting::RingPositions {
+            discovery: self.discovery_consumer.as_ref().map(|drain| {
+                let positions = events::discovery_drain_positions(drain);
+                (positions.producer as u64, positions.consumer as u64)
+            }),
+            events: self.events_consumer.as_ref().map(|drain| {
+                let positions = events::event_drain_positions(drain);
+                (positions.producer as u64, positions.consumer as u64)
+            }),
+        }
     }
 
     /// The idle-wait descriptors against the shared discovery allowance:
@@ -19624,7 +19691,6 @@ mod tests {
                     .fold(0u64, u64::saturating_add))
             },
             2,
-            0,
         )
         .unwrap();
         assert_eq!(first.ring_loss, 3);
@@ -19646,7 +19712,6 @@ mod tests {
                     .fold(0u64, u64::saturating_add))
             },
             3,
-            0,
         )
         .unwrap();
         assert!(retained.replace_with(next));
@@ -19671,34 +19736,33 @@ mod tests {
         );
     }
 
-    /// RED twin: the snapshot carries each ring's produced total — the
-    /// kernel half of the cross-check — from its new counter cell, and a
+    /// The produced snapshot carries each ring's submitted total — the
+    /// kernel half of the cross-check — from its own map cells, and a
     /// regressing produced total fails closed like every other cell.
+    /// (The RED twin first placed these cells in `CounterSnapshot`; the
+    /// privileged all-zero-healthy checks proved that map must stay
+    /// failure-only, so the counters moved to their own map.)
     #[test]
-    fn counter_snapshot_carries_each_rings_produced_total() {
-        let cells: [&[u64]; 6] = [&[1], &[0], &[0], &[0], &[0], &[40, 2]];
-        let snapshot = counter_snapshot_with(
-            |index| {
-                Ok(cells[index as usize]
-                    .iter()
-                    .copied()
-                    .fold(0u64, u64::saturating_add))
-            },
-            0,
-            7,
-        )
+    fn produced_snapshot_carries_each_rings_submit_total() {
+        let cells: [&[u64]; 2] = [&[40, 2], &[7]];
+        let snapshot = produced_snapshot_with(|index| {
+            Ok(cells[index as usize]
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
         .unwrap();
-        assert_eq!(snapshot.discovery_submitted, 42);
-        assert_eq!(snapshot.events_submitted, 7);
+        assert_eq!(snapshot.discovery, 42);
+        assert_eq!(snapshot.events, 7);
 
-        let mut retained = CounterSnapshot::default();
+        let mut retained = ProducedSnapshot::default();
         assert!(retained.replace_with(snapshot));
-        assert!(!retained.replace_with(CounterSnapshot {
-            discovery_submitted: snapshot.discovery_submitted - 1,
+        assert!(!retained.replace_with(ProducedSnapshot {
+            discovery: snapshot.discovery - 1,
             ..snapshot
         }));
-        assert!(!retained.replace_with(CounterSnapshot {
-            events_submitted: snapshot.events_submitted - 1,
+        assert!(!retained.replace_with(ProducedSnapshot {
+            events: snapshot.events - 1,
             ..snapshot
         }));
         assert_eq!(retained, snapshot);

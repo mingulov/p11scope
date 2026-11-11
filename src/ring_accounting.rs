@@ -87,6 +87,51 @@ impl RingReadings {
     }
 }
 
+impl RingAccounting {
+    /// True when either ring measured a dropped or unexplained record:
+    /// known loss, never silence.
+    pub(crate) fn has_loss(&self) -> bool {
+        [self.discovery, self.events]
+            .into_iter()
+            .flatten()
+            .any(|account| account.dropped > 0 || account.unexplained.is_some_and(|left| left > 0))
+    }
+}
+
+/// One ring's loop-end fragment: `produced/consumed/dropped/queued/
+/// unexplained`, with `?` for structurally unknown remainders.
+fn ring_fragment(name: &str, account: Option<RingAccount>) -> String {
+    match account {
+        None => format!("{name}=?"),
+        Some(account) => format!(
+            "{name} produced={} consumed={} dropped={} queued={} unexplained={}",
+            account.produced,
+            account.consumed,
+            account.dropped,
+            account
+                .still_queued
+                .map_or_else(|| "?".to_string(), |queued| queued.to_string()),
+            account
+                .unexplained
+                .map_or_else(|| "?".to_string(), |left| left.to_string()),
+        ),
+    }
+}
+
+/// The loop-end stderr line for both rings' accounts: `None` when
+/// neither ring has counters (nothing drained), so modes without a
+/// ring stay silent instead of printing zeros.
+pub(crate) fn loop_end_line(accounts: &RingAccounting) -> Option<String> {
+    if accounts.discovery.is_none() && accounts.events.is_none() {
+        return None;
+    }
+    Some(format!(
+        "p11scope: rings: {}; {}",
+        ring_fragment("discovery", accounts.discovery),
+        ring_fragment("events", accounts.events),
+    ))
+}
+
 impl RingReading {
     fn account(&self) -> Option<RingAccount> {
         let consumed = self.consumed?;
@@ -140,16 +185,6 @@ pub(crate) fn queued_records(positions: (u64, u64), stride: Option<u64>) -> Opti
     stride.and_then(|bytes| unread.checked_div(bytes))
 }
 
-/// Queued DISCOVERY records at these ring positions: the unread bytes over
-/// the fixed per-record size (see [`queued_records`]).
-pub(crate) fn discovery_queued_records(positions: aya::maps::ring_buf::RingBufPositions) -> u64 {
-    queued_records(
-        (positions.producer as u64, positions.consumer as u64),
-        Some(DISCOVERY_RING_RECORD_BYTES),
-    )
-    .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,18 +226,14 @@ mod tests {
 
     #[test]
     fn queued_records_divide_unread_bytes_by_record_size() {
-        let positions = aya::maps::ring_buf::RingBufPositions {
-            producer: 928 * 3,
-            consumer: 928,
-            capacity: 2 * 1024 * 1024,
-        };
-        assert_eq!(discovery_queued_records(positions), 2);
-        let drained = aya::maps::ring_buf::RingBufPositions {
-            producer: 928 * 3,
-            consumer: 928 * 3,
-            capacity: 2 * 1024 * 1024,
-        };
-        assert_eq!(discovery_queued_records(drained), 0);
+        assert_eq!(
+            queued_records((928 * 3, 928), Some(DISCOVERY_RING_RECORD_BYTES)),
+            Some(2)
+        );
+        assert_eq!(
+            queued_records((928 * 3, 928 * 3), Some(DISCOVERY_RING_RECORD_BYTES)),
+            Some(0)
+        );
     }
 
     #[test]
@@ -227,6 +258,64 @@ mod tests {
     fn unknown_stride_queues_unknown_until_drained() {
         assert_eq!(queued_records((1_000, 100), None), None);
         assert_eq!(queued_records((1_000, 1_000), None), Some(0));
+    }
+
+    #[test]
+    fn loop_end_line_names_every_counter_per_ring() {
+        let accounts = RingAccounting {
+            discovery: Some(RingAccount {
+                produced: 100,
+                consumed: 90,
+                dropped: 7,
+                still_queued: Some(3),
+                unexplained: Some(0),
+            }),
+            events: Some(RingAccount {
+                produced: 200,
+                consumed: 180,
+                dropped: 0,
+                still_queued: None,
+                unexplained: None,
+            }),
+        };
+        assert!(accounts.has_loss());
+        assert_eq!(
+            loop_end_line(&accounts).as_deref(),
+            Some(
+                "p11scope: rings: discovery produced=100 consumed=90 dropped=7 \
+                 queued=3 unexplained=0; events produced=200 consumed=180 dropped=0 \
+                 queued=? unexplained=?"
+            ),
+        );
+    }
+
+    #[test]
+    fn loop_end_line_stays_silent_without_counters() {
+        let accounts = RingAccounting::default();
+        assert!(!accounts.has_loss());
+        assert_eq!(loop_end_line(&accounts), None);
+    }
+
+    #[test]
+    fn loop_end_line_marks_only_the_missing_ring_unknown() {
+        let accounts = RingAccounting {
+            discovery: None,
+            events: Some(RingAccount {
+                produced: 5,
+                consumed: 5,
+                dropped: 0,
+                still_queued: Some(0),
+                unexplained: Some(0),
+            }),
+        };
+        assert!(!accounts.has_loss());
+        assert_eq!(
+            loop_end_line(&accounts).as_deref(),
+            Some(
+                "p11scope: rings: discovery=?; events produced=5 consumed=5 dropped=0 \
+                 queued=0 unexplained=0"
+            ),
+        );
     }
 
     #[test]

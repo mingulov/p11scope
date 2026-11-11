@@ -506,13 +506,13 @@ pub struct Engine {
     /// equivalence twin compares both modes engine against engine.
     #[cfg(test)]
     disable_publish_deferral_for_test: bool,
-    /// Test-only opt-in for first-candidate reuse. Production always
+    /// Test-only control for first-candidate reuse. Production always
     /// reuses a proved-identical First candidate; tests default to the
     /// full twin so candidate build-count pins keep their meaning, and
-    /// the equivalence twins opt in per engine (or process-wide through
-    /// the environment variable the gate reads).
+    /// the equivalence twins force either mode per engine (`None`
+    /// follows the process-wide environment variable the gate reads).
     #[cfg(test)]
-    enable_candidate_reuse_for_test: bool,
+    candidate_reuse_for_test: Option<bool>,
     /// Whether the committed plan, modules, pins and evidence equal what a
     /// full rebuild would produce, as verified by comparison at the last
     /// commit. The rebuild reads committed-plan reuse state, so a commit can
@@ -11418,7 +11418,7 @@ impl Engine {
             #[cfg(test)]
             disable_publish_deferral_for_test: false,
             #[cfg(test)]
-            enable_candidate_reuse_for_test: false,
+            candidate_reuse_for_test: None,
             plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
@@ -24834,13 +24834,16 @@ impl Engine {
     #[cfg(test)]
     fn candidate_reuse_enabled(&self) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("P11SCOPE_ENABLE_CANDIDATE_REUSE").is_some())
-            || self.enable_candidate_reuse_for_test
+        self.candidate_reuse_for_test
+            .unwrap_or_else(|| {
+                *ENABLED
+                    .get_or_init(|| std::env::var_os("P11SCOPE_ENABLE_CANDIDATE_REUSE").is_some())
+            })
     }
 
     #[cfg(test)]
     pub(crate) fn set_enable_candidate_reuse_for_test(&mut self, enabled: bool) {
-        self.enable_candidate_reuse_for_test = enabled;
+        self.candidate_reuse_for_test = Some(enabled);
     }
 
     /// Records object skips into the capture counters exactly once each

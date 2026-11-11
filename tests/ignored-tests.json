@@ -1036,6 +1036,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::privileged_jailed_view_pins_through_map_files_without_poisoning_its_group",
+      "reason": "root: self-chrooting pin child in a fresh mount namespace",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/scan.rs",
       "path": "discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path",
       "reason": "requires a root-owned target with two private cross-device mounts",

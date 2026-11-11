@@ -11798,6 +11798,380 @@ mod tests {
         }
     }
 
+    /// Re-exec channel for the self-chrooting pin fixture below. The parent
+    /// half respawns this same test binary with these variables set; the child
+    /// half enters a fresh mount namespace (via the `unshare(1)` launch),
+    /// chroots to an empty directory and sleeps until the parent kills it. Its
+    /// mappings keep their pre-chroot host paths, exactly like a sandboxed
+    /// browser child jailed in a dead helper's `/proc/<pid>/fdinfo`: the
+    /// retained target root cannot serve the mapped objects, and the foreign
+    /// mount namespace correctly refuses the host-root fallback.
+    const PIN_JAIL_MODE_ENV: &str = "P11SCOPE_PIN_JAIL_MODE";
+    const PIN_JAIL_DIR_ENV: &str = "P11SCOPE_PIN_JAIL_DIR";
+    const PIN_JAIL_PARENT_NS_ENV: &str = "P11SCOPE_PIN_JAIL_PARENT_NS";
+
+    fn pin_jail_child_main() {
+        let parent = std::env::var(PIN_JAIL_PARENT_NS_ENV).unwrap();
+        let own = std::fs::read_link("/proc/self/ns/mnt")
+            .unwrap()
+            .display()
+            .to_string();
+        assert_ne!(
+            own, parent,
+            "the pin jail child must run in a fresh mount namespace"
+        );
+        let dir = std::env::var(PIN_JAIL_DIR_ENV).unwrap();
+        let dir_c = std::ffi::CString::new(dir).unwrap();
+        // SAFETY: a NUL-terminated path; chroot affects only this child.
+        assert_eq!(
+            unsafe { libc::chroot(dir_c.as_ptr()) },
+            0,
+            "pin jail child cannot chroot"
+        );
+        let slash = std::ffi::CString::new("/").unwrap();
+        // SAFETY: a NUL-terminated path; chdir affects only this child.
+        assert_eq!(
+            unsafe { libc::chdir(slash.as_ptr()) },
+            0,
+            "pin jail child cannot chdir after chroot"
+        );
+        // Bounded sleep: the parent kills this child once pinned; the bound
+        // only reaps orphans if the parent dies first.
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// A live child held inside an empty root directory. Killed and reaped on
+    /// drop, on every exit path.
+    struct PinJailChild {
+        child: std::process::Child,
+        dir: tempfile::TempDir,
+    }
+
+    /// Named-precondition gate for the pin-jail cell: root (chroot),
+    /// `unshare(1)` and a mintable mount namespace. Any miss FAILS with
+    /// its name; nothing here ever skips.
+    fn pin_jail_preflight() -> Result<(), String> {
+        // SAFETY: geteuid takes no arguments and has no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("PIN-JAIL-PREFLIGHT root: chroot and mount namespaces need root".into());
+        }
+        match std::process::Command::new("unshare")
+            .args(["-m", "true"])
+            .output()
+        {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("Operation not permitted") {
+                    Err(format!(
+                        "PIN-JAIL-PREFLIGHT mountns: the kernel refused the fixture mount namespace: {}",
+                        stderr.trim()
+                    ))
+                } else {
+                    // Anything else proceeds so a real failure surfaces
+                    // loudly at the launch below.
+                    Ok(())
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "PIN-JAIL-PREFLIGHT mountns: unshare(1) is unavailable: {error}"
+            )),
+            Err(error) => Err(format!(
+                "PIN-JAIL-PREFLIGHT mountns: cannot probe mount namespaces: {error}"
+            )),
+        }
+    }
+
+    impl PinJailChild {
+        /// Spawn the child half of `test` via `unshare -m` so the whole
+        /// child process starts in a fresh mount namespace, then chroots
+        /// to `jail`: an empty directory for `"dir"` mode, or a live
+        /// helper's `/proc/<pid>/fdinfo` for `"dangle"` mode (the caller
+        /// kills the helper once the child is rooted, leaving the exact
+        /// dead-helper jail a sandboxed browser child runs in). `owned`
+        /// is caller scratch the child outlives (the `"dir"` target
+        /// itself). The caller passes [`pin_jail_preflight`] first; a
+        /// missing precondition fails there with its name, never here.
+        fn spawn(
+            mode: &str,
+            test: &str,
+            jail: std::path::PathBuf,
+            owned: tempfile::TempDir,
+        ) -> Self {
+            // SAFETY: geteuid takes no arguments and has no side effects.
+            assert_eq!(
+                unsafe { libc::geteuid() },
+                0,
+                "this cell needs root (chroot)"
+            );
+            let parent_ns = std::fs::read_link("/proc/self/ns/mnt")
+                .unwrap()
+                .display()
+                .to_string();
+            let exe = std::env::current_exe().unwrap();
+            let mut command = std::process::Command::new("unshare");
+            command.arg("-m").arg(&exe).args([
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            command
+                .env(PIN_JAIL_MODE_ENV, mode)
+                .env(PIN_JAIL_DIR_ENV, &jail)
+                .env(PIN_JAIL_PARENT_NS_ENV, &parent_ns);
+            let mut child = command.spawn().expect("spawn pin jail child");
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if std::fs::read_link(format!("/proc/{pid}/root")).is_ok_and(|link| link == jail) {
+                    break;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("pin jail child exited early: {status:?}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pin jail child never entered {}",
+                    jail.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Self { child, dir: owned }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for PinJailChild {
+        fn drop(&mut self) {
+            // SAFETY: signal a known child pid; failure means it already exited.
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    /// One mapped libc line from a `/proc/<pid>/maps` snapshot: the
+    /// host-absolute path plus the maps-rendered key. The libc filename is
+    /// probed, never hard-coded to a distribution path.
+    fn maps_libc_line(pid: u32) -> (String, ObjectKey) {
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .unwrap_or_else(|_| panic!("fixture process {pid} must have readable maps"));
+        for line in maps.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(_range), Some(_perms), Some(_offset), Some(dev), Some(ino)) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                continue;
+            };
+            let path = fields.last().unwrap_or("");
+            if !path.starts_with('/') || !path.contains("libc.so") {
+                continue;
+            }
+            let (major, minor) = dev.split_once(':').unwrap();
+            let key = ObjectKey {
+                device: Device {
+                    major: u64::from_str_radix(major, 16).unwrap(),
+                    minor: u64::from_str_radix(minor, 16).unwrap(),
+                },
+                inode: ino.parse().unwrap(),
+            };
+            return (path.to_string(), key);
+        }
+        panic!("fixture process {pid} must map its libc");
+    }
+
+    fn pin_jail_module(
+        view: &ProcessView,
+        key: ObjectKey,
+        path: &str,
+    ) -> crate::discovery::scan::ScannedModule {
+        crate::discovery::scan::ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: path.to_string(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        }
+    }
+
+    /// The jailed-sibling pin bug: one process view maps the same provider
+    /// file through an unreachable target root (a sandboxed browser child
+    /// jailed in a dead helper's `/proc/<pid>/fdinfo`, a chrooted daemon in
+    /// a foreign mount namespace) while a sibling view opens it normally.
+    /// The scan examines the jailed mapping through the VMA's own
+    /// `map_files` link; the pin must reopen that same file the same way.
+    /// A pin that cannot open its root must never poison the proven
+    /// sibling's key: the group attaches on the proven file, and the
+    /// jailed view's module binds to the merged pin. (Without the pin-side
+    /// route the jailed view's open failure rejects the whole raw-key
+    /// group, and a warm multi-process browser's provider is never
+    /// discovered at all.)
+    #[test]
+    #[ignore = "root: self-chrooting pin child in a fresh mount namespace"]
+    fn privileged_jailed_view_pins_through_map_files_without_poisoning_its_group() {
+        if std::env::var_os(PIN_JAIL_MODE_ENV).is_some() {
+            pin_jail_child_main();
+            return;
+        }
+        pin_jail_preflight().unwrap();
+        let cell = "discovery::identity::tests::privileged_jailed_view_pins_through_map_files_without_poisoning_its_group";
+        // Both jail modes map the same libc file: each child re-executed
+        // this same test binary, so its pre-chroot mappings are this
+        // process's files under host-absolute paths.
+        let own = std::process::id();
+        let (own_path, own_key) = maps_libc_line(own);
+        let hosted = std::fs::File::open(&own_path).unwrap();
+        let mapping = mapping_file_key(&hosted).unwrap();
+        assert_eq!(
+            (mapping.device_major, mapping.device_minor, mapping.inode),
+            (own_key.device.major, own_key.device.minor, own_key.inode),
+            "the maps key must be the hosted file's mountinfo key"
+        );
+        let own_view = ProcessView::open(ProcessViewId(0), own).unwrap();
+        let own_module = pin_jail_module(&own_view, own_key, &own_path);
+        // Mode one: an empty directory root in a fresh mount namespace
+        // (the chrooted-daemon shape: opens fail ENOENT, the host-root
+        // fallback is correctly refused, the mount table stays readable).
+        let dir_owned = tempfile::tempdir().unwrap();
+        let dir_jail = dir_owned.path().canonicalize().unwrap();
+        let dir_subject = PinJailChild::spawn("dir", cell, dir_jail, dir_owned);
+        let dir_pid = dir_subject.pid();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{dir_pid}/root")).unwrap(),
+            dir_subject.dir.path().canonicalize().unwrap(),
+            "the dir jail child must stay inside its empty root"
+        );
+        // Mode two: a dead helper's `/proc/<pid>/fdinfo` root (the exact
+        // sandboxed-browser-child shape: opens fail ESRCH and the mount
+        // table reads kernel-empty).
+        let mut helper = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn pin jail helper");
+        let helper_pid = helper.id();
+        let scratch = tempfile::tempdir().unwrap();
+        let dangle_subject = PinJailChild::spawn(
+            "dangle",
+            cell,
+            std::path::PathBuf::from(format!("/proc/{helper_pid}/fdinfo")),
+            scratch,
+        );
+        let dangle_pid = dangle_subject.pid();
+        // SAFETY: signal a known helper pid; the wait below reaps it.
+        unsafe {
+            libc::kill(helper_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = helper.wait();
+        assert!(
+            std::fs::read_link(format!("/proc/{dangle_pid}/root")).is_ok(),
+            "the dangling jail child must stay alive on its dead root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{dangle_pid}/mountinfo")).unwrap(),
+            "",
+            "the dangling jail must read a kernel-empty mount table"
+        );
+        let mut pins = Vec::new();
+        let mut skipped = Vec::new();
+        let mut modules = Vec::new();
+        for (id, pid, what) in [(1u32, dir_pid, "dir"), (2u32, dangle_pid, "dangle")] {
+            let (child_path, child_key) = maps_libc_line(pid);
+            assert_eq!(child_path, own_path, "both views must map one libc path");
+            assert_eq!(child_key, own_key, "both views must map one libc file");
+            let child_view = ProcessView::open(ProcessViewId(id), pid).unwrap();
+            assert_ne!(
+                child_view.mount_namespace(),
+                own_view.mount_namespace(),
+                "the pin jail child must live in a fresh mount namespace"
+            );
+            let child_module = pin_jail_module(&child_view, child_key, &child_path);
+            let (child_pins, child_skipped) = pin_scanned_view_objects(
+                &child_view,
+                std::slice::from_ref(&child_module),
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            pins.push(child_pins);
+            skipped.extend(child_skipped);
+            modules.push((child_module, what));
+        }
+        let (own_pins, own_skipped) = pin_scanned_view_objects(
+            &own_view,
+            std::slice::from_ref(&own_module),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(own_skipped.is_empty(), "{own_skipped:?}");
+        skipped.extend(own_skipped);
+        let (aggregate, aggregate_skipped) =
+            PinnedObjects::aggregate_views([&own_pins, &pins[0], &pins[1]]);
+        skipped.extend(aggregate_skipped);
+        // The merge is order-independent: jailed views first must attach
+        // the group exactly like the proven sibling first.
+        let (reversed, reversed_skipped) =
+            PinnedObjects::aggregate_views([&pins[0], &pins[1], &own_pins]);
+        skipped.extend(reversed_skipped);
+        assert!(
+            !reversed.rejects(own_key),
+            "arrival order must not matter: {skipped:?}"
+        );
+        assert!(
+            reversed
+                .id_for_scanned(&own_module, own_key, &own_path)
+                .is_some()
+                && reversed
+                    .id_for_scanned(&modules[0].0, own_key, &own_path)
+                    .is_some()
+                && reversed
+                    .id_for_scanned(&modules[1].0, own_key, &own_path)
+                    .is_some(),
+            "every view binds in reverse arrival order: {skipped:?}"
+        );
+        assert!(
+            !aggregate.rejects(own_key),
+            "the jailed views must not reject their proven group: {skipped:?}"
+        );
+        assert!(
+            aggregate
+                .id_for_scanned(&own_module, own_key, &own_path)
+                .is_some(),
+            "the proven sibling binds: {skipped:?}"
+        );
+        for (module, what) in &modules {
+            assert!(
+                aggregate
+                    .id_for_scanned(module, module.key, &module.path)
+                    .is_some(),
+                "the {what} jailed view binds the merged pin: {skipped:?}"
+            );
+        }
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
+            "no collision ambiguity for one proven file: {skipped:?}"
+        );
+    }
+
     #[test]
     fn aggregate_rejection_plus_a_later_local_collision_publishes_once() {
         let key = ObjectKey {

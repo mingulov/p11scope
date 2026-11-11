@@ -607,6 +607,11 @@ scope::tests::privileged_run_cgroup_create_under_observer_stays_nested
 # root, no BPF).
 discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings
 discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects
+# Jailed-view pin: the same chroot-plus-fresh-namespace shape at the pin
+# stage — a view that cannot open its root reopens the VMA's own map_files
+# link and merges with its proven sibling instead of rejecting the whole
+# raw-key group (needs only root, no BPF).
+discovery::identity::tests::privileged_jailed_view_pins_through_map_files_without_poisoning_its_group
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

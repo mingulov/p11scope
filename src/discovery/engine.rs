@@ -506,6 +506,13 @@ pub struct Engine {
     /// equivalence twin compares both modes engine against engine.
     #[cfg(test)]
     disable_publish_deferral_for_test: bool,
+    /// Test-only opt-in for first-candidate reuse. Production always
+    /// reuses a proved-identical First candidate; tests default to the
+    /// full twin so candidate build-count pins keep their meaning, and
+    /// the equivalence twins opt in per engine (or process-wide through
+    /// the environment variable the gate reads).
+    #[cfg(test)]
+    enable_candidate_reuse_for_test: bool,
     /// Whether the committed plan, modules, pins and evidence equal what a
     /// full rebuild would produce, as verified by comparison at the last
     /// commit. The rebuild reads committed-plan reuse state, so a commit can
@@ -9980,6 +9987,23 @@ fn scanned_module_objects_unchanged(pinned: &PinnedObjects, module: &ScannedModu
     })
 }
 
+/// Whether two inventory scan rounds produced identical candidate
+/// inputs: same views in the same order, equal scanned modules, and pin
+/// sets with identical identity content (scan-local pin ids aside).
+fn refreshed_scans_equal(
+    first: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
+    second: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
+) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(
+            |((first_view, first_modules, first_pins), (second_view, second_modules, second_pins))| {
+                first_view == second_view
+                    && first_modules == second_modules
+                    && first_pins.same_pin_content(second_pins)
+            },
+        )
+}
+
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
@@ -11393,6 +11417,8 @@ impl Engine {
             disable_empty_tick_fast_path_for_test: false,
             #[cfg(test)]
             disable_publish_deferral_for_test: false,
+            #[cfg(test)]
+            enable_candidate_reuse_for_test: false,
             plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
@@ -15163,13 +15189,7 @@ impl Engine {
         if self.pinned.has_overlay_uncertainty() || pinned.has_overlay_uncertainty() {
             self.invalidate_causal_timing();
         }
-        attribution::note_all(&skipped);
-        for skip in skipped {
-            if !self.counters.object_skips.contains(&skip) {
-                self.counters.object_skips.push(skip);
-                self.note_facts_mutated();
-            }
-        }
+        self.note_object_skips(skipped);
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -15198,13 +15218,7 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         let merge_mid_start = crate::attach::monotonic_ns();
-        attribution::note_all(&binding_skips);
-        for skip in binding_skips {
-            if !self.counters.object_skips.contains(&skip) {
-                self.counters.object_skips.push(skip);
-                self.note_facts_mutated();
-            }
-        }
+        self.note_object_skips(binding_skips);
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "live_merge_mid",
@@ -24812,6 +24826,36 @@ impl Engine {
         self.disable_publish_deferral_for_test = disabled;
     }
 
+    /// Whether the Final candidate may reuse the tick's First build when
+    /// every input and state fence still matches. Tests only as a gate:
+    /// production always reuses. The per-engine flag drives the
+    /// equivalence twins; the process-wide environment variable reruns
+    /// whole suites against the reuse path.
+    #[cfg(test)]
+    fn candidate_reuse_enabled(&self) -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("P11SCOPE_ENABLE_CANDIDATE_REUSE").is_some())
+            || self.enable_candidate_reuse_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_enable_candidate_reuse_for_test(&mut self, enabled: bool) {
+        self.enable_candidate_reuse_for_test = enabled;
+    }
+
+    /// Records object skips into the capture counters exactly once each
+    /// (the merge's skip-recording side effect, shared by the full,
+    /// unchanged and reused candidate paths).
+    fn note_object_skips(&mut self, skipped: Vec<Skipped>) {
+        attribution::note_all(&skipped);
+        for skip in skipped {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+                self.note_facts_mutated();
+            }
+        }
+    }
+
     /// Builds the candidate for a tick that changed nothing: no removals,
     /// rescans, admissions or declined views. The caller holds only while
     /// committed state is rebuild-stable — the last commit installed a built
@@ -24835,13 +24879,7 @@ impl Engine {
             self.invalidate_causal_timing();
         }
         self.loader_plan_cache = None;
-        attribution::note_all(&skipped);
-        for skip in skipped {
-            if !self.counters.object_skips.contains(&skip) {
-                self.counters.object_skips.push(skip);
-                self.note_facts_mutated();
-            }
-        }
+        self.note_object_skips(skipped);
         let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &candidate_pins);
         let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &candidate_pins);
         self.prearm
@@ -26618,7 +26656,20 @@ impl Engine {
         // Trial builds in newcomer isolation must not leak rejected keys:
         // remember the set the first build starts from.
         let saved_rejected_keys = self.pending_rejected_keys.clone();
-        let candidate = match inventory_candidate_observed(
+        // First-candidate reuse fences: the inputs the First build is
+        // about to consume and the pin-set generation it clones. The
+        // Final build may reuse the First candidate only if every fence
+        // still matches there.
+        #[cfg(not(test))]
+        let reuse_enabled = true;
+        #[cfg(test)]
+        let reuse_enabled = self.candidate_reuse_enabled();
+        let first_removed = removed.clone();
+        let first_declined = declined.clone();
+        let first_new_view_ids: Vec<_> =
+            new_views.iter().map(|(view, _, _)| view.id()).collect();
+        let first_pinned_fence = (self.pinned.revision(), self.pinned.copy_version());
+        let (candidate, first_direct) = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::First,
             || {
@@ -26639,7 +26690,7 @@ impl Engine {
                 )
             },
         ) {
-            Ok(candidate) => candidate,
+            Ok(candidate) => (candidate, true),
             Err(error) => match self.isolate_broken_newcomers(
                 &removed,
                 &refreshed_scans,
@@ -26654,7 +26705,7 @@ impl Engine {
                         !isolation.held.contains(pid) && !isolation.deferred.contains(pid)
                     });
                     failed_refresh_pids.extend(isolation.deferred.iter().copied());
-                    isolation.candidate
+                    (isolation.candidate, false)
                 }
                 None => {
                     self.note_dropped_tick(&error, &serviced_requests, &failed_refresh_pids);
@@ -26694,6 +26745,10 @@ impl Engine {
             } else {
                 self.latch_candidate_ambiguity(&candidate.plan)
             };
+        // The latch above is the one post-First-build plan mutation reuse
+        // must see: a latched ambiguity changes the plan the Final build
+        // would clone, so a changed latch disables reuse below.
+        let first_latch_changed = changed;
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         if !admission.stale_views.is_empty() {
@@ -26745,6 +26800,35 @@ impl Engine {
             )?;
             return Ok(changed);
         }
+
+        // State fences for First-candidate reuse, captured after the
+        // First admission and its latch: the committed plan fence, the
+        // facts revision, and the counter lengths the candidate tail
+        // cloned from. The candidate itself is held back for reuse only
+        // when it came from the direct build and the latch moved
+        // nothing; every early return above drops it unused, exactly as
+        // the trial candidate is dropped today.
+        let first_plan_fence = plan::PlanFence::snapshot(&self.plan).ok();
+        // The candidate tail reads the stable module-id registry and the
+        // scan-gap tombstones, and branches on staged facts — fence
+        // those exactly. The facts *revision* is a publication fence
+        // (every scan bumps it), not a candidate-input fence.
+        let first_facts_fence = (
+            self.capture_facts.next_module_id,
+            self.capture_facts.module_ids.len(),
+            self.capture_facts
+                .visible_history()
+                .scan_gap_tombstones
+                .len(),
+            self.capture_facts.staged.is_none(),
+        );
+        let first_counter_lens = (
+            self.counters.object_skips.len(),
+            self.counters.corroboration.len(),
+            self.counters.manifest_fallbacks.len(),
+        );
+        let mut reusable_first = (reuse_enabled && first_direct && !first_latch_changed)
+            .then_some(candidate);
 
         for context_id in &admission.missing_contexts {
             let Some(context) = self.loader_registry.context(*context_id) else {
@@ -26955,8 +27039,15 @@ impl Engine {
         }
         failed_refresh_pids.extend(failed_rescan_pids);
         failed_refresh_pids.extend(deferred_rescan_pids);
+        // On the reuse path the rescan skips are recorded directly (the
+        // skipped Final build would have recorded them); keep a copy.
+        let rescan_skips_replay = if reusable_first.is_some() {
+            rescan_skips.clone()
+        } else {
+            Vec::new()
+        };
         skipped.extend(rescan_skips);
-        refreshed_scans = rescanned;
+        let first_refreshed_scans = std::mem::replace(&mut refreshed_scans, rescanned);
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         let unscanned_contexts: Vec<_> = rescan_contexts
@@ -26973,6 +27064,40 @@ impl Engine {
             return Ok(changed);
         }
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
+        // Reuse the First candidate as the Final one only when the Final
+        // build would consume identical inputs against identical state:
+        // same removed/declined/new-view sets, rescans with identical
+        // module and pin content, an unchanged committed plan, pin set,
+        // facts revision and counters, and no selection state for the
+        // candidate tail to re-derive against the live loader registry.
+        // Anything else rebuilds exactly as before.
+        let reuse_first = reusable_first.is_some()
+            && !self.force_full_candidate
+            && removed == first_removed
+            && declined == first_declined
+            && new_views
+                .iter()
+                .map(|(view, _, _)| view.id())
+                .eq(first_new_view_ids.iter().copied())
+            && (self.pinned.revision(), self.pinned.copy_version()) == first_pinned_fence
+            && first_plan_fence.is_some_and(|fence| fence.check(&self.plan).is_ok())
+            && (
+                self.capture_facts.next_module_id,
+                self.capture_facts.module_ids.len(),
+                self.capture_facts
+                    .visible_history()
+                    .scan_gap_tombstones
+                    .len(),
+                self.capture_facts.staged.is_none(),
+            ) == first_facts_fence
+            && (
+                self.counters.object_skips.len(),
+                self.counters.corroboration.len(),
+                self.counters.manifest_fallbacks.len(),
+            ) == first_counter_lens
+            && self.selection_claims.is_empty()
+            && self.selection_tables.is_empty()
+            && refreshed_scans_equal(&first_refreshed_scans, &refreshed_scans);
         let mut candidate = match inventory_candidate_observed(
             session,
             InventoryDiagnosticPass::Final,
@@ -26984,7 +27109,22 @@ impl Engine {
                     None,
                 ]
             },
-            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped, &declined),
+            || {
+                if reuse_first {
+                    self.note_object_skips(rescan_skips_replay);
+                    Ok(reusable_first
+                        .take()
+                        .expect("reuse was fenced on a held First candidate"))
+                } else {
+                    self.inventory_candidate(
+                        &removed,
+                        &refreshed_scans,
+                        new_views,
+                        skipped,
+                        &declined,
+                    )
+                }
+            },
         ) {
             Ok(candidate) => candidate,
             Err(error) => {

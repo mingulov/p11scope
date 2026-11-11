@@ -5986,7 +5986,7 @@ pub(crate) fn operator_target_keys(
 /// resurrected retired keys, shared-target name narrowing, re-refusal reason
 /// strings) and resolve to no-growth by design.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct PlanFence {
+pub(crate) struct PlanFence {
     token: u64,
     mutations: u64,
     slots: usize,
@@ -5999,7 +5999,7 @@ struct PlanFence {
 impl PlanFence {
     /// Snapshots the fenced members. A poisoned token refuses at once, before
     /// any derivation step runs.
-    fn snapshot(plan: &AttachPlan) -> Result<Self, GraphRefusal> {
+    pub(crate) fn snapshot(plan: &AttachPlan) -> Result<Self, GraphRefusal> {
         if plan.token.0 == PLAN_TOKEN_POISON {
             return Err(GraphRefusal::SourceChanged);
         }
@@ -6012,7 +6012,7 @@ impl PlanFence {
         })
     }
 
-    fn check(&self, plan: &AttachPlan) -> Result<(), GraphRefusal> {
+    pub(crate) fn check(&self, plan: &AttachPlan) -> Result<(), GraphRefusal> {
         if Self::snapshot(plan)? == *self {
             Ok(())
         } else {

@@ -10048,7 +10048,7 @@ mod tests {
             "a raw-ownership change is content"
         );
 
-        let mut changed = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        let changed = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
         changed.changed.set(true);
         assert!(
             !one.same_pin_content(&changed),

@@ -14215,23 +14215,49 @@ impl Engine {
             return true;
         }
         if existing.is_none() && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
-            if consumed {
-                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-                // Diff-first arrivals retain their known dropped age.
-                let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
-                self.newcomer_ages
-                    .note_dropped(newcomer_age_ms(seen, now_ns));
-                self.mark_live_loss(
-                    "live discovery refresh",
-                    "refresh requests exceeded the bounded pending queue; excess requests were dropped",
-                );
+            // Fair-queue relief: a live waiter's request evicts one departed,
+            // ownerless queue entry instead of refusing. Departed entries can
+            // never be serviced; without relief a full queue of short-lived
+            // dead pids starves a late provider's holder unboundedly. Only
+            // entries with no retained owner, no view, and no /proc directory
+            // are evicted, so live pressure waiters keep their pinned
+            // retention. A departed newcomer never triggers relief (it would
+            // only churn the queue).
+            let newcomer_live = self.views.iter().any(|view| view.pid() == pid)
+                || std::path::Path::new(&format!("/proc/{pid}")).exists();
+            let victim = if newcomer_live {
+                self.refresh_requested
+                    .iter()
+                    .find(|(qpid, request)| {
+                        request.owner.is_none()
+                            && !self.views.iter().any(|view| view.pid() == **qpid)
+                            && !std::path::Path::new(&format!("/proc/{qpid}")).exists()
+                    })
+                    .map(|(qpid, _)| *qpid)
             } else {
-                self.mark_partial(
-                    "live discovery refresh",
-                    "refresh retry exceeded the bounded pending queue; work remains unfinished",
-                );
+                None
+            };
+            if let Some(victim) = victim {
+                self.refresh_requested.remove(&victim);
+            } else {
+                if consumed {
+                    self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                    // Diff-first arrivals retain their known dropped age.
+                    let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                    self.newcomer_ages
+                        .note_dropped(newcomer_age_ms(seen, now_ns));
+                    self.mark_live_loss(
+                        "live discovery refresh",
+                        "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+                    );
+                } else {
+                    self.mark_partial(
+                        "live discovery refresh",
+                        "refresh retry exceeded the bounded pending queue; work remains unfinished",
+                    );
+                }
+                return false;
             }
-            return false;
         }
         let Some(serial) = self.last_refresh_serial.checked_add(1) else {
             if consumed {

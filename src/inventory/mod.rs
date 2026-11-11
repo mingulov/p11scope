@@ -1956,6 +1956,10 @@ fn run_with_terminal_budget(
     // extra, and a pending publication still keeps its prior view.
     if stopped.is_none() {
         let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        // A scan seal that never seated would otherwise misread as
+        // "needs --manifest": disclose the terminal state, published
+        // with the same commit as the newcomers.
+        let unseated_seal = driver.disclose_unseated_scan_seal();
         if driver.coordinator.has_prearm() {
             let stop = driver.prearm_probe_stop.unwrap_or(false)
                 || capture_error.is_some()
@@ -1967,7 +1971,7 @@ fn run_with_terminal_budget(
             };
             driver.coordinator.finish_prearm_watches(cause, None);
             let _ = driver.commit(false);
-        } else if terminal_newcomers {
+        } else if terminal_newcomers || unseated_seal {
             let _ = driver.commit(false);
         }
     }
@@ -3493,6 +3497,66 @@ impl ClassicDriver<'_> {
         }
         self.scan_seal_waited += 1;
         false
+    }
+
+    /// Terminal disclosure for a scan seal that never seated:
+    /// without it the summary misreads "needs --manifest"
+    /// (`present.rs`), naming a missing flag when the seal was never
+    /// attempted or never found a table. True when it noted the gap
+    /// (the caller publishes with a commit, like the terminal
+    /// newcomers); noting clears the pending flag, so a second call —
+    /// from the other terminal hook — stays silent. Silent when the
+    /// seal seated, was never armed, or already disclosed its own
+    /// refusal remedy.
+    fn disclose_unseated_scan_seal(&mut self) -> bool {
+        if !self.scan_seal_pending || self.semantic.is_some() {
+            return false;
+        }
+        if self
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "key operations unavailable")
+        {
+            return false;
+        }
+        let passes = self.coordinator.passes();
+        // Cgroup collections return before the deferred attempt, so a
+        // pending seal there never ran; more passes cannot seat it.
+        let reason = if matches!(self.scope, InventoryRunScope::Cgroup) {
+            "the scan seal did not run for this --cgroup capture; \
+             pass --manifest <manifest.json> for per-key rows; \
+             broad inventory continues with S1 mechanisms and API results"
+                .to_string()
+        // A peeked set exists: the settle held the start back for the
+        // whole run (too few passes, or a set that never held still).
+        } else if self.scan_seal_last_sets.is_some() {
+            format!(
+                "the scan seal never seated: {} passes ran, {} stable passes over one provider \
+                 set needed; rerun with a longer --duration, a narrower scope (--pid or \
+                 --module), or --manifest <manifest.json> for per-key rows; broad inventory \
+                 continues with S1 mechanisms and API results",
+                passes, SCAN_SEAL_STABLE_PEEKS
+            )
+        // No peek ever succeeded: every mint was silent, so no table
+        // was discovered to seat (or no pass ran at all).
+        } else {
+            format!(
+                "the scan seal never seated: no provider table discovered within {} passes; \
+                 rerun with a longer --duration, a narrower scope (--pid or --module), or \
+                 --manifest <manifest.json> for per-key rows; broad inventory continues \
+                 with S1 mechanisms and API results",
+                passes
+            )
+        };
+        self.coordinator
+            .note_scope_gap("key operations unavailable".into(), reason);
+        // Disclosed: no later terminal hook notes it again (the staged
+        // gap is invisible to the published-gap check above until the
+        // final commit publishes it).
+        self.scan_seal_pending = false;
+        true
     }
 
     /// Name a settle that outlasted a set change: confirming an
@@ -6897,6 +6961,12 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
         // The counted short-lived gap stages beside the named disclosure.
         self.coordinator.note_short_lived_never_scanned();
+        // A scan seal that never seated would otherwise misread as
+        // "needs --manifest": disclose the terminal state here for
+        // native runs (the scan-only finish covers runs with no lane).
+        // Staged like the newcomers above, published by the final
+        // commit; idempotent across the two terminal hooks.
+        self.disclose_unseated_scan_seal();
         // The counted never-admitted gap stages from stop-time
         // records: retired subset-edged callers no subset instance
         // ever covered. Its refused-admission companion counts the
@@ -8538,6 +8608,10 @@ fn run_dashboard(
     // tail also discloses post-pass newcomers, as on the classic path.
     if stopped.is_none() {
         let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        // A scan seal that never seated would otherwise misread as
+        // "needs --manifest" (a no-op today: the dashboard never arms
+        // the seal, but the finish stays correct if it ever does).
+        let unseated_seal = driver.disclose_unseated_scan_seal();
         if driver.coordinator.has_prearm() {
             let stop = driver.prearm_probe_stop.unwrap_or(false)
                 || capture_error.is_some()
@@ -8549,7 +8623,7 @@ fn run_dashboard(
             };
             driver.coordinator.finish_prearm_watches(cause, None);
             let _ = driver.commit(false);
-        } else if terminal_newcomers {
+        } else if terminal_newcomers || unseated_seal {
             let _ = driver.commit(false);
         }
     }
@@ -28756,6 +28830,203 @@ mod seal_readiness_tests {
         assert!(driver.semantic.is_some(), "the pending attempt seals");
         assert!(!driver.scan_seal_pending);
         assert_eq!(take_sealed_for_test(), vec![SEAL_LINE.to_string()]);
+    }
+
+    /// The `--system` short-run shape (v0.7.0 item 4): a stable set
+    /// seen for fewer than `SCAN_SEAL_STABLE_PEEKS` passes never seats,
+    /// so no start is ever attempted and no gap exists — the summary
+    /// then misreads "needs --manifest". The terminal disclosure names
+    /// the settle the run missed instead of the missing flag.
+    #[test]
+    fn unseated_scan_seal_settle_held_discloses_pass_count() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        // One short of seating: the 20s `--system` run that reported
+        // "needs --manifest" with zero key endpoints.
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize - 1];
+        seal_startup_test::with_peek(peeks, Vec::new(), None, || {
+            for _ in 0..super::SCAN_SEAL_STABLE_PEEKS - 1 {
+                driver.attempt_deferred_scan_seal(scope);
+            }
+        });
+        assert!(driver.semantic.is_none(), "short of stable, nothing seats");
+        assert!(driver.scan_seal_pending, "the seal stays pending");
+        assert!(
+            driver.disclose_unseated_scan_seal(),
+            "the terminal run discloses the unseated seal"
+        );
+        assert!(
+            !driver.disclose_unseated_scan_seal(),
+            "the disclosure clears pending: a second terminal hook stays silent"
+        );
+        let gaps = gaps_for_subject(&mut *driver.coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "exactly one terminal gap: {gaps:?}");
+        assert!(
+            gaps[0].1.contains("never seated")
+                && gaps[0].1.contains(&format!(
+                    "{} stable passes over one provider set",
+                    super::SCAN_SEAL_STABLE_PEEKS
+                )),
+            "the gap names the settle the run missed: {:?}",
+            gaps[0].1
+        );
+    }
+
+    /// Every mint silent (nothing discovered yet, the retry-by-design
+    /// shape): starts are attempted but no table ever qualifies, so no
+    /// gap exists either. The terminal disclosure names the empty
+    /// discovery instead of the missing flag.
+    #[test]
+    fn unseated_scan_seal_silent_mints_disclose_empty_discovery() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        // No scripted peeks: the fixture's production mint is silent
+        // (nothing discovered), so every attempt falls through to a
+        // start that mints silently again and seats nothing.
+        seal_startup_test::with_start_queue(
+            vec![
+                silent_preparation(),
+                silent_preparation(),
+                silent_preparation(),
+            ],
+            Vec::new(),
+            || {
+                for _ in 0..3 {
+                    driver.attempt_deferred_scan_seal(scope);
+                }
+            },
+        );
+        assert!(driver.semantic.is_none(), "silent mints seat nothing");
+        assert!(driver.scan_seal_pending, "the seal stays pending");
+        assert!(
+            driver.disclose_unseated_scan_seal(),
+            "the terminal run discloses the unseated seal"
+        );
+        let gaps = gaps_for_subject(&mut *driver.coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "exactly one terminal gap: {gaps:?}");
+        assert!(
+            gaps[0].1.contains("no provider table"),
+            "the gap names the empty discovery: {:?}",
+            gaps[0].1
+        );
+    }
+
+    /// `--cgroup` collections return before the deferred attempt, so a
+    /// pending seal there means "never ran", never "needs more passes".
+    /// The disclosure names the scope instead of the missing flag.
+    #[test]
+    fn unseated_scan_seal_cgroup_names_scope() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        driver.scope = InventoryRunScope::Cgroup;
+        assert!(
+            driver.disclose_unseated_scan_seal(),
+            "the terminal run discloses the unseated seal"
+        );
+        let gaps = gaps_for_subject(&mut *driver.coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "exactly one terminal gap: {gaps:?}");
+        assert!(
+            gaps[0].1.contains("--cgroup"),
+            "the gap names the scope: {:?}",
+            gaps[0].1
+        );
+    }
+
+    /// A seated lane discloses nothing: the seal seated, so no terminal
+    /// gap may second-guess it.
+    #[test]
+    fn seated_scan_seal_discloses_nothing() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for _ in 0..super::SCAN_SEAL_STABLE_PEEKS {
+                    driver.attempt_deferred_scan_seal(scope);
+                }
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the confirmed set seats"
+        );
+        assert!(
+            !driver.disclose_unseated_scan_seal(),
+            "a seated seal discloses nothing"
+        );
+        assert!(
+            gaps_for_subject(&mut *driver.coordinator, "key operations unavailable").is_empty(),
+            "a seated seal leaves no terminal gap"
+        );
+    }
+
+    /// A refused mint already disclosed its own remedy; the terminal
+    /// pass must not stack a second "key operations unavailable" gap
+    /// beside it.
+    #[test]
+    fn refused_scan_seal_keeps_its_own_gap() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        driver.coordinator.note_scope_gap(
+            "key operations unavailable".into(),
+            "subset refused (incomplete_provider); rerun with --manifest <manifest.json>".into(),
+        );
+        // The refusal published with its pass commit, as in production.
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "key operations unavailable").len(),
+            1,
+            "the refused mint disclosed its remedy"
+        );
+        assert!(
+            !driver.disclose_unseated_scan_seal(),
+            "an already-disclosed seal discloses nothing new"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "key operations unavailable").len(),
+            1,
+            "no second gap stacks beside the refusal"
+        );
+    }
+
+    /// A mint that refused silently (nothing discovered yet): no subset,
+    /// no codes, no gap — the scan mint retries per pass by design.
+    fn silent_preparation() -> SubsetPreparation {
+        SubsetPreparation {
+            subset: None,
+            refusals: Vec::new(),
+        }
     }
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {

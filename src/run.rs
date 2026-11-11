@@ -7678,9 +7678,15 @@ const FAST_DISCOVERY_FRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// it. Never moves a frame later than the ordinary cadence would run it,
 /// and reads no clock when nothing was requested. The frame clock stays
 /// the one authority for snapshot/render (F-T8-1): this only moves it
-/// back, exactly like the recovery request below.
+/// back, exactly like the recovery request below. `next_fast_allowed`
+/// is the earliest instant a fast frame may land (the last actual frame
+/// plus the minimum interval, advanced by each request), held separately
+/// from the adjustable frame clock: computing the floor from the
+/// backdated clock would let a second hint schedule a frame inside the
+/// first hint's minimum interval.
 fn request_fast_discovery_frame(
     frame_clock: &mut Instant,
+    next_fast_allowed: &mut Instant,
     drain: Duration,
     requested: bool,
     now: impl FnOnce() -> Instant,
@@ -7688,9 +7694,8 @@ fn request_fast_discovery_frame(
     if !requested {
         return;
     }
-    let due = (*frame_clock + FAST_DISCOVERY_FRAME_MIN_INTERVAL)
-        .max(now())
-        .min(*frame_clock + drain);
+    let due = (*next_fast_allowed).max(now()).min(*frame_clock + drain);
+    *next_fast_allowed = due + FAST_DISCOVERY_FRAME_MIN_INTERVAL;
     let moved = due - drain;
     if moved < *frame_clock {
         *frame_clock = moved;
@@ -9219,6 +9224,7 @@ fn capture_profile(
     scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
+    let mut next_fast_frame = last_frame;
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
@@ -9530,6 +9536,7 @@ fn capture_profile(
 
         if tick_frame.render {
             last_frame = Instant::now();
+            next_fast_frame = last_frame + FAST_DISCOVERY_FRAME_MIN_INTERVAL;
             let render_start = Instant::now();
             scheduling.sync_discovery_deferrals(engine);
             scheduling.sync_engine_stages(engine);
@@ -9609,6 +9616,7 @@ fn capture_profile(
         );
         request_fast_discovery_frame(
             &mut last_frame,
+            &mut next_fast_frame,
             drain,
             engine.take_fast_discovery_frame(),
             Instant::now,
@@ -10838,6 +10846,7 @@ fn capture_trace(
     scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
+    let mut next_fast_frame = last_frame;
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
@@ -11118,6 +11127,9 @@ fn capture_trace(
             CaptureTick::Continue { paused, snapshot: () } => paused,
             CaptureTick::End(end) => break Ok(end),
         };
+        if pass == Some(DiscoveryPass::Frame) {
+            next_fast_frame = Instant::now() + FAST_DISCOVERY_FRAME_MIN_INTERVAL;
+        }
         request_profile_recovery_frame(
             &mut last_frame,
             drain,
@@ -11126,6 +11138,7 @@ fn capture_trace(
         );
         request_fast_discovery_frame(
             &mut last_frame,
+            &mut next_fast_frame,
             drain,
             engine.take_fast_discovery_frame(),
             Instant::now,
@@ -25532,15 +25545,25 @@ int main(int argc, char **argv) {
 
         // No request: the ordinary cadence stands, and no clock is read.
         let mut last_frame = rendered;
-        request_fast_discovery_frame(&mut last_frame, drain, false, || {
-            panic!("an unrequested fast frame reads no clock")
-        });
+        request_fast_discovery_frame(
+            &mut last_frame,
+            &mut (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL),
+            drain,
+            false,
+            || panic!("an unrequested fast frame reads no clock"),
+        );
         assert_eq!(last_frame, rendered);
 
         // Requested well past the minimum interval since the last render:
         // the very next tick is a whole frame.
         let late = rendered + Duration::from_millis(500);
-        request_fast_discovery_frame(&mut last_frame, drain, true, || late);
+        request_fast_discovery_frame(
+            &mut last_frame,
+            &mut (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL),
+            drain,
+            true,
+            || late,
+        );
         let frame = profile_frame_decisions(|| late.duration_since(last_frame), drain);
         assert_eq!(
             discovery_due(frame.since_frame, drain, || false, || false),
@@ -25552,8 +25575,9 @@ int main(int argc, char **argv) {
         // interval after that render, not immediately and not a full drain
         // later.
         let mut last_frame = rendered;
+        let mut next_fast_frame = rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL;
         let early = rendered + Duration::from_millis(10);
-        request_fast_discovery_frame(&mut last_frame, drain, true, || early);
+        request_fast_discovery_frame(&mut last_frame, &mut next_fast_frame, drain, true, || early);
         let before = profile_frame_decisions(
             || {
                 (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL - Duration::from_millis(1))
@@ -25577,11 +25601,49 @@ int main(int argc, char **argv) {
             Some(DiscoveryPass::Frame)
         );
 
+        // A second hint before that frame runs must not pull it inside
+        // the first hint's minimum interval: the floor is held apart
+        // from the backdated frame clock.
+        let mut last_frame = rendered;
+        let mut next_fast_frame = rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL;
+        request_fast_discovery_frame(&mut last_frame, &mut next_fast_frame, drain, true, || {
+            rendered + Duration::from_millis(10)
+        });
+        request_fast_discovery_frame(&mut last_frame, &mut next_fast_frame, drain, true, || {
+            rendered + Duration::from_millis(20)
+        });
+        let second_before = profile_frame_decisions(
+            || {
+                (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL - Duration::from_millis(1))
+                    .duration_since(last_frame)
+            },
+            drain,
+        );
+        assert_eq!(
+            discovery_due(second_before.since_frame, drain, || false, || false),
+            None,
+            "the second hint kept the first hint's floor"
+        );
+        let second_at = profile_frame_decisions(
+            || (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL).duration_since(last_frame),
+            drain,
+        );
+        assert_eq!(
+            discovery_due(second_at.since_frame, drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+
         // A drain shorter than the minimum interval keeps its own cadence:
         // a fast request never makes a frame later.
         let short_drain = Duration::from_millis(50);
         let mut last_frame = rendered;
-        request_fast_discovery_frame(&mut last_frame, short_drain, true, || early);
+        request_fast_discovery_frame(
+            &mut last_frame,
+            &mut (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL),
+            short_drain,
+            true,
+            || early,
+        );
         let ordinary = profile_frame_decisions(
             || (rendered + short_drain).duration_since(last_frame),
             short_drain,
@@ -25593,9 +25655,13 @@ int main(int argc, char **argv) {
 
         // Already overdue: the clock does not move at all.
         let mut last_frame = rendered;
-        request_fast_discovery_frame(&mut last_frame, drain, true, || {
-            rendered + Duration::from_secs(2)
-        });
+        request_fast_discovery_frame(
+            &mut last_frame,
+            &mut (rendered + FAST_DISCOVERY_FRAME_MIN_INTERVAL),
+            drain,
+            true,
+            || rendered + Duration::from_secs(2),
+        );
         assert_eq!(last_frame, rendered);
     }
 

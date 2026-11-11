@@ -25942,6 +25942,25 @@ impl Engine {
     /// the pids to keep queued (failures and deferrals alike), and the
     /// tick's skips. Extracted verbatim from the inventory tick so an
     /// injected clock can expire mid-path; production behavior is unchanged.
+    /// Mark a fresh-class pid that was windowed but never attempted to
+    /// keep fresh priority on the next scarce tick. The ledger names the
+    /// backlog and rotation classes; every other windowed pid was
+    /// fresh-class (rotation pids hold no request anyway). Used on every
+    /// early exit from the admission window (quantum expiry, capacity
+    /// exhaustion) so no exit path silently demotes an unattempted
+    /// fresh request by arrival age alone.
+    fn mark_unattempted_fresh(&mut self, pid: u32, ledger: &AdmissionLedger) {
+        let backlog_or_rotation = match ledger {
+            AdmissionLedger::Free { backlog } => backlog.contains(&pid),
+            AdmissionLedger::Scarce { backlog, rotation } => {
+                backlog.contains(&pid) || rotation.contains(&pid)
+            }
+        };
+        if !backlog_or_rotation && let Some(request) = self.refresh_requested.get_mut(&pid) {
+            request.deferred_fresh = true;
+        }
+    }
+
     fn admit_inventory_new_views(
         &mut self,
         admitted: Vec<u32>,
@@ -25958,21 +25977,9 @@ impl Engine {
             // pid and the rest defer with their requests retained.
             if self.scheduler.tick_expired(tick_now()) {
                 // Fresh-class windowed but never attempted: keep fresh
-                // priority for the next scarce tick. The ledger names the
-                // backlog and rotation classes; every other windowed pid
-                // was fresh-class (rotation pids hold no request anyway).
+                // priority for the next scarce tick.
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
-                    let backlog_or_rotation = match ledger {
-                        AdmissionLedger::Free { backlog } => backlog.contains(&deferred_pid),
-                        AdmissionLedger::Scarce { backlog, rotation } => {
-                            backlog.contains(&deferred_pid) || rotation.contains(&deferred_pid)
-                        }
-                    };
-                    if !backlog_or_rotation
-                        && let Some(request) = self.refresh_requested.get_mut(&deferred_pid)
-                    {
-                        request.deferred_fresh = true;
-                    }
+                    self.mark_unattempted_fresh(deferred_pid, ledger);
                     failed_refresh_pids.insert(deferred_pid);
                 }
                 skipped.push(Skipped {
@@ -25992,9 +25999,11 @@ impl Engine {
                     // ordinary relief cannot free a slot — and completes
                     // only provider-freedom a complete scan proved.
                     // Rotation candidates and unproven pids defer as before.
+                    let mut probed = false;
                     if self.refresh_requested.contains_key(&pid)
                         && self.find_evictable_victim_for_selected(pid).is_none()
                     {
+                        probed = true;
                         let (provider_free, probe_skips) = self.probe_newcomer_provider_free(pid);
                         skipped.extend(probe_skips);
                         match ledger {
@@ -26041,8 +26050,18 @@ impl Engine {
                     // Exhaustion drops nothing: the unprocessed pids stay
                     // queued (bounded) so a later pass with a free slot
                     // serves them instead of losing event-driven work.
+                    // Unattempted fresh-class pids in the tail (and the
+                    // current pid when no probe ran for it) keep fresh
+                    // priority for the next scarce tick, exactly like the
+                    // quantum-expiry tail.
+                    if !probed {
+                        self.mark_unattempted_fresh(pid, ledger);
+                    }
                     failed_refresh_pids.insert(pid);
-                    failed_refresh_pids.extend(unprocessed);
+                    for deferred_pid in unprocessed.by_ref() {
+                        self.mark_unattempted_fresh(deferred_pid, ledger);
+                        failed_refresh_pids.insert(deferred_pid);
+                    }
                     break;
                 }
             };

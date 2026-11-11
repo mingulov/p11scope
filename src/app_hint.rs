@@ -781,7 +781,10 @@ fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
 ///
 /// A fallback pin without a pidfd samples nothing: the start-time
 /// check below is tick-granular and cannot exclude a same-tick reuse.
-/// Without a readable exe there is no hint and no read. cmdline and the
+/// The retained pidfd must also poll live before the reads and after
+/// the final validation — holding it preserves the old reference,
+/// not the numeric PID's allocation. Without a readable exe there is
+/// no hint and no read. cmdline and the
 /// cgroup text are read only for a tabled runtime, comm only for
 /// python/perl/ruby; shells and native exes get no read at all. The exe
 /// identity and the process start time are re-read after sampling and
@@ -819,6 +822,18 @@ fn sample_for_pid_with_proc(
     if pin.pidfd().is_err() {
         return None;
     }
+    // The pin must name the sampled pid, and the original must still
+    // be alive: holding the old pidfd preserves its reference, not
+    // the numeric PID's allocation, so a same-exe same-tick
+    // replacement would pass every numeric comparison below. Poll
+    // errors fail closed (`still_the_same` is false unless the poll
+    // reports live).
+    if pin.pid() != pid {
+        return None;
+    }
+    if !pin.still_the_same() {
+        return None;
+    }
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
@@ -853,6 +868,12 @@ fn sample_for_pid_with_proc(
         start_before,
         crate::process::process_start_time(proc_pid).ok(),
     ) {
+        return None;
+    }
+    // Liveness close: the original may have exited under the numeric
+    // reads and the pid been reused since the pre-read poll, so the
+    // retained pidfd must still be live after the final validation.
+    if !pin.still_the_same() {
         return None;
     }
     Some(hint)

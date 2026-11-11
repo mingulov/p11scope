@@ -108,7 +108,7 @@ def r1_inputs(marker_fn="C_GenerateRandom", attempts=1, captured=1):
         "outside_move_ns": negative["t0"] - 1,
     }
     receipt["observer_argv"] = ["/held/p11scope", "trace", "--cgroup", original["path"],
-        "--module", "/w/lib.so", "--attach-backend", "singles", "--duration", "240s", "-o", "/w/trace.txt"]
+        "--module", "/w/lib.so", "--attach-backend", "singles", "--duration", "240s", "-o", "/w/trace.txt", "-v"]
     pin = copy.deepcopy(BASE["PIN"])
     pin["mapping"].update(file_offset=0, length=4096, permissions="r--p")
     receipt.update(provider_before=pin, provider_after=copy.deepcopy(pin))

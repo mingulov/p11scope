@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+# AppArmor profile for the p11scope observer container (least privilege).
+# Base: the Docker default profile as enforced by Docker 29.8.1, i.e.
+# moby/profiles/apparmor @ 61eaf32614c7 (Apache-2.0; the exact dep in
+# dockerd 29.8.1 per `go version -m`), rendered with abi <abi/3.0>
+# and the tunables/global + abstractions/base includes. Every rule
+# below is verbatim except the profile name/peers (rendered for
+# p11scope-observer with an unconfined dockerd, as on Ubuntu) and one
+# p11scope addition: `ptrace (read) peer=unconfined` (marked below).
+# Load: apparmor_parser -r deploy/apparmor-p11scope
+# Use:  docker run --security-opt apparmor=p11scope-observer ...
+abi <abi/3.0>,
+#include <tunables/global>
+
+profile p11scope-observer flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
+  deny network alg,
+  # Disallow AF_VSOCK to prevent host/guest communication.
+  deny network vsock,
+  capability,
+  file,
+  umount,
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  # crun may send signals to container processes (for "docker stop" when used with crun OCI runtime).
+  signal (receive) peer=crun,
+  # dockerd may send signals to container processes (for "docker kill"):
+  # rendered for an unconfined dockerd (Ubuntu/Fedora default installs).
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=p11scope-observer,
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+  deny mount,
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+  # allow processes within the container to trace each other,
+  # provided all other LSM and yama setting allow it.
+  ptrace (trace,tracedby,read,readby) peer=p11scope-observer,
+  # p11scope addition (measured 2026-11-11): allow READING host
+  # (unconfined) processes so /proc scans and maps snapshots see them
+  # (31/31 docker-default denials that day were ptrace read), and
+  # ptrace TRACE so /proc/<pid>/mem scans and profile attach work
+  # (denied_mask="trace" without it). No tracedby/readby, no signal
+  # send: confined peers (snap, cups) stay unreadable by design.
+  ptrace (read, trace) peer=unconfined,
+}

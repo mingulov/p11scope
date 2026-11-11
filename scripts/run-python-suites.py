@@ -52,6 +52,7 @@ INVOCATION_MARKERS = (
 RUN = [
     ("test_abi_execution_qualification.py", []),
     ("test_add_copyright_headers.py", []),
+    ("test_apparmor_profile.py", []),
     ("test_automatic_exec_oracle.py", []),
     ("test_automatic_exec_system_disclosures.py", []),
     ("test_automatic_initial_readiness.py", []),

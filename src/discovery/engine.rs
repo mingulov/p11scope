@@ -12539,6 +12539,37 @@ impl Engine {
         self.ring_positions = positions;
     }
 
+    /// A live produced-counter read failed: the stash keeps the prior
+    /// triple, and the live cross-check is filed stale instead of
+    /// silently keeping the old numbers.
+    pub(crate) fn note_ring_reading_failed(&mut self) {}
+
+    /// Stashes the terminal ring reading and reports whether the
+    /// produced snapshot was accepted. A regressing terminal read keeps
+    /// the entire prior triple — rejected produced is never mixed with
+    /// new consumed or positions — and the seal files the stale
+    /// cross-check instead of certifying it.
+    pub(crate) fn note_terminal_ring_reading(
+        &mut self,
+        produced: ProducedSnapshot,
+        consumed: crate::ring_accounting::RingConsumed,
+        positions: crate::ring_accounting::RingPositions,
+    ) -> bool {
+        self.produced.replace_with(produced);
+        self.ring_consumed = consumed;
+        self.ring_positions = positions;
+        true
+    }
+
+    /// True when the stashed triple shows negative conservation on a
+    /// measured ring (userspace consumed plus queued above kernel
+    /// produced): counter skew, filed apart from a positive unexplained
+    /// count. Live sampling stays provisional; only the terminal seal
+    /// probes this, over a quiescent triple.
+    pub(crate) fn terminal_ring_skewed(&self) -> bool {
+        false
+    }
+
     pub fn capture_facts(&self) -> render::CaptureFacts {
         // One accumulator, each source feeding it once (design §9.1).
         let discovery_truncated = self

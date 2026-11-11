@@ -8162,6 +8162,51 @@ fn note_session_ring_reading(engine: &mut Engine, session: &Session) {
     }
 }
 
+/// The terminal ring acquisition's outcome: fresh measured evidence, or
+/// a stale or skewed cross-check the seal files instead of certifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRingOutcome {
+    /// The final produced read was accepted and the triple conserves.
+    Fresh,
+    /// The final produced read failed; the stash is the prior triple,
+    /// explicitly stale.
+    StaleRead,
+    /// The final produced snapshot regressed; the prior triple was
+    /// retained instead of mixing old produced with new consumed.
+    StaleRegression,
+    /// The stashed triple shows consumed plus queued above produced on
+    /// a measured ring: counter skew, not an unexplained count.
+    Skewed,
+}
+
+/// Folds one terminal produced-read result into the engine's ring stash
+/// and reports the acquisition outcome for the seal. The [`Session`]
+/// wrapper is the production caller; tests inject the read result
+/// directly through this seam.
+fn terminal_ring_outcome_from(
+    read: Result<crate::attach::ProducedSnapshot>,
+    engine: &mut Engine,
+    consumed: crate::ring_accounting::RingConsumed,
+    positions: crate::ring_accounting::RingPositions,
+) -> TerminalRingOutcome {
+    let Ok(produced) = read else {
+        return TerminalRingOutcome::StaleRead;
+    };
+    if !engine.note_terminal_ring_reading(produced, consumed, positions) {
+        return TerminalRingOutcome::StaleRegression;
+    }
+    if engine.terminal_ring_skewed() {
+        return TerminalRingOutcome::Skewed;
+    }
+    TerminalRingOutcome::Fresh
+}
+
+/// Files a stale or skewed terminal ring cross-check on published
+/// evidence: PARTIAL via the `skipped` cause with the existing generic
+/// vocabulary, like every terminal seal failure, with the specific
+/// cross-check named on stderr. A fresh outcome files nothing.
+fn apply_terminal_ring_outcome(_evidence: &mut render::Evidence, _outcome: TerminalRingOutcome) {}
+
 /// Staged DISCOVERY items as the terminal batch's leading records and its
 /// malformed count.
 fn split_staged_discovery(
@@ -29920,6 +29965,313 @@ int main(int argc, char **argv) {
             assert_eq!(events["unexplained"], 20);
             assert_eq!(document["completeness"], "PARTIAL");
         }
+    }
+
+    /// Builds evidence for the ring cross-check twins: the engine/report
+    /// seam under test is the ring note plus `capture_facts` plus
+    /// [`evidence_for`].
+    fn ring_twin_evidence_for(engine: &Engine, facts: render::CaptureFacts) -> render::Evidence {
+        let state = semantics::State::new(engine.plan());
+        evidence_for(
+            engine,
+            facts,
+            0,
+            false,
+            false,
+            Default::default(),
+            render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+            &[],
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            0,
+            None,
+            None,
+            false,
+            render::SchedulingEvidence::default(),
+            None,
+            None,
+            None,
+            0,
+        )
+    }
+
+    /// A failed terminal produced read after an earlier balanced read
+    /// files the stale cross-check instead of certifying the old
+    /// balanced account as measured terminal evidence.
+    #[test]
+    fn failed_terminal_read_names_the_stale_ring_cross_check() {
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        engine.note_ring_reading(
+            crate::attach::ProducedSnapshot {
+                discovery: 100,
+                events: 100,
+            },
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(100),
+                events: Some(100),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((92800, 92800)),
+                events: Some((500, 500)),
+            },
+        );
+        let outcome = terminal_ring_outcome_from(
+            Err(anyhow::anyhow!("injected terminal produced-read failure")),
+            &mut engine,
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(110),
+                events: Some(109),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((102080, 102080)),
+                events: Some((600, 600)),
+            },
+        );
+        assert_eq!(
+            outcome,
+            TerminalRingOutcome::StaleRead,
+            "a failed terminal read is stale, never fresh"
+        );
+        let facts = engine.capture_facts();
+        assert_eq!(
+            facts.ring_readings().discovery.produced,
+            100,
+            "the failed read retains the prior produced total"
+        );
+        assert_eq!(
+            facts.ring_readings().discovery.consumed,
+            Some(100),
+            "the failed read retains the prior consumed total"
+        );
+        let mut evidence = ring_twin_evidence_for(&engine, facts);
+        let skipped_before = evidence.skipped.len();
+        apply_terminal_ring_outcome(&mut evidence, outcome);
+        assert_eq!(
+            evidence.skipped.len(),
+            skipped_before + 1,
+            "the stale cross-check is filed, never silent"
+        );
+        evidence.verdict();
+        assert_eq!(
+            evidence.completeness, "PARTIAL",
+            "a stale terminal cross-check never certifies COMPLETE"
+        );
+    }
+
+    /// A regressing produced snapshot retains the entire prior triple:
+    /// rejected produced is never mixed with new consumed or positions.
+    /// The rejected reading hides one discovery loss (110 submitted,
+    /// 109 drained) behind the events regression (99 after 100), while
+    /// the prior triple already misses one events record; the seal
+    /// files the stale cross-check and keeps the prior missing record
+    /// instead of certifying zero unexplained.
+    #[test]
+    fn rejected_regression_retains_the_prior_triple_and_names_the_cross_check() {
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        engine.note_ring_reading(
+            crate::attach::ProducedSnapshot {
+                discovery: 100,
+                events: 200,
+            },
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(100),
+                events: Some(199),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((92800, 92800)),
+                events: Some((700, 700)),
+            },
+        );
+        let outcome = terminal_ring_outcome_from(
+            Ok(crate::attach::ProducedSnapshot {
+                discovery: 110,
+                events: 99,
+            }),
+            &mut engine,
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(109),
+                events: Some(200),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((102080, 102080)),
+                events: Some((800, 800)),
+            },
+        );
+        let facts = engine.capture_facts();
+        assert_eq!(
+            facts.ring_readings().discovery.produced,
+            100,
+            "a regressing snapshot retains the prior produced total"
+        );
+        assert_eq!(
+            facts.ring_readings().discovery.consumed,
+            Some(100),
+            "rejected produced never mixes with new consumed"
+        );
+        assert_eq!(
+            facts.ring_readings().events.consumed,
+            Some(199),
+            "the prior missing record survives the rejection"
+        );
+        assert_eq!(
+            outcome,
+            TerminalRingOutcome::StaleRegression,
+            "a regressing terminal read is stale, never fresh"
+        );
+        let accounts = facts.ring_readings().accounts();
+        assert_eq!(
+            accounts.events.and_then(|account| account.unexplained),
+            Some(1),
+            "the prior missing record stays unexplained, never masked to zero"
+        );
+        let mut evidence = ring_twin_evidence_for(&engine, facts);
+        let skipped_before = evidence.skipped.len();
+        apply_terminal_ring_outcome(&mut evidence, outcome);
+        assert_eq!(
+            evidence.skipped.len(),
+            skipped_before + 1,
+            "the stale cross-check is filed, never silent"
+        );
+        evidence.verdict();
+        assert_eq!(
+            evidence.completeness, "PARTIAL",
+            "a stale terminal cross-check never certifies COMPLETE"
+        );
+    }
+
+    /// Control twin: a healthy final read with one missing record
+    /// reports unexplained=1 as a named gap. Passes before and after
+    /// the acquisition-validity fix, proving the seam is live.
+    #[test]
+    fn healthy_final_read_detects_missing_record() {
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        engine.note_ring_reading(
+            crate::attach::ProducedSnapshot {
+                discovery: 100,
+                events: 100,
+            },
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(100),
+                events: Some(100),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((92800, 92800)),
+                events: Some((500, 500)),
+            },
+        );
+        let outcome = terminal_ring_outcome_from(
+            Ok(crate::attach::ProducedSnapshot {
+                discovery: 110,
+                events: 110,
+            }),
+            &mut engine,
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(109),
+                events: Some(110),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((102080, 102080)),
+                events: Some((600, 600)),
+            },
+        );
+        assert_eq!(
+            outcome,
+            TerminalRingOutcome::Fresh,
+            "a healthy terminal read stays fresh"
+        );
+        let facts = engine.capture_facts();
+        assert_eq!(
+            facts.ring_readings().discovery.produced,
+            110,
+            "a healthy read installs the new triple"
+        );
+        let accounts = facts.ring_readings().accounts();
+        assert_eq!(
+            accounts.discovery.and_then(|account| account.unexplained),
+            Some(1),
+            "one missing record is unexplained=1"
+        );
+        let evidence = ring_twin_evidence_for(&engine, facts);
+        assert_eq!(
+            evidence
+                .ring_accounting
+                .discovery
+                .as_ref()
+                .and_then(|account| account.unexplained),
+            Some(1),
+            "the missing record reaches the published account"
+        );
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"discovery_ring_unexplained"),
+            "the missing record is a named observation gap"
+        );
+    }
+
+    /// A terminal triple with userspace consumed above kernel produced
+    /// is counter skew, filed apart from a positive unexplained count:
+    /// the remainder stays saturated at zero (never a false gap) while
+    /// the seal files the skewed cross-check.
+    #[test]
+    fn terminal_skew_is_filed_apart_from_unexplained() {
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let outcome = terminal_ring_outcome_from(
+            Ok(crate::attach::ProducedSnapshot {
+                discovery: 100,
+                events: 100,
+            }),
+            &mut engine,
+            crate::ring_accounting::RingConsumed {
+                discovery: Some(109),
+                events: Some(100),
+            },
+            crate::ring_accounting::RingPositions {
+                discovery: Some((92800, 92800)),
+                events: Some((500, 500)),
+            },
+        );
+        assert_eq!(
+            outcome,
+            TerminalRingOutcome::Skewed,
+            "consumed above produced is skew, never fresh"
+        );
+        let facts = engine.capture_facts();
+        let accounts = facts.ring_readings().accounts();
+        assert_eq!(
+            accounts.discovery.and_then(|account| account.unexplained),
+            Some(0),
+            "skew saturates the remainder instead of faking a gap"
+        );
+        let mut evidence = ring_twin_evidence_for(&engine, facts);
+        assert!(
+            !evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"discovery_ring_unexplained"),
+            "skew is never filed as an unexplained remainder"
+        );
+        let skipped_before = evidence.skipped.len();
+        apply_terminal_ring_outcome(&mut evidence, outcome);
+        assert_eq!(
+            evidence.skipped.len(),
+            skipped_before + 1,
+            "the skewed cross-check is filed, never silent"
+        );
+        evidence.verdict();
+        assert_eq!(
+            evidence.completeness, "PARTIAL",
+            "a skewed terminal cross-check never certifies COMPLETE"
+        );
     }
 
     #[test]

@@ -73732,6 +73732,65 @@ fn complete_initial_arming_files_no_window_gap_when_nothing_armed() {
     );
 }
 
+/// A regressing live produced snapshot retains the entire prior triple
+/// — rejected produced is never mixed with new consumed or positions —
+/// and files the live cross-check stale, like the counter path.
+#[test]
+fn regressing_live_produced_reading_retains_the_prior_triple() {
+    let (_fixture, mut engine, _context, _add, _session) = armed_seed_route(1);
+    engine.note_ring_reading(
+        ProducedSnapshot {
+            discovery: 100,
+            events: 100,
+        },
+        crate::ring_accounting::RingConsumed {
+            discovery: Some(100),
+            events: Some(100),
+        },
+        crate::ring_accounting::RingPositions {
+            discovery: Some((92800, 92800)),
+            events: Some((500, 500)),
+        },
+    );
+    engine.note_ring_reading(
+        ProducedSnapshot {
+            discovery: 110,
+            events: 99,
+        },
+        crate::ring_accounting::RingConsumed {
+            discovery: Some(109),
+            events: Some(100),
+        },
+        crate::ring_accounting::RingPositions {
+            discovery: Some((102080, 102080)),
+            events: Some((600, 600)),
+        },
+    );
+    let readings = engine.capture_facts().ring_readings();
+    assert_eq!(
+        readings.discovery.produced, 100,
+        "a regressing snapshot retains the prior produced total"
+    );
+    assert_eq!(
+        readings.discovery.consumed,
+        Some(100),
+        "rejected produced never mixes with new consumed"
+    );
+    assert_eq!(
+        readings.events.produced, 100,
+        "the regressing ring retains its prior produced total"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live ring accounting"
+                && skip.reason
+                    == "a produced counter decreased; the prior ring reading was retained"
+        }),
+        "the regression names the live cross-check: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Startup B4 twin (negative): a zero-millisecond window files no gap even
 /// with armed providers — below the clock's millisecond there is no window
 /// to name.
@@ -73994,4 +74053,45 @@ fn late_holder_relief_refuses_when_every_entry_is_protected() {
         "a refused arrival mutates nothing"
     );
     assert!(!engine.refresh_requested.contains_key(&holder));
+}
+
+/// A failed live produced read keeps the prior triple and files the
+/// live cross-check stale instead of silently keeping the old numbers.
+#[test]
+fn failed_live_produced_read_files_the_stale_cross_check() {
+    let (_fixture, mut engine, _context, _add, _session) = armed_seed_route(1);
+    engine.note_ring_reading(
+        ProducedSnapshot {
+            discovery: 100,
+            events: 100,
+        },
+        crate::ring_accounting::RingConsumed {
+            discovery: Some(100),
+            events: Some(100),
+        },
+        crate::ring_accounting::RingPositions {
+            discovery: Some((92800, 92800)),
+            events: Some((500, 500)),
+        },
+    );
+    engine.note_ring_reading_failed();
+    let readings = engine.capture_facts().ring_readings();
+    assert_eq!(
+        readings.discovery.produced, 100,
+        "the failed read retains the prior produced total"
+    );
+    assert_eq!(
+        readings.discovery.consumed,
+        Some(100),
+        "the failed read retains the prior consumed total"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live ring accounting"
+                && skip.reason
+                    == "the produced-counter read failed; the prior ring reading was retained"
+        }),
+        "the failure names the live cross-check: {:?}",
+        engine.counters.object_skips
+    );
 }

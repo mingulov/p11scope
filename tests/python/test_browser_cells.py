@@ -513,6 +513,25 @@ class BrowserCells(unittest.TestCase):
         with open(result.report_path, encoding="utf-8") as handle:
             report = json.load(handle)
         observations = report.get("object_observations") or {}
+        # Broad inventory observes the run on every build: the browser's
+        # softokn module and its instance must be in the report whether
+        # key rows follow (journal build) or the journal refusal lands
+        # (wide build). An empty capture must fail here, never pass.
+        browser_modules = {
+            module.get("id")
+            for module in report.get("modules") or []
+            if any(str(path).endswith("libsoftokn3.so")
+                   for path in (module.get("paths") or []))
+        }
+        self.assertGreater(
+            len(browser_modules), 0, "browser softokn module missing")
+        browser_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") in browser_modules
+        }
+        self.assertGreater(
+            len(browser_instances), 0, "browser softokn instance missing")
         # Wide-default build (v0.7.0): the production journal is omitted
         # (docs/known-limitations.md "Counter and journal companions at
         # the wide profile"), so `inventory --key-operations` refuses
@@ -560,19 +579,8 @@ class BrowserCells(unittest.TestCase):
             if row.get("category") == "sign")
         self.assertGreaterEqual(
             completed_signs, 1, "no completed client-cert signs observed")
-        browser_modules = {
-            module.get("id")
-            for module in report.get("modules") or []
-            if any(str(path).endswith("libsoftokn3.so")
-                   for path in (module.get("paths") or []))
-        }
-        self.assertGreater(
-            len(browser_modules), 0, "browser softokn module missing")
-        browser_instances = {
-            instance.get("id")
-            for instance in report.get("instances") or []
-            if instance.get("module") in browser_modules
-        }
+        # browser_modules/browser_instances were proven above (both
+        # legs share that data proof); the rows below join against them.
         browser_rows = [row for row in rows
                         if row.get("instance") in browser_instances]
         self.assertGreater(

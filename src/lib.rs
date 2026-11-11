@@ -42,6 +42,7 @@ pub mod cli;
 pub mod discovery;
 pub mod doctor;
 pub mod events;
+pub(crate) mod fanotify;
 #[cfg(test)]
 mod first_use_probe;
 #[cfg(test)]

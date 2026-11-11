@@ -916,3 +916,34 @@ fn counter_readmission_sites_share_the_demote_helper() {
         "the restore site funnels through the shared helper"
     );
 }
+
+/// Startup T3 twin 5 (counter neighbour): bank staging stays in the start
+/// past the ready split — it is bank staging the counter session refuses
+/// to run without, not per-view work — and never moves into the
+/// completion. The counter start-path twins above keep their behavior.
+#[test]
+fn counter_staging_stays_in_start_past_the_ready_split() {
+    let source = include_str!("engine.rs");
+    let start = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("    fn complete_initial_arming(")
+        .expect("completion bounds the start")
+        .0;
+    let completion = source
+        .split_once("    fn complete_initial_arming(")
+        .expect("complete_initial_arming exists")
+        .1
+        .split_once("pub(crate) mod session_fixture")
+        .expect("session fixture bounds the completion")
+        .0;
+    assert!(
+        start.contains("self.stage_counter_initial(&mut session)"),
+        "bank staging stays in the start"
+    );
+    assert!(
+        !completion.contains("stage_counter_initial"),
+        "the completion never stages banks"
+    );
+}

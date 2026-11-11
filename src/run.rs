@@ -26484,6 +26484,79 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// Startup T3 twin 6: both capture loops run the deferred initial
+    /// arming after the ready line and before the hook recount, then
+    /// re-sync their plan consumers — the completion's cleanup pass can
+    /// change the plan silently (no plan-changed tick fires for it), so
+    /// the semantic state, the tracer, the trace header and the endpoint
+    /// selection all resolve against the post-completion plan, exactly as
+    /// when the start armed inline. The loops need a live session, so the
+    /// order is pinned statically; the acceptance transcripts prove it runs.
+    #[test]
+    fn both_capture_loops_complete_initial_arming_after_ready() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("complete_initial_arming(").count(),
+            2,
+            "the profile and trace loops each complete once"
+        );
+        let profile = production
+            .split_once("fn capture_profile(")
+            .expect("profile loop")
+            .1
+            .split_once("fn capture_trace(")
+            .expect("trace loop bounds the profile loop")
+            .0;
+        let trace = production
+            .split_once("fn capture_trace(")
+            .expect("trace loop")
+            .1
+            .split_once("fn terminal_trace_count_line(")
+            .expect("terminal line bounds the trace loop")
+            .0;
+        for (name, body) in [("profile", profile), ("trace", trace)] {
+            let mut pos = 0;
+            for marker in [
+                "capture_ready_line(",
+                "complete_initial_arming(",
+                "sync_plan(",
+                "loader_readiness_hooks(",
+            ] {
+                let at = body[pos..]
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("{name} loop lacks {marker}"));
+                pos += at + marker.len();
+            }
+        }
+        assert_eq!(
+            profile.matches("sync_plan(").count(),
+            1,
+            "profile re-syncs its semantic state once"
+        );
+        assert_eq!(
+            trace.matches("sync_plan(").count(),
+            2,
+            "trace re-syncs its state and its tracer"
+        );
+        let complete = trace.find("complete_initial_arming(").unwrap();
+        let header = trace
+            .find("trace::header(")
+            .expect("trace assembles its header");
+        assert!(
+            complete < header,
+            "the trace header reads the post-completion plan"
+        );
+        let complete = profile.find("complete_initial_arming(").unwrap();
+        let selection = profile
+            .find("run_metrics_selection_stage(")
+            .expect("profile resolves its selection");
+        assert!(
+            complete < selection,
+            "the endpoint selection reads the post-completion plan"
+        );
+    }
+
     #[test]
     fn target_exit_marker_says_the_target_exited() {
         assert_eq!(

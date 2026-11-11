@@ -830,26 +830,63 @@ fn owned_session_prearms_while_exclusively_borrowing_the_unreleased_child() {
     );
 }
 
+/// Startup T3 retarget of `initial_provider_exports_are_attached_before_session_readiness`:
+/// the session now returns before loader arming, so the order pin moves to
+/// `complete_initial_arming` (arms, then exports, then the backlog drain)
+/// plus both capture loops running the completion after the ready line and
+/// before the first tick. Same intent — nothing goes live unarmed — across
+/// the new boundary.
 #[test]
-fn initial_provider_exports_are_attached_before_session_readiness() {
+fn initial_provider_exports_are_attached_after_ready_before_first_tick() {
     let source = include_str!("engine.rs");
-    let route = source
-        .split_once("    fn start_session_with(")
-        .unwrap()
+    let completion = source
+        .split_once("    fn complete_initial_arming(")
+        .expect("complete_initial_arming exists")
         .1
-        .split_once("\n    }\n}")
-        .unwrap()
+        .split_once("pub(crate) mod session_fixture")
+        .expect("session fixture bounds the completion")
         .0;
-    let external_loader = route.find("self.arm_initial_views(").unwrap();
-    let exports = route.find("self.attach_initial_exports(").unwrap();
-    let drain = route
-        .find("let cleanup = self.process_discovery_records(")
-        .unwrap();
-    let ready = route.rfind("Ok(session)").unwrap();
+    let mut pos = 0;
+    for marker in [
+        "self.arm_initial_views(",
+        "self.attach_initial_exports(",
+        "self.process_discovery_records(",
+    ] {
+        let at = completion[pos..]
+            .find(marker)
+            .unwrap_or_else(|| panic!("completion lacks {marker}"));
+        pos += at + marker.len();
+    }
 
-    assert!(external_loader < exports);
-    assert!(exports < drain);
-    assert!(drain < ready);
+    let run = include_str!("../run.rs");
+    let production = run.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+    let profile = production
+        .split_once("fn capture_profile(")
+        .expect("profile loop")
+        .1
+        .split_once("fn capture_trace(")
+        .expect("trace loop bounds the profile loop")
+        .0;
+    let trace = production
+        .split_once("fn capture_trace(")
+        .expect("trace loop")
+        .1
+        .split_once("fn terminal_trace_count_line(")
+        .expect("terminal line bounds the trace loop")
+        .0;
+    for (name, body) in [("profile", profile), ("trace", trace)] {
+        let mut pos = 0;
+        for marker in [
+            "capture_ready_line(",
+            "complete_initial_arming(",
+            "capture_tick_with(",
+        ] {
+            let at = body[pos..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("{name} loop lacks {marker}"));
+            pos += at + marker.len();
+        }
+    }
 }
 
 fn prepared_loader_registry() -> (LoaderRegistry, LoaderContextId) {
@@ -71732,45 +71769,254 @@ fn startup_arming_line_names_counts_and_zero_views() {
     );
 }
 
-/// Startup T1: every `start_session_with` segment is bracketed by its
-/// marker, in emission order. The start needs a live session, so the
-/// bracketing is pinned statically; the acceptance transcripts prove the
-/// lines print.
+/// Startup T3 retarget of `start_session_with_brackets_every_startup_segment_with_a_marker`:
+/// the ready-line split moves the arming, exports and backlog segments (and
+/// their markers) into `complete_initial_arming`, while the initial stage
+/// and prearm finalization stay in `start_session_with`. Each region keeps
+/// its markers in emission order; the completion publishes without `?`
+/// (failures degrade to PARTIAL), so its marker is the bare call.
 #[test]
-fn start_session_with_brackets_every_startup_segment_with_a_marker() {
+fn startup_split_brackets_every_segment_with_a_marker() {
     let source = include_str!("engine.rs");
-    let body = source
+    let start = source
         .split_once("    fn start_session_with(")
         .expect("start_session_with exists")
         .1
+        .split_once("    fn complete_initial_arming(")
+        .expect("completion bounds the start")
+        .0;
+    let completion = source
+        .split_once("    fn complete_initial_arming(")
+        .expect("complete_initial_arming exists")
+        .1
         .split_once("pub(crate) mod session_fixture")
-        .expect("session fixture bounds the start path")
+        .expect("session fixture bounds the completion")
         .0;
     // The marker call and its segment name are separate markers: rustfmt
     // may split the call across lines.
-    let markers = [
+    let start_markers = [
         "start_retained_with(self",
         "\"session_start\"",
         "session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;",
         "startup_segment_line(",
         "\"initial_stage\"",
-        "arm_initial_views(",
-        "startup_arming_line(",
-        "attach_initial_exports(",
-        "startup_segment_line(",
-        "\"initial_exports\"",
-        "publish_current_capture_facts()?",
-        "startup_segment_line(",
-        "\"initial_backlog\"",
         "finalize_prearm_witness(",
         "startup_segment_line(",
         "\"finalize_prearm\"",
     ];
     let mut pos = 0;
-    for marker in markers {
-        let at = body[pos..]
+    for marker in start_markers {
+        let at = start[pos..]
             .find(marker)
-            .unwrap_or_else(|| panic!("start_session_with lacks {marker}"));
+            .unwrap_or_else(|| panic!("start lacks {marker}"));
         pos += at + marker.len();
     }
+    let completion_markers = [
+        "arm_initial_views(",
+        "startup_arming_line(",
+        "attach_initial_exports(",
+        "startup_segment_line(",
+        "\"initial_exports\"",
+        "publish_current_capture_facts()",
+        "startup_segment_line(",
+        "\"initial_backlog\"",
+    ];
+    pos = 0;
+    for marker in completion_markers {
+        let at = completion[pos..]
+            .find(marker)
+            .unwrap_or_else(|| panic!("completion lacks {marker}"));
+        pos += at + marker.len();
+    }
+}
+
+/// Startup T3 twin 1a: a non-owned `start_session_with` returns with loader
+/// arming pending instead of arming. The start needs a live session, so the
+/// deferral is pinned statically: no arm call remains in the start, and the
+/// pending flag is set on the non-owned early return only. The live
+/// acceptance proves the behavior end to end (zero arms at ready time).
+#[test]
+fn non_owned_start_defers_loader_arming_past_session_return() {
+    let source = include_str!("engine.rs");
+    let route = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("\n    }\n}")
+        .expect("start_session_with body ends")
+        .0;
+    assert!(
+        !route.contains("self.arm_initial_views("),
+        "no loader arm runs inside the start"
+    );
+    let gate = route
+        .find("owned_child.is_none()")
+        .expect("the non-owned early return exists");
+    let pend = route
+        .find("initial_arming_pending = true")
+        .expect("the start pends initial arming");
+    let prearm = route
+        .find("self.arm_owned_loader_before_release(")
+        .expect("the owned pre-arm stays in the start");
+    assert!(
+        gate < pend && pend < prearm,
+        "only the non-owned early return pends arming"
+    );
+}
+
+/// Startup T3 twin 4: an owned start never pends initial arming — the whole
+/// pre-exec arming block stays inside the start behind the barrier. Owned
+/// neighbours (`arm_owned_loader_before_release` direct twins, the owned
+/// prearm order test) keep their signatures and stay green untouched.
+#[test]
+fn owned_start_never_pends_initial_arming() {
+    let source = include_str!("engine.rs");
+    let route = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("\n    }\n}")
+        .expect("start_session_with body ends")
+        .0;
+    // Exactly one pending set, on the non-owned early return above the
+    // owned block: the owned path reaches its pre-arm with no flag set.
+    assert_eq!(
+        route.matches("initial_arming_pending = true").count(),
+        1,
+        "one pending set in the start"
+    );
+    let pend = route.find("initial_arming_pending = true").unwrap();
+    let prearm = route
+        .find("self.arm_owned_loader_before_release(")
+        .expect("the owned pre-arm stays in the start");
+    let early_return = route[pend..]
+        .find("return Ok(session)")
+        .expect("the pending set returns before the owned block");
+    assert!(
+        pend + early_return < prearm,
+        "the owned block runs with arming unpended"
+    );
+}
+
+/// Startup T3 twin 1b: the completion arms every scripted view exactly once
+/// (dynamic loader attach calls recorded by the fixture) and clears the
+/// pending flag; a second completion is a no-op. The flag itself is set by
+/// the non-owned start (pinned statically above and proven live); the test
+/// sets it directly to drive the completion half.
+#[test]
+fn complete_initial_arming_arms_the_scripted_views() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    let mut session = ScriptedSession::default();
+    assert_eq!(engine.loader_arms(), 0, "no arm runs before the completion");
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert_eq!(engine.loader_arms(), 3, "one arm attempt per view");
+    assert_eq!(
+        session.dynamic_loader_attach_calls, 3,
+        "one loader attach per view"
+    );
+    assert!(
+        !engine.initial_arming_pending,
+        "the completion clears the pending flag"
+    );
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("a second completion is a no-op");
+    assert_eq!(engine.loader_arms(), 3, "nothing re-arms");
+    assert_eq!(session.dynamic_loader_attach_calls, 3, "no further attach");
+}
+
+/// Startup T3 twin 2: an invariant-class dynamic-loader attach failure
+/// during the completion degrades to PARTIAL with the "initial loader
+/// arming" reason instead of failing the start, and the session stays
+/// usable for scripted ticks. On the pre-split code the same failure
+/// makes the start return `Err`.
+#[test]
+fn complete_initial_arming_degrades_fatal_arm_failure_to_partial() {
+    let views = vec![ProcessView::open(ProcessViewId(0), std::process::id()).unwrap()];
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    let mut session = ScriptedSession::default();
+    // Fail the dynamic-loader attach invariant-class: a recorded detach
+    // failure refuses every later attachment (Registry), exactly like
+    // production after a detach bookkeeping failure. The loader-only
+    // candidate carries no static targets, so preflight and static attach
+    // stay admitted and the failure lands exactly on the loader attach.
+    session.detach_failed = true;
+    let _ = session.detach_dynamic_context(LoaderContextId::from_case_id(0));
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("a fatal arm degrades, never fails the capture");
+    let gap = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "initial loader arming")
+        .expect("the fatal arm names its PARTIAL gap");
+    assert!(
+        gap.reason
+            .contains("dynamic loader attachment invariant failed"),
+        "the gap names the invariant class: {}",
+        gap.reason
+    );
+    engine
+        .service_backlog_quantum(&mut session)
+        .expect("the session stays usable for scripted ticks");
+}
+
+/// Startup T3 twin 3: a stop arriving during the completion arms no further
+/// view and marks the unvisited remainder as a named gap by aggregate
+/// count, without an error. The stop flips after the first view's loader
+/// attach, so one of three views arms and two stay unarmed.
+#[test]
+fn complete_initial_arming_stops_between_views_with_a_named_gap() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    let mut session = ScriptedSession::default();
+    let stop = Cell::new(false);
+    session.before_dynamic_loader_attach = Some(Box::new(|| stop.set(true)));
+    engine
+        .complete_initial_arming(&mut session, &|| stop.get())
+        .expect("a stop during arming is not an error");
+    assert_eq!(
+        session.dynamic_loader_attach_calls, 1,
+        "the in-flight first attach completes"
+    );
+    assert_eq!(engine.loader_arms(), 1, "no further arm is attempted");
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(1))
+            .is_empty(),
+        "the second view stays unarmed"
+    );
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(2))
+            .is_empty(),
+        "the third view stays unarmed"
+    );
+    let gap = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "initial loader arming")
+        .expect("the stop names its gap");
+    assert!(
+        gap.reason.contains("after 1 of 3 views") && gap.reason.contains("2 views not visited"),
+        "the gap counts the unarmed remainder: {}",
+        gap.reason
+    );
 }

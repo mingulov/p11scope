@@ -14382,8 +14382,8 @@ impl Engine {
             // only: during the collected finish at stop no refresh service
             // pass runs, so an admitted head would sit unserviced with no
             // loss record; refuse it below with the explicit loss instead.
-            let newcomer_live = self.views.iter().any(|view| view.pid() == pid)
-                || !process::generation_dead(pid);
+            let newcomer_live =
+                self.views.iter().any(|view| view.pid() == pid) || !process::generation_dead(pid);
             let victim = if newcomer_live && self.collected_finish_actions.is_none() {
                 self.refresh_requested
                     .iter()

@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 241,
+  "default_floor": 242,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -120,6 +120,7 @@
     "attach::tests::collected_retirement_stopped_session_q_closes_original_lp64",
     "attach::tests::revival_probe_clears_a_live_detached_slot_lp64",
     "attach::tests::revival_probe_never_clears_a_singles_slot_lp64",
+    "attach::tests::revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64",
     "attach::tests::sealed_session_drain_linkage_is_behavioral",
     "attach::tests::gate_session_binds_live_gate_and_bank_cells",
     "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",

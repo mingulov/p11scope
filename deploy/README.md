@@ -103,8 +103,11 @@ needs a quiet host.
 Mandatory access control and kernel knobs (measured 2026-11-11):
 
 - SELinux (Fedora, Enforcing, Docker 29.7/29.9): both capability sets
-  capture exactly with the engine's default labeling — no
-  `--security-opt label` flag, no policy module. `--pid=host`
+  capture with the engine's default labeling — no
+  `--security-opt label` flag, no policy module. Full-multiset
+  exactness was shown on sm1 8/8 plus the fedora five-cap twin;
+  fedora system-shipped was 7/8 with one noise-only surplus leg.
+  `--pid=host`
   containers run as `system_u:system_r:spc_t:s0` (bisected: plain and
   five-cap-only containers get `container_t` with MCS categories;
   adding `--pid=host` switches to `spc_t`), under which BPF,

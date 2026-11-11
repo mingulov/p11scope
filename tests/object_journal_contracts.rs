@@ -1818,22 +1818,21 @@ fn object_journal_marker_drop_arms_call_the_gap() {
     let object = &lines[object_at..fork_at];
     // Each object copy holds its own reserve-failure ring-loss arm (gap
     // below) and its own refused-base output-loss arm (fault-covered,
-    // no gap). The retire/output shapes differ per copy: the ordinary
-    // copy retires through the owned removal with a direct output
-    // closure, the generic copy through the journal removal with a
-    // block output closure.
+    // no gap). The retire shapes differ per copy (owned vs journal
+    // removal); both output closures share the block shape that bumps
+    // the produced counter on a successful submit.
     for (name, body, retire, output) in [
         (
             "ordinary",
             object_ordinary,
             "preserve_refused_base(||owned_start_remove(&key,true).is_ok(),||unsafe{p11_object_fault()},",
-            "||EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok(),",
+            "||{letok=EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok();ifok{bump_produced(PRODUCED_EVENTS);}ok},",
         ),
         (
             "generic",
             object,
             "preserve_refused_base(||start_remove_for::<JOURNAL>(&key,true,JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),||unsafe{p11_object_fault()},",
-            "||{EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok()},",
+            "||{letok=EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok();ifok{bump_produced(PRODUCED_EVENTS);}ok},",
         ),
     ] {
         assert_eq!(
@@ -1966,13 +1965,13 @@ fn object_journal_refused_base_loss_stays_fault_covered() {
             "ordinary copy",
             object_ordinary,
             "preserve_refused_base(||owned_start_remove(&key,true).is_ok(),||unsafe{p11_object_fault()},",
-            "||EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok(),",
+            "||{letok=EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok();ifok{bump_produced(PRODUCED_EVENTS);}ok},",
         ),
         (
             "generic copy",
             object,
             "preserve_refused_base(||start_remove_for::<JOURNAL>(&key,true,JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),||unsafe{p11_object_fault()},",
-            "||{EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok()},",
+            "||{letok=EVENTS.output::<EventRecord>(unsafe{&(*raw).base},0).is_ok();ifok{bump_produced(PRODUCED_EVENTS);}ok},",
         ),
     ] {
         assert!(

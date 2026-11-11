@@ -42993,6 +42993,52 @@ fn e07_incomplete_rescan_with_agreeing_pins_retains() {
     );
 }
 
+/// Positive guard for the incomplete-scan refusal: fresh facts that agree
+/// with their retained identity still union on an incomplete scan — only
+/// a disproved identity refuses, never a changed-but-agreed observation.
+#[test]
+fn e07_incomplete_rescan_unions_agreed_fresh_facts() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    let before = e07_active_targets(&engine);
+    assert!(!before.is_empty(), "the planted table is covered");
+
+    provider.retarget_table(provider.second_bootstrap);
+    engine.loader_force_record_scan_incomplete = true;
+    e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+
+    let after = e07_active_targets(&engine);
+    assert!(
+        after.is_superset(&before),
+        "the union keeps retained targets: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        2,
+        "agreed fresh facts union on an incomplete scan: before={before:?} after={after:?}"
+    );
+}
+
 /// An unchanged metadata-only announcement must preserve validated
 /// endpoints: no retirement, no dependency re-pinning, no slot churn.
 /// Memory -> metadata -> memory keeps identical dependency IDs, active

@@ -1437,6 +1437,49 @@ impl PinnedObjects {
         true
     }
 
+    /// Whether fresh pins positively disprove one observed module's
+    /// retained identity: its own file or a table-entry dependency. A
+    /// contradiction needs a fresh pin for the raw that names a
+    /// different physical file than the retained entry (the same merge
+    /// predicate absorption uses to file an observation).
+    /// Missing evidence — no fresh pin, or no retained identity for
+    /// the raw — is never a contradiction: an unobserved or unpinned
+    /// member keeps the conservative path, only an observed
+    /// disagreement refuses.
+    pub(crate) fn fresh_pins_contradict_module(
+        &self,
+        incoming: &PinnedObjects,
+        module: &ScannedModule,
+    ) -> bool {
+        let mut raws = Vec::new();
+        let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) else {
+            return true;
+        };
+        raws.push(own);
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            let Some(target) = RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            else {
+                return true;
+            };
+            raws.push(target);
+        }
+        for raw in &raws {
+            let (Some(fresh_id), Some(kept_id)) =
+                (incoming.raw_to_id.get(raw), self.raw_to_id.get(raw))
+            else {
+                continue;
+            };
+            let (Some(fresh), Some(kept)) = (incoming.by_id.get(fresh_id), self.by_id.get(kept_id))
+            else {
+                continue;
+            };
+            if !ordinary_identity_equal(kept, fresh) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Test-only: overwrite the held entry of `id` with a clone of
     /// `source`'s entry, keeping every raw mapping. This crafts the
     /// forgery shape the identity layer defends against: the raw still
@@ -11531,6 +11574,97 @@ mod tests {
         assert!(
             !retained.fresh_pins_reprove(&fresh, &[scanned]),
             "a moved path is not a reproof of the old observation"
+        );
+    }
+
+    #[test]
+    fn contradiction_accepts_agreeing_module_and_dependency() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dependency = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        for pins in [&retained, &fresh] {
+            assert!(pins.raw_to_id.keys().any(|raw| raw.key == key));
+            assert!(pins.raw_to_id.keys().any(|raw| raw.key == dependency));
+        }
+        let mut scanned = module(key);
+        scanned.tables[0].entries[0].object = dependency;
+        assert!(
+            !retained.fresh_pins_contradict_module(&fresh, &scanned),
+            "agreeing fresh pins contradict nothing"
+        );
+    }
+
+    #[test]
+    fn contradiction_flags_a_rewritten_digest() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let fresh = image_pins(&[(key, "bbbbbbbb", 1)]);
+        assert!(
+            retained.fresh_pins_contradict_module(&fresh, &module(key)),
+            "a changed digest is a contradiction"
+        );
+    }
+
+    #[test]
+    fn contradiction_flags_a_disproved_dependency() {
+        // The owning module still agrees; only the entry target's file
+        // changed. The module closure is still contradicted.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dependency = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "cccccccc", 1)]);
+        let mut scanned = module(key);
+        scanned.tables[0].entries[0].object = dependency;
+        assert!(
+            retained.fresh_pins_contradict_module(&fresh, &scanned),
+            "a disproved dependency contradicts its module"
+        );
+    }
+
+    #[test]
+    fn contradiction_ignores_missing_evidence() {
+        // No fresh pin at all: missing evidence, never a disproof.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dependency = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        assert!(
+            !retained.fresh_pins_contradict_module(&PinnedObjects::empty(), &module(key)),
+            "an unpinned observation is not a contradiction"
+        );
+        // A fresh pin for a raw the retained set never filed (a new
+        // dependency): the ordinary identity path must reconcile it,
+        // the incomplete scan must not refuse on it.
+        let retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let fresh = image_pins(&[(key, "aaaaaaaa", 1), (dependency, "bbbbbbbb", 1)]);
+        assert!(fresh.raw_to_id.keys().any(|raw| raw.key == dependency));
+        assert!(retained.raw_to_id.keys().all(|raw| raw.key != dependency));
+        let mut scanned = module(key);
+        scanned.tables[0].entries[0].object = dependency;
+        assert!(
+            !retained.fresh_pins_contradict_module(&fresh, &scanned),
+            "an unretained fresh raw is not a contradiction"
         );
     }
 

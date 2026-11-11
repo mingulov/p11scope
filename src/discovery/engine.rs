@@ -18412,7 +18412,14 @@ impl Engine {
         // An incomplete scan is not proof that a provider disappeared: when
         // the memory rescan was bounded, this view's existing modules are
         // retained after their pins revalidate instead of being replaced by
-        // partial results. Metadata-only scans keep their own explicit
+        // partial results. A contradicted observation is not partial
+        // evidence, though: fresh pins that disprove a retained identity
+        // never credit fresh facts to the disproved identity — the
+        // incomplete path refuses those facts, other paths replace —
+        // and a metadata scan refuses retention for a contradicted
+        // module even though unpinned restored dependencies are
+        // preserved.
+        // Metadata-only scans keep their own explicit
         // table restoration above; failed revalidation falls through to the
         // replacement below, so stale identity still retires. A rescan that
         // finds exactly the same files also retains their pin IDs — but
@@ -18451,14 +18458,49 @@ impl Engine {
             .collect();
         found_files.sort();
         let same_files = retained_files == found_files && self.views[position].still_the_same();
+        // A metadata-only scan never observes memory: its restored tables
+        // are retained hearsay, and their dependencies carry no fresh
+        // pins. Whole-view reproof would therefore refuse every unchanged
+        // announcement and retire validated coverage through replacement.
+        // The metadata arm instead refuses only a positively contradicted
+        // module; unpinned restored dependencies are preserved until the
+        // deferred memory scan proves them fresh.
         let revalidated = (!found_complete
             && mode == LoaderScanMode::Memory
             && self.views[position].still_the_same()
             && self.view_pins_unchanged(view_id))
             || (same_files
                 && self.view_pins_unchanged(view_id)
-                && self.pinned.fresh_pins_reprove(&fresh_pins, &found));
+                && if mode == LoaderScanMode::MetadataOnly {
+                    found.iter().all(|module| {
+                        !self
+                            .pinned
+                            .fresh_pins_contradict_module(&fresh_pins, module)
+                    })
+                } else {
+                    self.pinned.fresh_pins_reprove(&fresh_pins, &found)
+                });
         let (candidate_pins, raw_modules) = if revalidated {
+            // An incomplete scan retains what it did not observe, but a
+            // fresh observation that positively disproves its retained
+            // identity must not union its facts into the disproved
+            // module: the retained facts stay while the contradicted
+            // fresh ones are refused. Missing evidence (no fresh pin)
+            // is never a disproof and keeps the conservative union.
+            // Complete scans need no filter: retention there already
+            // required whole-view reproof.
+            let found: Vec<ScannedModule> = if found_complete {
+                found
+            } else {
+                found
+                    .into_iter()
+                    .filter(|module| {
+                        !self
+                            .pinned
+                            .fresh_pins_contradict_module(&fresh_pins, module)
+                    })
+                    .collect()
+            };
             let mut candidate_pins = self.pinned.clone();
             // Fresh pins cover only newly observed modules: re-pinning
             // retained ones under an exhausted budget would reject their

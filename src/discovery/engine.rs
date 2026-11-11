@@ -1034,7 +1034,14 @@ const INITIAL_ARMING_SUBJECT: &str = "initial loader arming";
 /// admitted within about this long of its record instead of waiting for
 /// the whole initial set, while one arm's fixed costs stay amortized
 /// between batches. Provisional — ratify by measurement.
-const INITIAL_ARMING_YIELD_INTERVAL_NS: u64 = 100_000_000;
+const INITIAL_ARMING_YIELD_INTERVAL_NS: u64 = 250_000_000;
+
+/// Minimum initial views visited between discovery batches serviced
+/// during initial arming (the first batch is unrationed): bounds how far
+/// ambient churn can stretch the arming window — at the 256-view cap at
+/// most 32 batches interleave — while a late provider still waits at
+/// most a few arms. Provisional — ratify by measurement.
+const INITIAL_ARMING_YIELD_VIEWS: u64 = 8;
 /// Retry delay for a held-back process, in inventory passes; doubles per
 /// repeated isolation up to `HELD_BACK_RETRY_BASE_PASSES << 6`.
 const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
@@ -33251,6 +33258,8 @@ impl Engine {
         let mut attached = 0u64;
         let arms_before = self.loader_arms;
         let mut last_yield_ns: Option<u64> = None;
+        let mut yielded_once = false;
+        let mut visited_since_yield = 0u64;
         for (index, view_id) in initial_ids.iter().copied().enumerate() {
             if stop_requested() {
                 let done = index as u64;
@@ -33298,27 +33307,34 @@ impl Engine {
                     self.initial_arm_counts(views, stale, arms_before, attached),
                 );
             }
+            visited_since_yield = visited_since_yield.saturating_add(1);
             // Arming every initial view can take seconds on a busy host;
             // a program that execs during that window must not wait for
             // the last arm. Between arms, service staged discovery with
             // one ordinary batch (records, loader scans, one inventory
-            // tick) at most once per yield interval; the remaining
-            // initial arms then continue. Exports still attach only
-            // after every initial arm, in the caller's order.
+            // tick); the remaining initial arms then continue. Exports
+            // still attach only after every initial arm, in the caller's
+            // order. Yields are rationed by visited views and wall time
+            // so ambient churn cannot stretch arming without bound: at
+            // the 256-view cap at most 32 batches interleave.
             let work_waiting = session.staged_discovery_len() > 0
                 || !self.pending_discovery_records.is_empty()
                 || !self.refresh_requested.is_empty()
                 || !self.pending_loader_scans.is_empty();
             if work_waiting && !stop_requested() {
                 let now_ns = crate::attach::monotonic_ns();
-                let due = match (last_yield_ns, now_ns) {
+                let interval_due = match (last_yield_ns, now_ns) {
                     (Some(last), Some(now)) => {
                         now.saturating_sub(last) >= INITIAL_ARMING_YIELD_INTERVAL_NS
                     }
                     _ => true,
                 };
-                if due {
+                if !yielded_once
+                    || (visited_since_yield >= INITIAL_ARMING_YIELD_VIEWS && interval_due)
+                {
                     last_yield_ns = now_ns;
+                    yielded_once = true;
+                    visited_since_yield = 0;
                     if let Err(error) = self.service_discovery_during_initial_arming(session) {
                         return (
                             Some(error),

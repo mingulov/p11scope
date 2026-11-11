@@ -41999,6 +41999,8 @@ impl E07Provider {
     /// A second load of the same file in a fresh linker namespace (the
     /// `dlmopen` double-load shape): the scanner must see one module with
     /// two same-file loads, not two modules. The caller `dlclose`s it.
+    /// glibc-only: musl has no `dlmopen`.
+    #[cfg(target_env = "gnu")]
     fn open_second_load(&self) -> *mut std::ffi::c_void {
         let cpath = std::ffi::CString::new(self.path.as_os_str().as_bytes()).unwrap();
         // SAFETY: an owned file still on disk; RTLD_LOCAL keeps its
@@ -43629,6 +43631,7 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
 /// A complete same-file rescan lowers proof it disproves: after one of two
 /// same-file loads goes away, the retained load count drops back to one
 /// instead of keeping the union maximum.
+#[cfg(target_env = "gnu")]
 #[test]
 fn e07_complete_rescan_with_fewer_loads_lowers_load_count() {
     let provider = E07Provider::dlopen();

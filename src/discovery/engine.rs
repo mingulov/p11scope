@@ -33564,7 +33564,12 @@ impl Engine {
                 (pulled, pulled_malformed)
             }
         };
-        self.apply_discovery_batch(session, records, malformed)?;
+        // A live frame, like the capture loops run: the frame budget and
+        // its starvation bound apply, so a full refresh queue parked
+        // behind pressure rotation cannot block the inventory tick for
+        // the whole arming window the way an unframed batch would
+        // (tick_blocked with no starved escape outside a live frame).
+        self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))?;
         Ok(())
     }
 

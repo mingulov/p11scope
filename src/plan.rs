@@ -5499,6 +5499,32 @@ fn standard_layout_shape(table: &ScannedTable) -> bool {
         || (table.version.0 == 3 && table.extension_impossible && table.decoded_slot_count() == 68)
 }
 
+/// The ruling's common prerequisites (controller ruling 2026-11-11
+/// clause 1) that every standard-layout admission leg must satisfy:
+/// the version/count shape holds and every retained entry points
+/// into the provider's own object. The sole-complete and
+/// getter-export legs prove this inside their stricter predicates;
+/// the interface-linkage and live-return legs prove it here, so no
+/// leg can grant argument-read authority on linkage or return
+/// evidence alone. Entries reconciliation could not pin mint no
+/// target rows, so no argument is read through them either way.
+fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
+    let scanned = &module.scanned;
+    let table = &scanned.tables[index];
+    if !standard_layout_shape(table) {
+        return false;
+    }
+    let Some(objects) = module.entry_objects.get(index) else {
+        return false;
+    };
+    objects.len() == table.entries.len()
+        && table
+            .entries
+            .iter()
+            .zip(objects.iter())
+            .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
+}
+
 /// Typed-getter-export leg (controller ruling 2026-11-11 clause 1): the
 /// sole-complete leg generalized past 68 slots and past the 2.x getter
 /// exclusion. The provider exports `C_GetFunctionList` or
@@ -5718,21 +5744,25 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // Manifest corroboration is confirmed authority, not
         // standard-layout. Unknown or vendor-shifted tables stay
         // count-only: no argument is ever read through an unproven slot.
-        // The interface-linkage and sole-complete legs carry their own
-        // layout proof (the provider's own "PKCS 11" record naming this
-        // table; the sole leg's full version-consistent own-code walk).
-        // The getter-export leg generalizes the sole leg past 68 slots
-        // under the same ambient guards (see
+        // Every leg also satisfies the clause-1 core
+        // (`standard_layout_core`: version-consistent slot count,
+        // every retained entry in the provider's own object). The
+        // sole-complete and getter-export predicates include it in
+        // their stricter checks; an interface record naming the
+        // table or a live getter return proves neither the shape
+        // nor the entry destinations, so those legs check the core
+        // explicitly. The getter-export leg generalizes the sole
+        // leg past 68 slots under the same ambient guards (see
         // `getter_export_authorized`).
         let standard_layout_evidence = if !authorized || score.manifest {
             None
-        } else if score.linked {
+        } else if score.linked && standard_layout_core(module, index) {
             Some("interface linkage")
         } else if sole_complete_table_authorized(module, index, &exports) {
             Some("sole complete table")
         } else if getter_export_authorized(module, index, &exports, &score) {
             Some("typed getter export")
-        } else if scan_authorized && score.live_return {
+        } else if scan_authorized && score.live_return && standard_layout_core(module, index) {
             Some("typed getter return")
         } else {
             None
@@ -8803,13 +8833,7 @@ mod tests {
                     | extra,
             )
         };
-        let sign_ev = || {
-            observed_event(
-                sign,
-                0,
-                p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
-            )
-        };
+        let sign_ev = || observed_event(sign, 0, p11scope_ebpf_common::capture::OUTPUT_NON_NULL);
         let mut state = crate::semantics::State::new(&plan);
         state.observe(&init_ev(
             0xCE53_43A9,
@@ -8873,7 +8897,10 @@ mod tests {
         let sign = slot_named(&plan, "C_Sign");
         plan.standard_layout_slots.remove(&sign_init);
         assert!(!plan.is_standard_layout_slot(sign_init), "Init confirmed");
-        assert!(plan.is_standard_layout_slot(sign), "operation standard-layout");
+        assert!(
+            plan.is_standard_layout_slot(sign),
+            "operation standard-layout"
+        );
         let mut state = crate::semantics::State::new(&plan);
         state.observe(&observed_event(
             sign_init,
@@ -10170,34 +10197,35 @@ mod tests {
     fn linked_scan_label_disputing_the_manifest_stays_count_only() {
         // The safety property the unlinked case retires survives where it has
         // teeth: two AUTHORIZED names disagreeing about one target stay
-        // unresolvable, counted but never attributed.
-        use crate::discovery::scan::ScannedInterface;
-
-        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
-        scanned.scanned.interfaces.push(ScannedInterface {
-            index: 0,
-            name_class: "exact_standard",
-            name_lossy: None,
-            name_private: Some(b"PKCS 11".to_vec()),
-            flags: 0,
-            table: Some(0),
-        });
-        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+        // unresolvable, counted but never attributed. The scan side is a
+        // full standard-layout linked table (the only linked shape the
+        // ruling admits); the manifest disputes its C_Sign target.
+        let scanned = interface_linked_module();
+        let sign_offset = scanned.scanned.tables[0]
+            .entries
+            .iter()
+            .find(|entry| entry.name == "C_Sign")
+            .expect("C_Sign entry")
+            .file_offset;
+        let manifest = manifest_with(vec![resolved("C_Login", sign_offset)]);
 
         let plan = build_from_test_sources(
             std::slice::from_ref(&scanned),
             std::slice::from_ref(&manifest),
         );
 
-        assert_eq!(plan.slots.len(), 1);
-        assert_eq!(plan.slots[0].names, ["C_Login", "C_Sign"]);
+        let slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_Login", "C_Sign"])
+            .expect("disputed slot");
         // Owner 2026-11-11 (no manifest needed for standard providers):
         // the linked scan claim is now authorized like the manifest
         // claim, so both claims are authorized; the dispute still
         // resolves to count-only through the ambiguous descriptor.
-        assert!(plan.slots[0].semantic_authorized);
-        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
-        assert!(plan.slots[0].semantic_ambiguous);
+        assert!(slot.semantic_authorized);
+        assert_eq!(slot.semantics, SlotSemantics::COUNT_ONLY);
+        assert!(slot.semantic_ambiguous);
     }
 
     fn prearm_piece(proved: Vec<(String, u64)>) -> PrearmPlanPiece {

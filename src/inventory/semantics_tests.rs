@@ -115,6 +115,14 @@ impl ProviderFixture {
     }
 
     fn source(&self, names: [&'static str; 2]) -> ReconciledModule {
+        // A full 2.40 layout: the two named entries plus NULL holes
+        // for every other standard slot, so the decoded slot count
+        // matches the version (the standard-layout admission core).
+        let null_entries: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .filter(|name| !names.contains(name))
+            .collect();
         let object = self.pins.pinned().next().unwrap().id;
         let key = self.pins.raw_keys_for(object)[0];
         let view =
@@ -148,7 +156,7 @@ impl ProviderFixture {
                             file_offset,
                         })
                         .collect(),
-                    null_entries: Vec::new(),
+                    null_entries,
                     unpinned: Vec::new(),
                     address: 0,
                     file_offset: Some(0x40),
@@ -783,10 +791,12 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
     // Grow both providers the way they present live (fedora
     // SUBSETDIAG, 2026-11-05): the incomplete proxy's plan demand
     // is capped near 410 endpoints and admitted first-come,
-    // leaving less than the complete provider's 212 in the
+    // leaving less than the complete provider needs in the
     // 512-slot Detailed space, so the complete provider is
     // refused whole. Here: bad claims 4 tables x 100 endpoints,
-    // good needs 212 in one full table.
+    // good needs 160 across two full tables. Every grown table is
+    // a full 3.2 layout (104 decoded slots: entries plus NULL
+    // holes), the only shape standard-layout admission accepts.
     fn grow(module: &mut ReconciledModule, base: u64, tables: usize, per_table: u64) {
         let template = module.scanned.tables[0].clone();
         let names: Vec<&'static str> = template.entries.iter().map(|entry| entry.name).collect();
@@ -796,6 +806,7 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
         module.scanned.tables.clear();
         for t in 0..tables {
             let mut table = template.clone();
+            table.version = (3, 2);
             table.walk = if t == 0 { first_walk } else { "full" };
             table.entries.clear();
             for j in 0..per_table {
@@ -806,11 +817,17 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
                     file_offset: base + (t as u64) * per_table + j,
                 });
             }
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .cycle()
+                .take(104 - per_table as usize)
+                .collect();
             module.scanned.tables.push(table);
         }
     }
     grow(&mut bad, partial.offsets[0], 4, 100);
-    grow(&mut good, complete.offsets[0], 1, 212);
+    grow(&mut good, complete.offsets[0], 2, 80);
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
     let prepared = prepare_scan_attested_subset(&engine);
@@ -825,7 +842,7 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
         .subset
         .expect("a complete provider mints beside a huge incomplete one");
     assert_eq!(subset.required().len(), 1, "only the complete provider");
-    assert_eq!(subset.plan().slots.len(), 212);
+    assert_eq!(subset.plan().slots.len(), 160);
     assert!(
         subset
             .plan()
@@ -1291,6 +1308,8 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
         module.scanned.tables.clear();
         for t in 0..tables {
             let mut table = template.clone();
+            // Full 3.2 layouts (104 decoded slots), as above.
+            table.version = (3, 2);
             table.walk = "full";
             table.entries.clear();
             for j in 0..per_table {
@@ -1301,6 +1320,12 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
                     file_offset: base + (t as u64) * per_table + j,
                 });
             }
+            table.null_entries = pkcs11_module::FUNCTION_LIST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .cycle()
+                .take(104 - per_table as usize)
+                .collect();
             module.scanned.tables.push(table);
         }
     }
@@ -1313,7 +1338,7 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
         4,
         100,
     );
-    grow(&mut good, good_key, None, complete.offsets[0], 1, 212);
+    grow(&mut good, good_key, None, complete.offsets[0], 2, 80);
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
     let prepared = prepare_scan_attested_subset(&engine);
@@ -1328,7 +1353,7 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
         .subset
         .expect("a complete provider mints beside a huge cross-object one");
     assert_eq!(subset.required().len(), 1, "only the complete provider");
-    assert_eq!(subset.plan().slots.len(), 212);
+    assert_eq!(subset.plan().slots.len(), 160);
 }
 
 /// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live

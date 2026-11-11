@@ -274,7 +274,7 @@ fn inventory_objects_carry_exactly_the_loader_manifest_maps() {
     ] {
         let object = aya_obj::Object::parse(bytes).unwrap();
         let actual: BTreeSet<&str> = object.maps.keys().map(String::as_str).collect();
-        let mut expected: BTreeSet<&str> = manifest.keys().map(|name| *name).collect();
+        let mut expected: BTreeSet<&str> = manifest.keys().copied().collect();
         expected.extend(extra.iter().map(|(name, ..)| *name));
         assert_eq!(
             actual, expected,

@@ -243,6 +243,7 @@
     "scope::tests::privileged_run_cgroup_create_under_observer_stays_nested",
     "discovery::scan::tests::privileged_chrooted_process_scan_resolves_host_mappings",
     "discovery::scan::tests::privileged_foreign_mount_namespace_scan_collapses_unopenable_objects",
+    "discovery::identity::tests::privileged_jailed_view_pins_through_map_files_without_poisoning_its_group",
     "attach::tests::full_root_load_refusal_is_classified"
   ],
   "alternative_cells": [

@@ -72874,7 +72874,6 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
     c.wait().unwrap();
 }
 
-<<<<<<< HEAD
 /// Startup T1: the segment marker names the segment and its milliseconds,
 /// or `n/a` when the clock read failed.
 #[test]

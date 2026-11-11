@@ -4223,6 +4223,20 @@ pub(crate) fn admit_call_from_evidence(
             }
         }
     };
+    // Membership gate (ruling 2026-11-11 clause 2): through a
+    // standard-layout-only slot, a mechanism value outside the
+    // registered CKM_* registry enters the edge reducer as no
+    // mechanism at all, so its number is never published per-edge.
+    let capture = if plan.is_standard_layout_slot(slot.index)
+        && evidence.event.capture & p11scope_ebpf_common::capture::MECHANISM_MASK
+            == p11scope_ebpf_common::capture::MECHANISM_VALUE
+        && crate::mechanism_names::mechanism_name(evidence.event.mechanism).is_none()
+    {
+        (evidence.event.capture & !p11scope_ebpf_common::capture::MECHANISM_MASK)
+            | p11scope_ebpf_common::capture::MECHANISM_NONE
+    } else {
+        evidence.event.capture
+    };
     Ok(AdmittedInstanceCall {
         key: InstanceKey {
             domain: evidence.domain,
@@ -4240,7 +4254,7 @@ pub(crate) fn admit_call_from_evidence(
             rv: evidence.event.rv,
             session: evidence.event.session,
             mechanism: evidence.event.mechanism,
-            capture: evidence.event.capture,
+            capture,
             slot_id: evidence.event.slot_id,
             target_function: evidence.event.target_function,
             async_value: evidence.event.async_value,

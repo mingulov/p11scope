@@ -67,6 +67,13 @@ pub struct MechStat {
     /// from it: purge and reconciliation drop both together, and a cell
     /// can never outlive its row.
     pub by_module: BTreeMap<ModuleId, MechCallStat>,
+    /// At least one observation arrived through a standard-layout-only
+    /// slot (scan layout evidence, no manifest). JSON renders the
+    /// attribution basis from this and `attributed_confirmed`.
+    pub attributed_standard_layout: bool,
+    /// At least one observation arrived through a manifest/confirmed
+    /// (or synthetic confirmed) slot.
+    pub attributed_confirmed: bool,
 }
 
 #[cfg(test)]
@@ -2547,6 +2554,11 @@ pub struct SemanticEvidence {
     /// observation except those refused by the shared budget (counted
     /// in `semantic_state_drops`).
     pub mechanism_id_overflow: u64,
+    /// Mechanism observations through standard-layout-only slots whose
+    /// value is not an exact member of the registered CKM_* registry
+    /// (controller ruling 2026-11-11 clause 2): counted here only, the
+    /// number itself is never published and no row/cell is kept.
+    pub unregistered_standard_layout_mechanisms: u64,
     /// Closed or unauthenticated history records omitted from semantic totals.
     pub semantic_history_drops: u64,
 }
@@ -2575,6 +2587,7 @@ struct SlotMeta {
     fork_safe: bool,
     module: ModuleId,
     module_ids: Vec<ModuleId>,
+    standard_layout: bool,
 }
 
 impl SlotMeta {
@@ -2811,6 +2824,15 @@ enum MechanismCapture {
     Value(u64),
 }
 
+/// Membership gate (controller ruling 2026-11-11 clause 2): a mechanism
+/// value read through a standard-layout-only slot publishes only when
+/// it is an exact member of the registered CKM_* registry (standard ids
+/// plus the listed vendor ids, i.e. it has a registered name). Through
+/// a manifest/confirmed slot every value publishes as before.
+fn mechanism_publishable(meta: &SlotMeta, mechanism: u64) -> bool {
+    !meta.standard_layout || crate::mechanism_names::mechanism_name(mechanism).is_some()
+}
+
 fn mechanism_capture(ev: &Event) -> MechanismCapture {
     match ev.capture & capture::MECHANISM_MASK {
         capture::MECHANISM_NULL => MechanismCapture::Null,
@@ -2889,6 +2911,7 @@ fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
             fork_safe: slot.fork_safe,
             module: plan.module_of_slot(slot.index).unwrap_or(MODULE_UNRESOLVED),
             module_ids: slot.module_ids.clone(),
+            standard_layout: plan.is_standard_layout_slot(slot.index),
         });
     }
     slots
@@ -2909,6 +2932,7 @@ fn slot_semantics_changed(previous: &SlotMeta, next: Option<&SlotMeta>) -> bool 
         || previous.fork_safe != next.fork_safe
         || previous.module != next.module
         || previous.module_ids != next.module_ids
+        || previous.standard_layout != next.standard_layout
 }
 
 impl State {
@@ -3348,6 +3372,13 @@ impl State {
         let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
             return;
         };
+        if !mechanism_publishable(meta, mechanism) {
+            self.evidence.unregistered_standard_layout_mechanisms = self
+                .evidence
+                .unregistered_standard_layout_mechanisms
+                .saturating_add(1);
+            return;
+        }
         // The per-id table cap precedes the shared budget: a new id past
         // 256 sheds here with its own named count, keeping no row and no
         // cgroup/module cell, instead of falling through to the generic
@@ -3366,6 +3397,8 @@ impl State {
         }
         let stat = self.mechanisms.entry(mechanism).or_default();
         stat.unregistered |= ev.capture & capture::MECHANISM_UNREGISTERED != 0;
+        stat.attributed_standard_layout |= meta.standard_layout;
+        stat.attributed_confirmed |= !meta.standard_layout;
         record_call(stat, ev);
         // E19: skip the `String` allocation when the operation name is
         // already recorded. `BTreeSet<String>::contains` borrows `&str`,
@@ -3467,6 +3500,13 @@ impl State {
             }
         }
         for (mechanism, unregistered) in mechanisms {
+            if !mechanism_publishable(meta, mechanism) {
+                self.evidence.unregistered_standard_layout_mechanisms = self
+                    .evidence
+                    .unregistered_standard_layout_mechanisms
+                    .saturating_add(1);
+                continue;
+            }
             // The per-id table cap precedes the shared budget here too: a
             // new id past 256 sheds entirely (no cgroup cell either —
             // unlike a budget refusal, which still records cgroup
@@ -3491,6 +3531,8 @@ impl State {
             }
             let stat = self.mechanisms.entry(mechanism).or_default();
             stat.unregistered |= unregistered;
+            stat.attributed_standard_layout |= meta.standard_layout;
+            stat.attributed_confirmed |= !meta.standard_layout;
             record_call(stat, ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
             self.record_module_mechanism(mechanism, meta.module, ev.rv, unregistered);

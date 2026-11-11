@@ -310,7 +310,7 @@ pub fn unverified_note() -> &'static str {
 /// and scan-found slots are never authorized, so the note errs toward
 /// disclosure.
 pub(crate) fn watches_unverified(plan: &AttachPlan) -> bool {
-    plan.slots.is_empty() || plan.slots.iter().any(|slot| !slot.semantic_authorized)
+    plan.slots.is_empty() || plan.semantic_unverified_slot_count() > 0
 }
 
 /// One rendered caller identity: the process plus its verified-or-owned
@@ -598,6 +598,7 @@ struct TraceSlot {
     /// `plan::presented_label`: names, or `function #<ordinal> (unnamed)` when unnamed.
     label: String,
     semantics: p11scope_ebpf_common::SlotSemantics,
+    standard_layout: bool,
 }
 
 fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
@@ -610,6 +611,7 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
         slots[index] = Some(TraceSlot {
             label: plan.label_of(slot),
             semantics: plan.effective_semantics(slot),
+            standard_layout: plan.is_standard_layout_slot(slot.index),
         });
     }
     slots
@@ -777,6 +779,16 @@ impl Tracer {
         let mut rendered = *ev;
         if !semantic {
             rendered.capture = 0;
+        }
+        // Membership gate (ruling 2026-11-11 clause 2): a mechanism
+        // value outside the registered CKM_* registry read through a
+        // standard-layout-only slot never prints as a number.
+        if slot.as_ref().is_some_and(|slot| slot.standard_layout)
+            && rendered.capture & capture::MECHANISM_MASK == capture::MECHANISM_VALUE
+            && crate::mechanism_names::mechanism_name(rendered.mechanism).is_none()
+        {
+            rendered.capture =
+                (rendered.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NONE;
         }
         // The roll-up counts exactly this line, under exactly the caller
         // identity the line shows: the verified path when present, else
@@ -1299,6 +1311,9 @@ mod tests {
             semantic_key_budget: crate::semantics::MAX_STATE_KEYS,
             semantic_state_drops: 0,
             mechanism_id_overflow: 0,
+            unregistered_standard_layout_mechanisms: 0,
+            standard_layout_slots: 0,
+            standard_layout_evidence: Vec::new(),
             semantic_history_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,

@@ -1283,6 +1283,17 @@ pub struct Evidence {
     /// refused by the shared budget (counted in `semantic_state_drops`).
     /// Forces `PARTIAL`, like every other shed observation.
     pub mechanism_id_overflow: u64,
+    /// Mechanism observations through standard-layout-only slots whose
+    /// value is outside the registered CKM_* registry: counted only,
+    /// the number is never published (ruling 2026-11-11 clause 2).
+    pub unregistered_standard_layout_mechanisms: u64,
+    /// Planned slots whose semantic authority is standard-layout scan
+    /// evidence only. Renderer metadata for the coverage note.
+    #[serde(skip)]
+    pub standard_layout_slots: u64,
+    /// Layout-evidence labels behind those slots, for the note.
+    #[serde(skip)]
+    pub standard_layout_evidence: Vec<String>,
     pub semantic_history_drops: u64,
     pub pending_at_end: u64,
     /// Ring-buffer records rejected by the size check (`events::OwnedDrain`/`EventDrain`).
@@ -3106,7 +3117,7 @@ fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
         shown.join(", ")
     };
     let remedy = if verbose {
-        " — rerun with --manifest for each mapped provider file to confirm its table layout for mechanism decoding"
+        " — rerun with --manifest for provider files with unverified tables (see Coverage) to confirm their layouts for mechanism decoding"
     } else {
         ""
     };
@@ -3844,6 +3855,22 @@ pub fn live_scoped_with_verbosity_and_sessions(
                 },
             ));
         }
+        if ev.unregistered_standard_layout_mechanisms > 0 {
+            s.push_str(&format!(
+                "mechanism value not in the registry (names unconfirmed): {}\n",
+                ev.unregistered_standard_layout_mechanisms,
+            ));
+        }
+        if ev.standard_layout_slots > 0 {
+            let evidence = if ev.standard_layout_evidence.is_empty() {
+                "standard layout".to_string()
+            } else {
+                ev.standard_layout_evidence.join(", ")
+            };
+            s.push_str(&format!(
+                "mechanism names from the standard table (layout evidence: {evidence})\n"
+            ));
+        }
     } else if reports.iter().any(|r| r.calls > 0 || r.in_flight > 0) {
         // No attributed mechanisms despite observed calls: name the gap in
         // one plain line instead of omitting the section. Count-only slots
@@ -3854,7 +3881,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
             // Concise points at Coverage for the one remedy; verbose
             // repeats the remedy here beside the fact.
             let remedy = if verbosity == crate::cli::TextVerbosity::Verbose {
-                "; add --manifest for each mapped provider file to confirm table layouts"
+                "; add --manifest for provider files with unverified tables to confirm their layouts"
             } else {
                 ""
             };
@@ -3870,6 +3897,12 @@ pub fn live_scoped_with_verbosity_and_sessions(
             ));
         } else {
             s.push_str("Mechanisms: none recorded for the observed calls.\n");
+        }
+        if ev.unregistered_standard_layout_mechanisms > 0 {
+            s.push_str(&format!(
+                "mechanism value not in the registry (names unconfirmed): {}\n",
+                ev.unregistered_standard_layout_mechanisms,
+            ));
         }
     }
     // Capture-wide sessions/logins beside the mechanism section, in
@@ -5132,6 +5165,11 @@ struct MechanismOut {
     /// only, never decoded; the name above is display-only and
     /// independent of this flag.
     registered: bool,
+    /// Attribution basis for this row (ruling 2026-11-11 clause 3):
+    /// `"standard_layout"` when every observation came through a
+    /// slot authorized by standard-layout scan evidence only,
+    /// `"manifest"` when a manifest/confirmed slot contributed.
+    attribution_basis: &'static str,
     /// Operation categories (`"sign"`, `"encrypt"`, ...) this id was seen
     /// initializing. Empty when only ever seen as an orphan operational
     /// call (no `*Init` observed in this capture).
@@ -5616,6 +5654,11 @@ pub fn profile_json(
                 mechanism_hex: format!("0x{id:x}"),
                 name: mechanism_name(*id),
                 registered: !m.unregistered,
+                attribution_basis: if m.attributed_standard_layout && !m.attributed_confirmed {
+                    "standard_layout"
+                } else {
+                    "manifest"
+                },
                 ops: m.ops.iter().cloned().collect(),
                 calls: m.calls,
                 errors: m.errors,
@@ -6086,6 +6129,9 @@ pub(crate) mod tests {
             semantic_key_budget: crate::semantics::MAX_STATE_KEYS,
             semantic_state_drops: 0,
             mechanism_id_overflow: 0,
+            unregistered_standard_layout_mechanisms: 0,
+            standard_layout_slots: 0,
+            standard_layout_evidence: Vec::new(),
             semantic_history_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,
@@ -10571,7 +10617,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.contains("rerun with --manifest for each mapped provider file"),
+            text.contains("rerun with --manifest for provider files with unverified tables"),
             "{text}"
         );
     }
@@ -13169,7 +13215,7 @@ pub(crate) mod tests {
         assert!(
             out.contains(
                 "Mechanisms: none attributed — 212 functions named from the standard table, \
-                 unconfirmed; add --manifest for each mapped provider file to confirm table layouts (see Coverage)."
+                 unconfirmed; add --manifest for provider files with unverified tables to confirm their layouts (see Coverage)."
             ),
             "{out}"
         );
@@ -14353,6 +14399,44 @@ pub(crate) mod tests {
             out.contains("2 mechanism observations beyond the 256-id table"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn live_view_standard_layout_mechanisms_carry_the_ruling_notes() {
+        // Ruling 2026-11-11 clauses 2-3: the MECHANISM table shows by
+        // default for standard-layout slots, gated values count
+        // without their number, and one plain note names the layout
+        // evidence instead of suggesting --manifest.
+        let mut ev = evidence();
+        ev.standard_layout_slots = 68;
+        ev.standard_layout_evidence = vec!["sole complete table".to_string()];
+        ev.unregistered_standard_layout_mechanisms = 3;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x40, mech_stat(2, 0))].into_iter().collect();
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            crate::attach::CapturePolicy::Allowlisted,
+            "selected",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("CKM_SHA256_RSA_PKCS"), "{out}");
+        assert!(
+            out.contains("mechanism value not in the registry (names unconfirmed): 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "mechanism names from the standard table (layout evidence: sole complete table)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("none attributed"), "{out}");
     }
 
     #[test]

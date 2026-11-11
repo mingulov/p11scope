@@ -13560,11 +13560,7 @@ pub(crate) fn evidence_for(
             .iter()
             .map(render::capture_skipped_out)
             .collect(),
-        semantic_unverified_slots: plan
-            .slots
-            .iter()
-            .filter(|slot| !slot.semantic_authorized)
-            .count(),
+        semantic_unverified_slots: plan.semantic_unverified_slot_count(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
         surfaces: plan.surfaces.clone(),
         vendor_interfaces: plan.vendor_interfaces,
@@ -13598,6 +13594,13 @@ pub(crate) fn evidence_for(
         semantic_key_budget: state.key_limit(),
         semantic_state_drops: semantic.semantic_state_drops,
         mechanism_id_overflow: semantic.mechanism_id_overflow,
+        unregistered_standard_layout_mechanisms: semantic.unregistered_standard_layout_mechanisms,
+        standard_layout_slots: plan.standard_layout_slot_count(),
+        standard_layout_evidence: plan
+            .standard_layout_evidence()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         semantic_history_drops: semantic.semantic_history_drops,
         pending_at_end: state.pending_at_end(),
         malformed_records,

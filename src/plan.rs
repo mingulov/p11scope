@@ -1168,6 +1168,17 @@ pub struct AttachPlan {
     // as providers are admitted, carried through rebuilds like
     // `first_plan_objects`.
     first_plan_had_provider: bool,
+    // Slots whose semantic authority rests on standard-layout scan
+    // evidence only (controller ruling 2026-11-11: mechanisms without
+    // --manifest), not on a manifest/confirmed table. Mechanism values
+    // read through these slots publish only when they are exact members
+    // of the registered CKM_* registry; other values count without
+    // their number. Empty for synthetic/manifest plans.
+    standard_layout_slots: BTreeSet<u32>,
+    // Layout-evidence labels behind `standard_layout_slots`
+    // ("interface linkage", "sole complete table", ...), for the one
+    // plain coverage note. Static labels only, never provider data.
+    standard_layout_evidence: BTreeSet<&'static str>,
     // Plan fence for the conservative rebuild cursor: every `&mut self`
     // method bumps `mutations` first, and `token` is minted fresh per plan
     // value (`Clone` mints, so whole-plan replacement changes the token).
@@ -1464,6 +1475,10 @@ impl AttachPlan {
             .enumerate()
             .map(|(index, module)| (module.id, ModuleId(index as u32)))
             .collect();
+        let old_standard: Vec<bool> = slots
+            .iter()
+            .map(|slot| self.standard_layout_slots.contains(&slot.index))
+            .collect();
         for (index, slot) in slots.iter_mut().enumerate() {
             slot.index = index as u32;
             if degraded.contains(&AttachKey::of(slot)) {
@@ -1494,6 +1509,14 @@ impl AttachPlan {
             .map(|(key, value)| (*key, value.clone()))
             .collect();
         subset.object_identities = self.object_identities.clone();
+        subset.standard_layout_slots = subset
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| old_standard[*index] && slot.semantic_authorized)
+            .map(|(index, _)| index as u32)
+            .collect();
+        subset.standard_layout_evidence = self.standard_layout_evidence.clone();
         subset.validate_slot_index()?;
         Ok(subset)
     }
@@ -1561,9 +1584,43 @@ impl AttachPlan {
             object_identities: BTreeMap::new(),
             first_plan_objects: BTreeSet::new(),
             first_plan_had_provider: false,
+            standard_layout_slots: BTreeSet::new(),
+            standard_layout_evidence: BTreeSet::new(),
             mutations: MutationCount::default(),
             token: PlanToken::default(),
         })
+    }
+
+    /// Whether this slot's semantic authority is standard-layout scan
+    /// evidence only (no manifest/confirmed table behind it).
+    pub(crate) fn is_standard_layout_slot(&self, slot: u32) -> bool {
+        self.standard_layout_slots.contains(&slot)
+    }
+
+    /// Number of standard-layout-only slots in this plan.
+    pub(crate) fn standard_layout_slot_count(&self) -> u64 {
+        self.standard_layout_slots.len() as u64
+    }
+
+    /// Slots that cannot produce semantic attribution in this plan:
+    /// unauthorized slots, plus authorized slots whose descriptor was
+    /// frozen count-only at attach (verified only after probes linked,
+    /// so their BPF cookies read no argument). Reporting the frozen
+    /// remainder as unverified keeps the named gap and its remedy
+    /// honest until an upgrade path lands (review F2, option (c)).
+    pub(crate) fn semantic_unverified_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                !slot.semantic_authorized
+                    || (slot.descriptor_index == 0 && !slot.semantic_ambiguous)
+            })
+            .count()
+    }
+
+    /// Layout-evidence labels behind the standard-layout slots.
+    pub(crate) fn standard_layout_evidence(&self) -> Vec<&'static str> {
+        self.standard_layout_evidence.iter().copied().collect()
     }
 
     /// Every table ordinal that reached this slot's exact target, sorted.
@@ -2447,6 +2504,24 @@ impl AttachPlan {
         }
 
         self.slots = slots;
+        // Standard-layout basis follows the exact target across the
+        // remap: rebuilt keys take the rebuilt basis, retired keys keep
+        // the basis their historical cells were recorded under.
+        let merged_standard: BTreeSet<u32> = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                let key = AttachKey::of(slot);
+                match rebuilt.slot_by_key.get(&key) {
+                    Some(position) => rebuilt.standard_layout_slots.contains(&(*position as u32)),
+                    None => self.standard_layout_slots.contains(&slot.index),
+                }
+            })
+            .map(|slot| slot.index)
+            .collect();
+        self.standard_layout_slots = merged_standard;
+        self.standard_layout_evidence
+            .extend(rebuilt.standard_layout_evidence.iter().copied());
         // Capture-lifetime disclosure: ordinals and identities only grow.
         for (key, ordinals) in rebuilt.slot_ordinals {
             self.slot_ordinals.entry(key).or_default().extend(ordinals);
@@ -3000,6 +3075,10 @@ struct Target<'a> {
     file_offset: u64,
     fork_safe: bool,
     semantic_authorized: bool,
+    /// Layout-evidence label when this target's semantic authority is
+    /// standard-layout scan evidence only (no manifest behind it);
+    /// `None` for manifest/confirmed or unauthorized targets.
+    standard_layout_evidence: Option<&'static str>,
     /// Whether `name` may be presented as a PKCS#11 name: manifest targets are
     /// operator-authoritative, scan targets need linkage-or-manifest
     /// authorization for their table.
@@ -3105,6 +3184,8 @@ struct Building {
     name_authority: BTreeMap<String, bool>,
     fork_safe: bool,
     module_ids: Vec<ModuleId>,
+    standard_layout_evidence: Option<&'static str>,
+    confirmed_authority: bool,
 }
 
 /// Occurrence-deduped decoded counts for one merge group: a manifest
@@ -4550,6 +4631,8 @@ fn merge(
                             name_authority: BTreeMap::new(),
                             fork_safe: true,
                             module_ids: Vec::new(),
+                            standard_layout_evidence: None,
+                            confirmed_authority: false,
                         });
                         building.len() - 1
                     });
@@ -4568,6 +4651,12 @@ fn merge(
                         .or_insert(target.semantic_authorized);
                 }
                 slot.fork_safe &= target.fork_safe;
+                if target.semantic_authorized && target.standard_layout_evidence.is_none() {
+                    slot.confirmed_authority = true;
+                }
+                if slot.standard_layout_evidence.is_none() {
+                    slot.standard_layout_evidence = target.standard_layout_evidence;
+                }
                 if let Some(ordinal) = target.ordinal {
                     slot_ordinals
                         .entry(AttachKey {
@@ -4670,6 +4759,8 @@ fn merge(
         }
     }
 
+    let mut standard_layout_slots = BTreeSet::new();
+    let mut standard_layout_evidence = BTreeSet::new();
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
@@ -4689,6 +4780,14 @@ fn merge(
             // to either, so the slot may not carry semantics — it is counted, and the
             // report says it was not attributed.
             let shared = slot.module_ids.len() >= 2;
+            if semantic_authorized
+                && !shared
+                && !slot.confirmed_authority
+                && let Some(evidence) = slot.standard_layout_evidence
+            {
+                standard_layout_slots.insert(index as u32);
+                standard_layout_evidence.insert(evidence);
+            }
             Slot {
                 index: index as u32,
                 descriptor_index: if shared || !semantic_authorized {
@@ -4731,6 +4830,8 @@ fn merge(
         None => paths.keys().copied().collect(),
     };
     plan.first_plan_had_provider = first_plan_had_provider;
+    plan.standard_layout_slots = standard_layout_slots;
+    plan.standard_layout_evidence = standard_layout_evidence;
     plan
 }
 
@@ -5382,6 +5483,94 @@ const SOLE_COMPLETE_REQUIRED_2X: [&str; 20] = [
     "C_SetOperationState",
 ];
 
+/// Standard-layout shape (controller ruling 2026-11-11 clause 1): the
+/// table's version field is 2.x/3.x and its decoded slot count matches
+/// that version's standard layout (2.x = 68, 3.0/3.1 = 92, 3.2+ = 104),
+/// or it is the proven 68-slot legacy prefix of a 3.x table whose wider
+/// layouts were refuted (`extension_impossible`).
+fn standard_layout_shape(table: &ScannedTable) -> bool {
+    let expected = match table.version {
+        (2, _) => 68,
+        (3, 0 | 1) => 92,
+        (3, _) => 104,
+        _ => return false,
+    };
+    table.decoded_slot_count() == expected
+        || (table.version.0 == 3 && table.extension_impossible && table.decoded_slot_count() == 68)
+}
+
+/// Typed-getter-export leg (controller ruling 2026-11-11 clause 1): the
+/// sole-complete leg generalized past 68 slots and past the 2.x getter
+/// exclusion. The provider exports `C_GetFunctionList` or
+/// `C_GetInterface`, the one scanned table's version matches its
+/// standard slot count on a full walk, every retained entry is in the
+/// provider's own object and agrees per-ordinal with its exports, and
+/// the same ambient guards as the sole leg hold (finished scan, no
+/// vendor interface claim, no witness fault, not double-loaded,
+/// required key-operation entries present). Multi-table providers
+/// reach authority through interface linkage, not this leg.
+fn getter_export_authorized(
+    module: &ReconciledModule,
+    index: usize,
+    exports: &ObjectExports<'_>,
+    score: &TableEvidenceScore,
+) -> bool {
+    let scanned = &module.scanned;
+    if scanned.tables.len() != 1 || index != 0 || !scanned.tables_scan_finished {
+        return false;
+    }
+    if scanned
+        .interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index) && interface.name_class != "exact_standard")
+    {
+        return false;
+    }
+    let table = &scanned.tables[index];
+    if published_walk(index, &scanned.tables, &scanned.interfaces, exports) != "full" {
+        return false;
+    }
+    if !standard_layout_shape(table) || module.witness_fault || !table.unpinned.is_empty() {
+        return false;
+    }
+    // A 3.x getter beside a 2.x table refutes the legacy-prefix reading
+    // (a wider table may be reachable through it); beside a full 3.x
+    // table the table's own extent answers that concern.
+    if module.getter_present && table.version.0 == 2 {
+        return false;
+    }
+    let Some(objects) = module.entry_objects.get(index) else {
+        return false;
+    };
+    if objects.len() != table.entries.len()
+        || !table
+            .entries
+            .iter()
+            .zip(objects.iter())
+            .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
+    {
+        return false;
+    }
+    let present: BTreeSet<&str> = table.entries.iter().map(|entry| entry.name).collect();
+    if !SOLE_COMPLETE_REQUIRED_2X
+        .iter()
+        .all(|name| present.contains(name))
+    {
+        return false;
+    }
+    if !module
+        .exports
+        .iter()
+        .any(|(name, _)| name == "C_GetFunctionList" || name == "C_GetInterface")
+    {
+        return false;
+    }
+    if scanned.double_loaded || scanned.same_file_loads != 1 {
+        return false;
+    }
+    score.exports
+}
+
 /// Sole-complete-table scan authority (no-manifest key operations):
 /// a single static 2.x table with no rival proves the table a caller
 /// reaches without interface linkage or a live return. All five legs
@@ -5518,19 +5707,37 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         );
         let authorized = table_name_authorized(&score);
         // Argument-read (semantic) authority from a scan needs the
-        // table's standard layout proven by scan-time evidence: exact
-        // interface linkage, manifest corroboration, or the
-        // sole-complete-table leg. The live-return grant stays
-        // subset-only (a late return cannot upgrade a frozen slot).
-        // Export-name agreement alone proves names, not the table in
-        // use, so it stays count-only here; the per-ordinal exports
-        // leg is a follow-up. Unknown or vendor-shifted tables stay
+        // table's standard layout proven by scan-time evidence
+        // (controller ruling 2026-11-11 clause 1): the version field
+        // matches the decoded slot count and every retained entry
+        // points into the provider's own object, plus at least one of
+        // exact "PKCS 11" interface linkage, the sole-complete-table
+        // leg, a typed-getter export with full per-ordinal export
+        // agreement (the table reached through the provider's own
+        // exports), or (subset only) an observed typed-getter return.
+        // Manifest corroboration is confirmed authority, not
+        // standard-layout. Unknown or vendor-shifted tables stay
         // count-only: no argument is ever read through an unproven slot.
-        let scan_semantic = authorized
-            && (score.linked
-                || score.manifest
-                || sole_complete_table_authorized(module, index, &exports)
-                || (scan_authorized && score.live_return));
+        // The interface-linkage and sole-complete legs carry their own
+        // layout proof (the provider's own "PKCS 11" record naming this
+        // table; the sole leg's full version-consistent own-code walk).
+        // The getter-export leg generalizes the sole leg past 68 slots
+        // under the same ambient guards (see
+        // `getter_export_authorized`).
+        let standard_layout_evidence = if !authorized || score.manifest {
+            None
+        } else if score.linked {
+            Some("interface linkage")
+        } else if sole_complete_table_authorized(module, index, &exports) {
+            Some("sole complete table")
+        } else if getter_export_authorized(module, index, &exports, &score) {
+            Some("typed getter export")
+        } else if scan_authorized && score.live_return {
+            Some("typed getter return")
+        } else {
+            None
+        };
+        let scan_semantic = authorized && (score.manifest || standard_layout_evidence.is_some());
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -5576,6 +5783,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
                 file_offset: entry.file_offset,
                 fork_safe,
                 semantic_authorized: scan_semantic,
+                standard_layout_evidence,
                 name_authorized: authorized,
                 table: Some(index),
                 ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {
@@ -5782,6 +5990,7 @@ fn lower_manifest(
                         file_offset: *file_offset,
                         fork_safe,
                         semantic_authorized: true,
+                        standard_layout_evidence: None,
                         name_authorized: true,
                     });
                 }
@@ -5898,6 +6107,7 @@ fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
             file_offset: *file_offset,
             fork_safe: false,
             semantic_authorized: false,
+            standard_layout_evidence: None,
             name_authorized: true,
             table: None,
             ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
@@ -8275,6 +8485,183 @@ mod tests {
             state.mechanisms().get(&0x101).map(|stat| stat.calls),
             Some(1),
             "mechanism id from a standard-layout slot is attributed without a manifest"
+        );
+    }
+
+    #[test]
+    fn standard_layout_slot_publishes_only_registered_mechanisms() {
+        // Membership gate (controller ruling 2026-11-11 clause 2): a
+        // mechanism value read through a standard-layout-only slot
+        // publishes only as an exact registered CKM_* member; any
+        // other value counts without its number and keeps no row.
+        let module = sole_complete_module();
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        let sign_init = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot");
+        assert!(
+            plan.is_standard_layout_slot(sign_init.index),
+            "sole-complete authority is standard-layout basis, not manifest"
+        );
+        let event = |mechanism: u64, extra: u32| p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism,
+            rv: 0,
+            slot: sign_init.index,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL
+                | extra,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        let mut state = crate::semantics::State::new(&plan);
+        // Garbage/secret-like word in the mechanism position: never a row.
+        state.observe(&event(
+            0xCE53_43A9,
+            p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED,
+        ));
+        assert!(
+            state.mechanisms().is_empty(),
+            "unregistered value through a standard-layout slot keeps no row"
+        );
+        assert_eq!(
+            state
+                .semantic_evidence()
+                .unregistered_standard_layout_mechanisms,
+            1,
+            "the gated value is counted without its number"
+        );
+        // A registered id through the same slot publishes normally.
+        state.observe(&event(0x40, 0)); // CKM_SHA256_RSA_PKCS
+        let stat = state
+            .mechanisms()
+            .get(&0x40)
+            .expect("registered mechanism row");
+        assert_eq!(stat.calls, 1);
+        assert!(stat.attributed_standard_layout);
+        assert!(!stat.attributed_confirmed);
+    }
+
+    #[test]
+    fn vendor_shifted_table_stays_count_only_without_manifest() {
+        // A vendor-shifted layout (every function sitting one slot
+        // away from its standard position) disagrees with the
+        // provider's own exports at every ordinal: no layout evidence
+        // admits it, so it stays count-only and no argument is read.
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let offsets: Vec<u64> = table.entries.iter().map(|e| e.file_offset).collect();
+        let n = offsets.len();
+        for (index, entry) in table.entries.iter_mut().enumerate() {
+            entry.file_offset = offsets[(index + 1) % n];
+        }
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots.iter().all(|slot| !slot.semantic_authorized),
+            "shifted table slots carry no semantic authority"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 0);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+            "shifted table slots stay count-only"
+        );
+    }
+
+    #[test]
+    fn interface_linked_scan_table_mints_main_plan_semantics_without_manifest() {
+        // The owner symptom shape (review F4): an exports-vacuous
+        // provider (softokn3-like: only the typed getter is exported)
+        // whose own exact "PKCS 11" interface record names the table.
+        // The sole leg is refused by the 3.x getter presence, so only
+        // interface linkage can grant — and it must, in the main plan.
+        let mut module = sole_complete_module();
+        module.getter_present = true;
+        module.exports = std::sync::Arc::from(vec![("C_GetFunctionList".to_string(), 0x1000u64)]);
+        module
+            .scanned
+            .interfaces
+            .push(crate::discovery::scan::ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: None,
+                name_private: None,
+                flags: 0,
+                table: Some(0),
+            });
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "interface-linked slots carry semantic authority without a manifest"
+        );
+        let sign_init = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot");
+        assert_ne!(
+            sign_init.semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert!(plan.is_standard_layout_slot(sign_init.index));
+        let mut state = crate::semantics::State::new(&plan);
+        state.observe(&p11scope_ebpf_common::Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session: 7,
+            mechanism: 0x101,
+            rv: 0,
+            slot: sign_init.index,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            target_function: p11scope_ebpf_common::FUNCTION_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        });
+        assert_eq!(
+            state.mechanisms().get(&0x101).map(|stat| stat.calls),
+            Some(1),
+            "mechanism id from an interface-linked slot is attributed without a manifest"
+        );
+    }
+
+    #[test]
+    fn late_verified_frozen_slots_report_as_unverified() {
+        // Review F2 (option (c)): a table verified only after probes
+        // linked keeps its frozen count-only cookie, so no mechanism
+        // can flow; the slot must still report as unverified instead
+        // of silently claiming verified coverage.
+        let mut early = sole_complete_module();
+        early.scanned.tables_scan_finished = false;
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&early), &[], &PinnedObjects::empty());
+        assert!(plan.slots.iter().all(|slot| !slot.semantic_authorized));
+        let late = sole_complete_module();
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&late), &[], &PinnedObjects::empty());
+        assert!(rebuilt.slots.iter().all(|slot| slot.semantic_authorized));
+        plan.extend_exact(rebuilt).expect("extend onto frozen plan");
+        let frozen = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == ["C_SignInit"])
+            .expect("C_SignInit slot");
+        assert!(frozen.semantic_authorized, "userspace verified it late");
+        assert_eq!(
+            frozen.descriptor_index, 0,
+            "but its attach cookie stayed count-only"
+        );
+        assert_eq!(
+            plan.semantic_unverified_slot_count(),
+            plan.slots.len(),
+            "frozen late-verified slots report as unverified"
         );
     }
 
@@ -10741,6 +11128,7 @@ mod tests {
                 file_offset,
                 fork_safe: false,
                 semantic_authorized: true,
+                standard_layout_evidence: None,
                 name_authorized: true,
                 table: None,
                 ordinal: None,

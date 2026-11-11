@@ -42462,7 +42462,10 @@ fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
 /// same files (same maps keys) must still replace — not retain — when the
 /// view's pins no longer validate. An in-place rewrite (same inode, new
 /// bytes) keeps the key but fails `check_unchanged`; retaining would
-/// credit the new bytes as the old file.
+/// credit the new bytes as the old file. The replacement takes the
+/// ordinary collision path: the rewritten key fails closed (refused, not
+/// admitted under either identity), the stale targets retire, and the
+/// remaining pins validate.
 #[test]
 fn e07_same_files_with_changed_pins_replaces_stale_identity() {
     use std::io::Write as _;
@@ -42484,14 +42487,22 @@ fn e07_same_files_with_changed_pins_replaces_stale_identity() {
         &mut additions,
         &mut pending,
     );
+    let before = e07_active_targets(&engine);
     assert!(
-        !e07_active_targets(&engine).is_empty(),
+        !before.is_empty(),
         "the provider is attached before the rewrite"
     );
     assert!(
         engine.view_pins_unchanged(view_id),
         "pins validate before the rewrite"
     );
+    let key = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view_id)
+        .expect("the provider module is retained before the rewrite")
+        .scanned
+        .key;
 
     // In-place rewrite: same inode, new bytes. Appending keeps the ELF
     // parseable so the rescan still finds the same mapping key.
@@ -42525,9 +42536,14 @@ fn e07_same_files_with_changed_pins_replaces_stale_identity() {
         engine.pinned.check_unchanged().unwrap(),
         "replaced pins validate; stale identity must retire, not be retained"
     );
+    let after = e07_active_targets(&engine);
     assert!(
-        !e07_active_targets(&engine).is_empty(),
-        "the provider stays attached under its fresh identity"
+        after.is_disjoint(&before),
+        "no stale target stays active: before={before:?} after={after:?}"
+    );
+    assert!(
+        engine.pinned.rejects(key),
+        "the rewritten key fails closed through the collision path"
     );
 }
 

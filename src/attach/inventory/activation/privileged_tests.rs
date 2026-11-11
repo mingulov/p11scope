@@ -1316,7 +1316,7 @@ impl OwnedIds {
             baseline_unloaded == callers,
             "caller baseline iterator presence differs from the flavor"
         );
-        let expected_maps = if callers { 21 } else { 14 };
+        let expected_maps = if callers { 22 } else { 15 };
         ensure!(
             ids.maps.len() == expected_maps && ids.programs.len() == 12,
             "prepared Inventory census (maps, programs) = ({}, {}), expected ({expected_maps}, 12)",

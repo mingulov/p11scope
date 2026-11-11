@@ -167,7 +167,7 @@ fn inspect_prepared(prepared: &PreparedInventory) -> Result<OwnedIds> {
     anyhow::ensure!(super::super::program_array_id("TAIL_CALLS", tails, 1)?.is_none());
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 14 && ids.programs.len() == 12);
+    anyhow::ensure!(ids.maps.len() == 15 && ids.programs.len() == 12);
     let guard = prepared.ebpf.map("STACK_GUARD").context("STACK_GUARD")?;
     anyhow::ensure!(super::super::program_array_id("STACK_GUARD", guard, 0)?.is_none());
     ids.assert_no_links()?;
@@ -418,7 +418,7 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
     validate_runtime_inventory_programs(&prepared.ebpf, true)?;
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 21 && ids.programs.len() == 12);
+    anyhow::ensure!(ids.maps.len() == 22 && ids.programs.len() == 12);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     anyhow::ensure!(
         pidfd >= 0,
@@ -523,7 +523,7 @@ fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> R
             |state, step| {
                 ids.observe(state.ebpf()?)?;
                 if step == failed {
-                    anyhow::ensure!(ids.maps.len() == 21 && ids.programs.is_empty());
+                    anyhow::ensure!(ids.maps.len() == 22 && ids.programs.is_empty());
                     ids.assert_no_links()?;
                     eprintln!(
                         "I2C_CALLER_PREP_IDS phase=held step={failed:?} ids={ids:?} links={{}}"

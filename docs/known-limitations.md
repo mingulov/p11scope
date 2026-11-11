@@ -216,6 +216,33 @@ as a container-private tmpfs): those stay unknown, never guessed.
 Wrap such tools in `sudo p11scope run --user $USER -- <tool>` (or
 pass `--prearm-module PATH`) when first-run coverage matters.
 
+### File learning sees only the observer's mount namespace
+
+Learning marks come from the observer's own mount table
+(`/proc/self/mountinfo`). When the observer's mount namespace differs
+from pid 1's — a Docker or Kubernetes observer with `--pid=host`, or
+the host watching rootless podman — filesystems outside the
+observer's namespace are never marked, so providers opened only
+there are never learned. The capture names this scope limit with the
+`learned provider file` gap `file learning cannot see filesystems
+outside the observer's mount namespace; provider files opened only
+there were not learned` (never silent); in-namespace learning still
+runs, and ordinary discovery and call counts are unaffected. Marking
+through pid 1's mount table is future work.
+
+### FUSE and other zero-fsid filesystems cannot be marked for learning
+
+Since kernel 6.8, `FAN_MARK_FILESYSTEM` on a filesystem with a zero
+fsid — FUSE mounts such as GNOME's gvfs and portal mounts — fails
+with `ENODEV`, so those filesystems stay unmarked and providers
+opened only there are not learned. The unmarked filesystem files the
+unavailable-learning gap, which makes desktop `--system` runs
+`PARTIAL` for learning only: ordinary discovery, call counts and
+attribution are unaffected, and busy desktops are usually `PARTIAL`
+already for process churn. There is no per-filesystem workaround;
+wrapping the tool in `run` or passing `--prearm-module` covers a
+known provider regardless of learning.
+
 ### Kernels before 6.12
 
 Per the owner's 2026-11-08 ruling, specific pre-6.12 edge cases are

@@ -2156,8 +2156,10 @@ authorizes the one new disclosure below and no other.** A fanotify drain
 proves opened files from their held bytes (ELF header/dynamic-string
 prefilter, then the shared export parse); only provider-positive files
 are retained, by pinned identity. The drain reads no target memory,
-argv, environ, PIN, key, or payload bytes; file bytes that fail the
-provider proof leave no record (no path, no name) beyond counts.
+argv, or environ. It reads at most 64 header bytes per newly seen file
+to test the ELF magic; non-ELF bytes are discarded in memory, never
+retained or published. File bytes that fail the provider proof leave
+no record (no path, no name) beyond counts.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |

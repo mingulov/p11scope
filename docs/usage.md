@@ -824,7 +824,9 @@ held bytes, and provider files attach for all later processes. The
 learned provider is listed with its path and the program that first
 loaded it; that first use itself stays a named, missed interval, and
 learning being unavailable (no fanotify privilege) is a named gap,
-never a failed capture.
+never a failed capture. Set `P11SCOPE_DISABLE_FILE_LEARNING=1` to turn
+learning off (also a named gap); see
+[Environment (`P11SCOPE_*`)](#environment-p11scope_).
 Any admission after the initial sweep, and any unmatched leader exit, keeps
 the observation lossy by design: the process could have used an unattached
 provider before admission left no trace (see the
@@ -1943,6 +1945,11 @@ arguments instead of environment wherever a script is invoked by hand.
 - `P11SCOPE_LOADER_ENV_SANITIZED` — `p11scope-discover` loader-environment
   marker. The helper sets it for the provider it executes; a forged value in
   the incoming environment is rejected, never trusted. Capture-visible.
+- `P11SCOPE_DISABLE_FILE_LEARNING` — disables kernel file-open learning
+  under `--system` (the fanotify drain that catches later runs of
+  one-shot tools). Exactly `1` disables it; anything else (including
+  unset) keeps learning on. A disabled capture keeps ordinary discovery
+  and files the named disabled-learning gap. Capture-visible.
 - `P11SCOPE_PRODUCT_BUILD_MODE` — build lane selector for `scripts/`: `ordinary`
   (default) builds with the ambient toolchain, `prepared` builds with the
   pinned prepared-dependency toolchain. Affects builds, never a capture.

@@ -9917,6 +9917,24 @@ fn is_still_observed_module(found: &[ScannedModule], module: &ScannedModule) -> 
     })
 }
 
+/// Whether every retained object `module` names — its own file and
+/// every table-entry target — still matches its pin. An object with
+/// no retained identity has nothing to disprove and passes: only an
+/// observed change refuses, never missing evidence.
+fn scanned_module_objects_unchanged(pinned: &PinnedObjects, module: &ScannedModule) -> bool {
+    let own = (module.key, module.path.as_str());
+    let entries = module
+        .tables
+        .iter()
+        .flat_map(|table| &table.entries)
+        .map(|entry| (entry.object, entry.object_path.as_str()));
+    std::iter::once(own).chain(entries).all(|(key, path)| {
+        pinned
+            .id_for_scanned(module, key, path)
+            .is_none_or(|id| pinned.object_unchanged(id) == Ok(true))
+    })
+}
+
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
@@ -18578,6 +18596,75 @@ impl Engine {
                     merge_scanned_module(&mut retained, module);
                 }
                 raw_modules.extend(retained);
+            }
+            (candidate_pins, raw_modules)
+        } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
+            // A metadata scan pinned its modules before their tables
+            // were restored, so its fresh pins lack the restored
+            // tables' dependency pins. Replacing the whole view's
+            // ownership with that set would drop exactly those pins
+            // and retire every provider in the view whenever the
+            // module set grows or one identity changes. Reconcile per
+            // module instead: keep each module whose fresh pins do
+            // not contradict it and whose retained objects still
+            // match their pins, pin newly observed modules fresh, and
+            // retire only the contradicted or changed ones. A
+            // retained module a complete scan no longer observes
+            // retires with its facts; its pins stay held until the
+            // deferred memory scan reconciles ownership.
+            let retained: Vec<ScannedModule> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            let (kept_found, dropped_found): (Vec<ScannedModule>, Vec<ScannedModule>) =
+                found.into_iter().partition(|module| {
+                    !self
+                        .pinned
+                        .fresh_pins_contradict_module(&fresh_pins, module)
+                        && scanned_module_objects_unchanged(&self.pinned, module)
+                });
+            let mut candidate_pins = self.pinned.clone();
+            let new_modules: Vec<ScannedModule> = kept_found
+                .iter()
+                .filter(|module| is_newly_observed_module(&retained, module))
+                .cloned()
+                .collect();
+            let pin_start = crate::attach::monotonic_ns();
+            let pinned =
+                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget);
+            self.stage_timings.span(
+                crate::timing::StageKind::Pin,
+                "pin_new_modules",
+                pin_start,
+                crate::attach::monotonic_ns(),
+            );
+            let (new_pins, pin_skips) = pinned.map_err(anyhow::Error::msg)?;
+            skipped.extend(pin_skips);
+            skipped.extend(candidate_pins.absorb(new_pins));
+            let mut raw_modules: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view != view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            if found_complete {
+                for module in kept_found {
+                    merge_scanned_module(&mut raw_modules, module);
+                }
+            } else {
+                let mut kept_retained: Vec<_> = retained
+                    .into_iter()
+                    .filter(|module| {
+                        is_newly_observed_module(&dropped_found, module)
+                            && scanned_module_objects_unchanged(&self.pinned, module)
+                    })
+                    .collect();
+                for module in kept_found {
+                    merge_scanned_module(&mut kept_retained, module);
+                }
+                raw_modules.extend(kept_retained);
             }
             (candidate_pins, raw_modules)
         } else {

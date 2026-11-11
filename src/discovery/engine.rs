@@ -14375,22 +14375,24 @@ impl Engine {
             // ownerless queue entry instead of refusing. Departed entries can
             // never be serviced; without relief a full queue of short-lived
             // dead pids starves a late provider's holder unboundedly. Only
-            // entries with no retained owner, no view, and a provably dead
-            // generation are evicted, so live pressure waiters keep their
-            // pinned retention. A departed newcomer never triggers relief
-            // (it would only churn the queue). Relief is live-operation
-            // only: during the collected finish at stop no refresh service
-            // pass runs, so an admitted head would sit unserviced with no
-            // loss record; refuse it below with the explicit loss instead.
-            let newcomer_live =
-                self.views.iter().any(|view| view.pid() == pid) || !process::generation_dead(pid);
+            // entries with no retained owner, no view, and no /proc directory
+            // are evicted, so live pressure waiters keep their pinned
+            // retention. A departed newcomer never triggers relief (it would
+            // only churn the queue). A zombie leader keeps its /proc entry
+            // while a worker still runs, so path liveness retains the whole
+            // live group. Relief is live-operation only: during the
+            // collected finish at stop no refresh service pass runs, so an
+            // admitted head would sit unserviced with no loss record; refuse
+            // it below with the explicit loss instead.
+            let newcomer_live = self.views.iter().any(|view| view.pid() == pid)
+                || std::path::Path::new(&format!("/proc/{pid}")).exists();
             let victim = if newcomer_live && self.collected_finish_actions.is_none() {
                 self.refresh_requested
                     .iter()
                     .find(|(qpid, request)| {
                         request.owner.is_none()
                             && !self.views.iter().any(|view| view.pid() == **qpid)
-                            && process::generation_dead(**qpid)
+                            && !std::path::Path::new(&format!("/proc/{qpid}")).exists()
                     })
                     .map(|(qpid, _)| *qpid)
             } else {

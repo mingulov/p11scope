@@ -8937,56 +8937,6 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
-    // 6.15: resolve the CLI endpoint selection once, against the live
-    // broad plan, before the loop, and open the K0 detail window over
-    // a resolution with the selection-time broad read. The attempt —
-    // resolved slot or named refusal — records into the additive
-    // ledger the report composes; aggregate capture is untouched on
-    // every path.
-    let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
-    let mut k0_window: Option<metrics::selected_detail_driver::K0Window> = None;
-    if let Some(name) = select_endpoint
-        && let Some(resolved) = metrics::selected_detail_driver::run_metrics_selection_stage(
-            name,
-            engine.plan(),
-            scope,
-            owned.as_ref().map(|owned| owned.pid),
-            &mut selection_ledger,
-        )
-    {
-        let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy()
-        else {
-            unreachable!("resolve_selection admits Counters plans only");
-        };
-        k0_window = metrics::selected_detail_driver::open_k0_production(
-            resolved,
-            budget.endpoint_limit() as usize,
-            crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
-            engine.counter_reserver(),
-            session,
-            engine.plan(),
-            engine.pinned(),
-            session.pid_lifecycle_facts(),
-            metrics::selected_detail_driver::k0_comparable_losses(&engine.capture_facts()),
-            owned.is_some(),
-            &mut selection_ledger,
-        );
-    }
-    // A selection that never opened a window says so once, here:
-    // the JSON ledger alone left `--select-endpoint` a silent
-    // no-op. The close path stays quiet for these (no window opened).
-    if let Some(name) = select_endpoint
-        && k0_window.is_none()
-        && let Some((_, Some(refusal))) = selection_ledger.selection_outcome()
-    {
-        emit_capture_diagnostic(
-            &metrics::selected_detail_driver::format_selection_refused_line(
-                name,
-                refusal,
-                owned.is_some(),
-            ),
-        );
-    }
     let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_capture(owned.is_some());
     let OpenedCaptureStdout {
@@ -9158,6 +9108,68 @@ fn capture_profile(
         session.attached_probes(),
         owned.is_some(),
     ));
+    // Startup T3: finish the deferred initial arming (loader hooks,
+    // exports, backlog) now that the probes are live. Failures degrade
+    // to named PARTIAL gaps; a stop between views ends arming early the
+    // same way, and the loop's own stop path below still writes the
+    // report. Owned runs never pend, so this is a no-op there. The
+    // cleanup pass can change the plan silently, so the semantic state
+    // re-syncs exactly as on a plan-changed tick; nothing has been
+    // observed yet, so the purge is empty.
+    engine.complete_initial_arming(&mut *session, &|| interrupted.interrupted())?;
+    state.sync_plan(engine.plan());
+    // 6.15: resolve the CLI endpoint selection once, against the live
+    // broad plan, before the loop, and open the K0 detail window over
+    // a resolution with the selection-time broad read. The attempt —
+    // resolved slot or named refusal — records into the additive
+    // ledger the report composes; aggregate capture is untouched on
+    // every path. Startup T3 resolves it here, after the deferred
+    // initial arming completes, so it reads the post-completion plan
+    // exactly as when the start armed inline.
+    let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
+    let mut k0_window: Option<metrics::selected_detail_driver::K0Window> = None;
+    if let Some(name) = select_endpoint
+        && let Some(resolved) = metrics::selected_detail_driver::run_metrics_selection_stage(
+            name,
+            engine.plan(),
+            scope,
+            owned.as_ref().map(|owned| owned.pid),
+            &mut selection_ledger,
+        )
+    {
+        let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy()
+        else {
+            unreachable!("resolve_selection admits Counters plans only");
+        };
+        k0_window = metrics::selected_detail_driver::open_k0_production(
+            resolved,
+            budget.endpoint_limit() as usize,
+            crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
+            engine.counter_reserver(),
+            session,
+            engine.plan(),
+            engine.pinned(),
+            session.pid_lifecycle_facts(),
+            metrics::selected_detail_driver::k0_comparable_losses(&engine.capture_facts()),
+            owned.is_some(),
+            &mut selection_ledger,
+        );
+    }
+    // A selection that never opened a window says so once, here:
+    // the JSON ledger alone left `--select-endpoint` a silent
+    // no-op. The close path stays quiet for these (no window opened).
+    if let Some(name) = select_endpoint
+        && k0_window.is_none()
+        && let Some((_, Some(refusal))) = selection_ledger.selection_outcome()
+    {
+        emit_capture_diagnostic(
+            &metrics::selected_detail_driver::format_selection_refused_line(
+                name,
+                refusal,
+                owned.is_some(),
+            ),
+        );
+    }
     // The loader-hook recount is gated on diagnostics and deferred past
     // the ready line (startup T2): the off path never touches the engine.
     {
@@ -10641,19 +10653,6 @@ fn capture_trace(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    // One header assembly point (capture, identity, zone, and the
-    // unverified note when the plan watches any): no per-line marker
-    // repeats it.
-    let header = trace::header(policy, engine.plan());
-    if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
-        return Err(finish_capture_error(
-            error,
-            engine,
-            session,
-            owned.as_deref_mut(),
-            interrupted,
-        ));
-    }
     let clock = Instant::now();
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
@@ -10688,6 +10687,32 @@ fn capture_trace(
         session.attached_probes(),
         owned.is_some(),
     ));
+    // Startup T3: finish the deferred initial arming (loader hooks,
+    // exports, backlog) now that the probes are live. Failures degrade
+    // to named PARTIAL gaps; a stop between views ends arming early the
+    // same way, and the loop's own stop path below still writes the
+    // report. Owned runs never pend, so this is a no-op there. The
+    // cleanup pass can change the plan silently, so the semantic state
+    // and the tracer re-sync exactly as on a plan-changed tick; nothing
+    // has been observed yet, so the purge is empty.
+    engine.complete_initial_arming(&mut *session, &|| interrupted.interrupted())?;
+    state.sync_plan(engine.plan());
+    tracer.sync_plan(engine.plan());
+    // One header assembly point (capture, identity, zone, and the
+    // unverified note when the plan watches any): no per-line marker
+    // repeats it. Startup T3 assembles it here, after the deferred
+    // initial arming completes, so the unverified note reads the
+    // post-completion plan exactly as when the start armed inline.
+    let header = trace::header(policy, engine.plan());
+    if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
+        return Err(finish_capture_error(
+            error,
+            engine,
+            session,
+            owned.as_deref_mut(),
+            interrupted,
+        ));
+    }
     // The loader-hook recount is gated on diagnostics and deferred past
     // the ready line (startup T2): the off path never touches the engine.
     {
@@ -26515,30 +26540,28 @@ int main(int argc, char **argv) {
             .split_once("fn terminal_trace_count_line(")
             .expect("terminal line bounds the trace loop")
             .0;
-        for (name, body) in [("profile", profile), ("trace", trace)] {
+        // Each chain ends at the hook recount: the only other syncs
+        // sit in the terminal paths past it, so a missing re-sync fails
+        // the chain instead of matching a later one.
+        for (name, body, syncs) in [
+            ("profile", profile, &["state.sync_plan("][..]),
+            (
+                "trace",
+                trace,
+                &["state.sync_plan(", "tracer.sync_plan("][..],
+            ),
+        ] {
+            let mut markers = vec!["capture_ready_line(", "complete_initial_arming("];
+            markers.extend_from_slice(syncs);
+            markers.push("loader_readiness_hooks(");
             let mut pos = 0;
-            for marker in [
-                "capture_ready_line(",
-                "complete_initial_arming(",
-                "sync_plan(",
-                "loader_readiness_hooks(",
-            ] {
+            for marker in markers {
                 let at = body[pos..]
                     .find(marker)
                     .unwrap_or_else(|| panic!("{name} loop lacks {marker}"));
                 pos += at + marker.len();
             }
         }
-        assert_eq!(
-            profile.matches("sync_plan(").count(),
-            1,
-            "profile re-syncs its semantic state once"
-        );
-        assert_eq!(
-            trace.matches("sync_plan(").count(),
-            2,
-            "trace re-syncs its state and its tracer"
-        );
         let complete = trace.find("complete_initial_arming(").unwrap();
         let header = trace
             .find("trace::header(")

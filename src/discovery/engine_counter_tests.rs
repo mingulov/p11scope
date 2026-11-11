@@ -675,8 +675,12 @@ fn counter_start_state_with_owning_modules_survives_loader_arming() {
         });
     let mut additions_allowed = true;
     let mut pending_views = PendingViewRetirements::new();
-    let (fatal, _) =
-        engine.arm_initial_views(&mut session, &mut additions_allowed, &mut pending_views);
+    let (fatal, _) = engine.arm_initial_views(
+        &mut session,
+        &mut additions_allowed,
+        &mut pending_views,
+        &|| false,
+    );
     assert!(fatal.is_none(), "loader arming must not fail: {fatal:?}");
     assert_eq!(
         session.staged_counter_calls,
@@ -928,11 +932,11 @@ fn counter_staging_stays_in_start_past_the_ready_split() {
         .split_once("    fn start_session_with(")
         .expect("start_session_with exists")
         .1
-        .split_once("    fn complete_initial_arming(")
+        .split_once("fn complete_initial_arming(")
         .expect("completion bounds the start")
         .0;
     let completion = source
-        .split_once("    fn complete_initial_arming(")
+        .split_once("fn complete_initial_arming(")
         .expect("complete_initial_arming exists")
         .1
         .split_once("pub(crate) mod session_fixture")

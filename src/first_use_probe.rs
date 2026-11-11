@@ -504,7 +504,11 @@ pub(crate) fn loop_started(domain: &EventsDomain, at_ns: Option<u64>) {
 
 /// Read the actual producer counter, never Engine's cached projection. The
 /// per-CPU aggregate has a read interval, not an invented atomic timestamp.
-pub(crate) fn discovery_loss(stage: DiscoveryStage, session: &crate::attach::Session) {
+#[cfg(test)]
+pub(crate) fn discovery_loss(
+    stage: DiscoveryStage,
+    session: &dyn crate::discovery::engine::EngineSession,
+) {
     discovery_loss_with(
         stage,
         || session.events_domain(),

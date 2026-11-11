@@ -840,7 +840,7 @@ fn owned_session_prearms_while_exclusively_borrowing_the_unreleased_child() {
 fn initial_provider_exports_are_attached_after_ready_before_first_tick() {
     let source = include_str!("engine.rs");
     let completion = source
-        .split_once("    fn complete_initial_arming(")
+        .split_once("fn complete_initial_arming(")
         .expect("complete_initial_arming exists")
         .1
         .split_once("pub(crate) mod session_fixture")
@@ -3345,8 +3345,12 @@ fn capture_start_stages_the_discovery_ring_between_armed_views() {
     engine.scope = Scope::System;
     let mut session = ScriptedSession::default();
 
-    let (fatal, _) =
-        engine.arm_initial_views(&mut session, &mut true, &mut PendingViewRetirements::new());
+    let (fatal, _) = engine.arm_initial_views(
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+        &|| false,
+    );
 
     assert!(fatal.is_none());
     assert_eq!(session.stage_calls, 3, "one stage after every view");
@@ -71782,11 +71786,11 @@ fn startup_split_brackets_every_segment_with_a_marker() {
         .split_once("    fn start_session_with(")
         .expect("start_session_with exists")
         .1
-        .split_once("    fn complete_initial_arming(")
+        .split_once("fn complete_initial_arming(")
         .expect("completion bounds the start")
         .0;
     let completion = source
-        .split_once("    fn complete_initial_arming(")
+        .split_once("fn complete_initial_arming(")
         .expect("complete_initial_arming exists")
         .1
         .split_once("pub(crate) mod session_fixture")
@@ -71842,8 +71846,8 @@ fn non_owned_start_defers_loader_arming_past_session_return() {
         .split_once("    fn start_session_with(")
         .expect("start_session_with exists")
         .1
-        .split_once("\n    }\n}")
-        .expect("start_session_with body ends")
+        .split_once("fn complete_initial_arming(")
+        .expect("completion bounds the start")
         .0;
     assert!(
         !route.contains("self.arm_initial_views("),
@@ -71875,8 +71879,8 @@ fn owned_start_never_pends_initial_arming() {
         .split_once("    fn start_session_with(")
         .expect("start_session_with exists")
         .1
-        .split_once("\n    }\n}")
-        .expect("start_session_with body ends")
+        .split_once("fn complete_initial_arming(")
+        .expect("completion bounds the start")
         .0;
     // Exactly one pending set, on the non-owned early return above the
     // owned block: the owned path reaches its pre-arm with no flag set.
@@ -71984,8 +71988,11 @@ fn complete_initial_arming_stops_between_views_with_a_named_gap() {
     engine.scope = Scope::Pid(std::process::id());
     engine.initial_arming_pending = true;
     let mut session = ScriptedSession::default();
-    let stop = Cell::new(false);
-    session.before_dynamic_loader_attach = Some(Box::new(|| stop.set(true)));
+    let stop = std::rc::Rc::new(Cell::new(false));
+    session.before_dynamic_loader_attach = Some(Box::new({
+        let stop = std::rc::Rc::clone(&stop);
+        move || stop.set(true)
+    }));
     engine
         .complete_initial_arming(&mut session, &|| stop.get())
         .expect("a stop during arming is not an error");

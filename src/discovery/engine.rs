@@ -857,6 +857,12 @@ pub struct Engine {
     /// Loader-arm attempts driven by inventory (`arm_loader_or_partial`
     /// calls) — the hook half of the same oracle.
     loader_arms: u64,
+    /// Startup T3: initial loader arming (plus the first exports attach,
+    /// backlog drain and capture-facts publication) is still owed past
+    /// session return. Set only by a non-owned start;
+    /// `complete_initial_arming` clears it first, so a second completion
+    /// is a no-op, and owned starts never set it (barrier semantics).
+    initial_arming_pending: bool,
     /// Inventory ticks started (`refresh_inventory` entries). Names the
     /// dropped pass in the pass-containment gap; healthy ticks never read it.
     inventory_passes: u64,
@@ -3386,6 +3392,12 @@ pub(crate) trait EngineSession {
         true
     }
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
+    /// The session's EVENTS domain, for first-use loss sampling across the
+    /// startup split (startup T3): the sampler takes the trait now that the
+    /// arming stages run against `&mut dyn EngineSession` past the ready
+    /// line. The scripted session answers a test stand-in.
+    #[cfg(test)]
+    fn events_domain(&self) -> crate::events::EventsDomain;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
         &mut self,
@@ -3678,6 +3690,11 @@ impl EngineSession for Session {
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
         Session::counter_snapshot(self)
+    }
+
+    #[cfg(test)]
+    fn events_domain(&self) -> crate::events::EventsDomain {
+        Session::events_domain(self)
     }
 
     fn process_creation_tracking_unavailable(&self) -> Option<&str> {
@@ -11396,6 +11413,7 @@ impl Engine {
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
             loader_arms: 0,
+            initial_arming_pending: false,
             inventory_passes: 0,
             dropped_pass_gaps: BTreeMap::new(),
             dropped_pass_gap: None,
@@ -32646,18 +32664,35 @@ impl Engine {
     /// Arms every retained view's loader at capture start, staging the
     /// DISCOVERY ring after each view so the per-view locator scans, plan
     /// rebuilds and attaches never let it overflow (RB-2). Returns the first
-    /// fatal arming error; the caller still runs its cleanup pass.
+    /// fatal arming error; the caller still runs its cleanup pass. A stop
+    /// between views ends the pass early with the unvisited remainder as a
+    /// named gap (not a fatal): staging already done persists for the drain.
     fn arm_initial_views(
         &mut self,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        stop_requested: &dyn Fn() -> bool,
     ) -> (Option<anyhow::Error>, InitialArmCounts) {
         let views = self.views.len() as u64;
         let mut stale = 0u64;
         let mut attached = 0u64;
         let arms_before = self.loader_arms;
         for position in 0..self.views.len() {
+            if stop_requested() {
+                let done = position as u64;
+                let remaining = views.saturating_sub(done);
+                self.mark_partial(
+                    "initial loader arming",
+                    &format!(
+                        "capture stop arrived during initial loader arming after {done} of {views} views; {remaining} views not visited"
+                    ),
+                );
+                return (
+                    None,
+                    self.initial_arm_counts(views, stale, arms_before, attached),
+                );
+            }
             if !self.views[position].still_the_same() {
                 stale = stale.saturating_add(1);
                 continue;
@@ -33056,53 +33091,58 @@ impl Engine {
                     )
                 );
             }
+            // Startup T3: a non-owned start returns here, with the loader
+            // arming, exports, backlog drain and first publication pending
+            // past the ready line (`complete_initial_arming`, called by the
+            // capture loops). Owned starts keep everything below inline:
+            // the pre-exec arming must finish before the barrier releases.
+            if owned_child.is_none() {
+                // Counter bank staging stays in the start: the counter
+                // session refuses to run without it, and it is not
+                // per-view work.
+                if policy.counter_mode().is_some() {
+                    self.stage_counter_initial(&mut session)?;
+                }
+                self.initial_arming_pending = true;
+                return Ok(session);
+            }
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
             let mut closure = PauseClosure::new(true);
-            let mut fatal = None;
             let owned_generation = owned_child.map(OwnedChild::generation);
-            let mut owned_prearmed = false;
             let arming_start = crate::attach::monotonic_ns();
-            let arming_counts: InitialArmCounts;
-            if let Some(child) = owned_child {
-                owned_prearmed = matches!(
-                    self.arm_owned_loader_before_release(
-                        child,
-                        &mut session,
-                        &mut additions_allowed,
-                        &mut pending_views,
-                    )?,
-                    OwnedLoaderPrearmOutcome::Armed
-                );
-                // One initial-set context per owned run, armed or not.
-                if let Some(view) = self
-                    .views
-                    .iter()
-                    .find(|view| view.pid() == child.pid())
-                    .map(ProcessView::id)
-                {
-                    self.record_loader_arm(view, true);
-                }
-                // The initial set's timing gap is stated once, by
-                // `loader_discovery.initial_set_capture`: publishing it as a
-                // "discovery unavailable" skip too counted one fact twice and
-                // named nothing that was unavailable.
-                arming_counts = InitialArmCounts {
-                    views: 1,
-                    gated: 0,
-                    attempted: 1,
-                    attached: u64::from(owned_prearmed),
-                };
-            } else {
-                let (fatal_outcome, counts) = self.arm_initial_views(
+            let Some(child) = owned_child else {
+                unreachable!("non-owned starts return before loader arming");
+            };
+            let owned_prearmed = matches!(
+                self.arm_owned_loader_before_release(
+                    child,
                     &mut session,
                     &mut additions_allowed,
                     &mut pending_views,
-                );
-                fatal = fatal_outcome;
-                arming_counts = counts;
+                )?,
+                OwnedLoaderPrearmOutcome::Armed
+            );
+            // One initial-set context per owned run, armed or not.
+            if let Some(view) = self
+                .views
+                .iter()
+                .find(|view| view.pid() == child.pid())
+                .map(ProcessView::id)
+            {
+                self.record_loader_arm(view, true);
             }
+            // The initial set's timing gap is stated once, by
+            // `loader_discovery.initial_set_capture`: publishing it as a
+            // "discovery unavailable" skip too counted one fact twice and
+            // named nothing that was unavailable.
+            let arming_counts = InitialArmCounts {
+                views: 1,
+                gated: 0,
+                attempted: 1,
+                attached: u64::from(owned_prearmed),
+            };
             if crate::run::capture_diagnostics_on() {
                 eprintln!(
                     "{}",
@@ -33120,39 +33160,37 @@ impl Engine {
                 crate::first_use_probe::DiscoveryStage::LoaderArmingFinished,
                 &session,
             );
-            if fatal.is_none() {
-                let exports_start = crate::attach::monotonic_ns();
-                self.attach_initial_exports(
-                    &mut session,
-                    &mut additions_allowed,
-                    &mut pending_views,
-                    &mut closure,
+            let exports_start = crate::attach::monotonic_ns();
+            self.attach_initial_exports(
+                &mut session,
+                &mut additions_allowed,
+                &mut pending_views,
+                &mut closure,
+            );
+            // Counter captures stage banks where Detailed flows attach
+            // initial exports (inert for counter policies).
+            if policy.counter_mode().is_some() {
+                self.stage_counter_initial(&mut session)?;
+            }
+            // Stage what the export attach let accumulate; the first
+            // batch applies it in ring order (RB-2). Anything past the
+            // shared allowance waits in the ring for the next staging
+            // call after that batch.
+            let held = self.discovery_held_len();
+            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
+            if owned_prearmed && let Some(generation) = owned_generation {
+                self.mark_owned_selection_pending(generation);
+            }
+            // No stage span here: the export attach records its own
+            // Attach spans inside, and stages never overlap.
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "{}",
+                    Self::startup_segment_line(
+                        "initial_exports",
+                        ms(exports_start, crate::attach::monotonic_ns())
+                    )
                 );
-                // Counter captures stage banks where Detailed flows attach
-                // initial exports (inert for counter policies).
-                if policy.counter_mode().is_some() {
-                    self.stage_counter_initial(&mut session)?;
-                }
-                // Stage what the export attach let accumulate; the first
-                // batch applies it in ring order (RB-2). Anything past the
-                // shared allowance waits in the ring for the next staging
-                // call after that batch.
-                let held = self.discovery_held_len();
-                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
-                if owned_prearmed && let Some(generation) = owned_generation {
-                    self.mark_owned_selection_pending(generation);
-                }
-                // No stage span here: the export attach records its own
-                // Attach spans inside, and stages never overlap.
-                if crate::run::capture_diagnostics_on() {
-                    eprintln!(
-                        "{}",
-                        Self::startup_segment_line(
-                            "initial_exports",
-                            ms(exports_start, crate::attach::monotonic_ns())
-                        )
-                    );
-                }
             }
             #[cfg(test)]
             crate::first_use_probe::discovery_loss(
@@ -33165,18 +33203,14 @@ impl Engine {
             let mut collect =
                 |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let backlog_start = crate::attach::monotonic_ns();
-            let cleanup = self.process_discovery_records(
+            self.process_discovery_records(
                 &mut session,
                 &mut records,
                 &mut pending_views,
                 &mut additions_allowed,
                 &mut collect,
                 &mut closure,
-            );
-            if let Some(error) = fatal {
-                return Err(error);
-            }
-            cleanup?;
+            )?;
             record_object_skips(
                 &mut self.plan,
                 &self.counters.object_skips,
@@ -33219,6 +33253,138 @@ impl Engine {
             );
         }
         Ok(session)
+    }
+
+    /// Startup T3: finishes a non-owned start after the ready line. Runs
+    /// exactly the moved start block — initial loader arming, the initial
+    /// exports attach, the second discovery staging, the backlog cleanup
+    /// pass and the first publication — with two semantic conversions: a
+    /// fatal arm error or any other `Err` from the block degrades to a
+    /// named `initial loader arming` PARTIAL gap instead of failing the
+    /// capture, and a stop between views ends the arming early with the
+    /// unvisited remainder as a counted gap. No-op unless a non-owned
+    /// start pended (owned starts arm inline and never pend). The capture
+    /// loops call this between the ready line and the first tick, then
+    /// re-sync their plan consumers: the cleanup pass can change the plan
+    /// silently, with no plan-changed tick to carry it.
+    pub(crate) fn complete_initial_arming(
+        &mut self,
+        session: &mut dyn EngineSession,
+        stop_requested: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if !self.initial_arming_pending {
+            return Ok(());
+        }
+        self.initial_arming_pending = false;
+        // Startup markers (T1): the same clock-difference shape as the
+        // start; missing samples render as `n/a` there.
+        let ms = |start: Option<u64>, end: Option<u64>| match (start, end) {
+            (Some(start), Some(end)) => Some(end.saturating_sub(start) / 1_000_000),
+            _ => None,
+        };
+        let mut additions_allowed = true;
+        let mut records = Vec::new();
+        let mut pending_views = PendingViewRetirements::new();
+        // `PauseClosure` lives exactly here, as it did inside the start's
+        // result closure: nothing outside this block consumes it (the
+        // start's owned half keeps its own, and the tick paths build
+        // theirs per pass).
+        let mut closure = PauseClosure::new(true);
+        let arming_start = crate::attach::monotonic_ns();
+        let (fatal, arming_counts) = self.arm_initial_views(
+            &mut *session,
+            &mut additions_allowed,
+            &mut pending_views,
+            stop_requested,
+        );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "{}",
+                Self::startup_arming_line(
+                    ms(arming_start, crate::attach::monotonic_ns()),
+                    arming_counts.views,
+                    arming_counts.gated,
+                    arming_counts.attempted,
+                    arming_counts.attached
+                )
+            );
+        }
+        #[cfg(test)]
+        crate::first_use_probe::discovery_loss(
+            crate::first_use_probe::DiscoveryStage::LoaderArmingFinished,
+            &*session,
+        );
+        if fatal.is_none() {
+            let exports_start = crate::attach::monotonic_ns();
+            self.attach_initial_exports(
+                &mut *session,
+                &mut additions_allowed,
+                &mut pending_views,
+                &mut closure,
+            );
+            // Stage what the export attach let accumulate; the first
+            // batch applies it in ring order (RB-2). Anything past the
+            // shared allowance waits in the ring for the next staging
+            // call after that batch.
+            let held = self.discovery_held_len();
+            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
+                self.mark_partial("initial loader arming", &format!("{error:#}"));
+            }
+            // No stage span here: the export attach records its own
+            // Attach spans inside, and stages never overlap.
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "{}",
+                    Self::startup_segment_line(
+                        "initial_exports",
+                        ms(exports_start, crate::attach::monotonic_ns())
+                    )
+                );
+            }
+        } else if let Some(error) = fatal {
+            self.mark_partial("initial loader arming", &format!("{error:#}"));
+        }
+        #[cfg(test)]
+        crate::first_use_probe::discovery_loss(
+            crate::first_use_probe::DiscoveryStage::InitialExportsFinished,
+            &*session,
+        );
+        // The cleanup pass's nested pulls share one budget seeded
+        // from the shared allowance after all staging settled.
+        let nested_budget = Cell::new(self.shared_allowance_remaining(session, records.len()));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+        let backlog_start = crate::attach::monotonic_ns();
+        if let Err(error) = self.process_discovery_records(
+            &mut *session,
+            &mut records,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut collect,
+            &mut closure,
+        ) {
+            self.mark_partial("initial loader arming", &format!("{error:#}"));
+        }
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
+        if let Err(error) = self.publish_current_capture_facts() {
+            self.mark_partial("initial loader arming", &format!("{error:#}"));
+        }
+        // No stage span here: the batch records its own spans inside,
+        // and stages never overlap.
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "{}",
+                Self::startup_segment_line(
+                    "initial_backlog",
+                    ms(backlog_start, crate::attach::monotonic_ns())
+                )
+            );
+        }
+        Ok(())
     }
 }
 
@@ -33838,6 +34004,10 @@ pub(crate) mod session_fixture {
                 bail!("scripted producer counter read failed");
             }
             Ok(self.counters)
+        }
+
+        fn events_domain(&self) -> crate::events::EventsDomain {
+            crate::events::EventsDomain::test_standin(1)
         }
 
         fn read_selection_table(

@@ -136,19 +136,56 @@ already-running browser, earlier operations are counted in named gaps
 
 The same demo commands run through `ghcr.io/mingulov/p11scope:latest`
 (the tags appear when the release is published; `:0.7.0` pins the exact
-0.7.0 version), with the documented container flags and no extra mounts:
+0.7.0 version), with the documented container flags and no extra mounts.
+On Ubuntu, use the copy-paste script below — it includes the one
+AppArmor flag the demo needs there:
 
 ```sh
-FLAGS="--pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro"
 IMG=ghcr.io/mingulov/p11scope:latest
+FLAGS="--pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined"
 docker run --rm $FLAGS $IMG doctor
 docker run --rm $FLAGS $IMG inventory --system --duration 15s
 docker run --rm $FLAGS $IMG profile --system --duration 30s
 ```
 
-(Where AppArmor is enforcing, load `deploy/apparmor-p11scope` once
-with `apparmor_parser -r` and add
-`--security-opt apparmor=p11scope-observer`.)
+(On hosts without AppArmor, drop the `--security-opt` flag. A
+least-privilege FLAGS without `CAP_SYS_ADMIN` follows below.)
+
+### On Ubuntu and other AppArmor hosts
+
+On Ubuntu and other AppArmor hosts, Docker confines every container
+with the `docker-default` profile, which blocks reading other
+processes. Without a fix the run sees almost nothing: on the owner's
+Ubuntu desktop the run scanned 2 of 485 processes and found 0 provider
+files. Earlier builds gave no reason for the empty result; current
+builds fail `doctor`'s `process access` check (naming the confining
+label and the fix) and print a one-line hint plus a `process access`
+gap in `inventory` and `profile`.
+
+The simplest fix is one flag, `--security-opt apparmor=unconfined`,
+as in the script above. Measured on the owner's Ubuntu desktop
+2026-11-11: 8 provider files including snap Firefox's libsoftokn3,
+189 callers, 19,819 functions watched. The trade-off is one sentence:
+this container runs without extra AppArmor confinement, while the
+granted capabilities and the default seccomp profile still apply.
+
+To check that AppArmor is the cause, look for the ptrace denials:
+
+```sh
+sudo dmesg | grep 'apparmor="DENIED"' | grep docker-default
+```
+
+The hardened option keeps confinement: from the checkout, load the
+shipped profile once with `sudo apparmor_parser -r
+deploy/apparmor-p11scope` (the load is lost on reboot unless the file
+is copied to `/etc/apparmor.d/`), then use `--security-opt
+apparmor=p11scope-observer` instead of `unconfined`. Measured on the
+same desktop: 4 provider files, 156 callers. Against non-snap targets
+the shipped profile captures the same demo exactly (measured: 142
+callers, 5 providers, ledgered `profile --pid` multiset-exact);
+snap-confined apps such as snap Firefox stay unreadable under it
+(their per-process `unreadable` gaps name them) — for those, use the
+unconfined flag or run natively.
 
 Least privilege (measured 2026-11-11; no `--privileged`, no
 `CAP_SYS_ADMIN`) captures the same demo exactly with the narrow
@@ -156,11 +193,17 @@ five-capability set under the Docker default seccomp profile — no
 `--security-opt seccomp` flag is needed on Docker 24 and later (where
 the engine default cannot be used, pass
 `--security-opt seccomp=deploy/seccomp-p11scope.json` from the
-checkout):
+checkout). Where AppArmor is enforcing, keep the `--security-opt
+apparmor=...` flag alongside it:
 
 ```sh
-FLAGS="--pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro"
+FLAGS="--pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined"
 ```
+
+Measured 2026-11-11 on the dev host (Ubuntu 26.04.1, rootful Docker,
+AppArmor enforcing): the least-privilege set scans 188 callers with
+the opt and 2 without; the shipped-capability set scans 175 callers
+with the opt.
 
 ### What the container needs
 
@@ -175,23 +218,12 @@ leaves providers in private directories invisible. The read-only
 cgroup mount names pod cgroups from the node view. Details:
 [Container privileges](../deploy/k8s/README.md#privileges-and-why).
 
-A user in the `docker` group needs no sudo: on this dev host (Ubuntu
-26.04.1, rootful Docker, AppArmor enforcing) `doctor` exited 0 and
-`inventory --system` scanned 175 callers with the flags above plus the
-AppArmor opt. Without the opt, `doctor` fails its `process access`
-check (naming the confining label and the fix) and `inventory` still
-exits 0 but sees almost nothing (2 callers, 0 providers), with a
-one-line stderr hint and a `process access` gap — so where AppArmor is
-enforcing, the opt is what makes captures see processes.
-The least-privilege set behaves the same (measured 2026-11-11: 188
-callers with the opt, 2 without). The opt used to be
-`apparmor=unconfined`; the shipped [`apparmor-p11scope`](../deploy/apparmor-p11scope)
-profile (the Docker default plus one `ptrace (read, trace)` rule)
-keeps the confinement and measures the same (142 callers, 5
-providers, ledgered `profile --pid` multiset-exact).
-Snap-confined apps (e.g. snap Firefox) stay unreadable from a
-container even with the shipped profile (their per-process
-`unreadable` gaps name them); run natively for those.
+A user in the `docker` group needs no sudo. Where AppArmor is
+enforcing, the `--security-opt apparmor=...` flag above is what makes
+captures see processes at all (without it, `doctor` fails its
+`process access` check and `inventory` sees almost nothing); the
+shipped [`apparmor-p11scope`](../deploy/apparmor-p11scope) profile is
+the Docker default plus one `ptrace (read, trace)` rule.
 
 Rootless Docker or Podman cannot work: BPF loading and uprobes need real
 host capabilities, which a rootless container cannot grant. Use rootful
@@ -234,6 +266,18 @@ C_EncryptMessage             libsoftokn3.so          1      0     8.2µs     8.2
 C_GenerateRandom             libsoftokn3.so          1      0     4.1µs     4.1µs     4.1µs         0
 run with -v for details
 ```
+
+### Firefox in the demo
+
+Firefox's own NSS module, libsoftokn3, is a PKCS#11 provider, so a
+desktop Firefox shows up in the demo without any setup, as in the
+outputs above. Activity appears when Firefox does cryptography:
+opening https sites, opening Settings > Privacy & Security > Security
+Devices, or viewing saved passwords. A Firefox that was already
+running before the capture has its earlier calls in named gaps
+("mappings predate the watch, earlier calls are not counted"). For
+snap Firefox, use the unconfined flag or run natively — the shipped
+AppArmor profile cannot read snap-confined processes.
 
 ## Learn more
 

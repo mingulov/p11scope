@@ -48,6 +48,13 @@ Run `doctor` through it ([privileges](deploy/k8s/README.md)):
 docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:latest doctor
 ```
 
+On Ubuntu and other AppArmor hosts, add `--security-opt
+apparmor=unconfined`: Docker confines every container with
+`docker-default`, which blocks reading other processes, so without the
+flag the run sees almost nothing. The [container
+demo](docs/demo.md#with-the-container-image) has the full copy-paste
+script, the hardened profile alternative, and the measured numbers.
+
 ## First commands
 
 ```sh

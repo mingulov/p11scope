@@ -6326,6 +6326,233 @@ mod journal_unavailable_tests {
         );
     }
 
+    /// A birth offered for a key already holding an installed Joint
+    /// feed is a healthy duplicate: the production reserve path
+    /// names it AlreadySelected exactly, never Capacity — a
+    /// transient verdict would defer, re-offer and evict a feed
+    /// that never failed. No capacity latch fires: nothing is
+    /// full. (Touched S1Only-held keys still refuse Capacity at
+    /// the fits gate, pinned beside this test.)
+    #[test]
+    fn held_joint_key_birth_reserve_names_already_selected() {
+        let mut scene = UnlinkedScene::new();
+        let receipt = birth_receipt();
+        let joint_key = scene.key(3);
+        assert!(
+            scene
+                .registry
+                .install_joint_receipt(joint_key.clone(), receipt),
+            "the grant installs"
+        );
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(joint_key.clone(), scene.caller));
+        scene.registry.publish();
+        assert_eq!(
+            scene
+                .registry
+                .feed_mode_for_test(RegistryInstanceId::from_raw(0)),
+            Some(FeedMode::Joint),
+            "drained with a receipt on a linked journal"
+        );
+        assert_eq!(
+            scene.registry.joint_feeds(),
+            1,
+            "the duplicate's feed is installed Joint"
+        );
+        // Stage the duplicate birth offer for the held key.
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(joint_key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            joint_key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            scene.registry.held_feed_is_not_s1only(&input),
+            "a Joint-held key is a healthy duplicate"
+        );
+        assert!(
+            matches!(
+                scene.registry.reserve_admitted_joint_receipt(&input),
+                Err(JointReceiptInstallRefusal::AlreadySelected)
+            ),
+            "a Joint-held duplicate names its selected feed, never capacity"
+        );
+        assert!(
+            scene.registry.first_birth_capacity().is_none(),
+            "a final duplicate latches no capacity arm"
+        );
+    }
+
+    /// The birth-capacity latch ignores drained refusals: a touched
+    /// S1Only-held key refuses Capacity for drain state (it needs
+    /// no slot), not for a full table, so it must not occupy the
+    /// first-arm slot. A later genuinely over-limit birth still
+    /// latches `fits` with its own table sizes.
+    #[test]
+    fn birth_capacity_latch_ignores_drained_refusals() {
+        let mut scene = UnlinkedScene::new();
+        let (key, _) = scene.register(0);
+        scene.observe(&key, s1_call("C_Sign", RV_OK, MECHANISM));
+        scene.registry.publish();
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            matches!(
+                scene.registry.reserve_admitted_joint_receipt(&input),
+                Err(JointReceiptInstallRefusal::Capacity)
+            ),
+            "a touched held key refuses capacity, never selects late"
+        );
+        assert!(
+            scene.registry.first_birth_capacity().is_none(),
+            "a drained refusal latches no capacity arm"
+        );
+        // A genuinely over-limit birth still latches.
+        scene.registry.reference_instance_limit(1);
+        let fresh = scene.key(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(fresh.clone(), scene.caller));
+        let fresh_input = AdmittedInstanceCall::scripted(
+            fresh,
+            scene.caller,
+            2,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        assert!(
+            matches!(
+                scene.registry.reserve_admitted_joint_receipt(&fresh_input),
+                Err(JointReceiptInstallRefusal::Capacity)
+            ),
+            "an over-limit birth refuses capacity"
+        );
+        let latched = scene
+            .registry
+            .first_birth_capacity()
+            .expect("a genuine wall latches");
+        assert_eq!(latched.arm, "fits");
+        assert_eq!(
+            (latched.records, latched.grants, latched.negatives),
+            (1, 0, 0)
+        );
+    }
+
+    /// `position()` authority guards: a wrong caller, a window past
+    /// the staged end, an unknown key and a first call from another
+    /// caller all refuse SubjectMismatch before any fits or
+    /// drain-state verdict. The matching control positions cleanly.
+    #[test]
+    fn joint_position_rejects_foreign_plan_inputs() {
+        let mut scene = UnlinkedScene::new();
+        let key = scene.key(1);
+        let strange = scene.key(9);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        let good = AdmittedInstanceCall::scripted(
+            key.clone(),
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let foreign = AdmittedInstanceCall::scripted(
+            key,
+            CallerId(99),
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let unknown = AdmittedInstanceCall::scripted(
+            strange,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            plan.position(&good, &window).is_ok(),
+            "the staged registration positions"
+        );
+        assert!(
+            matches!(
+                plan.position(&foreign, &window),
+                Err(JointReceiptInstallRefusal::SubjectMismatch)
+            ),
+            "a wrong caller never positions"
+        );
+        let stale = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len + 1,
+        };
+        assert!(
+            matches!(
+                plan.position(&good, &stale),
+                Err(JointReceiptInstallRefusal::SubjectMismatch)
+            ),
+            "a window past the staged end is stale"
+        );
+        assert!(
+            matches!(
+                plan.position(&unknown, &window),
+                Err(JointReceiptInstallRefusal::SubjectMismatch)
+            ),
+            "an unstaged key never positions"
+        );
+        drop(plan);
+        // A first call from another caller mismatches the staged row.
+        let mut scene = UnlinkedScene::new();
+        let key = scene.key(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), scene.caller));
+        scene
+            .registry
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key.clone(),
+                CallerId(99),
+                5,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            ));
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            scene.caller,
+            1,
+            s1_call("C_Sign", RV_OK, MECHANISM),
+        );
+        let mut plan = scene
+            .registry
+            .joint_registration_plan()
+            .expect("plan builds");
+        let window = JointRegistrationWindow {
+            start: 0,
+            end: plan.staged_len,
+        };
+        assert!(
+            matches!(
+                plan.position(&input, &window),
+                Err(JointReceiptInstallRefusal::SubjectMismatch)
+            ),
+            "a first call from another caller never positions"
+        );
+    }
+
     /// Ordering control for the staged-mapping priority: a
     /// mapping staged AFTER the genuine registration applies
     /// after it at the drain, so the row still cannot mint and

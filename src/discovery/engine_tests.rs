@@ -75656,6 +75656,83 @@ fn learned_replaced_file_at_same_path_stages_fresh() {
     assert_eq!(engine.learned_notes.len(), 2);
 }
 
+/// A held provider file unlinked before staging is refused, not
+/// staged: the held descriptor's link count is zero, so the learner
+/// boundary files the finite replaced/deleted row and pins nothing.
+#[test]
+fn learned_deleted_held_file_is_refused_not_staged() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("gone.c");
+    let so = dir.path().join("libgone.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    std::fs::remove_file(&so).unwrap();
+    assert_eq!(
+        file.metadata().unwrap().nlink(),
+        0,
+        "the held inode is really unlinked"
+    );
+    // The display label comes from the held descriptor itself, exactly
+    // as the drain derives it (the kernel appends " (deleted)").
+    let display_path = crate::fanotify::display_path_for(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path,
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        },
+    ))
+    .unwrap();
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "a deleted held file must not stage"
+    );
+    assert!(
+        engine.learned_notes.is_empty(),
+        "a refused deleted file keeps no loader note"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was replaced or deleted before staging; \
+                         it was not learned"
+        }),
+        "the deletion files its finite named refusal: {public:?}"
+    );
+}
+
 /// An unavailable-learning signal from the drain files the finite
 /// unavailable row once: membership-style failures are counted named
 /// gaps, never silently dropped.

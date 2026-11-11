@@ -71375,6 +71375,58 @@ fn scarce_tick_serves_fresh_pending_newcomer_before_older_backlog() {
     assert_eq!(engine.probationary_completions, 2);
 }
 
+/// A fresh pending newcomer that was windowed but never attempted (the
+/// tick quantum expired first) keeps its fresh priority on the next tick:
+/// freshness-by-arrival alone demotes it to backlog behind every older
+/// waiter, which on a busy host delays a late provider by the whole queue.
+/// Tick 1 windows the fresh pid with zero permits (no attempt); tick 2
+/// must still serve it ahead of the older lower backlog pid.
+#[test]
+fn scarce_tick_keeps_unattempted_fresh_newcomer_ahead_of_backlog() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-fresh-kept");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    let mut sleeps = e06_spawn_sleeps(2);
+    sleeps.sort_by_key(SystemScopeChildGuard::pid);
+    let older_pid = sleeps[0].pid();
+    let fresh_pid = sleeps[1].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(1));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    let mut listing = vec![owner_pid, older_pid, fresh_pid];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(older_pid, Some(100)));
+    assert!(engine.request_refresh(fresh_pid, Some(200)));
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    // Tick 1: zero permits — the window opens (fresh classified) but the
+    // quantum expires before any attempt, so both stay queued.
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert!(
+        engine.refresh_requested.contains_key(&fresh_pid),
+        "the fresh newcomer was not attempted on tick 1"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Tick 2: one permit. Arrival-freshness has expired for both pids, but
+    // the unattempted fresh pid still completes first.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh_pid),
+        "the unattempted fresh newcomer keeps priority and completes first"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&older_pid),
+        "the older backlog pid waits another tick"
+    );
+    assert_eq!(engine.probationary_completions, 1);
+}
+
 /// Backlog rotation passes a persistently failing low pid: three backlog
 /// pids (all deferred unattempted on their arrival tick), the lowest one
 /// persistently unreadable, one attempt per tick. The third pid keeps the
@@ -73707,6 +73759,40 @@ fn complete_initial_arming_stops_between_views_with_a_named_gap() {
         gap.reason.contains("after 1 of 3 views") && gap.reason.contains("2 views not visited"),
         "the gap counts the unarmed remainder: {}",
         gap.reason
+    );
+}
+
+/// Post-ready arming must not starve discovery: staged kernel records are
+/// serviced by an ordinary inventory tick between initial arms, so a
+/// program that execs (and dlopens a provider) during the arming window is
+/// admitted then instead of waiting for every initial view to arm first.
+/// On the unchunked completion no inventory pass runs until the backlog
+/// drain after all arms, which never refreshes.
+#[test]
+fn complete_initial_arming_services_discovery_between_arms() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::Pid(std::process::id());
+    engine.initial_arming_pending = true;
+    let mut session = ScriptedSession::default();
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(std::process::id()),
+    )))]
+    .into_iter()
+    .collect();
+    session
+        .stage_discovery(1, 0)
+        .expect("the exec record stages before arming");
+    assert_eq!(engine.inventory_passes, 0, "no tick before the completion");
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert_eq!(engine.loader_arms(), 3, "every initial view still arms");
+    assert!(
+        engine.inventory_passes >= 1,
+        "a discovery tick ran between arms instead of after all of them"
     );
 }
 

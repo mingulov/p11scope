@@ -3268,9 +3268,15 @@ struct RefreshRequest {
     // tick quantum expired before any attempt: the request keeps fresh
     // priority on the NEXT scarce tick instead of demoting to backlog by
     // arrival age alone behind the whole queue. One extra tick only:
-    // classification consumes the flag, so a persistently unattempted
-    // pid cannot bloat the fresh class and starve later arrivals.
+    // classification consumes the flag into `fresh_carry_spent`, and a
+    // spent carry-over cannot be re-earned, so a persistently
+    // unattempted pid cannot bloat the fresh class and starve later
+    // arrivals.
     deferred_fresh: bool,
+    // The one-tick carry-over above has been spent: this request no
+    // longer qualifies as fresh through `deferred_fresh` and cannot
+    // earn it again (preserved across serial renewal like the flag).
+    fresh_carry_spent: bool,
 }
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
@@ -14542,6 +14548,9 @@ impl Engine {
                 deferred_fresh: existing
                     .as_ref()
                     .is_some_and(|request| request.deferred_fresh),
+                fresh_carry_spent: existing
+                    .as_ref()
+                    .is_some_and(|request| request.fresh_carry_spent),
             },
         );
         if let Some(owner) = owner
@@ -25956,7 +25965,10 @@ impl Engine {
                 backlog.contains(&pid) || rotation.contains(&pid)
             }
         };
-        if !backlog_or_rotation && let Some(request) = self.refresh_requested.get_mut(&pid) {
+        if !backlog_or_rotation
+            && let Some(request) = self.refresh_requested.get_mut(&pid)
+            && !request.fresh_carry_spent
+        {
             request.deferred_fresh = true;
         }
     }
@@ -26572,7 +26584,7 @@ impl Engine {
                 if !pending.contains(&pid) {
                     rotation.push(pid);
                 } else if self.refresh_requested.get(&pid).is_some_and(|request| {
-                    request.deferred_fresh
+                    (request.deferred_fresh && !request.fresh_carry_spent)
                         || request
                             .first_seen_ns
                             .is_some_and(|seen| prev_tick.is_some_and(|prev| seen > prev))
@@ -26589,21 +26601,28 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
-            // Kept-fresh priority is consumed by this classification: a
-            // pid still unattempted after its extra tick demotes to
-            // backlog instead of bloating the fresh class. This tick's
-            // own unattempted fresh pids are re-marked below and in the
-            // admission loop.
+            // Kept-fresh priority is consumed by this classification:
+            // every fresh member's carry-over is spent now, so a pid
+            // still unattempted after its extra tick demotes to backlog
+            // instead of bloating the fresh class. Marking below and in
+            // the admission loop re-earns the flag only for requests
+            // whose carry-over was not already spent (genuinely new
+            // arrivals), never for this tick's carry-over spenders.
             for pid in fresh.iter() {
-                if let Some(request) = self.refresh_requested.get_mut(pid) {
+                if let Some(request) = self.refresh_requested.get_mut(pid)
+                    && request.deferred_fresh
+                {
                     request.deferred_fresh = false;
+                    request.fresh_carry_spent = true;
                 }
             }
             // A fresh pid the window itself deferred was never attempted:
             // it keeps fresh priority next tick instead of demoting by age.
             let fresh_set: BTreeSet<u32> = fresh.iter().copied().collect();
             for pid in deferred.iter().filter(|pid| fresh_set.contains(pid)) {
-                if let Some(request) = self.refresh_requested.get_mut(pid) {
+                if let Some(request) = self.refresh_requested.get_mut(pid)
+                    && !request.fresh_carry_spent
+                {
                     request.deferred_fresh = true;
                 }
             }

@@ -71536,6 +71536,53 @@ fn scarce_tick_keeps_unattempted_fresh_newcomer_ahead_of_backlog() {
     assert_eq!(engine.probationary_completions, 1);
 }
 
+/// Kept-fresh priority is one extra tick only: a fresh pid deferred
+/// unattempted on two consecutive scarce ticks demotes to backlog on
+/// the third, so the older backlog pid completes ahead of it. Without
+/// consumption provenance the flag re-arms itself every tick and the
+/// fresh pid would still win tick 3.
+#[test]
+fn scarce_tick_demotes_fresh_newcomer_after_one_carry_over_tick() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-fresh-spent");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    let mut sleeps = e06_spawn_sleeps(2);
+    sleeps.sort_by_key(SystemScopeChildGuard::pid);
+    let older_pid = sleeps[0].pid();
+    let fresh_pid = sleeps[1].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(1));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    let mut listing = vec![owner_pid, older_pid, fresh_pid];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(older_pid, Some(100)));
+    assert!(engine.request_refresh(fresh_pid, Some(200)));
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    // Tick 1 (arrival-fresh, zero permits) and tick 2 (carry-over tick,
+    // zero permits): nobody is attempted, nobody completes.
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert_eq!(engine.probationary_completions, 0);
+    // Tick 3: the carry-over is spent, so the older backlog pid wins.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&older_pid),
+        "the older backlog pid completes first after the carry-over expires"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&fresh_pid),
+        "the twice-deferred fresh pid demoted to backlog"
+    );
+    assert_eq!(engine.probationary_completions, 1);
+}
+
 /// Backlog rotation passes a persistently failing low pid: three backlog
 /// pids (all deferred unattempted on their arrival tick), the lowest one
 /// persistently unreadable, one attempt per tick. The third pid keeps the

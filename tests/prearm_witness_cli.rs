@@ -930,7 +930,8 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
         "profile".to_string(),
         "--system".to_string(),
         "--duration".to_string(),
-        "45".to_string(),
+        "90".to_string(),
+        "-v".to_string(),
         "-o".to_string(),
         out.to_str().expect("utf8 out").to_string(),
     ];
@@ -938,10 +939,18 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
     wait_ready(&mut capture);
     // Round 1: the first-ever run against this file in the capture.
     run_tool("round 1");
-    // Learning + attach settle: the staged frame is expedited, but the
-    // cell waits several ordinary frames so the rate below measures
-    // steady-state catching, not the arm latency.
-    std::thread::sleep(Duration::from_secs(8));
+    // Wait for the learning event itself (the `-v` staging line names
+    // the copy), then a few ordinary frames for the expedited attach,
+    // so the rate below measures steady-state catching, not arm
+    // latency on a small or loaded host. No line within the harness
+    // deadline fails loud in `next_line`.
+    loop {
+        let line = capture.next_line("learned staging");
+        if line.contains("learned provider") && line.contains("libbrandnew-") {
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_secs(10));
     // Round 2: twenty one-shot runs, no retry masking the rate.
     for index in 0..20 {
         run_tool(&format!("round 2 run {index}"));

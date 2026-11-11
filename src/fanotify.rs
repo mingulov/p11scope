@@ -9,7 +9,7 @@
 //! path lists. Event fds, pidfds and readlink strings of files that fail
 //! the provider test never leave this module.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,9 +68,10 @@ pub(crate) enum LearnMsg {
         pid: u32,
     },
     QueueOverflow,
-    /// A periodic re-mark found no marked filesystem (for example the
-    /// post-setup capability shed took `CAP_SYS_ADMIN`): learning is
-    /// degraded from here, filed once as a named gap.
+    /// A mark pass left a visible filesystem uncovered (for example a
+    /// newly mounted filesystem after the post-setup capability shed
+    /// took `CAP_SYS_ADMIN`): learning is degraded there, filed once
+    /// as a named gap while the capture continues (data-always).
     Unavailable,
 }
 
@@ -643,11 +644,19 @@ pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&
 pub(crate) struct FileLearner {
     state: Arc<LearnShutdownState>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Group + sender held between arming and `begin_drain`: the
-    /// reader thread spawns post-shed so it never retains the
-    /// transient startup `CAP_SYS_ADMIN` (capabilities are
-    /// per-thread). `None` once the drain runs.
-    pending: Option<(OwnedFd, SyncSender<LearnMsg>)>,
+    /// Group + sender + startup mark coverage held between arming
+    /// and `begin_drain`: the reader thread spawns post-shed so it
+    /// never retains the transient startup `CAP_SYS_ADMIN`
+    /// (capabilities are per-thread). `None` once the drain runs.
+    /// The bool records that the startup pass left a visible
+    /// filesystem uncovered, which the drain files as the finite
+    /// unavailable-learning gap as soon as it runs.
+    pending: Option<(
+        OwnedFd,
+        SyncSender<LearnMsg>,
+        BTreeSet<std::path::PathBuf>,
+        bool,
+    )>,
 }
 
 impl FileLearner {
@@ -679,15 +688,16 @@ impl FileLearner {
         }
         // SAFETY: fanotify_init returned an owned fd.
         let group = unsafe { OwnedFd::from_raw_fd(fd) };
-        let (marked, skipped) = mark_all_filesystems(&group);
-        if marked == 0 {
+        let (covered, uncovered) = mark_visible_filesystems(&group, &BTreeSet::new());
+        if covered.is_empty() {
             return Err(LearnAbsent {
-                reason: format!("no filesystem could be marked ({skipped} skipped)"),
+                reason: format!("no filesystem could be marked ({uncovered} skipped)"),
             });
         }
         if crate::run::capture_diagnostics_on() {
             eprintln!(
-                "p11scope: file learning active: {marked} filesystems marked ({skipped} skipped)"
+                "p11scope: file learning active: {} filesystems marked ({uncovered} skipped)",
+                covered.len()
             );
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_CHANNEL_DEPTH);
@@ -696,7 +706,7 @@ impl FileLearner {
             Self {
                 state,
                 thread: None,
-                pending: Some((group, tx)),
+                pending: Some((group, tx, covered, uncovered > 0)),
             },
             rx,
         ))
@@ -704,20 +714,22 @@ impl FileLearner {
 
     /// Spawns the reader thread with the caller's current capability
     /// sets (post-shed). Idempotent. Re-marking from the drain may
-    /// fail without `CAP_SYS_ADMIN`; the initial marks keep
-    /// delivering, and the drain files unavailable only when no
-    /// event proves the marks alive (its existing blind check).
+    /// fail without `CAP_SYS_ADMIN`; retained initial marks keep
+    /// delivering, but a visible filesystem that was never covered
+    /// files the finite unavailable-learning gap (data-always: the
+    /// capture continues and says so), whatever traffic older
+    /// filesystems produce.
     pub(crate) fn begin_drain(&mut self) -> Result<(), LearnAbsent> {
         if self.thread.is_some() {
             return Ok(());
         }
-        let Some((group, tx)) = self.pending.take() else {
+        let Some((group, tx, covered, initial_gap_owed)) = self.pending.take() else {
             return Ok(());
         };
         let worker_state = Arc::clone(&self.state);
         match std::thread::Builder::new()
             .name("p11scope-learn".to_string())
-            .spawn(move || drain_loop(group, tx, worker_state))
+            .spawn(move || drain_loop(group, tx, worker_state, covered, initial_gap_owed))
         {
             Ok(thread) => {
                 self.thread = Some(thread);
@@ -754,44 +766,87 @@ impl Drop for FileLearner {
     }
 }
 
-/// Marks every real filesystem from the observer's mount table. Returns
-/// `(marked, skipped)`: per-mount failures are tolerated, an unreadable
-/// table falls back to `/` alone.
-fn mark_all_filesystems(group: &OwnedFd) -> (usize, usize) {
-    use std::os::unix::ffi::OsStrExt;
+/// Bound on the retained covered-filesystem set: the mount table it
+/// mirrors is itself size-capped below, and the set never retains a
+/// mount point the current table no longer shows.
+const MARK_COVERAGE_CAP: usize = 8192;
+
+/// Decides filesystem-mark coverage for one (re-)mark pass: each
+/// visible mount point is offered to `mark`; a success covers it, a
+/// failure still covers it when a mark from an earlier pass is
+/// retained (the startup marks survive the post-setup capability
+/// shed and keep delivering), and a failure on a filesystem never
+/// covered before counts as uncovered. Coverage therefore comes
+/// from this retained set alone — traffic on older filesystems can
+/// never stand in for a filesystem whose mark failed. Returns the
+/// next covered set and the uncovered-visible count; a nonzero
+/// count owes the finite unavailable-learning gap.
+pub(crate) fn evaluate_mark_coverage(
+    previously_covered: &BTreeSet<std::path::PathBuf>,
+    visible: &[std::path::PathBuf],
+    mut mark: impl FnMut(&std::path::Path) -> bool,
+) -> (BTreeSet<std::path::PathBuf>, usize) {
+    let mut covered = BTreeSet::new();
+    let mut uncovered = 0usize;
+    for point in visible {
+        if covered.contains(point) {
+            continue;
+        }
+        if (mark(point) || previously_covered.contains(point))
+            && covered.len() < MARK_COVERAGE_CAP
+        {
+            covered.insert(point.clone());
+        } else {
+            uncovered += 1;
+        }
+    }
+    (covered, uncovered)
+}
+
+/// The mount points a mark pass must cover, from the observer's
+/// mount table; an unreadable table falls back to `/` alone.
+fn visible_mount_points() -> Vec<std::path::PathBuf> {
     const MOUNTINFO_CAP: usize = 1024 * 1024;
     let text = std::fs::read_to_string("/proc/self/mountinfo")
         .ok()
         .filter(|text| text.len() <= MOUNTINFO_CAP);
-    let points = text
-        .as_deref()
+    text.as_deref()
         .map(mount_points_for_marks)
         .filter(|points| !points.is_empty())
-        .unwrap_or_else(|| vec![std::path::PathBuf::from("/")]);
-    let mut marked = 0usize;
-    let mut skipped = 0usize;
-    for point in &points {
-        let Ok(path) = std::ffi::CString::new(point.as_os_str().as_bytes()) else {
-            skipped += 1;
-            continue;
-        };
-        // SAFETY: libc call; the group fd and NUL-terminated path are valid.
-        let rc = unsafe {
-            libc::fanotify_mark(
-                group.as_raw_fd(),
-                libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
-                libc::FAN_OPEN,
-                libc::AT_FDCWD,
-                path.as_ptr(),
-            )
-        };
-        if rc == 0 {
-            marked += 1;
-        } else {
-            skipped += 1;
-        }
-    }
-    (marked, skipped)
+        .unwrap_or_else(|| vec![std::path::PathBuf::from("/")])
+}
+
+/// Adds one filesystem mark; false when the kernel refuses (for
+/// example without `CAP_SYS_ADMIN` after the capability shed).
+fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(point.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: libc call; the group fd and NUL-terminated path are valid.
+    let rc = unsafe {
+        libc::fanotify_mark(
+            group.as_raw_fd(),
+            libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
+            libc::FAN_OPEN,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+        )
+    };
+    rc == 0
+}
+
+/// One (re-)mark pass over the visible filesystems, retaining the
+/// coverage earlier passes established. Returns the next covered set
+/// and how many visible filesystems it leaves uncovered.
+fn mark_visible_filesystems(
+    group: &OwnedFd,
+    previously_covered: &BTreeSet<std::path::PathBuf>,
+) -> (BTreeSet<std::path::PathBuf>, usize) {
+    let points = visible_mount_points();
+    evaluate_mark_coverage(previously_covered, &points, |point| {
+        try_mark_filesystem(group, point)
+    })
 }
 
 /// Reads the `Pid:` of a pidfd from its fdinfo: the pid belongs to the
@@ -874,7 +929,13 @@ struct DrainStats {
 /// tallies and overflow. Never blocks the engine; the engine never
 /// blocks it past the bounded channel (then the kernel queue absorbs,
 /// then overflow names the loss).
-fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdownState>) {
+fn drain_loop(
+    group: OwnedFd,
+    tx: SyncSender<LearnMsg>,
+    state: Arc<LearnShutdownState>,
+    mut covered: BTreeSet<std::path::PathBuf>,
+    initial_gap_owed: bool,
+) {
     // Scheduling note: loader processes live ~15 ms, so the drain
     // wants prompt scheduling to name them (files still stage via
     // the unknown-loader reason when it loses the race). The observer
@@ -889,7 +950,15 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_remark = std::time::Instant::now();
     let mut unavailable_sent = false;
-    let mut events_at_last_remark = 0u64;
+    // The startup pass already left a visible filesystem uncovered:
+    // name that partial coverage now, once (data-always), instead of
+    // letting traffic on the covered filesystems stand in for it.
+    if initial_gap_owed {
+        unavailable_sent = true;
+        if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+            return;
+        }
+    }
     'drain: while !state.shutdown.load(Ordering::Acquire) {
         let mut polled = libc::pollfd {
             fd: raw,
@@ -906,14 +975,16 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
         }
         if last_remark.elapsed() >= std::time::Duration::from_secs(30) {
             last_remark = std::time::Instant::now();
-            let (marked, _) = mark_all_filesystems(&group);
-            // A failed re-mark alone does not prove learning stopped:
-            // the initial marks survive a capability shed and keep
-            // delivering. Only when no event arrived since the last
-            // re-mark either is the drain really blind.
-            let blind = stats.events == events_at_last_remark;
-            events_at_last_remark = stats.events;
-            if marked == 0 && blind && !unavailable_sent {
+            // Coverage is the retained-mark set, never event traffic:
+            // a failed re-mark of a retained filesystem is harmless
+            // (its startup mark still delivers), but a visible
+            // filesystem that no pass ever covered — a new mount the
+            // post-shed drain cannot mark — files the finite
+            // unavailable-learning gap once, however busy the covered
+            // filesystems are. The capture continues (data-always).
+            let (next_covered, uncovered) = mark_visible_filesystems(&group, &covered);
+            covered = next_covered;
+            if uncovered > 0 && !unavailable_sent {
                 unavailable_sent = true;
                 if !send_learn(&tx, &state, LearnMsg::Unavailable) {
                     break 'drain;
@@ -965,7 +1036,8 @@ fn drain_loop(group: OwnedFd, tx: SyncSender<LearnMsg>, state: Arc<LearnShutdown
             };
             if event.overflow {
                 stats.overflows = stats.overflows.saturating_add(1);
-                mark_all_filesystems(&group);
+                let (next_covered, _) = mark_visible_filesystems(&group, &covered);
+                covered = next_covered;
                 if !send_learn(&tx, &state, LearnMsg::QueueOverflow) {
                     close_unread_tail(&buf, offset, read as usize);
                     break 'drain;

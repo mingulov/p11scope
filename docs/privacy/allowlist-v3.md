@@ -2169,4 +2169,5 @@ and per-tick pins; overload, an unavailable drain, a lost shutdown tail,
 and the cap each file a finite counted gap. The drain thread spawns after
 the post-setup capability shed, so it holds no transient `CAP_SYS_ADMIN`;
 re-marking a filesystem first mounted mid-capture may then fail, which
-the no-events check turns into the unavailable gap instead of silence.
+the retained-mark coverage check turns into the unavailable gap instead
+of silence, whatever traffic already-marked filesystems produce.

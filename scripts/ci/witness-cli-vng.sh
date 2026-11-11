@@ -31,7 +31,8 @@
 # calling workflow, not here): busybox-static qemu-system-x86 qemu-utils
 # seabios ipxe-qemu gcc (the cells compile their runtime workload in the
 # guest) softhsm2 (the guest shares the runner rootfs, so the provider
-# cells see the runner's SoftHSM install). virtme-ng comes from pipx at
+# cells see the runner's SoftHSM install) opensc (pkcs11-tool for the
+# learned-provider cell). virtme-ng comes from pipx at
 # the workflow's pinned CI_VNG_VERSION.
 set -u
 

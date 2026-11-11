@@ -74309,3 +74309,121 @@ fn failed_live_produced_read_files_the_stale_cross_check() {
         engine.counters.object_skips
     );
 }
+
+/// Relief victim protection across a leader exit: a queued ownerless,
+/// viewless request for a group whose leader turned zombie while a worker
+/// still runs must survive relief. A zombie leader is not proof the group
+/// exited, and eviction records no truncation or live loss.
+#[test]
+fn review_relief_keeps_live_group_after_leader_exit() {
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    let tgid = group.pid();
+    assert!(
+        tgid < FAKE_PID_FLOOR,
+        "the real group sorts below the fake fill range"
+    );
+    let pin = crate::process::PidPin::open(tgid).expect("pin the live group");
+    let mut engine = Engine::empty();
+    assert!(
+        engine.request_refresh_consumed(tgid, Some(100)),
+        "the live group queues while its leader is alive"
+    );
+    let mut offset = 0u32;
+    while engine.refresh_requested.len() < MAX_PENDING_REFRESH {
+        assert!(
+            engine.request_refresh(FAKE_PID_FLOOR + offset, Some(200)),
+            "the queue accepts departed pid {} while filling",
+            FAKE_PID_FLOOR + offset
+        );
+        offset += 1;
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    group.leave_leader();
+    assert!(
+        process::process_is_zombie(tgid),
+        "the leader is a real zombie"
+    );
+    assert_eq!(
+        pin.original_exited(),
+        Ok(false),
+        "the original pidfd generation still runs"
+    );
+    group.call_three();
+    let guards = e06_spawn_sleeps(1);
+    let arrival = guards[0].pid();
+    assert_ne!(arrival, tgid);
+    let before: std::collections::BTreeSet<u32> =
+        engine.refresh_requested.keys().copied().collect();
+    assert!(
+        engine.request_refresh_consumed(arrival, Some(300)),
+        "a live arrival triggers relief"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&tgid),
+        "relief keeps the live group's request"
+    );
+    group.call_three();
+    let evicted: Vec<u32> = before
+        .iter()
+        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .copied()
+        .collect();
+    assert_eq!(
+        evicted.len(),
+        1,
+        "relief evicts exactly one departed entry: {evicted:?}"
+    );
+    assert!(
+        evicted[0] >= FAKE_PID_FLOOR,
+        "the evicted entry is a departed filler, not the live group: {evicted:?}"
+    );
+}
+
+/// Relief newcomer liveness across a leader exit: a group whose leader is
+/// zombie while a worker still runs still counts as live, so a
+/// departed-filled queue must admit its refresh request through relief.
+#[test]
+fn review_relief_admits_live_group_after_leader_exit() {
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    let tgid = group.pid();
+    assert!(
+        tgid < FAKE_PID_FLOOR,
+        "the real group sorts below the fake fill range"
+    );
+    let pin = crate::process::PidPin::open(tgid).expect("pin the live group");
+    group.leave_leader();
+    assert!(
+        process::process_is_zombie(tgid),
+        "the leader is a real zombie"
+    );
+    assert_eq!(
+        pin.original_exited(),
+        Ok(false),
+        "the original pidfd generation still runs"
+    );
+    group.call_three();
+    let mut engine = Engine::empty();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh(FAKE_PID_FLOOR + offset, Some(100)),
+            "the queue accepts departed pid {} while filling",
+            FAKE_PID_FLOOR + offset
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert!(
+        engine.request_refresh_consumed(tgid, Some(200)),
+        "a live group admits past departed pending after its leader exits"
+    );
+    assert!(engine.refresh_requested.contains_key(&tgid));
+    assert_eq!(
+        engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "relief replaces exactly one entry, the queue stays bounded"
+    );
+    group.call_three();
+}

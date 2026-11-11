@@ -164,6 +164,7 @@ pub struct LongRunDetector {
     first_event_loss: Option<u64>,
     first_discovery_loss: Option<u64>,
     identity_sampled: bool,
+    identity_final_unread: bool,
     identity_budget_exhausted: bool,
     identity_unavailable: u64,
     newcomer_pending: u64,
@@ -209,12 +210,22 @@ impl LongRunDetector {
     /// lifetime budget is spent and how many identities were refused.
     /// Replaced, never merged: the loop syncs the latest snapshot,
     /// with a final read at loop end. A sync also marks the health
-    /// sampled; without any sample the verdict reports unknown
-    /// identity health instead of substituting this healthy default.
+    /// sampled and clears the unread tail; without any sample the
+    /// verdict reports unknown identity health instead of substituting
+    /// this healthy default.
     pub fn note_identity_budget(&mut self, exhausted: bool, unavailable: u64) {
         self.identity_sampled = true;
+        self.identity_final_unread = false;
         self.identity_budget_exhausted = exhausted;
         self.identity_unavailable = unavailable;
+    }
+
+    /// An unread final identity-health read: the last-good counts
+    /// stand, but health is no longer known through the end, so the
+    /// verdict reports unknown instead of a stale clean. A later
+    /// successful sync clears this via [`Self::note_identity_budget`].
+    pub fn note_identity_unread(&mut self) {
+        self.identity_final_unread = true;
     }
 
     /// Latest newcomer point-in-time: pids still waiting and their
@@ -272,7 +283,9 @@ impl LongRunDetector {
     /// snapshot publishes); first-drain readings never exceed them.
     /// Bounds are strict: a tick or gap exactly at its bound is clean.
     /// Identity health without any sample is an unknown finding, never
-    /// a silent healthy default.
+    /// a silent healthy default; so is a sampled detector whose final
+    /// read went unread — the last-good counts stand beside the unknown
+    /// instead of yielding a stale clean.
     pub fn finish(&self, total_event_loss: u64, total_discovery_loss: u64) -> LongRunReport {
         let mut findings = Vec::new();
         if self.max_tick_ms > self.config.tick_latency_max_ms {
@@ -319,23 +332,33 @@ impl LongRunDetector {
                 detail: "identity health unknown (no usable kernel identity sample)".to_string(),
                 at_tick: None,
             });
-        } else if self.identity_budget_exhausted || self.identity_unavailable > 0 {
-            let detail = if self.identity_budget_exhausted {
-                format!(
-                    "lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent; {} refused",
-                    self.identity_unavailable
-                )
-            } else {
-                format!(
-                    "{} refused without a spent budget",
-                    self.identity_unavailable
-                )
-            };
-            findings.push(LongRunFinding {
-                code: FINDING_IDENTITY_BUDGET_EXHAUSTED,
-                detail,
-                at_tick: None,
-            });
+        } else {
+            if self.identity_budget_exhausted || self.identity_unavailable > 0 {
+                let detail = if self.identity_budget_exhausted {
+                    format!(
+                        "lifetime budget of {IMAGE_IDENTITY_TICKET_LIMIT} identities spent; {} refused",
+                        self.identity_unavailable
+                    )
+                } else {
+                    format!(
+                        "{} refused without a spent budget",
+                        self.identity_unavailable
+                    )
+                };
+                findings.push(LongRunFinding {
+                    code: FINDING_IDENTITY_BUDGET_EXHAUSTED,
+                    detail,
+                    at_tick: None,
+                });
+            }
+            if self.identity_final_unread {
+                findings.push(LongRunFinding {
+                    code: FINDING_IDENTITY_HEALTH_UNKNOWN,
+                    detail: "identity health unknown (final kernel identity sample unread)"
+                        .to_string(),
+                    at_tick: None,
+                });
+            }
         }
         if newcomer_stalled(self.newcomer_pending, self.newcomer_oldest_pending_age_ms) {
             findings.push(LongRunFinding {
@@ -765,6 +788,73 @@ mod tests {
             report.report_line().contains("p11scope: longrun: clean"),
             "{report:?}"
         );
+    }
+
+    // Identity health (RED): a healthy sample followed by an unread
+    // final read is unknown, never clean. The last-good counts stand,
+    // but the verdict cannot claim health through the end.
+    #[test]
+    fn healthy_sample_then_unread_final_is_unknown_never_clean() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(false, 0);
+        detector.note_newcomer(0, None);
+        detector.note_identity_unread();
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == FINDING_IDENTITY_HEALTH_UNKNOWN)
+            .expect("identity_health_unknown finding");
+        assert_eq!(finding.at_tick, None);
+        let line = report.report_line();
+        assert!(line.contains(FINDING_IDENTITY_HEALTH_UNKNOWN), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (RED twin): a spent sample followed by an unread
+    // final keeps the spent finding beside the unknown, never clean
+    // and never unknown alone.
+    #[test]
+    fn spent_sample_then_unread_final_keeps_spent_beside_unknown() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(true, 7);
+        detector.note_newcomer(0, None);
+        detector.note_identity_unread();
+        let report = detector.finish(0, 0);
+        assert!(!report.is_clean(), "{report:?}");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == FINDING_IDENTITY_BUDGET_EXHAUSTED),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == FINDING_IDENTITY_HEALTH_UNKNOWN),
+            "{report:?}"
+        );
+        let line = report.report_line();
+        assert!(line.contains(FINDING_IDENTITY_BUDGET_EXHAUSTED), "{line}");
+        assert!(line.contains(FINDING_IDENTITY_HEALTH_UNKNOWN), "{line}");
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (twin): a successful sync after an unread flag
+    // means health is known through the end again, so the clean line
+    // returns.
+    #[test]
+    fn successful_sync_after_unread_clears_the_unknown() {
+        let mut detector = ordinary_detector();
+        detector.note_identity_budget(false, 0);
+        detector.note_identity_unread();
+        detector.note_identity_budget(false, 0);
+        detector.note_newcomer(0, None);
+        let report = detector.finish(0, 0);
+        assert!(report.is_clean(), "{report:?}");
     }
 
     // T2 (RED): thresholds come from the config, not the constants.

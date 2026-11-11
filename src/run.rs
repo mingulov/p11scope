@@ -9482,12 +9482,11 @@ fn capture_profile(
     // per-tick samples above are the last good state, and this
     // independent control read refreshes it without the evidence
     // cells, so an unrelated cell failure cannot discard a readable
-    // spent budget. Best effort: a failed read keeps the last synced
-    // sample, and a run that never sampled identity health reports it
-    // unknown, never clean.
-    if let Ok(control) = metrics::kernel_control(session) {
-        scheduling.sync_identity_health(&control);
-    }
+    // spent budget. The result always lands: success refreshes the
+    // sample, failure marks the tail unread so a prior healthy sample
+    // cannot yield clean, and a run that never sampled identity health
+    // reports it unknown, never clean.
+    scheduling.sync_identity_health_result(metrics::kernel_control(session));
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
     if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
@@ -10811,7 +10810,9 @@ fn capture_trace(
                     // Last-good identity sample for the long-run
                     // verdict: the trace loop takes no snapshots, so
                     // the control read stands alone beside the loss
-                    // report. Best effort, like the final sync.
+                    // report. Best effort per tick: a failed tick keeps
+                    // the last sample, while the loop-end helper records
+                    // its own result.
                     if let Ok(control) = metrics::kernel_control(context.1) {
                         consumers.scheduling.sync_identity_health(&control);
                     }
@@ -10948,12 +10949,11 @@ fn capture_trace(
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     // Final identity/newcomer sync for the long-run verdict, as on
     // the profile path: the independent control read refreshes the
-    // last-good per-tick sample without the evidence cells. Best
-    // effort: a failed read keeps the last synced sample, and a run
-    // that never sampled identity health reports it unknown.
-    if let Ok(control) = metrics::kernel_control(session) {
-        scheduling.sync_identity_health(&control);
-    }
+    // last-good per-tick sample without the evidence cells. The result
+    // always lands: a failed read marks the tail unread so a prior
+    // healthy sample cannot yield clean, and a run that never sampled
+    // identity health reports it unknown.
+    scheduling.sync_identity_health_result(metrics::kernel_control(session));
     scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
     // Findings always warn; a clean or unavailable detector is diagnostics.
     if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
@@ -12236,15 +12236,32 @@ impl SchedulingAccumulator {
 
     /// Carries the kernel identity health (COOKIE_CTL) into the
     /// long-run detector: a spent lifetime budget blinds the capture
-    /// to new processes, so the loop-end line must name it. Best
-    /// effort like every sync: callers skip the call when the read
-    /// fails, so a failed read keeps the last synced sample, and the
-    /// detector reports unknown when no sample ever landed.
+    /// to new processes, so the loop-end line must name it. Per-tick
+    /// callers skip the call when the read fails, so a failed tick
+    /// keeps the last synced sample; loop-end callers must use
+    /// [`Self::sync_identity_health_result`] instead so a failed final
+    /// read marks the tail unread rather than yielding a stale clean.
     pub(crate) fn sync_identity_health(&mut self, control: &crate::metrics::KernelControl) {
         self.longrun.note_identity_budget(
             control.identity_budget_exhausted,
             control.identity_unavailable,
         );
+    }
+
+    /// Records one loop-end identity-health read result in the
+    /// long-run detector: success refreshes the last-good sample,
+    /// failure marks the tail unread while the counts stand, so a
+    /// prior healthy sample cannot yield clean and a run that never
+    /// sampled reports unknown. Both capture loops route their final
+    /// independent control read through this helper.
+    pub(crate) fn sync_identity_health_result<E>(
+        &mut self,
+        result: Result<crate::metrics::KernelControl, E>,
+    ) {
+        match result {
+            Ok(control) => self.sync_identity_health(&control),
+            Err(_) => self.longrun.note_identity_unread(),
+        }
     }
 
     /// Carries one tick snapshot's identity health into the long-run
@@ -24560,6 +24577,8 @@ int main(int argc, char **argv) {
         let mut acc = SchedulingAccumulator::default();
         acc.note_longrun_first_loss(Some(0), 0, true);
         acc.note_longrun_tick(1, Duration::from_millis(50));
+        let failed: Result<crate::metrics::KernelControl, ()> = Err(());
+        acc.sync_identity_health_result(failed);
         acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
         acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
         assert!(acc.longrun_has_findings(true));
@@ -24569,8 +24588,9 @@ int main(int argc, char **argv) {
     }
 
     // Identity health (twin): a spent sample synced from an earlier
-    // tick survives a failed final read — the caller simply syncs
-    // nothing — instead of degrading to unknown or clean.
+    // tick survives a failed final read beside the unknown tail —
+    // the known counts stand instead of degrading to unknown alone
+    // or clean.
     #[test]
     fn spent_identity_sample_survives_a_failed_final_read() {
         let mut acc = SchedulingAccumulator::default();
@@ -24581,7 +24601,10 @@ int main(int argc, char **argv) {
             identity_budget_exhausted: true,
             ..Default::default()
         });
-        // The final read failed: no second sync lands.
+        // The final read failed: the loop-end helper records the
+        // failure while the spent counts stand.
+        let failed: Result<crate::metrics::KernelControl, ()> = Err(());
+        acc.sync_identity_health_result(failed);
         acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
         acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
         assert!(acc.longrun_has_findings(true));
@@ -24591,7 +24614,10 @@ int main(int argc, char **argv) {
             "{line}"
         );
         assert!(line.contains('7'), "{line}");
-        assert!(!line.contains("identity_health_unknown"), "{line}");
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_HEALTH_UNKNOWN),
+            "{line}"
+        );
         assert!(!line.contains("clean"), "{line}");
     }
 
@@ -24649,6 +24675,79 @@ int main(int argc, char **argv) {
             "{line}"
         );
         assert!(line.contains('7'), "{line}");
+    }
+
+    // Identity health (RED): profile loop — a healthy tick sample
+    // followed by an unread COOKIE snapshot and a failed final read
+    // is unknown, never clean. The last-good healthy counts stand,
+    // but the verdict cannot claim health through the end.
+    #[test]
+    fn profile_healthy_then_failed_final_is_unknown_never_clean() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_evidence(&crate::metrics::KernelEvidence {
+            control: crate::metrics::KernelControl::default(),
+            unknown_cells: 0,
+            ..Default::default()
+        });
+        acc.sync_identity_evidence(&crate::metrics::KernelEvidence {
+            control: crate::metrics::KernelControl::default(),
+            unknown_cells: crate::metrics::LEGACY_UNKNOWN_COOKIE,
+            ..Default::default()
+        });
+        // The final read failed: the loop-end helper records the
+        // failure instead of skipping the sync.
+        let failed: Result<crate::metrics::KernelControl, ()> = Err(());
+        acc.sync_identity_health_result(failed);
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_has_findings(true));
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_HEALTH_UNKNOWN),
+            "{line}"
+        );
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (RED): trace loop — a healthy per-tick control
+    // read followed by a failed final read is unknown, never clean.
+    #[test]
+    fn trace_healthy_then_failed_final_is_unknown_never_clean() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl::default());
+        // The final read failed: the loop-end helper records the
+        // failure instead of skipping the sync.
+        let failed: Result<crate::metrics::KernelControl, ()> = Err(());
+        acc.sync_identity_health_result(failed);
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(acc.longrun_has_findings(true));
+        let line = acc.longrun_line(true);
+        assert!(
+            line.contains(crate::longrun::FINDING_IDENTITY_HEALTH_UNKNOWN),
+            "{line}"
+        );
+        assert!(!line.contains("clean"), "{line}");
+    }
+
+    // Identity health (twin): a healthy tick sample followed by a
+    // successful healthy final keeps the clean line — the helper's Ok
+    // path refreshes the sample and clears the unread tail.
+    #[test]
+    fn healthy_sample_then_successful_final_stays_clean() {
+        let mut acc = SchedulingAccumulator::default();
+        acc.note_longrun_first_loss(Some(0), 0, true);
+        acc.note_longrun_tick(1, Duration::from_millis(50));
+        acc.sync_identity_health(&crate::metrics::KernelControl::default());
+        acc.sync_identity_health_result::<()>(Ok(crate::metrics::KernelControl::default()));
+        acc.note_newcomer_stats(crate::timing::NewcomerStats::new());
+        acc.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(!acc.longrun_has_findings(true));
+        assert!(acc.longrun_line(true).contains("clean"));
     }
 
     /// CLI text: only a detector with findings warns on default
@@ -27174,11 +27273,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    /// Identity health (RED): both loops refresh the long-run
-    /// identity sample from the independent control read at loop end,
-    /// so an unrelated EVIDENCE-cell failure cannot discard a readable
-    /// spent COOKIE_CTL. The loops only run live, so the wiring is
-    /// pinned statically like the shared finish helpers below.
+    /// Identity health (RED): both loops record the independent
+    /// control read result at loop end — success and failure — so an
+    /// unrelated EVIDENCE-cell failure cannot discard a readable spent
+    /// COOKIE_CTL and a failed final read cannot yield a stale clean.
+    /// The loops only run live, so the wiring is pinned statically
+    /// like the shared finish helpers below.
     #[test]
     fn both_capture_loops_sync_identity_health_from_the_control_read() {
         let source = include_str!("run.rs");
@@ -27202,12 +27302,9 @@ int main(int argc, char **argv) {
                 1,
                 "{function} must take its final identity sample from the control read"
             );
-            let sync = body
-                .find("metrics::kernel_control(session)")
-                .expect("final control read");
             assert!(
-                body[..sync].ends_with("if let Ok(control) = "),
-                "{function} must sync the control read best-effort"
+                body.contains("sync_identity_health_result(metrics::kernel_control(session))"),
+                "{function} must record the final control read result (success and failure)"
             );
             assert!(
                 !body.contains("sync_identity_health(&kernel.control)"),

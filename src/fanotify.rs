@@ -1323,6 +1323,70 @@ mod tests {
         assert_eq!(marks, vec!["/", "/dev", "/mnt/ovl", "/mnt/with space"]);
     }
 
+    /// A failed re-mark of an already covered filesystem is not a
+    /// coverage loss: the startup mark survives the capability shed
+    /// and keeps delivering, so post-shed add failures on retained
+    /// filesystems file no gap.
+    #[test]
+    fn learn_retained_mark_failure_is_not_a_coverage_gap() {
+        let covered: std::collections::BTreeSet<std::path::PathBuf> =
+            ["/", "/data"].iter().map(std::path::PathBuf::from).collect();
+        let visible: Vec<std::path::PathBuf> = covered.iter().cloned().collect();
+        // Every add fails now (no CAP_SYS_ADMIN after the shed).
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 0, "retained marks stay covered");
+        assert_eq!(next, covered);
+    }
+
+    /// A newly mounted filesystem whose mark fails is uncovered even
+    /// while older filesystems keep delivering: coverage comes from
+    /// the retained-mark set, never from traffic elsewhere.
+    #[test]
+    fn learn_failed_new_filesystem_mark_is_uncovered() {
+        let covered: std::collections::BTreeSet<std::path::PathBuf> =
+            ["/"].iter().map(std::path::PathBuf::from).collect();
+        let visible = vec![
+            std::path::PathBuf::from("/"),
+            std::path::PathBuf::from("/mnt/new"),
+        ];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 1, "the unmarked new filesystem is a gap");
+        assert_eq!(next, covered, "only the retained filesystem is covered");
+    }
+
+    /// A newly mounted filesystem that marks successfully joins the
+    /// covered set with no gap.
+    #[test]
+    fn learn_successful_new_filesystem_mark_covers_it() {
+        let covered: std::collections::BTreeSet<std::path::PathBuf> =
+            ["/"].iter().map(std::path::PathBuf::from).collect();
+        let visible = vec![
+            std::path::PathBuf::from("/"),
+            std::path::PathBuf::from("/mnt/new"),
+        ];
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |point| {
+                point.as_os_str() == "/mnt/new"
+            });
+        assert_eq!(uncovered, 0);
+        assert!(next.contains(std::path::Path::new("/mnt/new")));
+        assert!(next.contains(std::path::Path::new("/")));
+    }
+
+    /// With nothing retained, every failed mark is uncovered (the
+    /// startup shape behind the unavailable-learning refusal).
+    #[test]
+    fn learn_no_retained_marks_counts_every_failure() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![
+            std::path::PathBuf::from("/"),
+            std::path::PathBuf::from("/data"),
+        ];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| false);
+        assert_eq!(uncovered, 2);
+        assert!(next.is_empty());
+    }
+
     /// The drain parses the pidfd info record beside the metadata, so the
     /// loader is named from a reuse-immune handle, never a bare pid.
     #[test]

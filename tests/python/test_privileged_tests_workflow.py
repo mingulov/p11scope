@@ -668,6 +668,60 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertNotIn("--allow-nonqualifying", job)
         self.assertIn("name: container-image", job)
 
+    def test_journal_proof_builds_at_full_capacities(self):
+        # The private proof refuses SMALL/WIDE/unsafe/P0 (build.rs); the
+        # wide default carries no journal object to prove, so the proof
+        # step builds FULL (--no-default-features) in its own target dir
+        # while the product stays wide. The proof configuration itself
+        # never changes: the same filter must select the same 2 tests.
+        step = re.search(
+            r"Build P11SCOPE_JOURNAL_PROOF=1 and run root_proof_tests"
+            r"[\s\S]*?test result: ok\. 2 passed",
+            self.yml)
+        self.assertIsNotNone(step, "proof step with the 2-test gate")
+        self.assertIn("--no-default-features", step.group(0),
+                      "proof step must build FULL capacities, not the wide default")
+        self.assertIn("--target-dir target/proof", step.group(0),
+                      "proof build must keep its separate target dir")
+
+    def test_journal_flavor_verifies_the_full512_curation(self):
+        # The journal flavor builds FULL (--no-default-features), where
+        # the 21 wide-only cells do not exist; its --list and the
+        # second-flavor run verify the FULL-512 curation explicitly, so
+        # a silent gating change fails instead of flipping coverage.
+        journal = job_body(self.yml, "privileged-build-journal")
+        self.assertIn("--no-default-features", journal)
+        self.assertIn("--list --full-512", journal,
+                      "journal --list must verify the FULL-512 curation")
+        second = job_body(self.yml, "privileged-second-flavor")
+        self.assertIn("run-privileged-lib-tests.sh \"$in/lib-tests\" "
+                      "\"$out/run\" --full-512", second,
+                      "second-flavor run must verify the FULL-512 curation")
+
+    def test_counter_cells_are_expected_failures_on_the_wide_build(self):
+        # The wide default build omits counter objects, so the 9
+        # counter/select-endpoint cells refuse with the documented
+        # build reason; the qualifier records them as expected
+        # failures, and both the host template leg and the shared
+        # workflow judge must declare exactly those 9.
+        cells = ("counter-latency-mt",
+                 "counter-counts-pid", "counter-timestamps-pid",
+                 "counter-latency-pid", "counter-counts-system",
+                 "counter-timestamps-system", "counter-latency-system",
+                 "select-endpoint-pid", "select-endpoint-system")
+        job = job_body(self.yml, "public-cli")
+        host_leg = job.split("qualify-public-cli-vng.sh")[0]
+        for cell in cells:
+            with self.subTest(cell=cell):
+                self.assertIn(f"--expected-failure {cell}", host_leg,
+                              f"host template leg must declare {cell}")
+        expected = re.search(r"expected_cells = \{(.*?)\}", job, re.S)
+        self.assertIsNotNone(expected, "workflow judge expected_cells set")
+        for cell in cells:
+            with self.subTest(cell=cell):
+                self.assertIn(f'"{cell}"', expected.group(1),
+                              f"workflow judge must declare {cell}")
+
 
 if __name__ == "__main__":
     unittest.main()

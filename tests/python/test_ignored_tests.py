@@ -50,6 +50,37 @@ CELLS = {
 
 WIDE_OWNER = "wide-detailed-2112 runner"
 
+# The 21 wide-only cells: curated tests that exist only in a
+# wide-detailed-2112 binary (cfg wide, no FULL twin). A FULL-512 binary
+# (--no-default-features, the journal flavor) must lack exactly these;
+# the runner's WIDE_ONLY_TESTS pins them for --full-512 verification.
+# Pinned literally so a runner edit that drops or renames one fails
+# here, not silently; test_wide_only_matches_cfg_wide_sources pins the
+# set against the cfg gates, so a gate change fails here too.
+WIDE_ONLY_EXPECTED = [
+    "attach::inventory::activation::privileged_tests::privileged_detailed_2112_stop_publishes_before_cleanup",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_2112_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_nonleader_exec",
+    "attach::inventory::activation::privileged_tests::privileged_task4_highslot_2048_worker_exit",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2048_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n2049_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n511_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_n513_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_detailed_physical_identity_controls",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2049_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n511_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n512_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n513_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_task4_inventory_physical_identity_controls",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64",
+    "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64",
+]
+
 # The nine wide-Detailed cells, promoted to DEFAULT_TESTS since v0.7.0
 # made 2,112 slots the default profile (the four wide-gated fns plus
 # the five wide-gated detailed_sweep_test! expansions). Pinned
@@ -2114,6 +2145,217 @@ class IgnoredTestsTests(unittest.TestCase):
                          result.stdout + result.stderr)
         self.assertIn("exec_task_continuity", result.stderr)
         self.assertIn("more than one test binary", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+
+PRIVILEGED_TESTS_RS = (ROOT / "src" / "attach" / "inventory" / "activation"
+                       / "privileged_tests.rs")
+PRIVILEGED_TESTS_MOD = "attach::inventory::activation::privileged_tests"
+SWEEP_MACROS = ("inventory_sweep_test", "detailed_sweep_test")
+
+
+def _attr_block_above(lines, index):
+    """Consecutive #[...] lines directly above lines[index]."""
+    attrs = []
+    cursor = index - 1
+    while cursor >= 0:
+        stripped = lines[cursor].strip()
+        if not stripped:
+            cursor -= 1
+            continue
+        if stripped.startswith("#["):
+            attrs.append(stripped)
+            cursor -= 1
+            continue
+        break
+    return attrs
+
+
+def _gate_class(attrs):
+    """wide when a positive wide-detailed-2112 cfg gates the site.
+
+    A cfg(not(feature = "wide-detailed-2112")) twin (the n512 pair)
+    and ungated sites are FULL-present, never wide-only.
+    """
+    cfgs = [attr for attr in attrs if "cfg" in attr]
+    if not cfgs:
+        return "full"
+    wide = any("wide-detailed-2112" in cfg and "not(" not in cfg
+               for cfg in cfgs)
+    other = any("wide-detailed-2112" not in cfg or "not(" in cfg
+                for cfg in cfgs)
+    if wide and not other:
+        return "wide"
+    return "full"
+
+
+def wide_only_from_sources():
+    """Full paths of ignored lib tests gated wide-only in src/.
+
+    A test is wide-only when every definition site (plain fn or
+    sweep-macro invocation) carries a positive wide cfg and none is
+    FULL-present. Macro-definition gates join the invocation gate.
+    Only privileged_tests.rs holds ignore-bearing sweep macros (see
+    the guard test); every other src file is guarded separately.
+    """
+    text = PRIVILEGED_TESTS_RS.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    def_gate = {}
+    for name in SWEEP_MACROS:
+        match = re.search(rf"^macro_rules! {name} \{{", text, re.M)
+        assert match is not None, f"missing macro def {name}"
+        opening = text.count("\n", 0, match.start())
+        template = "\n".join(lines[opening:opening + 12])
+        assert "#[ignore" in template, f"{name} template lost #[ignore]"
+        def_gate[name] = _gate_class(_attr_block_above(lines, opening))
+    sites = {}
+    for number, line in enumerate(lines):
+        fn_match = re.match(r"fn (\w+)\s*\(", line.strip())
+        if fn_match is not None:
+            attrs = _attr_block_above(lines, number)
+            if any(attr.startswith("#[ignore") for attr in attrs):
+                sites.setdefault(fn_match.group(1), []).append(
+                    _gate_class(attrs))
+            continue
+        for name in SWEEP_MACROS:
+            if re.match(rf"{name}!\s*\(", line.strip()) is None:
+                continue
+            rest = "\n".join(lines[number:number + 4])
+            arg = re.search(rf"{name}!\s*\(\s*(\w+)", rest)
+            assert arg is not None, f"cannot parse {name} invocation"
+            gate = _gate_class(_attr_block_above(lines, number))
+            if gate == "full" and def_gate[name] == "wide":
+                gate = "wide"
+            sites.setdefault(arg.group(1), []).append(gate)
+    return {f"{PRIVILEGED_TESTS_MOD}::{name}"
+            for name, gates in sites.items()
+            if gates and all(gate == "wide" for gate in gates)}
+
+
+class Full512CurationTests(unittest.TestCase):
+    def test_wide_only_list_is_pinned_and_curated(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        members = lists.get("WIDE_ONLY_TESTS", set())
+        self.assertEqual(sorted(members), sorted(WIDE_ONLY_EXPECTED))
+        campaign = set(lists["DEFAULT_TESTS"]) | set(lists["LONG_TESTS"])
+        for name in WIDE_ONLY_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn(name, campaign,
+                              "every wide-only cell stays curated")
+
+    def test_wide_only_matches_cfg_wide_sources(self):
+        self.assertEqual(wide_only_from_sources(), set(WIDE_ONLY_EXPECTED))
+
+    def test_no_other_file_holds_a_wide_gated_ignored_test(self):
+        # The source scan covers privileged_tests.rs only; every other
+        # src file with a wide cfg must keep ignored tests away from
+        # it, so a new wide-gated test outside the scan fails here.
+        offenders = []
+        for path in sorted((ROOT / "src").rglob("*.rs")):
+            if path == PRIVILEGED_TESTS_RS:
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for number, line in enumerate(lines):
+                if "wide-detailed-2112" not in line or "cfg" not in line:
+                    continue
+                window = "\n".join(lines[number:number + 9])
+                if "#[ignore" in window:
+                    offenders.append(f"{path}:{number + 1}")
+        self.assertEqual(offenders, [])
+
+    def test_full512_list_mode_accepts_a_full_binary(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        binary_tests = sorted(full - proof - set(WIDE_ONLY_EXPECTED))
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-full512"
+            write_fake_binary(binary, binary_tests)
+            result = run_runner("--list", "--full-512", str(binary))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        # DEFAULT 240 minus the 17 wide members, plus both load-gate
+        # alternatives the fake lists (a real binary has exactly one);
+        # LONG 17 minus the 4 wide members.
+        self.assertIn("default (225)", result.stdout)
+        self.assertIn("long (13, --include-long only)", result.stdout)
+        for name in WIDE_ONLY_EXPECTED:
+            self.assertNotIn(name, result.stdout)
+        self.assertIn("verify: full-512 curation matches the binary",
+                      result.stdout)
+
+    def test_full512_list_mode_refuses_a_wide_binary(self):
+        # A wide binary contains the wide-only cells: --full-512 must
+        # refuse it by name, never grade it as FULL-512.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-wide"
+            write_fake_binary(binary, sorted(full - proof))
+            result = run_runner("--list", "--full-512", str(binary))
+        self.assertNotEqual(result.returncode, 0,
+                            result.stdout + result.stderr)
+        self.assertIn("unexpectedly contains wide-only", result.stderr)
+        self.assertIn("privileged_task4_detailed_2112_lp64", result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_full512_list_mode_refuses_a_partial_binary(self):
+        # Exactly one wide-only cell present is still a refusal, not a
+        # quieter FULL-512: partial presence fails by name.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        keep = WIDE_ONLY_EXPECTED[3]
+        binary_tests = sorted(full - proof - set(WIDE_ONLY_EXPECTED)
+                              | {keep})
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-partial"
+            write_fake_binary(binary, binary_tests)
+            result = run_runner("--list", "--full-512", str(binary))
+        self.assertNotEqual(result.returncode, 0,
+                            result.stdout + result.stderr)
+        self.assertIn("unexpectedly contains wide-only", result.stderr)
+        self.assertIn(keep, result.stderr)
+        self.assertNotIn("verify:", result.stdout)
+
+    def test_full512_list_mode_refuses_an_uncurated_test(self):
+        # The flavor check keeps the exact cover: a new ignored test
+        # in a FULL-512 binary still fails as uncurated.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        binary_tests = (sorted(full - proof - set(WIDE_ONLY_EXPECTED))
+                        + ["attach::tests::brand_new_ignored_cell"])
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-newcell"
+            write_fake_binary(binary, binary_tests)
+            result = run_runner("--list", "--full-512", str(binary))
+        self.assertNotEqual(result.returncode, 0,
+                            result.stdout + result.stderr)
+        self.assertIn("ignored in the binary but not curated",
+                      result.stderr)
+        self.assertIn("brand_new_ignored_cell", result.stderr)
         self.assertNotIn("verify:", result.stdout)
 
 

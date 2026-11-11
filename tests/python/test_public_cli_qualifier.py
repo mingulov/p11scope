@@ -11,6 +11,7 @@ the real code.
 
 import ast
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -702,6 +703,186 @@ class JudgeFlagTests(unittest.TestCase):
             with self.subTest(cell=cell):
                 argv = run_judge_case(cell, "6.6.157-0606157-generic")
                 self.assertNotIn(self.FLAG, argv)
+
+
+REFUSAL = ("counter-mode-unavailable-in-build: "
+           "this build omits counter objects")
+BOGUS_PID = "2147483647"
+
+
+def run_counter_shell(body, *, cwd):
+    """Run body with the qualifier's counter-refusal code extracted."""
+    funcs = extract_functions("result", "counter_refused",
+                              "counter_build_supported")
+    const = subprocess.run(
+        ["grep", "^COUNTER_BUILD_REFUSAL=", str(QUAL)],
+        capture_output=True, text=True, timeout=5)
+    script = funcs + "\n" + const.stdout + "\n" + body
+    return subprocess.run(
+        ["bash", "-u", "-c", script],
+        capture_output=True, text=True, timeout=10, cwd=str(cwd))
+
+
+def write_fake_observer(path, stdout_text, stderr_text, rc, make_output=False):
+    """A fake observer: canned stdout/stderr/rc, optional -o creation."""
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' \"{stdout_text}\" \n"
+        f"printf '%s' \"{stderr_text}\" >&2\n"
+        + ("for arg in \"$@\"; do "
+           "if [ \"$seen_o\" = 1 ]; then : > \"$arg\"; fi; "
+           "if [ \"$arg\" = -o ]; then seen_o=1; else seen_o=0; fi; done\n"
+           if make_output else "")
+        + f"exit {rc}\n",
+        encoding="utf-8")
+    path.chmod(0o755)
+
+
+class CounterRefusalTests(unittest.TestCase):
+    def test_refusal_constant_matches_the_source_gate(self):
+        gate = (ROOT / "src" / "attach" / "counter_banks.rs").read_text(
+            encoding="utf-8")
+        self.assertIn(REFUSAL, gate,
+                      "source build gate must emit the pinned refusal")
+        script = QUAL.read_text(encoding="utf-8")
+        match = re.search(r'^COUNTER_BUILD_REFUSAL="([^"]+)"', script, re.M)
+        self.assertIsNotNone(match, "qualifier pins the refusal constant")
+        self.assertEqual(match.group(1), REFUSAL)
+        self.assertIn("REASON_COUNTER_WIDE", script)
+        self.assertIn(BOGUS_PID, script,
+                      "probe and refusal arm share one bogus pid")
+
+    def test_counter_cells_run_through_the_refusal_wrapper(self):
+        script = QUAL.read_text(encoding="utf-8")
+        cells = ("counter-latency-mt",
+                 "counter-counts-pid", "counter-timestamps-pid",
+                 "counter-latency-pid", "counter-counts-system",
+                 "counter-timestamps-system", "counter-latency-system",
+                 "select-endpoint-pid", "select-endpoint-system")
+        for cell in cells:
+            with self.subTest(cell=cell):
+                self.assertIn(f"counter_cell {cell} ", script,
+                              f"{cell} must run through counter_cell")
+        self.assertNotIn("gated counter-", script,
+                         "no counter cell may bypass the wrapper")
+        self.assertNotIn("gated select-endpoint-", script,
+                         "no select-endpoint cell may bypass the wrapper")
+
+    def test_probe_reads_the_exact_wide_refusal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-wide"
+            write_fake_observer(fake, "", f"p11scope: {REFUSAL}\n", 1)
+            body = (f"P={fake} OUT={tmp} "
+                    "counter_build_supported; echo rc=$?")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "rc=1")
+
+    def test_probe_passes_a_full_build_through(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-full"
+            write_fake_observer(fake, "", "p11scope: no such process\n", 1)
+            body = (f"P={fake} OUT={tmp} "
+                    "counter_build_supported; echo rc=$?")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "rc=0")
+
+    def test_probe_refuses_an_impossible_success(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-ok"
+            write_fake_observer(fake, "", "", 0)
+            body = (f"P={fake} OUT={tmp} "
+                    "counter_build_supported; echo rc=$?")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "rc=64")
+
+    def test_probe_refuses_a_noisy_refusal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-noisy"
+            write_fake_observer(
+                fake, "", f"p11scope: {REFUSAL}\nextra line\n", 1)
+            body = (f"P={fake} OUT={tmp} "
+                    "counter_build_supported; echo rc=$?")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "rc=64")
+
+    def test_refused_cell_records_the_known_gap(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-wide"
+            write_fake_observer(fake, "", f"p11scope: {REFUSAL}\n", 1)
+            out = tmp / "counter-counts-pid.json"
+            body = (f"P={fake} "
+                    "counter_refused counter-counts-pid profile "
+                    "--mode metrics --counter-mode counts --pid 999 "
+                    f"--duration 12 -o {out}")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = [json.loads(line) for line in
+                (tmp / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["cell"], "counter-counts-pid")
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "expected-failure")
+        self.assertIn("0.7.x", row["detail"])
+        self.assertFalse(out.exists())
+
+    def test_refused_cell_fails_a_full_style_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-full"
+            write_fake_observer(fake, "", "p11scope: no such process\n", 1)
+            out = tmp / "counter-counts-pid.json"
+            body = (f"P={fake} "
+                    "counter_refused counter-counts-pid profile "
+                    "--mode metrics --counter-mode counts --pid 999 "
+                    f"--duration 12 -o {out}")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        rows = [json.loads(line) for line in
+                (tmp / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0]["qualification"], "failed")
+
+    def test_refused_cell_fails_an_unexpected_success(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-ok"
+            write_fake_observer(fake, "", "", 0, make_output=True)
+            out = tmp / "counter-counts-pid.json"
+            body = (f"P={fake} "
+                    "counter_refused counter-counts-pid profile "
+                    "--mode metrics --counter-mode counts --pid 999 "
+                    f"--duration 12 -o {out}")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        rows = [json.loads(line) for line in
+                (tmp / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0]["qualification"], "failed")
+
+    def test_refused_cell_fails_stdout_noise(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fake = tmp / "observer-noisy"
+            write_fake_observer(fake, "stray output\n",
+                                f"p11scope: {REFUSAL}\n", 1)
+            out = tmp / "counter-counts-pid.json"
+            body = (f"P={fake} "
+                    "counter_refused counter-counts-pid profile "
+                    "--mode metrics --counter-mode counts --pid 999 "
+                    f"--duration 12 -o {out}")
+            proc = run_counter_shell(body, cwd=tmp)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        rows = [json.loads(line) for line in
+                (tmp / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0]["qualification"], "failed")
 
 
 if __name__ == "__main__":

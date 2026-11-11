@@ -73777,8 +73777,10 @@ fn complete_initial_arming_services_discovery_between_arms() {
     engine.scope = Scope::Pid(std::process::id());
     engine.initial_arming_pending = true;
     let mut session = ScriptedSession::default();
+    // An out-of-scope exec record: servicing it runs a tick without
+    // exec-refreshing the named views (which would re-arm them).
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
-        exec_record_for(std::process::id()),
+        exec_record_for(1),
     )))]
     .into_iter()
     .collect();

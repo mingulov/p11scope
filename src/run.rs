@@ -7665,6 +7665,38 @@ fn profile_frame_decisions(
     }
 }
 
+/// The closest two frames may sit when kernel-found frame-only work
+/// (a newcomer admission, a deferred loader scan) asks for an early one.
+/// Bounds the extra snapshot/render work a churning host can cause while
+/// keeping a newly found provider's admission within about this long of
+/// the record that named it, instead of up to a full drain interval.
+const FAST_DISCOVERY_FRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bring the next ordinary frame forward for kernel-found frame-only
+/// work: due at once when the last frame is at least
+/// [`FAST_DISCOVERY_FRAME_MIN_INTERVAL`] old, else at that interval after
+/// it. Never moves a frame later than the ordinary cadence would run it,
+/// and reads no clock when nothing was requested. The frame clock stays
+/// the one authority for snapshot/render (F-T8-1): this only moves it
+/// back, exactly like the recovery request below.
+fn request_fast_discovery_frame(
+    frame_clock: &mut Instant,
+    drain: Duration,
+    requested: bool,
+    now: impl FnOnce() -> Instant,
+) {
+    if !requested {
+        return;
+    }
+    let due = (*frame_clock + FAST_DISCOVERY_FRAME_MIN_INTERVAL)
+        .max(now())
+        .min(*frame_clock + drain);
+    let moved = due - drain;
+    if moved < *frame_clock {
+        *frame_clock = moved;
+    }
+}
+
 /// Request one ordinary frame after loss or native-retirement settlement. Preserve
 /// the render's clock and avoid another clock read on the ordinary cadence.
 fn request_profile_recovery_frame(
@@ -9575,6 +9607,12 @@ fn capture_profile(
             engine.take_immediate_exec_recovery_frame(),
             Instant::now,
         );
+        request_fast_discovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_fast_discovery_frame(),
+            Instant::now,
+        );
         collect_sink_drops(
             stdout,
             &mut scheduling,
@@ -11084,6 +11122,12 @@ fn capture_trace(
             &mut last_frame,
             drain,
             engine.take_immediate_exec_recovery_frame(),
+            Instant::now,
+        );
+        request_fast_discovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_fast_discovery_frame(),
             Instant::now,
         );
         flush_stdout(stdout, &mut stdout_open)?;

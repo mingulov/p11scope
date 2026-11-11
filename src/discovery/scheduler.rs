@@ -757,6 +757,24 @@ impl DiscoveryScheduler {
         self.prev_tick_start_ns
     }
 
+    /// Extend the tick deadline by one more quantum for the admission
+    /// phase when refreshed rescans ran first: rescans stay bounded by the
+    /// first quantum (they stop at the original deadline), and admissions
+    /// then get their own full quantum measured from the tick start, so a
+    /// costly rescan phase can no longer consume the whole tick and leave
+    /// every newcomer unattempted. No clock read: derived from the tick
+    /// start `begin_deep_scan_tick` recorded. Outside a tick (no deadline)
+    /// this is a no-op; a failed tick-start clock keeps the expired
+    /// deadline, so nothing runs blind.
+    pub(crate) fn extend_tick_deadline_for_admissions(&mut self) {
+        if self.tick_deadline_ns.is_some()
+            && let Some(start) = self.last_tick_start_ns
+        {
+            self.tick_deadline_ns =
+                Some(start.saturating_add(self.tick_quantum_ns.saturating_mul(2)));
+        }
+    }
+
     /// Whether the tick's deep-scan phase must stop before another scan. A
     /// failed clock poll also stops the phase, for the same reason as above.
     pub(crate) fn tick_expired(&self, now_ns: Option<u64>) -> bool {

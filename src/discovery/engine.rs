@@ -573,6 +573,11 @@ pub struct Engine {
     /// One-shot scheduling hint after an older leader loss or actual global
     /// native retirement settles. It grants no admission authority.
     immediate_exec_recovery_frame: bool,
+    /// One-shot scheduling hint that kernel-found frame-only work is
+    /// queued: a newcomer pid awaiting the inventory pass, or a newly
+    /// deferred loader memory scan. It grants no admission authority; the
+    /// run loop only moves the next ordinary frame earlier.
+    fast_discovery_frame: bool,
     pending_global_retirement: Option<RetirementTicket>,
     /// Retired slots the last revival refresh observed physically
     /// detached. A slot clears for revival only when observed detached
@@ -1023,6 +1028,13 @@ const CAPACITY_NO_VICTIM_REASON: &str = "capture process-view capacity was exhau
 /// path — a fatal arm, a stop, a staging/backlog/publish failure, and the
 /// clean post-ready window — files under this one subject.
 const INITIAL_ARMING_SUBJECT: &str = "initial loader arming";
+
+/// Minimum spacing between discovery batches serviced between initial
+/// loader arms: a late provider arriving during post-ready arming is
+/// admitted within about this long of its record instead of waiting for
+/// the whole initial set, while one arm's fixed costs stay amortized
+/// between batches. Provisional — ratify by measurement.
+const INITIAL_ARMING_YIELD_INTERVAL_NS: u64 = 100_000_000;
 /// Retry delay for a held-back process, in inventory passes; doubles per
 /// repeated isolation up to `HELD_BACK_RETRY_BASE_PASSES << 6`.
 const HELD_BACK_RETRY_BASE_PASSES: u64 = 8;
@@ -3232,6 +3244,11 @@ struct RefreshRequest {
     exec_binding: Option<crate::attach::ExecBinding>,
     // The matched, bound EXEC's kernel hook clock, never its arrival clock.
     exec_hook_ts_ns: Option<u64>,
+    // Windowed as a fresh newcomer (or into the admission window) but the
+    // tick quantum expired before any attempt: the request keeps fresh
+    // priority on later scarce ticks until its first attempt, instead of
+    // demoting to backlog by arrival age alone behind the whole queue.
+    deferred_fresh: bool,
 }
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
@@ -11385,6 +11402,7 @@ impl Engine {
             pressure_attempts: 0,
             frame_fresh_blocked: false,
             immediate_exec_recovery_frame: false,
+            fast_discovery_frame: false,
             pending_global_retirement: None,
             revival_observed_detached: BTreeSet::new(),
             revival_finalized: BTreeSet::new(),
@@ -14461,12 +14479,22 @@ impl Engine {
                 owner,
                 exec_binding: None,
                 exec_hook_ts_ns: None,
+                deferred_fresh: existing
+                    .as_ref()
+                    .is_some_and(|request| request.deferred_fresh),
             },
         );
         if let Some(owner) = owner
             && let Some(marker) = self.exec_rearm_views.get_mut(&owner)
         {
             *marker = Some(serial);
+        }
+        // A consumed record that first queued a pid no retained view owns
+        // can only be admitted by a frame's inventory pass: ask the run
+        // loop to bring that frame forward. Renewals and self-queued
+        // (non-consumed) requests keep the ordinary cadence.
+        if consumed && existing.is_none() && owner.is_none() {
+            self.fast_discovery_frame = true;
         }
         true
     }
@@ -14754,6 +14782,9 @@ impl Engine {
         }
         self.pending_loader_scans
             .insert(key, (hook_ts_ns, announced));
+        // A newly deferred scan is serviced only inside a frame: bring
+        // that frame forward instead of waiting out the drain interval.
+        self.fast_discovery_frame = true;
     }
 
     fn record_pending_loader_scan_loss(&mut self, reason: &str) {
@@ -23632,6 +23663,12 @@ impl Engine {
         std::mem::take(&mut self.immediate_exec_recovery_frame)
     }
 
+    /// Consume only the fast-frame scheduling hint, never admission
+    /// authority.
+    pub(crate) fn take_fast_discovery_frame(&mut self) -> bool {
+        std::mem::take(&mut self.fast_discovery_frame)
+    }
+
     /// Poll only the current Session allocation's ticket. Ordinary live work
     /// stays blocked on both pending and refused ownership. Carry the actual
     /// verdict so collected Finish can end incompletely on refusal while
@@ -24187,11 +24224,11 @@ impl Engine {
                 // terminal authority.
                 if deferred_mismatches.is_empty()
                     && queued.terminal_owner.is_none()
+                    && self.frame_work_exhausted()
                     && batch
                         .as_slice()
                         .iter()
                         .all(|rest| rest.terminal_owner.is_none())
-                    && self.frame_work_exhausted()
                 {
                     self.note_frame_deferral();
                     self.pending_discovery_records
@@ -25842,8 +25879,24 @@ impl Engine {
             // The tick quantum stops admissions before another scan: this
             // pid and the rest defer with their requests retained.
             if self.scheduler.tick_expired(tick_now()) {
-                failed_refresh_pids.insert(pid);
-                failed_refresh_pids.extend(unprocessed);
+                // Fresh-class windowed but never attempted: keep fresh
+                // priority for the next scarce tick. The ledger names the
+                // backlog and rotation classes; every other windowed pid
+                // was fresh-class (rotation pids hold no request anyway).
+                for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
+                    let backlog_or_rotation = match ledger {
+                        AdmissionLedger::Free { backlog } => backlog.contains(&deferred_pid),
+                        AdmissionLedger::Scarce { backlog, rotation } => {
+                            backlog.contains(&deferred_pid) || rotation.contains(&deferred_pid)
+                        }
+                    };
+                    if !backlog_or_rotation
+                        && let Some(request) = self.refresh_requested.get_mut(&deferred_pid)
+                    {
+                        request.deferred_fresh = true;
+                    }
+                    failed_refresh_pids.insert(deferred_pid);
+                }
                 skipped.push(Skipped {
                     subject: "live discovery tick".into(),
                     reason: "tick deep-scan quantum exhausted; remaining new processes deferred to the next tick"
@@ -25877,6 +25930,10 @@ impl Engine {
                                 self.scheduler.note_new_view_attempt(pid);
                             }
                             _ => self.scheduler.note_newcomer_attempt(pid),
+                        }
+                        // Attempted at last: kept-fresh priority is spent.
+                        if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                            request.deferred_fresh = false;
                         }
                         if provider_free {
                             self.newcomer_first_seen.remove(&pid);
@@ -25922,6 +25979,10 @@ impl Engine {
                     self.scheduler.note_new_view_attempt(pid);
                 }
                 _ => self.scheduler.note_newcomer_attempt(pid),
+            }
+            // Attempted at last: kept-fresh priority is spent.
+            if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                request.deferred_fresh = false;
             }
             let open_start = crate::attach::monotonic_ns();
             let opened = ProcessView::open_with_budget(id, pid, &mut self.budget);
@@ -26413,12 +26474,12 @@ impl Engine {
             for pid in new_pids.iter().copied() {
                 if !pending.contains(&pid) {
                     rotation.push(pid);
-                } else if self
-                    .refresh_requested
-                    .get(&pid)
-                    .and_then(|request| request.first_seen_ns)
-                    .is_some_and(|seen| prev_tick.is_some_and(|prev| seen > prev))
-                {
+                } else if self.refresh_requested.get(&pid).is_some_and(|request| {
+                    request.deferred_fresh
+                        || request
+                            .first_seen_ns
+                            .is_some_and(|seen| prev_tick.is_some_and(|prev| seen > prev))
+                }) {
                     fresh.push(pid);
                 } else {
                     backlog_pids.push(pid);
@@ -26431,6 +26492,14 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
+            // A fresh pid the window itself deferred was never attempted:
+            // it keeps fresh priority next tick instead of demoting by age.
+            let fresh_set: BTreeSet<u32> = fresh.iter().copied().collect();
+            for pid in deferred.iter().filter(|pid| fresh_set.contains(pid)) {
+                if let Some(request) = self.refresh_requested.get_mut(pid) {
+                    request.deferred_fresh = true;
+                }
+            }
             let backlog: BTreeSet<u32> = backlog_pids.into_iter().collect();
             let rotation_set: BTreeSet<u32> = rotation.into_iter().collect();
             (
@@ -26498,6 +26567,9 @@ impl Engine {
                 "a requested inventory refresh failed",
                 &mut *tick_now,
             );
+            // Admissions keep their own quantum: a rescan phase that spent
+            // the first quantum must not leave every newcomer unattempted.
+            self.scheduler.extend_tick_deadline_for_admissions();
             let admission =
                 self.admit_inventory_new_views(admitted, &ledger, max_scan_pids, &mut *tick_now);
             (refresh, admission)
@@ -31677,6 +31749,14 @@ impl Engine {
     /// never reads aggregate maps or renders, and never runs an ordinary
     /// whole-scope tick. It reuses the frame's 200 ms work budget and
     /// checkpoints, scoped to the opportunity.
+    /// Restore records at the head of the pending FIFO in their original
+    /// order with one bulk move instead of one front insertion per record
+    /// (each insertion memmoves the whole queue).
+    fn prepend_pending_records(&mut self, mut front: Vec<QueuedDiscoveryRecord>) {
+        front.append(&mut self.pending_discovery_records);
+        self.pending_discovery_records = front;
+    }
+
     pub(crate) fn service_backlog_quantum(
         &mut self,
         session: &mut dyn EngineSession,
@@ -31793,10 +31873,7 @@ impl Engine {
             Err((error, records)) => {
                 // Counter authority failed: the quantum waits at the head
                 // of the queue, in order, for the next opportunity.
-                records
-                    .into_iter()
-                    .rev()
-                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+                self.prepend_pending_records(records);
                 return Err(error);
             }
         };
@@ -31854,10 +31931,7 @@ impl Engine {
                 self.pending_discovery_records.extend(queued);
             } else {
                 front_inserted = queued.len();
-                queued
-                    .into_iter()
-                    .rev()
-                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+                self.prepend_pending_records(queued);
             }
         } else {
             queued.extend(deferred_exits);
@@ -31872,10 +31946,7 @@ impl Engine {
                 )?;
             }
             front_inserted = queued.len();
-            queued
-                .into_iter()
-                .rev()
-                .for_each(|record| self.pending_discovery_records.insert(0, record));
+            self.prepend_pending_records(queued);
         }
         // A re-park or a frame deferral appended behind the rest of the
         // queue; restore FIFO order with the held prefix first.
@@ -33171,13 +33242,18 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         stop_requested: &dyn Fn() -> bool,
     ) -> (Option<anyhow::Error>, InitialArmCounts) {
-        let views = self.views.len() as u64;
+        // The initial set is the views retained when arming starts, by ID:
+        // servicing discovery between arms (below) can admit and retire
+        // views, so positions are re-derived per view instead of walked.
+        let initial_ids: Vec<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let views = initial_ids.len() as u64;
         let mut stale = 0u64;
         let mut attached = 0u64;
         let arms_before = self.loader_arms;
-        for position in 0..self.views.len() {
+        let mut last_yield_ns: Option<u64> = None;
+        for (index, view_id) in initial_ids.iter().copied().enumerate() {
             if stop_requested() {
-                let done = position as u64;
+                let done = index as u64;
                 let remaining = views.saturating_sub(done);
                 self.mark_partial(
                     INITIAL_ARMING_SUBJECT,
@@ -33190,6 +33266,10 @@ impl Engine {
                     self.initial_arm_counts(views, stale, arms_before, attached),
                 );
             }
+            let Some(position) = self.views.iter().position(|view| view.id() == view_id) else {
+                stale = stale.saturating_add(1);
+                continue;
+            };
             if !self.views[position].still_the_same() {
                 stale = stale.saturating_add(1);
                 continue;
@@ -33218,11 +33298,75 @@ impl Engine {
                     self.initial_arm_counts(views, stale, arms_before, attached),
                 );
             }
+            // Arming every initial view can take seconds on a busy host;
+            // a program that execs during that window must not wait for
+            // the last arm. Between arms, service staged discovery with
+            // one ordinary batch (records, loader scans, one inventory
+            // tick) at most once per yield interval; the remaining
+            // initial arms then continue. Exports still attach only
+            // after every initial arm, in the caller's order.
+            let work_waiting = session.staged_discovery_len() > 0
+                || !self.pending_discovery_records.is_empty()
+                || !self.refresh_requested.is_empty()
+                || !self.pending_loader_scans.is_empty();
+            if work_waiting && !stop_requested() {
+                let now_ns = crate::attach::monotonic_ns();
+                let due = match (last_yield_ns, now_ns) {
+                    (Some(last), Some(now)) => {
+                        now.saturating_sub(last) >= INITIAL_ARMING_YIELD_INTERVAL_NS
+                    }
+                    _ => true,
+                };
+                if due {
+                    last_yield_ns = now_ns;
+                    if let Err(error) = self.service_discovery_during_initial_arming(session) {
+                        return (
+                            Some(error),
+                            self.initial_arm_counts(views, stale, arms_before, attached),
+                        );
+                    }
+                }
+            }
         }
         (
             None,
             self.initial_arm_counts(views, stale, arms_before, attached),
         )
+    }
+
+    /// One ordinary discovery batch serviced between initial loader arms:
+    /// pull one bounded quantum within the shared allowance and apply it
+    /// exactly like a live frame batch (dispatch, deferred loader scans,
+    /// one inventory tick). A transport failure applies the pulled prefix
+    /// with a gap instead of aborting the arming, like a backlog pass.
+    fn service_discovery_during_initial_arming(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<()> {
+        let budget = Cell::new(self.shared_allowance_remaining(session, 0));
+        let (records, malformed) = match Self::collect_discovery_records_budgeted(
+            session,
+            &budget,
+            LIVE_DISCOVERY_DRAIN_QUANTUM,
+        ) {
+            Ok((records, malformed, _)) => (records, malformed),
+            Err(error) => {
+                let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                let pulled = incomplete.records;
+                let pulled_malformed = incomplete.malformed;
+                self.mark_partial(
+                    "live discovery transport",
+                    &format!(
+                        "discovery transport unavailable: dequeue failed after {} records ({} malformed); prefix applied",
+                        pulled.len(),
+                        pulled_malformed
+                    ),
+                );
+                (pulled, pulled_malformed)
+            }
+        };
+        self.apply_discovery_batch(session, records, malformed)?;
+        Ok(())
     }
 
     /// Aggregate the initial-arm counts: attempted arms are the

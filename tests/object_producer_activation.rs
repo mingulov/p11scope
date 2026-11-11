@@ -3235,6 +3235,13 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// newline, so the dump is the previous dump with one more `\n` in
 /// its leading run of newlines): 149086 B, measured with this same lexer on the integrated
 /// source; the previous pin matches its parent.
+/// Re-baselined for the produced/consumed ring cross-check (the only
+/// BPF source changes: 7f873bbdd adds the PRODUCED submitted-counter
+/// map with its bump helper and the emit-site bumps, and 5af02efc8
+/// gives the generic refused-base output closure the same
+/// bump-on-success shape, plus their comment lines): 149801 B,
+/// measured with this same lexer on the integrated source; the
+/// previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3244,8 +3251,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            149086,
-            "10f9a1bb5d15dbd3d97c1d99c6d862eb3987e37219ece52545715326d4649e1c"
+            149801,
+            "e9cabc05d9a6ea21a65790c38fed961552789e9693c62dbc0be7f4e13bc28b4a"
         ),
         "stripped BPF dump must stay byte-identical"
     );

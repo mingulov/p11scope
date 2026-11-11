@@ -26806,8 +26806,9 @@ impl Engine {
 
         // State fences for First-candidate reuse, captured after the
         // First admission and its latch: the committed plan fence, the
-        // facts revision, and the counter lengths the candidate tail
-        // cloned from. The candidate itself is held back for reuse only
+        // candidate-input facts state, and the counter lengths the
+        // candidate tail cloned from. The candidate itself is held
+        // back for reuse only
         // when it came from the direct build and the latch moved
         // nothing; every early return above drops it unused, exactly as
         // the trial candidate is dropped today.

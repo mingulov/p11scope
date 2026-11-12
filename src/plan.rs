@@ -8938,6 +8938,11 @@ mod tests {
             plan.slots.iter().all(|slot| slot.semantic_authorized),
             "interface-linked slots carry semantic authority without a manifest"
         );
+        assert_eq!(
+            plan.standard_layout_evidence(),
+            ["interface linkage"],
+            "the recorded basis is the linkage leg — the only leg that can grant here"
+        );
         let sign_init = plan
             .slots
             .iter()

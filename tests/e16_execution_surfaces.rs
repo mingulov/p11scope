@@ -466,8 +466,17 @@ fn discover(pid: u32, hint: &Path) -> Engine {
 
 /// The endpoint's module is a discovered module whose `{dev, ino}` is the
 /// kernel's rendering of the executing mapping and whose digest is the
-/// fixture's bytes; the plan attaches the exact endpoint offset, count-only.
-fn assert_endpoint_admitted(engine: &Engine, mapping: &Mapping, endpoint: u64, object: &Path) {
+/// fixture's bytes; the plan attaches the exact endpoint offset.
+/// `authorized` selects the authority pin: a table proven by the provider's
+/// own layout evidence (control) authorizes every slot, while a shape with
+/// no layout leg (proxy, static, vendor) stays count-only.
+fn assert_endpoint_admitted(
+    engine: &Engine,
+    mapping: &Mapping,
+    endpoint: u64,
+    object: &Path,
+    authorized: bool,
+) {
     let name = file_name(object);
     assert!(mapping.path.ends_with(&name), "{mapping:?}");
     let module = engine
@@ -498,14 +507,25 @@ fn assert_endpoint_admitted(engine: &Engine, mapping: &Mapping, endpoint: u64, o
         1,
         "the executed endpoint (file offset 0x{offset:x}) is one planned slot"
     );
-    assert!(
-        engine
-            .plan()
-            .slots
-            .iter()
-            .all(|slot| !slot.semantic_authorized),
-        "scan-found slots never authorize semantics"
-    );
+    if authorized {
+        assert!(
+            engine
+                .plan()
+                .slots
+                .iter()
+                .all(|slot| slot.semantic_authorized),
+            "a layout-proven table authorizes every slot"
+        );
+    } else {
+        assert!(
+            engine
+                .plan()
+                .slots
+                .iter()
+                .all(|slot| !slot.semantic_authorized),
+            "scan-found slots without layout evidence never authorize semantics"
+        );
+    }
     assert!(
         !engine
             .plan()
@@ -515,6 +535,61 @@ fn assert_endpoint_admitted(engine: &Engine, mapping: &Mapping, endpoint: u64, o
         "an admitted object carries no no-table record: {:?}",
         engine.plan().skipped
     );
+}
+
+/// Interface-linkage authority (controller ruling 2026-11-12 05:25b,
+/// mech-ruling.md clause 1): the provider's own exact-standard "PKCS 11"
+/// interface record names its (3, 2) table, and the clause-1 core holds
+/// (104 decoded slots on a full walk, every entry in the provider's own
+/// object), so every slot carries semantic authority under its canonical
+/// name. `linkage == "interface"` is `score.linked`, the first granting
+/// arm of `lower_scanned_with`, so an authorized linked table with no
+/// manifest is necessarily authorized via the linkage leg — the unit pin
+/// `interface_linked_scan_table_mints_main_plan_semantics_without_manifest`
+/// records the same grant as basis `"interface linkage"`.
+fn assert_interface_linkage_authority(engine: &Engine, object: &Path) {
+    let name = file_name(object);
+    let module = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with(&name))
+        .unwrap_or_else(|| panic!("{name} must be a planned module"));
+    assert_eq!(module.tables.len(), 1, "{:?}", module.tables);
+    let table = &module.tables[0];
+    assert_eq!(table.source, "scan", "{table:?}");
+    assert_eq!(table.version, (3, 2), "{table:?}");
+    assert_eq!(table.entries, 104, "{table:?}");
+    assert_eq!(table.linkage, "interface", "{table:?}");
+    let surface = engine
+        .plan()
+        .surfaces
+        .iter()
+        .find(|surface| surface.source.contains("table 3.2"))
+        .expect("the 3.2 table surface is published");
+    assert_eq!(surface.walk, "full", "{surface:?}");
+    assert!(
+        engine
+            .plan()
+            .surfaces
+            .iter()
+            .any(|surface| surface.source.contains("interface[0] exact_standard")),
+        "the provider's own exact-standard interface record is published: {:?}",
+        engine.plan().surfaces
+    );
+    let owned: Vec<_> = engine
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.object_path.ends_with(&name))
+        .collect();
+    assert_eq!(owned.len(), 104, "standard table has 104 endpoints");
+    for slot in owned {
+        assert_eq!(slot.names.len(), 1, "{slot:?}");
+        assert_ne!(slot.names, ["unknown"], "{slot:?}");
+        assert!(slot.semantic_authorized, "{slot:?}");
+        assert_ne!(slot.descriptor_index, 0, "{slot:?}");
+    }
 }
 
 /// The 104 standard-layout endpoints of one object: count-only, unnamed.
@@ -558,7 +633,8 @@ fn assert_no_table_record(engine: &Engine, object: &Path) {
 
 /// Supported-shape control: a file-backed provider with standard factories
 /// and an exported table. The executed table endpoint is admitted at its
-/// exact offset in the object the child maps.
+/// exact offset in the object the child maps, and the provider's own
+/// exact-standard interface record authorizes every slot (ruling 05:25b).
 #[test]
 fn e16_control_file_backed_provider_is_admitted_with_validated_identity() {
     let dir = scratch("control");
@@ -575,7 +651,8 @@ fn e16_control_file_backed_provider_is_admitted_with_validated_identity() {
     let mapping = executable_mapping(held.ready.pid, held.ready.endpoint);
     let engine = discover(held.ready.pid, &provider);
     assert_eq!(held.go("table[0]"), 3);
-    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider);
+    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider, true);
+    assert_interface_linkage_authority(&engine, &provider);
     let name = file_name(&provider);
     assert!(
         engine
@@ -636,7 +713,7 @@ fn e16_static_linked_surface_is_count_only_and_identity_pinned() {
     assert_eq!(held.go("table[0]"), 3);
     assert_eq!(held.witness_count("static E16_C_Initialize"), 3);
     assert_count_only_table(&engine, &driver);
-    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &driver);
+    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &driver, false);
     held.release();
 }
 
@@ -683,6 +760,9 @@ fn e16_jit_anonymous_code_is_not_admitted() {
 /// A synthetic client-side HSM proxy: a standard, file-backed table whose
 /// entries forward over an owned socketpair. Discovery admits the client
 /// surface like the control; nothing server-side exists or is claimed.
+/// The same 104-entry shape stays count-only here: the interface record is
+/// never populated in memory and no entry is exported, so no layout leg
+/// fires — the controlled refusal pair to the control's linkage grant.
 #[test]
 fn e16_synthetic_hsm_proxy_client_surface_is_admitted_like_control() {
     let dir = scratch("proxy");
@@ -709,7 +789,7 @@ fn e16_synthetic_hsm_proxy_client_surface_is_admitted_like_control() {
     let engine = discover(held.ready.pid, &provider);
     assert_eq!(held.go("table[0]"), 2);
     assert_eq!(held.witness_count("proxy E16_C_Initialize"), 2);
-    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider);
+    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider, false);
     let name = file_name(&provider);
     assert!(
         engine
@@ -744,7 +824,7 @@ fn e16_vendor_only_factory_surface_is_count_only_and_identity_pinned() {
     assert_eq!(held.go("table[0]"), 3);
     assert_eq!(held.witness_count("vendor E16_C_Initialize"), 3);
     assert_count_only_table(&engine, &provider);
-    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider);
+    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider, false);
     held.release();
 }
 

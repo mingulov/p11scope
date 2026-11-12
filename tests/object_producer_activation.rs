@@ -1908,6 +1908,72 @@ fn pin_continuity_gate_precedes_fills() {
     );
 }
 
+/// Trace-cgroup accounting contract shared by every refused-join arm
+/// (ordinary, generic, journal): the helper's returned `unmatched`
+/// and `semantic` values must guard exactly one corresponding bump
+/// each, and ring loss stays OutputFailed-only. Comment- and
+/// whitespace-insensitive. Returns false for suppressed
+/// (`if unmatched && false`), unconditional (`if true`), or missing
+/// bumps, and for any extra bump of these kinds in the arm.
+fn refused_join_accounting_guards_hold(arm: &str) -> bool {
+    let code: String = arm
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let helper = "let(unmatched,semantic)=refused_join_accounting(outcome,true);";
+    let unmatched = "ifunmatched{bump_evidence(EVIDENCE_UNMATCHED_RETURNS);}";
+    let semantic = "ifsemantic{bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);}";
+    let loss = "ifoutcome==RefusedBaseOutcome::OutputFailed{bump_evidence(EVIDENCE_RING_LOSS);}";
+    match (
+        code.find(helper),
+        code.find(unmatched),
+        code.find(semantic),
+        code.find(loss),
+    ) {
+        (Some(helper), Some(unmatched), Some(semantic), Some(loss)) => {
+            // Ring loss precedes the helper and the helper precedes
+            // both guards in every production arm; exactly one bump
+            // of each kind (no suppressed duplicate, no extra
+            // unconditional bump).
+            loss < helper
+                && helper < unmatched
+                && unmatched < semantic
+                && code
+                    .matches("bump_evidence(EVIDENCE_UNMATCHED_RETURNS);")
+                    .count()
+                    == 1
+                && code
+                    .matches("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);")
+                    .count()
+                    == 1
+                && code.matches("bump_evidence(EVIDENCE_RING_LOSS);").count() == 1
+        }
+        _ => false,
+    }
+}
+
+/// Mutation controls for one refused arm: a suppressed unmatched
+/// bump, an unconditional unmatched bump, and a missing semantic
+/// bump must all fail the accounting-guard checker.
+fn pin_refused_join_accounting_mutations(name: &str, arm: &str) {
+    for (before, after) in [
+        ("if unmatched {", "if unmatched && false {"),
+        ("if unmatched {", "if true {"),
+        ("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);", ""),
+    ] {
+        assert!(
+            arm.contains(before),
+            "{name}: mutant must change the refused arm ({before:?})"
+        );
+        let mutant = arm.replacen(before, after, 1);
+        assert!(
+            !refused_join_accounting_guards_hold(&mutant),
+            "{name}: the accounting guard must reject mutation of {before:?}"
+        );
+    }
+}
+
 /// Continuity refusal preserves the initialized ordinary return without
 /// granting permission to fill an object tail. The shared adapter's executed
 /// cleanup/output controls are covered by the common and raw decoder tests.
@@ -1961,10 +2027,14 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
         // Outcome-split accounting (trace-cgroup): only a failed
         // retirement bumps unmatched (genuinely no recorded start); a
         // retired start with a refused join bumps semantic capture
-        // (observed call, withheld object detail).
-        assert!(arm.contains("refused_join_accounting(outcome, true)"));
-        assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
-        assert!(arm.contains("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)"));
+        // (observed call, withheld object detail). The helper's
+        // returned values guard exactly one corresponding bump each;
+        // ring loss stays OutputFailed-only.
+        assert!(
+            refused_join_accounting_guards_hold(arm),
+            "{name}: refused arm must guard exactly one unmatched and one semantic bump from the helper"
+        );
+        pin_refused_join_accounting_mutations(name, arm);
         assert!(
             !arm[discard..].contains("raw"),
             "{name}: never read a discarded reservation"
@@ -1993,6 +2063,18 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
             "{name}: healthy 608-byte returns do not copy a second record"
         );
     }
+    // Journal copy (journal_roots.rs): the same accounting contract on
+    // the third refused arm — the helper's returned values guard
+    // exactly one corresponding bump each, ring loss stays
+    // OutputFailed-only.
+    let roots =
+        std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
+    let journal = source_between(&roots, "if !unsafe { continuity_joins", "let Some(reason)");
+    assert!(
+        refused_join_accounting_guards_hold(journal),
+        "journal copy: refused arm must guard exactly one unmatched and one semantic bump from the helper"
+    );
+    pin_refused_join_accounting_mutations("journal copy", journal);
 }
 
 /// G02/E1: refused continuity performs zero result-handle reads. Healthy

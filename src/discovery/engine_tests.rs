@@ -10221,6 +10221,82 @@ fn genuine_arm_failures_still_mark_partial() {
     );
 }
 
+/// An original that exited mid-arm leaves nothing to track: the dead view
+/// can never produce a future loader hit, and its retirement (or the
+/// descendant gap, when unmatched) already accounts the exit. The loader
+/// aggregate stays silent exactly when the skip accounting does — no
+/// `unavailable` growth, no mark — instead of filing a `loader_discovery`
+/// gap for loads that cannot exist. Mirrors privileged run 43233958485
+/// mt-system v6.12 (4 bound + 1 silent unbound, exact counts, hits=0):
+/// a short-lived workload child lost the attach-precheck race after the
+/// gate released, the prepared context was cancelled and removed, and the
+/// stale record stuck to capture end. The reused-pid view makes the race
+/// deterministic: a live pid (exe present at the arm entry check) with a
+/// stale retained generation (postcheck lost, exit provable).
+#[test]
+fn arming_a_view_exited_mid_arm_is_silent_not_unavailable() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    let view =
+        crate::process::reused_process_view_for_test(ProcessViewId(0), pid).unwrap();
+    assert!(
+        !view.still_the_same(),
+        "the reused view must lose the generation postcheck"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "the stale generation must prove the original exited"
+    );
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.views.push(view);
+
+    let mut session = ScriptedSession::default();
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    armed.expect("an expected exit mid-arm is not an arm failure");
+
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "an expected exit marks nothing: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.loader_contexts.is_empty(),
+        "an exited view records no loader context"
+    );
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(0))
+            .is_empty()
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(aggregate.strategies.unavailable, 0);
+    assert_eq!(aggregate.dlopen_timing.none, 0);
+}
+
 #[test]
 fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
     let (fixture, view, _module, _pins) = loaded_seed_provider();

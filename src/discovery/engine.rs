@@ -11703,6 +11703,15 @@ impl Engine {
         }
     }
 
+    /// Whether any loader context for `view` is still live (present and not
+    /// tombstoned): `record_loader_arm` below stays bound exactly then.
+    fn loader_view_has_live_context(&self, view: ProcessViewId) -> bool {
+        self.loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .any(|id| !self.loader_registry.is_tombstoned(id))
+    }
+
     /// Classifies the exact live-loader context this view owns after an arming
     /// attempt. Re-arming the same context in one load kind updates its entry
     /// rather than adding a second — that is what makes the published counts
@@ -22290,8 +22299,17 @@ impl Engine {
             .is_some_and(|view| view.id() == view_id && view.still_the_same());
         let outcome = loader_arm_outcome(generation_valid, result);
         // NotArmable views stay out of the loader aggregate entirely: no
-        // record, so they never inflate the `unavailable` count. Every
-        // other outcome records exactly as today.
+        // record, so they never inflate the `unavailable` count. So does a
+        // generation lost to an expected exit when no context bound: the
+        // dead view can never produce a future loader hit, and its
+        // retirement (or the descendant gap, when unmatched) already
+        // accounts the exit, so recording it unbound would file a
+        // `loader_discovery` gap for loads that cannot exist. The aggregate
+        // stays silent exactly when the skip accounting does
+        // (`mark_generation_change` on an exited original). A context that
+        // bound before the exit still records, as does any generation loss
+        // the exit does not explain; every other outcome records exactly
+        // as today.
         let not_armable = matches!(
             outcome,
             LoaderArmOutcome::NotArmable
@@ -22300,7 +22318,10 @@ impl Engine {
                     ..
                 }
         );
-        if !not_armable {
+        let lost_to_expected_exit = matches!(outcome, LoaderArmOutcome::GenerationLost { .. })
+            && self.original_exited(view_id)
+            && !self.loader_view_has_live_context(view_id);
+        if !not_armable && !lost_to_expected_exit {
             self.record_loader_arm(view_id, false);
         }
         match outcome {

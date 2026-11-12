@@ -987,7 +987,7 @@ fn scan_pinned_member_inner(
         ),
         None => scan_process_view_examined(&request, view_handle, budget),
     };
-    let (outcome, examined, hints_examined) = match scanned {
+    let (outcome, examined, hints_examined, _) = match scanned {
         Ok(scanned) => scanned,
         Err(error) => {
             return member_not_scanned(

@@ -21,13 +21,13 @@ use crate::discovery::attribution;
 use crate::discovery::elf_needed;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
-    KernelSelfMappingProbe, ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId,
-    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
-    RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
-    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
-    open_view_executable_cached, open_view_rooted_object_cached, opened_file_matches_maps,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_of,
+    ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
+    InstalledPinsBacking, KernelSelfMappingProbe, ManifestStaleReason, Pin,
+    PinnedConservativeCursor, PinnedObjectId, PinnedObjects, PinnedTimingKey, PrearmPinnedInput,
+    ReconciledModule, RetainedScannedInputs, RetiredFileHandoff, ScannedInputMeasure,
+    ScannedRebindCursor, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
+    canonicalize_scanned_overlays, open_view_executable_cached, open_view_rooted_object_cached,
+    opened_file_matches_maps, pin_manifest_objects_deferred_in_views_with_budget, pin_of,
     pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects, preexec_object_key,
     retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
 };
@@ -38,10 +38,10 @@ use crate::discovery::scan::{
     ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
     ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
     exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, published_walk, read_elf_snapshot, read_maps_or_refuse,
-    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
-    scan_skip_truncates, table_evidence_score, table_has_only_opaque_interfaces, table_linkage,
-    target_layout,
+    index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
+    read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
+    scan_process_view_examined, scan_process_view_without_memory, scan_skip_truncates,
+    table_evidence_score, table_has_only_opaque_interfaces, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_NEWCOMER_ADMISSIONS_PER_TICK, MAX_PENDING_REFRESH,
@@ -6455,6 +6455,54 @@ fn scan_and_pin_with(
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
+    scan_and_pin_with_proof(
+        view,
+        hints,
+        hooks,
+        budget,
+        counters,
+        broad_admit,
+        stage,
+        |request, view, budget| {
+            scan(request, view, budget).map(|outcome| (outcome, Vec::new(), BTreeSet::new()))
+        },
+    )
+    .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
+}
+
+/// One scan plus its pins plus its shape proof: the modules, the pins,
+/// the completeness verdict, the negative examined-file evidence, and
+/// the provider `.so`-set of the scan's own initial maps.
+type ScanProofResult = (
+    Vec<ScannedModule>,
+    PinnedObjects,
+    bool,
+    Vec<ExaminedObject>,
+    BTreeSet<ObjectKey>,
+);
+
+/// [`scan_and_pin_with`] plus the scan's own shape proof for
+/// view-collapse coverage: the negative examined-file evidence and the
+/// provider `.so`-set of the scan's own initial maps. The completeness
+/// verdict is computed once, here, identically for both wrappers.
+#[allow(clippy::too_many_arguments)]
+fn scan_and_pin_with_proof(
+    view: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    counters: &mut DiscoveryCounters,
+    broad_admit: bool,
+    stage: &mut crate::timing::StageTimings,
+    scan: impl FnOnce(
+        &ScanRequest<'_>,
+        &ProcessView,
+        &mut CaptureWorkBudget,
+    ) -> std::result::Result<
+        (ScanOutcome, Vec<ExaminedObject>, BTreeSet<ObjectKey>),
+        String,
+    >,
+) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
     let scan_start = crate::attach::monotonic_ns();
@@ -6473,7 +6521,7 @@ fn scan_and_pin_with(
         scan_start,
         crate::attach::monotonic_ns(),
     );
-    let outcome =
+    let (outcome, scan_examined, scan_shape) =
         scanned.map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
     let complete = outcome.unavailable_reason().is_none()
         && stop_before.is_none()
@@ -6516,7 +6564,7 @@ fn scan_and_pin_with(
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
     }
-    Ok((modules, pinned, complete))
+    Ok((modules, pinned, complete, scan_examined, scan_shape))
 }
 
 /// Task 1.6 experiment: recognized fixed-family pool layout.
@@ -6833,17 +6881,6 @@ fn broad_pool_table(
     Ok(bytes.len())
 }
 
-/// A mapping that can carry a PKCS#11 provider: a mapped file whose path
-/// names a shared object. Pure so phase-1 selection can group pids without
-/// decoding anything.
-pub(crate) fn is_provider_mapping(entry: &MapEntry) -> bool {
-    entry.inode != 0
-        && entry
-            .raw_path
-            .as_ref()
-            .is_some_and(|path| path.windows(3).any(|window| window == b".so"))
-}
-
 /// Phase 2 of the two-phase scan: choose which swept pids earn a deep scan.
 /// Under the cap this is the identity (all pids ascending — today's exact
 /// order); over the cap each provider group sends its lowest pid, rarest
@@ -6915,18 +6952,20 @@ fn shape_key(entries: &[MapEntry]) -> BTreeSet<ObjectKey> {
         .collect()
 }
 
-/// View-collapse fix1c: counts unselected eligible pids whose exact
-/// `.so`-set matches a shape a retained deep scan actually examined —
-/// the collapsed processes file discovery still covers through one
-/// view per shape. `examined` carries the scan-time shapes of complete
-/// retained scans only (each scan's own maps, never the advisory phase-1
-/// sweep's): a representative whose maps changed between sweep and scan,
-/// whose scan was incomplete, or whose scan-time maps could not be read
-/// contributes nothing, and its old sweep shape stays in the remainder.
-/// Empty keys (unmapped individuals, unavailable snapshots) never
-/// count: each needs its own slot. Kernel-thread exclusions never
-/// count either. Pure over the sweep plus the caller-supplied examined
-/// set, so the twins pin it without `/proc`.
+/// View-collapse fix1c, hardened by fix4: counts unselected eligible
+/// pids whose exact `.so`-set matches a shape a retained deep scan
+/// actually examined — the collapsed processes file discovery still
+/// covers through one view per shape. `examined` carries the credited
+/// shapes of complete retained scans only (each scan's own validated
+/// maps plus per-member examination proof, never the advisory phase-1
+/// sweep's and never a caller-side pre-read): a representative whose
+/// maps changed between sweep and scan, whose scan was incomplete, or
+/// whose scan left any shape member unproved contributes nothing, and
+/// its old sweep shape stays in the remainder. Empty keys (unmapped
+/// individuals, unavailable snapshots) never count: each needs its own
+/// slot. Kernel-thread exclusions never count either. Pure over the
+/// sweep plus the caller-supplied examined set, so the twins pin it
+/// without `/proc`.
 pub(crate) fn deep_scan_shape_covered(
     sweep: &[(u32, Vec<MapEntry>)],
     retained: &[u32],
@@ -6942,6 +6981,39 @@ pub(crate) fn deep_scan_shape_covered(
             !key.is_empty() && examined.contains(&key)
         })
         .count()
+}
+
+/// View-collapse fix4: the shape one retained deep scan may cover —
+/// `Some` only when the scan was complete and proved every member of
+/// its own shape examined. `own_shape` is the provider `.so`-set of the
+/// scan's own initial maps snapshot (never a caller-side pre-read, so a
+/// representative that churned between sweep and scan cannot credit its
+/// stale old shape). Proof is the union of actual provider observations
+/// (`modules`, post-bracket) and negative examined-file evidence
+/// (`examined`): a member the scan skipped, narrowed out, excluded, or
+/// never opened (notably a data-only `.so` dropped before the scan
+/// loop) withholds the whole shape, and the unselected processes
+/// sharing it stay counted in the remainder. Pure over the scan's
+/// own result, so the twins pin it without `/proc`.
+pub(crate) fn credited_scan_shape(
+    complete: bool,
+    own_shape: &BTreeSet<ObjectKey>,
+    modules: &[ScannedModule],
+    examined: &[ExaminedObject],
+) -> Option<BTreeSet<ObjectKey>> {
+    if !complete || own_shape.is_empty() {
+        return None;
+    }
+    let proved: BTreeSet<ObjectKey> = modules
+        .iter()
+        .map(|module| module.key)
+        .chain(examined.iter().map(|object| object.key))
+        .collect();
+    if own_shape.iter().all(|key| proved.contains(key)) {
+        Some(own_shape.clone())
+    } else {
+        None
+    }
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -7575,9 +7647,10 @@ fn discover_plan(
             discovered.base_counters.object_skips.push(skipped);
         }
     }
-    // View-collapse fix1c: scan-time shapes of complete retained scans,
-    // for the counted gap below. Only the over-cap path fills this;
-    // under the cap it stays empty and unused.
+    // View-collapse fix1c, hardened by fix4: credited shapes of
+    // complete retained scans, for the counted gap below. Only the
+    // over-cap path fills this; under the cap it stays empty and
+    // unused.
     let mut examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
     // FD reserve (scan-1k guard), sampled once for the whole pass: one
     // pidfd per retained view crosses a small soft limit fast; when fewer
@@ -7690,22 +7763,14 @@ fn discover_plan(
             discovered.base_counters.object_skips.push(skipped);
             break;
         }
-        // View-collapse fix1c: this scan's own `.so`-set, read from the
-        // retained view just before the scan. Compared against unselected
-        // sweep shapes below, so a representative that changed maps since
-        // the advisory sweep cannot credit its stale old shape. Over-cap
-        // only; under the cap no shape coverage is reported. A failed
-        // read contributes nothing (fail closed, no new gap wording).
-        let scan_shape: Option<BTreeSet<ObjectKey>> = if over_cap_sweep.is_some() {
-            Engine::read_maps(&view, &mut discovered.budget)
-                .ok()
-                .map(|maps| shape_key(&maps))
-        } else {
-            None
-        };
         let mut counters = DiscoveryCounters::default();
         let broad_admit = discovered.broad_admit;
-        let scan_result = scan_and_pin_with(
+        // View-collapse fix4: the shape proof comes from the scan
+        // itself (its own initial maps plus its examined evidence),
+        // never from a caller-side maps pre-read outside the scan's
+        // validation bracket. Same scan work as `scan_process_view`;
+        // only already-computed values are surfaced.
+        let scan_result = scan_and_pin_with_proof(
             &view,
             &a.modules,
             &a.hooks,
@@ -7713,20 +7778,25 @@ fn discover_plan(
             &mut counters,
             broad_admit,
             &mut discovered.stage_timings,
-            scan_process_view,
+            |request, view, budget| {
+                scan_process_view_examined(request, view, budget)
+                    .map(|(outcome, examined, _, own_shape)| (outcome, examined, own_shape))
+            },
         );
         // 6.14 Option B: the scan observed this generation alive; learn
         // its executable path whether or not the scan completed.
         elf_needed::learn_view_exe(&mut discovered.extensive, &view);
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
-            Ok((found, pins, complete)) => {
-                // Only a complete scan examines its shape: incomplete,
-                // unavailable, empty, or unreadable representatives leave
-                // their sweep shape in the remainder.
-                if complete
-                    && let Some(shape) = scan_shape
-                    && !shape.is_empty()
+            Ok((found, pins, complete, scan_examined, scan_shape)) => {
+                // Only a complete scan that proved every member of its
+                // own shape examined covers it: incomplete scans,
+                // skipped members, and unopened data-only `.so` files
+                // leave their sweep shape in the remainder. Over-cap
+                // only; under the cap no shape coverage is reported.
+                if over_cap_sweep.is_some()
+                    && let Some(shape) =
+                        credited_scan_shape(complete, &scan_shape, &found, &scan_examined)
                 {
                     examined_shapes.insert(shape);
                 }
@@ -7778,13 +7848,14 @@ fn discover_plan(
         }
     }
 
-    // View-collapse fix1c: the counted gap snapshot. User processes only;
-    // deep-scanned counts retained views (failed scans file their own
-    // gaps beside this one), and shape sharing counts unselected
-    // processes whose exact `.so`-set matches a shape a retained scan
-    // actually examined (scan-time maps plus completeness, never the
-    // advisory sweep alone). `None` under the cap, so under-cap
-    // documents are unchanged.
+    // View-collapse fix1c, hardened by fix4: the counted gap
+    // snapshot. User processes only; deep-scanned counts retained
+    // views (failed scans file their own gaps beside this one), and
+    // shape sharing counts unselected processes whose exact `.so`-set
+    // matches a shape a retained scan actually examined (the scan's
+    // own validated maps plus per-member proof and completeness,
+    // never the advisory sweep alone). `None` under the cap, so
+    // under-cap documents are unchanged.
     if let Some((sweep, excluded)) = over_cap_sweep {
         let eligible = sweep.len().saturating_sub(excluded.len());
         if eligible > max_scan_pids {

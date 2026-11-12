@@ -123,7 +123,7 @@ fn run_examined(
     fixture: &mut EmptyMapsFixture,
     budget: &mut CaptureWorkBudget,
     hints: &[PathBuf],
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     let view = self_view();
     let hooks = HookRegistry::builtin();
     scan_view_with_examined(
@@ -182,7 +182,7 @@ fn kernel_thread_scan_never_examines_hints() {
         exe: Err(io::ErrorKind::NotFound),
     };
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, examined, hints_examined) =
+    let (outcome, examined, hints_examined, _) =
         run_examined(&mut fixture, &mut budget, &[]).expect("kernel thread must scan, not error");
     assert!(
         !hints_examined,
@@ -202,7 +202,7 @@ fn refused_initial_scan_never_examines_hints() {
         exe: Ok(PathBuf::from("/usr/bin/worker")),
     };
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &[])
+    let (outcome, _, hints_examined, _) = run_examined(&mut fixture, &mut budget, &[])
         .expect("refusal must keep scanning, not error");
     assert!(
         !hints_examined,
@@ -229,7 +229,7 @@ fn completed_scan_marks_hints_examined() {
     };
     let mut budget = CaptureWorkBudget::default();
     let hints = [PathBuf::from("/opt/typo.so")];
-    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &hints)
+    let (outcome, _, hints_examined, _) = run_examined(&mut fixture, &mut budget, &hints)
         .expect("an ordinary scan must complete, not error");
     assert!(
         hints_examined,
@@ -280,7 +280,7 @@ fn inode_match_without_usable_path_still_misses_the_hint() {
     for raw_path in ["[memfd:jit-cache]", "/opt/stale/libtok.so (deleted)"] {
         let (_dir, hint, mut fixture) = inode_alias_fixture(raw_path);
         let mut budget = CaptureWorkBudget::default();
-        let (outcome, _, hints_examined) =
+        let (outcome, _, hints_examined, _) =
             run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
                 .expect("the scan must complete, not error");
         assert!(
@@ -307,7 +307,7 @@ fn deleted_exec_mapping_is_a_named_replaced_file_loss() {
         exe: Err(io::ErrorKind::NotFound),
     };
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, _, _) =
+    let (outcome, _, _, _) =
         run_examined(&mut fixture, &mut budget, &[]).expect("the scan must complete, not error");
     let reasons: Vec<&str> = outcome
         .skipped()
@@ -330,7 +330,7 @@ fn inode_match_with_unopenable_object_still_misses_the_hint() {
     // the target: the gate never runs, so the hint stays unmatched.
     let (_dir, hint, mut fixture) = inode_alias_fixture("/nonexistent-dir/unopenable.so");
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, _, hints_examined) =
+    let (outcome, _, hints_examined, _) =
         run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
             .expect("the scan must complete, not error");
     assert!(hints_examined, "the scan reached the hint loop");
@@ -363,7 +363,7 @@ fn path_match_counts_as_matched_without_further_confirmation() {
         exe: Err(io::ErrorKind::NotFound),
     };
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, _, hints_examined) =
+    let (outcome, _, hints_examined, _) =
         run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
             .expect("the scan must complete, not error");
     assert!(hints_examined, "the scan reached the hint loop");

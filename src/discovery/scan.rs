@@ -4048,6 +4048,20 @@ pub(crate) fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&Ma
     groups
 }
 
+/// A mapping that can carry a PKCS#11 provider: a mapped file whose path
+/// names a shared object. Pure so phase-1 selection can group pids without
+/// decoding anything. Note the deliberate gap against [`candidate_groups`]:
+/// a data-only `.so` mapping is a shape member here but offers no group
+/// there, so a scan of a data-only representative proves nothing — shape
+/// coverage must withhold, never assume, such members.
+pub(crate) fn is_provider_mapping(entry: &MapEntry) -> bool {
+    entry.inode != 0
+        && entry
+            .raw_path
+            .as_ref()
+            .is_some_and(|path| path.windows(3).any(|window| window == b".so"))
+}
+
 /// Duplicate executable file-offset coverage within one candidate
 /// group (F7b): two executable mappings covering a shared file
 /// offset at different addresses. One loader load maps each segment
@@ -6730,18 +6744,20 @@ fn scan_process_view_with_io(
 /// own maps snapshot (never an earlier sweep's). Empty when the scan's
 /// final bracket failed. C1b uses them to call a key examined. The flag
 /// reports whether the scan reached its `--module` hint loop; kernel
-/// threads and refused-initial scans never do.
+/// threads and refused-initial scans never do. The trailing shape is the
+/// provider `.so`-set of this scan's own initial maps snapshot, for
+/// view-collapse shape coverage (empty unless the scan read its maps).
 pub(crate) fn scan_process_view_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo::new(), true);
     #[cfg(test)]
     {
         let probe = result
             .as_ref()
-            .map(|(outcome, _, _)| outcome.clone())
+            .map(|(outcome, _, _, _)| outcome.clone())
             .map_err(Clone::clone);
         crate::first_use_probe::scan_returned(view, true, budget, &probe);
     }
@@ -6755,7 +6771,8 @@ fn scan_process_view_with_io_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
-    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _, _)| outcome)
+    scan_view_with_examined(request, view, budget, io, scan_memory)
+        .map(|(outcome, _, _, _)| outcome)
 }
 
 /// Post-read pin check: the export facts read after `before` are trusted only
@@ -6779,7 +6796,7 @@ pub(crate) fn scan_process_view_held(
     budget: &mut CaptureWorkBudget,
     custody: &mut super::kernel_identity::ExaminedCustody,
     scan: u64,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     scan_view_with_custody(
         request,
         view,
@@ -6800,7 +6817,7 @@ fn scan_view_with_custody(
     scan_memory: bool,
     custody: &mut super::kernel_identity::ExaminedCustody,
     scan: u64,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     let result = scan_view_examined_mode(
         request,
         view,
@@ -6811,7 +6828,7 @@ fn scan_view_with_custody(
     );
     if !result
         .as_ref()
-        .is_ok_and(|(outcome, _, _)| outcome.mapping_scan_completed())
+        .is_ok_and(|(outcome, _, _, _)| outcome.mapping_scan_completed())
         || budget.stopped_reason().is_some()
     {
         custody.discard_scan(scan);
@@ -6825,7 +6842,7 @@ fn scan_view_with_examined(
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
     scan_memory: bool,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     scan_view_examined_mode(request, view, budget, io, scan_memory, None)
 }
 
@@ -6901,7 +6918,7 @@ fn scan_view_examined_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
     mut custody: Option<(&mut super::kernel_identity::ExaminedCustody, u64)>,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
     }
@@ -6926,6 +6943,7 @@ fn scan_view_examined_mode(
             },
             Vec::new(),
             false,
+            BTreeSet::new(),
         )
     };
     let sub_maps = Instant::now();
@@ -6942,6 +6960,7 @@ fn scan_view_examined_mode(
                     },
                     Vec::new(),
                     false,
+                    BTreeSet::new(),
                 ));
             }
             Ok(EmptyMapsClass::Refuse) => return Ok(refused_initial(error.reason)),
@@ -6959,6 +6978,15 @@ fn scan_view_examined_mode(
         Ok(index) => index,
         Err(reason) => return Ok(refused_initial(reason)),
     };
+    // View-collapse fix4: this scan's own provider shape, read from the
+    // same initial maps the candidate groups below come from — never a
+    // caller-side pre-read, so churn between the sweep and this read
+    // cannot credit a shape this scan never saw.
+    let own_shape: BTreeSet<ObjectKey> = maps
+        .iter()
+        .filter(|entry| is_provider_mapping(entry))
+        .map(ObjectKey::of)
+        .collect();
     substage::add(0, sub_maps);
     let mut modules = Vec::new();
     let mut examined: Vec<ExaminedObject> = Vec::new();
@@ -7683,7 +7711,7 @@ fn scan_view_examined_mode(
             skipped,
         },
     };
-    Ok((outcome, examined, true))
+    Ok((outcome, examined, true, own_shape))
 }
 
 #[cfg(test)]
@@ -8085,7 +8113,7 @@ mod tests {
             let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
             let scan = custody.begin_scan();
             let mut budget = CaptureWorkBudget::default();
-            let (outcome, examined, _) = scan_view_with_custody(
+            let (outcome, examined, _, _) = scan_view_with_custody(
                 &ScanRequest {
                     pid: view.pid(),
                     hints: &[],
@@ -8910,7 +8938,7 @@ mod tests {
         let mut fixture = BracketFixture::new(8, true);
         let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
         let mut budget = CaptureWorkBudget::with_work_ceiling(1);
-        let (outcome, examined, _) =
+        let (outcome, examined, _, _) =
             scan_view_with_examined(&request, &view, &mut budget, &mut fixture, true)
                 .expect("a bounded retained-view scan");
         assert!(
@@ -12438,7 +12466,7 @@ mod tests {
             hints: &[],
             hooks: &hooks,
         };
-        let (outcome, examined, _) =
+        let (outcome, examined, _, _) =
             scan_process_view_examined(&request, &view, &mut budget).expect("scan chrooted child");
         assert!(view.still_the_same());
         assert!(
@@ -12588,7 +12616,7 @@ mod tests {
             Ok::<(), String>(())
         })
         .unwrap();
-        let (outcome, examined, _) = scan_process_view_examined(&request, &view, &mut budget)
+        let (outcome, examined, _, _) = scan_process_view_examined(&request, &view, &mut budget)
             .expect("scan foreign-root child");
         assert!(view.still_the_same());
         assert!(
@@ -14917,7 +14945,7 @@ mod tests {
         };
         let view = ProcessView::open(ProcessViewId(502), std::process::id()).unwrap();
         let mut budget = CaptureWorkBudget::default();
-        let (outcome, _, hints_examined) = scan_view_with_examined(
+        let (outcome, _, hints_examined, _) = scan_view_with_examined(
             &ScanRequest {
                 pid: view.pid(),
                 hints: std::slice::from_ref(&hint),
@@ -14974,7 +15002,7 @@ mod tests {
         let mut fixture = DeletedHintFixture { maps };
         let view = ProcessView::open(ProcessViewId(502), std::process::id()).unwrap();
         let mut budget = CaptureWorkBudget::default();
-        let (outcome, _, hints_examined) = scan_view_with_examined(
+        let (outcome, _, hints_examined, _) = scan_view_with_examined(
             &ScanRequest {
                 pid: view.pid(),
                 hints: std::slice::from_ref(&hint),
@@ -18044,7 +18072,7 @@ mod tests {
             budget.set_collection_work(CollectionWork::new(|_| true));
         }
         let hooks = HookRegistry::builtin();
-        let (outcome, _, _) = scan_view_with_examined(
+        let (outcome, _, _, _) = scan_view_with_examined(
             &ScanRequest {
                 pid: view.pid(),
                 hints: std::slice::from_ref(&so_path),
@@ -18516,7 +18544,7 @@ mod tests {
         fn run(
             &mut self,
             budget: &mut CaptureWorkBudget,
-        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
             self.run_with_hints(budget, &[])
         }
 
@@ -18524,7 +18552,7 @@ mod tests {
             &mut self,
             budget: &mut CaptureWorkBudget,
             hints: &[PathBuf],
-        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+        ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool, BTreeSet<ObjectKey>), String> {
             let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
             let hooks = HookRegistry::builtin();
             scan_view_with_examined(
@@ -18553,7 +18581,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
@@ -18585,7 +18613,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.root_failure = None;
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
             "the root-opened object must be examined, got examined={examined:?} skipped={:?}",
@@ -18620,7 +18648,7 @@ mod tests {
             MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
             FileIdentity { dev: 37, ino: 10 },
         ));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -18653,7 +18681,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Fail(libc::EPERM);
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -18707,7 +18735,7 @@ mod tests {
             },
             proven,
         ));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
             "the key-mismatched object must stay unexamined, got {examined:?}"
@@ -18749,7 +18777,7 @@ mod tests {
         // than the guard: script the proven rendering at that key.
         fixture.restated = Some(fixture.key);
         fixture.mountinfo_empty = Some(true);
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
             "the exempt proven object must be examined, got examined={examined:?} skipped={:?}",
@@ -18790,7 +18818,7 @@ mod tests {
         fixture.mountinfo_empty = Some(false);
         // Match the maps key so a stuck-true exemption would examine and fail.
         fixture.restated = Some(fixture.key);
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
             "the key-mismatched object must stay unexamined, got {examined:?}"
@@ -18818,7 +18846,7 @@ mod tests {
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         fixture.mountinfo_empty = Some(true);
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
@@ -18860,7 +18888,7 @@ mod tests {
         // stale key.
         fixture.restated = None;
         fixture.mountinfo_empty = Some(true);
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
             "the racing object must stay unexamined, got {examined:?}"
@@ -18889,7 +18917,7 @@ mod tests {
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         fixture.mountinfo_empty = Some(true);
         fixture.restated_err = Some("injected re-stat failure".into());
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -18933,7 +18961,7 @@ mod tests {
         fixture.map_files =
             MapFilesScript::Serve(File::open(fixture.path.parent().unwrap()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -18964,7 +18992,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
         fixture.map_files = MapFilesScript::Serve(File::open(&big).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -18994,7 +19022,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.map_files = MapFilesScript::Serve(fixture.deleted_served());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
             "the replaced object must be examined, got examined={examined:?} skipped={:?}",
@@ -19032,7 +19060,7 @@ mod tests {
         fixture.map_files = MapFilesScript::Serve(fixture.deleted_served());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let hint = fixture.path.clone();
-        let (outcome, _, _) = fixture
+        let (outcome, _, _, _) = fixture
             .run_with_hints(
                 &mut CaptureWorkBudget::default(),
                 std::slice::from_ref(&hint),
@@ -19083,7 +19111,7 @@ mod tests {
             MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
             FileIdentity { dev: 37, ino: 10 },
         ));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = format!("{} (deleted)", fixture.path.display());
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -19116,7 +19144,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.map_files = MapFilesScript::Fail(libc::EPERM);
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = format!("{} (deleted)", fixture.path.display());
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -19145,7 +19173,7 @@ mod tests {
         let identity = FileIdentity { dev: 37, ino: 9 };
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
             "the memfd mapping must stay unexamined, got {examined:?}"
@@ -19182,7 +19210,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::foreign_enoent());
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().any(|object| object.key == fixture.key),
@@ -19217,7 +19245,7 @@ mod tests {
             MapFilesFallbackFixture::scripted_held(FileIdentity { dev: 37, ino: 9 }),
             FileIdentity { dev: 37, ino: 10 },
         ));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -19250,7 +19278,7 @@ mod tests {
         fixture.root_failure = Some(MapFilesFallbackFixture::same_root_enoent());
         fixture.map_files = MapFilesScript::Serve(File::open(fixture.path.clone()).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),
@@ -19296,7 +19324,7 @@ mod tests {
         });
         fixture.map_files = MapFilesScript::Fail(libc::EPERM);
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
-        let (outcome, examined, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
+        let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
         let subject = fixture.path.display().to_string();
         assert!(
             examined.iter().all(|object| object.key != fixture.key),

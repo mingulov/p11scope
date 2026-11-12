@@ -49,7 +49,6 @@
 //! file contents. Paths come only from matched provider mappings.
 
 use crate::discovery::caller_registry::{ColdMint, ExeIdentity};
-use crate::discovery::engine::is_provider_mapping;
 use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
 };
@@ -58,6 +57,7 @@ use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
+    is_provider_mapping,
 };
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, mapped_path};
 use std::collections::{BTreeMap, BTreeSet};

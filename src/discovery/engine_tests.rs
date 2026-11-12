@@ -40843,6 +40843,177 @@ fn incomplete_retained_scan_must_not_cover_old_shape() {
     );
 }
 
+/// View-collapse fix4 F1 (codex probe
+/// `preread_churn_must_not_credit_unexamined_shape`): the phase-1 sweep
+/// sees A in retained PID 10, but PID 10 unloads A and loads B before
+/// the scanner's own initial read. The scan examines B, validates B,
+/// and completes. Only the scan's own B shape may be credited, so
+/// unselected PID 20 (still A) shares no examined shape and stays in
+/// the remainder.
+#[test]
+fn preread_churn_must_not_credit_unexamined_shape() {
+    use crate::discovery::identity::{ExaminedObject, FileIdentity};
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // Phase 1: both PIDs map A; selection retains 10.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![map_entry("/tmp/a.so", 1)]),
+    ];
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    // The retained scan's own maps read B (churned after the sweep),
+    // and the scan proved B examined (opened, identified, read: not a
+    // provider) within its validated bracket.
+    let scan_maps = vec![map_entry("/tmp/b.so", 2)];
+    let own_shape = shape_key(&scan_maps);
+    assert_eq!(own_shape.len(), 1, "the scan saw exactly B");
+    let examined = vec![ExaminedObject {
+        key: ObjectKey::of(&scan_maps[0]),
+        identity: FileIdentity { dev: 0x801, ino: 2 },
+        key_is_identity: true,
+    }];
+    let credited = credited_scan_shape(true, &own_shape, &[], &examined);
+    assert_eq!(
+        credited,
+        Some(own_shape),
+        "a complete scan credits only its own examined shape"
+    );
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; scan saw B, unselected PID 20 maps only A"
+    );
+}
+
+/// View-collapse fix4 F2 (codex probe
+/// `data_only_representative_must_not_credit_unopened_file`): PID 10
+/// maps A read-only while PID 20 maps the same A executable, so their
+/// shape keys are identical and selection collapses them. PID 10's
+/// complete scan never opens A — `candidate_groups` drops the
+/// data-only group before the scan loop — so the full shape must be
+/// withheld even though the scan is complete. PID 20 stays in the
+/// remainder, never vanishes.
+#[test]
+fn data_only_representative_must_not_credit_unopened_file() {
+    use crate::discovery::scan::candidate_groups;
+    fn map_entry(path: &str, inode: u64, permissions: &[u8; 4]) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *permissions,
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let ten_maps = vec![map_entry("/tmp/a.so", 1, b"r--p")];
+    let twenty_maps = vec![map_entry("/tmp/a.so", 1, b"r-xp")];
+    // Identical shape keys (selection collapses them), but the
+    // retained representative has zero candidate groups to scan while
+    // the unselected process has one executable group.
+    assert_eq!(shape_key(&ten_maps), shape_key(&twenty_maps));
+    assert!(
+        candidate_groups(&ten_maps).is_empty(),
+        "a data-only mapping offers no candidate group"
+    );
+    assert_eq!(candidate_groups(&twenty_maps).len(), 1);
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![(10, ten_maps.clone()), (20, twenty_maps)];
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    // Stable maps: the scan's own read agrees (data-only A), the scan
+    // completes, and it proves nothing examined — A was never opened.
+    let own_shape = shape_key(&ten_maps);
+    assert_eq!(own_shape.len(), 1, "the data-only .so is a shape member");
+    let credited = credited_scan_shape(true, &own_shape, &[], &[]);
+    assert_eq!(
+        credited, None,
+        "an unopened shape member withholds the whole shape"
+    );
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; A was never opened, unselected PID 20 stays counted"
+    );
+}
+
+/// View-collapse fix4 positive control: a complete scan that proved
+/// every shape member examined — one provider observation plus one
+/// negative — still covers an unselected same-shape process. Either
+/// proof kind alone must not suffice for a two-member shape.
+#[test]
+fn fully_examined_shape_covers_same_shape_sharing() {
+    use crate::discovery::identity::{ExaminedObject, FileIdentity};
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn module(key: ObjectKey, path: &str) -> ScannedModule {
+        ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            view: ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 0,
+                inode: 0,
+            },
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            path: path.into(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: vec![],
+            tables: vec![],
+            interfaces: vec![],
+        }
+    }
+    let ten_maps = vec![map_entry("/tmp/a.so", 1), map_entry("/tmp/b.so", 2)];
+    let twenty_maps = vec![map_entry("/tmp/a.so", 1), map_entry("/tmp/b.so", 2)];
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![(10, ten_maps.clone()), (20, twenty_maps)];
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    // Stable maps: the scan's own read agrees, and the scan proved
+    // both members — A as an observed provider, B as examined-not-a-
+    // provider — within its validated bracket.
+    let own_shape = shape_key(&ten_maps);
+    assert_eq!(own_shape.len(), 2);
+    let modules = vec![module(ObjectKey::of(&ten_maps[0]), "/tmp/a.so")];
+    let examined = vec![ExaminedObject {
+        key: ObjectKey::of(&ten_maps[1]),
+        identity: FileIdentity { dev: 0x801, ino: 2 },
+        key_is_identity: true,
+    }];
+    let credited = credited_scan_shape(true, &own_shape, &modules, &examined);
+    assert_eq!(credited, Some(own_shape));
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 1,
+        "reported shape_covered={reported}; unselected PID 20 shares the fully examined shape"
+    );
+}
+
 /// Task 3 (F3) helpers: the same C-fixture bodies as `tests/system_scope.rs`
 /// (`build_fixture`, `build_driver`, `spawn_loaded`), duplicated here
 /// because a `--lib` unit test cannot import `tests/support`. Two owned

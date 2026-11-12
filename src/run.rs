@@ -8480,7 +8480,8 @@ pub(crate) const TARGET_CALLER_EXITED: &str = "target exited before its exe link
 pub(crate) const TARGET_CALLER_EXE_UNREADABLE: &str = "target exe link unreadable";
 
 /// Resolve the pid-scope target's caller identity from
-/// `/proc/<pid>/exe`: the link text, or the finite reason it could not
+/// `/proc/<pid>/exe`: the link text and the exe file identity (device
+/// and inode from the same object), or the finite reason it could not
 /// be read. The read is bound to the target's retained pin when one is
 /// held: a generation change under the read discards even a readable
 /// path, so a recycled pid never misattaches an unrelated program's
@@ -8503,6 +8504,11 @@ pub(crate) fn resolve_pid_caller(
                 .ok()
                 .map(|link| link.to_string_lossy().into_owned())
         },
+        |path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+        },
         // A zombie still answers `kill(pid, 0)`, so the signal proof
         // alone would mislabel an unreaped exit as hidepid: the stat
         // verdict covers it (a fallback pin cannot see zombies either).
@@ -8514,16 +8520,20 @@ pub(crate) fn resolve_pid_caller(
 /// [`resolve_pid_caller`] over injected readers, so every outcome is
 /// unit-testable without live `/proc` state. The `still_same` bracket
 /// mirrors `ProcessView::run_while_same`: false before the read, or
-/// after it, discards the path and names the exit.
+/// after it, discards the path and names the exit. The identity reader
+/// stats the same exe object the link reader names, inside the same
+/// bracket, and only for a readable link.
 fn resolve_pid_caller_with(
     pid: u32,
     read_exe_link: impl Fn(&str) -> Option<String>,
+    read_exe_id: impl Fn(&str) -> Option<(u64, u64)>,
     proven_exited: impl Fn(u32) -> bool,
     mut still_same: impl FnMut() -> bool,
 ) -> render::CaptureCaller {
     let exited = || render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(TARGET_CALLER_EXITED),
+        exe_id: None,
         exec_to_exe: None,
     };
     if !still_same() {
@@ -8531,6 +8541,11 @@ fn resolve_pid_caller_with(
     }
     let path = format!("/proc/{pid}/exe");
     let exe = read_exe_link(&path);
+    let exe_id = if exe.is_some() {
+        read_exe_id(&path)
+    } else {
+        None
+    };
     if !still_same() {
         return exited();
     }
@@ -8538,6 +8553,7 @@ fn resolve_pid_caller_with(
         return render::CaptureCaller {
             exe: Some(exe),
             exe_unknown_reason: None,
+            exe_id,
             exec_to_exe: None,
         };
     }
@@ -8549,6 +8565,7 @@ fn resolve_pid_caller_with(
     render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(reason),
+        exe_id: None,
         exec_to_exe: None,
     }
 }
@@ -26542,6 +26559,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/opt/target/harness".to_string()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         assert_eq!(
@@ -26556,6 +26574,7 @@ int main(int argc, char **argv) {
             let caller = render::CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some(reason),
+                exe_id: None,
                 exec_to_exe: None,
             };
             assert_eq!(
@@ -26572,6 +26591,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/tmp/x\x1b[1m".to_string()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         let line = target_caller_line(4242, &caller);
@@ -26610,17 +26630,30 @@ int main(int argc, char **argv) {
         let named = resolve_pid_caller_with(
             7,
             |_| Some("/bin/app".to_string()),
+            |_| None,
             |_| panic!("a readable link never consults the exit proof"),
             || true,
         );
         assert_eq!(named.exe.as_deref(), Some("/bin/app"));
         assert_eq!(named.exe_unknown_reason, None);
         // Unreadable plus proven exit: the exit is named.
-        let exited = resolve_pid_caller_with(7, |_| None, |_| true, || true);
+        let exited = resolve_pid_caller_with(
+            7,
+            |_| None,
+            |_| panic!("an unreadable link never consults the identity proof"),
+            |_| true,
+            || true,
+        );
         assert_eq!(exited.exe, None);
         assert_eq!(exited.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
         // Unreadable but live: unreadable, never presumed exited.
-        let hidden = resolve_pid_caller_with(7, |_| None, |_| false, || true);
+        let hidden = resolve_pid_caller_with(
+            7,
+            |_| None,
+            |_| panic!("an unreadable link never consults the identity proof"),
+            |_| false,
+            || true,
+        );
         assert_eq!(hidden.exe, None);
         assert_eq!(
             hidden.exe_unknown_reason,
@@ -26632,6 +26665,7 @@ int main(int argc, char **argv) {
         let changed = resolve_pid_caller_with(
             7,
             |_| Some("/bin/recycled".to_string()),
+            |_| panic!("a changed generation never consults the identity proof"),
             |_| panic!("a changed generation never consults the exit proof"),
             || false,
         );
@@ -26643,6 +26677,7 @@ int main(int argc, char **argv) {
         let raced = resolve_pid_caller_with(
             7,
             |_| Some("/bin/recycled".to_string()),
+            |_| None,
             |_| panic!("a changed generation never consults the exit proof"),
             || std::mem::replace(&mut first, false),
         );
@@ -26708,6 +26743,129 @@ int main(int argc, char **argv) {
             pinned.exe_unknown_reason,
             Some(TARGET_CALLER_EXITED),
             "{pinned:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_pid_caller_with_carries_the_exe_file_identity() {
+        // The injected identity reader rides the named outcome: a known
+        // exe carries its file identity for the exec reconcile.
+        let caller = resolve_pid_caller_with(
+            7,
+            |_| Some("/bin/app".to_string()),
+            |_| Some((9, 9)),
+            |_| panic!("a readable link never consults the exit proof"),
+            || true,
+        );
+        assert_eq!(caller.exe.as_deref(), Some("/bin/app"));
+        assert_eq!(caller.exe_id, Some((9, 9)));
+        assert_eq!(caller.exe_unknown_reason, None);
+        assert_eq!(caller.exec_to_exe, None);
+    }
+
+    #[test]
+    fn resolve_pid_caller_stats_the_live_exe_identity() {
+        // The real reader stats the same exe object it names: this test
+        // process carries its own (dev, ino).
+        use std::os::unix::fs::MetadataExt as _;
+        let pid = std::process::id();
+        let caller = resolve_pid_caller(pid, None);
+        let exe = caller.exe.as_deref().unwrap_or_default();
+        assert!(!exe.is_empty(), "{caller:?}");
+        let meta = std::fs::metadata(format!("/proc/{pid}/exe")).expect("statting the test exe");
+        assert_eq!(caller.exe_id, Some((meta.dev(), meta.ino())), "{caller:?}");
+    }
+
+    #[test]
+    fn resolve_pid_caller_keeps_the_exe_identity_across_a_rename() {
+        // The rename-proof scenario at the production seam: one live
+        // child, no exec. Rename-only and unlink-only change the exe link
+        // text but keep the executable file identity, so neither may
+        // claim an exec.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("linger.c");
+        let original = dir.path().join("rename-A");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); return 0; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&original)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut child = KillOnDrop(
+            std::process::Command::new(&original)
+                .die_with_parent()
+                .spawn()
+                .expect("spawning the rename fixture"),
+        );
+        let pid = child.0.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+            if exe.is_ok_and(|link| link.to_string_lossy().ends_with("rename-A")) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rename fixture never exec'd");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let attach = resolve_pid_caller(pid, None);
+        assert!(
+            attach
+                .exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("rename-A"),
+            "{attach:?}"
+        );
+        let attach_id = attach
+            .exe_id
+            .expect("a readable exe carries its file identity");
+        // Rename-only: new link text, same identity, no exec.
+        let renamed = dir.path().join("rename-B");
+        std::fs::rename(&original, &renamed).unwrap();
+        let end = resolve_pid_caller(pid, None);
+        assert!(
+            end.exe.as_deref().unwrap_or_default().ends_with("rename-B"),
+            "{end:?}"
+        );
+        assert_eq!(end.exe_id, Some(attach_id), "{end:?}");
+        let reconciled = render::reconcile_caller_exec(&attach, end);
+        assert_eq!(
+            reconciled.exe.as_deref(),
+            Some(attach.exe.as_deref().unwrap())
+        );
+        assert_eq!(reconciled.exec_to_exe, None, "{reconciled:?}");
+        // Unlink-only: " (deleted)" text, same identity, no exec.
+        std::fs::remove_file(&renamed).unwrap();
+        let unlinked = resolve_pid_caller(pid, None);
+        assert!(
+            unlinked
+                .exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("rename-B (deleted)"),
+            "{unlinked:?}"
+        );
+        assert_eq!(unlinked.exe_id, Some(attach_id), "{unlinked:?}");
+        let reconciled = render::reconcile_caller_exec(&attach, unlinked);
+        assert_eq!(reconciled.exec_to_exe, None, "{reconciled:?}");
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the fixture is still the same live child"
         );
     }
 

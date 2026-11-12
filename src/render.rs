@@ -5588,43 +5588,81 @@ pub struct CaptureCaller {
     pub exe: Option<String>,
     /// Finite reason when `exe` is `None`, else `None`.
     pub exe_unknown_reason: Option<&'static str>,
+    /// The executable file identity behind `exe`: `(st_dev, st_ino)` of
+    /// the `/proc/<pid>/exe` target, read beside the link text. Internal
+    /// exec evidence only, never serialized: `None` when `exe` is `None`
+    /// or the identity read failed.
+    pub exe_id: Option<(u64, u64)>,
     /// The end-of-capture exe when the re-read proved the target exec'd
-    /// (two different known exes for one pinned process): text lines and
-    /// the JSON caller name both programs from it. `None` without a
-    /// proven exec, so the no-exec JSON keeps exactly its two keys.
+    /// (the executable file identity changed between the two reads for
+    /// one pinned process): text lines and the JSON caller name both
+    /// programs from it. `None` without a proven exec, so the no-exec
+    /// JSON keeps exactly its two keys.
     pub exec_to_exe: Option<String>,
 }
 
+/// True only when the two caller reads prove the target exec'd: both
+/// name a known program, the names differ, and the executable file
+/// identity (device + inode of the exe) changed between the reads for
+/// the one pinned process. A pathname change alone — a rename or unlink
+/// of the running executable — is not an exec, and an unreadable
+/// identity on either side proves nothing either.
+fn caller_exec_proven(attach: &CaptureCaller, end: &CaptureCaller) -> bool {
+    matches!(
+        (&attach.exe, &end.exe, attach.exe_id, end.exe_id),
+        (Some(attach_exe), Some(end_exe), Some(attach_id), Some(end_id))
+            if attach_exe != end_exe && attach_id != end_id
+    )
+}
+
 /// Reconcile the attach-time caller identity with the end-of-capture
-/// re-read of the same pinned target. Two known exes that differ prove
-/// a mid-capture exec — but nothing says which program made which
-/// calls, so the attach-time exe stays `exe` (calls the first program
-/// made are never relabeled) and the end exe rides `exec_to_exe` for
-/// the plain-words text transition and the JSON disclosure. An unknown
-/// end read never erases a known attach exe (the target exited after
-/// making its calls as that program); a known end read upgrades an
-/// unknown attach without claiming an exec; two unknown reads keep the
-/// attach-time reason. At most one transition is provable from two
+/// re-read of the same pinned target. A proven exec — two different
+/// known exes whose file identity changed between the reads — keeps the
+/// attach-time exe: nothing says which program made which calls, so the
+/// attach-time exe stays `exe` (calls the first program made are never
+/// relabeled) and the end exe rides `exec_to_exe` for the plain-words
+/// text transition and the JSON disclosure. Two known names with no
+/// proven exec — the same program renamed or unlinked, or an unreadable
+/// identity — keep the attach-time name with no transition claimed. An
+/// unknown end read never erases a known attach exe (the target exited
+/// after making its calls as that program); a known end read upgrades
+/// an unknown attach without claiming an exec; two unknown reads keep
+/// the attach-time reason. At most one transition is provable from two
 /// reads: an intermediate program (A->B->C reads as A->C) and a re-exec of
 /// the same path are invisible — and need no saying when the name is
 /// unchanged.
 pub fn reconcile_caller_exec(attach: &CaptureCaller, end: CaptureCaller) -> CaptureCaller {
     match (&attach.exe, &end.exe) {
-        (Some(attach_exe), Some(end_exe)) if attach_exe != end_exe => CaptureCaller {
+        (Some(attach_exe), Some(end_exe)) if caller_exec_proven(attach, &end) => CaptureCaller {
             exe: Some(attach_exe.clone()),
             exe_unknown_reason: None,
+            exe_id: attach.exe_id,
             exec_to_exe: Some(end_exe.clone()),
         },
-        (_, Some(_)) => CaptureCaller {
-            exe: end.exe,
+        // Two known names with no proven exec: the same program renamed
+        // or unlinked (same file identity), or an unreadable identity on
+        // either side. A pathname change alone is not an exec, so the
+        // attach-time name stays and no transition is claimed.
+        (Some(_), Some(_)) => CaptureCaller {
+            exe: attach.exe.clone(),
             exe_unknown_reason: None,
+            exe_id: attach.exe_id,
             exec_to_exe: None,
         },
-        // A transition rides only the reconcile that proved it from its own
-        // two reads: keeping the attach identity never carries a stale one.
+        // A known end read upgrades an unknown attach without claiming an
+        // exec; anything else keeps the attach-time identity. A transition
+        // rides only the reconcile that proved it from its own two reads:
+        // keeping the attach identity never carries a stale one.
+        (None, Some(_)) => CaptureCaller {
+            exe: end.exe,
+            exe_unknown_reason: None,
+            exe_id: end.exe_id,
+            exec_to_exe: None,
+        },
         _ => CaptureCaller {
             exe: attach.exe.clone(),
             exe_unknown_reason: attach.exe_unknown_reason,
+            exe_id: attach.exe_id,
             exec_to_exe: None,
         },
     }
@@ -7836,6 +7874,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: Some("/opt/target/harness".to_string()),
                 exe_unknown_reason: None,
+                exe_id: None,
                 exec_to_exe: None,
             }),
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
@@ -14695,6 +14734,7 @@ pub(crate) mod tests {
         let caller = CaptureCaller {
             exe: Some("/usr/bin/python3.14".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         for verbosity in [
@@ -14728,6 +14768,7 @@ pub(crate) mod tests {
         let unknown = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("exe_unreadable"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let out = live_scoped_with_caller(
@@ -14816,6 +14857,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some("target exe link unreadable"),
+                exe_id: None,
                 exec_to_exe: None,
             }),
             ..capture_fixture()
@@ -14837,6 +14879,7 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, attach.clone());
@@ -14847,18 +14890,21 @@ pub(crate) mod tests {
 
     #[test]
     fn reconcile_caller_exec_keeps_the_attach_exe_and_discloses_the_end_exe() {
-        // The target exec'd mid-capture: nothing says which program made
-        // which calls, so the attach-time exe stays `exe` (calls the
-        // first program made are never relabeled) and the end-of-capture
-        // exe rides `exec_to_exe` for the transition.
+        // The target exec'd mid-capture — the file identity changed
+        // between the reads — so nothing says which program made which
+        // calls: the attach-time exe stays `exe` (calls the first
+        // program made are never relabeled) and the end-of-capture exe
+        // rides `exec_to_exe` for the transition.
         let attach = CaptureCaller {
             exe: Some("/usr/bin/bash".into()),
             exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
             exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -14878,11 +14924,13 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -14898,11 +14946,13 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exe link unreadable"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -14920,11 +14970,13 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: Some("/usr/bin/stale".into()),
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -14938,11 +14990,13 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exe link unreadable"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
+            exe_id: None,
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -14965,6 +15019,7 @@ pub(crate) mod tests {
         let caller = CaptureCaller {
             exe: Some("/usr/bin/bash".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: Some("/usr/bin/pkcs11-tool".into()),
         };
         assert_eq!(
@@ -15012,6 +15067,7 @@ pub(crate) mod tests {
         let caller = CaptureCaller {
             exe: Some("/tmp/old\x07".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: Some("/tmp/new\x1b[1m".into()),
         };
         let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
@@ -15036,11 +15092,13 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/wrapper".into()),
             exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
             exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
             exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
@@ -15084,6 +15142,7 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exe_id: None,
             exec_to_exe: None,
         };
         let capture = CaptureMeta {
@@ -15105,6 +15164,215 @@ pub(crate) mod tests {
                 "no exec means the caller shape is unchanged: {caller}"
             );
         }
+    }
+
+    #[test]
+    fn reconcile_caller_exec_ignores_a_rename_without_an_exec() {
+        // F1: renaming the running executable changes the exe link text
+        // but keeps the executable file identity — the same program keeps
+        // running, so no transition is claimed and the attach-time name
+        // stays.
+        let attach = CaptureCaller {
+            exe: Some("/tmp/rename-A".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/tmp/rename-B".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/tmp/rename-A"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_ignores_an_unlink_without_an_exec() {
+        // F1: unlinking the running executable appends " (deleted)" to the
+        // exe link text, but the file identity is unchanged — no exec
+        // happened, so no transition is claimed.
+        let attach = CaptureCaller {
+            exe: Some("/tmp/rename-A".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/tmp/rename-B (deleted)".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/tmp/rename-A"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_claims_no_exec_without_exe_identity() {
+        // A pathname change alone is not exec evidence: when either
+        // identity read failed, nothing proves a second program ran, so
+        // the attach-time name stays and no transition is claimed.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/bash".into()),
+            exe_unknown_reason: None,
+            exe_id: None,
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exe_id: None,
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/bash"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_claims_an_exec_when_the_exe_identity_changed() {
+        // Healthy twin: two different known programs for one pinned
+        // process, with the executable file identity changed between the
+        // reads — a proven exec keeps the attach-time exe and discloses
+        // the end-of-capture one.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/wrapper".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/gated".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/wrapper"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe.as_deref(), Some("/usr/bin/gated"));
+    }
+
+    #[test]
+    fn reconcile_caller_exec_keeps_a_same_path_re_exec_invisible() {
+        // A re-exec of the same path stays invisible: the name is
+        // unchanged, so no transition is claimed even though the file
+        // identity changed underneath.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/tool".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/tool".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe, None);
+    }
+
+    #[test]
+    fn pid_capture_json_rename_without_exec_keeps_exactly_its_two_keys() {
+        // F1 in both JSON lanes: a mid-capture rename is not an exec, so
+        // the caller keeps exactly `{exe, exe_unknown_reason}` — no
+        // `exec_to_exe` key — in profile and metrics alike.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let attach = CaptureCaller {
+            exe: Some("/tmp/rename-A".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/tmp/rename-B".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let capture = CaptureMeta {
+            caller: Some(reconcile_caller_exec(&attach, end)),
+            ..capture_fixture()
+        };
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            assert_eq!(
+                caller,
+                &serde_json::json!({
+                    "exe": "/tmp/rename-A",
+                    "exe_unknown_reason": null,
+                }),
+                "a rename is not an exec, so the caller shape is unchanged: {caller}"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_profile_text_ignores_a_rename_without_an_exec() {
+        // F1 on stdout: after a mid-capture rename the caller line names
+        // the attach-time program plainly, with no exec transition — both
+        // from the line function and through the frame builder.
+        let attach = CaptureCaller {
+            exe: Some("/tmp/rename-A".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/tmp/rename-B".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(
+            caller_text_line(Some(&reconciled)).as_deref(),
+            Some("caller: /tmp/rename-A")
+        );
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_caller(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            Some(&reconciled),
+            crate::cli::TextVerbosity::Concise,
+            &crate::semantics::SessionStats::default(),
+            &BTreeMap::new(),
+        );
+        assert!(
+            out.contains("caller: /tmp/rename-A"),
+            "the frame names the attach-time program: {out}"
+        );
+        assert!(
+            !out.contains("exec'd to"),
+            "a rename claims no exec transition: {out}"
+        );
     }
 
     #[test]

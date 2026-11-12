@@ -105,11 +105,20 @@ _GAPS_NEVER_MAPPED_RUN = _GAPS_NEVER_MAPPED | frozenset({
     "pid_descendant_gaps",
 })
 
-#: Verdict details each cell kind earned: attached cells read
-#: attribution_only when observation is exact, concrete_gap behind loader
-#: or window timing; never-mapped cells always carry the structural
-#: discovery gap, so concrete_gap only.
+#: Verdict details each cell kind earned. Attached cells over a
+#: standard-layout provider table read clean_proven when observation is
+#: exact: the scan verifies the table without a manifest (owner ruling
+#: 2026-11-11, docs/usage.md "needs no manifest"), so the SoftHSM v2.40
+#: table carries semantics through the sole-complete / typed-getter-export
+#: legs, semantic_unverified_slots is 0 and no gap cause remains. The pin
+#: is exact on purpose: a standard-layout regression reads
+#: attribution_only and any observation loss reads concrete_gap, and both
+#: must fail loud. Never-mapped cells always carry the structural
+#: discovery gap, so concrete_gap only. _VERDICTS_ATTACHED keeps the
+#: pre-standard-layout pair for the twin builder's synthetic docs, which
+#: carry verdict_detail attribution_only and no scan evidence.
 _VERDICTS_ATTACHED = ("attribution_only", "concrete_gap")
+_VERDICTS_ATTACHED_VERIFIED = ("clean_proven",)
 _VERDICTS_NEVER_MAPPED = ("concrete_gap",)
 
 #: Private-token operations no PINBOUND flow may ever reach: login plus
@@ -373,6 +382,7 @@ class BrowserCells(unittest.TestCase):
         # with C_FindObjects>0) and sessions.opened is legitimately 0.
         self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_FLOOR,
+                          allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           s1={})
 
     @gate("chromium")
@@ -401,6 +411,7 @@ class BrowserCells(unittest.TestCase):
         # window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
+                          allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           s1={})
 
     @gate("firefox")
@@ -447,6 +458,7 @@ class BrowserCells(unittest.TestCase):
         # runs), so no count is pinned; login and signing never happen.
         self.check_report(result, store, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT,
+                          allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           absent=_PINBOUND_ABSENT, s1={})
 
     @gate("chromium")
@@ -476,6 +488,7 @@ class BrowserCells(unittest.TestCase):
         # No opened floor (same window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
+                          allowed_verdicts=_VERDICTS_ATTACHED_VERIFIED,
                           s1={})
 
     @gate_system("firefox")

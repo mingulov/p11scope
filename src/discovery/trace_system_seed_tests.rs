@@ -859,6 +859,7 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
                     &mut capture.engine.budget,
                     false,
                     &mut capture.engine.stage_timings,
+                    None,
                 );
                 let (modules, _pins, _) = scan.unwrap();
                 assert!(!modules.is_empty());

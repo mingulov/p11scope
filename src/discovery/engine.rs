@@ -28,8 +28,9 @@ use crate::discovery::identity::{
     ScannedRebindCursor, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
     canonicalize_scanned_overlays, open_view_executable_cached, open_view_rooted_object_cached,
     opened_file_matches_maps, pin_manifest_objects_deferred_in_views_with_budget, pin_of,
-    pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects, preexec_object_key,
-    retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
+    pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects,
+    pin_scanned_view_objects_with_reserve, preexec_object_key, retained_object_key_cached,
+    self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -474,6 +475,25 @@ pub struct Engine {
     /// inventory refresh consumed them: shallow-idle frames must not
     /// skip the apply that attaches the new file.
     learned_unapplied: bool,
+    /// Pids deferred for handles (view-collapse fix7, owner 21:10):
+    /// reserve/budget/wait deferrals that owe a retry, each with its
+    /// deferral mono-ns (`None` when that clock read failed — ordering
+    /// unaffected, delay unmeasured). Members attempt FIRST in the next
+    /// round, ahead of window order; the mark is spent on re-attempt,
+    /// and departed pids prune every tick beside the scheduler's own
+    /// stale set, so the map never outgrows the live scope.
+    handles_deferred: BTreeMap<u32, Option<u64>>,
+    /// The last measured handles-deferral-to-retry delay in mono-ns
+    /// (fix7, owner 21:10): production-measured, internal scheduling
+    /// evidence only, never report content. `None` until a marked pid
+    /// re-attempts with both clocks readable.
+    handles_last_retry_delay_ns: Option<u64>,
+    /// A tick freed handles (views or library pins dropped) while a
+    /// handles-deferred retry still pends: the next round runs
+    /// immediately instead of at the next frame cadence (fix7, owner
+    /// 21:10). One-shot, taken by the run loop beside the
+    /// learned/exec-recovery takes; it grants no admission authority.
+    handles_freed_frame_owed: bool,
     /// The drain was shut down orderly (joined): its channel closing
     /// afterwards is the expected terminal state, not drain death.
     /// Genuine loss at shutdown rides the drain's lost-tail report.
@@ -6453,6 +6473,7 @@ fn scan_and_pin(
         broad_admit,
         stage,
         scan_process_view,
+        None,
     )
     .map(|(modules, pins, _)| (modules, pins))
 }
@@ -6477,6 +6498,7 @@ fn scan_and_pin_with(
         &ProcessView,
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
+    reserve: Option<&crate::fd_budget::FdReserveTick>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     scan_and_pin_with_proof(
         view,
@@ -6489,6 +6511,7 @@ fn scan_and_pin_with(
         |request, view, budget| {
             scan(request, view, budget).map(|outcome| (outcome, Vec::new(), BTreeSet::new()))
         },
+        reserve,
     )
     .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
 }
@@ -6525,6 +6548,7 @@ fn scan_and_pin_with_proof(
         (ScanOutcome, Vec<ExaminedObject>, BTreeSet<ObjectKey>),
         String,
     >,
+    reserve: Option<&crate::fd_budget::FdReserveTick>,
 ) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
@@ -6573,7 +6597,11 @@ fn scan_and_pin_with_proof(
         broad_fixed_pool_pass(view, &mut modules, budget, counters);
     }
     let pin_start = crate::attach::monotonic_ns();
-    let pinned = pin_scanned_view_objects(view, &modules, budget);
+    // Fix7 F1: the tick's reserve budgets the pin loop itself, so a scan
+    // that wants more pins than the headroom covers stops with the rest
+    // pending instead of opening into `EMFILE`. Admission scans pass
+    // `Some`; every other scan site passes `None` (today's behavior).
+    let pinned = pin_scanned_view_objects_with_reserve(view, &modules, budget, reserve);
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",
@@ -7095,6 +7123,29 @@ fn scan_pins_waited(skips: &[Skipped]) -> bool {
     skips
         .iter()
         .any(|skip| skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT)
+}
+
+/// True when a scan's pins waited ONLY for the pre-emptive reserve stop
+/// (view-collapse fix7 F1): every wait gap carries the not-attempted
+/// detail, so no open ever failed — the guard tripped first. The
+/// admission loops file the reserve tail then; any real
+/// open-exhaustion wait (fix6 A3) keeps the fd-table-exhausted tail.
+/// Ordinary per-path skips are ignored, like in [`scan_pins_waited`].
+fn scan_pins_waited_only_for_reserve(skips: &[Skipped]) -> bool {
+    let mut waited = false;
+    for skip in skips {
+        if skip.subject != crate::discovery::identity::PIN_WAIT_SUBJECT {
+            continue;
+        }
+        if !skip
+            .reason
+            .contains(crate::discovery::identity::PIN_RESERVE_STOP_DETAIL)
+        {
+            return false;
+        }
+        waited = true;
+    }
+    waited
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -7758,11 +7809,16 @@ fn discover_plan(
     // pass recounts from the live sets.
     let library_cap = discovered.library_handle_cap();
     let mut held_handles = discovered.count_held_library_handles();
-    for pid in selected.iter() {
+    for (index, pid) in selected.iter().enumerate() {
         // The pass counts its own opens against the snapshot (conservative
         // within the pass: drops are not subtracted; the fresh snapshot
         // bounds the drift every pass).
         if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
+            // Fix7 (owner 21:10): this pid and the unprocessed rest owe
+            // a handles-first retry in the next round.
+            for deferred_pid in &selected[index..] {
+                discovered.note_handles_deferred(*deferred_pid);
+            }
             let skipped = Skipped {
                 subject: "process view".into(),
                 reason: "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
@@ -7776,6 +7832,11 @@ fn discover_plan(
         // counted named gap, never dropped; a later pass with freed
         // handles serves them instead of losing the work.
         if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
+            // Fix7 (owner 21:10): this pid and the unprocessed rest owe
+            // a handles-first retry in the next round.
+            for deferred_pid in &selected[index..] {
+                discovered.note_handles_deferred(*deferred_pid);
+            }
             let skipped = Skipped {
                 subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
                 reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL.into(),
@@ -7885,6 +7946,8 @@ fn discover_plan(
                 scan_process_view_examined(request, view, budget)
                     .map(|(outcome, examined, _, own_shape)| (outcome, examined, own_shape))
             },
+            // Fix7 F1: the pass's reserve budgets the pin loop itself.
+            reserve_tick.as_ref(),
         );
         // 6.14 Option B: the scan observed this generation alive; learn
         // its executable path whether or not the scan completed.
@@ -7901,6 +7964,17 @@ fn discover_plan(
                 // waits behind the same break as the reserve path.
                 if scan_pins_waited(&counters.object_skips) {
                     discovered.release_view_id(view.id());
+                    // Fix7 F1: a scan that stopped BEFORE the reserve
+                    // tripped files the reserve tail — nothing filled, the
+                    // guard tripped first. Any real open-exhaustion wait
+                    // keeps the fd-table-exhausted tail.
+                    let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
+                    // Fix7 (owner 21:10): this pid's view deferred whole,
+                    // and the break defers the unprocessed rest: all owe a
+                    // handles-first retry in the next round.
+                    for deferred_pid in &selected[index..] {
+                        discovered.note_handles_deferred(*deferred_pid);
+                    }
                     discovered.base_counters.scan_unavailable = discovered
                         .base_counters
                         .scan_unavailable
@@ -7914,10 +7988,14 @@ fn discover_plan(
                         .object_skips
                         .extend(counters.object_skips);
                     discovered.base_counters.noise.merge(&counters.noise);
+                    let reason = if reserve_stop {
+                        "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
+                    } else {
+                        "fd table exhausted while opening a library; remaining processes deferred to the next tick"
+                    };
                     let skipped = Skipped {
                         subject: "process view".into(),
-                        reason: "fd table exhausted while opening a library; remaining processes deferred to the next tick"
-                            .into(),
+                        reason: reason.into(),
                     };
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
@@ -11927,6 +12005,9 @@ impl Engine {
             learned_cap_skipped: 0,
             learned_frame_owed: false,
             learned_unapplied: false,
+            handles_deferred: BTreeMap::new(),
+            handles_last_retry_delay_ns: None,
+            handles_freed_frame_owed: false,
             learned_close_expected: false,
             prearm: crate::prearm_module::PrearmState::empty(),
             prearm_witness: None,
@@ -14910,6 +14991,7 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
+        reserve: Option<&crate::fd_budget::FdReserveTick>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -14924,6 +15006,7 @@ impl Engine {
                 broad_admit,
                 stage,
                 scan_process_view,
+                reserve,
             )
         })
     }
@@ -14949,6 +15032,7 @@ impl Engine {
                 broad_admit,
                 stage,
                 scan_process_view_without_memory,
+                None,
             )
         })
     }
@@ -19171,6 +19255,7 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                None,
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
@@ -26080,6 +26165,7 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                None,
             );
             // 6.14 Option B: learn the refreshed generation's executable.
             elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
@@ -27217,6 +27303,7 @@ impl Engine {
             &mut self.budget,
             broad_admit,
             &mut self.stage_timings,
+            None,
         );
         // 6.14 Option B: learn the probationary generation's executable.
         elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -27281,6 +27368,78 @@ impl Engine {
         crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES
     }
 
+    /// Mark a pid deferred for handles (fix7, owner 21:10): a
+    /// reserve/budget/wait deferral that owes a handles-first retry in
+    /// the next round. Stamped with the production mono clock for the
+    /// retry-delay measurement (`None` when that read fails: ordering
+    /// unaffected, delay unmeasured). Re-deferral restamps: the delay
+    /// always measures the latest deferral.
+    fn note_handles_deferred(&mut self, pid: u32) {
+        self.handles_deferred
+            .insert(pid, crate::attach::monotonic_ns());
+    }
+
+    /// A handles-deferred pid is attempted again (fix7, owner 21:10):
+    /// spend its first-in-round mark and, when both clocks read,
+    /// measure the defer-to-retry delay into
+    /// `handles_last_retry_delay_ns`. A failed clock read keeps the
+    /// previous measurement (no measurement, no overwrite).
+    fn note_handles_retry(&mut self, pid: u32) {
+        if let Some(deferred_at) = self.handles_deferred.remove(&pid)
+            && let (Some(deferred), Some(now)) = (deferred_at, crate::attach::monotonic_ns())
+        {
+            self.handles_last_retry_delay_ns = Some(now.saturating_sub(deferred));
+        }
+    }
+
+    /// Handles-deferred members of the admission window first (fix7,
+    /// owner 21:10), stable otherwise: the scheduler's fairness order
+    /// stands within each part, and window MEMBERSHIP still follows the
+    /// scheduler's bounds and rotation — this only orders the round's
+    /// attempts. Applied once at admission entry, so every window path
+    /// (free, scarce, selected) retries handles-deferred pids first.
+    fn order_handles_deferred_first(
+        admitted: Vec<u32>,
+        deferred: &BTreeMap<u32, Option<u64>>,
+    ) -> Vec<u32> {
+        if deferred.is_empty() {
+            return admitted;
+        }
+        let (mut first, rest): (Vec<u32>, Vec<u32>) = admitted
+            .into_iter()
+            .partition(|pid| deferred.contains_key(pid));
+        first.extend(rest);
+        first
+    }
+
+    /// End-of-tick handle-release observation (fix7, owner 21:10): when
+    /// a handles-deferred retry still pends and this tick freed handles
+    /// — fewer held library files, or fewer views (their pidfds) — owe
+    /// the next round immediately instead of at the next frame cadence.
+    /// The run loop takes the flag beside the learned/exec-recovery
+    /// takes. Strictly release-driven: a pending retry without a freed
+    /// handle waits for the next frame, never a futile immediate spin;
+    /// and a release with nothing pending owes nothing. The wrapper
+    /// skips the baseline count while the map is empty, so idle ticks
+    /// pay one `is_empty`.
+    fn note_tick_handle_release(&mut self, held_before: usize, views_before: usize) {
+        if self.handles_deferred.is_empty() {
+            return;
+        }
+        if self.count_held_library_handles() < held_before || self.views.len() < views_before {
+            self.handles_freed_frame_owed = true;
+        }
+    }
+
+    /// Take the owed immediate round for the run loop (fix7, owner
+    /// 21:10): a set flag rewinds the frame clock so the next iteration
+    /// runs its frame, then clears. Mirrors [`take_learned_frame`].
+    ///
+    /// [`take_learned_frame`]: Engine::take_learned_frame
+    pub(crate) fn take_handles_freed_frame(&mut self) -> bool {
+        std::mem::take(&mut self.handles_freed_frame_owed)
+    }
+
     /// Distinct library files this capture currently holds (fix6 A2):
     /// the union over per-view scan pins, manifest pins, pre-arm pins
     /// and the engine aggregate (whose entries alias the same `Arc`s, so
@@ -27323,6 +27482,9 @@ impl Engine {
         // counted at staging like any admission, subtracted if the yield
         // completes and drops the staged pins at the next loop-top.
         let mut staged_new_fds: u64 = 0;
+        // Fix7 (owner 21:10): handles-deferred members attempt first in
+        // this round, ahead of window order (stable otherwise).
+        let admitted = Self::order_handles_deferred_first(admitted, &self.handles_deferred);
         let mut unprocessed = admitted.into_iter();
         // FD reserve (scan-1k guard), sampled once for the tick: one
         // pidfd plus the retained scan pins per admitted view cross a
@@ -27404,6 +27566,9 @@ impl Engine {
             if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
+                    // Fix7 (owner 21:10): the rest owe a handles-first
+                    // retry in the next round.
+                    self.note_handles_deferred(deferred_pid);
                     failed_refresh_pids.insert(deferred_pid);
                 }
                 skipped.push(Skipped {
@@ -27420,6 +27585,9 @@ impl Engine {
             if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
+                    // Fix7 (owner 21:10): the rest owe a handles-first
+                    // retry in the next round.
+                    self.note_handles_deferred(deferred_pid);
                     failed_refresh_pids.insert(deferred_pid);
                 }
                 skipped.push(Skipped {
@@ -27551,6 +27719,11 @@ impl Engine {
             if let Some(tick) = reserve_tick.as_mut() {
                 tick.note_opened();
             }
+            // Fix7 (owner 21:10): a handles-deferred pid re-attempted —
+            // spend its first-in-round mark and measure the delay. An
+            // open failure above keeps the mark (the pid retries later;
+            // a departed pid prunes every tick).
+            self.note_handles_retry(pid);
             let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &view,
@@ -27559,13 +27732,17 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                // Fix7 F1: the tick's reserve budgets the pin loop itself.
+                reserve_tick.as_ref(),
             );
             // 6.14 Option B: learn the newcomer's executable path.
             elf_needed::learn_view_exe(&mut self.extensive, &view);
             self.deep_scans = self.deep_scans.saturating_add(1);
             // Fix6 A3: snapshot the pin-open wait before the counters are
-            // absorbed — a waited scan defers whole below.
+            // absorbed — a waited scan defers whole below. Fix7 F1
+            // snapshots the pre-emptive-stop kind beside it for the tail.
             let pins_waited = scan_pins_waited(&counters.object_skips);
+            let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // Completeness is otherwise unused here: a new view has
@@ -27583,15 +27760,29 @@ impl Engine {
                     if pins_waited {
                         self.release_view_id(view.id());
                         self.mark_unattempted_fresh(pid, ledger);
+                        // Fix7 (owner 21:10): this pid's view deferred
+                        // whole, and the break defers the unprocessed
+                        // rest: all owe a handles-first retry.
+                        self.note_handles_deferred(pid);
                         failed_refresh_pids.insert(pid);
                         for deferred_pid in unprocessed.by_ref() {
                             self.mark_unattempted_fresh(deferred_pid, ledger);
+                            self.note_handles_deferred(deferred_pid);
                             failed_refresh_pids.insert(deferred_pid);
                         }
+                        // Fix7 F1: a scan that stopped BEFORE the reserve
+                        // tripped files the reserve tail — nothing filled,
+                        // the guard tripped first. Any real
+                        // open-exhaustion wait keeps the
+                        // fd-table-exhausted tail.
+                        let reason = if reserve_stop {
+                            "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
+                        } else {
+                            "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
+                        };
                         skipped.push(Skipped {
                             subject: "live discovery tick".into(),
-                            reason: "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
-                                .into(),
+                            reason: reason.into(),
                         });
                         break;
                     }
@@ -27722,6 +27913,14 @@ impl Engine {
         });
         let mut new_views = Vec::new();
         self.inventory_passes = self.inventory_passes.saturating_add(1);
+        // Fix7 (owner 21:10): the handle baseline for the end-of-tick
+        // release observation — only while a handles-deferred retry
+        // pends, so idle ticks pay one `is_empty` for the whole round.
+        let handle_baseline = if self.handles_deferred.is_empty() {
+            None
+        } else {
+            Some((self.count_held_library_handles(), self.views.len()))
+        };
         self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(
             session,
@@ -27735,6 +27934,12 @@ impl Engine {
         );
         self.in_refresh_tick = false;
         self.release_unadmitted_views(new_views);
+        // Fix7 (owner 21:10): a release observed while a retry pends owes
+        // the next round immediately — after the unadmitted drops, so
+        // their freed pins count as the release they are.
+        if let Some((held_before, views_before)) = handle_baseline {
+            self.note_tick_handle_release(held_before, views_before);
+        }
         #[cfg(feature = "h6-reexec-diagnostic")]
         if let Some(span) = diagnostic_span {
             span.finish_result(&result);
@@ -27891,6 +28096,10 @@ impl Engine {
         // new generation, correctly fresh).
         let live: BTreeSet<u32> = pids.iter().copied().collect();
         self.scheduler.prune_stale_to_enumerated(&live);
+        // Fix7 (owner 21:10): departed handles-deferred pids owe no
+        // retry — prune beside the scheduler's own stale set, so the
+        // map never outgrows the live scope.
+        self.handles_deferred.retain(|pid, _| live.contains(pid));
         self.note_scope_walk(&live, enumerate_start, enumerate_end);
         // Ordinary ticks never sweep maps: over the cap the scheduler serves
         // queued event-driven work plus a fairness-rotation window, and only

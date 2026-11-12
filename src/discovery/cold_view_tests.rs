@@ -68,6 +68,7 @@ fn cold_group_deep_scan_keeps_sparse_provider_targets_useful() {
             &mut budget,
             false,
             &mut timings,
+            None,
         );
 
         let (modules, pins, _) =

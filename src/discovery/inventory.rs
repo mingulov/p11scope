@@ -979,6 +979,7 @@ impl Engine {
             false,
             &mut self.stage_timings,
             scan,
+            None,
         );
         let pinning_complete = self.budget.stopped_reason().is_none()
             && before_refusals == self.budget.refusal_counts()

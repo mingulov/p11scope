@@ -9712,7 +9712,9 @@ fn capture_profile(
         request_profile_recovery_frame(
             &mut last_frame,
             drain,
-            engine.take_immediate_exec_recovery_frame() | engine.take_learned_frame(),
+            engine.take_immediate_exec_recovery_frame()
+                | engine.take_learned_frame()
+                | engine.take_handles_freed_frame(),
             Instant::now,
         );
         collect_sink_drops(
@@ -11258,7 +11260,9 @@ fn capture_trace(
         request_profile_recovery_frame(
             &mut last_frame,
             drain,
-            engine.take_immediate_exec_recovery_frame() | engine.take_learned_frame(),
+            engine.take_immediate_exec_recovery_frame()
+                | engine.take_learned_frame()
+                | engine.take_handles_freed_frame(),
             Instant::now,
         );
         flush_stdout(stdout, &mut stdout_open)?;
@@ -25589,6 +25593,53 @@ int main(int argc, char **argv) {
             !trace.contains("*frame_clock ="),
             "trace must not advance its frame clock outside the shared step"
         );
+    }
+
+    /// View-collapse fix7 21:10 addendum (immediate round on release):
+    /// both capture loops fold the handles-freed take into the
+    /// immediate-frame request — a round owed on release rewinds the
+    /// frame clock exactly like the learned/exec-recovery takes, so the
+    /// next iteration runs its frame instead of sleeping to cadence.
+    /// Sliced like `capture_loops_service_a_pending_stop_between_frames`.
+    #[test]
+    fn capture_loops_request_immediate_round_on_handles_freed() {
+        let source = include_str!("run.rs");
+        let tick_of = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+                .split_once("    loop {")
+                .unwrap()
+                .1
+                .split_once("let mut finish_context =")
+                .unwrap()
+                .0
+        };
+        let profile = tick_of("fn capture_profile(", "fn write_json_report");
+        let trace = tick_of("fn capture_trace(", "fn terminal_trace_count_line");
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                tick.matches("take_handles_freed_frame()").count(),
+                1,
+                "{function} must take the handles-freed round exactly once per tick"
+            );
+            let immediate = tick
+                .split_once("request_profile_recovery_frame(")
+                .unwrap_or_else(|| panic!("{function} must request its recovery frame"))
+                .1
+                .split_once(");")
+                .unwrap_or_else(|| panic!("{function} must close its recovery-frame request"))
+                .0;
+            assert!(
+                immediate.contains("take_handles_freed_frame()")
+                    && immediate.contains("take_learned_frame()"),
+                "{function} must join the handles-freed take into the immediate-frame request"
+            );
+        }
     }
 
     /// F-T8-1, one tick on scripted clock reads. The gate reads the frame clock

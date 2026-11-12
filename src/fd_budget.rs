@@ -265,6 +265,27 @@ pub(crate) fn reserve_defers(sample: Option<&FdReserveTick>) -> bool {
     sample.is_some_and(FdReserveTick::breached)
 }
 
+/// True when one more persistent open would breach the reserve: the tick
+/// snapshot plus the tick's debited opens plus `scan_opens` already
+/// opened by this scan, plus the open about to happen. Pinning checks
+/// this before each open (view-collapse fix7 F1): the admission-level
+/// check plus the post-scan debit cannot protect a scan that opens many
+/// files itself. Saturating like [`FdReserveTick::breached`]: absurd
+/// counts defer, never wrap into admission. Fail open like
+/// [`reserve_defers`]: no snapshot, no stop.
+pub(crate) fn reserve_defers_next_open(sample: Option<&FdReserveTick>, scan_opens: u64) -> bool {
+    sample.is_some_and(|tick| {
+        fd_reserve_breached(
+            tick.open
+                .saturating_add(tick.opened)
+                .saturating_add(scan_opens)
+                .saturating_add(1),
+            tick.soft,
+            FD_RESERVE,
+        )
+    })
+}
+
 /// The fixed subject of the one unreadable-snapshot report: the reserve
 /// guard went blind and views proceed without it.
 pub(crate) const UNREADABLE_SUBJECT: &str = "capture file-descriptor reserve";
@@ -730,5 +751,50 @@ mod tests {
         assert!(!library_handle_budget_exhausted(1, 2));
         assert!(library_handle_budget_exhausted(2, 2));
         assert!(library_handle_budget_exhausted(3, 2));
+    }
+
+    /// View-collapse fix7 F1 (codex blocking): pinning checks the projected
+    /// headroom before EACH open inside one scan — the tick snapshot plus
+    /// the tick's debited opens plus the scan's own opens so far, plus the
+    /// open about to happen. Healthy: with room for the next open the scan
+    /// continues.
+    #[test]
+    fn reserve_defers_next_open_admits_with_headroom() {
+        let soft = 512u64;
+        let tick = FdReserveTick::from_counts(350, soft);
+        assert!(!reserve_defers(Some(&tick)));
+        // 350 + 0 + 0 + 1 = 351: 161 free, over the 128 reserve.
+        assert!(!reserve_defers_next_open(Some(&tick), 0));
+        // 350 + 0 + 33 + 1 = 384: exactly the reserve remains.
+        assert!(!reserve_defers_next_open(Some(&tick), 33));
+    }
+
+    /// Failure pair: once the next open would breach the reserve the scan
+    /// must stop with the rest pending — never open into `EMFILE`.
+    #[test]
+    fn reserve_defers_next_open_stops_before_the_reserve_trips() {
+        let soft = 512u64;
+        let tick = FdReserveTick::from_counts(350, soft);
+        // 350 + 0 + 34 + 1 = 385: 127 free, below the 128 reserve.
+        assert!(reserve_defers_next_open(Some(&tick), 34));
+        // The tick's own debited opens count too: one view already opened.
+        let mut tick = tick;
+        tick.note_opened();
+        assert!(reserve_defers_next_open(Some(&tick), 33));
+        assert!(!reserve_defers_next_open(Some(&tick), 32));
+    }
+
+    /// Failure pair: absurd counts saturate into deferral (never wrap into
+    /// admission), and an unreadable snapshot never stops the scan (fail
+    /// open, like `reserve_defers`).
+    #[test]
+    fn reserve_defers_next_open_saturates_and_fails_open() {
+        let absurd = FdReserveTick::from_counts(u64::MAX, u64::MAX);
+        assert!(reserve_defers_next_open(Some(&absurd), 0));
+        let mut tick = FdReserveTick::from_counts(0, 1000);
+        tick.note_opened_n(u64::MAX);
+        assert!(reserve_defers_next_open(Some(&tick), 0));
+        assert!(!reserve_defers_next_open(None, 0));
+        assert!(!reserve_defers_next_open(None, u64::MAX));
     }
 }

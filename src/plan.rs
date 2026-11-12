@@ -9965,6 +9965,71 @@ mod tests {
         assert_plan_count_only(&plan, "getter-export table with a foreign entry");
     }
 
+    fn assert_getter_export_interface_forward_keeps_authority(getter: &str) {
+        // Amendment 22:45 2026-11-11: a retained cross-object
+        // interface-getter forward keeps the exports-only 3.x grant —
+        // bind kept it, so the pinned target's own `.dynsym` defines
+        // that same name at that exact offset (ordinary linker
+        // interposition under p11-kit-proxy). The verified forward
+        // agrees with the provider's exports instead of contradicting
+        // them, so all 92 slots authorize via the typed-getter-export
+        // leg; the forwarded getter slot itself stays count-only, and
+        // every mechanism-published slot stays own-object +
+        // unambiguous.
+        let mut module = getter_export_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == getter)
+            .expect("interface getter entry");
+        let other_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 43,
+        };
+        table.entries[position].object = other_key;
+        table.entries[position].object_path = "/opt/other.so".into();
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 92);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a verified forwarded {getter} keeps the getter-export grant"
+        );
+        assert_eq!(plan.standard_layout_slot_count(), 92);
+        assert_eq!(plan.standard_layout_evidence(), ["typed getter export"]);
+        let (forwarded, local): (Vec<_>, Vec<_>) =
+            plan.slots.iter().partition(|slot| slot.names == [getter]);
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded[0].semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            "the exempted getter slot never reads arguments"
+        );
+        assert_eq!(forwarded[0].object, PinnedObjectId(43));
+        assert_eq!(local.len(), 91);
+        for slot in &local {
+            assert_eq!(
+                slot.object, module.object,
+                "every mechanism-published slot stays own-object: {slot:?}"
+            );
+            assert!(
+                !slot.aliased,
+                "every mechanism-published slot stays unambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn getter_export_interface_forward_keeps_authority() {
+        assert_getter_export_interface_forward_keeps_authority("C_GetInterface");
+    }
+
+    #[test]
+    fn getter_export_interface_list_forward_keeps_authority() {
+        assert_getter_export_interface_forward_keeps_authority("C_GetInterfaceList");
+    }
+
     #[test]
     fn getter_export_table_with_partial_export_agreement_stays_count_only() {
         // Ruling 05:25b twin (exports-disagree): the getter-export leg

@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 /// The 2.40 `CK_FUNCTION_LIST` ordinal count.
 const LEGACY_ORDINALS: usize = 68;
 
+/// The full 3.0 `CK_FUNCTION_LIST_3_0` ordinal count.
+const FULL_3X_ORDINALS: usize = 92;
+
 #[derive(Clone, Copy)]
 enum Variant {
     /// Every standard name exported, every ordinal pointing at its export.
@@ -61,6 +64,19 @@ enum Variant {
     /// `C_GetFunctionList` — a forwarded bootstrap to a wrong offset.
     /// The forward must be refused and every ordinal must stay `unknown`.
     Misdirected32,
+    /// A full 3.0 provider (92 distinct exports) whose `C_GetInterface`
+    /// slot forwards to a preloaded provider's same-named export by
+    /// ordinary dynamic-linker interposition — the exports-only 3.x
+    /// interface route (amendment 22:45 2026-11-11).
+    Interposed3xInterface,
+    /// The same 3.0 shape with `C_GetInterfaceList` forwarded.
+    Interposed3xInterfaceList,
+    /// Hostile twins: the forwarded interface slot points at the
+    /// preload's *decoy* export instead of the same-named getter — a
+    /// forwarded interface getter to a wrong offset, which bind must
+    /// refuse so every ordinal stays `unknown`.
+    Misdirected3xInterface,
+    Misdirected3xInterfaceList,
 }
 
 fn legacy_names() -> Vec<&'static str> {
@@ -69,8 +85,29 @@ fn legacy_names() -> Vec<&'static str> {
         .collect()
 }
 
+fn full_3x_names() -> Vec<&'static str> {
+    (0..FULL_3X_ORDINALS)
+        .map(|ordinal| pkcs11_module::function_name(ordinal).expect("3.0 ordinal name"))
+        .collect()
+}
+
+fn is_full_3x(variant: Variant) -> bool {
+    matches!(
+        variant,
+        Variant::Interposed3xInterface
+            | Variant::Interposed3xInterfaceList
+            | Variant::Misdirected3xInterface
+            | Variant::Misdirected3xInterfaceList
+    )
+}
+
 fn source(variant: Variant) -> String {
-    let names = legacy_names();
+    let names = if is_full_3x(variant) {
+        full_3x_names()
+    } else {
+        legacy_names()
+    };
+    let count = names.len();
     let mut c = String::new();
     for (ordinal, name) in names.iter().enumerate() {
         let body = 0x1000 + ordinal;
@@ -102,25 +139,45 @@ fn source(variant: Variant) -> String {
             Variant::Misdirected32 if name == "C_GetFunctionList" => {
                 "(void *)p11scope_decoy".into()
             }
+            Variant::Misdirected3xInterface if name == "C_GetInterface" => {
+                "(void *)p11scope_decoy".into()
+            }
+            Variant::Misdirected3xInterfaceList if name == "C_GetInterfaceList" => {
+                "(void *)p11scope_decoy".into()
+            }
             _ => format!("(void *){name}"),
         }
     };
-    let entries: Vec<String> = (0..LEGACY_ORDINALS).map(entry).collect();
-    if matches!(variant, Variant::Misdirected32) {
+    let entries: Vec<String> = (0..count).map(entry).collect();
+    if matches!(
+        variant,
+        Variant::Misdirected32
+            | Variant::Misdirected3xInterface
+            | Variant::Misdirected3xInterfaceList
+    ) {
         // The reference must link: the provider defines the decoy too, but
         // the globally preloaded decoy wins the relocation by load order,
-        // so the bootstrap slot forwards out of the module to a wrong
+        // so the forwarded slot leaves the module to a wrong
         // offset. Distinct body, so the two decoys can never fold.
         c.push_str("unsigned long p11scope_decoy(void) { return 0xDEC07; }\n");
     }
-    if matches!(variant, Variant::Interposed32 | Variant::Misdirected32) {
+    if is_full_3x(variant) {
+        // A genuine full 3.0 table: all 92 slots hold distinct text
+        // pointers, so the decoder walks the complete standard extent.
+        c.push_str(&format!(
+            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{count}]; }};\n\
+             __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
+             {{ 3, 0, {{ {} }} }};\n",
+            entries.join(", ")
+        ));
+    } else if matches!(variant, Variant::Interposed32 | Variant::Misdirected32) {
         // The 3.2 stamp walks the 68-slot known prefix; the embedded tail
         // of small non-pointer words refutes wider layouts at ordinal 68
         // deterministically (low addresses never resolve to executable
         // file mappings), proving the prefix complete.
         let tail: Vec<String> = (1..=24).map(|word| word.to_string()).collect();
         c.push_str(&format!(
-            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{LEGACY_ORDINALS}]; unsigned long tail[24]; }};\n\
+            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{count}]; unsigned long tail[24]; }};\n\
              __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
              {{ 3, 2, {{ {} }}, {{ {} }} }};\n",
             entries.join(", "),
@@ -128,7 +185,7 @@ fn source(variant: Variant) -> String {
         ));
     } else {
         c.push_str(&format!(
-            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{LEGACY_ORDINALS}]; }};\n\
+            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{count}]; }};\n\
              __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
              {{ 2, 40, {{ {} }} }};\n",
             entries.join(", ")
@@ -330,9 +387,34 @@ impl Loaded {
         Self::build_interposed_like(Variant::Misdirected32, build_decoy_preload)
     }
 
+    /// The 3.x interface twins: a full 3.0 provider plus a preload
+    /// exporting exactly `getter` (healthy) or the getter plus a decoy
+    /// the forwarded slot misdirects to (`misdirected`). Returns the
+    /// loaded subject and the preload path.
+    fn build_3x_interposed(getter: &str, misdirected: bool) -> (Self, PathBuf) {
+        let variant = match (getter, misdirected) {
+            ("C_GetInterface", false) => Variant::Interposed3xInterface,
+            ("C_GetInterfaceList", false) => Variant::Interposed3xInterfaceList,
+            ("C_GetInterface", true) => Variant::Misdirected3xInterface,
+            ("C_GetInterfaceList", true) => Variant::Misdirected3xInterfaceList,
+            _ => panic!("unknown 3.x interface getter {getter}"),
+        };
+        let sources = if misdirected {
+            format!(
+                "unsigned long {getter}(void) {{ return 0x1FACE; }}\n\
+                 unsigned long p11scope_decoy(void) {{ return 0xDEC09; }}\n"
+            )
+        } else {
+            format!("unsigned long {getter}(void) {{ return 0x1FACE; }}\n")
+        };
+        Self::build_interposed_like(variant, |dir| {
+            build_preload_source(dir, "preload", &sources)
+        })
+    }
+
     fn build_interposed_like(
         variant: Variant,
-        build_preload: fn(&Path) -> PathBuf,
+        build_preload: impl Fn(&Path) -> PathBuf,
     ) -> (Self, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let c = dir.path().join("provider.c");
@@ -443,11 +525,14 @@ impl Loaded {
 
     /// `.dynsym` definitions of the standard names, by file offset.
     fn exports_by_offset(&self) -> BTreeMap<u64, Vec<String>> {
+        self.exports_by_offset_for(&legacy_names())
+    }
+
+    /// `.dynsym` definitions of `names`, by file offset.
+    fn exports_by_offset_for(&self, names: &[&str]) -> BTreeMap<u64, Vec<String>> {
         let file = std::fs::File::open(&self.path).unwrap();
         let mut by_offset: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-        for (name, offset) in
-            p11scope_manifest::elf::exports_matching(&file, &legacy_names()).unwrap()
-        {
+        for (name, offset) in p11scope_manifest::elf::exports_matching(&file, names).unwrap() {
             by_offset.entry(offset).or_default().push(name);
         }
         for names in by_offset.values_mut() {
@@ -817,6 +902,171 @@ fn forwarded_bootstrap_to_a_wrong_offset_stays_unnamed() {
         .expect("the 3.2 table surface is published");
     assert_eq!(surface.walk, "known_prefix", "{surface:?}");
     assert_count_only(&plan);
+}
+
+/// RED (fix round 1): a full 3.0 provider whose interface-getter slot
+/// forwards to a preloaded same-named export still names every ordinal
+/// (linkage `exports`) and keeps the getter-export grant: the verified
+/// forward agrees with the provider's exports instead of contradicting
+/// them. Amendment 22:45 2026-11-11. Drives the production scan → pin →
+/// bind → plan chain over a real interposed child.
+fn assert_3x_interface_forward_keeps_authority(getter: &str) {
+    let names = full_3x_names();
+    let (loaded, preload) = Loaded::build_3x_interposed(getter, false);
+    let exports = loaded.exports_by_offset_for(&names);
+    assert_eq!(
+        exports.len(),
+        FULL_3X_ORDINALS,
+        "every name is its own stub"
+    );
+    let preload_file = std::fs::File::open(&preload).unwrap();
+    let preload_offsets =
+        p11scope_manifest::elf::exports_matching(&preload_file, &[getter]).unwrap();
+    assert_eq!(
+        preload_offsets.len(),
+        1,
+        "the preload exports exactly the getter"
+    );
+    let (_, preload_offset) = &preload_offsets[0];
+    let (reconciled, _pinned, lost) = loaded.reconciled_with_loss();
+    assert!(lost.is_empty(), "the verified forward binds: {lost:?}");
+    assert_eq!(reconciled.len(), 1);
+    // Bind-time verification proof: the forwarded entry's name/offset
+    // exactly matches the pinned preload's own ELF definition, and
+    // every other entry stays in the provider object.
+    let key = reconciled[0].scanned.key;
+    let entries = &reconciled[0].scanned.tables[0].entries;
+    assert_eq!(entries.len(), FULL_3X_ORDINALS);
+    for entry in entries {
+        if entry.name == getter {
+            assert_ne!(entry.object, key, "the getter slot forwards out");
+            assert_eq!(
+                entry.file_offset, *preload_offset,
+                "the forwarded slot targets the preload's export"
+            );
+        } else {
+            assert_eq!(
+                entry.object, key,
+                "only the getter forwards: {}",
+                entry.name
+            );
+        }
+    }
+    let provider = reconciled[0].object;
+    let plan = build_from_reconciled_modules(&reconciled);
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].version, (3, 0), "{tables:?}");
+    assert_eq!(tables[0].linkage, "exports", "{tables:?}");
+    assert_eq!(plan.slots.len(), FULL_3X_ORDINALS);
+    assert_eq!(plan.standard_layout_slot_count(), 92);
+    assert_eq!(plan.standard_layout_evidence(), ["typed getter export"]);
+    let surface = plan
+        .surfaces
+        .iter()
+        .find(|surface| surface.source.contains("table 3.0"))
+        .expect("the 3.0 table surface is published");
+    assert_eq!(surface.walk, "full", "{surface:?}");
+    assert_eq!(surface.functions, FULL_3X_ORDINALS, "{surface:?}");
+    let (forwarded, local): (Vec<_>, Vec<_>) =
+        plan.slots.iter().partition(|slot| slot.names == [getter]);
+    assert_eq!(forwarded.len(), 1, "one forwarded slot: {:?}", plan.slots);
+    assert_eq!(
+        forwarded[0].semantics,
+        SlotSemantics::COUNT_ONLY,
+        "the exempted getter slot stays count-only"
+    );
+    assert_ne!(
+        forwarded[0].object, provider,
+        "the getter slot targets the preload"
+    );
+    assert_eq!(local.len(), FULL_3X_ORDINALS - 1);
+    for slot in &local {
+        assert_eq!(
+            slot.object, provider,
+            "every mechanism-published slot stays own-object: {slot:?}"
+        );
+        assert!(
+            !slot.aliased,
+            "every mechanism-published slot stays unambiguous: {slot:?}"
+        );
+    }
+}
+
+#[test]
+fn interposed_3x_interface_forward_keeps_authority() {
+    assert_3x_interface_forward_keeps_authority("C_GetInterface");
+}
+
+#[test]
+fn interposed_3x_interface_list_forward_keeps_authority() {
+    assert_3x_interface_forward_keeps_authority("C_GetInterfaceList");
+}
+
+/// The hostile twin: a 3.0 interface-getter slot forwarded to the
+/// preload's *decoy* export — a wrong offset — must not name the
+/// table. Bind refuses the forward and every ordinal stays `unknown`
+/// (linkage `heuristic`): the interface exemption trusts only a
+/// forward the pinned target's own `.dynsym` resolves by name.
+fn assert_3x_interface_misdirected_stays_unnamed(getter: &str) {
+    let (loaded, preload) = Loaded::build_3x_interposed(getter, true);
+    let preload_file = std::fs::File::open(&preload).unwrap();
+    let mut preload_offsets =
+        p11scope_manifest::elf::exports_matching(&preload_file, &[getter, "p11scope_decoy"])
+            .unwrap();
+    preload_offsets.sort();
+    assert_eq!(
+        preload_offsets.len(),
+        2,
+        "the preload exports the getter and the decoy"
+    );
+    let genuine = preload_offsets
+        .iter()
+        .find(|(name, _)| name == getter)
+        .map(|(_, offset)| *offset)
+        .expect("the preload exports the getter");
+    let decoy = preload_offsets
+        .iter()
+        .find(|(name, _)| name == "p11scope_decoy")
+        .map(|(_, offset)| *offset)
+        .expect("the preload exports the decoy");
+    assert_ne!(
+        genuine, decoy,
+        "the decoy must sit at a different offset than the getter"
+    );
+    let (reconciled, _pinned, lost) = loaded.reconciled_with_loss();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(
+        lost.len(),
+        1,
+        "exactly the misdirected getter is refused: {lost:?}"
+    );
+    assert_eq!(lost[0].subject, getter);
+    assert!(
+        lost[0].reason.contains(getter) && lost[0].reason.contains("not attached"),
+        "the refusal names the check and the outcome: {}",
+        lost[0].reason
+    );
+    let plan = build_from_reconciled_modules(&reconciled);
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].version, (3, 0), "{tables:?}");
+    assert_eq!(tables[0].linkage, "heuristic", "{tables:?}");
+    assert_eq!(plan.slots.len(), FULL_3X_ORDINALS - 1);
+    for slot in &plan.slots {
+        assert_eq!(slot.names, ["unknown"], "{slot:?}");
+    }
+    assert_count_only(&plan);
+}
+
+#[test]
+fn misdirected_3x_interface_forward_stays_unnamed() {
+    assert_3x_interface_misdirected_stays_unnamed("C_GetInterface");
+}
+
+#[test]
+fn misdirected_3x_interface_list_forward_stays_unnamed() {
+    assert_3x_interface_misdirected_stays_unnamed("C_GetInterfaceList");
 }
 
 /// A table that contradicts any exported name is refused as a whole: the

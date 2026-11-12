@@ -11,7 +11,8 @@ use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
-    ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique, pin_of,
+    ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique, forwardable_getter,
+    pin_of,
 };
 #[cfg(test)]
 use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
@@ -2385,10 +2386,10 @@ pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ObjectExports<'a> {
     /// The object whose `.dynsym` was read. Only an entry that lands in this
-    /// same object can agree — except an interposed `C_GetFunctionList`
-    /// bootstrap (see [`export_agreement`]), which the linker resolved by
+    /// same object can agree — except a verified interposed getter
+    /// forward (see [`export_agreement`]), which the linker resolved by
     /// name; a forwarded entry is never compared against a dependency's
-    /// symbols it was not read from. The bootstrap exception is checked
+    /// symbols it was not read from. The forward exception is checked
     /// before scoring: bind refuses a forward the target object does not
     /// define at the forwarded offset, so this witness never scores an
     /// unverified forward.
@@ -2442,12 +2443,12 @@ impl<'a> ObjectExports<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExportAgreement {
     /// Ordinals whose target is exactly every definition of their name, in
-    /// the exporting object — plus an interposed `C_GetFunctionList`
-    /// bootstrap (see [`export_agreement`]).
+    /// the exporting object — plus a verified interposed getter forward
+    /// (see [`export_agreement`]).
     pub(crate) agreeing: usize,
     /// Ordinals whose name is defined somewhere other than their target —
-    /// including a target in another object, except an interposed
-    /// `C_GetFunctionList` bootstrap in an otherwise agreeing table.
+    /// including a target in another object, except a verified
+    /// interposed getter forward in an otherwise agreeing table.
     pub(crate) disagreeing: usize,
 }
 
@@ -2461,18 +2462,23 @@ impl ExportAgreement {
 }
 
 /// Compares each retained entry against the module's own export witness.
-/// One cross-object forward is not a contradiction: the `C_GetFunctionList`
-/// bootstrap legitimately interposes in multi-provider processes (every
-/// provider exports it, so the first one loaded wins the relocation by
-/// name). When at least one other entry agrees in-object — proving the
-/// layout is a real function list — the forwarded bootstrap keeps its
-/// ABI-definitional name. A lone forward, or any other forwarded name,
-/// still contradicts: only the bootstrap interposes by construction.
-/// The arm trusts reconciled input: both bind paths refuse a forwarded
-/// bootstrap the pinned target's own `.dynsym` does not define at the
-/// forwarded offset (see `forwarded_bootstrap_verified`), so a forward
-/// reaching this score was resolved by name. A wrong-offset, stale, or
-/// hostile forward never agrees — it arrives as an unpinned contradiction.
+/// A cross-object getter forward is not a contradiction: the typed
+/// getters legitimately interpose in multi-provider processes (every
+/// provider exports `C_GetFunctionList`, and 3.x providers export the
+/// interface getters, so the first one loaded wins the relocation by
+/// name — seen live under p11-kit-proxy). When at least one other entry
+/// agrees in-object — proving the layout is a real function list — the
+/// forwarded getter keeps its ABI-definitional name. A lone forward, or
+/// any other forwarded name, still contradicts: only the getters
+/// interpose by construction. The arm trusts reconciled input: both bind
+/// paths refuse a forwarded getter the pinned target's own `.dynsym`
+/// does not define at the forwarded offset (see
+/// `forwarded_bootstrap_verified`), so a forward reaching this score was
+/// resolved by name. A wrong-offset, stale, or hostile forward never
+/// agrees — it arrives as an unpinned contradiction. Amendment 22:45
+/// 2026-11-11: generalized past the `C_GetFunctionList` bootstrap to the
+/// two 3.x interface getters, coordinated with the standard-layout core
+/// exemption, which admits only forwards verified at bind time.
 pub(crate) fn export_agreement(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
@@ -2492,9 +2498,9 @@ pub(crate) fn export_agreement(
         }
         let same_target =
             entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset);
-        let interposed_bootstrap =
-            entry.name == "C_GetFunctionList" && entry.object != exports.object && layout_proven;
-        if same_target || interposed_bootstrap {
+        let interposed_getter =
+            forwardable_getter(entry.name) && entry.object != exports.object && layout_proven;
+        if same_target || interposed_getter {
             agreement.agreeing += 1;
         } else {
             agreement.disagreeing += 1;

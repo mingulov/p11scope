@@ -14768,6 +14768,201 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reconcile_caller_exec_keeps_the_unchanged_exe() {
+        // No exec: the end-of-capture re-read names the same program, so
+        // the caller is unchanged and carries no transition.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, attach.clone());
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_from_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_reports_the_end_exe_with_both_names() {
+        // The target exec'd mid-capture: the report names the program that
+        // made the calls (the end-of-capture exe) and keeps the attach-time
+        // exe for the plain-words transition.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/bash".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(
+            reconciled.exec_from_exe.as_deref(),
+            Some("/usr/bin/bash")
+        );
+    }
+
+    #[test]
+    fn reconcile_caller_exec_keeps_attach_exe_when_the_end_read_is_unknown() {
+        // The target exited (or hid its link) before the end-of-capture
+        // re-read: the attach-time exe stays — it names the program that
+        // made the calls — and no exec is claimed.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("target exited before its exe link was read"),
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_from_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_upgrades_an_unknown_attach_to_the_end_exe() {
+        // The attach-time read failed but the end read names a program: the
+        // known exe wins, with no exec claimed (nothing proves one).
+        let attach = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("target exe link unreadable"),
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_from_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_keeps_the_attach_reason_when_both_reads_are_unknown() {
+        let attach = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("target exe link unreadable"),
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("target exited before its exe link was read"),
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe, None);
+        assert_eq!(
+            reconciled.exe_unknown_reason,
+            Some("target exe link unreadable")
+        );
+        assert_eq!(reconciled.exec_from_exe, None);
+    }
+
+    #[test]
+    fn pid_profile_text_names_both_programs_after_an_exec() {
+        // After a mid-capture exec the stdout caller line names the
+        // end-of-capture program with the attach-time one beside it, at
+        // every verbosity, without the PID number.
+        let caller = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: Some("/usr/bin/bash".into()),
+        };
+        assert_eq!(
+            caller_text_line(Some(&caller)).as_deref(),
+            Some(
+                "caller: /usr/bin/pkcs11-tool (exec'd from /usr/bin/bash during the capture)"
+            )
+        );
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let line =
+                caller_text_line(Some(&caller)).expect("a known caller renders a line");
+            assert!(
+                line.contains("caller: /usr/bin/pkcs11-tool"),
+                "{verbosity:?} names the end-of-capture program: {line}"
+            );
+            assert!(
+                line.contains("/usr/bin/bash"),
+                "{verbosity:?} names the attach-time program too: {line}"
+            );
+            assert!(
+                !line.contains("pid 4242"),
+                "{verbosity:?} carries no PID number: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_profile_exec_line_escapes_both_exes_controls() {
+        // Both exes are target-controlled: control bytes are rewritten at
+        // this terminal boundary, never printed raw.
+        let caller = CaptureCaller {
+            exe: Some("/tmp/new\x1b[1m".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: Some("/tmp/old\x07".into()),
+        };
+        let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(!line.contains('\x07'), "{line}");
+        assert!(line.contains("/tmp/new"), "{line}");
+        assert!(line.contains("/tmp/old"), "{line}");
+    }
+
+    #[test]
+    fn pid_capture_json_carries_the_end_exe_without_new_keys_after_an_exec() {
+        // After a mid-capture exec the JSON caller names the end-of-capture
+        // exe through the existing allowlisted fields only: no new key
+        // carries the transition (text lines name both programs).
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/bash".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let capture = CaptureMeta {
+            caller: Some(reconcile_caller_exec(&attach, end)),
+            ..capture_fixture()
+        };
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            assert_eq!(caller["exe"], "/usr/bin/pkcs11-tool", "{caller}");
+            assert!(caller["exe_unknown_reason"].is_null(), "{caller}");
+            assert_eq!(
+                caller.as_object().map(|map| map.len()),
+                Some(2),
+                "the JSON caller keeps exactly its two allowlisted keys: {caller}"
+            );
+        }
+    }
+
+    #[test]
     fn profile_and_metrics_pid_capture_without_caller_omit_the_key() {
         // A pid scope that resolved nothing emits no caller key —
         // absent, never null — in both lanes.

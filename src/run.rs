@@ -26510,6 +26510,30 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn target_exec_line_names_pid_and_both_exes() {
+        // The end-of-capture stderr note after a mid-capture exec: the
+        // operator's own target pid beside the program that made the calls,
+        // with the attach-time program beside it.
+        let line = target_exec_line(4242, "/usr/bin/bash", "/usr/bin/pkcs11-tool");
+        assert_eq!(
+            line,
+            "p11scope: target: pid 4242 exe /usr/bin/pkcs11-tool \
+             (exec'd from /usr/bin/bash during the capture)"
+        );
+    }
+
+    #[test]
+    fn target_exec_line_escapes_both_exes_controls() {
+        // Both exes are target-controlled: control bytes are rewritten at
+        // this terminal boundary, never printed raw.
+        let line = target_exec_line(4242, "/tmp/old\x07", "/tmp/new\x1b[1m");
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(!line.contains('\x07'), "{line}");
+        assert!(line.contains("pid 4242 exe /tmp/new"), "{line}");
+        assert!(line.contains("/tmp/old"), "{line}");
+    }
+
+    #[test]
     fn resolve_pid_caller_with_names_all_outcomes() {
         // Named: the link text wins without consulting the exit proof.
         let named = resolve_pid_caller_with(

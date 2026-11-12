@@ -372,11 +372,15 @@ physical-identity and non-leader-exec qualifications under
 
 ### Pid-scope caller name after exec
 
-`profile --pid` and `metrics --pid` name the target executable read
-when probes attach; if the target execs another program during the
-capture, `capture.caller` and the stderr `target:` line keep the
-attach-time name while the new program's calls still count. Reporting
-the end-of-capture executable is planned for a later release.
+Since v0.8.0, when a `profile --pid` or `metrics --pid` target execs
+another program during the capture, the report names the
+end-of-capture executable — the program that made the calls — while
+the stderr `target:` end note and the stdout `caller:` line name both
+programs plainly. Residual limits: the JSON `capture.caller` carries
+the end-of-capture exe through its existing keys only, so a JSON-only
+reader sees no exec marker; calls made before the exec are attributed
+to the end-of-capture program; and a re-exec of the same path is
+invisible (the name is unchanged).
 
 ### Key-tracking rate ceiling
 

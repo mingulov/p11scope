@@ -422,6 +422,9 @@ could not be read — names the caller program on profile stdout after
 the header (`caller: <path>`, or `caller unknown: <reason>`), and
 carries the same identity in `capture.caller`
 of the JSON report (`{exe, exe_unknown_reason}`, exactly one set).
+When the target execs mid-capture, the report names the end-of-capture
+executable, and a stderr end note plus the stdout `caller:` line name
+both programs (`(exec'd from <attach-exe> during the capture)`).
 The report carries no PID number; the pid is an operator diagnostic
 only. Cgroup and system scopes name no single caller.
 

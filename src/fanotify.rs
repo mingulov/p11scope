@@ -1135,6 +1135,21 @@ fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
 /// own mount entry marks — so the bind needs no separate filesystem
 /// of its own.
 fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
+    open_file_for_mark_impl(point, || {})
+}
+
+/// Test seam: `pre_reopen` runs after the `O_PATH` type check and before
+/// the read-only reopen, so the ancestor-swap twin can prove the final
+/// handle never re-resolves the pathname. Production passes a no-op.
+#[cfg(test)]
+fn open_file_for_mark_with_pre_reopen(
+    point: &std::path::Path,
+    pre_reopen: impl FnOnce(),
+) -> Option<OwnedFd> {
+    open_file_for_mark_impl(point, pre_reopen)
+}
+
+fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -> Option<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
     // SAFETY: libc call; the NUL-terminated path is valid.
@@ -1157,6 +1172,7 @@ fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return None;
     }
+    pre_reopen();
     // SAFETY: libc call; the NUL-terminated path is valid.
     let raw = unsafe {
         libc::open(
@@ -2414,6 +2430,54 @@ mod tests {
         assert!(
             super::open_file_for_mark(&file).is_some(),
             "a regular-file bind still marks"
+        );
+    }
+
+    /// The type-checked descriptor itself is the open path: an ancestor
+    /// replaced between the probe and the reopen — here renamed away
+    /// and swapped for a symlink to `/dev`, so the pathname now spells
+    /// `/dev/null` — must not redirect the handle. The reopen binds to
+    /// the probed regular file (still returned, same identity): a
+    /// pathname re-resolution would open the device instead, and its
+    /// driver side effects would happen before any final fstat refuses it.
+    #[test]
+    fn learn_file_mark_fd_survives_ancestor_swap_to_device() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("real");
+        std::fs::create_dir(&ancestor).unwrap();
+        // Named so the swapped pathname spells a live device: a
+        // pathname re-resolution opens the device here.
+        let file = ancestor.join("null");
+        std::fs::write(&file, "still the probed file").unwrap();
+        let expected = std::fs::metadata(&file).unwrap();
+        let moved = dir.path().join("real.moved");
+        let held = super::open_file_for_mark_with_pre_reopen(&file, || {
+            std::fs::rename(&ancestor, &moved).unwrap();
+            std::os::unix::fs::symlink("/dev", &ancestor).unwrap();
+        })
+        .expect("the probed file reopens through its own descriptor, not the swapped pathname");
+        assert!(
+            std::fs::metadata(&file)
+                .is_ok_and(|meta| meta.file_type().is_char_device()),
+            "the fixture swapped the pathname onto a live device"
+        );
+        // SAFETY: fstat on our own held descriptor into a zeroed stat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(held.as_raw_fd(), &mut stat) },
+            0,
+            "fstat reads the held descriptor"
+        );
+        assert_eq!(
+            (stat.st_dev, stat.st_ino),
+            (expected.dev(), expected.ino()),
+            "the handle is the probed file, not the swapped-in device"
+        );
+        assert_eq!(
+            stat.st_mode & libc::S_IFMT,
+            libc::S_IFREG,
+            "the handle stayed a regular file across the swap"
         );
     }
 

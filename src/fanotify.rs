@@ -1132,21 +1132,27 @@ fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
 /// Opens a file bind mount for a filesystem mark. The type is probed
 /// first through an `O_PATH | O_NOFOLLOW | O_CLOEXEC` fd, which never
 /// opens the object itself (no device side effects, no automount
-/// trigger — open(2)): only a regular file is then opened read-only.
-/// A device bind (`/dev/watchdog`, a tty), fifo, socket or symlink is
-/// never opened `O_RDONLY` — opening a watchdog arms it, opening a
-/// tty without `O_NOCTTY` can take a controlling terminal — and is
-/// skipped instead (the uncovered count files the named gap, never
-/// silent coverage). The read-only handle carries `O_NONBLOCK` (a
-/// file swapped for a fifo between the probe and the open still
-/// cannot hang the pass), `O_NOCTTY` and `O_NOFOLLOW`, never `O_PATH`
-/// (the kernel rejects `FAN_MARK_FILESYSTEM` through an `O_PATH` fd
-/// with `EBADF`) and never `O_DIRECTORY` (a file bind refuses it
-/// with `ENOTDIR`). The final fd is re-statted so a file swapped
-/// for a device between the probe and the open is still refused.
-/// The mark covers the file's filesystem — the same superblock its
-/// own mount entry marks — so the bind needs no separate filesystem
-/// of its own.
+/// trigger — open(2)): only a regular file proceeds. A device bind
+/// (`/dev/watchdog`, a tty), fifo, socket or symlink is never opened
+/// `O_RDONLY` — opening a watchdog arms it, opening a tty without
+/// `O_NOCTTY` can take a controlling terminal — and is skipped
+/// instead (the uncovered count files the named gap, never silent
+/// coverage). The read-only handle reopens the type-checked probe
+/// through its own `/proc/self/fd/N` link and never re-resolves the
+/// pathname, so an ancestor swapped for a device between the probe
+/// and the open cannot redirect it: a device is never opened, not
+/// merely refused afterwards. The handle carries `O_NONBLOCK` and
+/// `O_NOCTTY`, never `O_PATH` (the kernel rejects
+/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF`) and
+/// never `O_DIRECTORY` (a file bind refuses it with `ENOTDIR`); it
+/// carries no `O_NOFOLLOW` because the fd link resolves to the held
+/// object itself (`O_NOFOLLOW` would refuse that link with `ELOOP`) —
+/// symlink refusal lives at the probe, which stats a symlink as
+/// `S_IFLNK`. The final fd is re-statted and identity-checked
+/// against the probe, so it is provably the same regular file. The
+/// mark covers the file's filesystem — the same superblock its own
+/// mount entry marks — so the bind needs no separate filesystem of
+/// its own.
 fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     open_file_for_mark_impl(point, || {})
 }
@@ -1185,12 +1191,24 @@ fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return None;
     }
+    let (probed_dev, probed_ino) = (stat.st_dev, stat.st_ino);
     pre_reopen();
-    // SAFETY: libc call; the NUL-terminated path is valid.
+    // The type-checked descriptor itself is the open path: the
+    // read-only handle reopens the held probe through its own
+    // `/proc/self/fd/N` link, following the repo's held-FD practice,
+    // and never re-resolves the original pathname — an ancestor
+    // replaced in between cannot redirect it onto a device. No
+    // `O_NOFOLLOW` here: the fd link is traversed by the kernel to
+    // the held object itself, and `O_NOFOLLOW` would refuse it with
+    // `ELOOP` (probed, not just read from the man page).
+    let fd_path =
+        std::ffi::CString::new(format!("/proc/self/fd/{}", probe.as_raw_fd())).ok()?;
+    // SAFETY: libc call; the NUL-terminated fd link is valid, and the
+    // probe is alive for this whole call so the link cannot dangle.
     let raw = unsafe {
         libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            fd_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
         )
     };
     if raw < 0 {
@@ -1202,6 +1220,7 @@ fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -
     let mut final_stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(held.as_raw_fd(), &mut final_stat) } != 0
         || final_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || (final_stat.st_dev, final_stat.st_ino) != (probed_dev, probed_ino)
     {
         return None;
     }
@@ -2377,8 +2396,12 @@ mod tests {
     /// marking as a real `O_RDONLY` file handle: never `O_PATH` (its
     /// marks fail `EBADF`), never `O_DIRECTORY` (files refuse it),
     /// `O_NONBLOCK` so a fifo bind cannot hang the pass, and
-    /// `O_NOFOLLOW | O_CLOEXEC` like the directory handle. A
-    /// trailing symlink still refuses.
+    /// `O_CLOEXEC` like the directory handle. The handle reopens the
+    /// type-checked probe through its own `/proc/self/fd/N` link, so it
+    /// carries no `O_NOFOLLOW` (the kernel refuses that flag on the fd
+    /// link with `ELOOP`) and is bound to the probed identity instead;
+    /// symlink refusal lives at the `O_PATH` probe. A trailing symlink
+    /// still refuses.
     #[test]
     fn learn_file_mark_fd_opens_non_directories_for_marking() {
         let dir = tempfile::tempdir().unwrap();
@@ -2407,10 +2430,23 @@ mod tests {
             flags & libc::O_NONBLOCK != 0,
             "the file mark fd never blocks on a fifo: {flags}"
         );
-        assert!(
-            flags & libc::O_NOFOLLOW != 0,
-            "the file mark fd never follows a trailing symlink: {flags}"
-        );
+        // No O_NOFOLLOW on the final handle: it reopens the probed
+        // object through its own /proc/self/fd/N link, which leaves no
+        // pathname traversal to refuse (and the kernel refuses the flag
+        // on that link with ELOOP). The binding is by identity instead:
+        // the held fd stats back to the probed file.
+        let mut bound: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat on our own live fd.
+        assert_eq!(unsafe { libc::fstat(held.as_raw_fd(), &mut bound) }, 0);
+        let source = std::fs::metadata(&file).unwrap();
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                (bound.st_dev, bound.st_ino),
+                (source.dev(), source.ino()),
+                "the file mark fd is the probed object itself"
+            );
+        }
         // SAFETY: fcntl on our own live fd.
         let fd_flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFD) };
         assert!(

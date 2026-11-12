@@ -2892,11 +2892,14 @@ mod tests {
             }
         }
         let candidate = got.expect("the drain reports the held provider");
+        // /bin/sh is dash on Debian but bash on Fedora: either names the shell holder.
         assert!(
             candidate
                 .loader_exe
                 .as_deref()
-                .is_some_and(|exe| exe.ends_with("/sh") || exe.ends_with("/dash")),
+                .is_some_and(|exe| exe.ends_with("/sh")
+                    || exe.ends_with("/dash")
+                    || exe.ends_with("/bash")),
             "the still-live holder is named: {:?} / {:?}",
             candidate.loader_exe,
             candidate.loader_unknown_reason

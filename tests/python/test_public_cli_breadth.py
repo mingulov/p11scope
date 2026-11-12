@@ -41,7 +41,9 @@ VERDICT_COUNTERS = (
     "module_unresolved_slots", "unprotected_live_windows", "pause_partial", "pause_unavailable",
     "unpublished_mechanisms", "vendor_interfaces")
 PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
-                  "pid_descendant_gaps", "multi_rebuild_gaps")
+                  "pid_descendant_gaps", "multi_rebuild_gaps",
+                  "learned_staged_files", "learned_event_loss",
+                  "learned_cap_skipped")
 
 
 def provider_pin():
@@ -98,7 +100,9 @@ def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
         attach_mechanisms=["per-offset"],
         attach_backend={"selection": "singles", "fallback": None,
                         "scope_filter": None if scope in ("system", "cgroup") else "perf-task+bpf"},
-        pid_descendant_gaps=0, multi_rebuild_gaps=0)
+        pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        learned_staged_files=0, learned_event_loss=0,
+        learned_cap_skipped=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
         report["lane"] = report["capture"]["mode"] = "metrics"
@@ -231,7 +235,9 @@ def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
         attach_mechanisms=["per-offset"],
         attach_backend={"selection": "singles", "fallback": None,
                         "scope_filter": None if scope == "system" else "perf-task+bpf"},
-        pid_descendant_gaps=0, multi_rebuild_gaps=0)
+        pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        learned_staged_files=0, learned_event_loss=0,
+        learned_cap_skipped=0)
     if metrics:
         report["schema"] = "p11scope/observed-profile/v3-metrics"
         report["lane"] = report["capture"]["mode"] = "metrics"

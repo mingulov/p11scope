@@ -4,8 +4,8 @@
 if [ "$1" = doctor ]; then
     pid=; previous=
     for argument do [ "$previous" = --pid ] && pid=$argument; previous=$argument; done
-    echo "/proc/$pid/maps ...................... FAIL EACCES — module discovery unavailable for this target"
-    echo "/proc/$pid/mem ....................... FAIL EACCES — memory scan unavailable for this target"
+    echo "/proc/$pid/maps ...................... FAIL EACCES - module discovery unavailable for this target"
+    echo "/proc/$pid/mem ....................... FAIL EACCES - memory scan unavailable for this target"
     exit 1
 fi
 if [ "$1" = profile ]; then

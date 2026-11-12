@@ -1179,6 +1179,19 @@ pub struct AttachPlan {
     // ("interface linkage", "sole complete table", ...), for the one
     // plain coverage note. Static labels only, never provider data.
     standard_layout_evidence: BTreeSet<&'static str>,
+    // Slots this lowering re-proved except for scan finished-ness: the
+    // table passes the clause-1 core and every other sole-complete or
+    // getter-export conjunct, but `tables_scan_finished` is false (a
+    // metadata-only loader scan restores retained tables onto a fresh
+    // shell it never observed). Carry permission only, consulted solely
+    // by `extend_exact_prepared` against the old plan's verified basis
+    // for the same exact target — never a grant, so a fresh plan built
+    // from an unfinished scan stays count-only. Empty for finished
+    // lowerings; remapped with `standard_layout_slots` on every
+    // position change, and never carried across a merge except from the
+    // fresh rebuilt lowering (a permission always reflects the newest
+    // evidence, never superseded history).
+    reproven_unfinished_slots: BTreeSet<u32>,
     // Plan fence for the conservative rebuild cursor: every `&mut self`
     // method bumps `mutations` first, and `token` is minted fresh per plan
     // value (`Clone` mints, so whole-plan replacement changes the token).
@@ -1479,6 +1492,10 @@ impl AttachPlan {
             .iter()
             .map(|slot| self.standard_layout_slots.contains(&slot.index))
             .collect();
+        let old_reproven: Vec<bool> = slots
+            .iter()
+            .map(|slot| self.reproven_unfinished_slots.contains(&slot.index))
+            .collect();
         for (index, slot) in slots.iter_mut().enumerate() {
             slot.index = index as u32;
             if degraded.contains(&AttachKey::of(slot)) {
@@ -1514,6 +1531,15 @@ impl AttachPlan {
             .iter()
             .enumerate()
             .filter(|(index, slot)| old_standard[*index] && slot.semantic_authorized)
+            .map(|(index, _)| index as u32)
+            .collect();
+        subset.reproven_unfinished_slots = subset
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| {
+                old_reproven[*index] && !degraded.contains(&AttachKey::of(slot))
+            })
             .map(|(index, _)| index as u32)
             .collect();
         subset.standard_layout_evidence = self.standard_layout_evidence.clone();
@@ -1586,6 +1612,7 @@ impl AttachPlan {
             first_plan_had_provider: false,
             standard_layout_slots: BTreeSet::new(),
             standard_layout_evidence: BTreeSet::new(),
+            reproven_unfinished_slots: BTreeSet::new(),
             mutations: MutationCount::default(),
             token: PlanToken::default(),
         })
@@ -2396,6 +2423,9 @@ impl AttachPlan {
             replace: vec![],
             retire: vec![],
         };
+        // Exact targets whose verified basis carried across an unfinished
+        // re-proof instead of replacing (see the carry branch below).
+        let mut carried_keys = BTreeSet::new();
 
         for (key, position) in &self.slot_by_key {
             if rebuilt.slot_by_key.contains_key(key) {
@@ -2432,7 +2462,7 @@ impl AttachPlan {
                     updated.semantic_ambiguous = true;
                 }
                 if aggregate_owners[position] == AggregateOwner::Ambiguous {
-                    updated.names.extend(old.names);
+                    updated.names.extend(old.names.iter().cloned());
                     updated.names.sort();
                     updated.names.dedup();
                     drop_transparent_unknown(&mut updated.names);
@@ -2460,7 +2490,35 @@ impl AttachPlan {
                                 old.index, old.descriptor_index, updated.descriptor_index
                             ));
                         }
-                        delta.replace.push(updated.clone());
+                        // Carry across an unfinished re-proof: the same
+                        // verified table (same exact target, owners
+                        // agreeing, rebuilt names reproduced verbatim,
+                        // rebuilt slot unshared) re-proved its layout
+                        // except for scan finished-ness — typically
+                        // restored tables on a metadata-only loader scan.
+                        // The names compared are the rebuilt slot's own,
+                        // before the merge restores old names over an
+                        // `unknown`: a rename the new evidence cannot
+                        // authorize must not inherit old descriptors. The
+                        // old descriptors stay; anything else (forged
+                        // entries, static rivals, renames, ambiguity,
+                        // first sight) still replaces into count-only
+                        // below.
+                        let carry_verified = self.standard_layout_slots.contains(&old.index)
+                            && rebuilt.reproven_unfinished_slots.contains(&slot.index)
+                            && aggregate_owners[position] != AggregateOwner::Ambiguous
+                            && slot.names == old.names
+                            && slot.module_ids.len() < 2;
+                        if carry_verified {
+                            updated.descriptor_index = old.descriptor_index;
+                            updated.semantics = old.semantics;
+                            updated.semantic_authorized = old.semantic_authorized;
+                            updated.semantic_ambiguous |= old.semantic_ambiguous;
+                            updated.aliased |= old.aliased;
+                            carried_keys.insert(key);
+                        } else {
+                            delta.replace.push(updated.clone());
+                        }
                     }
                 }
                 slots[position] = updated;
@@ -2506,20 +2564,46 @@ impl AttachPlan {
         self.slots = slots;
         // Standard-layout basis follows the exact target across the
         // remap: rebuilt keys take the rebuilt basis, retired keys keep
-        // the basis their historical cells were recorded under.
+        // the basis their historical cells were recorded under, and
+        // carried keys keep the verified basis the carry branch preserved
+        // their descriptors under.
         let merged_standard: BTreeSet<u32> = self
             .slots
             .iter()
             .filter(|slot| {
                 let key = AttachKey::of(slot);
                 match rebuilt.slot_by_key.get(&key) {
-                    Some(position) => rebuilt.standard_layout_slots.contains(&(*position as u32)),
+                    Some(position) => {
+                        rebuilt.standard_layout_slots.contains(&(*position as u32))
+                            || (carried_keys.contains(&key)
+                                && self.standard_layout_slots.contains(&slot.index))
+                    }
                     None => self.standard_layout_slots.contains(&slot.index),
                 }
             })
             .map(|slot| slot.index)
             .collect();
         self.standard_layout_slots = merged_standard;
+        // Re-proof permission reflects the freshest lowering only: rebuilt
+        // keys take the rebuilt permission, and superseded history —
+        // including permissions this merge already consumed by carrying —
+        // lapses rather than lingering.
+        let merged_reproven: BTreeSet<u32> = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                rebuilt
+                    .slot_by_key
+                    .get(&AttachKey::of(slot))
+                    .is_some_and(|position| {
+                        rebuilt
+                            .reproven_unfinished_slots
+                            .contains(&(*position as u32))
+                    })
+            })
+            .map(|slot| slot.index)
+            .collect();
+        self.reproven_unfinished_slots = merged_reproven;
         self.standard_layout_evidence
             .extend(rebuilt.standard_layout_evidence.iter().copied());
         // Capture-lifetime disclosure: ordinals and identities only grow.
@@ -2731,6 +2815,8 @@ impl AttachPlan {
         self.aggregate_owners.truncate(accepted);
         self.standard_layout_slots
             .retain(|position| (*position as usize) < accepted);
+        self.reproven_unfinished_slots
+            .retain(|position| (*position as usize) < accepted);
         self.retired_slots.retain(|position| *position < accepted);
         self.retired_keys.retain(|_, position| *position < accepted);
         self.revivable.retain(|_, position| *position < accepted);
@@ -2810,6 +2896,17 @@ impl AttachPlan {
             .collect();
         self.standard_layout_slots = self
             .standard_layout_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new
+                    .get(*position as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new)
+            })
+            .collect();
+        self.reproven_unfinished_slots = self
+            .reproven_unfinished_slots
             .iter()
             .filter_map(|position| {
                 let new = old_to_new
@@ -3128,6 +3225,10 @@ struct Target<'a> {
     /// standard-layout scan evidence only (no manifest behind it);
     /// `None` for manifest/confirmed or unauthorized targets.
     standard_layout_evidence: Option<&'static str>,
+    /// This target's table re-proves the standard layout except for scan
+    /// finished-ness (see `reproven_unfinished_slots`): only ever true
+    /// for denied scan targets, never for manifest targets or grants.
+    reproven_unfinished: bool,
     /// Whether `name` may be presented as a PKCS#11 name: manifest targets are
     /// operator-authoritative, scan targets need linkage-or-manifest
     /// authorization for their table.
@@ -3235,6 +3336,10 @@ struct Building {
     module_ids: Vec<ModuleId>,
     standard_layout_evidence: Option<&'static str>,
     confirmed_authority: bool,
+    /// Re-proof across every contributing scan table (`None` until the
+    /// first one): a slot carries only when each table claiming it
+    /// re-proves, so one genuinely denied table vetoes the whole slot.
+    reproven_unfinished: Option<bool>,
 }
 
 /// Occurrence-deduped decoded counts for one merge group: a manifest
@@ -4682,6 +4787,7 @@ fn merge(
                             module_ids: Vec::new(),
                             standard_layout_evidence: None,
                             confirmed_authority: false,
+                            reproven_unfinished: None,
                         });
                         building.len() - 1
                     });
@@ -4705,6 +4811,11 @@ fn merge(
                 }
                 if slot.standard_layout_evidence.is_none() {
                     slot.standard_layout_evidence = target.standard_layout_evidence;
+                }
+                if target.table.is_some() {
+                    slot.reproven_unfinished = Some(
+                        slot.reproven_unfinished.unwrap_or(true) && target.reproven_unfinished,
+                    );
                 }
                 if let Some(ordinal) = target.ordinal {
                     slot_ordinals
@@ -4810,6 +4921,7 @@ fn merge(
 
     let mut standard_layout_slots = BTreeSet::new();
     let mut standard_layout_evidence = BTreeSet::new();
+    let mut reproven_unfinished_slots = BTreeSet::new();
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
@@ -4836,6 +4948,12 @@ fn merge(
             {
                 standard_layout_slots.insert(index as u32);
                 standard_layout_evidence.insert(evidence);
+            }
+            // Carry permission, never a grant: every claiming scan table
+            // re-proved the layout except for finished-ness, and the slot
+            // is otherwise unremarkable (unshared, unconfirmed).
+            if !shared && !slot.confirmed_authority && slot.reproven_unfinished == Some(true) {
+                reproven_unfinished_slots.insert(index as u32);
             }
             Slot {
                 index: index as u32,
@@ -4881,6 +4999,7 @@ fn merge(
     plan.first_plan_had_provider = first_plan_had_provider;
     plan.standard_layout_slots = standard_layout_slots;
     plan.standard_layout_evidence = standard_layout_evidence;
+    plan.reproven_unfinished_slots = reproven_unfinished_slots;
     plan
 }
 
@@ -5594,6 +5713,7 @@ fn getter_export_authorized(
     index: usize,
     exports: &ObjectExports<'_>,
     score: &TableEvidenceScore,
+    scan_finished: bool,
 ) -> bool {
     let scanned = &module.scanned;
     // Live tables are runtime observations, never scan rivals: the leg
@@ -5608,7 +5728,7 @@ fn getter_export_authorized(
     let Some((position, _)) = static_tables.next() else {
         return false;
     };
-    if static_tables.next().is_some() || index != position || !scanned.tables_scan_finished {
+    if static_tables.next().is_some() || index != position || !scan_finished {
         return false;
     }
     if scanned
@@ -5675,6 +5795,7 @@ fn sole_complete_table_authorized(
     module: &ReconciledModule,
     index: usize,
     exports: &ObjectExports<'_>,
+    scan_finished: bool,
 ) -> bool {
     let scanned = &module.scanned;
     // Live tables are runtime observations, never scan rivals: the leg
@@ -5692,7 +5813,7 @@ fn sole_complete_table_authorized(
     if static_tables.next().is_some() || index != position {
         return false;
     }
-    if !scanned.tables_scan_finished {
+    if !scan_finished {
         return false;
     }
     if scanned
@@ -5841,14 +5962,21 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // checks. The getter-export leg generalizes the sole leg
         // past 68 slots under the same ambient guards (see
         // `getter_export_authorized`).
+        // The static legs read finished-ness from the parameter so the
+        // re-proof below can reuse what they would grant on a finished
+        // scan; the grant itself additionally requires the real flag, so
+        // an unfinished scan grants nothing here.
+        let scan_finished = scanned.tables_scan_finished;
+        let sole_proven = sole_complete_table_authorized(module, index, &exports, true);
+        let getter_proven = getter_export_authorized(module, index, &exports, &score, true);
         let standard_layout_evidence =
             if !authorized || score.manifest || !standard_layout_core(module, index) {
                 None
             } else if score.linked {
                 Some("interface linkage")
-            } else if sole_complete_table_authorized(module, index, &exports) {
+            } else if scan_finished && sole_proven {
                 Some("sole complete table")
-            } else if getter_export_authorized(module, index, &exports, &score) {
+            } else if scan_finished && getter_proven {
                 Some("typed getter export")
             } else if score.live_return && (scan_authorized || score.exports) {
                 // The subset takes any core-passing return (heap-first
@@ -5863,6 +5991,13 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
             } else {
                 None
             };
+        // Re-proof, not a grant: no leg granted, the scan is unfinished,
+        // and a static leg would grant this same table on a finished
+        // scan. `extend_exact_prepared` may carry a verified basis across
+        // exactly this transient; forged, rivaled or otherwise unproven
+        // tables fail the assumed-finished legs and stay refused.
+        let reproven_unfinished =
+            standard_layout_evidence.is_none() && !scan_finished && (sole_proven || getter_proven);
         let scan_semantic = authorized && (score.manifest || standard_layout_evidence.is_some());
         tables.push(TableSummary {
             version: table.version,
@@ -5910,6 +6045,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
                 fork_safe,
                 semantic_authorized: scan_semantic,
                 standard_layout_evidence,
+                reproven_unfinished,
                 name_authorized: authorized,
                 table: Some(index),
                 ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {
@@ -6117,6 +6253,7 @@ fn lower_manifest(
                         fork_safe,
                         semantic_authorized: true,
                         standard_layout_evidence: None,
+                        reproven_unfinished: false,
                         name_authorized: true,
                     });
                 }
@@ -6234,6 +6371,7 @@ fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
             fork_safe: false,
             semantic_authorized: false,
             standard_layout_evidence: None,
+            reproven_unfinished: false,
             name_authorized: true,
             table: None,
             ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
@@ -9040,6 +9178,192 @@ mod tests {
             plan.slots.iter().all(|slot| slot.descriptor_index != 0),
             "attached descriptors survive the agreeing sibling"
         );
+    }
+
+    #[test]
+    fn unfinished_rescan_of_verified_table_keeps_semantics_without_replace() {
+        // Desktop-Firefox churn (v070-ff-churn, observed live): a
+        // metadata-only loader scan restores the retained tables onto a
+        // fresh module shell with `tables_scan_finished=false`, and the
+        // complete-scan replacement rebuilds the plan from the same
+        // verified table. The fresh lowering must still deny it (no
+        // finished proof), but the merge carries the verified basis
+        // across instead of replacing all 68 slots into count-only
+        // (which detaches static probes and reattaches exact pairs).
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut rescanned = sole_complete_module();
+        rescanned.scanned.tables_scan_finished = false;
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&rescanned),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            rebuilt.slots.iter().all(|slot| !slot.semantic_authorized),
+            "the unfinished lowering grants nothing fresh"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.retire.is_empty());
+        assert!(
+            delta.replace.is_empty(),
+            "the same verified table keeps its basis across the unfinished rescan"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index != 0),
+            "attached descriptors survive the unfinished rescan"
+        );
+        assert_eq!(
+            plan.standard_layout_slot_count(),
+            68,
+            "the carried slots keep their standard-layout basis"
+        );
+        // The next finished scan re-grants in place: still no replace.
+        let finished = sole_complete_module();
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&finished),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            delta.new.is_empty() && delta.retire.is_empty() && delta.replace.is_empty(),
+            "the confirming finished scan changes nothing"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index != 0),
+            "attached descriptors survive the confirming scan"
+        );
+    }
+
+    #[test]
+    fn unfinished_rescan_with_forged_entry_still_replaces() {
+        // Failure twin: the unfinished rescan re-proves nothing when the
+        // table itself changed — a foreign entry object refuses the whole
+        // table, and the merge must still replace into count-only.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut forged = sole_complete_module();
+        forged.scanned.tables_scan_finished = false;
+        let position = forged.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        forged.scanned.tables[0].entries[position].object = ObjectKey {
+            inode: 43,
+            ..TEST_OBJECT
+        };
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&forged), &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            !delta.replace.is_empty(),
+            "a forged table must still downgrade attached semantic slots"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index == 0),
+            "forged tables leave count-only descriptors behind"
+        );
+    }
+
+    #[test]
+    fn unfinished_rescan_with_second_static_table_still_replaces() {
+        // Failure twin: an unfinished scan surfacing a second static table
+        // is genuine rivalry, not a re-proof — the replace stands.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut rival = sole_complete_module();
+        rival.scanned.tables_scan_finished = false;
+        let mut sibling = rival.scanned.tables[0].clone();
+        sibling.address = 0x7f00_0000;
+        rival.scanned.tables.push(sibling);
+        rival
+            .entry_objects
+            .push(vec![rival.object; rival.scanned.tables[0].entries.len()]);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&rival), &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            !delta.replace.is_empty(),
+            "a static rival must still downgrade attached semantic slots"
+        );
+    }
+
+    #[test]
+    fn unfinished_rescan_with_renamed_slot_still_replaces() {
+        // Failure twin pinning the names gate: the layout re-proves
+        // (the renamed entry is not a required one, so the
+        // assumed-finished sole leg still holds), but the rename breaks
+        // table-wide exports agreement, so no rebuilt name reproduces
+        // its verified name — the old descriptors must not carry onto
+        // slots the new evidence cannot name.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut renamed = sole_complete_module();
+        renamed.scanned.tables_scan_finished = false;
+        let position = renamed.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_Initialize")
+            .expect("C_Initialize entry");
+        renamed.scanned.tables[0].entries[position].name = "C_Login";
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&renamed), &[], &PinnedObjects::empty());
+        assert_eq!(
+            rebuilt.reproven_unfinished_slots.len(),
+            68,
+            "the layout re-proves despite the rename"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            delta.replace.len(),
+            68,
+            "unnamed slots must not inherit verified descriptors"
+        );
+    }
+
+    #[test]
+    fn unfinished_first_scan_grants_nothing() {
+        // Unknown tables never carry: without a verified basis the
+        // unfinished lowering stays count-only on first sight.
+        let mut unfinished = sole_complete_module();
+        unfinished.scanned.tables_scan_finished = false;
+        let plan = build_from_sources(
+            std::slice::from_ref(&unfinished),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_plan_count_only(&plan, "unfinished first scan");
     }
 
     #[test]
@@ -12143,6 +12467,7 @@ mod tests {
                 fork_safe: false,
                 semantic_authorized: true,
                 standard_layout_evidence: None,
+                reproven_unfinished: false,
                 name_authorized: true,
                 table: None,
                 ordinal: None,

@@ -14959,7 +14959,9 @@ pub(crate) mod tests {
         // After a mid-capture exec the stdout caller line names the
         // attach-time program with the end-of-capture one beside it, at
         // every verbosity, without the PID number — matching the JSON
-        // caller, which keeps the attach-time exe.
+        // caller, which keeps the attach-time exe. The per-verbosity
+        // check runs through the real frame builder, not the pure
+        // line function, so the loop proves the insertion path.
         let caller = CaptureCaller {
             exe: Some("/usr/bin/bash".into()),
             exe_unknown_reason: None,
@@ -14969,22 +14971,36 @@ pub(crate) mod tests {
             caller_text_line(Some(&caller)).as_deref(),
             Some("caller: /usr/bin/bash (exec'd to /usr/bin/pkcs11-tool during the capture)")
         );
+        let mut ev = evidence();
+        ev.verdict();
         for verbosity in [
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
         ] {
-            let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
-            assert!(
-                line.contains("caller: /usr/bin/bash"),
-                "{verbosity:?} names the attach-time program: {line}"
+            let out = live_scoped_with_caller(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &BTreeMap::new(),
+                Some(&caller),
+                verbosity,
+                &crate::semantics::SessionStats::default(),
+                &BTreeMap::new(),
             );
             assert!(
-                line.contains("/usr/bin/pkcs11-tool"),
-                "{verbosity:?} names the end-of-capture program too: {line}"
+                out.contains(
+                    "caller: /usr/bin/bash (exec'd to /usr/bin/pkcs11-tool during the capture)"
+                ),
+                "{verbosity:?} names both programs: {out}"
             );
             assert!(
-                !line.contains("pid 4242"),
-                "{verbosity:?} carries no PID number: {line}"
+                !out.contains("pid 4242"),
+                "{verbosity:?} carries no PID number: {out}"
             );
         }
     }

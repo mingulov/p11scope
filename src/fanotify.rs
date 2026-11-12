@@ -2647,12 +2647,44 @@ mod tests {
         assert_eq!(quick, Some(7), "quick work returns its value");
     }
 
+    // libc 0.2.189 exposes `pthread_getattr_np` but not
+    // `pthread_attr_getdetachstate` on Linux, so the detach-state probe
+    // declares that one accessor here, test-only.
+    unsafe extern "C" {
+        fn pthread_attr_getdetachstate(
+            attr: *const libc::pthread_attr_t,
+            detachstate: *mut libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    /// Reports the detach state of a live native thread without changing
+    /// it: `PTHREAD_CREATE_DETACHED` once its `JoinHandle` was dropped,
+    /// `PTHREAD_CREATE_JOINABLE` while it stays joinable. A second
+    /// `pthread_detach` is not a portable probe — it segfaults on musl —
+    /// so both detach twins read state through this query instead.
+    ///
+    /// SAFETY: `tid` must identify a live thread that stays alive for the
+    /// whole call; both callers hold their worker on a release channel
+    /// across the probe.
+    unsafe fn detach_state_of(tid: libc::pthread_t) -> libc::c_int {
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            let rc = libc::pthread_getattr_np(tid, &mut attr);
+            assert_eq!(rc, 0, "the probe reads the live thread (rc={rc})");
+            let mut state: libc::c_int = -1;
+            let rc = pthread_attr_getdetachstate(&attr, &mut state);
+            assert_eq!(rc, 0, "the probe reads the detach state (rc={rc})");
+            let _ = libc::pthread_attr_destroy(&mut attr);
+            state
+        }
+    }
+
     /// A timed-out arming helper is really detached: its native thread
     /// must not stay joinable (a forgotten `JoinHandle` leaks the
     /// joinable thread resources until process exit). The worker reports
     /// its native handle, stays blocked on a release channel past the
-    /// timeout, and `pthread_detach` on the live worker must report
-    /// `EINVAL` — already detached — never success.
+    /// timeout, and the read-only detach-state probe on the live worker
+    /// must report detached — never joinable.
     #[test]
     fn learn_arming_timeout_detaches_the_helper() {
         let (id_tx, id_rx) = std::sync::mpsc::channel::<usize>();
@@ -2666,16 +2698,16 @@ mod tests {
         let raw_tid = id_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the worker reports its native handle");
-        // SAFETY: `pthread_detach` on the live worker's own id, sent as
-        // an integer because a raw `pthread_t` is not `Send` on musl, and
-        // cast back only while the worker stays blocked until released below.
+        // SAFETY: the live worker's own id, sent as an integer because a
+        // raw `pthread_t` is not `Send` on musl, and cast back only while
+        // the worker stays blocked until released below.
         let tid: libc::pthread_t = raw_tid as libc::pthread_t;
-        let rc = unsafe { libc::pthread_detach(tid) };
+        let state = unsafe { detach_state_of(tid) };
         let _ = release_tx.send(());
         assert_eq!(
-            rc,
-            libc::EINVAL,
-            "an already-detached worker refuses a second detach (rc={rc})"
+            state,
+            libc::PTHREAD_CREATE_DETACHED,
+            "a dropped handle leaves the worker detached (state={state})"
         );
     }
 
@@ -2706,16 +2738,16 @@ mod tests {
         let raw_tid = id_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the drain reports its native handle");
-        // SAFETY: `pthread_detach` on the live drain's own id, sent as
-        // an integer because a raw `pthread_t` is not `Send` on musl, and
-        // cast back only while the drain stays blocked until released below.
+        // SAFETY: the live drain's own id, sent as an integer because a
+        // raw `pthread_t` is not `Send` on musl, and cast back only while
+        // the drain stays blocked until released below.
         let tid: libc::pthread_t = raw_tid as libc::pthread_t;
-        let rc = unsafe { libc::pthread_detach(tid) };
+        let state = unsafe { detach_state_of(tid) };
         let _ = release_tx.send(());
         assert_eq!(
-            rc,
-            libc::EINVAL,
-            "an already-detached drain refuses a second detach (rc={rc})"
+            state,
+            libc::PTHREAD_CREATE_DETACHED,
+            "a dropped handle leaves the drain detached (state={state})"
         );
     }
 

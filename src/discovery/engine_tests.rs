@@ -78878,3 +78878,133 @@ fn learned_staging_applies_without_a_discovery_batch() {
         "the apply discharges the shallow-idle latch"
     );
 }
+
+/// Fix4 failure twin (sm1 strict-system gap): a kernel-thread exit
+/// (a btrfs-endio-write kworker on a quiet host) must not count a
+/// descendant gap. The exit drains for a pid the ledger already
+/// proved a kernel thread; the gap stays 0.
+#[test]
+fn system_kworker_exit_counts_no_descendant_gap() {
+    // Empty proc fixture: the known set alone drives the skip, with
+    // no host /proc involved.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = dir.path().to_path_buf();
+    engine.known_kernel_threads.insert(4242);
+    drain_newcomer_exit(&mut engine, 4242, 200);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a proven kernel-thread exit must not gap"
+    );
+}
+
+/// Fix4 healthy twin: a real user-process descendant exit still
+/// counts. Pid 4343 is unclassifiable under the empty proc fixture,
+/// so fail-closed counts it like any user generation.
+#[test]
+fn system_user_exit_still_counts_descendant_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = dir.path().to_path_buf();
+    drain_newcomer_exit(&mut engine, 4343, 200);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+}
+
+/// The ledger classifier is conjunctive and fail-closed: only the
+/// `PF_KTHREAD` flag plus empty maps proves a kernel thread. A
+/// zombie-shaped user task (empty maps, no flag), an mm-borrowing
+/// thread (flag plus mappings), a flagged pid with missing maps, a
+/// malformed stat, and an absent pid all stay countable.
+#[test]
+fn pid_is_kernel_thread_needs_the_flag_and_empty_maps() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for (pid, flags) in [
+        (10u32, crate::process::PF_KTHREAD),
+        (11, 0u32),
+        (12, crate::process::PF_KTHREAD),
+        (13, crate::process::PF_KTHREAD),
+        (14, crate::process::PF_KTHREAD),
+    ] {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let stat = if pid == 14 {
+            "malformed".to_string()
+        } else {
+            stat_line(pid, "p", flags)
+        };
+        std::fs::write(pid_dir.join("stat"), stat).unwrap();
+    }
+    std::fs::write(proc_root.join("10").join("maps"), "").unwrap();
+    std::fs::write(proc_root.join("11").join("maps"), "").unwrap();
+    std::fs::write(
+        proc_root.join("12").join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    std::fs::write(proc_root.join("14").join("maps"), "").unwrap();
+    assert!(pid_is_kernel_thread(proc_root, 10));
+    for pid in [11, 12, 13, 14, 15] {
+        assert!(!pid_is_kernel_thread(proc_root, pid), "pid {pid}");
+    }
+}
+
+/// Fix4 wiring: a scope walk proves the kworker (flag plus empty
+/// maps) while the user-shaped pid stays unknown, so the kworker's
+/// mark never forms and its exit never gaps; the user exit gaps
+/// once and the prune adds nothing.
+#[test]
+fn system_walk_proves_kworker_so_its_exit_never_gaps() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for (pid, flags) in [(4242u32, crate::process::PF_KTHREAD), (4343, 0u32)] {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("stat"), stat_line(pid, "p", flags)).unwrap();
+    }
+    std::fs::write(proc_root.join("4242").join("maps"), "").unwrap();
+    std::fs::write(
+        proc_root.join("4343").join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    walk_scope(&mut engine, &[4242, 4343], 100);
+    assert_eq!(engine.known_kernel_threads, BTreeSet::from([4242]));
+    engine.mark_newcomer_arrival(4242, Some(110));
+    engine.mark_newcomer_arrival(4343, Some(110));
+    assert!(!engine.newcomer_first_seen.contains_key(&4242));
+    assert!(engine.newcomer_first_seen.contains_key(&4343));
+    drain_newcomer_exit(&mut engine, 4242, 120);
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    drain_newcomer_exit(&mut engine, 4343, 130);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    walk_scope(&mut engine, &[], 200);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+}
+
+/// Belt-and-braces: a mark that somehow names a proven kthread
+/// (user-to-kthread PID reuse between the mark and the walk) still
+/// never gaps at prune or finish.
+#[test]
+fn cgroup_mark_naming_a_proven_kthread_never_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = dir.path().to_path_buf();
+    engine.mark_newcomer_arrival(4242, Some(100));
+    engine.known_kernel_threads.insert(4242);
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    engine.mark_newcomer_arrival(4343, Some(100));
+    engine.known_kernel_threads.insert(4343);
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+}

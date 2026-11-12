@@ -784,6 +784,18 @@ pub struct Engine {
     scope_listed_since: BTreeMap<u32, u64>,
     /// Start and end of the last scope walk.
     last_scope_walk: Option<(Option<u64>, Option<u64>)>,
+    /// Pids proven to be kernel threads with no user address space
+    /// (`PF_KTHREAD` plus empty maps) while live: their exits never
+    /// count descendant gaps, matching the deep-scan exclusion. Fed
+    /// by scope walks for newly listed pids (and by live checks at
+    /// the ledger's other entries); a reused pid re-classifies on
+    /// its next listing, so a user generation never inherits the
+    /// mark. Bounded: past `MAX_SCAN_PIDS` new marks drop and count
+    /// (fail-closed).
+    known_kernel_threads: BTreeSet<u32>,
+    /// Proc root the kernel-thread classifier reads (`/proc` in
+    /// production; tests point it at a fixture dir).
+    proc_root: PathBuf,
     /// Cumulative newcomer queue-age evidence (admissions and drops sample
     /// here; pending counts fill in at snapshot time).
     newcomer_ages: crate::timing::NewcomerStats,
@@ -7241,6 +7253,38 @@ pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// True when `pid` is provably a kernel thread with no user address
+/// space: the `PF_KTHREAD` flag in `{proc_root}/<pid>/stat` plus an
+/// empty `{proc_root}/<pid>/maps` (one byte decides; a mapping-heavy
+/// address space is never read whole). The single-pid twin of the
+/// sweep predicate above, for pids the sweep never snapshotted, so
+/// the exit/descendant-gap ledger skips kernel-thread generations at
+/// the same cause. Fail-closed: any unreadable or unparsable input —
+/// a reaped pid, a refused maps read, a malformed stat — answers
+/// false and the caller keeps counting.
+pub(crate) fn pid_is_kernel_thread(proc_root: &Path, pid: u32) -> bool {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"));
+    let flagged = stat.is_ok_and(|text| {
+        process::stat_flags_from_stat_text(&text)
+            .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
+    });
+    if !flagged {
+        return false;
+    }
+    maps_is_empty(proc_root, pid)
+}
+
+/// True when `{proc_root}/<pid>/maps` reads zero bytes: no user
+/// mappings. Fail-closed (false) on any open or read error.
+fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
+    let mut file = match std::fs::File::open(proc_root.join(pid.to_string()).join("maps")) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut byte = [0u8; 1];
+    matches!(std::io::Read::read(&mut file, &mut byte), Ok(0))
+}
+
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
@@ -12213,6 +12257,8 @@ impl Engine {
             newcomer_gap_overflow: false,
             scope_listed_since: BTreeMap::new(),
             last_scope_walk: None,
+            known_kernel_threads: BTreeSet::new(),
+            proc_root: PathBuf::from("/proc"),
             newcomer_ages: crate::timing::NewcomerStats::new(),
             // A fresh engine owes its first tail publication: the revision
             // starts dirty so the first batch tail publishes unconditionally,

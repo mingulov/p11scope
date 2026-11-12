@@ -784,15 +784,27 @@ pub struct Engine {
     scope_listed_since: BTreeMap<u32, u64>,
     /// Start and end of the last scope walk.
     last_scope_walk: Option<(Option<u64>, Option<u64>)>,
-    /// Pids proven to be kernel threads with no user address space
-    /// (`PF_KTHREAD` plus empty maps) while live: their exits never
-    /// count descendant gaps, matching the deep-scan exclusion. Fed
-    /// only by scope walks for newly listed pids; a reused pid
-    /// re-classifies on its next listing, so a user generation
-    /// never inherits the mark (a death plus reuse inside one walk
-    /// interval is the documented hole). Bounded: past
+    /// Currently listed pids proven to be kernel threads with no
+    /// user address space (`PF_KTHREAD` plus empty maps) while live,
+    /// with the generation lower bound they were proved under: their
+    /// exits never count descendant gaps, matching the deep-scan
+    /// exclusion. Fed only by scope walks for newly listed pids; a
+    /// departed pid leaves for the history below, and a reused pid
+    /// re-classifies on its next listing, so a later user generation
+    /// never inherits the live mark (a death plus reuse inside one
+    /// walk interval is the documented hole). Bounded: past
     /// `MAX_SCAN_PIDS` new marks drop and count (fail-closed).
-    known_kernel_threads: BTreeSet<u32>,
+    known_kernel_threads: BTreeMap<u32, u64>,
+    /// Departed proved-kthread generations as `(pid, lower, upper)`:
+    /// the lower bound is the live proof's generation bound, the
+    /// upper the end of the walk that found the pid absent. A delayed
+    /// exit record from the old kthread still skips when its hook
+    /// timestamp falls inside; a later user generation reusing the
+    /// pid counts, since its exit is past the upper (or past the
+    /// relisted generation's own bound). Bounded separately from the
+    /// live set, oldest evicted first, so departed entries never block
+    /// fresh exemptions; an evicted delayed exit counts (fail-closed).
+    departed_kernel_threads: BTreeSet<(u32, u64, u64)>,
     /// Proc root the kernel-thread classifier reads (`/proc` in
     /// production; tests point it at a fixture dir).
     proc_root: PathBuf,
@@ -12280,7 +12292,8 @@ impl Engine {
             newcomer_gap_overflow: false,
             scope_listed_since: BTreeMap::new(),
             last_scope_walk: None,
-            known_kernel_threads: BTreeSet::new(),
+            known_kernel_threads: BTreeMap::new(),
+            departed_kernel_threads: BTreeSet::new(),
             proc_root: PathBuf::from("/proc"),
             newcomer_ages: crate::timing::NewcomerStats::new(),
             // A fresh engine owes its first tail publication: the revision
@@ -13802,14 +13815,15 @@ impl Engine {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
-        // Kernel threads never count: an exit for a pid the walks
-        // proved a kernel thread leaves the ledger untouched (no
-        // gap, no hint, no stash drop — a reused pid's user
-        // generation owns its entries now). Only walk-observed
-        // state judges here: a live /proc read would classify
-        // whatever generation holds the pid now, not the dead one
-        // this record is for. Fail-closed: unknown pids count on.
-        if self.known_kernel_threads.contains(&pid) {
+        // Kernel threads never count: an exit tied to a proved
+        // kthread generation leaves the ledger untouched (no gap, no
+        // hint, no stash drop — a reused pid's user generation owns
+        // its entries now). Only walk-observed state judges here: a
+        // live /proc read would classify whatever generation holds
+        // the pid now, not the dead one this record is for.
+        // Fail-closed: unknown pids, and exits past the proved
+        // generation's interval, count on.
+        if self.is_proved_kthread_exit(pid, record.hook_ts_ns) {
             return;
         }
         if self
@@ -15420,12 +15434,13 @@ impl Engine {
         if self.newcomer_first_seen.contains_key(&pid) {
             return;
         }
-        // Kernel threads never count: a pid the walks proved a
-        // kernel thread takes no arrival mark, so its departure
-        // never gaps at prune or finish. Only walk-observed state
-        // judges here, like the exit path above. Fail-closed:
-        // unknown pids mark on.
-        if self.known_kernel_threads.contains(&pid) {
+        // Kernel threads never count: a currently listed pid the
+        // walks proved a kernel thread takes no arrival mark, so its
+        // departure never gaps at prune or finish. Only live
+        // walk-observed state judges here: departed proofs live in
+        // the history below and never block a reused pid's mark.
+        // Fail-closed: unknown pids mark on.
+        if self.known_kernel_threads.contains_key(&pid) {
             return;
         }
         if self.newcomer_first_seen.len() >= crate::timing::MAX_NEWCOMER_MARKS {
@@ -15537,27 +15552,91 @@ impl Engine {
             return;
         }
         let bound = previous_start.unwrap_or(0);
+        // Departed proved kthreads leave the live set for the bounded
+        // history: their delayed exits still skip by interval, while a
+        // later user generation reusing the pid counts. This runs after
+        // the prune sweep above, so a kthread's own mark (which never
+        // forms outside hand-built tests) still skips there.
+        let upper = walk_end.unwrap_or(u64::MAX);
+        let departed: Vec<(u32, u64)> = self
+            .known_kernel_threads
+            .iter()
+            .filter(|(pid, _)| !live.contains(pid))
+            .map(|(pid, lower)| (*pid, *lower))
+            .collect();
+        for (pid, lower) in departed {
+            self.known_kernel_threads.remove(&pid);
+            self.remember_departed_kthread(pid, lower, upper);
+        }
         self.scope_listed_since.retain(|pid, _| live.contains(pid));
         for pid in live {
             if !self.scope_listed_since.contains_key(pid) {
-                self.classify_newly_listed_pid(*pid);
+                self.classify_newly_listed_pid(*pid, bound);
             }
             self.scope_listed_since.entry(*pid).or_insert(bound);
         }
     }
 
     /// Classify one newly listed pid for the kernel-thread ledger
-    /// exclusion: a proven kthread joins the known set (its exit
-    /// never gaps), a user pid leaves it (PID reuse never inherits
-    /// the mark). Fail-closed: past the bound new marks drop.
-    fn classify_newly_listed_pid(&mut self, pid: u32) {
+    /// exclusion: a proven kthread joins the live set under its
+    /// generation bound (its exit never gaps), a user pid leaves it
+    /// (PID reuse never inherits the live mark; the old generation's
+    /// interval stays in the departed history for delayed exits).
+    /// Fail-closed: past the bound new marks drop.
+    fn classify_newly_listed_pid(&mut self, pid: u32, bound: u64) {
         if pid_is_kernel_thread(&self.proc_root, pid) {
             if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
-                self.known_kernel_threads.insert(pid);
+                self.known_kernel_threads.insert(pid, bound);
             }
         } else {
             self.known_kernel_threads.remove(&pid);
         }
+    }
+
+    /// True when an exit record for `pid` at `hook_ts` belongs to a
+    /// proved kthread generation: the live proof covers exits at or
+    /// past its generation bound, and the departed history covers
+    /// exits inside its recorded interval. A relisted pid's current
+    /// generation bound rejects history matches at or past it — those
+    /// exits could be the new generation, so they count
+    /// (fail-closed). Unknown pids count.
+    fn is_proved_kthread_exit(&self, pid: u32, hook_ts: u64) -> bool {
+        if let Some(lower) = self.known_kernel_threads.get(&pid)
+            && hook_ts >= *lower
+        {
+            return true;
+        }
+        if let Some(current) = self.scope_listed_since.get(&pid)
+            && hook_ts >= *current
+        {
+            return false;
+        }
+        self.departed_kernel_threads
+            .range((pid, 0, 0)..=(pid, hook_ts, u64::MAX))
+            .any(|(_, _, upper)| hook_ts <= *upper)
+    }
+
+    /// Records one departed proved-kthread generation for delayed-exit
+    /// matching. Past the bound the oldest interval is evicted first:
+    /// its delayed exit then counts (fail-closed), and departed
+    /// entries never block fresh live exemptions.
+    fn remember_departed_kthread(&mut self, pid: u32, lower: u64, upper: u64) {
+        if lower > upper {
+            return;
+        }
+        if self.departed_kernel_threads.contains(&(pid, lower, upper)) {
+            return;
+        }
+        if self.departed_kernel_threads.len() >= MAX_SCAN_PIDS
+            && let Some(oldest) = self
+                .departed_kernel_threads
+                .iter()
+                .min_by(|a, b| (a.1, a.2, a.0).cmp(&(b.1, b.2, b.0)))
+                .copied()
+        {
+            self.departed_kernel_threads.remove(&oldest);
+        }
+        self.departed_kernel_threads.insert((pid, lower, upper));
     }
 
     /// Fail-closed births: every diff-discovered newcomer mark for a pid
@@ -15590,10 +15669,10 @@ impl Engine {
             if counted == Some(NewcomerGapCount::Exit) {
                 continue;
             }
-            // Belt-and-braces: marks never form for proven
+            // Belt-and-braces: marks never form for live proven
             // kthreads, but a mark that somehow names one still
             // never gaps.
-            if self.known_kernel_threads.contains(&pid) {
+            if self.known_kernel_threads.contains_key(&pid) {
                 continue;
             }
             let bound = self.newcomer_generation_bound(pid);
@@ -15639,7 +15718,7 @@ impl Engine {
             .collect();
         for pid in remaining {
             // Belt-and-braces, like the prune sweep above.
-            if self.known_kernel_threads.contains(&pid) {
+            if self.known_kernel_threads.contains_key(&pid) {
                 continue;
             }
             self.newcomer_counted.insert(pid, NewcomerGapCount::Finish);

@@ -79157,7 +79157,7 @@ fn system_kworker_exit_counts_no_descendant_gap() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = system_generation_engine();
     engine.proc_root = dir.path().to_path_buf();
-    engine.known_kernel_threads.insert(4242);
+    engine.known_kernel_threads.insert(4242, 0);
     drain_newcomer_exit(&mut engine, 4242, 200);
     assert_eq!(
         engine.pid_descendant_gaps(),
@@ -79248,7 +79248,7 @@ fn system_walk_proves_kworker_so_its_exit_never_gaps() {
     // would discard this test's fixtures.
     let live: BTreeSet<u32> = [4242, 4343].into_iter().collect();
     engine.note_scope_walk(&live, Some(100), Some(105));
-    assert_eq!(engine.known_kernel_threads, BTreeSet::from([4242]));
+    assert_eq!(engine.known_kernel_threads, BTreeMap::from([(4242, 0)]));
     engine.mark_newcomer_arrival(4242, Some(110));
     engine.mark_newcomer_arrival(4343, Some(110));
     assert!(!engine.newcomer_first_seen.contains_key(&4242));
@@ -79270,11 +79270,11 @@ fn cgroup_mark_naming_a_proven_kthread_never_gaps() {
     let mut engine = cgroup_generation_engine();
     engine.proc_root = dir.path().to_path_buf();
     engine.mark_newcomer_arrival(4242, Some(100));
-    engine.known_kernel_threads.insert(4242);
+    engine.known_kernel_threads.insert(4242, 0);
     engine.close_pruned_newcomer_gaps(&BTreeSet::new());
     assert_eq!(engine.pid_descendant_gaps(), 0);
     engine.mark_newcomer_arrival(4343, Some(100));
-    engine.known_kernel_threads.insert(4343);
+    engine.known_kernel_threads.insert(4343, 0);
     engine.settle_frame_deferrals_at_capture_end();
     assert_eq!(engine.pid_descendant_gaps(), 0);
 }

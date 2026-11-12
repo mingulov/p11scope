@@ -143,6 +143,89 @@ def inputs(*, metrics=False, system=False):
     return report, ledger, receipt
 
 
+MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal",
+            "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
+MT_SYSTEM_CHILDREN = (124, 125, 126, 127)
+
+
+def mt_rv_key(rv):
+    return "0x%016x" % rv
+
+
+def mt_row_ledger(name, calls):
+    return {"name": name, "attempts": calls, "successful": calls,
+            "rv_counts": {mt_rv_key(0): calls}}
+
+
+def inputs_mt_system(*, calls=40):
+    # Minimal mt-system fixture for the lone-gap twins: ledger v2 with
+    # return maps, 4 distinct children and the 32-open scaffold the
+    # oracle requires, plus the profile verdict fields (including the
+    # learned_* trio) so the gap gate, not field authority, judges.
+    targets = [{"name": name, "dev": [8, 1], "ino": 71,
+                "file_offset": 4096 + i * 16} for i, name in enumerate(MT_NAMES)]
+    report = {"schema": "p11scope/observed-profile/v3",
+              "lane": "profile", "capture": {"scope": "system", "mode": "profile"},
+              "functions": [{"names": [name], "calls": calls, "errors": 0,
+                             "in_flight": 0, "pending_returns": 0,
+                             "module": dict(OWNED), "module_ambiguous": False,
+                             "module_unresolved": False,
+                             "rv_counts": dict(mt_row_ledger(name, calls)["rv_counts"]),
+                             "target": {"object": dict(OWNED),
+                                        "file_offset": 4096 + i * 16}}
+                            for i, name in enumerate(MT_NAMES)],
+              "evidence": {"completeness": "COMPLETE", "verdict_detail": "clean_proven",
+                           "in_flight_at_end": 0, "event_loss": 0,
+                           "discovery": [dict(OWNED, path="/owned.so", tables=[{}])],
+                           "modules_skipped": []}}
+    report["evidence"].update({key: 0 for key in LOSS_COUNTERS + VERDICT_COUNTERS})
+    report["evidence"].update(
+        slots=8, scan_unavailable=None, attach_failures=[], skipped=[], surfaces=[], aliased=[],
+        interface_list="absent", provider_changed=False, templates_truncated=False,
+        scheduling={"terminal_drain_truncated": False, "sink_dropped_bytes": 0},
+        loader_discovery={"strategies": {"debug_state_every_hit": 0, "dlopen_return": 0, "unavailable": 0},
+                          "dlopen_timing": {"qualified_pre_constructor": 0, "known_pre_relocation": 0,
+                                            "unproven": 0, "none": 0, "pause_protected": 0},
+                          "initial_set_timing": {"qualified_pre_constructor": 0, "known_pre_relocation": 0,
+                                                 "unproven": 0, "none": 0, "pause_protected": 0},
+                          "initial_set_capture": {"eligible": 0, "none": 0, "pause_protected": 0},
+                          "state_read_failures": 0, "hits": 0},
+        pid_namespace={"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
+        drain_proven=True, stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False})
+    report["evidence"]["gap_classes"] = {
+        "observation": {"status": "exact", "causes": []},
+        "attribution": {"status": "attested", "causes": []},
+        "semantics": {"status": "complete", "causes": []},
+        "open_calls": 0, "settlement": "proven", "stdout_data_sink": False}
+    report["evidence"]["kernel_control"] = {
+        "capture_halted": False, "owner_poison": [], "owner_admission_failures": 0,
+        "identity_unavailable": 0, "identity_budget_exhausted": False,
+        "root_affiliation_failures": []}
+    report["evidence"].update(
+        interface_selection={"selection_truncated": False, "providers": [],
+                             "standard_exports": [], "inventory_surfaces": [], "tuples": []},
+        attach_mechanisms=["per-offset"],
+        attach_backend={"selection": "singles", "fallback": None, "scope_filter": None},
+        pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        learned_staged_files=0, learned_event_loss=0,
+        learned_cap_skipped=0)
+    ledger = ["TARGET " + json.dumps(row) for row in targets]
+    ledger += ["CHILD pid=%d" % pid for pid in MT_SYSTEM_CHILDREN]
+    ledger += ["READY pid=123", "LEDGER " + json.dumps({
+        "schema": "p11scope/public-cli-ledger/v2", "pid": 123, "complete": True,
+        "functions": [mt_row_ledger(name, calls) for name in MT_NAMES]})]
+    ledger += ["SCAFFOLD " + json.dumps({"opens_attempted": 32, "opens_ok": 32,
+                                        "closes": 32, "finalizes": 1})]
+    receipt = {"schema": "p11scope/public-cli-receipt/v1", "cell": "mt-system",
+               "scope": "system", "count_domain": "owned-provider",
+               "launched_pid": 123, "generation": 456,
+               "ready_pid": 123, "ready_generation": 456,
+               "workload_ready": True, "capture_ready": True, "gate_released": True,
+               "observer_exit": 0, "workload_exit": 0, "ledger_complete": True,
+               "provider_before": provider_pin(), "provider_after": provider_pin()}
+    return report, ledger, receipt
+
+
 def replace_successful_totals(report, ledger, totals):
     """Keep the independent ledger and observed report coherent for denominator controls."""
     payload = json.loads(ledger[-1][len("LEDGER "):])
@@ -646,6 +729,28 @@ class RunnerNoiseTests(unittest.TestCase):
     """Ruling CI-GAP-1: hosted host system cell discloses runner noise."""
     run_case = OracleTests.run_case
 
+    def run_case_mt_system(self, mutate=None, *, want=0):
+        report, ledger, receipt = inputs_mt_system()
+        if mutate:
+            mutate(report, ledger, receipt)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            paths = {}
+            for key, value in (("report", report), ("receipt", receipt)):
+                paths[key] = tmp / key
+                paths[key].write_text(json.dumps(value))
+            paths["ledger"] = tmp / "ledger"
+            paths["ledger"].write_text("\n".join(ledger) + "\n")
+            args = [sys.executable, "-I", str(ORACLE),
+                    "--cell", "mt-system", *sum((["--" + key, str(path)]
+                                         for key, path in paths.items()), [])]
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["cell"], "mt-system")
+        self.assertEqual(result["pass"], want == 0)
+        return result
+
     def test_exact_with_noise_passes_when_allowed(self):
         def mutate(d, l, r):
             d["evidence"]["pid_descendant_gaps"] = 1
@@ -766,6 +871,68 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["multi_rebuild_gaps"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_passes_on_mt_system_in_strict_mode(self):
+        # Fix2 twin of the system lone-gap pass: mt-system carries
+        # the same exactly-one-gap ceiling with exact owned counts.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_lone_gap_with_two_gaps_fails_on_mt_system_in_strict_mode(self):
+        # The mt-system ceiling is exactly one, never nonzero: two
+        # descendant gaps still fail strict, with exact counts.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 2
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_unknown_status_fails_on_mt_system_in_strict_mode(self):
+        # Only the disclosed lossy lone class qualifies on
+        # mt-system: an unknown status with one gap still fails.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "unknown", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_count_mismatch_fails_on_mt_system_in_strict_mode(self):
+        # The mt-system lone arm never waives exact owned counts:
+        # one disclosed gap with a 39/40 deficit still fails.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 39
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_lone_gap_with_solo_other_gap_fails_on_mt_system_in_strict_mode(self):
+        # Zero descendant gaps with a solo other gap kind is not
+        # the lone descendant gap on mt-system either.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 0
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["multi_rebuild_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 

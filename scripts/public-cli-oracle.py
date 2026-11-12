@@ -618,18 +618,18 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
-    # ruling to the system cell): quiet VNG guests disclose exactly
-    # one ambient descendant exit with no skip (60906ccca stopped
-    # filing the bogus B4 post-ready window gap, and the exit itself
-    # predates wave 1 on every leg, previously bundled into the
-    # ambient shape). The system cell accepts exactly that one
-    # disclosed gap with exact owned counts (checked below), zero
-    # loss (checked above) and no other class; any other cell, cause
-    # set, skip or gap count (zero, two or more) still fails.
-    # Mirrors the mt-system-only precedent of the relaxed skip
-    # family above.
+    # ruling to the system and mt-system cells): quiet VNG guests
+    # disclose exactly one ambient descendant exit with no skip
+    # (60906ccca stopped filing the bogus B4 post-ready window gap,
+    # and the exit itself predates wave 1 on every leg, previously
+    # bundled into the ambient shape). Both system-scope count cells
+    # accept exactly that one disclosed gap with exact owned counts
+    # (checked below), zero loss (checked above) and no other class;
+    # any other cell, cause set, skip or gap count (zero, two or
+    # more) still fails. The ceiling is exactly one, never nonzero:
+    # two ambient exits are not a lone gap.
     ok_lone_gap = (
-        cell == "system"
+        cell in ("system", "mt-system")
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["pid_descendant_gaps"]
         and skip_entries == []

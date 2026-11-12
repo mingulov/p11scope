@@ -2063,7 +2063,7 @@ fabricated or otherwise untrusted saved input.
 
 **Status: privacy review accepted 2026-11-08; owner approval/installed
 qualification pending (v0.7.0 if approved by 2026-11-09 03:00, else
-v0.7.1).** Owner ruling recorded in
+a later release).** Owner ruling recorded in
 `docs/superpowers/decisions/2026-11-06-schedule-dl10.md`, as corrected the
 same day: runtime basenames (`python3`, `java`, `node`, `perl`, `ruby`) do
 not tell the operator who called; a narrow app-identity extension is

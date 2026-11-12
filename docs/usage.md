@@ -715,7 +715,7 @@ supplementary groups, and may signal your processes or lower their
 priority; terminal stdio ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
 without `connect`. Ioctls of filesystems outside the listed types
-still pass until the v0.8 allowlist lands.
+still pass until a later allowlist lands.
 
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,

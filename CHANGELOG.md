@@ -240,7 +240,7 @@ versioned separately and are opaque, exact dispatch keys.
   stacking it: 15-minute churn soaks stay flat at 368 MB peak
   (VmHWM) on the musl static observer and 322 MB on glibc.
   See [Observer memory grows under heavy process churn](docs/known-limitations.md#observer-memory-grows-under-heavy-process-churn);
-  bounded memory is planned for v0.8.0.
+  bounded memory is planned for a later release.
 
 ### Known limitations
 
@@ -250,15 +250,15 @@ The v0.7.0 limits live in
 - A browser started after a background PKCS#11 process can,
   intermittently, end without per-key operation tracking (reported as
   `bootstrap_unavailable`); its calls and counts are still recorded.
-  Planned for 0.7.1.
+  Planned for a later release.
 - On a busy host, a multi-threaded program that exits during a
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting
-  a loss. Planned for 0.7.1.
+  a loss. Planned for a later release.
 - Above about 6,000 key operations per second, per-key rows can
   arrive seconds late and part of a window shows as exact named
   counts instead of per-call rows. Exact per-call rows past 6,250/s
-  wait for the 0.7.1 event reader.
+  wait for the event reader planned for 0.8.0.
 - A one-shot tool's first use of a provider no running program holds
   is still missed under `--system`; later runs in the same capture are
   caught by kernel file-open learning. Wrap such tools in

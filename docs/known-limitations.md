@@ -54,8 +54,8 @@ still consumes fresh lifetime budget, so distinct-file churn can
 starve at the cap. A true retire-to-revive live cell (map, all
 mappers exit, remap with same-index reuse) has not been run; 0.7.0
 accepts the quarantine/revival probe plus unit twins as revival
-evidence. General slot reuse across different targets is 0.7.1
-work.
+evidence. General slot reuse across different targets is planned
+for a later release.
 
 ### Changed-evidence revival at a full budget drops ticks
 
@@ -110,7 +110,7 @@ before it attached were not counted. `--pid` captures arm before the
 `--cgroup` scopes the same window can mark a fully counted capture
 PARTIAL: the post-ready completion attached only provider-publication
 hooks, which count no calls, yet the gap fires anyway. All calls are
-counted; only the verdict is wrong. Fixed in 0.7.1.
+counted; only the verdict is wrong. A fix is planned for 0.8.0.
 
 ### Long captures go blind to new processes once the 262,144 identity budget is spent
 
@@ -141,7 +141,7 @@ of 262144 identities spent)`; the JSON report is PARTIAL with
 
 Workaround: bound the capture (`--duration`) or split by `--pid` or
 `--cgroup`. Ticket recycling (bank/incarnation reuse) is planned for
-v0.7.1. This supersedes the v0.3.0 DR-06 rate wording ("about an hour
+a later release. This supersedes the v0.3.0 DR-06 rate wording ("about an hour
 at 5/s") for v0.7.0.
 
 ### A provider first loaded after capture start can attach late, or never, under churn
@@ -157,7 +157,7 @@ a scale cell joined 0 of 309,861 calls. Missed calls are shed with
 exact counts and named causes, never silently dropped.
 
 Avoid it with `--prearm-module PATH`, `run`, or a narrower
-`--pid`/`--cgroup` scope. A scheduling redesign is planned for 0.7.1.
+`--pid`/`--cgroup` scope. A scheduling redesign is planned for a later release.
 
 ### Manifest captures at very large endpoint counts may shed calls
 
@@ -200,7 +200,7 @@ pre-fix way. Plan for about 400 MB of observer memory for a
 quarter-hour system-wide capture on a busy host; `--pid`, cgroup and
 `run` captures of a quiet scope stay far below that. A formal
 long-soak ceiling and bounded observer memory are still planned for
-v0.8.0.
+a later release.
 
 ### Short-lived processes never scanned
 
@@ -417,7 +417,7 @@ joined. If the event ring itself overflows, the overflowed records
 are counted and named as event loss; the affected calls are not
 silently dropped. Sustained rates above 6,250 key operations per
 second with exact per-call rows need the independent event reader,
-planned for 0.7.1.
+planned for 0.8.0.
 
 ### System key operations without a manifest show no per-key rows
 
@@ -426,7 +426,7 @@ planned for 0.7.1.
 and shows no per-key rows. Workaround: build a manifest with the
 offline helper (`p11scope-discover --module <path> -o manifest.json`)
 and pass `--manifest manifest.json`, or capture the process by
-`--pid`. Per-key rows without a manifest are planned for 0.7.1.
+`--pid`. Per-key rows without a manifest are planned for 0.8.0.
 
 ### Calls through the p11-kit proxy can publish no mechanism names
 
@@ -437,7 +437,7 @@ stays empty. Measured: 140 proxy calls counted with 0 mechanism
 rows, while the same workload against the provider directly
 publishes its rows. Workaround: point the application at the
 provider itself instead of the proxy when mechanism names matter.
-Fixed in 0.7.1.
+A fix is planned for 0.8.0.
 
 ### `trace --system` and `profile` rate ceilings on a small VM
 
@@ -454,25 +454,7 @@ loss up to 50,000 calls/s (448,750 records lost at 100,000/s).
 A browser started after a background PKCS#11 process is already
 running can, intermittently, end without per-key operation tracking
 (reported as `bootstrap_unavailable`). Its calls and counts are still
-recorded. The fix is planned for 0.7.1.
-
-### Warm Firefox already open: its token calls can go uncounted
-
-If Firefox is already running when a `--system` capture starts, its
-sandboxed children can make the softokn provider's identity ambiguous:
-the scan sees a second physical identity for `libsoftokn3.so` through
-a jailed child view, the collision group is refused (`physical
-identity is ambiguous; the collision group was not attached`), the
-module never attaches (verbose: `module has no comparable pinned
-identity; it was not attached`), and the capture counts 0 calls on
-it. Measured: the release candidate counts 0 softokn calls with
-Firefox already open, while the same workload counts about 1,280
-calls without the defect. The run still reports PARTIAL with the
-named gaps. Workaround: start the capture before opening Firefox; a
-Firefox started after the capture begins attaches and its calls count
-normally (the per-key tracking gap above can still leave it without
-per-key operation tracking). A fix is in review; if it misses this
-release it lands in 0.7.1.
+recorded. The fix is planned for a later release.
 
 ### Starting Firefox mid-capture can withhold mechanism names
 
@@ -482,7 +464,7 @@ with the `static probes detached and exact pairs reattached` and
 `static probe coverage gap incomplete` skips, and mechanism names
 are withheld (slots fall back to count-only). Calls are still
 counted exactly. There is no workaround for the names; the counts
-stay valid. Fixed in 0.7.1.
+stay valid. A fix is planned for a later release.
 
 ### Main thread exits first: a later library load can go unreported
 
@@ -1332,8 +1314,8 @@ detail during a counter capture (`--select-endpoint`).
   inventory Detailed-subset activation, and same-granularity rewrite proof
   (packet 6.13 follow-ups).
 - Bounded observer memory for long system-wide captures on busy hosts
-  (v0.8.0), for example by keeping capture data on disk and building the
-  report from it separately.
+  (a later release), for example by keeping capture data on disk and
+  building the report from it separately.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.
@@ -1372,10 +1354,10 @@ detail during a counter capture (`--select-endpoint`).
   within one pass only — a plain side admitted in an earlier pass
   still leaves a later pre side refused.
 - An independent event reader for sustained 10,000 key
-  operations per second with exact per-call rows (0.7.1).
+  operations per second with exact per-call rows (0.8.0).
 - Per-key tracking for programs started after a background caller
-  (0.7.1).
-- Narrower count-only windows at high key-operation rates (0.7.1).
+  (a later release).
+- Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
   exits (0.7.x).
 - Post-quantum key details, cluster aggregation, telemetry,
@@ -2092,7 +2074,7 @@ The old bounds are measurements, not a product startup SLA.
 - Planned: reusable identity slots are not in 0.6.0; v0.6.0 keeps
   the 16,384 budget with the named gaps above. v0.7.0 widens the budget
   to 262,144 per capture, still never reused; ticket recycling (bank
-  epoch rollover) is planned for 0.7.1.
+  epoch rollover) is planned for a later release.
 
 ### Provisional P/N defaults (DR-07)
 

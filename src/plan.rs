@@ -5085,8 +5085,9 @@ pub fn build_from_sources_for_policy_scoped_with_prearm_and_flags(
 /// Builds the initial Detailed/Named plan for the no-manifest
 /// semantic subset (DEMO-4): scanned pieces lower with scan
 /// authorization, manifest pieces keep their own authority. Used
-/// only by the scan subset mint; every broad/capture plan keeps
-/// scan targets count-only.
+/// only by the scan subset mint; broad/capture plans grant the same
+/// standard-layout legs (interface linkage, sole-complete table,
+/// typed-getter export) while the live-return leg stays subset-only.
 pub(crate) fn build_from_sources_scan_authorized(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],

@@ -12,8 +12,11 @@ scan-only module without layout evidence stays PARTIAL.
 The oracle sees the JSON evidence only, so it proxies the three product legs
 through the scan table fields: `linkage == "interface"` is the interface leg
 itself, and a fully export-verified table (`exports_agreeing == entries` on a
-non-heuristic linkage) is the sole-complete / typed-getter-export leg. No
-root, no BPF, no observer: pure oracle twins.
+non-heuristic linkage) is the sole-complete / typed-getter-export leg. Both
+oracle rules consume the shared predicate — the verdict rule
+(`exact_discovery_semantics`) and the join rule (`semantic_join_eligible`) —
+so every fixture shape below is driven through both. No root, no BPF, no
+observer: pure oracle twins.
 """
 
 import importlib.util
@@ -48,17 +51,24 @@ def scan_table(*, linkage="exports", entries=68, agreeing=68, version=(2, 40)):
 
 def scan_only_evidence(tables, completeness):
     return {
-        "discovery": [
-            {
-                "sources": ["scan"],
-                "corroborated": False,
-                "corroboration": ["single_source"],
-                "tables": tables,
-            }
-        ],
+        "discovery": [scan_only_module(tables)],
         "discovery_conflicts": 0,
         "completeness": completeness,
     }
+
+
+def scan_only_module(tables):
+    return {
+        "sources": ["scan"],
+        "corroborated": False,
+        "corroboration": ["single_source"],
+        "tables": tables,
+    }
+
+
+def joinable_function():
+    """A function whose own flags never veto the join under test."""
+    return {"module": 0, "module_ambiguous": False, "aliased": False}
 
 
 class ScanOnlyLayoutOracleTests(unittest.TestCase):
@@ -124,6 +134,87 @@ class ScanOnlyLayoutOracleTests(unittest.TestCase):
             scan_only_evidence([scan_table(linkage="heuristic", agreeing=0)], "PARTIAL")
         )
         CHECKER.exact_discovery_semantics(scan_only_evidence([scan_table()], "PARTIAL"))
+
+    def test_bool_agreeing_count_fails_closed(self):
+        # `True == 1` is true, so only the `type() is int` guard keeps a
+        # boolean agreement count from reading as full verification — an
+        # `isinstance` check would admit it.
+        table = scan_table(linkage="exports", entries=1, agreeing=True)
+        evidence = scan_only_evidence([table], "COMPLETE")
+        with self.assertRaises(AssertionError):
+            CHECKER.exact_discovery_semantics(evidence)
+
+    def test_string_agreeing_count_fails_closed(self):
+        # A non-integer agreement count is garbage evidence, never layout
+        # evidence, whatever the linkage claims.
+        table = scan_table(linkage="exports", entries=68, agreeing="68")
+        evidence = scan_only_evidence([table], "COMPLETE")
+        with self.assertRaises(AssertionError):
+            CHECKER.exact_discovery_semantics(evidence)
+
+    def test_bool_entries_count_fails_closed(self):
+        # The entries side carries the same fail-closed bool guard: a
+        # boolean table size never verifies, even beside a matching count.
+        table = scan_table(linkage="exports", entries=True, agreeing=1)
+        evidence = scan_only_evidence([table], "COMPLETE")
+        with self.assertRaises(AssertionError):
+            CHECKER.exact_discovery_semantics(evidence)
+
+    def test_heuristic_linkage_with_full_counts_stays_partial(self):
+        # Full per-ordinal counts never rescue a heuristic linkage: only
+        # `exports`/`live_return` (or `interface` alone) evidence the
+        # standard layout.
+        table = scan_table(linkage="heuristic", entries=68, agreeing=68)
+        evidence = scan_only_evidence([table], "COMPLETE")
+        with self.assertRaises(AssertionError):
+            CHECKER.exact_discovery_semantics(evidence)
+
+
+class ScanOnlyLayoutJoinTests(unittest.TestCase):
+    """The same table fixtures through the join rule.
+
+    The verdict twin above pins `exact_discovery_semantics`; these pin
+    `semantic_join_eligible` directly, so a reintroduced second-rule veto
+    on any admitted shape fails here even while the verdict stays green.
+    """
+
+    maxDiff = 4096
+
+    def assert_join(self, tables, expected):
+        module = scan_only_module(tables)
+        self.assertEqual(
+            CHECKER.semantic_join_eligible(
+                joinable_function(), module, has_manifest_object_fallback=False
+            ),
+            expected,
+        )
+
+    def test_export_verified_table_is_joinable(self):
+        self.assert_join([scan_table()], True)
+
+    def test_interface_linked_table_is_joinable_without_agreement(self):
+        # Interface linkage alone is layout evidence: no export count is
+        # required for the join either.
+        self.assert_join([scan_table(linkage="interface", agreeing=0)], True)
+
+    def test_live_return_with_full_agreement_is_joinable(self):
+        self.assert_join([scan_table(linkage="live_return")], True)
+
+    def test_heuristic_table_is_not_joinable(self):
+        self.assert_join([scan_table(linkage="heuristic", agreeing=0)], False)
+
+    def test_partially_agreeing_table_is_not_joinable(self):
+        self.assert_join([scan_table(agreeing=67)], False)
+
+    def test_tableless_module_is_not_joinable(self):
+        self.assert_join([], False)
+
+    def test_unwitnessed_table_is_not_joinable(self):
+        self.assert_join([scan_table(agreeing=None)], False)
+
+    def test_mixed_tables_module_is_not_joinable(self):
+        tables = [scan_table(), scan_table(linkage="heuristic", agreeing=0)]
+        self.assert_join(tables, False)
 
 
 if __name__ == "__main__":

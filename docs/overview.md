@@ -214,8 +214,9 @@ Public live cgroup qualification remains a development gate.
   migration compatibility.
 
   Start with a passive diagnostic capture. This manifest-free path retains
-  aggregate function counts, return values and latency; scanned slots are
-  semantics-unverified and count-only. File-data scans can miss tables held
+  aggregate function counts, return values and latency; scanned slots without
+  layout evidence are semantics-unverified and count-only. File-data scans
+  can miss tables held
   only in runtime allocation. A manifest built with `p11scope-discover`
   supplies explicit targets when discovery has no observed publication (see
   [known limitations](known-limitations.md#runtime-built-function-tables-need-publication-evidence-or-a-manifest)).

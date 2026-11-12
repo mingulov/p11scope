@@ -654,9 +654,9 @@ missed. If a suitable manifest was prepared while the same provider identity
 was available, pass it
 with `--manifest`; it is explicit operator attestation of exact accepted
 function-name/offset claims, hash-matched against the pinned file, and
-corroborated when the provider is already mapped. Scan-only discovery is
-semantics-unverified and count-only, but aggregate counts/RVs/latency remain
-available. A helper run after the fact cannot repair a missed capture window,
+corroborated when the provider is already mapped. Scan-only discovery without
+layout evidence is semantics-unverified and count-only, but aggregate counts/RVs/latency
+remain available. A helper run after the fact cannot repair a missed capture window,
 and `--manifest` remains the explicit-attestation path for that case.
 
 Attach takes time to land (seconds for hundreds of probes), and the first
@@ -2826,8 +2826,8 @@ requires `COMPLETE` exactly when the drain is proven.
 not a claim that deliberately malicious native provider code truthfully
 implements the ABI role named in its own function table.
 
-Memory scanning itself is heuristic discovery. Scan-only discovery is
-semantics-unverified and count-only: it retains aggregate
+Memory scanning itself is heuristic discovery. Scan-only discovery without
+layout evidence is semantics-unverified and count-only: it retains aggregate
 counts/RVs/latency but creates no semantic interpretation. Live and terminal
 evidence are PARTIAL while scan-only semantic claims without layout evidence
 remain. P11Lab joins reject scan-only modules without layout evidence, and

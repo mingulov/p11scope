@@ -21513,7 +21513,7 @@ impl Engine {
     }
 
     /// Attaches every initial view's dynamic exports; returns whether any
-    /// hook newly attached, i.e. whether this pass added coverage.
+    /// hook newly attached (publication detection, not counting coverage).
     fn attach_initial_exports(
         &mut self,
         session: &mut dyn EngineSession,

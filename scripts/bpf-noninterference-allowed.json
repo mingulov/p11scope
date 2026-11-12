@@ -484,7 +484,7 @@
     },
     {
       "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
-      "candidate_revision": "v0.7.0 wave-1 combined tip (measured at fd54df1920415b844776123b81d023ac6b91a83a; the record commit adds only this record, which is not a BPF input)",
+      "candidate_revision": "v0.7.0 wave-1 combined tip (BPF inputs of fd54df1920415b844776123b81d023ac6b91a83a; shape pinned from the CI build of a085e764fccc9d748d3c59273a57ce15ec8d4791, run 43212507777; the record commit adds only this record, which is not a BPF input)",
       "changed": {
         "p11scope-ebpf": {
           "added": {},
@@ -528,7 +528,7 @@
             ".debug_line": 97,
             ".debug_loclists": 383,
             ".debug_rnglists": 41,
-            ".debug_str": 84,
+            ".debug_str": 83,
             ".debug_str_offsets": 12,
             ".rel.BTF": 16,
             ".rel.BTF.ext": 128,
@@ -576,7 +576,7 @@
       },
       "identical": [],
       "lane": "trace-cgroup retired-join split on the guest-returns gate",
-      "rationale": "The trace-cgroup repair on top of transition 7 (931c251ba merged with the guest-returns fix1 arms: the three refused arms split through refused_join_accounting(outcome, bump), so a retired start with a refused join reports a semantic capture failure when continuity was active and stays silent when never-active, while a failed START retirement stays unmatched on every coverage state; OutputFailed still bumps ring loss only): the Detailed object gains .text +24 to cumulative +1320 for the helper calls with their unmatched/semantic guards, with matching debug/BTF moves (.BTF.ext +32, .debug_line +14, .debug_loclists +107, .debug_str +19, .debug_addr +16, .debug_info +158, .debug_str_offsets +8, .rel.BTF.ext +32, .rel.debug_addr +32, .rel.debug_info +32, .rel.debug_str_offsets +32, .rel.text +16; .debug_rnglists -15); no new symbol (.symtab/.strtab unchanged), no section added or removed, uprobe (+184) and maps (+28) unchanged. Both Inventory objects keep exactly the transition-7 shape (.text +112/+176, uprobe +128, maps +28)."
+      "rationale": "The trace-cgroup repair on top of transition 7 (931c251ba merged with the guest-returns fix1 arms: the three refused arms split through refused_join_accounting(outcome, bump), so a retired start with a refused join reports a semantic capture failure when continuity was active and stays silent when never-active, while a failed START retirement stays unmatched on every coverage state; OutputFailed still bumps ring loss only): the Detailed object gains .text +24 to cumulative +1320 for the helper calls with their unmatched/semantic guards, with matching debug/BTF moves (.BTF.ext +32, .debug_line +14, .debug_loclists +107, .debug_str +19, .debug_addr +16, .debug_info +158, .debug_str_offsets +8, .rel.BTF.ext +32, .rel.debug_addr +32, .rel.debug_info +32, .rel.debug_str_offsets +32, .rel.text +16; .debug_rnglists -15); no new symbol (.symtab/.strtab unchanged), no section added or removed, uprobe (+184) and maps (+28) unchanged. Both Inventory objects keep exactly the transition-7 shape (.text +112/+176, uprobe +128, maps +28). Correction: the plain Inventory .debug_str delta is +83 on the gate's stable CI path, one byte under the locally measured +84 (.debug_str suffix-merging sizes vary with work-path-derived disambiguator hashes; CI run 43212507777), so the record pins the CI build's value; code, maps, BTF and every other section keep the transition-7 shape exactly."
     }
   ],
   "version": 1

@@ -2928,12 +2928,11 @@ fn cgroup_move_out_guard_moves_pid_out_while_unwinding() {
 #[ignore = "privileged: live BPF cgroup-scoped 257-provider-load view-capacity gap; run as root with --ignored --test-threads=1 under the privileged lane"]
 fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     const WHAT: &str = "life-257-live";
-    const LOADS: usize = MAX_SCAN_PIDS + 1;
+    const LOADS: usize = 257;
     assert_privileged_lane(WHAT);
-    assert_eq!(
-        MAX_SCAN_PIDS, 256,
-        "{WHAT}: the cell proves the real 256 views"
-    );
+    // Explicit 256 below: this cell pins the view-capacity gap shape at a
+    // fixed cap (257 loads over 256 views), not the production default
+    // (pinned by default_deep_scan_cap_covers_a_thousand_processes).
     assert_eq!(
         MAX_LOADER_CONTEXTS, 256,
         "{WHAT}: views gate the 256 loader contexts one to one"
@@ -2947,8 +2946,10 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     let started = Instant::now();
     let scope = crate::scope::capture_cgroup(&cgroup.path)
         .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
-    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
-        .expect("live cgroup discovery");
+    let mut cgroup_capture_args = cgroup_args(hints, cgroup.path.clone());
+    cgroup_capture_args.max_scan_pids = Some(256);
+    let mut engine =
+        Engine::discover(&cgroup_capture_args, &scope, None).expect("live cgroup discovery");
     let mut session = engine
         .start_session(
             CapturePolicy::Allowlisted,
@@ -3007,7 +3008,7 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     let start = Instant::now();
     let deadline = start + STRANDED_WAIT;
     let mut ticks = 0u64;
-    let view_gap_reason = format!("capture process-view capacity {MAX_SCAN_PIDS} was exhausted");
+    let view_gap_reason = "capture process-view capacity 256 was exhausted".to_string();
     // A pid is accounted when viewed or queued; the union cannot
     // double-count a pid that is both.
     let accounted_owned = |engine: &Engine| -> BTreeSet<u32> {
@@ -3104,9 +3105,9 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     // Engine->render seam pin: the skip the engine actually produced must
     // carry the full structural sentence and project to the normalized
     // named reason and text line. Drift in the engine sentence fails here.
-    let full_view_reason = format!(
-        "capture process-view capacity {MAX_SCAN_PIDS} was exhausted; remaining generations were not scanned"
-    );
+    let full_view_reason =
+        "capture process-view capacity 256 was exhausted; remaining generations were not scanned"
+            .to_string();
     for (label, found) in [
         (
             "counters",

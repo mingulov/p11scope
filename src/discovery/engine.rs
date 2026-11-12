@@ -5834,7 +5834,9 @@ struct BoundFallbackProof {
 /// ponytail: the capture byte budget already bounds work; this flat cap also bounds
 /// `/proc` inventory overhead for cgroups containing thousands of processes.
 /// Shared with `inspect --system` as the default `--max-scan-pids`.
-pub(crate) const MAX_SCAN_PIDS: usize = 256;
+/// 2048 by the 2026-11-12 fedora measurement: 1,052 user processes scan
+/// fully at +2.3 s start-up and ~148 MB peak RSS.
+pub(crate) const MAX_SCAN_PIDS: usize = 2048;
 
 /// How a marked newcomer generation's descendant gap was counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6971,6 +6973,25 @@ pub(crate) fn kernel_thread_exclusions(
     excluded
 }
 
+/// The user processes among `pids`: everything without the `PF_KTHREAD`
+/// flag in `{proc_root}/<pid>/stat`. Kernel threads have no user address
+/// space and can never call a provider, so the deep-scan cap counts user
+/// processes only. Fail-closed: an unreadable or unparsable stat keeps
+/// the pid. `proc_root` is `/proc` live, a fixture tree in tests.
+pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
+    pids.iter()
+        .copied()
+        .filter(|pid| {
+            !std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).is_ok_and(
+                |text| {
+                    process::stat_flags_from_stat_text(&text)
+                        .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
+                },
+            )
+        })
+        .collect()
+}
+
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
@@ -7451,6 +7472,17 @@ fn discover_plan(
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
     let max_scan_pids = discovered.max_scan_pids;
+    // The cap counts user processes only: kernel threads can never call a
+    // provider, so counting them toward the cap collapses selection on a
+    // busy host. The newcomer baseline above keeps the full set, so live
+    // ticks do not re-churn threads as newcomers; everything from here
+    // (comparison, sweep, selection, record, views) is user-only. A named
+    // --pid is never filtered.
+    let pids = if named {
+        pids
+    } else {
+        user_process_pids(&pids, Path::new("/proc"))
+    };
     // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
     // deep-scans the selected candidates only. Under the cap selection is
     // the identity, so the sweep (and its budget charge) is skipped there.

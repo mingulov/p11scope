@@ -40303,6 +40303,76 @@ fn kernel_threads_first_in_pid_order_do_not_consume_deep_scan_slots() {
     let _ = std::fs::remove_dir_all(&proc_root);
 }
 
+/// The over-cap trigger counts user processes only: a host with 300
+/// kernel threads (past the old 256 total) but only 200 user processes is
+/// NOT over the deep-scan cap. A fixture /proc pins the filter; a pid
+/// with no stat at all stays eligible (fail-closed).
+#[test]
+fn over_cap_trigger_counts_user_processes_only() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let proc_root = std::env::temp_dir().join(format!("scan1k-usercap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    let mut pids = Vec::new();
+    for pid in 2..302u32 {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            stat_line(pid, "kworker", crate::process::PF_KTHREAD),
+        )
+        .unwrap();
+        pids.push(pid);
+    }
+    for pid in 10000..10200u32 {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), stat_line(pid, "worker", 0)).unwrap();
+        pids.push(pid);
+    }
+    pids.push(424242);
+    assert_eq!(pids.len(), 501);
+    let kept = user_process_pids(&pids, &proc_root);
+    assert_eq!(kept.len(), 201, "{kept:?}");
+    assert!(kept.iter().all(|pid| *pid >= 10000), "{kept:?}");
+    assert!(
+        kept.len() <= MAX_SCAN_PIDS,
+        "300 kernel threads + 200 user processes is not over the cap"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// The deep-scan default covers a 1,000-process host: 2048, pinned by the
+/// 2026-11-12 fedora measurement (1,052 user processes scan fully at
+/// +2.3 s start-up and ~148 MB peak RSS), with selection binding exactly
+/// at the cap.
+#[test]
+fn default_deep_scan_cap_covers_a_thousand_processes() {
+    assert_eq!(
+        MAX_SCAN_PIDS, 2048,
+        "measured 2026-11-12 on fedora at 1k user processes"
+    );
+    let sweep: Vec<(u32, Vec<MapEntry>)> = (0..MAX_SCAN_PIDS + 1)
+        .map(|index| {
+            (
+                50000 + index as u32,
+                vec![MapEntry {
+                    start: 0x1000,
+                    end: 0x2000,
+                    file_offset: 0,
+                    permissions: *b"r-xp",
+                    device: Device { major: 8, minor: 1 },
+                    inode: 9000 + index as u64,
+                    raw_path: Some(format!("/usr/lib/shape-{index}.so").into_bytes()),
+                }],
+            )
+        })
+        .collect();
+    let selected = select_deep_scan_candidates(&sweep, MAX_SCAN_PIDS);
+    assert_eq!(selected.len(), MAX_SCAN_PIDS);
+}
+
 /// The exclusion is conjunctive and fail-closed: a zombie shape (empty maps,
 /// no thread flag), an unavailable snapshot, a flagged pid with mappings,
 /// and an unreadable stat all stay eligible for deep scanning.
@@ -46660,7 +46730,9 @@ fn e05_cross_module_admission_at_256_and_above_cap() {
     let scope_dir = tempfile::tempdir().expect("a scope directory");
     e06_write_listing(scope_dir.path(), &pids);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
-    let args = e06_cgroup_args(scope_dir.path(), hints, None);
+    // Explicit 256: this twin pins above-cap rotation arithmetic, not the
+    // production default (2048 since the 1k scan).
+    let args = e06_cgroup_args(scope_dir.path(), hints, Some(256));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
     // Deterministic paging: the wall-time quanta are covered by their own
@@ -46800,7 +46872,9 @@ fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
     let scope_dir = tempfile::tempdir().expect("a scope directory");
     e06_write_listing(scope_dir.path(), &pids);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
-    let args = e06_cgroup_args(scope_dir.path(), hints, None);
+    // Explicit 256: this twin pins above-cap rotation arithmetic, not the
+    // production default (2048 since the 1k scan).
+    let args = e06_cgroup_args(scope_dir.path(), hints, Some(256));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
     // Deterministic paging (same confound as the E05 scale twin): the

@@ -815,7 +815,7 @@ included, is refused with `not a cgroup v2 directory` before discovery, by
 `doctor --cgroup` as well. `--system` requests
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
-discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
+discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 2048,
 rarest providers first). Scope admission does not promise that every process
 or call is captured (see the
 [known limitations](../CHANGELOG.md#known-limitations)), and the whole-machine
@@ -1027,10 +1027,12 @@ not hold (`interrupted` when a stop landed while protection was active,
 report carries one plain `pause refused: ...` line.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
-256 members per pass, rarest providers first; past the cap the capture
-publishes a skip naming the bound. The default stays 256 by measurement
-(2026-09-17, ~550-process scope: a 600-member run discovered the same
-4 modules as the default run at +32% scan time, so the raise buys nothing).
+2048 members per pass, rarest providers first; past the cap the capture
+publishes a skip naming the bound. Kernel threads never count toward the
+cap (they have no user address space and cannot call a provider). The
+default is 2048 by measurement (2026-11-12, ~1,050-user-process scope: a
+full scan cost +2.3 s start-up at unchanged peak RSS against the 256
+default, which collapsed the same scope to 43 views).
 `--max-scan-pids <n>` sets the cap:
 
 sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 512 --duration 60 -o observed-profile.json

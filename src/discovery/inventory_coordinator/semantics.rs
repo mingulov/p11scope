@@ -6643,6 +6643,121 @@ mod finalizer_history_tests {
         );
     }
 
+    #[test]
+    fn review_shed_taint_wrong_exec_binding_stays_refused() {
+        // JK-19b F2: a binding for another exec of the same process must
+        // not lift a never-bound image's shed-taint. Background (41, 1)
+        // bound; image (77, 3) sheds (tainted at once); exec 4 of cookie
+        // 77 binds; a finalize within grace must leave (77, 3) refused.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "shed-taints still land at once"
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 4,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(
+                domain,
+                crate::semantic_capture::InvalidationScope::CoverageFailed,
+                10,
+            )],
+        );
+        assert!(
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "a binding of exec 4 must not lift never-bound exec 3"
+        );
+    }
+
+    #[test]
+    fn review_shed_taint_wrong_exec_history_stays_refused() {
+        // JK-19b F2 twin, other ownership branch: admission history for
+        // another exec of the same process must not lift a never-bound
+        // image's shed-taint either.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "shed-taints still land at once"
+        );
+        admit_history(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 4,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(
+                domain,
+                crate::semantic_capture::InvalidationScope::CoverageFailed,
+                10,
+            )],
+        );
+        assert!(
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "admission history of exec 4 must not lift never-bound exec 3"
+        );
+    }
+
     /// Gap reasons by subject for the two unrouted subjects.
     fn unrouted_subject_calls(
         coordinator: &InventoryCoordinator<OsProcessSource>,

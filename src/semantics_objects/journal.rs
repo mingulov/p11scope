@@ -13527,6 +13527,109 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn review_contradiction_during_shed_grace_stays_refused() {
+        // JK-19b F1: a shed-taint eligible to lift turns permanent when a
+        // contradiction lands before the lift. Shed first (as the
+        // finalizer's refuse_other_caller_image path does), then an
+        // unmatched END (TerminalBeforeBegin), then the timely-bind lift
+        // attempt: attestation must still refuse ImageTainted.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a contradiction during shed grace makes the taint permanent"
+        );
+        assert!(!scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review_contradiction_before_shed_stays_refused() {
+        // JK-19b F1 twin, other order: a contradiction-tainted image that
+        // later sheds must never lift either. The shed re-taint lands on
+        // an already-tainted image, so it must not gain lift eligibility.
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a shed after a contradiction must not gain lift eligibility"
+        );
+        assert!(!scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review_shed_only_lift_stays_healthy() {
+        // JK-19b F1 guard pin: a shed-taint with no contradiction still
+        // lifts, and the image attests again. Failing closed the other
+        // way would reintroduce the browser-bootstrap refusal.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(!scene.adapter.image_refused((COOKIE, EXEC)));
+        assert!(scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("lifted image attests");
+    }
+
+    #[test]
+    fn review_lift_past_cap_stays_refused() {
+        // JK-19b spark-F2: past the lifted cap the taint must stay (fail
+        // closed), not lift without fallback eligibility.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 8,
+                thread_floors: 8,
+                refused_begins: 8,
+                domain_keys: 8,
+                image_sightings: 1,
+            },
+        );
+        let other = (COOKIE + 11, EXEC);
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        assert!(scene.adapter.refuse_other_caller_image(other));
+        scene.adapter.untaint_shed_image(other);
+        assert!(
+            scene.adapter.image_refused(other),
+            "past the lifted cap the taint must stay (fail closed)"
+        );
+        assert!(!scene.adapter.shed_taint_lifted(other));
+    }
+
+    #[test]
     fn object_journal_bounded_uppers_keep_max_only() {
         // I5: only the maximum bounded-loss upper is retained. Two
         // bounded losses across two seals must not grow a per-loss

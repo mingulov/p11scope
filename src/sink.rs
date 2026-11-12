@@ -180,7 +180,11 @@ pub(crate) fn try_stderr_line(line: &str) -> io::Result<SinkDrops> {
 
 /// Best-effort diagnostics without the trailing newline (the bounded
 /// `eprint!`): the same no-wait delivery as [`try_stderr_line`], bytes
-/// verbatim.
+/// verbatim. Retained without current production callers so the shadow
+/// stays complete: a future `eprint!` must shed like every other
+/// diagnostic, never reintroduce a blocking write.
+/// The F3 shape test pins the macro on this helper.
+#[allow(dead_code)]
 pub(crate) fn try_stderr_text(text: &str) -> io::Result<SinkDrops> {
     try_diagnostic_bytes_on_fd(std::io::stderr().as_raw_fd(), text.as_bytes())
 }

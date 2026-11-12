@@ -562,6 +562,63 @@ def load_handoff_pair():
     raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
 
 
+def load_prearm_counter():
+    """Compile completed_calls from the real run-prearm oracle block.
+
+    AST-extracted (not copied) so the tests track the shipped counter;
+    only the function is compiled, never the block's top-level capture
+    assertions.
+    """
+    tree = ast.parse(extract_handoff_oracle())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
+            namespace = {}
+            exec(compile(ast.Module(body=[node], type_ignores=[]),
+                         "<prearm-counter>", "exec"), namespace)
+            return namespace["completed_calls"]
+    raise AssertionError("completed_calls missing from the run-prearm oracle")
+
+
+def load_prearm_gate():
+    """Compile the shipped `assert counts == (3, 3, 1)` gate (not a copy).
+
+    Returns a gate(counts) callable executing exactly that assertion:
+    healthy (3, 3, 1) passes, any other count raises AssertionError.
+    """
+    tree = ast.parse(extract_handoff_oracle())
+    for node in tree.body:
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                and test.left.id == "counts" and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq) and len(test.comparators) == 1):
+            continue
+        compar = test.comparators[0]
+        if not (isinstance(compar, ast.Tuple)
+                and [getattr(elt, "value", None) for elt in compar.elts] == [3, 3, 1]):
+            continue
+        code = compile(ast.Module(body=[node], type_ignores=[]),
+                       "<prearm-gate>", "exec")
+
+        def gate(counts, _code=code):
+            exec(_code, {"counts": counts})
+
+        return gate
+    raise AssertionError("run-prearm (3, 3, 1) gate missing from the oracle")
+
+
+def prearm_trace_lines(*, separator=" -> ", counts=(3, 3, 1)):
+    """Synthetic held-twin trace text in the product's completed-call shape."""
+    names = ("C_Initialize", "C_Finalize", "C_GetFunctionList")
+    lines = []
+    for name, want in zip(names, counts):
+        for index in range(want):
+            lines.append(f"00:00:0{index} loader (PID 100, TID 10{index}) "
+                         f"{name}{separator}CKR_OK 10ns")
+    return "\n".join(lines) + "\n"
+
+
 def handoff_module(late, unattached, attached):
     """A pre-armed module record with the exact handoff window pair."""
     return {"attached_at_ns": attached,
@@ -646,6 +703,56 @@ class HandoffPairTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIn(line, text)
+
+
+class PrearmExactnessTests(unittest.TestCase):
+    """The run-prearm (3, 3, 1) gate executes the shipped oracle code.
+
+    The counter and the count assertion are AST-extracted from the
+    qualifier's run-prearm block (never copied), then run against
+    synthetic trace text in the product's completed-call shape.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.count = staticmethod(load_prearm_counter())
+        cls.gate = staticmethod(load_prearm_gate())
+
+    def gate_counts(self, text):
+        return tuple(self.count(text, name)
+                     for name in ("C_Initialize", "C_Finalize", "C_GetFunctionList"))
+
+    def test_healthy_ascii_trace_passes_the_gate(self):
+        # Seven completed calls in the product's ASCII shape count
+        # exactly (3, 3, 1) and satisfy the shipped gate assertion.
+        counts = self.gate_counts(prearm_trace_lines())
+        self.assertEqual(counts, (3, 3, 1))
+        self.gate(counts)
+
+    def test_deficient_counts_fail_the_gate(self):
+        # One missing C_Initialize completion counts (2, 3, 1): the
+        # shipped gate rejects it.
+        counts = self.gate_counts(prearm_trace_lines(counts=(2, 3, 1)))
+        self.assertEqual(counts, (2, 3, 1))
+        with self.assertRaises(AssertionError):
+            self.gate(counts)
+
+    def test_excess_counts_fail_the_gate(self):
+        # One extra C_GetFunctionList completion counts (3, 3, 2):
+        # the shipped gate rejects it.
+        counts = self.gate_counts(prearm_trace_lines(counts=(3, 3, 2)))
+        self.assertEqual(counts, (3, 3, 2))
+        with self.assertRaises(AssertionError):
+            self.gate(counts)
+
+    def test_arrow_separator_counts_zero(self):
+        # The wave1-early red shape: ASCII product text carries no
+        # U+2192 arrow, so the shipped ASCII counter reads (0, 0, 0)
+        # on arrow-shaped lines and the gate rejects it.
+        counts = self.gate_counts(prearm_trace_lines(separator=" \u2192 "))
+        self.assertEqual(counts, (0, 0, 0))
+        with self.assertRaises(AssertionError):
+            self.gate(counts)
 
 
 STUB_ORACLE = """\

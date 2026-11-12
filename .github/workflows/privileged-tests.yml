@@ -371,6 +371,7 @@ jobs:
             ${{ runner.temp }}/results-${{ matrix.shard }}.txt
             ${{ runner.temp }}/privileged-out/run/results.txt
             ${{ runner.temp }}/privileged-out/run/logs/
+            ${{ runner.temp }}/privileged-out/run/evidence/
           if-no-files-found: warn
           retention-days: 7
   # Every listed cell ran exactly once across the shards and passed; the

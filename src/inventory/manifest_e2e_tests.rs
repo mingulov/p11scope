@@ -403,6 +403,83 @@ fn keep_workload_on_failure(workload: E2eWorkload, outcome: Result<()>, tag: &st
     outcome
 }
 
+/// Copies of the scale cell's report and observer log exported to the
+/// runner's per-test evidence dir when the cell fails, so a CI red
+/// arrives root-caused. Armed at spawn time, disarmed on success; any
+/// early `ensure!` bail drops the guard and copies whatever exists.
+/// A missing file or an unset dir is silent: local runs without the
+/// runner keep only the workload dir.
+struct ScaleFailureEvidence {
+    inv: PathBuf,
+    observer: PathBuf,
+    done: bool,
+}
+
+impl ScaleFailureEvidence {
+    fn arm(inv: &Path, observer: &Path) -> Self {
+        Self {
+            inv: inv.to_path_buf(),
+            observer: observer.to_path_buf(),
+            done: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for ScaleFailureEvidence {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let Some(dir) = std::env::var_os("P11SCOPE_TASK4_EVIDENCE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        for (src, name) in [
+            (&self.inv, "scale4097-inv.json"),
+            (&self.observer, "scale4097-observer.out"),
+        ] {
+            if std::fs::copy(src, dir.join(name)).is_ok() {
+                println!("SCALE2_E2E evidence kept {name}");
+            }
+        }
+    }
+}
+
+/// Print the shed and scan-refusal reasons behind a scale run: every
+/// `semantic calls unrouted*` and `semantic scan refused` gap reason
+/// from the report, bounded to whole ASCII lines. Both arms print, so
+/// a pass and a fail can be compared row for row.
+fn print_scale_shed_reasons(gaps: &[serde_json::Value]) {
+    const MAX_CHARS: usize = 1500;
+    for gap in gaps {
+        let subject = gap
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        if subject != "semantic calls unrouted"
+            && subject != "semantic calls unrouted from other callers"
+            && subject != "semantic scan refused"
+        {
+            continue;
+        }
+        let reason = gap
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let bounded: String = reason.chars().take(MAX_CHARS).collect();
+        let cut = if bounded.len() < reason.len() {
+            " [truncated]"
+        } else {
+            ""
+        };
+        println!("SCALE2_E2E shed subject={subject:?} reason={bounded:?}{cut}");
+    }
+}
+
 #[test]
 fn headline_workload_holds_after_done_without_adding_calls() -> Result<()> {
     let module = softhsm_path()?;
@@ -1434,6 +1511,7 @@ fn scale4097_inner(
     let gate = workload.path("gate");
     let ledger_out = workload.path("ledger.out");
     let observer_out = workload.path("observer.out");
+    let mut scale_evidence = ScaleFailureEvidence::arm(&out, &observer_out);
     let mut target = workload.spawn(
         &ledger_out,
         module,
@@ -1577,6 +1655,7 @@ fn scale4097_inner(
         }
         println!("SCALE2_E2E gaps={subjects:?}");
     }
+    print_scale_shed_reasons(gaps);
     let callers = report
         .get("callers")
         .and_then(serde_json::Value::as_array)
@@ -1658,6 +1737,7 @@ fn scale4097_inner(
         "key operations stay unavailable on the S1 path"
     );
     println!("SCALE2_E2E edges={} rc=0", edges.len());
+    scale_evidence.disarm();
     Ok(())
 }
 

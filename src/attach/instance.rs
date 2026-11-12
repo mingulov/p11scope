@@ -204,7 +204,20 @@ pub(super) struct PreparedInstanceTracking {
 }
 struct HookPreparationRefusal {
     reason: String,
-    fail_coverage: bool,
+}
+
+/// Records a prepare refusal. Coverage is intentionally untouched: the
+/// hooks never started, so continuity is never-active (disabled), not
+/// failed. Only a mid-run failure (audit, BPF image fault) or teardown
+/// fails coverage. The BPF join gate consults exactly this distinction,
+/// so refused-before-start systems never count unstamped returns as
+/// unmatched. Takes coverage so the twin pins the no-fail contract.
+fn apply_prepare_refusal(
+    _coverage: &super::image_query::CoverageControl,
+    tracking: &mut InstanceTracking,
+    reason: String,
+) {
+    tracking.refused = Some(reason);
 }
 
 /// One watched provider file.
@@ -411,25 +424,18 @@ impl InstanceTracking {
         policy: super::CapturePolicy,
         image_query_refusal: Option<String>,
     ) -> PreparedInstanceTracking {
-        let refused = |reason, fail_coverage| PreparedInstanceTracking {
-            programs: Err(HookPreparationRefusal {
-                reason,
-                fail_coverage,
-            }),
+        let refused = |reason| PreparedInstanceTracking {
+            programs: Err(HookPreparationRefusal { reason }),
         };
         if hooks_disabled_by_env() {
-            return refused(
-                format!(
-                    "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
-                ),
-                true,
-            );
+            return refused(format!(
+                "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
+            ));
         }
         if !policy.wants_instance_hooks() {
             return refused(
                 "instance continuity hooks refused: aggregate-only (metrics) sessions never join per-call records to load instances (Task 1d overhead gate)"
                     .to_string(),
-                false,
             );
         }
         let preparation = (|| {
@@ -444,7 +450,6 @@ impl InstanceTracking {
         PreparedInstanceTracking {
             programs: preparation.map_err(|error| HookPreparationRefusal {
                 reason: format!("instance continuity hooks unavailable: {error:#}"),
-                fail_coverage: true,
             }),
         }
     }
@@ -479,10 +484,7 @@ impl InstanceTracking {
         let loaded = match prepared.programs {
             Ok(loaded) => loaded,
             Err(refusal) => {
-                if refusal.fail_coverage {
-                    coverage.fail();
-                }
-                tracking.refused = Some(refusal.reason);
+                apply_prepare_refusal(coverage, &mut tracking, refusal.reason);
                 return tracking;
             }
         };
@@ -3078,6 +3080,29 @@ mod tests {
             }
             assert_eq!(called.get(), case != 0);
         }
+    }
+
+    /// A prepare refusal (LTO-unverifiable kernels, aggregate sessions)
+    /// records its reason and leaves coverage disabled (never-active),
+    /// never failed: only a mid-run failure fails coverage. The BPF
+    /// join gate consults exactly this distinction.
+    #[test]
+    fn prepare_refusal_records_reason_and_leaves_coverage_disabled() {
+        let coverage = super::super::image_query::CoverageControl::test_owner(false);
+        let mut tracking = super::InstanceTracking::default();
+        super::apply_prepare_refusal(
+            &coverage,
+            &mut tracking,
+            "instance continuity hooks refused: test refusal".to_string(),
+        );
+        assert_eq!(
+            tracking.refused(),
+            Some("instance continuity hooks refused: test refusal")
+        );
+        assert!(
+            coverage.enable().is_ok(),
+            "a prepare refusal must leave coverage disabled, not failed"
+        );
     }
 
     #[test]

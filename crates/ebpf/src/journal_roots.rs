@@ -189,6 +189,7 @@ pub(super) mod program {
         initialize_end,
     };
     use crate::*;
+    use p11scope_ebpf_common::object_flow::join_refusal_bump;
     use p11scope_ebpf_common::object_journal::{
         JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalEndFull,
     };
@@ -360,6 +361,11 @@ pub(super) mod program {
             let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
         }
         if !unsafe { continuity_joins(&(*raw).continuity) } {
+            // Decide accounting before the discard below invalidates
+            // `raw`: both reads are pure (reservation bytes, cell).
+            let bump = join_refusal_bump(unsafe { &(*raw).continuity }, unsafe {
+                p11_instance_coverage_cell()
+            });
             let outcome = preserve_refused_base(
                 || remove(&key, true, JOURNAL_REASON_IDENTITY_REFUSED) == 0,
                 || unsafe { p11_object_fault() },
@@ -376,7 +382,9 @@ pub(super) mod program {
                 bump_evidence(EVIDENCE_RING_LOSS);
             }
             gap();
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            if bump {
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
             return 0;
         }
         let Some(reason) = (unsafe { complete(record, &key, true) }) else {

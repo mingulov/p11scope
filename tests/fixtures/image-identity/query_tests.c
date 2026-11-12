@@ -39,6 +39,7 @@ static struct image_bank_select select_word;
 #endif
 static u64 coverage, flags, index_cookie, record_key, indexed_tgid, cookie, now;
 static int index_present, record_present, index_fail, record_fail, storage_busy;
+static int coverage_missing;
 static unsigned int index_updates, record_updates, storage_reads, writes;
 static struct image_continuity continuity;
 static struct image_continuity retired_continuity;
@@ -94,7 +95,7 @@ static u64 *index_slot(u64 tgid)
 }
 static void *lookup(void *map, const void *key)
 {
-    if (map == &INSTANCE_GEN) { assert(*(u32 *)key == 3); return &coverage; }
+    if (map == &INSTANCE_GEN) { assert(*(u32 *)key == 3); return coverage_missing ? 0 : &coverage; }
     if (map == &CONFIG) { assert(*(u32 *)key == 0); return &flags; }
 #ifdef P11SCOPE_LOADER_GATE
     if (map == &IMAGE_BANK_SELECT) {
@@ -217,6 +218,7 @@ static void reset(void)
     select_present = 1;
 #endif
     index_present = record_present = index_fail = record_fail = storage_busy = 0;
+    coverage_missing = 0;
     retired_present = record_race = 0; index_race_cookie = retired_key = 0;
     write_fail_at = -1; mutate_on_fresh = deadline_after_write = 0;
     hold_publication = 0;
@@ -505,5 +507,13 @@ int main(int argc, char **argv)
     assert(coverage == IMG_FAILED);
     puts("image continuity: qualified bank-B cookies seed, query and invalidate");
 #endif
+    /* Join-refusal accounting read: the raw coverage cell, all-ones
+     * when the map lookup misses (fail-closed: the refusal bumps). */
+    reset();
+    coverage = IMG_DISABLED; assert(p11_instance_coverage_cell() == IMG_DISABLED);
+    coverage = IMG_ENABLED; assert(p11_instance_coverage_cell() == IMG_ENABLED);
+    coverage = IMG_FAILED; assert(p11_instance_coverage_cell() == IMG_FAILED);
+    coverage_missing = 1; assert(p11_instance_coverage_cell() == ~0ULL);
+    coverage_missing = 0;
     puts("image continuity: entry/index_cookie/poison/query/limits verified");
 }

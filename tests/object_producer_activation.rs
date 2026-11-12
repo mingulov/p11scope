@@ -3242,6 +3242,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// bump-on-success shape, plus their comment lines): 149801 B,
 /// measured with this same lexer on the integrated source; the
 /// previous pin matches its parent.
+/// Re-baselined for the never-active coverage join-refusal silence
+/// (the only BPF source changes: the native coverage-cell read plus
+/// the shared decision helper and its three gated-arm call sites,
+/// with the decision hoisted before the reservation discard, plus
+/// their comment lines): 150308 B, measured with this same lexer on
+/// the integrated source; the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3251,8 +3257,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            149801,
-            "e9cabc05d9a6ea21a65790c38fed961552789e9693c62dbc0be7f4e13bc28b4a"
+            150308,
+            "7a7e9902b32552416ddae32812f272f5d9190616829911ed401be063993ed634"
         ),
         "stripped BPF dump must stay byte-identical"
     );

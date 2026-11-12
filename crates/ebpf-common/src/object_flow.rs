@@ -255,6 +255,21 @@ pub fn continuity_joins(continuity: &InstanceContinuity) -> bool {
     instance::stamp_joinable(continuity.entry_stamp, continuity.return_stamp)
 }
 
+/// Join-refusal accounting shared by every gated return arm: a refused
+/// join bumps `EVIDENCE_UNMATCHED_RETURNS` unless the entry stamp was
+/// never recorded AND continuity was never active (`coverage` reads
+/// `COVERAGE_DISABLED`: LTO-unverifiable kernels, aggregate sessions).
+/// A recorded-but-mismatched entry always bumps (genuine straddle), as
+/// does an unrecorded entry on an active or failed system (genuine
+/// per-call failure or mid-run failure) or an unreadable cell.
+#[inline(always)]
+pub fn join_refusal_bump(continuity: &InstanceContinuity, coverage: u64) -> bool {
+    if continuity_joins(continuity) {
+        return false;
+    }
+    instance::entry_recorded(continuity.entry_stamp) || coverage != instance::COVERAGE_DISABLED
+}
+
 /// Production Derive entry adapter body (H7-E3): fetch the arg-1 mechanism
 /// pointer, classify through the shared guard, then acquire arg 5 ONLY on
 /// membership. Refused mechanisms never fetch arg 5. `fetch_arg` supplies
@@ -3313,5 +3328,79 @@ mod tests {
                 "host tests never run stubbed"
             );
         }
+    }
+
+    fn recorded_stamp() -> crate::InstanceStamp {
+        crate::InstanceStamp {
+            epoch: 7,
+            global: 3,
+            fault: 1,
+            file_slot_plus1: 5,
+            flags: instance::STAMP_VALID,
+        }
+    }
+
+    fn continuity_of(entry: crate::InstanceStamp, ret: crate::InstanceStamp) -> InstanceContinuity {
+        InstanceContinuity {
+            entry_ip: 0x1000,
+            entry_stamp: entry,
+            return_stamp: ret,
+        }
+    }
+
+    /// Healthy twin: a joined call never bumps; a genuine straddle
+    /// (recorded entry, moved return) and an unrecorded entry on an
+    /// ACTIVE system (per-call failure: exec race, LRU eviction) always
+    /// bump, on every coverage state.
+    #[test]
+    fn joined_and_straddle_join_refusal_accounting() {
+        let recorded = recorded_stamp();
+        let moved = crate::InstanceStamp {
+            epoch: 8,
+            ..recorded
+        };
+        let blank = crate::InstanceStamp::default();
+        assert!(instance::stamp_joinable(recorded, recorded));
+        assert!(!instance::stamp_joinable(recorded, moved));
+        for coverage in [
+            instance::COVERAGE_DISABLED,
+            instance::COVERAGE_ENABLED,
+            instance::COVERAGE_FAILED,
+            u64::MAX,
+        ] {
+            assert!(
+                !join_refusal_bump(&continuity_of(recorded, recorded), coverage),
+                "joined call is silent on coverage {coverage}"
+            );
+            assert!(
+                join_refusal_bump(&continuity_of(recorded, moved), coverage),
+                "genuine straddle bumps on coverage {coverage}"
+            );
+        }
+        assert!(
+            join_refusal_bump(&continuity_of(blank, recorded), instance::COVERAGE_ENABLED),
+            "unrecorded entry on an active system bumps"
+        );
+    }
+
+    /// Failure twin: an unrecorded entry with coverage never-active
+    /// (LTO-unverifiable kernels: every vng guest) stays silent, while a
+    /// mid-run failure and an unreadable cell stay fail-closed (bump).
+    #[test]
+    fn never_active_coverage_silences_unstamped_join_refusal() {
+        let recorded = recorded_stamp();
+        let blank = crate::InstanceStamp::default();
+        assert!(
+            !join_refusal_bump(&continuity_of(blank, recorded), instance::COVERAGE_DISABLED),
+            "unstamped refusal with never-active coverage stays silent"
+        );
+        assert!(
+            join_refusal_bump(&continuity_of(blank, recorded), instance::COVERAGE_FAILED),
+            "unstamped refusal after a mid-run failure bumps"
+        );
+        assert!(
+            join_refusal_bump(&continuity_of(blank, recorded), u64::MAX),
+            "unstamped refusal with an unreadable cell bumps"
+        );
     }
 }

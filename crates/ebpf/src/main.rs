@@ -93,7 +93,7 @@ use p11scope_ebpf_common::object_flow::{
     adapter_derive_entry, adapter_emit_find_control, adapter_emit_get_control,
     adapter_fill_return_control, adapter_kem_entry, adapter_tail_fill, continuity_joins,
     decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
-    preserve_refused_base,
+    join_refusal_bump, preserve_refused_base,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_journal::{
@@ -3257,6 +3257,11 @@ unsafe extern "C" {
     fn p11_instance_entry(key: *const StartKey, ip: u64, cookie: u64, exec_id: u64) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
+    /// Join-refusal accounting read (native image_identity_query.c): the
+    /// raw image-coverage cell, or all-ones when unreadable (fail-closed).
+    /// Every gated return arm consults it before counting a refused join.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_instance_coverage_cell() -> u64;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
     /// 6.14 Option A exit-time mapping summary (native
@@ -4856,6 +4861,12 @@ fn object_return_ordinary(
     }
     let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
     if !joined {
+        // Decide accounting before the discard below invalidates `raw`:
+        // both reads are pure (reservation bytes, coverage cell).
+        let bump = join_refusal_bump(
+            unsafe { &(*raw).base.continuity },
+            unsafe { p11_instance_coverage_cell() },
+        );
         let outcome = preserve_refused_base(
             || owned_start_remove(&key, true).is_ok(),
             || unsafe { p11_object_fault() },
@@ -4875,7 +4886,9 @@ fn object_return_ordinary(
         if outcome == RefusedBaseOutcome::OutputFailed {
             bump_evidence(EVIDENCE_RING_LOSS);
         }
-        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        if bump {
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
         return 0;
     }
     let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
@@ -5053,6 +5066,12 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
     let raw = unsafe { Record::payload(reservation) };
     let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
     if !joined {
+        // Decide accounting before the discard below invalidates `raw`:
+        // both reads are pure (reservation bytes, coverage cell).
+        let bump = join_refusal_bump(
+            unsafe { &(*raw).base.continuity },
+            unsafe { p11_instance_coverage_cell() },
+        );
         let outcome = preserve_refused_base(
             || start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED).is_ok(),
             || unsafe { p11_object_fault() },
@@ -5076,7 +5095,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         if JOURNAL {
             journal_roots::program::gap();
         }
-        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        if bump {
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
         return 0;
     }
     let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };

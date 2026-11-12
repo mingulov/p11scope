@@ -107,6 +107,19 @@ static IMG_INLINE int image_allowed(void)
     u64 *cell = image_coverage();
     return cell && IMG_READ(*cell) == IMG_ENABLED;
 }
+/* Join-refusal accounting read for the gated return arms (Rust): the raw
+ * coverage cell (Disabled=0 never-active, Enabled=1, Failed=2). A
+ * missing cell reads all-ones, which never equals Disabled, so an
+ * unreadable cell stays fail-closed (the refusal bumps). Read-only:
+ * never enables, fails, or perturbs the cell. */
+__attribute__((noinline)) u64 p11_instance_coverage_cell(void)
+{
+    u64 *cell = image_coverage();
+    if (!cell)
+        return ~0ULL;
+    return IMG_READ(*cell);
+}
+
 static IMG_INLINE int image_cookie_valid(u64 cookie)
 {
 #ifdef P11SCOPE_LOADER_GATE

@@ -1727,20 +1727,35 @@ pub mod instance {
     /// Image continuity is Disabled=0, Enabled=1 or permanently Failed=2.
     pub const GEN_IMAGE_COVERAGE: u32 = 3;
     pub const GEN_CELLS: u32 = 4;
+    /// `INSTANCE_GEN[GEN_IMAGE_COVERAGE]` values. Mirror of the native
+    /// `IMG_DISABLED`/`IMG_ENABLED`/`IMG_FAILED` (`image_identity_query.h`).
+    /// Disabled means never-active (prepare refused: LTO-unverifiable
+    /// kernels, aggregate sessions); only a mid-run failure moves to
+    /// Failed. The join-refusal accounting consults exactly this split.
+    pub const COVERAGE_DISABLED: u64 = 0;
+    pub const COVERAGE_ENABLED: u64 = 1;
+    pub const COVERAGE_FAILED: u64 = 2;
     /// `INSTANCE_GEN[GEN_STICKY]`: a CLONE_VM child could not be marked.
     pub const STICKY_FORK_UNMARKED: u64 = 1;
 
     const BLOCKING: u16 =
         STAMP_NO_FILE | STAMP_NO_TASK | STAMP_SHARED_MM | STAMP_OVERFLOW | STAMP_LOCAL_FAULT;
 
+    /// The entry half of the join rule: the entry stamp was recorded
+    /// (valid, unblocked, naming a watched file). A refused join with a
+    /// recorded entry is a genuine straddle; without one it is unstamped,
+    /// which the coverage state classifies (never-active vs failed).
+    #[inline(always)]
+    pub(crate) const fn entry_recorded(entry: InstanceStamp) -> bool {
+        entry.flags & STAMP_VALID != 0 && entry.flags & BLOCKING == 0 && entry.file_slot_plus1 != 0
+    }
+
     /// The per-call half of the join rule: both stamps were taken, are equal
     /// (no straddle), name a watched file, and carry no refusal flag. The
     /// scan half (a stable observation with this epoch triple) is userspace's.
     #[inline(always)]
     pub const fn stamp_joinable(entry: InstanceStamp, ret: InstanceStamp) -> bool {
-        entry.flags & STAMP_VALID != 0
-            && entry.flags & BLOCKING == 0
-            && entry.file_slot_plus1 != 0
+        entry_recorded(entry)
             && entry.epoch == ret.epoch
             && entry.global == ret.global
             && entry.fault == ret.fault

@@ -82,6 +82,12 @@ LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
 # other live value still fails.
 AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
+# d0de7028c: aggregate captures (--mode metrics) write no per-call record,
+# so the loader keeps EVENTS at AGGREGATE_RING_BYTES (src/run.rs) instead
+# of the pinned 32 MiB default. The live comparison below expects exactly
+# the loader's 4 MiB report for EVENTS on aggregate-only lanes. No other
+# map, field, or lane is narrowed: any other live value still fails.
+AGGREGATE_ONLY_EVENTS_MAX_ENTRIES = 4 * 1024 * 1024
 # Owned (`run`-tree) lanes capture in Scope::Cgroup, where
 # discovery_ring_bytes (src/attach.rs) sizes DISCOVERY at
 # SHARED_SCOPE_DISCOVERY_BYTES. Pid scope loads the same compiled 2 MiB
@@ -693,9 +699,12 @@ def validate_inventory(maps, variant, privacy='allowlisted', workload_origin='ex
         dumper.snapshot_map_metadata(item)
         wanted = expected[item['name']]
         live_flags = LIVE_IMAGE_MAP_FLAGS.get(item['name'], wanted['flags'])
-        live_max = (1 if privacy == 'aggregate-only'
-                    and item['name'] in AGGREGATE_ONLY_SINGLETON_MAPS
-                    else wanted['max_entries'])
+        live_max = wanted['max_entries']
+        if privacy == 'aggregate-only':
+            if item['name'] in AGGREGATE_ONLY_SINGLETON_MAPS:
+                live_max = 1
+            elif item['name'] == 'EVENTS':
+                live_max = AGGREGATE_ONLY_EVENTS_MAX_ENTRIES
         if workload_origin == 'owned' and item['name'] == 'DISCOVERY':
             live_max = OWNED_DISCOVERY_MAX_ENTRIES
         live = (item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])

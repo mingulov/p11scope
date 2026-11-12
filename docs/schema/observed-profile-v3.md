@@ -455,7 +455,7 @@ files its own row once and the capture continues with ordinary
 discovery only.
 
 `deep_scan_selection` is present if and only if the initial discovery
-pass ran over the deep-scan cap (`--max-scan-pids`, default 256);
+pass ran over the deep-scan cap (`--max-scan-pids`, default 1024);
 otherwise the key is absent, never null. The profile, metrics and
 terminal trace lanes all publish it there. It carries the counted gap
 as four u64 counts: `processes` (user processes in scope at

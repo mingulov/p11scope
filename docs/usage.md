@@ -2759,7 +2759,7 @@ large provider costs kilobytes of table reads; the per-object gate no longer
 applies to that check, though it still guards memory snapshots and identity
 hashing. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
-cgroup discovery considers at most 256 members by default (`--max-scan-pids`)
+cgroup discovery considers at most 1024 members by default (`--max-scan-pids`)
 and planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;
 no retry renews a budget. On hosts where the per-CPU STATS table would exceed
 `max(64 MiB, 1% of RAM)`, the ceiling sizes down at load instead (never below

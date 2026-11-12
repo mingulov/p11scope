@@ -3565,7 +3565,14 @@ pub fn live_scoped(
 pub fn caller_text_line(caller: Option<&CaptureCaller>) -> Option<String> {
     let caller = caller?;
     match (&caller.exe, caller.exe_unknown_reason) {
-        (Some(exe), _) => Some(format!("caller: {}", escape_controls(exe))),
+        (Some(exe), _) => Some(match &caller.exec_from_exe {
+            Some(from) => format!(
+                "caller: {} (exec'd from {} during the capture)",
+                escape_controls(exe),
+                escape_controls(from)
+            ),
+            None => format!("caller: {}", escape_controls(exe)),
+        }),
         (None, Some(reason)) => Some(format!("caller unknown: {reason}")),
         (None, None) => Some("caller unknown: caller unresolved".to_string()),
     }
@@ -5553,7 +5560,8 @@ pub struct CaptureMeta<'a> {
     pub policy: CapturePolicy,
     /// Capture scope kind: `pid`, `cgroup`, or `system` (`Scope::kind`).
     pub scope: &'static str,
-    /// The pid-scope target's caller identity, resolved at attach time.
+    /// The pid-scope target's caller identity, reconciled at report time
+    /// from the attach-time read and the end-of-capture re-read.
     /// `None` for aggregate scopes (cgroup/system), which name no single
     /// caller by design. The renderer emits `capture.caller` only for
     /// pid scope with `Some`, so a stray `Some` can never leak a caller
@@ -5566,22 +5574,57 @@ pub struct CaptureMeta<'a> {
 }
 
 /// The pid-scope target's caller identity: the `/proc/<pid>/exe` link
-/// text read at attach time, or the finite reason it could not be read.
-/// Exactly one of the two is `Some`. No PID number is carried: profile
-/// and metrics reports do not publish raw PID/TID (allowlist v1); the
-/// operator's own target pid is named on stderr diagnostics only.
+/// text at report time — the end-of-capture executable, after a
+/// mid-capture exec — or the finite reason it could not be read.
+/// Exactly one of `exe`/`exe_unknown_reason` is `Some`. No PID number is
+/// carried: profile and metrics reports do not publish raw PID/TID
+/// (allowlist v1); the operator's own target pid is named on stderr
+/// diagnostics only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureCaller {
     /// Target executable path, lossy UTF-8 from the exe link.
     pub exe: Option<String>,
     /// Finite reason when `exe` is `None`, else `None`.
     pub exe_unknown_reason: Option<&'static str>,
+    /// The attach-time exe when the end-of-capture re-read proved the
+    /// target exec'd (two different known exes for one pinned process):
+    /// text lines name both programs from it. Text-only — the JSON
+    /// `capture.caller` keeps exactly its two allowlisted keys.
+    pub exec_from_exe: Option<String>,
+}
+
+/// Reconcile the attach-time caller identity with the end-of-capture
+/// re-read of the same pinned target, so the report names the program
+/// that made the calls. A changed known exe proves a mid-capture exec:
+/// the end exe wins and the attach-time exe rides `exec_from_exe` for
+/// the plain-words text transition. An unknown end read never erases a
+/// known attach exe (the target exited after making its calls as that
+/// program); a known end read upgrades an unknown attach without
+/// claiming an exec; two unknown reads keep the attach-time reason. A
+/// re-exec of the same path is invisible — and needs no saying, since
+/// the name is unchanged.
+pub fn reconcile_caller_exec(attach: &CaptureCaller, end: CaptureCaller) -> CaptureCaller {
+    match (&attach.exe, &end.exe) {
+        (Some(attach_exe), Some(end_exe)) if attach_exe != end_exe => CaptureCaller {
+            exe: Some(end_exe.clone()),
+            exe_unknown_reason: None,
+            exec_from_exe: Some(attach_exe.clone()),
+        },
+        (_, Some(_)) => CaptureCaller {
+            exe: end.exe,
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        },
+        _ => attach.clone(),
+    }
 }
 
 /// `capture.caller`, present if and only if this is a pid-scope capture
 /// with resolved caller identity: `{exe, exe_unknown_reason}` with
 /// exactly one non-null. Aggregate scopes emit no key — absent, never
-/// null — and neither does a pid scope that resolved nothing.
+/// null — and neither does a pid scope that resolved nothing. The
+/// exec-transition exe (`exec_from_exe`) never reaches JSON: text lines
+/// name both programs, the report names the end-of-capture one.
 fn caller_out(scope: &str, caller: Option<&CaptureCaller>) -> Option<serde_json::Value> {
     if scope != "pid" {
         return None;
@@ -7777,6 +7820,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: Some("/opt/target/harness".to_string()),
                 exe_unknown_reason: None,
+                exec_from_exe: None,
             }),
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
@@ -14635,6 +14679,7 @@ pub(crate) mod tests {
         let caller = CaptureCaller {
             exe: Some("/usr/bin/python3.14".into()),
             exe_unknown_reason: None,
+            exec_from_exe: None,
         };
         for verbosity in [
             crate::cli::TextVerbosity::Concise,
@@ -14667,6 +14712,7 @@ pub(crate) mod tests {
         let unknown = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("exe_unreadable"),
+            exec_from_exe: None,
         };
         let out = live_scoped_with_caller(
             &[],
@@ -14754,6 +14800,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some("target exe link unreadable"),
+                exec_from_exe: None,
             }),
             ..capture_fixture()
         };
@@ -14800,10 +14847,7 @@ pub(crate) mod tests {
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(
-            reconciled.exec_from_exe.as_deref(),
-            Some("/usr/bin/bash")
-        );
+        assert_eq!(reconciled.exec_from_exe.as_deref(), Some("/usr/bin/bash"));
     }
 
     #[test]
@@ -14880,16 +14924,13 @@ pub(crate) mod tests {
         };
         assert_eq!(
             caller_text_line(Some(&caller)).as_deref(),
-            Some(
-                "caller: /usr/bin/pkcs11-tool (exec'd from /usr/bin/bash during the capture)"
-            )
+            Some("caller: /usr/bin/pkcs11-tool (exec'd from /usr/bin/bash during the capture)")
         );
         for verbosity in [
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let line =
-                caller_text_line(Some(&caller)).expect("a known caller renders a line");
+            let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
             assert!(
                 line.contains("caller: /usr/bin/pkcs11-tool"),
                 "{verbosity:?} names the end-of-capture program: {line}"

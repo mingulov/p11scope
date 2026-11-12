@@ -5161,7 +5161,9 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     let mut malformed_records: u64 = 0;
     let mut handoff_gaps: Vec<render::SkippedOut> = Vec::new();
     // The pid-scope target, named once here as the loop would have named
-    // it at its start; the terminal reuses the value and never re-reads.
+    // it at its start; the seal below re-reads the same pin and
+    // reconciles, so a mid-capture exec replaces this attach-time name
+    // with the end-of-capture executable.
     let target_caller = match context.scope {
         Scope::Pid(pid) => {
             let owned_pin = context.owned.child.as_ref().map(|child| child.pin());
@@ -5400,6 +5402,27 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         render::apply_counter_snapshot(&mut ev, snapshot);
         render::apply_legacy_gaps(&mut ev, snapshot);
     }
+    // The end-of-capture exe re-read, mirroring the capture loop's
+    // terminal: a mid-capture exec replaces the attach-time name with the
+    // program that made the calls, and the stderr note names both. The
+    // re-read binds the same retained pin, so a recycled pid can never
+    // misattach an unrelated program's exe.
+    let terminal_caller: Option<render::CaptureCaller> = match (context.scope, &target_caller) {
+        (Scope::Pid(pid), Some(attach)) => {
+            let owned_pin = context.owned.child.as_ref().map(|child| child.pin());
+            let engine_pin = context.engine.pid_target_pin(*pid);
+            let pin = owned_pin.or(engine_pin.as_deref());
+            let reconciled = render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
+            if let (Some(to), Some(from)) = (
+                reconciled.exe.as_deref(),
+                reconciled.exec_from_exe.as_deref(),
+            ) {
+                emit_capture_diagnostic(&target_exec_line(*pid, from, to));
+            }
+            Some(reconciled)
+        }
+        _ => target_caller.clone(),
+    };
     let facts = context.engine.capture_facts();
     let frame = render::live_scoped_with_caller(
         &reports,
@@ -5410,7 +5433,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         context.policy,
         context.scope.kind(),
         state.mechanisms(),
-        target_caller.as_ref(),
+        terminal_caller.as_ref(),
         crate::cli::text_verbosity(),
         &state.sessions(),
         state.logins(),
@@ -5448,7 +5471,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             kernel: &kernel,
             policy: context.policy,
             scope: context.scope.kind(),
-            caller: target_caller,
+            caller: terminal_caller,
             // The loader's own resolver: an owned run takes no journal, so the
             // disclosure is the ring that was loaded (4 MiB for metrics).
             ring_bytes: resolve_capture_ring_bytes(context.policy, false, context.ring_bytes),
@@ -8501,6 +8524,7 @@ fn resolve_pid_caller_with(
     let exited = || render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(TARGET_CALLER_EXITED),
+        exec_from_exe: None,
     };
     if !still_same() {
         return exited();
@@ -8514,6 +8538,7 @@ fn resolve_pid_caller_with(
         return render::CaptureCaller {
             exe: Some(exe),
             exe_unknown_reason: None,
+            exec_from_exe: None,
         };
     }
     let reason = if proven_exited(pid) {
@@ -8524,6 +8549,7 @@ fn resolve_pid_caller_with(
     render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(reason),
+        exec_from_exe: None,
     }
 }
 
@@ -8543,6 +8569,19 @@ pub(crate) fn target_caller_line(pid: u32, caller: &render::CaptureCaller) -> St
         }
         (None, None) => format!("p11scope: target: pid {pid} caller unknown: caller unresolved"),
     }
+}
+
+/// The pid-scope end-of-capture stderr note, emitted beside the terminal
+/// report when the end-of-capture exe re-read proved the target exec'd:
+/// the operator's own target pid beside the program that made the calls,
+/// with the attach-time program beside it. Both exes are
+/// target-controlled, so both are control-escaped at this boundary.
+pub(crate) fn target_exec_line(pid: u32, from_exe: &str, to_exe: &str) -> String {
+    format!(
+        "p11scope: target: pid {pid} exe {} (exec'd from {} during the capture)",
+        crate::render::escape_controls(to_exe),
+        crate::render::escape_controls(from_exe)
+    )
 }
 
 fn loader_readiness_line(active_hooks: usize) -> String {
@@ -9234,13 +9273,12 @@ fn capture_profile(
     }
     // The pid-scope target, resolved once probes are attached (usually
     // alive; an exit between attach and the read is named via the exit
-    // reason): stderr names it beside the readiness line, and the
-    // terminal report carries the same identity. The read is bound to
-    // the target's retained pin — the owned child's pin on the degraded
-    // run path, else the named view's — so a recycled pid never
-    // misattaches an unrelated program's exe. At report time the target
-    // may be long gone, so the terminal block reuses this value and
-    // never re-reads.
+    // reason): stderr names it beside the readiness line. The read is
+    // bound to the target's retained pin — the owned child's pin on the
+    // degraded run path, else the named view's — so a recycled pid never
+    // misattaches an unrelated program's exe. The terminal block re-reads
+    // the same pin and reconciles: a mid-capture exec replaces this
+    // attach-time name with the end-of-capture executable.
     let target_caller = match scope {
         Scope::Pid(pid) => {
             let owned_pin = owned
@@ -10428,6 +10466,34 @@ fn capture_profile(
         render::apply_counter_snapshot(&mut ev, &snapshot);
         render::apply_legacy_gaps(&mut ev, &snapshot);
         render::apply_snapshot_failure(&mut ev, &snapshot);
+        // The end-of-capture exe re-read: a mid-capture exec replaces the
+        // attach-time name with the program that made the calls, and the
+        // stderr note names both. The re-read binds the same retained pin
+        // (the owned child's, else the named view's), so a recycled pid can
+        // never misattach an unrelated program's exe; an unknown end read
+        // keeps the attach-time identity.
+        let terminal_caller: Option<render::CaptureCaller> = match (scope, target_caller) {
+            (Scope::Pid(pid), Some(attach)) => {
+                let owned_pin = context
+                    .2
+                    .as_deref()
+                    .and_then(|owned| owned.child.as_ref())
+                    .filter(|child| child.pid() == *pid)
+                    .map(|child| child.pin());
+                let engine_pin = context.0.pid_target_pin(*pid);
+                let pin = owned_pin.or(engine_pin.as_deref());
+                let reconciled =
+                    render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
+                if let (Some(to), Some(from)) = (
+                    reconciled.exe.as_deref(),
+                    reconciled.exec_from_exe.as_deref(),
+                ) {
+                    emit_capture_diagnostic(&target_exec_line(*pid, from, to));
+                }
+                Some(reconciled)
+            }
+            _ => target_caller.clone(),
+        };
         let facts = context.0.capture_facts();
         let mut frame = render::live_snapshot_scoped(
             &snapshot,
@@ -10438,7 +10504,7 @@ fn capture_profile(
             policy,
             scope.kind(),
             consumers.state.mechanisms(),
-            target_caller.as_ref(),
+            terminal_caller.as_ref(),
             &consumers.state.sessions(),
             consumers.state.logins(),
         );
@@ -10502,7 +10568,7 @@ fn capture_profile(
                 kernel: &kernel,
                 policy,
                 scope: scope.kind(),
-                caller: target_caller.clone(),
+                caller: terminal_caller,
                 // The loader's own resolver; `capture_profile` never takes a
                 // journal, so the disclosure is the ring that was loaded.
                 ring_bytes: resolve_capture_ring_bytes(policy, false, ring_bytes),
@@ -26475,6 +26541,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/opt/target/harness".to_string()),
             exe_unknown_reason: None,
+            exec_from_exe: None,
         };
         assert_eq!(
             target_caller_line(4242, &caller),
@@ -26488,6 +26555,7 @@ int main(int argc, char **argv) {
             let caller = render::CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some(reason),
+                exec_from_exe: None,
             };
             assert_eq!(
                 target_caller_line(4242, &caller),
@@ -26503,6 +26571,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/tmp/x\x1b[1m".to_string()),
             exe_unknown_reason: None,
+            exec_from_exe: None,
         };
         let line = target_caller_line(4242, &caller);
         assert!(!line.contains('\x1b'), "{line}");

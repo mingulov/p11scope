@@ -9367,6 +9367,91 @@ mod tests {
     }
 
     #[test]
+    fn stale_supported_disagreeing_unfinished_table_stays_count_only_without_carry() {
+        // A3 twin (stale-port): a 68-slot stale-manifest replacement
+        // whose exports disagree (swapped own-object targets, 66/68
+        // agreeing) on an unfinished scan. Owner ruling 05:25: a stale
+        // manifest grants NOTHING; only the replacement table's own
+        // layout evidence counts. The fresh lowering stays COUNT_ONLY
+        // and the unfinished re-proof carries nothing across.
+        let mut disagreeing = sole_complete_module();
+        let entries = &mut disagreeing.scanned.tables[0].entries;
+        let sign_init = entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        let verify = entries
+            .iter()
+            .position(|entry| entry.name == "C_Verify")
+            .expect("C_Verify entry");
+        let swapped = entries[sign_init].file_offset;
+        entries[sign_init].file_offset = entries[verify].file_offset;
+        entries[verify].file_offset = swapped;
+        disagreeing.scanned.tables[0].manifest_supported = true;
+        disagreeing.scanned.tables_scan_finished = false;
+        let fresh = build_from_sources(
+            std::slice::from_ref(&disagreeing),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(fresh.slots.len(), 68, "all entries stay admitted");
+        assert_eq!(
+            fresh.modules[0].tables[0].exports_agreeing,
+            Some(66),
+            "the replacement disagrees with its own exports"
+        );
+        assert_eq!(
+            fresh.modules[0].tables[0].linkage, "manifest",
+            "stale support reaches the score"
+        );
+        assert_plan_count_only(&fresh, "stale disagreeing unfinished table");
+        assert!(
+            fresh.standard_layout_evidence().is_empty(),
+            "no layout basis is recorded for a refused table"
+        );
+        assert!(
+            fresh.slots.iter().all(|slot| slot.names != ["unknown"]),
+            "the stale fallback still lends names"
+        );
+        assert!(
+            fresh.reproven_unfinished_slots.is_empty(),
+            "a disagreeing stale table re-proves nothing unfinished"
+        );
+        // Carry: a verified plan meeting the same disagreeing
+        // unfinished rescan must downgrade, never carry old descriptors.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "the sole-complete scan grants first"
+        );
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&disagreeing),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            rebuilt.reproven_unfinished_slots.is_empty(),
+            "a disagreeing stale rescan carries no re-proof permission"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            !delta.replace.is_empty(),
+            "a disagreeing stale table must still downgrade attached semantic slots"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index == 0),
+            "disagreeing stale tables leave count-only descriptors behind"
+        );
+        assert_eq!(
+            plan.standard_layout_slot_count(),
+            0,
+            "no carried slot keeps a standard-layout basis"
+        );
+    }
+
+    #[test]
     fn live_sibling_with_incomplete_return_keeps_static_grant_without_replace() {
         // Fedora pair with an unreconciled live table: the observed
         // return has not bound its entry objects yet, so the

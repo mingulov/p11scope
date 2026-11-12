@@ -815,11 +815,19 @@ if degraded:
     # the run deadline, the designed collection bound (ruling CI-GAP-2,
     # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
     # plus the named module-level positive (excluded above).
+    # A straddling pass also refuses a staged refresh of an
+    # already-active owner by name (a permit-missing refresh refuses
+    # at any outcome) and retains its facts: the incomplete
+    # transaction marks nobody, the disclosure names the caller, and
+    # the owner's data stays published. One row per owning caller.
+    # The bare member-lost variant (no retention suffix: the member
+    # died after the final sample of a still-complete transaction)
+    # is deliberately NOT known here: it fails loudly below.
     # The unproven member gaps degrade per caller without incompleting
     # the shared transaction, so 'cgroup member scan was incomplete'
     # is deliberately NOT known here: its reappearance fails loudly
     # below instead of hiding.
-    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
+    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
     assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
     assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))

@@ -38,11 +38,11 @@ const LEARN_WORKER_BOUND: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Runs `work` on a named helper thread, waiting at most `bound` for
 /// it: `Some` when it finishes in time, `None` on timeout (the helper
-/// is detached — forgotten, so it finishes on its own holding only
-/// its own fds — and the caller never blocks past the bound), on
-/// spawn failure, or on panic. The arming mark pass uses this so a
-/// hung mount cannot wedge the start; the end join applies the same
-/// bound through the drain's done channel below.
+/// handle is dropped, which detaches the thread, so it finishes on
+/// its own holding only its own fds — and the caller never blocks
+/// past the bound), on spawn failure, or on panic. The arming mark
+/// pass uses this so a hung mount cannot wedge the start; the end
+/// join applies the same bound through the drain's done channel below.
 fn run_with_bound<T: Send + 'static>(
     name: &str,
     bound: std::time::Duration,
@@ -68,7 +68,9 @@ fn run_with_bound<T: Send + 'static>(
             None
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            std::mem::forget(helper);
+            // Dropping the handle detaches the helper; forgetting it
+            // would leave the thread joinable (leaked) instead.
+            drop(helper);
             None
         }
     }
@@ -934,10 +936,10 @@ impl FileLearner {
     /// an unsent message or unread queue contents at shutdown, a drain
     /// thread that panicked, or a join that hit the worker bound. A
     /// drain stuck in a hung mark open (hard NFS, dead FUSE) is
-    /// detached at the bound — forgotten, holding only its own fds and
-    /// sender, exiting on its own once the hang clears — and counts as
-    /// lost. The engine files that loss loudly (the overflow
-    /// aggregate). Bounded: the report is never blocked.
+    /// detached at the bound — its handle is dropped, holding only its
+    /// own fds and sender, exiting on its own once the hang clears —
+    /// and counts as lost. The engine files that loss loudly (the
+    /// overflow aggregate). Bounded: the report is never blocked.
     pub(crate) fn shutdown_and_join(&mut self) -> bool {
         self.state.shutdown.store(true, Ordering::Release);
         // A never-begun learner holds the only sender: drop it so the
@@ -957,7 +959,9 @@ impl FileLearner {
                     lost = true;
                 }
             } else {
-                std::mem::forget(worker.handle);
+                // Dropping the handle detaches the drain; forgetting
+                // it would leave the thread joinable (leaked) instead.
+                drop(worker.handle);
                 lost = true;
             }
         }

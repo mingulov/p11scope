@@ -3566,7 +3566,7 @@ fn joint_machine_shed_taint_lifts_when_image_binds_within_grace() {
             .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
         "shed-taints still land at once"
     );
-    let _caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
     fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
     fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
     fixture.published_labeled("fast-binding", None);
@@ -3586,6 +3586,17 @@ fn joint_machine_shed_taint_lifts_when_image_binds_within_grace() {
             .adapter()
             .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
         "binding within grace lifts the shed-taint"
+    );
+    // JK-19b residue: the lift does not rewrite history. The bind
+    // named joint_image_refused while the image was still refused
+    // (its first calls genuinely were not tracked); the gap row stays
+    // while the feed tracks from the lift on.
+    assert!(
+        registry.gaps().iter().any(|gap| gap.caller == Some(caller)
+            && gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+            && gap.reason == "joint_image_refused"),
+        "the lifted image keeps its refused gap row: {:?}",
+        registry.gaps()
     );
 }
 

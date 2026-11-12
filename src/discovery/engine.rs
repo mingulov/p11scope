@@ -13771,6 +13771,16 @@ impl Engine {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
+        // Kernel threads never count: a proven kthread's exit leaves
+        // the ledger untouched (no gap, no hint, no stash drop — a
+        // reused pid's user generation owns its entries now).
+        // Fail-closed: unclassifiable pids count on.
+        if self.known_kernel_threads.contains(&pid) || pid_is_kernel_thread(&self.proc_root, pid) {
+            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
+                self.known_kernel_threads.insert(pid);
+            }
+            return;
+        }
         if self
             .admitted_cgroup_views
             .values()
@@ -15379,6 +15389,17 @@ impl Engine {
         if self.newcomer_first_seen.contains_key(&pid) {
             return;
         }
+        // Kernel threads never count: a proven kthread takes no
+        // arrival mark, so its departure never gaps at prune or
+        // finish. The scope walk usually classified it already; the
+        // live check covers direct marks. Fail-closed: unclassifiable
+        // pids mark on.
+        if self.known_kernel_threads.contains(&pid) || pid_is_kernel_thread(&self.proc_root, pid) {
+            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
+                self.known_kernel_threads.insert(pid);
+            }
+            return;
+        }
         if self.newcomer_first_seen.len() >= crate::timing::MAX_NEWCOMER_MARKS {
             self.newcomer_ages.note_mark_dropped();
             return;
@@ -15490,7 +15511,24 @@ impl Engine {
         let bound = previous_start.unwrap_or(0);
         self.scope_listed_since.retain(|pid, _| live.contains(pid));
         for pid in live {
+            if !self.scope_listed_since.contains_key(pid) {
+                self.classify_newly_listed_pid(*pid);
+            }
             self.scope_listed_since.entry(*pid).or_insert(bound);
+        }
+    }
+
+    /// Classify one newly listed pid for the kernel-thread ledger
+    /// exclusion: a proven kthread joins the known set (its exit
+    /// never gaps), a user pid leaves it (PID reuse never inherits
+    /// the mark). Fail-closed: past the bound new marks drop.
+    fn classify_newly_listed_pid(&mut self, pid: u32) {
+        if pid_is_kernel_thread(&self.proc_root, pid) {
+            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
+                self.known_kernel_threads.insert(pid);
+            }
+        } else {
+            self.known_kernel_threads.remove(&pid);
         }
     }
 
@@ -15522,6 +15560,12 @@ impl Engine {
             self.newcomer_first_seen.remove(&pid);
             let counted = self.newcomer_counted.remove(&pid);
             if counted == Some(NewcomerGapCount::Exit) {
+                continue;
+            }
+            // Belt-and-braces: marks never form for proven
+            // kthreads, but a mark that somehow names one still
+            // never gaps.
+            if self.known_kernel_threads.contains(&pid) {
                 continue;
             }
             let bound = self.newcomer_generation_bound(pid);
@@ -15566,6 +15610,10 @@ impl Engine {
             .copied()
             .collect();
         for pid in remaining {
+            // Belt-and-braces, like the prune sweep above.
+            if self.known_kernel_threads.contains(&pid) {
+                continue;
+            }
             self.newcomer_counted.insert(pid, NewcomerGapCount::Finish);
             self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
         }

@@ -1848,6 +1848,12 @@ pub struct Session {
     discovery_staged: DiscoveryStage,
     root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
+    /// Slots the latest `attach_targets` call left unfinished by fd
+    /// exhaustion (fix6 A3), overwritten per call: the engine withholds
+    /// exactly these for a next-tick retry instead of deactivating them.
+    /// They stay in the call's `failed` list (partial links still detach)
+    /// but out of `attach_failures` evidence (they never failed).
+    attach_exhausted: BTreeSet<u32>,
     detach_failures: Vec<String>,
     /// Attach units whose detach failed (ruling JK-22a): only these refuse
     /// future attachment, through [`attachment_admission_for`]. Unrelated
@@ -3034,6 +3040,13 @@ pub(crate) struct AttachOutcome {
     /// or failure entry were never attempted. Fresh attach reports the one
     /// shared summary; the group rebuild records every remainder explicitly.
     exhausted: bool,
+    /// Slots exhaustion left unfinished (fix6 A3): the summary slot plus
+    /// every never-attempted remainder. The engine withholds exactly these
+    /// for a next-tick retry; pre-exhaustion real failures are absent.
+    exhausted_slots: BTreeSet<u32>,
+    /// The exhaustion came from `ENFILE` (the system file table), not
+    /// `EMFILE`: evidence names the full table from this.
+    exhausted_enfile: bool,
 }
 
 type SlotCompletion = (u32, Option<u64>);
@@ -4493,25 +4506,36 @@ fn extract_selected_links(
     taken
 }
 
+/// The exhaustion remedy tail: the process-limit raise for `EMFILE`
+/// (byte-identical to the historical wording), the system-table note
+/// for `ENFILE` — which must never misdirect to `ulimit`.
+fn exhaustion_remedy(enfile: bool) -> &'static str {
+    if enfile {
+        "the system file table is full (ENFILE)"
+    } else {
+        "raise RLIMIT_NOFILE (ulimit -n) and retry"
+    }
+}
+
 /// Explicit failure for a slot left without a completed pair when fd exhaustion
 /// stops attachment. Callers detach and deactivate exactly the failed indices,
 /// so an unlisted slot would stay link-less or keep an entry-less return link.
-fn unfinished_after_exhaustion(slot: u32) -> (u32, String) {
+fn unfinished_after_exhaustion(slot: u32, enfile: bool) -> (u32, String) {
     (
         slot,
         format!(
-            "fd table exhausted before slot {slot} was fully attached; \
-             raise RLIMIT_NOFILE (ulimit -n) and retry"
+            "fd table exhausted before slot {slot} was fully attached; {}",
+            exhaustion_remedy(enfile)
         ),
     )
 }
 
-fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
+fn exhausted_multi(slot: u32, endpoints: usize, links: usize, enfile: bool) -> (u32, String) {
     (
         slot,
         format!(
-            "fd table exhausted attaching slot {slot} ({endpoints} endpoints across {links} links); \
-             raise RLIMIT_NOFILE (ulimit -n) and retry"
+            "fd table exhausted attaching slot {slot} ({endpoints} endpoints across {links} links); {}",
+            exhaustion_remedy(enfile)
         ),
     )
 }
@@ -4554,11 +4578,13 @@ fn attach_target_groups_observed_with<T>(
         // belongs entirely to completed or entirely to failed members.
         let mut settled: BTreeSet<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
         settled.extend(outcome.completed.iter().map(|(slot, _)| *slot));
+        let enfile = outcome.exhausted_enfile;
         for member in groups.iter().flat_map(|group| &group.members) {
             if settled.insert(member.slot.index) {
                 outcome
                     .failures
-                    .push(unfinished_after_exhaustion(member.slot.index));
+                    .push(unfinished_after_exhaustion(member.slot.index, enfile));
+                outcome.exhausted_slots.insert(member.slot.index);
             }
         }
     }
@@ -4602,12 +4628,14 @@ fn attach_target_groups_unsettled<T>(
             Err(GroupHalt::Unsupported(error)) => {
                 return Err(BackendFallbackRequired::unsupported(error));
             }
-            Err(GroupHalt::Exhausted(_)) => {
+            Err(GroupHalt::Exhausted(error)) => {
                 let first = group.members.first().expect("groups are never empty");
+                let enfile = error.raw_os_error() == Some(libc::ENFILE);
                 failures.push(exhausted_multi(
                     first.slot.index,
                     successful.len(),
                     links_attached,
+                    enfile,
                 ));
                 return Ok((
                     bundles,
@@ -4617,6 +4645,8 @@ fn attach_target_groups_unsettled<T>(
                         completed,
                         continuity_rounds,
                         exhausted: true,
+                        exhausted_slots: BTreeSet::from([first.slot.index]),
+                        exhausted_enfile: enfile,
                     },
                 ));
             }
@@ -4674,11 +4704,13 @@ fn attach_target_groups_unsettled<T>(
             Err(GroupHalt::Unsupported(error)) => {
                 return Err(BackendFallbackRequired::unsupported(error));
             }
-            Err(GroupHalt::Exhausted(_)) => {
+            Err(GroupHalt::Exhausted(error)) => {
+                let enfile = error.raw_os_error() == Some(libc::ENFILE);
                 failures.push(exhausted_multi(
                     paired[0].slot.index,
                     successful.len(),
                     links_attached,
+                    enfile,
                 ));
                 return Ok((
                     bundles,
@@ -4688,6 +4720,8 @@ fn attach_target_groups_unsettled<T>(
                         completed,
                         continuity_rounds,
                         exhausted: true,
+                        exhausted_slots: BTreeSet::from([paired[0].slot.index]),
+                        exhausted_enfile: enfile,
                     },
                 ));
             }
@@ -4730,6 +4764,8 @@ fn attach_target_groups_unsettled<T>(
             completed,
             continuity_rounds,
             exhausted: false,
+            exhausted_slots: BTreeSet::new(),
+            exhausted_enfile: false,
         },
     ))
 }
@@ -4807,6 +4843,8 @@ fn reattach_rebuilt_groups_observed_with<T>(
     let mut completed = Vec::new();
     let mut continuity_rounds = Vec::new();
     let mut exhausted = false;
+    let mut exhausted_slots = BTreeSet::new();
+    let mut exhausted_enfile = false;
     for (position, group) in groups.iter().enumerate() {
         let later = || {
             groups[position + 1..]
@@ -4845,6 +4883,8 @@ fn reattach_rebuilt_groups_observed_with<T>(
                             completed,
                             continuity_rounds,
                             exhausted,
+                            exhausted_slots,
+                            exhausted_enfile,
                         },
                     );
                 }
@@ -4855,20 +4895,26 @@ fn reattach_rebuilt_groups_observed_with<T>(
                 // a partial link — and every member without an entry is
                 // recorded explicitly instead of staying silently link-less.
                 exhausted = true;
+                exhausted_enfile = outcome.exhausted_enfile;
                 let failed: BTreeSet<u32> =
                     outcome.failures.iter().map(|(slot, _)| *slot).collect();
                 failures.extend(outcome.failures);
+                exhausted_slots.extend(outcome.exhausted_slots);
                 detach_rebuild_round(&mut detach_bundles, bundles);
-                fail_unreattached(
-                    &mut failures,
-                    round
-                        .members
-                        .iter()
-                        .map(|member| member.slot.index)
-                        .filter(|slot| !failed.contains(slot))
-                        .chain(later()),
-                    "fd table exhausted; raise RLIMIT_NOFILE (ulimit -n) and retry",
-                );
+                let unattached: Vec<u32> = round
+                    .members
+                    .iter()
+                    .map(|member| member.slot.index)
+                    .filter(|slot| !failed.contains(slot))
+                    .chain(later())
+                    .collect();
+                let reason = if exhausted_enfile {
+                    "fd table exhausted; the system file table is full (ENFILE)"
+                } else {
+                    "fd table exhausted; raise RLIMIT_NOFILE (ulimit -n) and retry"
+                };
+                fail_unreattached(&mut failures, unattached.iter().copied(), reason);
+                exhausted_slots.extend(unattached);
                 return (
                     kept,
                     AttachOutcome {
@@ -4877,6 +4923,8 @@ fn reattach_rebuilt_groups_observed_with<T>(
                         completed,
                         continuity_rounds,
                         exhausted,
+                        exhausted_slots,
+                        exhausted_enfile,
                     },
                 );
             }
@@ -4923,6 +4971,8 @@ fn reattach_rebuilt_groups_observed_with<T>(
             completed,
             continuity_rounds,
             exhausted,
+            exhausted_slots,
+            exhausted_enfile,
         },
     )
 }
@@ -5010,15 +5060,29 @@ fn slot_attach_point(slot: &Slot) -> UProbeAttachPoint<'static> {
     }
 }
 
-/// True when the attach error chain bottoms out at EMFILE: the fd table is
-/// full, so every further link would fail identically.
+/// True when the attach error chain bottoms out at handle exhaustion
+/// ([`is_handle_exhaustion_errno`](crate::fd_budget::is_handle_exhaustion_errno)):
+/// the fd table is full, so every further link would fail identically.
 pub(crate) fn is_fd_exhaustion(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<io::Error>(),
-            Some(io) if io.raw_os_error() == Some(libc::EMFILE)
+            Some(io)
+                if io
+                    .raw_os_error()
+                    .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
         )
     })
+}
+
+/// The first open(2)-family errno in the attach error chain, if any: the
+/// exhaustion summaries name the full table from it (`ENFILE` is the
+/// system table, not the process limit). `None` only when no io cause
+/// exists — impossible beside a true [`is_fd_exhaustion`].
+fn attach_chain_errno(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>()?.raw_os_error())
 }
 
 fn static_attach_error(
@@ -5170,29 +5234,35 @@ fn attach_targets_observed_with_roots_journal(
     let mut continuity_rounds = Vec::new();
     let mut timings = BTreeMap::<u32, pid_continuity::RoundClock>::new();
     let mut return_attached = BTreeSet::new();
-    // EMFILE ends the run with one summary: links are retained, so no later
-    // slot could succeed once the table is full.
+    // Exhaustion ends the run with one summary: links are retained, so no
+    // later slot could succeed once the table is full.
     let exhausted =
         |slot: &Slot, successful: &BTreeSet<(u32, ProbeSide)>, error: &anyhow::Error| {
+            let enfile = attach_chain_errno(error) == Some(libc::ENFILE);
             (
                 slot.index,
                 format!(
-                    "fd table exhausted attaching slot {} ({} links attached); \
-                 raise RLIMIT_NOFILE (ulimit -n) and retry: {error:#}",
+                    "fd table exhausted attaching slot {} ({} links attached); {}: {error:#}",
                     slot.index,
-                    successful.len()
+                    successful.len(),
+                    exhaustion_remedy(enfile)
                 ),
             )
         };
     // After the summary, fail every slot without a completed pair explicitly:
     // callers detach and deactivate exactly the failed indices, so an
     // unlisted slot would stay link-less or keep a return that can never pair.
-    let fail_unfinished = |failures: &mut Vec<(u32, String)>, completed: &[(u32, Option<u64>)]| {
+    // Every such slot also joins the exhausted set for a next-tick retry.
+    let fail_unfinished = |failures: &mut Vec<(u32, String)>,
+                           completed: &[(u32, Option<u64>)],
+                           exhausted_slots: &mut BTreeSet<u32>,
+                           enfile: bool| {
         let mut settled: BTreeSet<u32> = failures.iter().map(|(slot, _)| *slot).collect();
         settled.extend(completed.iter().map(|(slot, _)| *slot));
         for (slot, _) in &targets {
             if settled.insert(slot.index) {
-                failures.push(unfinished_after_exhaustion(slot.index));
+                failures.push(unfinished_after_exhaustion(slot.index, enfile));
+                exhausted_slots.insert(slot.index);
             }
         }
     };
@@ -5212,14 +5282,18 @@ fn attach_targets_observed_with_roots_journal(
             }
             Err(error) => {
                 if is_fd_exhaustion(&error) {
+                    let enfile = attach_chain_errno(&error) == Some(libc::ENFILE);
                     failures.push(exhausted(slot, &successful, &error));
-                    fail_unfinished(&mut failures, &completed);
+                    let mut exhausted_slots = BTreeSet::from([slot.index]);
+                    fail_unfinished(&mut failures, &completed, &mut exhausted_slots, enfile);
                     return Ok(AttachOutcome {
                         successful,
                         failures,
                         completed,
                         continuity_rounds,
                         exhausted: true,
+                        exhausted_slots,
+                        exhausted_enfile: enfile,
                     });
                 }
                 failures.push((slot.index, format!("{error:#}")));
@@ -5272,14 +5346,18 @@ fn attach_targets_observed_with_roots_journal(
                 }
                 Err(error) => {
                     if is_fd_exhaustion(&error) {
+                        let enfile = attach_chain_errno(&error) == Some(libc::ENFILE);
                         failures.push(exhausted(slot, &successful, &error));
-                        fail_unfinished(&mut failures, &completed);
+                        let mut exhausted_slots = BTreeSet::from([slot.index]);
+                        fail_unfinished(&mut failures, &completed, &mut exhausted_slots, enfile);
                         return Ok(AttachOutcome {
                             successful,
                             failures,
                             completed,
                             continuity_rounds,
                             exhausted: true,
+                            exhausted_slots,
+                            exhausted_enfile: enfile,
                         });
                     }
                     failures.push((slot.index, format!("{error:#}")));
@@ -5293,6 +5371,8 @@ fn attach_targets_observed_with_roots_journal(
         completed,
         continuity_rounds,
         exhausted: false,
+        exhausted_slots: BTreeSet::new(),
+        exhausted_enfile: false,
     })
 }
 
@@ -8122,6 +8202,7 @@ impl Session {
                 discovery_staged: DiscoveryStage::default(),
                 root_seed,
                 attach_failures: vec![],
+                attach_exhausted: BTreeSet::new(),
                 detach_failures: vec![],
                 detach_quarantine: BTreeSet::new(),
                 quarantine_reasons: BTreeMap::new(),
@@ -9297,6 +9378,8 @@ impl Session {
             completed,
             continuity_rounds,
             exhausted: _,
+            exhausted_slots,
+            exhausted_enfile: _,
         } = outcome;
         retain_from_successful(
             &mut self.retained_static,
@@ -9332,7 +9415,16 @@ impl Session {
         self.successful_static.extend(successful);
         let mut failed: Vec<_> = quarantined_failed;
         failed.extend(failures.iter().map(|(slot, _)| *slot));
-        self.attach_failures.extend(failures);
+        // Fix6 A3: exhaustion-unfinished slots wait for a retry — they
+        // stay in `failed` (partial links still detach) but out of the
+        // failure evidence (they never failed). Recorded per call, so a
+        // later clean attach clears the set.
+        self.attach_exhausted = exhausted_slots;
+        self.attach_failures.extend(
+            failures
+                .into_iter()
+                .filter(|(slot, _)| !self.attach_exhausted.contains(slot)),
+        );
         reexec_diagnostic::observe!(self, |diag| {
             let sides = self.current_static_sides();
             let paired = self
@@ -10062,6 +10154,8 @@ impl Session {
             completed: recompleted,
             continuity_rounds,
             exhausted: _,
+            exhausted_slots: _,
+            exhausted_enfile: _,
         } = outcome;
         let current_sides = self.current_static_sides();
         self.pid_pairs.seal(
@@ -11086,6 +11180,12 @@ impl Session {
     /// silently treated as zero calls.
     pub fn attach_failures(&self) -> &[(u32, String)] {
         &self.attach_failures
+    }
+
+    /// Slots the latest `attach_targets` call left unfinished by fd
+    /// exhaustion: the engine withholds these for a next-tick retry.
+    pub(crate) fn attach_exhausted_slots(&self) -> BTreeSet<u32> {
+        self.attach_exhausted.clone()
     }
 
     /// Detach failures remain available after the terminal best-effort drain.
@@ -17875,8 +17975,10 @@ mod tests {
         // These unchanged exhaustion messages also enter Counts' retained
         // failures. Include their actual format capacity, not only text length.
         for (_, message) in [
-            unfinished_after_exhaustion(u32::MAX),
-            exhausted_multi(u32::MAX, usize::MAX, usize::MAX),
+            unfinished_after_exhaustion(u32::MAX, false),
+            unfinished_after_exhaustion(u32::MAX, true),
+            exhausted_multi(u32::MAX, usize::MAX, usize::MAX, false),
+            exhausted_multi(u32::MAX, usize::MAX, usize::MAX, true),
         ] {
             assert!(message.len() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
             assert!(message.capacity() <= COUNTER_GROUP_DIAGNOSTIC_BYTES);
@@ -19917,6 +20019,183 @@ mod tests {
             "summary must name the remedy: {}",
             outcome.failures[0].1
         );
+    }
+
+    /// View-collapse fix6 A3 (owner 20:25): a full system file table
+    /// (ENFILE) is fd exhaustion exactly like a full process table
+    /// (EMFILE): every further link would fail identically, so the run
+    /// must stop with the exhaustion summary, not with per-slot errors.
+    #[test]
+    fn fd_exhaustion_matches_enfile_like_emfile() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
+                .context("bpf_link_create failed");
+            assert!(
+                is_fd_exhaustion(&error),
+                "errno {errno} must read as fd exhaustion"
+            );
+        }
+        for errno in [libc::EPERM, libc::EINVAL, libc::ENOTSUP] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
+                .context("bpf_link_create failed");
+            assert!(
+                !is_fd_exhaustion(&error),
+                "errno {errno} must not read as fd exhaustion"
+            );
+        }
+    }
+
+    /// The exhaustion summary names the right table: EMFILE keeps the
+    /// process-limit remedy byte-identical, while ENFILE names the system
+    /// table instead of misdirecting to `ulimit`.
+    #[test]
+    fn fd_exhaustion_summary_names_the_full_table() {
+        for (errno, remedy) in [
+            (libc::EMFILE, "raise RLIMIT_NOFILE (ulimit -n) and retry"),
+            (libc::ENFILE, "the system file table is full (ENFILE)"),
+        ] {
+            let slots = [test_slot(0), test_slot(1)];
+            let outcome = attach_targets_with(
+                &slots,
+                CapturePolicy::Allowlisted,
+                false,
+                |_| Ok(ElfAbi::Lp64),
+                |_, slot, _| {
+                    if slot.index == 0 {
+                        let exhausted = std::io::Error::from_raw_os_error(errno);
+                        return Err(anyhow::Error::new(exhausted).context("bpf_link_create failed"));
+                    }
+                    Ok(())
+                },
+                |_| Some(10),
+            )
+            .unwrap();
+            assert!(outcome.exhausted, "errno {errno} must exhaust");
+            assert!(
+                outcome.failures[0]
+                    .1
+                    .contains(&format!("fd table exhausted attaching slot 0")),
+                "errno {errno} keeps the summary shape: {}",
+                outcome.failures[0].1
+            );
+            assert!(
+                outcome.failures[0].1.contains(remedy),
+                "errno {errno} must name its remedy: {}",
+                outcome.failures[0].1
+            );
+        }
+    }
+
+    /// View-collapse fix6 A3 (owner 20:25): the attach outcome reports
+    /// exactly which slots exhaustion left unfinished, so the engine can
+    /// withhold those for a next-tick retry while real failures stay
+    /// terminal. Slot 0 fails really (EPERM) before slot 1 exhausts the
+    /// table: only slots 1 and 2 wait.
+    #[test]
+    fn exhausted_slots_report_unfinished_for_retry() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let slots = [test_slot(0), test_slot(1), test_slot(2)];
+            let outcome = attach_targets_with(
+                &slots,
+                CapturePolicy::Allowlisted,
+                false,
+                |_| Ok(ElfAbi::Lp64),
+                |_, slot, _| {
+                    if slot.index == 0 {
+                        let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+                        return Err(anyhow::Error::new(denied).context("bpf_link_create failed"));
+                    }
+                    if slot.index == 1 {
+                        let exhausted = std::io::Error::from_raw_os_error(errno);
+                        return Err(anyhow::Error::new(exhausted).context("bpf_link_create failed"));
+                    }
+                    Ok(())
+                },
+                |_| Some(10),
+            )
+            .unwrap();
+            assert!(outcome.exhausted, "errno {errno} must exhaust");
+            assert_eq!(
+                outcome.exhausted_slots,
+                BTreeSet::from([1, 2]),
+                "errno {errno}: only exhaustion-unfinished slots wait"
+            );
+            assert!(
+                outcome.failures.iter().any(|(slot, _)| *slot == 0),
+                "the real failure stays reported: {:?}",
+                outcome.failures
+            );
+        }
+    }
+
+    /// Entry-side exhaustion leaves earlier completed slots alone: slots 0
+    /// and 1 pair fully, slot 2's entry exhausts, and only slots 2 and 3
+    /// wait for the next tick.
+    #[test]
+    fn exhausted_slots_spare_completed_pairs() {
+        let slots = [test_slot(0), test_slot(1), test_slot(2), test_slot(3)];
+        let outcome = attach_targets_with(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                if program == "p11_entry" && slot.index == 2 {
+                    let exhausted = std::io::Error::from_raw_os_error(libc::EMFILE);
+                    return Err(anyhow::Error::new(exhausted).context("bpf_link_create failed"));
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+        assert!(outcome.exhausted);
+        assert_eq!(
+            outcome.completed,
+            [(0, Some(10)), (1, Some(10))],
+            "completed pairs stay completed: {:?}",
+            outcome.completed
+        );
+        assert_eq!(
+            outcome.exhausted_slots,
+            BTreeSet::from([2, 3]),
+            "only the unfinished tail waits"
+        );
+    }
+
+    /// Multi back end: group exhaustion reports every uncompleted member
+    /// for retry while completed groups stay attached. Group /b.so's
+    /// entry exhausts after /a.so paired fully: only slots 2 and 3 wait,
+    /// on EMFILE and on ENFILE alike.
+    #[test]
+    fn multi_exhausted_slots_report_uncompleted_members_for_retry() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let (slots, targets) = two_groups();
+            let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+            let mock = MockGroup {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail: Box::new(move |path, _, is_return| {
+                    (path == "/b.so" && !is_return).then(|| io::Error::from_raw_os_error(errno))
+                }),
+            };
+            let (_bundles, outcome) =
+                attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+            assert!(outcome.exhausted, "errno {errno} must exhaust");
+            assert_eq!(
+                outcome
+                    .completed
+                    .iter()
+                    .map(|(slot, _)| *slot)
+                    .collect::<Vec<_>>(),
+                [0, 1],
+                "errno {errno}: the completed group stays completed"
+            );
+            assert_eq!(
+                outcome.exhausted_slots,
+                BTreeSet::from([2, 3]),
+                "errno {errno}: only the unfinished group waits"
+            );
+        }
     }
 
     fn aya_attach_errno(errno: i32) -> aya::programs::ProgramError {

@@ -43,6 +43,15 @@ pub(crate) const LIBRARY_HANDLE_BUDGET_SUBJECT: &str = "library handles";
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_INITIAL: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining processes deferred to the next tick";
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LIVE: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining new processes deferred to the next tick";
 
+/// True for the open(2)-family errnos that mean "out of handles, wait":
+/// `EMFILE` (this process's fd table is full) and `ENFILE` (the
+/// system-wide file table is full). Either leaves the item pending for
+/// the next tick with a counted named gap — never a permanent skip,
+/// never the end of the capture (view-collapse fix6 A3, owner 20:25).
+pub(crate) fn is_handle_exhaustion_errno(errno: i32) -> bool {
+    errno == libc::EMFILE || errno == libc::ENFILE
+}
+
 /// The soft-limit target for the startup raise: the hard limit, literally
 /// (standard practice). The `max` only guards an insane `getrlimit` result
 /// (`soft > hard` never happens); it never lowers.

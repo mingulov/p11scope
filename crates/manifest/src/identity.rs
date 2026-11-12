@@ -103,17 +103,38 @@ impl InspectedObject {
     }
 }
 
+/// An [`open_object`] failure with the open(2)-family errno preserved
+/// when the failure came from opening (fix6 A3): size and type refusals
+/// carry `None` and never classify as exhaustion.
+#[cfg(feature = "identify")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenObjectError {
+    pub reason: String,
+    pub errno: Option<i32>,
+}
+
 #[cfg(feature = "identify")]
 pub fn open_object(path: &Path) -> Result<std::fs::File, String> {
-    let file = open_regular(path)?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("metadata failed: {error}"))?;
+    open_object_errno(path).map_err(|error| error.reason)
+}
+
+/// [`open_object`] with the open errno preserved: identical reasons,
+/// plus the errno for handle-exhaustion classification.
+#[cfg(feature = "identify")]
+pub fn open_object_errno(path: &Path) -> Result<std::fs::File, OpenObjectError> {
+    let file = open_regular_errno(path)?;
+    let metadata = file.metadata().map_err(|error| OpenObjectError {
+        reason: format!("metadata failed: {error}"),
+        errno: error.raw_os_error(),
+    })?;
     if metadata.len() > MAX_OBJECT_BYTES {
-        return Err(format!(
-            "object is {} bytes; limit is {MAX_OBJECT_BYTES}",
-            metadata.len()
-        ));
+        return Err(OpenObjectError {
+            reason: format!(
+                "object is {} bytes; limit is {MAX_OBJECT_BYTES}",
+                metadata.len()
+            ),
+            errno: None,
+        });
     }
     Ok(file)
 }
@@ -189,22 +210,39 @@ pub fn is_missing_mount_id_error(error: &str) -> bool {
 /// same inode. Normal provider symlinks remain supported safely.
 #[cfg(feature = "identify")]
 pub fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+    open_regular_errno(path).map_err(|error| error.reason)
+}
+
+/// [`open_regular`] with the open errno preserved: identical reasons,
+/// plus the errno for handle-exhaustion classification.
+#[cfg(feature = "identify")]
+pub fn open_regular_errno(path: &Path) -> Result<std::fs::File, OpenObjectError> {
     let pinned = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|error| format!("open failed: {error}"))?;
-    let metadata = pinned
-        .metadata()
-        .map_err(|error| format!("metadata failed: {error}"))?;
+        .map_err(|error| OpenObjectError {
+            reason: format!("open failed: {error}"),
+            errno: error.raw_os_error(),
+        })?;
+    let metadata = pinned.metadata().map_err(|error| OpenObjectError {
+        reason: format!("metadata failed: {error}"),
+        errno: error.raw_os_error(),
+    })?;
     if !metadata.file_type().is_file() {
-        return Err("not a regular file".into());
+        return Err(OpenObjectError {
+            reason: "not a regular file".into(),
+            errno: None,
+        });
     }
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC)
         .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
-        .map_err(|error| format!("opening pinned regular file failed: {error}"))
+        .map_err(|error| OpenObjectError {
+            reason: format!("opening pinned regular file failed: {error}"),
+            errno: error.raw_os_error(),
+        })
 }
 
 #[cfg(feature = "identify")]
@@ -722,6 +760,24 @@ fn parse_probed_maps_line(line: &[u8], addr: u64) -> Result<Option<ObjectKey>, (
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// `open_object_errno` preserves the open errno without changing the
+    /// reason `open_object` reports for the same failure: a missing path
+    /// carries its `ENOENT`, a directory carries no errno (a type
+    /// refusal, never exhaustion), and a real object opens.
+    #[test]
+    fn open_object_errno_preserves_errno_with_identical_reasons() {
+        let missing = Path::new("/private/definitely-missing-p11scope-lib.so");
+        let plain = open_object(missing).unwrap_err();
+        let typed = open_object_errno(missing).unwrap_err();
+        assert_eq!(typed.reason, plain);
+        assert!(typed.reason.contains("open failed"), "{}", typed.reason);
+        assert_eq!(typed.errno, Some(libc::ENOENT));
+        let directory = open_object_errno(&std::env::temp_dir()).unwrap_err();
+        assert_eq!(directory.reason, "not a regular file");
+        assert_eq!(directory.errno, None);
+        assert!(open_object_errno(Path::new("/bin/sh")).is_ok());
+    }
 
     #[test]
     fn retained_process_view_mount_table_controls_the_mapping_device() {

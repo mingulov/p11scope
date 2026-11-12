@@ -3548,6 +3548,14 @@ pub(crate) trait EngineSession {
         objects: &PinnedObjects,
         ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult>;
+    /// Slots the latest `attach_targets` call left unfinished by fd
+    /// exhaustion (fix6 A3), overwritten per call: the engine withholds
+    /// exactly these for a next-tick retry instead of deactivating them.
+    /// Fail-closed default: sessions that cannot report exhaustion keep
+    /// today's deactivate-every-failure behavior.
+    fn attach_exhausted_slots(&self) -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
     /// Counter growth staging for this candidate plan. Sessions without
     /// banks refuse; scripted sessions record and replay.
     fn stage_counter_growth(
@@ -3863,6 +3871,10 @@ impl EngineSession for Session {
         ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
         Session::attach_targets(self, targets, objects, ended)
+    }
+
+    fn attach_exhausted_slots(&self) -> BTreeSet<u32> {
+        Session::attach_exhausted_slots(self)
     }
 
     fn stage_counter_growth(
@@ -7075,6 +7087,16 @@ pub(crate) fn note_retained_scan_pins<'a>(
     new_fds
 }
 
+/// True when a scan's pins filed the handle-exhaustion wait gap (fix6
+/// A3): at least one library open waits for the next tick, so the view
+/// must defer whole instead of admitting partially. Matches the fixed
+/// wait subject only; ordinary per-path skips never defer.
+fn scan_pins_waited(skips: &[Skipped]) -> bool {
+    skips
+        .iter()
+        .any(|skip| skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT)
+}
+
 /// Pids in `sweep` that are kernel threads with no user address space, to
 /// be excluded before the deep-scan cap is applied: a successfully-read
 /// but empty maps snapshot (never an unavailable one) plus the
@@ -7870,6 +7892,37 @@ fn discover_plan(
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
             Ok((found, mut pins, complete, scan_examined, scan_shape)) => {
+                // Fix6 A3 (owner 20:25): handle exhaustion waits, never
+                // skips. A scan with waited pins defers whole — the view
+                // drops, its ID returns to the pool, and the next tick
+                // retries the scan — with this scan's evidence (including
+                // the wait gaps) merged like a failed scan's. The fd
+                // table just proved itself full, so the rest of the pass
+                // waits behind the same break as the reserve path.
+                if scan_pins_waited(&counters.object_skips) {
+                    discovered.release_view_id(view.id());
+                    discovered.base_counters.scan_unavailable = discovered
+                        .base_counters
+                        .scan_unavailable
+                        .or(counters.scan_unavailable);
+                    discovered.base_counters.scan_ms = discovered
+                        .base_counters
+                        .scan_ms
+                        .saturating_add(counters.scan_ms);
+                    discovered
+                        .base_counters
+                        .object_skips
+                        .extend(counters.object_skips);
+                    discovered.base_counters.noise.merge(&counters.noise);
+                    let skipped = Skipped {
+                        subject: "process view".into(),
+                        reason: "fd table exhausted while opening a library; remaining processes deferred to the next tick"
+                            .into(),
+                    };
+                    attribution::note(&skipped);
+                    discovered.base_counters.object_skips.push(skipped);
+                    break;
+                }
                 // Only a complete scan that proved every member of its
                 // own shape examined covers it: incomplete scans,
                 // skipped members, and unopened data-only `.so` files
@@ -16821,6 +16874,7 @@ impl Engine {
                             detach_failed_slots_start,
                             crate::attach::monotonic_ns(),
                         );
+                        let detach_clean = detach_failed_slots_outcome.is_ok();
                         match detach_failed_slots_outcome {
                             Ok(report) => self.apply_group_rebuild(
                                 &mut candidate.plan,
@@ -16836,11 +16890,105 @@ impl Engine {
                                 );
                             }
                         }
-                        for slot in failed_slots {
+                        // Fix6 A3 (owner 20:25): fd exhaustion waits, real
+                        // failures die. Exhaustion-unfinished slots are
+                        // withheld for a next-tick retry — deactivated,
+                        // then excised so their keys leave the index and
+                        // the next proven tick re-derives them through the
+                        // ordinary path (the withhold vehicle) — instead
+                        // of recording static failures. Withholding needs
+                        // clean partial-link detach (a leftover link must
+                        // never strand) and excisable tail cells; anything
+                        // else falls back to today's terminal treatment
+                        // with its own gap, never a silent skip.
+                        let exhausted = session.attach_exhausted_slots();
+                        let mut withheld = BTreeSet::new();
+                        for slot in &failed_slots {
+                            if detach_clean && exhausted.contains(&slot.index) {
+                                withheld.insert(slot.index);
+                                continue;
+                            }
                             outcome
                                 .static_failures
-                                .extend(slot_timing_keys(&slot, &timing_owners));
+                                .extend(slot_timing_keys(slot, &timing_owners));
                             candidate.plan.deactivate(slot.index);
+                        }
+                        if !withheld.is_empty() {
+                            // Withheld slots leave the delta, so committing
+                            // this candidate no longer installs their cells:
+                            // the next proven tick re-derives them as fresh
+                            // delta entries through the ordinary path.
+                            candidate
+                                .delta
+                                .new
+                                .retain(|slot| !withheld.contains(&slot.index));
+                            for index in &withheld {
+                                candidate.plan.deactivate(*index);
+                            }
+                            let old_to_new = candidate
+                                .plan
+                                .excise_unlinked_tail_cells(self.plan.slots.len(), &withheld);
+                            for slot in candidate
+                                .delta
+                                .new
+                                .iter_mut()
+                                .chain(&mut candidate.delta.replace)
+                                .chain(&mut candidate.delta.retire)
+                            {
+                                let new = old_to_new
+                                    .get(slot.index as usize)
+                                    .copied()
+                                    .unwrap_or(u32::MAX);
+                                debug_assert!(
+                                    new != u32::MAX,
+                                    "a surviving delta slot is never an excised cell"
+                                );
+                                if new != u32::MAX {
+                                    slot.index = new;
+                                }
+                            }
+                            // Cells the excise could not take (not
+                            // inactive tail cells) cannot retry: terminal
+                            // treatment with their own gap. Fresh tail
+                            // cells always excise; this is the honest
+                            // fallback, not the path.
+                            let stuck: Vec<u32> = withheld
+                                .iter()
+                                .copied()
+                                .filter(|index| {
+                                    old_to_new.get(*index as usize).copied().unwrap_or(u32::MAX)
+                                        != u32::MAX
+                                })
+                                .collect();
+                            for index in &stuck {
+                                let new =
+                                    old_to_new.get(*index as usize).copied().unwrap_or(u32::MAX);
+                                if new != u32::MAX
+                                    && let Some(slot) = candidate
+                                        .plan
+                                        .slots
+                                        .iter()
+                                        .find(|slot| slot.index == new)
+                                        .cloned()
+                                {
+                                    outcome
+                                        .static_failures
+                                        .extend(slot_timing_keys(&slot, &timing_owners));
+                                }
+                            }
+                            self.plan_rebuild_stable = false;
+                            if stuck.len() < withheld.len() {
+                                self.mark_partial(
+                                    "live discovery attach",
+                                    "fd table exhausted attaching new slots; they wait for the next tick",
+                                );
+                            }
+                            if !stuck.is_empty() {
+                                self.mark_partial(
+                                    "live discovery attach",
+                                    "fd table exhausted attaching new slots, and some could not be withheld for retry; they were deactivated",
+                                );
+                            }
                         }
                     }
                     Err(_) => {
@@ -27415,12 +27563,38 @@ impl Engine {
             // 6.14 Option B: learn the newcomer's executable path.
             elf_needed::learn_view_exe(&mut self.extensive, &view);
             self.deep_scans = self.deep_scans.saturating_add(1);
+            // Fix6 A3: snapshot the pin-open wait before the counters are
+            // absorbed — a waited scan defers whole below.
+            let pins_waited = scan_pins_waited(&counters.object_skips);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // Completeness is otherwise unused here: a new view has
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, mut pins, complete)) => {
+                    // Fix6 A3 (owner 20:25): handle exhaustion waits,
+                    // never skips. A scan with waited pins defers whole
+                    // with its request retained — the view drops and the
+                    // next tick retries the scan — exactly like the
+                    // reserve-expiry tail, with the wait gaps already
+                    // absorbed above and the tail named below. The fd
+                    // table just proved itself full, so the rest of the
+                    // tick waits behind the same break.
+                    if pins_waited {
+                        self.release_view_id(view.id());
+                        self.mark_unattempted_fresh(pid, ledger);
+                        failed_refresh_pids.insert(pid);
+                        for deferred_pid in unprocessed.by_ref() {
+                            self.mark_unattempted_fresh(deferred_pid, ledger);
+                            failed_refresh_pids.insert(deferred_pid);
+                        }
+                        skipped.push(Skipped {
+                            subject: "live discovery tick".into(),
+                            reason: "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
+                                .into(),
+                        });
+                        break;
+                    }
                     // The tick retains this scan's pins from here (staged
                     // or pushed below): share one pin per physical file
                     // with the already-retained views, then debit what
@@ -35841,6 +36015,9 @@ pub(crate) mod session_fixture {
         detach_rebuild_script: VecDeque<DetachOutcome>,
         /// Static target slot indices that the next attach reports as failed.
         fail_target_slots: BTreeSet<u32>,
+        /// Failed slots the next attach reports as exhaustion-unfinished
+        /// (fix6 A3): the engine withholds exactly these for retry.
+        exhaust_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
         pub(crate) attached_slots: Vec<usize>,
         /// Every attach request's exact `(slot, object, file offset)`
@@ -36054,6 +36231,10 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn fail_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
             self.fail_target_slots = slots.into_iter().collect();
+        }
+
+        pub(crate) fn exhaust_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
+            self.exhaust_target_slots = slots.into_iter().collect();
         }
 
         pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
@@ -36499,6 +36680,10 @@ pub(crate) mod session_fixture {
                     .collect(),
                 Vec::new(),
             ))
+        }
+
+        fn attach_exhausted_slots(&self) -> BTreeSet<u32> {
+            self.exhaust_target_slots.clone()
         }
 
         fn stage_counter_growth(

@@ -25901,6 +25901,110 @@ fn static_seed_attach_failure_detaches_and_deactivates_seed_slot() {
     assert!(engine.plan.surfaces.is_empty());
 }
 
+/// View-collapse fix6 A3 (owner 20:25): an attach that exhausts the fd
+/// table withholds the unfinished slots for a next-tick retry instead
+/// of deactivating them. The exhausted seed slot's partial links are
+/// detached like any failed slot's, but its cell is excised (its key
+/// leaves the index, so the next proven tick re-derives it through the
+/// ordinary path), the wait gap is filed, and no static failure is
+/// recorded — never a permanent skip.
+#[test]
+fn static_seed_attach_exhaustion_withholds_slot_for_retry() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .unwrap();
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&module),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+    let seed = &collected.count_only_seeds[0];
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot.clone());
+
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([slot.index]);
+    session.exhaust_target_slots([slot.index]);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+
+    // Unlike a terminal failure, a withhold leaves no failure: the apply
+    // is complete as far as it could go (mirroring the pre-attach
+    // withhold vehicle), and the wait gap below carries the pending
+    // coverage — `required_complete == false` would abort pause cycles
+    // over work that simply waits for the next tick.
+    assert!(outcome.required_complete());
+    assert_eq!(session.attached_slots, [1]);
+    assert!(
+        session
+            .failed_cleanup_slot_indices
+            .iter()
+            .flatten()
+            .any(|index| *index == slot.index),
+        "the exhausted slot's partial links detach: {:?}",
+        session.failed_cleanup_slot_indices
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|kept| kept.index != slot.index),
+        "the exhausted cell is excised, not left deactivated in place"
+    );
+    assert!(
+        engine
+            .plan
+            .slot_index_for_key(plan::AttachKey::of(&slot))
+            .is_none(),
+        "the exhausted key leaves the index for next-tick re-derivation"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery attach"
+                && skip.reason.contains("exhausted")
+                && skip.reason.contains("next tick")),
+        "the wait gap is filed: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        outcome.static_failures.is_empty(),
+        "the withheld slot pends, it did not fail: {:?}",
+        outcome.static_failures
+    );
+}
+
 #[test]
 fn static_seed_preflight_refusal_keeps_accepted_plan_and_links_unchanged() {
     let (_fixture, view, module, pins) = loaded_seed_provider();
@@ -47904,6 +48008,23 @@ fn library_handle_headroom_admits_newcomer() {
         !skipped.iter().any(|skip| skip.subject == "library handles"),
         "no budget gap under the cap: {skipped:?}"
     );
+}
+
+/// The wait-deferral matcher (fix6 A3): only the pin-open wait subject
+/// defers a view; ordinary per-path skips never do.
+#[test]
+fn scan_wait_matcher_fires_only_on_the_wait_subject() {
+    let waited = Skipped {
+        subject: "library file open".into(),
+        reason: "x".into(),
+    };
+    let ordinary = Skipped {
+        subject: "/lib/x.so".into(),
+        reason: "y".into(),
+    };
+    assert!(scan_pins_waited(&[ordinary.clone(), waited]));
+    assert!(!scan_pins_waited(&[ordinary]));
+    assert!(!scan_pins_waited(&[]));
 }
 /// C3: discovery-before-semantics ordering. The discovery batch publishes
 /// synchronously before it returns: when the arrival batch (refresh commit

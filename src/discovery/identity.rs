@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
-    IdentityKind, InspectedObject, MappingFileKey, SelfMappedFallback,
+    IdentityKind, InspectedObject, MappingFileKey, OpenObjectError, SelfMappedFallback,
     inspect_file_with_reader_exporting, is_missing_mount_id_error, mapping_file_key,
-    mapping_file_key_in_mountinfo, open_object, open_regular,
+    mapping_file_key_in_mountinfo, open_object, open_object_errno, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
@@ -8671,11 +8671,73 @@ fn pin_scanned_view_objects_with(
     Ok((pinned, skipped))
 }
 
+/// The fixed subject of the pin-open wait gap (fix6 A3): a library
+/// open that hit handle exhaustion and waits for the next tick. The
+/// admission loops match this subject to defer the whole view for
+/// retry instead of admitting it partially.
+pub(crate) const PIN_WAIT_SUBJECT: &str = "library file open";
+
+/// How one scan pin failed (fix6 A3, owner 20:25): an ordinary refusal —
+/// recorded with today's reason and key rejection — or handle
+/// exhaustion, which waits for the next tick instead (a counted named
+/// gap, never a rejection). Every pre-existing `Err(reason)` site
+/// converts through `From`, so only the library-open sites name the
+/// distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PinFailure {
+    Refused(String),
+    Wait { reason: String },
+}
+
+impl PinFailure {
+    /// Classifies a mapping-open failure: handle exhaustion waits,
+    /// everything else refuses with today's reason, byte-identical.
+    fn from_mapped_open_error(failure: &MappedOpenError) -> Self {
+        if failure
+            .errno
+            .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
+        {
+            Self::Wait {
+                reason: failure.gap_reason(),
+            }
+        } else {
+            Self::Refused(failure.gap_reason())
+        }
+    }
+}
+
+impl From<String> for PinFailure {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<&str> for PinFailure {
+    fn from(reason: &str) -> Self {
+        Self::Refused(reason.to_string())
+    }
+}
+
+impl From<OpenObjectError> for PinFailure {
+    fn from(error: OpenObjectError) -> Self {
+        if error
+            .errno
+            .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
+        {
+            Self::Wait {
+                reason: error.reason,
+            }
+        } else {
+            Self::Refused(error.reason)
+        }
+    }
+}
+
 fn record_scanned_candidate(
     pinned: &mut PinnedObjects,
     view: ProcessViewId,
     raw: RawObjectInstance,
-    candidate: Result<Entry, String>,
+    candidate: Result<Entry, PinFailure>,
     skipped: &mut Vec<Skipped>,
 ) {
     match candidate {
@@ -8685,7 +8747,17 @@ fn record_scanned_candidate(
                 pinned.raw_ownership.entry(view).or_default().insert(raw);
             }
         }
-        Err(reason) => {
+        Err(PinFailure::Wait { reason }) => {
+            // Out of handles: the open waits for the next tick. No key
+            // rejection — nothing was proven about the file — just the
+            // counted named gap; the admission loops defer the view so
+            // the next tick retries the whole scan.
+            skipped.push(Skipped {
+                subject: PIN_WAIT_SUBJECT.into(),
+                reason: format!("{}: {reason}; the pin waits for the next tick", raw.path),
+            });
+        }
+        Err(PinFailure::Refused(reason)) => {
             // A missing mapping identity or digest makes every equal raw-key
             // observation incomparable. Remember the failed member so a candidate
             // from another process view cannot become receiver-wins authority.
@@ -8967,11 +9039,14 @@ fn pin_map_files_fallback_triggered(failure: &MappedOpenError) -> bool {
 /// unreadable) keeps the caller's own failure record, while a served
 /// file refused on its own evidence (non-regular, over the shared
 /// size cap, or a proven stranger) refuses with its own reason. The
-/// `Unproven` detail is the `(map_files fallback: …)` text.
+/// `Unproven` detail is the `(map_files fallback: …)` text. `Wait`
+/// (fix6 A3) is handle exhaustion at the fallback open itself: the pin
+/// waits for the next tick instead of failing.
 #[derive(Debug, PartialEq, Eq)]
 enum PinMapFilesRefusal {
     Unproven(String),
     Refused(String),
+    Wait(String),
 }
 
 /// Whether a pathname carries the kernel's replaced-file marker: the
@@ -9203,7 +9278,16 @@ fn pin_map_files_fallback(
     let file = view
         .run_while_same(|| std::fs::File::open(format!("/proc/{pid}/map_files/{start:x}-{end:x}")))
         .map_err(Unproven)?
-        .map_err(|error| Unproven(error.to_string()))?;
+        .map_err(|error| {
+            if error
+                .raw_os_error()
+                .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
+            {
+                PinMapFilesRefusal::Wait(error.to_string())
+            } else {
+                Unproven(error.to_string())
+            }
+        })?;
     let metadata = file
         .metadata()
         .map_err(|error| Unproven(error.to_string()))?;
@@ -9340,7 +9424,7 @@ fn pin_scanned_object(
     pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
-) -> Result<Entry, String> {
+) -> Result<Entry, PinFailure> {
     // A pre-copy-up raw reopens its proven mount-table candidate, not the
     // merged path: the candidate list is recomputed from the same target
     // table the scan proved against, and the scanned check below binds
@@ -9380,7 +9464,7 @@ fn pin_scanned_object(
     // from the target's table by construction).
     let (file, found) = match &pre_path {
         Some(candidate) => {
-            let file = open_object(candidate)?;
+            let file = open_object_errno(candidate)?;
             let found = mapping_file_key(&file)
                 .map_err(|error| format!("mapping identity unavailable: {error}"))?;
             (file, found)
@@ -9400,16 +9484,25 @@ fn pin_scanned_object(
                 Err(failure) if pin_map_files_fallback_triggered(&failure) => {
                     match pin_map_files_fallback(view, &raw, mounts, pinned_identity, budget) {
                         Ok(served) => served,
+                        Err(PinMapFilesRefusal::Wait(detail)) => {
+                            return Err(PinFailure::Wait {
+                                reason: format!(
+                                    "{} (map_files fallback: {detail})",
+                                    failure.gap_reason()
+                                ),
+                            });
+                        }
                         Err(PinMapFilesRefusal::Unproven(detail)) => {
                             return Err(format!(
                                 "{} (map_files fallback: {detail})",
                                 failure.gap_reason()
-                            ));
+                            )
+                            .into());
                         }
-                        Err(PinMapFilesRefusal::Refused(reason)) => return Err(reason),
+                        Err(PinMapFilesRefusal::Refused(reason)) => return Err(reason.into()),
                     }
                 }
-                Err(failure) => return Err(failure.gap_reason()),
+                Err(failure) => return Err(PinFailure::from_mapped_open_error(&failure)),
             }
         }
     };
@@ -9429,13 +9522,13 @@ fn pin_scanned_object(
             &KernelSelfMappingProbe,
         )
     {
-        return Err(format!(
+        return Err(PinFailure::Refused(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
              (compared via mountinfo)",
             raw.key,
             raw.path,
             object_key(found),
-        ));
+        )));
     }
     let before = pin_of(&file)?;
     let mapped = budget
@@ -9455,10 +9548,10 @@ fn pin_scanned_object(
     // incrementally at the reader below, and a partial digest is never trusted.
     if before.size > budget.limits().per_object_bytes {
         let limits = budget.limits();
-        return Err(format!(
+        return Err(PinFailure::Refused(format!(
             "too_large ({} bytes; per-object cap is {})",
             before.size, limits.per_object_bytes,
-        ));
+        )));
     }
     #[cfg(test)]
     tests::run_before_hash_test_hook(budget);
@@ -9485,7 +9578,8 @@ fn pin_scanned_object(
                 found,
                 mapped,
                 verified_ns,
-            );
+            )
+            .map_err(PinFailure::from);
         }
     }
     let mut operation_bytes = 0u64;
@@ -9527,6 +9621,7 @@ fn pin_scanned_object(
         mapped,
         verified_ns,
     )
+    .map_err(PinFailure::from)
 }
 
 #[cfg(test)]
@@ -12054,7 +12149,9 @@ mod tests {
                 &mut pins,
                 ProcessViewId(*view as u32),
                 raw.clone(),
-                Err(format!("/private/view-{view}.so: unavailable")),
+                Err(PinFailure::Refused(format!(
+                    "/private/view-{view}.so: unavailable"
+                ))),
                 &mut skipped,
             );
         }
@@ -13283,9 +13380,9 @@ mod tests {
                 &mut pins,
                 ProcessViewId(view as u32),
                 raw,
-                Err(format!(
+                Err(PinFailure::Refused(format!(
                     "/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"
-                )),
+                ))),
                 &mut skipped,
             );
             skipped.extend(aggregate.absorb(pins));
@@ -19901,5 +19998,164 @@ mod tests {
         retained.held_library_fds(&mut fds);
         shared.held_library_fds(&mut fds);
         assert_eq!(fds.len(), 1, "two views over one file hold one handle");
+    }
+
+    /// Copies of `/bin/true` as pinnable scan modules for the pin-wait
+    /// twins. Each module's key is the production maps-comparable
+    /// resolution for its copy, so the pin path's own identity guard
+    /// passes on any filesystem and the twins exercise only handle
+    /// exhaustion, never identity resolution.
+    fn pin_wait_modules(
+        view: &ProcessView,
+        dir: &Path,
+        count: usize,
+        budget: &mut CaptureWorkBudget,
+    ) -> Vec<ScannedModule> {
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut mounts = MountTableCache::default();
+        (0..count)
+            .map(|n| {
+                let path = dir.join(format!("lib{n:03}.so"));
+                std::fs::write(&path, &bytes).unwrap();
+                let (_file, key) =
+                    open_view_object_cached(view, &path, &mut mounts, budget).unwrap();
+                let mut module = test_fixture::module(key);
+                module.view = view.id();
+                module.mount_namespace = view.mount_namespace();
+                module.key = key;
+                module.path = path.to_str().unwrap().to_string();
+                module.tables = Vec::new();
+                module
+            })
+            .collect()
+    }
+
+    /// Healthy control for the exhaustion twin below: with headroom every
+    /// pin lands and no wait is filed. Green before and after the fix; a
+    /// red here means the fixture (not the code) is wrong.
+    #[test]
+    fn reviewed_pin_open_headroom_pins_without_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), 2, &mut budget);
+        let (pins, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
+        assert!(skipped.is_empty(), "headroom pins cleanly: {skipped:?}");
+        assert_eq!(pins.entry_count_for_test(), 2);
+        assert!(pins.rejected_keys.is_empty());
+    }
+
+    /// View-collapse fix6 A3 (owner 20:25): EMFILE/ENFILE while opening a
+    /// library waits for the next tick — a counted named gap, never a
+    /// permanent skip. With soft AND hard `RLIMIT_NOFILE` at 64, pinning
+    /// 96 libraries exhausts the table mid-pass: every failure must file
+    /// the wait gap, no waited key may be rejected (here or through
+    /// `absorb` into the capture-lifetime set), and the same key pins
+    /// cleanly once capacity frees. Runs in an isolated child: lowering
+    /// the hard limit is process-global and irreversible.
+    #[test]
+    fn reviewed_pin_open_exhaustion_waits_and_retries() {
+        const CHILD: &str = "P11SCOPE_PIN_WAIT_CHILD";
+        const COMPLETED: &str = "P11SCOPE_PIN_WAIT_COMPLETED";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "discovery::identity::tests::reviewed_pin_open_exhaustion_waits_and_retries",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "pin-wait child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "pin-wait child did not complete its assertions:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), 96, &mut budget);
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_max >= 64,
+            "the box must allow a 64 hard fd limit for the pin-wait child"
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        // SAFETY: lowering both limits in the isolated child; the child
+        // exits after its assertions, so the irreversible hard-limit drop
+        // never escapes to siblings.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let (pins, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
+        let waited: Vec<_> = skipped
+            .iter()
+            .filter(|skip| skip.subject == "library file open")
+            .collect();
+        assert!(
+            !waited.is_empty(),
+            "exhaustion must wait, never skip silently: {skipped:?}"
+        );
+        assert_eq!(
+            waited.len(),
+            skipped.len(),
+            "every failure under exhaustion is a wait: {skipped:?}"
+        );
+        assert!(
+            waited
+                .iter()
+                .all(|skip| skip.reason.contains("waits for the next tick")),
+            "the wait gap names the retry: {skipped:?}"
+        );
+        assert!(
+            pins.rejected_keys.is_empty(),
+            "waited keys are never rejected: {:?}",
+            pins.rejected_keys
+        );
+        // The capture-lifetime set absorbs the waited pass without
+        // inheriting any rejection for the waited keys.
+        let mut engine_pins = PinnedObjects::empty();
+        let absorb_skips = engine_pins.absorb(pins);
+        assert!(
+            engine_pins.rejected_keys.is_empty(),
+            "absorb carries no wait rejection: {:?}",
+            engine_pins.rejected_keys
+        );
+        drop(absorb_skips);
+        drop(engine_pins);
+        // Retry after capacity frees: the first module pins cleanly with
+        // no skip at all, proving the wait left nothing sticky behind.
+        let mut budget = CaptureWorkBudget::default();
+        let (retry_pins, retry_skipped) =
+            pin_scanned_view_objects(&view, &modules[..1], &mut budget).unwrap();
+        assert!(
+            retry_skipped.is_empty(),
+            "the retry pins cleanly: {retry_skipped:?}"
+        );
+        assert_eq!(retry_pins.entry_count_for_test(), 1);
+        println!("\n{COMPLETED}");
     }
 }

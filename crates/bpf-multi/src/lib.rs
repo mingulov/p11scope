@@ -289,10 +289,14 @@ fn is_permission_err(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
 }
 
-/// The fd table is full: nothing more can attach, so the whole run ends
-/// instead of bisecting (a split would fail identically).
+/// The fd table is full — `EMFILE` (this process's table) or `ENFILE`
+/// (the system-wide table): nothing more can attach, so the whole run
+/// ends instead of bisecting (a split would fail identically). Paired
+/// with `p11scope::fd_budget::is_handle_exhaustion_errno` (this crate
+/// cannot depend on the binary); keep the two in sync.
 fn is_exhaustion_err(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EMFILE)
+    e.raw_os_error()
+        .is_some_and(|errno| errno == libc::EMFILE || errno == libc::ENFILE)
 }
 
 /// Kernel-rejected multi support (old kernel without `uprobe_multi`):
@@ -315,7 +319,7 @@ pub fn is_unsupported_kernel_errno(errno: i32) -> bool {
 pub enum GroupHalt {
     /// `ENOTSUP`/`EOPNOTSUPP` from `BPF_LINK_CREATE`: multi unsupported.
     Unsupported(io::Error),
-    /// `EMFILE` from `BPF_LINK_CREATE`: nothing more can attach.
+    /// `EMFILE`/`ENFILE` from `BPF_LINK_CREATE`: nothing more can attach.
     Exhausted(io::Error),
 }
 

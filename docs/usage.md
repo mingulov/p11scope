@@ -815,7 +815,7 @@ included, is refused with `not a cgroup v2 directory` before discovery, by
 `doctor --cgroup` as well. `--system` requests
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
-discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 2048,
+discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 1024,
 rarest providers first). Scope admission does not promise that every process
 or call is captured (see the
 [known limitations](../CHANGELOG.md#known-limitations)), and the whole-machine
@@ -1027,15 +1027,19 @@ not hold (`interrupted` when a stop landed while protection was active,
 report carries one plain `pause refused: ...` line.
 
 A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
-2048 members per pass, rarest providers first; past the cap the capture
+1024 members per pass, rarest providers first; past the cap the capture
 publishes a skip naming the bound. Kernel threads never count toward the
 cap (they have no user address space and cannot call a provider). The
-default is 2048 by measurement (2026-11-12, ~1,050-user-process scope: a
-full scan cost +2.3 s start-up at unchanged peak RSS against the 256
-default, which collapsed the same scope to 43 views).
+default is 1024 by the 2026-11-12 guard round: the raised cap stays (owner
+14:35) now that the fd wall is fixed at the cause — the capture raises its
+`RLIMIT_NOFILE` soft limit to the hard limit at startup (effective value on
+the `-v` log) and holds a fixed fd reserve so fanotify/file learning and
+later attaches never hit `EMFILE`; when the reserve would be breached the
+remaining views wait for the next tick instead of failing. 2048 still needs
+a clean sm1 TTC re-measure and stays behind the flag.
 `--max-scan-pids <n>` sets the cap:
 
-sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 512 --duration 60 -o observed-profile.json
+sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 1024 --duration 60 -o observed-profile.json
 
 Views without an executable (kernel threads) and static executables are not
 loader-arming candidates and no longer count as `unavailable`: arming returns

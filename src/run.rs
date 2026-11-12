@@ -3587,6 +3587,14 @@ fn capture_with_host(
     // Capture-process resource baseline, before the discovery scan charges
     // its first byte: threaded to the loops as the timeline's start point.
     let resource_start = crate::timing::read_resource_sample();
+    // FD wall (scan-1k guard): one pidfd per retained view plus the fixed
+    // BPF/pin set crosses soft 1024 at ~700 views, killing fanotify and
+    // later attaches with EMFILE. Raise soft to hard before the scan opens
+    // anything; the effective value is a -v line, never a fatal.
+    let nofile = crate::fd_budget::raise_nofile_soft_to_hard();
+    if capture_diagnostics_on() {
+        emit_capture_diagnostic(&crate::fd_budget::nofile_startup_line(&nofile));
+    }
     // The slow startup (discovery scan, then attach) follows: one
     // stderr line first so the run never looks hung. After the fast
     // fail-fast checks above, before the first slow step.

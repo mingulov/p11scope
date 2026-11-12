@@ -40343,15 +40343,16 @@ fn over_cap_trigger_counts_user_processes_only() {
     let _ = std::fs::remove_dir_all(&proc_root);
 }
 
-/// The deep-scan default covers a 1,000-process host: 2048, pinned by the
-/// 2026-11-12 fedora measurement (1,052 user processes scan fully at
-/// +2.3 s start-up and ~148 MB peak RSS), with selection binding exactly
-/// at the cap.
+/// The deep-scan default is 1024 user processes, pinned by the 2026-11-12
+/// guard round: the raised cap stays (owner 14:35) once the fd wall is
+/// fixed at the cause (rlimit raise + reserve), the 512 choice is
+/// superseded, and 2048 still needs a clean sm1 TTC re-measure. Selection
+/// binds exactly at the cap.
 #[test]
-fn default_deep_scan_cap_covers_a_thousand_processes() {
+fn default_deep_scan_cap_is_1024_by_guard_round() {
     assert_eq!(
-        MAX_SCAN_PIDS, 2048,
-        "measured 2026-11-12 on fedora at 1k user processes"
+        MAX_SCAN_PIDS, 1024,
+        "guard 2026-11-12: raised cap stays with the fd fix; 512 superseded"
     );
     let sweep: Vec<(u32, Vec<MapEntry>)> = (0..MAX_SCAN_PIDS + 1)
         .map(|index| {
@@ -40371,6 +40372,58 @@ fn default_deep_scan_cap_covers_a_thousand_processes() {
         .collect();
     let selected = select_deep_scan_candidates(&sweep, MAX_SCAN_PIDS);
     assert_eq!(selected.len(), MAX_SCAN_PIDS);
+}
+
+/// A tick arms late arrivals before the refreshed backlog: the view admitted
+/// after the initial backlog (possibly carrying a brand-new provider file)
+/// jumps the FIFO queue, views order within each tier.
+#[test]
+fn tick_arms_order_newcomers_before_the_backlog() {
+    let views = vec![
+        ProcessViewId(1),
+        ProcessViewId(2),
+        ProcessViewId(3),
+        ProcessViewId(4),
+    ];
+    let refreshed: BTreeSet<ProcessViewId> = views.iter().copied().collect();
+    let newcomers: BTreeSet<ProcessViewId> = [ProcessViewId(3)].into_iter().collect();
+    assert_eq!(
+        order_tick_arms_newcomers_first(&views, &refreshed, &newcomers),
+        vec![2, 0, 1, 3]
+    );
+    let newcomers: BTreeSet<ProcessViewId> =
+        [ProcessViewId(2), ProcessViewId(4)].into_iter().collect();
+    assert_eq!(
+        order_tick_arms_newcomers_first(&views, &refreshed, &newcomers),
+        vec![1, 3, 0, 2]
+    );
+    // Views the tick did not refresh stay out of the arm list entirely.
+    let refreshed: BTreeSet<ProcessViewId> =
+        [ProcessViewId(2), ProcessViewId(3)].into_iter().collect();
+    let newcomers: BTreeSet<ProcessViewId> = [ProcessViewId(3)].into_iter().collect();
+    assert_eq!(
+        order_tick_arms_newcomers_first(&views, &refreshed, &newcomers),
+        vec![2, 1]
+    );
+}
+
+/// Failure pair: with no newcomers the tick order is the unchanged FIFO, and
+/// stale ids (admitted then retired before the tick) never index the views.
+#[test]
+fn tick_arms_order_without_newcomers_stays_fifo() {
+    let views = vec![ProcessViewId(1), ProcessViewId(2), ProcessViewId(3)];
+    let refreshed: BTreeSet<ProcessViewId> = views.iter().copied().collect();
+    assert_eq!(
+        order_tick_arms_newcomers_first(&views, &refreshed, &BTreeSet::new()),
+        vec![0, 1, 2]
+    );
+    let newcomers: BTreeSet<ProcessViewId> =
+        [ProcessViewId(2), ProcessViewId(99)].into_iter().collect();
+    assert_eq!(
+        order_tick_arms_newcomers_first(&views, &refreshed, &newcomers),
+        vec![1, 0, 2]
+    );
+    assert!(order_tick_arms_newcomers_first(&[], &BTreeSet::new(), &BTreeSet::new()).is_empty());
 }
 
 /// The exclusion is conjunctive and fail-closed: a zombie shape (empty maps,

@@ -5834,9 +5834,13 @@ struct BoundFallbackProof {
 /// ponytail: the capture byte budget already bounds work; this flat cap also bounds
 /// `/proc` inventory overhead for cgroups containing thousands of processes.
 /// Shared with `inspect --system` as the default `--max-scan-pids`.
-/// 2048 by the 2026-11-12 fedora measurement: 1,052 user processes scan
-/// fully at +2.3 s start-up and ~148 MB peak RSS.
-pub(crate) const MAX_SCAN_PIDS: usize = 2048;
+/// 1024 by the 2026-11-12 guard round: the raised cap stays (owner 14:35)
+/// now that the fd wall is fixed at the cause (startup rlimit raise plus a
+/// fixed reserve, so file learning stays available at 1k identity). The
+/// 512 choice is superseded; 2048 still needs a clean sm1 TTC re-measure
+/// (one 8.66 s sample over the +3 s gate on the old binary) and stays
+/// behind `--max-scan-pids`.
+pub(crate) const MAX_SCAN_PIDS: usize = 1024;
 
 /// How a marked newcomer generation's descendant gap was counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7387,6 +7391,31 @@ where
     sweep
 }
 
+/// One tick's loader-arm/export order, newcomers first (scan-1k guard
+/// priority lane): every view in `new_view_ids` — late arrivals, possibly
+/// carrying a brand-new provider file — before every other view in
+/// `refreshed` (the initial backlog), views order within each tier. Indices
+/// into `view_order`; ids missing from it (retired before the tick) are
+/// skipped. Membership is the unchanged refreshed-or-new set; with no
+/// newcomers the order is the unchanged FIFO.
+pub(crate) fn order_tick_arms_newcomers_first(
+    view_order: &[ProcessViewId],
+    refreshed: &BTreeSet<ProcessViewId>,
+    new_view_ids: &BTreeSet<ProcessViewId>,
+) -> Vec<usize> {
+    let mut newcomers = Vec::new();
+    let mut backlog = Vec::new();
+    for (index, id) in view_order.iter().enumerate() {
+        if new_view_ids.contains(id) {
+            newcomers.push(index);
+        } else if refreshed.contains(id) {
+            backlog.push(index);
+        }
+    }
+    newcomers.extend(backlog);
+    newcomers
+}
+
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object, and record how all of it was found.
 /// Task 1.6 experiment switch, read once per discovery (read-only, so
@@ -7551,6 +7580,21 @@ fn discover_plan(
     // under the cap it stays empty and unused.
     let mut examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
     for pid in selected.iter() {
+        // FD reserve (scan-1k guard): one pidfd per retained view crosses a
+        // small soft limit fast; when fewer than the reserve remains, the
+        // rest wait for the next tick instead of dying on EMFILE. The
+        // reconciliation sweep admits never-scanned pids first, so a
+        // deferred pid is still reached.
+        if crate::fd_budget::fd_reserve_breached_now() {
+            let skipped = Skipped {
+                subject: "process view".into(),
+                reason: "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
+                    .into(),
+            };
+            attribution::note(&skipped);
+            discovered.base_counters.object_skips.push(skipped);
+            break;
+        }
         let opened = if named {
             named_view
                 .take()
@@ -26948,6 +26992,23 @@ impl Engine {
                 });
                 break;
             }
+            // FD reserve (scan-1k guard): after the quantum poll (which stays
+            // first: injected clocks count polls), before another view opens.
+            // This pid and the rest defer with their requests retained,
+            // exactly like the quantum-expiry tail, so fanotify/file
+            // learning and later attaches never hit EMFILE.
+            if crate::fd_budget::fd_reserve_breached_now() {
+                for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
+                    self.mark_unattempted_fresh(deferred_pid, ledger);
+                    failed_refresh_pids.insert(deferred_pid);
+                }
+                skipped.push(Skipped {
+                    subject: "live discovery tick".into(),
+                    reason: "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
+                        .into(),
+                });
+                break;
+            }
             let id = match self.allocate_view_id_for_newcomer(pid) {
                 Ok(id) => id,
                 Err(_) => {
@@ -28532,17 +28593,17 @@ impl Engine {
                 ],
             )
         });
+        // Priority lane (scan-1k guard): this tick's arming order serves
+        // late arrivals before the refreshed backlog, so a view admitted
+        // for a brand-new provider file does not wait behind the initial
+        // backlog. Membership is the unchanged refreshed-or-new set; the
+        // snapshot also feeds the export loop below (ids, stable across
+        // retirements during arming).
+        let tick_view_ids: Vec<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let tick_arm_order =
+            order_tick_arms_newcomers_first(&tick_view_ids, &refreshed_ok, &new_view_ids);
         let arm_result = if *additions_allowed {
-            let arm: Vec<_> = self
-                .views
-                .iter()
-                .enumerate()
-                .filter_map(|(position, view)| {
-                    (refreshed_ok.contains(&view.id()) || new_view_ids.contains(&view.id()))
-                        .then_some(position)
-                })
-                .collect();
-            arm_refreshed_views_with(&arm, |position| {
+            arm_refreshed_views_with(&tick_arm_order, |position| {
                 // H-1: a spent live frame arms no more views; each one left
                 // is requested, so the next frame rescans and arms it.
                 if self.frame_work_exhausted() {
@@ -28563,7 +28624,14 @@ impl Engine {
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
-                for view in refreshed_ok.union(&new_view_ids).copied() {
+                // The same priority lane for the export attach: newcomers
+                // first, by id (a view retired during arming simply has no
+                // modules left to attach).
+                let export_order: Vec<ProcessViewId> = tick_arm_order
+                    .iter()
+                    .map(|position| tick_view_ids[*position])
+                    .collect();
+                for view in export_order {
                     // H-1: export attach left for the next frame is requested
                     // the way skipped export work already is.
                     if self.frame_work_exhausted() {

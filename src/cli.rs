@@ -130,7 +130,7 @@ pub struct CaptureArgs {
     /// sink, so the terminal EVIDENCE stays on stdout at default.
     pub out_is_stdout: bool,
     pub max_events: Option<u64>,
-    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 2048 default.
+    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 1024 default.
     pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 32 MiB default.
     pub ring_bytes: Option<u32>,
@@ -195,7 +195,7 @@ pub struct RunArgs {
     /// complete sink, so the terminal EVIDENCE stays on stdout at default.
     pub out_is_stdout: bool,
     pub max_events: Option<u64>,
-    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 2048 default.
+    /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 1024 default.
     pub max_scan_pids: Option<usize>,
     /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 32 MiB default.
     pub ring_bytes: Option<u32>,
@@ -259,7 +259,7 @@ pub struct InspectArgs {
     pub exclude_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub json: bool,
-    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 2048 default.
+    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 1024 default.
     /// Only `--system` scans more than one member, so only it reads this.
     pub max_scan_pids: Option<usize>,
     /// `-v`/`--verbose`: full text detail plus informational stderr
@@ -302,7 +302,7 @@ pub struct InventoryArgs {
     pub key_operations: bool,
     pub hooks: HookRegistry,
     pub json: bool,
-    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 2048 default.
+    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 1024 default.
     /// System and cgroup scopes may scan multiple members; this is not a tree cap.
     pub max_scan_pids: Option<usize>,
     /// `--max-gaps`: retained gap history bound; None ⇒ 8192 default.

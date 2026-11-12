@@ -2932,7 +2932,7 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
     assert_privileged_lane(WHAT);
     // Explicit 256 below: this cell pins the view-capacity gap shape at a
     // fixed cap (257 loads over 256 views), not the production default
-    // (pinned by default_deep_scan_cap_covers_a_thousand_processes).
+    // (pinned by default_deep_scan_cap_is_1024_by_guard_round).
     assert_eq!(
         MAX_LOADER_CONTEXTS, 256,
         "{WHAT}: views gate the 256 loader contexts one to one"

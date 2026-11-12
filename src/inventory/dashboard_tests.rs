@@ -586,6 +586,47 @@ fn truncate_cell_never_splits_chars() {
 }
 
 #[test]
+fn truncate_path_tail_keeps_the_distinguishing_tail() {
+    // Fits already return unchanged: no marker on whole paths.
+    assert_eq!(truncate_path_tail("/a/b.so", 20), "/a/b.so");
+    assert_eq!(truncate_path_tail("", 4), "");
+    // Long paths keep their tail at a `/` boundary.
+    assert_eq!(
+        truncate_path_tail("/separate/physical/providers/provider.so", 28),
+        ".../providers/provider.so"
+    );
+    assert_eq!(
+        truncate_path_tail("/separate/physical/providers/provider.so", 33),
+        ".../providers/provider.so"
+    );
+    // A tail without a `/` in range keeps the char cut.
+    assert_eq!(
+        truncate_path_tail("/averylongdirectoryname", 10),
+        "...oryname"
+    );
+    // Wide chars never split and the cell never overflows.
+    assert_eq!(truncate_path_tail("/lib/日本語.so", 10), "...本語.so");
+    assert_eq!(truncate_path_tail("日本語", 2), "..");
+    assert_eq!(truncate_path_tail("abcd", 3), "...");
+    assert_eq!(truncate_path_tail("a", 0), "");
+    // The `module ` prefix and the physical reference survive; the
+    // path keeps its tail between them.
+    assert_eq!(
+        identity_path_cell(
+            "module ",
+            "/separate/physical/providers/provider.so",
+            "m0",
+            40
+        ),
+        "module .../providers/provider.so [m0]"
+    );
+    assert_eq!(
+        identity_path_cell("module ", "/a/b.so", "m1", 40),
+        "module /a/b.so [m1]"
+    );
+}
+
+#[test]
 fn key_parsing_maps_navigation_promotion_quit_and_nothing_else() {
     fn scripted(bytes: &[u8]) -> Option<Key> {
         let mut remaining = bytes.to_vec();
@@ -2595,9 +2636,14 @@ fn app_first_dashboard_reserves_both_identity_labels() {
             viewport,
         );
         assert!(text.contains("python3"), "{text}");
-        if width == 80 {
-            assert!(text.contains("/separate/physical/providers/"), "{text}");
-        }
+        // The width-bounded dashboard keeps the provider tail, never a
+        // truncated head: the file name stays visible at every size,
+        // whole when it fits, behind a `.../` tail marker otherwise.
+        assert!(text.contains("provider.so"), "{text}");
+        assert!(
+            text.contains("/separate/physical/providers/provider.so") || text.contains(".../"),
+            "{text}"
+        );
         let edge = &presentation.edges[0];
         assert!(
             text.contains(&format!("[{}]", edge.caller.label())),
@@ -2677,7 +2723,7 @@ fn compact_inventory_keeps_associations_scrollable() {
         "{bottom}"
     );
     assert!(
-        bottom.contains("python3") && bottom.contains("/separate/physical/"),
+        bottom.contains("python3") && bottom.contains(".../providers/provider.so"),
         "{bottom}"
     );
     let loss_row = bottom.lines().nth(2).expect("compact coverage/loss row");
@@ -2859,7 +2905,8 @@ fn assert_compact_log_drop_accounting_with_large_counters(width: usize) {
             text.contains(&format!("application python3 [{}]", edge.caller.label())),
             "{text}"
         );
-        assert!(text.contains("module /separate/"), "{text}");
+        assert!(text.contains("module .../"), "{text}");
+        assert!(text.contains("provider.so"), "{text}");
         assert!(
             text.contains(&format!("[{}]", edge.module.label())),
             "{text}"

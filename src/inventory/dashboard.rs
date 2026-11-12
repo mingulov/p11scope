@@ -41,7 +41,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Coalesced redraw cadence: ~3 Hz inside the plan's 2–4 Hz band.
 pub(crate) const REDRAW_INTERVAL: Duration = Duration::from_millis(333);
@@ -92,6 +92,52 @@ pub(crate) fn truncate_cell(text: &str, width: usize) -> String {
     }
     kept.push_str(TRUNCATION_MARK);
     kept
+}
+
+/// Truncate a provider path to `width` display cells keeping the
+/// distinguishing tail: long paths keep their tail at a `/` boundary
+/// (`.../libc.so.6`) so distinct files stay distinct; a tail without
+/// a `/` in range falls back to a char cut so long machine names
+/// still fit. Fits already return unchanged. Mirrors the snapshot
+/// gap path rule for width-bounded cells: the dashboard shows full
+/// provider paths, and a truncated head would hide the file name the
+/// row is about. Callers escape controls before layout.
+fn truncate_path_tail(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mark_width = TRUNCATION_MARK.width();
+    if width <= mark_width {
+        return TRUNCATION_MARK.chars().take(width).collect();
+    }
+    // The longest tail (with the mark) that fits, by display cells.
+    let budget = width - mark_width;
+    let chars: Vec<char> = text.chars().collect();
+    let mut tail_start = chars.len();
+    let mut tail_width = 0;
+    while tail_start > 0 {
+        let cell = chars[tail_start - 1].width().unwrap_or(0);
+        if tail_width + cell > budget {
+            break;
+        }
+        tail_width += cell;
+        tail_start -= 1;
+    }
+    // Prefer a `/` boundary so directory names read whole; a tail
+    // without one keeps the char cut.
+    let mut cut = tail_start;
+    while cut < chars.len() && chars[cut] != '/' {
+        cut += 1;
+    }
+    let shown: String = if cut < chars.len() {
+        chars[cut..].iter().collect()
+    } else {
+        chars[tail_start..].iter().collect()
+    };
+    if shown.chars().count() >= 2 {
+        return format!("{TRUNCATION_MARK}{shown}");
+    }
+    truncate_cell(text, width)
 }
 
 /// Producer-side bounded observer-log tail. Every push sanitizes
@@ -684,7 +730,7 @@ fn render_compact_edge_window(
             head_width,
         );
         lines.push(if marked { format!("> {head}") } else { head });
-        lines.push(identity_cell(
+        lines.push(identity_path_cell(
             "module ",
             &crate::inventory_present::module_display_name(presentation, edge.module),
             &edge.module.label(),
@@ -1351,6 +1397,18 @@ fn identity_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
     truncate_cell(&format!("{text}{suffix}"), width)
 }
 
+/// Reserve the `module ` prefix and the physical reference before
+/// tail-truncating a provider path label: the row keeps its kind,
+/// its distinguishing path tail, and its id.
+fn identity_path_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
+    let suffix = format!(" [{id}]");
+    let label_width = width
+        .saturating_sub(suffix.width())
+        .saturating_sub(prefix.width());
+    let text = truncate_path_tail(label, label_width);
+    truncate_cell(&format!("{prefix}{text}{suffix}"), width)
+}
+
 /// Independently budget the application and module around the arrow.
 /// A selected edge (the promotion cursor) takes a `> ` marker, budgeted
 /// from the same width so marked and unmarked lines share the layout.
@@ -1374,7 +1432,7 @@ fn edge_identity_line(
         &edge.caller.label(),
         app_width,
     );
-    let module = identity_cell(
+    let module = identity_path_cell(
         "",
         &crate::inventory_present::module_display_name(presentation, edge.module),
         &edge.module.label(),

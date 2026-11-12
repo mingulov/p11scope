@@ -291,17 +291,23 @@ def app_first_mode() -> int:
         os.write(launch_write, b"1")
         first = complete_frame(0, 24, lambda text: "scroll 0/1" in text
                                and "app-p1.so" in text and "app-p2.so" in text)
-        associations = re.findall(r"app-first-driver \[(c\d+)\] -> (app-p[12]\.so) \[(m\d+)\]", first)
+        # Provider cells name the full retained path, tail-truncated
+        # with a `.../` marker when the cell is too narrow: the
+        # association pins the path-ness, the file name and both ids.
+        associations = re.findall(
+            r"app-first-driver \[(c\d+)\] -> ([^\s]*/)?(app-p[12]\.so) \[(m\d+)\]", first)
         assert len(associations) == 2, f"two named initial associations: {first}"
-        caller_ids = {caller for caller, _, _ in associations}
+        assert all(tail for _, tail, _, _ in associations), \
+            f"providers shown as path tails, not bare names: {first}"
+        caller_ids = {caller for caller, _, _, _ in associations}
         assert len(caller_ids) == 1, f"one owned caller: {associations}"
         caller_id = associations[0][0]
-        modules = {name: module for _, name, module in associations}
+        modules = {name: module for _, _, name, module in associations}
         assert len(set(modules.values())) == 2, f"physical modules remain separate: {modules}"
         # Navigation follows the rendered edge order, rather than assuming
         # module IDs were assigned in the fixture's argument order.
-        first_name, first_id = associations[0][1:]
-        later_name, later_id = associations[1][1:]
+        _, _, first_name, first_id = associations[0]
+        _, _, later_name, later_id = associations[1]
         assert f"pid {pid} incarnation 0" in first, first
         excerpts.append(("80x24 initial", first))
 
@@ -326,7 +332,8 @@ def app_first_mode() -> int:
         compact = complete_frame(mark, compact_height, lambda text: "(minimal)" in text
                                  and initial_range in text and "tab d x q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in compact, compact
-        assert f"module {first_name} [{first_id}]" in compact, compact
+        assert "module .../" in compact, compact
+        assert f"{first_name} [{first_id}]" in compact, compact
         assert "Module mapped; activity not captured" in compact, compact
         assert "totals: 1 callers 2 modules 2 edges" in compact, compact
         assert all(len(line) <= compact_width for line in compact.splitlines()), compact
@@ -336,8 +343,9 @@ def app_first_mode() -> int:
         os.write(master, b"j")
         later = complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab d x q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in later, later
-        assert f"module {later_name} [{later_id}]" in later, later
-        assert f"module {first_name} [{first_id}]" not in later, later
+        assert "module .../" in later, later
+        assert f"{later_name} [{later_id}]" in later, later
+        assert f"{first_name} [{first_id}]" not in later, later
         assert "Module mapped; activity not captured" in later, later
         assert "totals: 1 callers 2 modules 2 edges" in later, later
         assert all(len(line) <= compact_width for line in later.splitlines()), later
@@ -381,7 +389,11 @@ def app_first_mode() -> int:
         # x cancel, q quit") truncates past 80 columns, so "q quit" no longer
         # renders; pin the DR37 keys instead (src/inventory/dashboard.rs:948).
         enlarged = complete_frame(mark, 24, lambda text: "scroll 1/1" in text and "d promote" in text)
-        assert f"app-first-driver [{caller_id}] -> {later_name} [{later_id}]" in enlarged, enlarged
+        assert re.search(
+            rf"app-first-driver \[{re.escape(caller_id)}\] -> [^\s]*/{re.escape(later_name)} "
+            rf"\[{re.escape(later_id)}\]",
+            enlarged,
+        ), enlarged
         assert f"pid {pid} incarnation 0" in enlarged, enlarged
         assert "presence mapped | capture scan only | activity not covered" in enlarged, enlarged
         assert "entries ?" in enlarged, enlarged

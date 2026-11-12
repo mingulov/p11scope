@@ -4183,14 +4183,18 @@ fn object_journal_exec_birth_present_in_journal_object() {
     );
 }
 
-/// F1: the refused arm's unmatched decision stays outcome-aware. A failed
-/// START retirement (`RetirementFailed`) bumps `EVIDENCE_UNMATCHED_RETURNS`
-/// even when the continuity/coverage predicate (`bump`) is silent
-/// (never-active guest: unstamped entry + `COVERAGE_DISABLED`). Ring loss
-/// stays `OutputFailed`-only. Whitespace/comment-insensitive; the caller
-/// supplies the arm body plus its end marker (`let tail =` for the two
-/// `main.rs` copies, `let Some(reason)` for the journal copy). Accepts both
-/// refused shapes: `if !joined {` (main.rs) and
+/// F1 (combined tip): the refused arm splits retired joins from failed
+/// retirements through the helper, gated by the coverage predicate. A
+/// failed START retirement (`RetirementFailed`) bumps
+/// `EVIDENCE_UNMATCHED_RETURNS` even when the predicate (`bump`) is
+/// silent (never-active guest: unstamped entry + `COVERAGE_DISABLED`);
+/// a retired start with a refused join bumps
+/// `EVIDENCE_SEMANTIC_CAPTURE_FAILURES` when the predicate counts and
+/// stays silent otherwise. Ring loss stays `OutputFailed`-only.
+/// Whitespace/comment-insensitive; the caller supplies the arm body
+/// plus its end marker (`let tail =` for the two `main.rs` copies,
+/// `let Some(reason)` for the journal copy). Accepts both refused
+/// shapes: `if !joined {` (main.rs) and
 /// `if !unsafe { continuity_joins(..) } {` (journal_roots.rs).
 fn refused_unmatched_is_retirement_aware(body: &str, end_marker: &str) -> bool {
     let refused = if let Some((_, refused)) = body.split_once("if !joined {") {
@@ -4213,12 +4217,25 @@ fn refused_unmatched_is_retirement_aware(body: &str, end_marker: &str) -> bool {
         .collect();
     let ring_loss =
         "ifoutcome==RefusedBaseOutcome::OutputFailed{bump_evidence(EVIDENCE_RING_LOSS);}";
-    let unmatched_aware = "ifbump||outcome==RefusedBaseOutcome::RetirementFailed{bump_evidence(EVIDENCE_UNMATCHED_RETURNS);}";
-    match (code.find(ring_loss), code.find(unmatched_aware)) {
-        (Some(loss), Some(unmatched)) => {
-            loss < unmatched
+    let helper = "let(unmatched,semantic)=refused_join_accounting(outcome,bump);";
+    let unmatched = "ifunmatched{bump_evidence(EVIDENCE_UNMATCHED_RETURNS);}";
+    let semantic = "ifsemantic{bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);}";
+    match (
+        code.find(ring_loss),
+        code.find(helper),
+        code.find(unmatched),
+        code.find(semantic),
+    ) {
+        (Some(loss), Some(helper), Some(unmatched), Some(semantic)) => {
+            loss < helper
+                && helper < unmatched
+                && unmatched < semantic
                 && code
                     .matches("bump_evidence(EVIDENCE_UNMATCHED_RETURNS);")
+                    .count()
+                    == 1
+                && code
+                    .matches("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);")
                     .count()
                     == 1
                 && code.matches("bump_evidence(EVIDENCE_RING_LOSS);").count() == 1
@@ -4227,15 +4244,18 @@ fn refused_unmatched_is_retirement_aware(body: &str, end_marker: &str) -> bool {
     }
 }
 
-/// F1 composition: the real predicate + preservation + the expected final
-/// decision. Healthy never-active emits silently (0/0); failed retirement
-/// bumps unmatched (1) without output or ring loss; output failure bumps
-/// ring loss only; an active predicate bumps on every outcome. The final
-/// decision here is the fixed `bump || RetirementFailed` contract; the
-/// per-caller source pin above binds it to production.
+/// F1 composition (combined tip): the real predicate + preservation +
+/// the helper's outcome split. Healthy never-active emits silently
+/// (0/0); failed retirement bumps unmatched (1, never semantic)
+/// without output or ring loss; output failure bumps ring loss only;
+/// an active predicate reports semantic on retired starts and
+/// unmatched only on failed retirement. The final decision here is
+/// the `refused_join_accounting` contract; the per-caller source pin
+/// above binds it to production.
 fn check_refused_retirement_composition(tag: &str) {
     use p11scope_ebpf_common::object_flow::{
         RefusedBaseOutcome, continuity_joins, join_refusal_bump, preserve_refused_base,
+        refused_join_accounting,
     };
     use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp, instance};
     use std::cell::Cell;
@@ -4263,9 +4283,8 @@ fn check_refused_retirement_composition(tag: &str) {
         "{tag}: never-active unstamped predicate stays silent"
     );
 
-    let final_unmatched = |bump: bool, outcome: RefusedBaseOutcome| {
-        bump || outcome == RefusedBaseOutcome::RetirementFailed
-    };
+    let final_decision =
+        |bump: bool, outcome: RefusedBaseOutcome| refused_join_accounting(outcome, bump);
     let final_ring_loss = |outcome: RefusedBaseOutcome| outcome == RefusedBaseOutcome::OutputFailed;
 
     {
@@ -4292,9 +4311,10 @@ fn check_refused_retirement_composition(tag: &str) {
             output_called.get(),
             "{tag}: healthy outputs the preserved base"
         );
-        assert!(
-            !final_unmatched(bump, outcome),
-            "{tag}: healthy never-active emits silently (0 unmatched)"
+        assert_eq!(
+            final_decision(bump, outcome),
+            (false, false),
+            "{tag}: healthy never-active emits silently (0 unmatched, 0 semantic)"
         );
         assert!(!final_ring_loss(outcome), "{tag}: healthy has no ring loss");
     }
@@ -4319,8 +4339,9 @@ fn check_refused_retirement_composition(tag: &str) {
             !output_called.get(),
             "{tag}: failed retirement never outputs"
         );
-        assert!(
-            final_unmatched(bump, outcome),
+        assert_eq!(
+            final_decision(bump, outcome),
+            (true, false),
             "{tag}: failed retirement bumps unmatched even when the predicate is silent"
         );
         assert!(
@@ -4331,9 +4352,10 @@ fn check_refused_retirement_composition(tag: &str) {
     {
         let outcome = preserve_refused_base(|| true, || {}, || false);
         assert_eq!(outcome, RefusedBaseOutcome::OutputFailed);
-        assert!(
-            !final_unmatched(bump, outcome),
-            "{tag}: OutputFailed with a silent predicate stays unmatched-silent"
+        assert_eq!(
+            final_decision(bump, outcome),
+            (false, false),
+            "{tag}: OutputFailed with a silent predicate stays silent"
         );
         assert!(
             final_ring_loss(outcome),
@@ -4343,24 +4365,26 @@ fn check_refused_retirement_composition(tag: &str) {
     {
         let active_bump = join_refusal_bump(&continuity, instance::COVERAGE_ENABLED);
         assert!(active_bump, "{tag}: active unstamped predicate bumps");
-        for outcome in [
-            RefusedBaseOutcome::Emitted,
-            RefusedBaseOutcome::OutputFailed,
-            RefusedBaseOutcome::RetirementFailed,
+        for (outcome, expected) in [
+            (RefusedBaseOutcome::Emitted, (false, true)),
+            (RefusedBaseOutcome::OutputFailed, (false, true)),
+            (RefusedBaseOutcome::RetirementFailed, (true, false)),
         ] {
-            assert!(
-                final_unmatched(active_bump, outcome),
-                "{tag}: active predicate bumps on {outcome:?}"
+            assert_eq!(
+                final_decision(active_bump, outcome),
+                expected,
+                "{tag}: active predicate splits {outcome:?} into (unmatched, semantic) = {expected:?}"
             );
         }
     }
 }
 
 /// The pin itself is non-vacuous: it accepts the fixed shape and rejects
-/// the pre-fix `if bump` shape, a wrong outcome, and a dropped ring-loss
-/// guard. Runs before the production assertion so RED still proves the
-/// helper works. Uses the journal refused shape when the journal end
-/// marker is given, so both production spellings are covered.
+/// a dropped coverage gate, an unconditional unmatched bump, a missing
+/// semantic bump, and a dropped ring-loss guard. Runs before the
+/// production assertion so RED still proves the helper works. Uses the
+/// journal refused shape when the journal end marker is given, so both
+/// production spellings are covered.
 fn assert_retirement_pin_is_nonvacuous(end_marker: &str) {
     let head = if end_marker == "let Some(reason)" {
         "if !unsafe { continuity_joins(&(*raw).continuity) } {"
@@ -4371,25 +4395,35 @@ fn assert_retirement_pin_is_nonvacuous(end_marker: &str) {
         "{head} let bump = join_refusal_bump(); let outcome = preserve_refused_base(); \
          entry.discard(0); if outcome == RefusedBaseOutcome::OutputFailed {{ \
          bump_evidence(EVIDENCE_RING_LOSS); }} \
-         if bump || outcome == RefusedBaseOutcome::RetirementFailed {{ \
-         bump_evidence(EVIDENCE_UNMATCHED_RETURNS); }} return 0; }} {end_marker}"
+         let (unmatched, semantic) = refused_join_accounting(outcome, bump); \
+         if unmatched {{ bump_evidence(EVIDENCE_UNMATCHED_RETURNS); }} \
+         if semantic {{ bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES); }} \
+         return 0; }} {end_marker}"
     );
     assert!(
         refused_unmatched_is_retirement_aware(&fixed, end_marker),
         "the pin must accept the fixed shape"
     );
-    let buggy = fixed.replace(
-        "if bump || outcome == RefusedBaseOutcome::RetirementFailed",
-        "if bump",
+    let dropped_gate = fixed.replace(
+        "refused_join_accounting(outcome, bump)",
+        "refused_join_accounting(outcome, true)",
     );
     assert!(
-        !refused_unmatched_is_retirement_aware(&buggy, end_marker),
-        "the pin must reject the pre-fix `if bump` shape"
+        !refused_unmatched_is_retirement_aware(&dropped_gate, end_marker),
+        "the pin must reject a dropped coverage gate"
     );
-    let wrong_outcome = fixed.replace("RetirementFailed", "Emitted");
+    let unconditional = fixed.replace("if unmatched {", "if true {");
     assert!(
-        !refused_unmatched_is_retirement_aware(&wrong_outcome, end_marker),
-        "the pin must reject a wrong outcome"
+        !refused_unmatched_is_retirement_aware(&unconditional, end_marker),
+        "the pin must reject an unconditional unmatched bump"
+    );
+    let missing_semantic = fixed.replace(
+        "if semantic { bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES); }",
+        "",
+    );
+    assert!(
+        !refused_unmatched_is_retirement_aware(&missing_semantic, end_marker),
+        "the pin must reject a missing semantic bump"
     );
     let dropped_loss = fixed.replace(
         "if outcome == RefusedBaseOutcome::OutputFailed { bump_evidence(EVIDENCE_RING_LOSS); }",
@@ -4413,7 +4447,7 @@ fn guest_returns_ordinary_retirement_failure_is_still_unmatched() {
         .expect("ordinary object half end");
     assert!(
         refused_unmatched_is_retirement_aware(ordinary, "let tail ="),
-        "ordinary refused arm must OR unmatched with RetirementFailed"
+        "ordinary refused arm must gate the helper on the coverage predicate and split failed retirement from retired joins"
     );
     check_refused_retirement_composition("ordinary");
 }
@@ -4430,7 +4464,7 @@ fn guest_returns_generic_retirement_failure_is_still_unmatched() {
         .expect("object half end");
     assert!(
         refused_unmatched_is_retirement_aware(object, "let tail ="),
-        "generic refused arm must OR unmatched with RetirementFailed"
+        "generic refused arm must gate the helper on the coverage predicate and split failed retirement from retired joins"
     );
     check_refused_retirement_composition("generic");
 }
@@ -4445,7 +4479,7 @@ fn guest_returns_journal_retirement_failure_is_still_unmatched() {
         .expect("journal ordinary half");
     assert!(
         refused_unmatched_is_retirement_aware(journal, "let Some(reason)"),
-        "journal refused arm must OR unmatched with RetirementFailed"
+        "journal refused arm must gate the helper on the coverage predicate and split failed retirement from retired joins"
     );
     check_refused_retirement_composition("journal");
 }

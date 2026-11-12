@@ -759,11 +759,14 @@ fn inventory_snapshot_names_the_observed_executable_and_module() {
     let edges = edges_for(&doc, caller_id, module_id);
     assert_eq!(edges.len(), 1);
     assert_scan_only_entries(edges[0], "app-first owned mapping");
+    // Provider heads name the full retained path (text-polish 3cac05e06),
+    // so the joined overview carries the whole module path; the
+    // application side keeps its executable basename.
     let overview = format!(
         "application {} [{caller_id} pid {pid} incarnation {}] -> module {} [{module_id}]: Module mapped; activity not captured",
         Path::new(exe).file_name().unwrap().to_str().unwrap(),
         caller["incarnation"].as_u64().unwrap(),
-        Path::new(path).file_name().unwrap().to_str().unwrap(),
+        path,
     );
     assert!(
         text.lines().any(|line| line.starts_with(&overview)),

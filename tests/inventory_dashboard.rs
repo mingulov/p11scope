@@ -176,13 +176,16 @@ fn dashboard_on_pipe_degrades_to_snapshots_never_ansi() {
         "{stdout}"
     );
     // The owned edges render with the full dashboard state columns.
+    // Provider heads name the full retained path (text-polish
+    // 3cac05e06), so the joined overview carries the whole path.
     for soname in ["dg-p1.so", "dg-p2.so"] {
+        let full = dir.join(soname);
         assert!(stdout.contains(soname), "owned {soname} visible: {stdout}");
         assert!(
             stdout
                 .lines()
                 .any(|line| line.starts_with("application degrade-driver [c")
-                    && line.contains(&format!("-> module {soname} [m"))
+                    && line.contains(&format!("-> module {} [m", full.display()))
                     && line.contains("Module mapped; activity not captured")),
             "joined overview for {soname}: {stdout}"
         );

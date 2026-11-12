@@ -33105,6 +33105,68 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
 }
 
 #[test]
+fn live_union_preserves_finished_scan_without_new_static_table() {
+    // A live C_GetFunctionList return unioned into a finished
+    // single-table scan module must not reopen finished-ness: the
+    // observation confirms rather than expands the scan surface, so
+    // the static table keeps its sole-complete grant instead of
+    // churning the capture through a detach+reattach static episode.
+    // A genuinely new static table still re-opens finished-ness.
+    let table = |address: u64, live_return: bool| ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset: Some(0),
+        live_return,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |finished: bool, tables: Vec<ScannedTable>| ScannedModule {
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: finished,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    let mut confirmed = vec![module(true, vec![table(0x1000, false)])];
+    merge_scanned_module(
+        &mut confirmed,
+        module(false, vec![table(0x7f00_0000, true)]),
+    );
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0].tables.len(), 2);
+    assert!(
+        confirmed[0].tables_scan_finished,
+        "a pure-live union preserves the finished scan"
+    );
+    let mut reopened = vec![module(true, vec![table(0x1000, false)])];
+    merge_scanned_module(&mut reopened, module(true, vec![table(0x2000, false)]));
+    assert_eq!(reopened[0].tables.len(), 2);
+    assert!(
+        !reopened[0].tables_scan_finished,
+        "a new static table still re-opens finished-ness"
+    );
+}
+
+#[test]
 fn incomplete_rescan_preserves_double_load_detection() {
     // F7d: the revalidated-rescan union preserves positive
     // double-load evidence in both directions — a retained `true`

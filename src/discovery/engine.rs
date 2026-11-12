@@ -10125,13 +10125,22 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     // sees fewer loads is not fresh evidence of fewer loads.
     existing.double_loaded |= incoming.double_loaded;
     existing.same_file_loads = existing.same_file_loads.max(incoming.same_file_loads);
-    // The finished flag ANDs: both scans must have finished, and the union
-    // must add no new table (a new table means neither scan alone saw the
-    // whole surface). Like the load count, only a complete-scan replacement
-    // re-proves finished-ness, never a union.
+    // The finished flag ANDs over static tables: both scans must have
+    // finished, and the union must add no new static table (a new static
+    // table means neither scan alone saw the whole surface). Live tables
+    // are runtime observations, not scan findings: a union that only
+    // adds or merges live tables leaves the finished scan's completeness
+    // claim intact — no second static table is hiding. Like the load
+    // count, only a complete-scan replacement re-proves finished-ness,
+    // never a union.
     let finished_before = existing.tables_scan_finished;
-    let tables_before = existing.tables.len();
     let incoming_finished = incoming.tables_scan_finished;
+    let incoming_has_tables = !incoming.tables.is_empty();
+    let incoming_has_static = incoming.tables.iter().any(|table| !table.live_return);
+    // A purely live incoming (observations, no scan findings) never
+    // re-opens finished-ness for unfinished-ness it cannot have.
+    let incoming_pure_live = incoming_has_tables && !incoming_has_static;
+    let mut appended_static = false;
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
@@ -10142,6 +10151,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
         let typed_live = table.live_return
             && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
+        let incoming_is_static = !table.live_return;
         let index = existing.tables.iter().position(|known| *known == table);
         table_indices.push(match index {
             Some(index) => {
@@ -10174,6 +10184,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 index
             }
             None => {
+                appended_static |= incoming_is_static;
                 existing.tables.push(table);
                 let index = existing.tables.len() - 1;
                 if typed_live {
@@ -10184,7 +10195,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         });
     }
     existing.tables_scan_finished =
-        finished_before && incoming_finished && existing.tables.len() == tables_before;
+        finished_before && (incoming_finished || incoming_pure_live) && !appended_static;
     for mut interface in incoming.interfaces.drain(..) {
         interface.table = interface
             .table

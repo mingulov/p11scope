@@ -5585,8 +5585,9 @@ fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
 /// provider's own object and agrees per-ordinal with its exports, and
 /// the same ambient guards as the sole leg hold (finished scan, no
 /// vendor interface claim, no witness fault, not double-loaded,
-/// required key-operation entries present). Multi-table providers
-/// reach authority through interface linkage, not this leg.
+/// required key-operation entries present). Multi-static-table
+/// providers reach authority through interface linkage, not this leg;
+/// live siblings are observations, not rivals.
 fn getter_export_authorized(
     module: &ReconciledModule,
     index: usize,
@@ -5594,7 +5595,19 @@ fn getter_export_authorized(
     score: &TableEvidenceScore,
 ) -> bool {
     let scanned = &module.scanned;
-    if scanned.tables.len() != 1 || index != 0 || !scanned.tables_scan_finished {
+    // Live tables are runtime observations, never scan rivals: the leg
+    // needs exactly one static table, and the candidate must be that
+    // table. A live sibling confirms rather than disputes; the live
+    // table itself grants only through the live-return leg, never here.
+    let mut static_tables = scanned
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| !table.live_return);
+    let Some((position, _)) = static_tables.next() else {
+        return false;
+    };
+    if static_tables.next().is_some() || index != position || !scanned.tables_scan_finished {
         return false;
     }
     if scanned
@@ -5650,18 +5663,32 @@ fn getter_export_authorized(
 }
 
 /// Sole-complete-table scan authority (no-manifest key operations):
-/// a single static 2.x table with no rival proves the table a caller
-/// reaches without interface linkage or a live return. All five legs
-/// hold or nothing grants; anything else stays refused. Leg (a) needs a
+/// a single static 2.x table with no static rival proves the table a
+/// caller reaches without interface linkage. All five legs hold or
+/// nothing grants; anything else stays refused. Leg (a) needs a
 /// finished tables scan: a truncated scan that found one table proves
-/// nothing about a second it never reached.
+/// nothing about a second it never reached. Live siblings are not
+/// rivals (the observed return confirms); the live table itself grants
+/// only through the live-return leg.
 fn sole_complete_table_authorized(
     module: &ReconciledModule,
     index: usize,
     exports: &ObjectExports<'_>,
 ) -> bool {
     let scanned = &module.scanned;
-    if scanned.tables.len() != 1 || index != 0 {
+    // Live tables are runtime observations, never scan rivals: the leg
+    // needs exactly one static table, and the candidate must be that
+    // table. A live sibling confirms rather than disputes; the live
+    // table itself grants only through the live-return leg, never here.
+    let mut static_tables = scanned
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| !table.live_return);
+    let Some((position, _)) = static_tables.next() else {
+        return false;
+    };
+    if static_tables.next().is_some() || index != position {
         return false;
     }
     if !scanned.tables_scan_finished {
@@ -5726,9 +5753,10 @@ fn sole_complete_table_authorized(
         return false;
     }
     // No unresolved-lookalike count is needed here: (a) above already
-    // requires exactly one table, and a closure array needs more than
-    // `MAX_TABLES_PER_OBJECT` unresolved tables, so any second candidate
-    // — exports-only or otherwise — refuses at the (a) gate.
+    // requires exactly one static table, and a closure array needs more
+    // than `MAX_TABLES_PER_OBJECT` unresolved tables, so any second
+    // static candidate — exports-only or otherwise — refuses at the (a)
+    // gate. Live siblings are observations, not candidates.
     true
 }
 
@@ -9010,6 +9038,70 @@ mod tests {
         assert!(
             plan.slots.iter().all(|slot| slot.descriptor_index != 0),
             "attached descriptors survive the agreeing sibling"
+        );
+    }
+
+    #[test]
+    fn live_sibling_with_incomplete_return_keeps_static_grant_without_replace() {
+        // Fedora pair with an unreconciled live table: the observed
+        // return has not bound its entry objects yet, so the
+        // live-return leg cannot grant it — but the finished static
+        // table still proves the layout (a live sibling confirms
+        // rather than disputes), so the attached grant must survive
+        // without a detach+reattach static episode.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut paired = sole_complete_module();
+        let mut sibling = paired.scanned.tables[0].clone();
+        sibling.live_return = true;
+        sibling.address = 0x7f00_0000;
+        paired.scanned.tables.push(sibling);
+        paired
+            .entry_objects
+            .push(vec![paired.object; paired.scanned.tables[0].entries.len()]);
+        // The live table is not reconciled yet: one entry sits
+        // unpinned, so its clause-1 core fails while the static
+        // table's holds (same disposition `move_entry_aside` gives
+        // table zero, applied to the sibling).
+        let position = paired.scanned.tables[1]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetInfo")
+            .expect("entry to move aside");
+        let entry = paired.scanned.tables[1].entries.remove(position);
+        paired.entry_objects[1].remove(position);
+        paired.scanned.tables[1].unpinned.push(Skipped {
+            subject: entry.name.to_string(),
+            reason: "target not pinned to a comparable object".into(),
+        });
+        assert_eq!(
+            paired.scanned.tables[1].decoded_slot_count(),
+            68,
+            "the decoded extent is preserved"
+        );
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&paired), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.slots.iter().all(|slot| slot.semantic_authorized),
+            "the static grant survives an incomplete live sibling"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.retire.is_empty());
+        assert!(
+            delta.replace.is_empty(),
+            "an incomplete live sibling must not downgrade attached semantic slots"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.descriptor_index != 0),
+            "attached descriptors survive the incomplete live sibling"
         );
     }
 

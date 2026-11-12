@@ -2442,6 +2442,7 @@ mod tests {
     /// driver side effects would happen before any final fstat refuses it.
     #[test]
     fn learn_file_mark_fd_survives_ancestor_swap_to_device() {
+        use std::os::unix::fs::FileTypeExt as _;
         use std::os::unix::fs::MetadataExt as _;
         let dir = tempfile::tempdir().unwrap();
         let ancestor = dir.path().join("real");

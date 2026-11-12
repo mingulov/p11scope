@@ -960,15 +960,18 @@ UTF-8; non-UTF-8 bytes become U+FFFD) at attach time, or the
 finite reason it could not be read. The attach-time read is re-read at
 report time from the same target, each read bound to the target's
 retained pin, so a recycled pid never misattaches an unrelated
-program's exe. If the target execs mid-capture, `exe` keeps the
-attach-time program — calls it made are never relabeled — and
-`exec_to_exe` names the end-of-capture program; the stderr `target:`
-end note and the stdout `caller:` line name both programs the same
-way. Per-program call counts are not attributed: nothing says which
-program made which calls, at most one transition is provable from the
-two reads (an intermediate program reads as a single hop, and a
-re-exec of the same path is invisible), and `exec_to_exe` is absent,
-never null, without a proven exec. It
+program's exe. If the target execs mid-capture — proven only when the
+executable file identity (device + inode of the exe) changed between
+the two reads — `exe` keeps the attach-time program — calls it made
+are never relabeled — and `exec_to_exe` names the end-of-capture
+program; the stderr `target:` end note and the stdout `caller:` line
+name both programs the same way. A pathname change alone is not an
+exec: renaming or unlinking the running executable keeps the
+attach-time name with no `exec_to_exe`. Per-program call counts are
+not attributed: nothing says which program made which calls, at most
+one transition is provable from the two reads (an intermediate program
+reads as a single hop, and a re-exec of the same path is invisible),
+and `exec_to_exe` is absent, never null, without a proven exec. It
 is present if and only if the scope is `pid` with resolved caller
 identity (a pid scope that resolved nothing emits no key; that arm is
 test-only — production always resolves exactly one of the two for pid

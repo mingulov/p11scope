@@ -1674,5 +1674,35 @@ class RvNamesRowAgreement(unittest.TestCase):
         )
 
 
+class CallerExecRowAgreement(unittest.TestCase):
+    """capture.caller.exec_to_exe: the v3-additive post-exec disclosure.
+
+    Like initialization above, the release oracle does not close
+    capture.caller keys, so there is no oracle vocabulary to agree with
+    here: this pins the machine schema's additive shape instead — an
+    optional plain string, absent (never null) without a proven exec.
+    Per docs/schema/observed-profile-v3.md, the producer emits it only
+    when the executable file identity changed between the attach-time
+    and end-of-capture reads; a rename or unlink of the running
+    executable is not an exec.
+    """
+
+    def caller_schema(self):
+        return SCHEMA["properties"]["capture"]["properties"]["caller"]
+
+    def test_exec_to_exe_is_an_optional_string(self):
+        caller = self.caller_schema()
+        self.assertIn("exec_to_exe", caller["properties"])
+        self.assertNotIn("exec_to_exe", caller.get("required", []))
+        self.assertEqual(
+            caller["properties"]["exec_to_exe"], {"type": "string"}
+        )
+
+    def test_exec_to_exe_description_names_the_proven_exec_rule(self):
+        caller = self.caller_schema()
+        self.assertIn("exec_to_exe", caller["description"])
+        self.assertIn("proven exec", caller["description"])
+
+
 if __name__ == "__main__":
     unittest.main()

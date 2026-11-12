@@ -372,11 +372,16 @@ physical-identity and non-leader-exec qualifications under
 
 ### Pid-scope caller name after exec
 
-Since v0.8.0, when a `profile --pid` or `metrics --pid` target execs
-another program during the capture, the report keeps the attach-time
-program in `capture.caller.exe` and discloses the end-of-capture
-program in `capture.caller.exec_to_exe`, while the stderr `target:`
-end note and the stdout `caller:` line name both programs plainly.
+Since v0.7.0, when a `profile --pid` or `metrics --pid` target execs
+another program during the capture — proven only when the executable
+file identity (device + inode of the exe) changed between the
+attach-time and end-of-capture reads — the report keeps the
+attach-time program in `capture.caller.exe` and discloses the
+end-of-capture program in `capture.caller.exec_to_exe`, while the
+stderr `target:` end note and the stdout `caller:` line name both
+programs plainly. A pathname change alone is not an exec: renaming or
+unlinking the running executable keeps the attach-time name with no
+transition claimed.
 Residual limits: per-program call counts are not attributed (nothing
 says which program made which calls); at most one transition is
 provable from the two reads, so an intermediate program (A->B->C

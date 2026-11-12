@@ -22,10 +22,11 @@
         "modules": {"type": "array"},
         "caller": {
           "type": "object",
-          "description": "Pid-scope target identity, present only for pid scope with resolved caller identity: exactly one of exe/exe_unknown_reason is non-null.",
+          "description": "Pid-scope target identity, present only for pid scope with resolved caller identity: exactly one of exe/exe_unknown_reason is non-null. exec_to_exe names the end-of-capture program after a proven exec (absent, never null, otherwise).",
           "properties": {
             "exe": {"type": ["string", "null"]},
-            "exe_unknown_reason": {"type": ["string", "null"]}
+            "exe_unknown_reason": {"type": ["string", "null"]},
+            "exec_to_exe": {"type": "string"}
           }
         }
       }

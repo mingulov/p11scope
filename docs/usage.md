@@ -422,11 +422,14 @@ could not be read — names the caller program on profile stdout after
 the header (`caller: <path>`, or `caller unknown: <reason>`), and
 carries the same identity in `capture.caller`
 of the JSON report (`{exe, exe_unknown_reason}`, exactly one set).
-When the target execs mid-capture, `exe` keeps the attach-time
+When the target execs mid-capture — proven only when the executable
+file identity (device + inode of the exe) changed between the
+attach-time and end-of-capture reads — `exe` keeps the attach-time
 program, `exec_to_exe` names the end-of-capture program, and a stderr
 end note plus the stdout `caller:` line name both programs
-(`(exec'd to <end-exe> during the capture)`). Per-program call counts
-are not attributed.
+(`(exec'd to <end-exe> during the capture)`). A rename or unlink of
+the running executable is not an exec: the attach-time name stays with
+no transition claimed. Per-program call counts are not attributed.
 The report carries no PID number; the pid is an operator diagnostic
 only. Cgroup and system scopes name no single caller.
 

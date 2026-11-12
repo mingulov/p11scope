@@ -2078,12 +2078,18 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
             for item in maps:
                 if item['name'] in singletons:
                     item['max_entries'] = 1
+                if item['name'] == 'EVENTS':
+                    item['max_entries'] = capture.AGGREGATE_ONLY_EVENTS_MAX_ENTRIES
             return maps
 
         capture.validate_inventory(aggregate_inventory(), 'default', 'aggregate-only')
+        singletons_only = self.live_inventory()
+        for item in singletons_only:
+            if item['name'] in singletons:
+                item['max_entries'] = 1
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=IMAGE_CONTINUITY'):
-            capture.validate_inventory(aggregate_inventory(), 'default', 'allowlisted')
+            capture.validate_inventory(singletons_only, 'default', 'allowlisted')
         for name, full in (("IMAGE_CONTINUITY", 262144), ("IMAGE_TGID_INDEX", 262144),
                            ("IMAGE_QUERY_REQUESTS", 1024)):
             with self.subTest(name=name, size="full"):
@@ -2131,6 +2137,8 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     item['max_entries'] = owned_discovery
                 elif privacy == 'aggregate-only' and item['name'] in singletons:
                     item['max_entries'] = 1
+                elif privacy == 'aggregate-only' and item['name'] == 'EVENTS':
+                    item['max_entries'] = capture.AGGREGATE_ONLY_EVENTS_MAX_ENTRIES
             return maps
 
         self.assertEqual(capture.definitions.SAFE_MAPS['DISCOVERY']['max_entries'], 2_097_152)
@@ -2281,6 +2289,57 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         capture.validate_inventory(self.live_inventory(), 'default')
         capture.validate_inventory(
             self.live_inventory_from(capture.definitions.UNSAFE_MAPS), 'diagnostic')
+
+    def test_aggregate_only_inventory_expects_4m_events_ring(self):
+        """Aggregate-only lanes load a 4 MiB EVENTS ring, by contract.
+
+        Aggregate captures write no per-call record, so the loader keeps
+        EVENTS at AGGREGATE_RING_BYTES (src/run.rs) instead of the pinned
+        32 MiB default. The live comparison expects exactly the loader's
+        4 MiB report on aggregate-only lanes. Any other size, any other
+        field drift, or a 4 MiB ring on an allowlisted lane still fails.
+        """
+        def aggregate_inventory():
+            maps = self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS)
+            for item in maps:
+                if item['name'] in {"IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"}:
+                    item['max_entries'] = 1
+                if item['name'] == 'EVENTS':
+                    item['max_entries'] = 4 * 1024 * 1024
+            return maps
+
+        capture.validate_inventory(aggregate_inventory(), 'wide', 'aggregate-only')
+        full = aggregate_inventory()
+        next(item for item in full if item['name'] == 'EVENTS')['max_entries'] = 33_554_432
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=EVENTS'):
+            capture.validate_inventory(full, 'wide', 'aggregate-only')
+        allowlisted = aggregate_inventory()
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=EVENTS'):
+            capture.validate_inventory(allowlisted, 'wide', 'allowlisted')
+        retyped = aggregate_inventory()
+        next(item for item in retyped if item['name'] == 'EVENTS')['bytes_key'] = 4
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=EVENTS'):
+            capture.validate_inventory(retyped, 'wide', 'aggregate-only')
+
+    def test_aggregate_events_size_tracks_rust_constant(self):
+        """AGGREGATE_ONLY_EVENTS_MAX_ENTRIES tracks AGGREGATE_RING_BYTES.
+
+        The canary's aggregate-lane EVENTS expectation must equal the
+        loader size in src/run.rs; the constant is parsed from the Rust
+        source so a one-sided change fails here instead of breaking live
+        metrics lanes while this suite stays green.
+        """
+        run = (ROOT / "src/run.rs").read_text()
+        matches = re.findall(
+            r"pub\(crate\) const AGGREGATE_RING_BYTES: u32 = ([^;]+);", run)
+        self.assertEqual(len(matches), 1)
+        rust_value = 1
+        for factor in matches[0].split("*"):
+            rust_value *= int(factor.strip())
+        self.assertEqual(capture.AGGREGATE_ONLY_EVENTS_MAX_ENTRIES, rust_value)
 
     def test_real_stop_refusal_resumes_only_observer_and_never_publishes(self):
         self.probe('first_refusal')

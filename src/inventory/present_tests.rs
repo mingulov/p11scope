@@ -6674,3 +6674,187 @@ fn provider_line_with_split_callers_reads_multiple_origins() {
         " [multiple origins]"
     );
 }
+
+/// Same container, mixed freshness: a sampled row and its aged twin
+/// are one origin, not multiple. The head shows the agreed container
+/// with the freshest (sampled) label; per-caller lines keep each
+/// row's own freshness marker.
+#[test]
+fn provider_line_with_same_container_mixed_freshness_shows_single_origin() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "fixture must map two callers to one module"
+    );
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let stale = docker.to_stale();
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, if index == 0 { docker } else { stale }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert_eq!(
+        module_display_name(&presentation, module)
+            .strip_prefix(
+                presentation.modules[0]
+                    .paths
+                    .first()
+                    .expect("fixture paths")
+                    .as_str()
+            )
+            .expect("display starts with the path"),
+        " [container 0123456789ab (docker, cgroup hint)]"
+    );
+}
+
+/// Two containers sharing a 12-hex display prefix are two origins:
+/// agreement compares full canonical IDs, never truncated prefixes,
+/// so the head must not name one container for both.
+#[test]
+fn provider_line_with_shared_prefix_containers_reads_multiple_origins() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "fixture must map two callers to one module"
+    );
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let twin_id = format!("0123456789ab{}", "f".repeat(52));
+    let twin = scope_metadata_for(&format!("system.slice/docker-{twin_id}.scope"));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, if index == 0 { docker } else { twin }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert_eq!(
+        module_display_name(&presentation, module)
+            .strip_prefix(
+                presentation.modules[0]
+                    .paths
+                    .first()
+                    .expect("fixture paths")
+                    .as_str()
+            )
+            .expect("display starts with the path"),
+        " [multiple origins]"
+    );
+}
+
+/// One docker-labeled caller plus one host caller: every labeled
+/// caller agrees, so the head carries the agreed origin. The host
+/// caller stays covered by the provider line above plus its own
+/// scopeless per-caller row.
+#[test]
+fn provider_line_with_mixed_labeled_and_host_callers_shows_agreed_origin() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "fixture must map two callers to one module"
+    );
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let host = scope_metadata_for("user.slice/user-1000.slice/session-2.scope");
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, if index == 0 { docker } else { host }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert_eq!(
+        module_display_name(&presentation, module)
+            .strip_prefix(
+                presentation.modules[0]
+                    .paths
+                    .first()
+                    .expect("fixture paths")
+                    .as_str()
+            )
+            .expect("display starts with the path"),
+        " [container 0123456789ab (docker, cgroup hint)]"
+    );
+}
+
+/// Two different docker containers behind one provider read as
+/// multiple origins rather than one wrong container: same runtime
+/// is not agreement.
+#[test]
+fn provider_line_with_two_docker_containers_reads_multiple_origins() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "fixture must map two callers to one module"
+    );
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let other_id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let other = scope_metadata_for(&format!("system.slice/docker-{other_id}.scope"));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, if index == 0 { docker } else { other }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert_eq!(
+        module_display_name(&presentation, module)
+            .strip_prefix(
+                presentation.modules[0]
+                    .paths
+                    .first()
+                    .expect("fixture paths")
+                    .as_str()
+            )
+            .expect("display starts with the path"),
+        " [multiple origins]"
+    );
+}

@@ -1404,33 +1404,64 @@ pub(crate) fn module_label(presentation: &Presentation, module: ModuleId) -> Str
     retained_full_path_label(path, "Unknown module")
 }
 
+/// Full origin identity behind one provider head: the canonical pod
+/// UID, container ID and parsed runtime. Freshness is not identity: a
+/// sampled row and its aged twin describe one origin. Display prefixes
+/// are not identity either: two containers can share a 12-hex prefix.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct ModuleOriginKey {
+    pod: Option<String>,
+    container: Option<String>,
+    runtime: Option<&'static str>,
+}
+
 /// Bracketed origin for a provider head from its mapping callers' opt-in
 /// container metadata: `[container <12hex> (<runtime>, cgroup hint)]` when
-/// every labeled caller agrees, `[multiple origins]` when they disagree,
-/// and none when no caller carries a label (host-only callers or the
-/// `--caller-metadata` frame off). Display-only: the per-caller scope
-/// lines and JSON carry the full IDs. Reuses the caller scope label so
-/// the two cannot drift; never reads new process data.
+/// every labeled caller agrees on one [`ModuleOriginKey`],
+/// `[multiple origins]` when labeled callers carry two or more, and none
+/// when no caller carries a label (host-only callers or the
+/// `--caller-metadata` frame off). Agreement compares full canonical IDs,
+/// never truncated display prefixes, and never freshness: a stale twin
+/// of a sampled row is the same origin. The single-origin head reuses
+/// the caller scope label (the sampled row's when one is sampled, else
+/// the first), so the head and the per-caller scope lines cannot drift.
+/// Display-only: the per-caller scope lines keep each row's own
+/// freshness marker and JSON carries the full IDs. Never reads new
+/// process data.
 fn module_origin_suffix(presentation: &Presentation, module: ModuleId) -> Option<String> {
-    use std::collections::BTreeSet;
-    let mut labels: BTreeSet<String> = BTreeSet::new();
+    use crate::caller_metadata::presentation::{
+        MetadataStatus, concise_scope_label, runtime_label,
+    };
+    use std::collections::BTreeMap;
+    let mut origins: BTreeMap<ModuleOriginKey, Vec<(MetadataStatus, String)>> = BTreeMap::new();
     for edge in &presentation.edges {
         if edge.module != module {
             continue;
         }
         let metadata = presentation.caller_metadata.metadata(edge.caller);
         if let Some(metadata) = metadata
-            && let Some(label) =
-                crate::caller_metadata::presentation::concise_scope_label(&metadata, false)
+            && let Some(label) = concise_scope_label(&metadata, false)
         {
-            labels.insert(label);
+            origins
+                .entry(ModuleOriginKey {
+                    pod: metadata.pod.uid.map(|uid| uid.as_str().to_string()),
+                    container: metadata.container.id.map(|id| id.as_str().to_string()),
+                    runtime: metadata.container.runtime.map(runtime_label),
+                })
+                .or_default()
+                .push((metadata.status, label));
         }
     }
-    match labels.len() {
+    match origins.len() {
         0 => None,
         1 => {
-            let only = labels.into_iter().next().expect("one label counted");
-            Some(format!(" [{only}]"))
+            let (_, rows) = origins.into_iter().next().expect("one origin counted");
+            let (_, label) = rows
+                .iter()
+                .find(|(status, _)| *status == MetadataStatus::Sampled)
+                .or(rows.first())
+                .expect("one row counted");
+            Some(format!(" [{label}]"))
         }
         _ => Some(" [multiple origins]".to_string()),
     }

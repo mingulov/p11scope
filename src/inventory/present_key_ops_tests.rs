@@ -531,7 +531,7 @@ fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
 }
 
 #[test]
-fn key_ops_line_subset_refused_names_basename_for_other_providers() {
+fn key_ops_line_subset_refused_names_full_path_for_other_providers() {
     // Same refusal, an unfamiliar provider file: the line names the
     // file's full path, never a guessed product.
     let mut presentation =

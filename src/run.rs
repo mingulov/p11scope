@@ -26869,6 +26869,327 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A gated-exec fixture child, killed and reaped on drop so it never
+    /// outlives its test even when an assertion fires before the gate
+    /// opens.
+    struct GatedFixtureChild(std::process::Child);
+    impl Drop for GatedFixtureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Wait until `/proc/<pid>/exe` ends with `needle`, or fail with
+    /// `what`: the deterministic gate for exec-between-read twins.
+    fn wait_for_exe_suffix(pid: u32, needle: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let link = std::fs::read_link(format!("/proc/{pid}/exe"));
+            if link.is_ok_and(|link| link.to_string_lossy().ends_with(needle)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Compile a C fixture with `gcc -O0`, like the rename twin.
+    fn compile_gated_fixture(
+        dir: &std::path::Path,
+        name: &str,
+        source: &str,
+    ) -> std::path::PathBuf {
+        let origin = dir.join(format!("{name}.c"));
+        let binary = dir.join(name);
+        std::fs::write(&origin, source).unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&binary)
+                .arg(&origin)
+                .status()
+                .unwrap()
+                .success(),
+            "compiling the {name} fixture"
+        );
+        binary
+    }
+
+    /// The gated-exec fixture: wait for the gate file, then exec the
+    /// target image. `argv[1]` is the gate path, `argv[2]` the target.
+    const GATED_EXEC_SOURCE: &str = r#"#include <unistd.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+    struct stat st;
+    if (argc != 3) return 2;
+    for (;;) {
+        if (stat(argv[1], &st) == 0) break;
+        usleep(5000);
+    }
+    char *const args[] = {argv[2], NULL};
+    execv(argv[2], args);
+    return 127;
+}
+"#;
+
+    /// The linger fixture, unchanged from the rename twin.
+    const GATED_LINGER_SOURCE: &str =
+        "#include <unistd.h>\nint main(void) { for (;;) pause(); return 0; }\n";
+
+    /// Test mirrors of the production readers in [`resolve_pid_caller`]:
+    /// the real readlink, metadata and exit proof, so gated twins
+    /// exercise real `/proc` state through the injected seam.
+    fn twin_read_link(path: &str) -> Option<String> {
+        std::fs::read_link(path)
+            .ok()
+            .map(|link| link.to_string_lossy().into_owned())
+    }
+
+    fn twin_read_id(path: &str) -> Option<(u64, u64)> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    }
+
+    fn twin_proven_exited(pid: u32) -> bool {
+        crate::process::process_proven_exited(pid) || crate::process::generation_dead(pid)
+    }
+
+    #[test]
+    fn resolve_pid_caller_withholds_a_renamed_path_when_an_exec_lands_between_its_reads() {
+        // Terminal-acquisition twin: attach coherently reads program A;
+        // the still-running A is renamed; the end-of-capture acquisition
+        // reads the renamed link text, then the child execs program B
+        // before the identity lookup. The mixed pair (renamed old path +
+        // new image identity) must never publish the renamed path as an
+        // exec destination: the rename was never an exec, and the real
+        // destination is B.
+        let dir = tempfile::tempdir().unwrap();
+        let race_a = compile_gated_fixture(dir.path(), "race-A", GATED_EXEC_SOURCE);
+        let race_b = compile_gated_fixture(dir.path(), "race-B", GATED_LINGER_SOURCE);
+        let gate = dir.path().join("go");
+        let mut child = GatedFixtureChild(
+            std::process::Command::new(&race_a)
+                .arg(&gate)
+                .arg(&race_b)
+                .die_with_parent()
+                .spawn()
+                .expect("spawning the gated-exec fixture"),
+        );
+        let pid = child.0.id();
+        wait_for_exe_suffix(pid, "race-A", "the gated fixture never exec'd race-A");
+        let pin = crate::process::PidPin::open(pid).expect("pinning the live child");
+        let attach = resolve_pid_caller_with(
+            pid,
+            twin_read_link,
+            twin_read_id,
+            twin_proven_exited,
+            || pin.still_the_same(),
+        );
+        assert!(
+            attach
+                .exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("race-A"),
+            "{attach:?}"
+        );
+        assert!(
+            attach.exe_id.is_some(),
+            "a readable attach exe carries its file identity: {attach:?}"
+        );
+        let renamed = dir.path().join("race-A-renamed");
+        std::fs::rename(&race_a, &renamed).unwrap();
+        let end = resolve_pid_caller_with(
+            pid,
+            |path| {
+                let link = twin_read_link(path);
+                assert!(
+                    link.as_deref()
+                        .unwrap_or_default()
+                        .ends_with("race-A-renamed"),
+                    "the end read starts from the renamed link text: {link:?}"
+                );
+                std::fs::write(&gate, b"go").unwrap();
+                wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
+                link
+            },
+            twin_read_id,
+            twin_proven_exited,
+            || pin.still_the_same(),
+        );
+        let meta_b = std::fs::metadata(&race_b).expect("statting race-B");
+        assert!(
+            end.exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("race-A-renamed"),
+            "{end:?}"
+        );
+        assert_eq!(
+            end.exe_id,
+            Some((meta_b.dev(), meta_b.ino())),
+            "the exec landed between the link read and the identity lookup: {end:?}"
+        );
+        assert!(
+            pin.still_the_same(),
+            "the lifetime bracket held across the exec"
+        );
+        let reconciled = render::reconcile_caller_exec(&attach, end);
+        assert!(
+            reconciled
+                .exe
+                .as_deref()
+                .is_some_and(|exe| exe.ends_with("race-A")),
+            "the attach-time name stays: {reconciled:?}"
+        );
+        assert!(
+            reconciled
+                .exec_to_exe
+                .as_deref()
+                .is_none_or(|to| !to.ends_with("race-A-renamed")),
+            "the renamed old image was published as an exec destination: {reconciled:?}"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the fixture is still the same live child"
+        );
+    }
+
+    #[test]
+    fn resolve_pid_caller_withholds_a_mixed_attach_when_an_exec_lands_between_its_reads() {
+        // Attach-acquisition twin: the attach read takes program A's link
+        // text, then the child execs program B before the identity
+        // lookup. The mixed attach (old path + new identity) suppresses
+        // the real A->B exec; a coherent attach instead proves it and
+        // names the true destination B.
+        let dir = tempfile::tempdir().unwrap();
+        let race_a = compile_gated_fixture(dir.path(), "race-A", GATED_EXEC_SOURCE);
+        let race_b = compile_gated_fixture(dir.path(), "race-B", GATED_LINGER_SOURCE);
+        let gate = dir.path().join("go");
+        let mut child = GatedFixtureChild(
+            std::process::Command::new(&race_a)
+                .arg(&gate)
+                .arg(&race_b)
+                .die_with_parent()
+                .spawn()
+                .expect("spawning the gated-exec fixture"),
+        );
+        let pid = child.0.id();
+        wait_for_exe_suffix(pid, "race-A", "the gated fixture never exec'd race-A");
+        let pin = crate::process::PidPin::open(pid).expect("pinning the live child");
+        let attach = resolve_pid_caller_with(
+            pid,
+            |path| {
+                let link = twin_read_link(path);
+                assert!(
+                    link.as_deref().unwrap_or_default().ends_with("race-A"),
+                    "the attach read starts from program A: {link:?}"
+                );
+                std::fs::write(&gate, b"go").unwrap();
+                wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
+                link
+            },
+            twin_read_id,
+            twin_proven_exited,
+            || pin.still_the_same(),
+        );
+        let meta_b = std::fs::metadata(&race_b).expect("statting race-B");
+        assert!(
+            attach
+                .exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("race-A"),
+            "{attach:?}"
+        );
+        assert_eq!(
+            attach.exe_id,
+            Some((meta_b.dev(), meta_b.ino())),
+            "the exec landed between the link read and the identity lookup: {attach:?}"
+        );
+        let end = resolve_pid_caller_with(
+            pid,
+            twin_read_link,
+            twin_read_id,
+            twin_proven_exited,
+            || pin.still_the_same(),
+        );
+        assert!(
+            end.exe.as_deref().unwrap_or_default().ends_with("race-B"),
+            "{end:?}"
+        );
+        assert_eq!(end.exe_id, Some((meta_b.dev(), meta_b.ino())), "{end:?}");
+        assert!(
+            pin.still_the_same(),
+            "the lifetime bracket held across the exec"
+        );
+        let reconciled = render::reconcile_caller_exec(&attach, end);
+        assert!(
+            reconciled
+                .exec_to_exe
+                .as_deref()
+                .is_some_and(|to| to.ends_with("race-B")),
+            "the real exec to race-B was suppressed by a mixed attach observation: {reconciled:?}"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the fixture is still the same live child"
+        );
+    }
+
+    #[test]
+    fn resolve_pid_caller_proves_a_real_exec_without_a_mid_read_exec() {
+        // Stable real-exec control for the gated twins: the exec lands
+        // strictly between the two acquisitions, so both observations are
+        // coherent and the reconcile names the true destination. This
+        // passes before and after the coherent-acquisition fix.
+        let dir = tempfile::tempdir().unwrap();
+        let race_a = compile_gated_fixture(dir.path(), "race-A", GATED_EXEC_SOURCE);
+        let race_b = compile_gated_fixture(dir.path(), "race-B", GATED_LINGER_SOURCE);
+        let gate = dir.path().join("go");
+        let mut child = GatedFixtureChild(
+            std::process::Command::new(&race_a)
+                .arg(&gate)
+                .arg(&race_b)
+                .die_with_parent()
+                .spawn()
+                .expect("spawning the gated-exec fixture"),
+        );
+        let pid = child.0.id();
+        wait_for_exe_suffix(pid, "race-A", "the gated fixture never exec'd race-A");
+        let pin = crate::process::PidPin::open(pid).expect("pinning the live child");
+        let attach = resolve_pid_caller(pid, Some(&pin));
+        assert!(
+            attach
+                .exe
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("race-A"),
+            "{attach:?}"
+        );
+        std::fs::write(&gate, b"go").unwrap();
+        wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
+        let end = resolve_pid_caller(pid, Some(&pin));
+        assert!(
+            end.exe.as_deref().unwrap_or_default().ends_with("race-B"),
+            "{end:?}"
+        );
+        let reconciled = render::reconcile_caller_exec(&attach, end);
+        assert!(
+            reconciled
+                .exec_to_exe
+                .as_deref()
+                .is_some_and(|to| to.ends_with("race-B")),
+            "a clean A->B exec names its destination: {reconciled:?}"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the fixture is still the same live child"
+        );
+    }
+
     /// CLI text: with nothing attached yet, the readiness line says
     /// what the capture waits for instead of reading as a failure.
     #[test]

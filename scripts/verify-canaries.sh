@@ -366,8 +366,8 @@ run_lane() {
     [ -z "$lane_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     set -- "$@" --duration 6 -o "$WORK/$lane.output"
     case $build in
-        default) lane_variant=default ;;
-        *) lane_variant=diagnostic ;;
+        default) lane_variant=wide ;;
+        *) lane_variant=wide-diagnostic ;;
     esac
     case $build in
         feature-unsafe) lane_privacy=unsafe-unvalidated-metadata ;;
@@ -471,8 +471,8 @@ run_start_lane() {
         --mode profile --duration 8 -o "$WORK/$start_lane.output"
     [ -z "$start_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     case $start_build in
-        default) start_variant=default ;;
-        *) start_variant=diagnostic ;;
+        default) start_variant=wide ;;
+        *) start_variant=wide-diagnostic ;;
     esac
     sudo python3 -I scripts/capture-stopped-canary.py \
         --object-attributes "$OBJECT_ATTRIBUTES" \
@@ -567,7 +567,7 @@ run_object_cell() {
     # the live frame's ` - privacy=` marker, which is verbose-only.
     sudo python3 -I scripts/capture-stopped-canary.py \
         --object-attributes "$OBJECT_ATTRIBUTES" \
-        --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
+        --lane "$object_lane" --variant wide --mode profile --privacy allowlisted \
         --target-bits "$TARGET_BITS" --workload-mode object \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
         --out-dir "$WORK" --prefix "$WORK/$object_lane" \
@@ -621,7 +621,7 @@ run_object_cell() {
     }
     sudo python3 -I scripts/capture-stopped-canary.py \
         --object-attributes "$OBJECT_ATTRIBUTES" \
-        --lane "$object_blocked_lane" --variant default --mode profile --privacy allowlisted \
+        --lane "$object_blocked_lane" --variant wide --mode profile --privacy allowlisted \
         --target-bits "$TARGET_BITS" --workload-mode object-blocked \
         --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
         --out-dir "$WORK" --prefix "$WORK/$object_blocked_lane" \
@@ -675,8 +675,8 @@ run_owned_lane() {
     owned_lane=$1
     owned_build=$2
     case "$owned_lane:$owned_build" in
-        owned-default-metrics:default) owned_observer=$P11SCOPE_DEFAULT; owned_variant=default ;;
-        owned-feature-metrics:feature) owned_observer=$P11SCOPE_FEATURE; owned_variant=diagnostic ;;
+        owned-default-metrics:default) owned_observer=$P11SCOPE_DEFAULT; owned_variant=wide ;;
+        owned-feature-metrics:feature) owned_observer=$P11SCOPE_FEATURE; owned_variant=wide-diagnostic ;;
         *) echo "unknown owned lane/build: $owned_lane:$owned_build" >&2; exit 1 ;;
     esac
     echo "=== $owned_lane ($owned_build owned metrics) ==="

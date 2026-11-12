@@ -232,7 +232,7 @@ class FakeMaps(capture.LiveMaps):
         self.fds, self.fd_by_id, self.rings = [], {}, {}
         self.opened_rings, self.closed_fds = [], []
         self.calls = []
-        definitions = capture.definitions.SAFE_MAPS if config.variant == 'default' else capture.definitions.UNSAFE_MAPS
+        definitions = capture.live_expected_maps(config.variant)
         self.maps = [capture.dumper.normalize_map_metadata({
             'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
             'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
@@ -2573,7 +2573,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
             with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
                 lane = 'aggregate-only-metrics'
                 prefix = str(Path(directory) / lane)
-                argv = ['--lane', lane, '--variant', 'default', '--mode', 'metrics',
+                argv = ['--lane', lane, '--variant', 'wide', '--mode', 'metrics',
                        '--privacy', 'aggregate-only', '--workload-mode', 'matrix',
                        '--out-dir', directory, '--prefix', prefix,
                        '--ready', f'{prefix}.ready', '--go', f'{prefix}.go',

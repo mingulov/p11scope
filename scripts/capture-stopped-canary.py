@@ -35,26 +35,30 @@ custody = load_sibling('canary_process_custody.py')
 dumper = load_sibling('dump-owned-bpf-maps.py')
 evidence = load_sibling('check-canary-evidence.py')
 definitions = load_sibling('check-bpf-map-defs.py')
+# Both canary builds keep default features (the p0 capture mode only adds
+# stub-object-attributes), so every live lane runs the wide object and
+# validates against the wide frozen inventory, exactly like the static
+# --safe-variant wide / --unsafe-variant wide-diagnostic legs.
 LANES = {
-    'default-safe-profile': ('default', 'profile', 'allowlisted', 'matrix'),
-    'default-safe-trace': ('default', 'trace', 'allowlisted', 'matrix'),
-    'feature-safe-profile': ('diagnostic', 'profile', 'allowlisted', 'matrix'),
-    'feature-safe-trace': ('diagnostic', 'trace', 'allowlisted', 'matrix'),
-    'feature-unsafe-profile': ('diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'matrix'),
-    'feature-unsafe-trace': ('diagnostic', 'trace', 'unsafe-unvalidated-metadata', 'matrix'),
-    'aggregate-only-metrics': ('default', 'metrics', 'aggregate-only', 'matrix'),
-    'default-safe-start': ('default', 'profile', 'allowlisted', 'blocked'),
-    'feature-safe-start': ('diagnostic', 'profile', 'allowlisted', 'blocked'),
-    'feature-unsafe-fault': ('diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'faults'),
-    'owned-default-metrics': ('default', 'metrics', 'aggregate-only', 'matrix'),
-    'owned-feature-metrics': ('diagnostic', 'metrics', 'aggregate-only', 'matrix'),
+    'default-safe-profile': ('wide', 'profile', 'allowlisted', 'matrix'),
+    'default-safe-trace': ('wide', 'trace', 'allowlisted', 'matrix'),
+    'feature-safe-profile': ('wide-diagnostic', 'profile', 'allowlisted', 'matrix'),
+    'feature-safe-trace': ('wide-diagnostic', 'trace', 'allowlisted', 'matrix'),
+    'feature-unsafe-profile': ('wide-diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'matrix'),
+    'feature-unsafe-trace': ('wide-diagnostic', 'trace', 'unsafe-unvalidated-metadata', 'matrix'),
+    'aggregate-only-metrics': ('wide', 'metrics', 'aggregate-only', 'matrix'),
+    'default-safe-start': ('wide', 'profile', 'allowlisted', 'blocked'),
+    'feature-safe-start': ('wide-diagnostic', 'profile', 'allowlisted', 'blocked'),
+    'feature-unsafe-fault': ('wide-diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'faults'),
+    'owned-default-metrics': ('wide', 'metrics', 'aggregate-only', 'matrix'),
+    'owned-feature-metrics': ('wide-diagnostic', 'metrics', 'aggregate-only', 'matrix'),
     # H7 slice D object cells: the completion phase drives all 25 named
     # object functions (matrix-shaped barrier), the blocked phase parks
     # four object workers for the stopped side-row acquisition.
-    'object-lp64': ('default', 'profile', 'allowlisted', 'object'),
-    'object-lp64-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
-    'object-ia32': ('default', 'profile', 'allowlisted', 'object'),
-    'object-ia32-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
+    'object-lp64': ('wide', 'profile', 'allowlisted', 'object'),
+    'object-lp64-blocked': ('wide', 'profile', 'allowlisted', 'object-blocked'),
+    'object-ia32': ('wide', 'profile', 'allowlisted', 'object'),
+    'object-ia32-blocked': ('wide', 'profile', 'allowlisted', 'object-blocked'),
 }
 OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
 OWNED_DURATION_SECONDS = 35
@@ -333,7 +337,7 @@ def validate_config(config):
             'observer executable must be absolute')
     if config.workload_origin == 'owned':
         validate_owned_argv(config)
-    expected = definitions.SAFE_MAPS if config.variant == 'default' else definitions.UNSAFE_MAPS
+    expected = live_expected_maps(config.variant)
     destinations = [config.go, config.finish, config.observer_log, Path(f'{config.prefix}.output'),
                     config.out_dir / f'mapdump_manifest_{config.lane}.json',
                     config.out_dir / f'mapdump_snapshot_{config.lane}.json']
@@ -660,9 +664,28 @@ def partition_identity_maps(rows, origin):
     return capture, identity
 
 
+def live_expected_maps(variant):
+    """Exact frozen map inventory for one live object variant.
+
+    Names match the static checker's FROZEN_INVENTORY keys: the 512
+    comparison build validates as default/diagnostic, the wide release
+    build as wide/wide-diagnostic. Unknown variants fail closed; the
+    caller never falls back to a neighboring width.
+    """
+    if variant == 'default':
+        return definitions.SAFE_MAPS
+    if variant == 'wide':
+        return definitions.WIDE_MARKER_MAPS
+    if variant == 'diagnostic':
+        return definitions.UNSAFE_MAPS
+    if variant == 'wide-diagnostic':
+        return definitions.WIDE_UNSAFE_MAPS
+    raise CaptureError(f'unknown live object variant {variant!r}')
+
+
 def validate_inventory(maps, variant, privacy='allowlisted', workload_origin='external'):
     require(workload_origin in ('owned', 'external'), f'unknown workload origin {workload_origin!r}')
-    expected = definitions.SAFE_MAPS if variant == 'default' else definitions.UNSAFE_MAPS
+    expected = live_expected_maps(variant)
     require(isinstance(maps, list) and len(maps) == len(expected)
             and {item['name'] for item in maps} == set(expected)
             and len({item['id'] for item in maps}) == len(maps), 'map inventory mismatch')

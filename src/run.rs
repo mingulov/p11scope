@@ -5403,8 +5403,9 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
         render::apply_legacy_gaps(&mut ev, snapshot);
     }
     // The end-of-capture exe re-read, mirroring the capture loop's
-    // terminal: a mid-capture exec replaces the attach-time name with the
-    // program that made the calls, and the stderr note names both. The
+    // terminal: a mid-capture exec keeps the attach-time name (calls the
+    // first program made are never relabeled) and discloses the
+    // end-of-capture program, and the stderr note names both. The
     // re-read binds the same retained pin, so a recycled pid can never
     // misattach an unrelated program's exe.
     let terminal_caller: Option<render::CaptureCaller> = match (context.scope, &target_caller) {
@@ -5413,10 +5414,9 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             let engine_pin = context.engine.pid_target_pin(*pid);
             let pin = owned_pin.or(engine_pin.as_deref());
             let reconciled = render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
-            if let (Some(to), Some(from)) = (
-                reconciled.exe.as_deref(),
-                reconciled.exec_from_exe.as_deref(),
-            ) {
+            if let (Some(from), Some(to)) =
+                (reconciled.exe.as_deref(), reconciled.exec_to_exe.as_deref())
+            {
                 emit_capture_diagnostic(&target_exec_line(*pid, from, to));
             }
             Some(reconciled)
@@ -8524,7 +8524,7 @@ fn resolve_pid_caller_with(
     let exited = || render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(TARGET_CALLER_EXITED),
-        exec_from_exe: None,
+        exec_to_exe: None,
     };
     if !still_same() {
         return exited();
@@ -8538,7 +8538,7 @@ fn resolve_pid_caller_with(
         return render::CaptureCaller {
             exe: Some(exe),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
     }
     let reason = if proven_exited(pid) {
@@ -8549,7 +8549,7 @@ fn resolve_pid_caller_with(
     render::CaptureCaller {
         exe: None,
         exe_unknown_reason: Some(reason),
-        exec_from_exe: None,
+        exec_to_exe: None,
     }
 }
 
@@ -8573,14 +8573,15 @@ pub(crate) fn target_caller_line(pid: u32, caller: &render::CaptureCaller) -> St
 
 /// The pid-scope end-of-capture stderr note, emitted beside the terminal
 /// report when the end-of-capture exe re-read proved the target exec'd:
-/// the operator's own target pid beside the program that made the calls,
-/// with the attach-time program beside it. Both exes are
-/// target-controlled, so both are control-escaped at this boundary.
+/// the operator's own target pid beside the attach-time program, with
+/// the end-of-capture program beside it — matching the JSON caller,
+/// which keeps the attach-time exe. Both exes are target-controlled, so
+/// both are control-escaped at this boundary.
 pub(crate) fn target_exec_line(pid: u32, from_exe: &str, to_exe: &str) -> String {
     format!(
-        "p11scope: target: pid {pid} exe {} (exec'd from {} during the capture)",
-        crate::render::escape_controls(to_exe),
-        crate::render::escape_controls(from_exe)
+        "p11scope: target: pid {pid} exe {} (exec'd to {} during the capture)",
+        crate::render::escape_controls(from_exe),
+        crate::render::escape_controls(to_exe)
     )
 }
 
@@ -10466,8 +10467,9 @@ fn capture_profile(
         render::apply_counter_snapshot(&mut ev, &snapshot);
         render::apply_legacy_gaps(&mut ev, &snapshot);
         render::apply_snapshot_failure(&mut ev, &snapshot);
-        // The end-of-capture exe re-read: a mid-capture exec replaces the
-        // attach-time name with the program that made the calls, and the
+        // The end-of-capture exe re-read: a mid-capture exec keeps the
+        // attach-time name (calls the first program made are never
+        // relabeled) and discloses the end-of-capture program, and the
         // stderr note names both. The re-read binds the same retained pin
         // (the owned child's, else the named view's), so a recycled pid can
         // never misattach an unrelated program's exe; an unknown end read
@@ -10484,10 +10486,9 @@ fn capture_profile(
                 let pin = owned_pin.or(engine_pin.as_deref());
                 let reconciled =
                     render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
-                if let (Some(to), Some(from)) = (
-                    reconciled.exe.as_deref(),
-                    reconciled.exec_from_exe.as_deref(),
-                ) {
+                if let (Some(from), Some(to)) =
+                    (reconciled.exe.as_deref(), reconciled.exec_to_exe.as_deref())
+                {
                     emit_capture_diagnostic(&target_exec_line(*pid, from, to));
                 }
                 Some(reconciled)
@@ -26541,7 +26542,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/opt/target/harness".to_string()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         assert_eq!(
             target_caller_line(4242, &caller),
@@ -26555,7 +26556,7 @@ int main(int argc, char **argv) {
             let caller = render::CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some(reason),
-                exec_from_exe: None,
+                exec_to_exe: None,
             };
             assert_eq!(
                 target_caller_line(4242, &caller),
@@ -26571,7 +26572,7 @@ int main(int argc, char **argv) {
         let caller = render::CaptureCaller {
             exe: Some("/tmp/x\x1b[1m".to_string()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let line = target_caller_line(4242, &caller);
         assert!(!line.contains('\x1b'), "{line}");
@@ -26581,13 +26582,14 @@ int main(int argc, char **argv) {
     #[test]
     fn target_exec_line_names_pid_and_both_exes() {
         // The end-of-capture stderr note after a mid-capture exec: the
-        // operator's own target pid beside the program that made the calls,
-        // with the attach-time program beside it.
+        // operator's own target pid beside the attach-time program, with
+        // the end-of-capture program beside it — matching the JSON
+        // caller, which keeps the attach-time exe.
         let line = target_exec_line(4242, "/usr/bin/bash", "/usr/bin/pkcs11-tool");
         assert_eq!(
             line,
-            "p11scope: target: pid 4242 exe /usr/bin/pkcs11-tool \
-             (exec'd from /usr/bin/bash during the capture)"
+            "p11scope: target: pid 4242 exe /usr/bin/bash \
+             (exec'd to /usr/bin/pkcs11-tool during the capture)"
         );
     }
 
@@ -26598,8 +26600,8 @@ int main(int argc, char **argv) {
         let line = target_exec_line(4242, "/tmp/old\x07", "/tmp/new\x1b[1m");
         assert!(!line.contains('\x1b'), "{line}");
         assert!(!line.contains('\x07'), "{line}");
-        assert!(line.contains("pid 4242 exe /tmp/new"), "{line}");
-        assert!(line.contains("/tmp/old"), "{line}");
+        assert!(line.contains("pid 4242 exe /tmp/old"), "{line}");
+        assert!(line.contains("/tmp/new"), "{line}");
     }
 
     #[test]

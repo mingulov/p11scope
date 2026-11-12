@@ -3565,11 +3565,11 @@ pub fn live_scoped(
 pub fn caller_text_line(caller: Option<&CaptureCaller>) -> Option<String> {
     let caller = caller?;
     match (&caller.exe, caller.exe_unknown_reason) {
-        (Some(exe), _) => Some(match &caller.exec_from_exe {
-            Some(from) => format!(
-                "caller: {} (exec'd from {} during the capture)",
+        (Some(exe), _) => Some(match &caller.exec_to_exe {
+            Some(to) => format!(
+                "caller: {} (exec'd to {} during the capture)",
                 escape_controls(exe),
-                escape_controls(from)
+                escape_controls(to)
             ),
             None => format!("caller: {}", escape_controls(exe)),
         }),
@@ -5574,72 +5574,82 @@ pub struct CaptureMeta<'a> {
 }
 
 /// The pid-scope target's caller identity: the `/proc/<pid>/exe` link
-/// text at report time — the end-of-capture executable, after a
-/// mid-capture exec — or the finite reason it could not be read.
+/// text at attach time — the program the capture started on — or the
+/// finite reason it could not be read.
 /// Exactly one of `exe`/`exe_unknown_reason` is `Some`. No PID number is
 /// carried: profile and metrics reports do not publish raw PID/TID
 /// (allowlist v1); the operator's own target pid is named on stderr
 /// diagnostics only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureCaller {
-    /// Target executable path, lossy UTF-8 from the exe link.
+    /// Target executable path at attach time, lossy UTF-8 from the exe
+    /// link. Never relabeled by a later exec: calls the attach-time
+    /// program made stay attributed to it.
     pub exe: Option<String>,
     /// Finite reason when `exe` is `None`, else `None`.
     pub exe_unknown_reason: Option<&'static str>,
-    /// The attach-time exe when the end-of-capture re-read proved the
-    /// target exec'd (two different known exes for one pinned process):
-    /// text lines name both programs from it. Text-only — the JSON
-    /// `capture.caller` keeps exactly its two allowlisted keys.
-    pub exec_from_exe: Option<String>,
+    /// The end-of-capture exe when the re-read proved the target exec'd
+    /// (two different known exes for one pinned process): text lines and
+    /// the JSON caller name both programs from it. `None` without a
+    /// proven exec, so the no-exec JSON keeps exactly its two keys.
+    pub exec_to_exe: Option<String>,
 }
 
 /// Reconcile the attach-time caller identity with the end-of-capture
-/// re-read of the same pinned target, so the report names the program
-/// that made the calls. A changed known exe proves a mid-capture exec:
-/// the end exe wins and the attach-time exe rides `exec_from_exe` for
-/// the plain-words text transition. An unknown end read never erases a
-/// known attach exe (the target exited after making its calls as that
-/// program); a known end read upgrades an unknown attach without
-/// claiming an exec; two unknown reads keep the attach-time reason. A
-/// re-exec of the same path is invisible — and needs no saying, since
-/// the name is unchanged.
+/// re-read of the same pinned target. Two known exes that differ prove
+/// a mid-capture exec — but nothing says which program made which
+/// calls, so the attach-time exe stays `exe` (calls the first program
+/// made are never relabeled) and the end exe rides `exec_to_exe` for
+/// the plain-words text transition and the JSON disclosure. An unknown
+/// end read never erases a known attach exe (the target exited after
+/// making its calls as that program); a known end read upgrades an
+/// unknown attach without claiming an exec; two unknown reads keep the
+/// attach-time reason. At most one transition is provable from two
+/// reads: an intermediate program (A->B->C reads as A->C) and a re-exec of
+/// the same path are invisible — and need no saying when the name is
+/// unchanged.
 pub fn reconcile_caller_exec(attach: &CaptureCaller, end: CaptureCaller) -> CaptureCaller {
     match (&attach.exe, &end.exe) {
         (Some(attach_exe), Some(end_exe)) if attach_exe != end_exe => CaptureCaller {
-            exe: Some(end_exe.clone()),
+            exe: Some(attach_exe.clone()),
             exe_unknown_reason: None,
-            exec_from_exe: Some(attach_exe.clone()),
+            exec_to_exe: Some(end_exe.clone()),
         },
         (_, Some(_)) => CaptureCaller {
             exe: end.exe,
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         },
         // A transition rides only the reconcile that proved it from its own
         // two reads: keeping the attach identity never carries a stale one.
         _ => CaptureCaller {
             exe: attach.exe.clone(),
             exe_unknown_reason: attach.exe_unknown_reason,
-            exec_from_exe: None,
+            exec_to_exe: None,
         },
     }
 }
 
 /// `capture.caller`, present if and only if this is a pid-scope capture
 /// with resolved caller identity: `{exe, exe_unknown_reason}` with
-/// exactly one non-null. Aggregate scopes emit no key — absent, never
-/// null — and neither does a pid scope that resolved nothing. The
-/// exec-transition exe (`exec_from_exe`) never reaches JSON: text lines
-/// name both programs, the report names the end-of-capture one.
+/// exactly one non-null, plus `exec_to_exe` naming the end-of-capture
+/// program when the target exec'd mid-capture (absent, never null,
+/// otherwise). Aggregate scopes emit no key — absent, never null — and
+/// neither does a pid scope that resolved nothing. `exe` is the
+/// attach-time program; per-program call counts are not attributed.
 fn caller_out(scope: &str, caller: Option<&CaptureCaller>) -> Option<serde_json::Value> {
     if scope != "pid" {
         return None;
     }
     let caller = caller?;
-    Some(serde_json::json!({
+    let mut out = serde_json::json!({
         "exe": caller.exe.as_deref(),
         "exe_unknown_reason": caller.exe_unknown_reason,
-    }))
+    });
+    if let Some(to) = caller.exec_to_exe.as_deref() {
+        out["exec_to_exe"] = serde_json::Value::String(to.to_string());
+    }
+    Some(out)
 }
 
 /// The v2 `observed-profile.json` document. `functions` comes from the
@@ -7826,7 +7836,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: Some("/opt/target/harness".to_string()),
                 exe_unknown_reason: None,
-                exec_from_exe: None,
+                exec_to_exe: None,
             }),
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
@@ -14685,7 +14695,7 @@ pub(crate) mod tests {
         let caller = CaptureCaller {
             exe: Some("/usr/bin/python3.14".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         for verbosity in [
             crate::cli::TextVerbosity::Concise,
@@ -14718,7 +14728,7 @@ pub(crate) mod tests {
         let unknown = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("exe_unreadable"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let out = live_scoped_with_caller(
             &[],
@@ -14806,7 +14816,7 @@ pub(crate) mod tests {
             caller: Some(CaptureCaller {
                 exe: None,
                 exe_unknown_reason: Some("target exe link unreadable"),
-                exec_from_exe: None,
+                exec_to_exe: None,
             }),
             ..capture_fixture()
         };
@@ -14827,33 +14837,37 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, attach.clone());
         assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(reconciled.exec_from_exe, None);
+        assert_eq!(reconciled.exec_to_exe, None);
     }
 
     #[test]
-    fn reconcile_caller_exec_reports_the_end_exe_with_both_names() {
-        // The target exec'd mid-capture: the report names the program that
-        // made the calls (the end-of-capture exe) and keeps the attach-time
-        // exe for the plain-words transition.
+    fn reconcile_caller_exec_keeps_the_attach_exe_and_discloses_the_end_exe() {
+        // The target exec'd mid-capture: nothing says which program made
+        // which calls, so the attach-time exe stays `exe` (calls the
+        // first program made are never relabeled) and the end-of-capture
+        // exe rides `exec_to_exe` for the transition.
         let attach = CaptureCaller {
             exe: Some("/usr/bin/bash".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
-        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/bash"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(reconciled.exec_from_exe.as_deref(), Some("/usr/bin/bash"));
+        assert_eq!(
+            reconciled.exec_to_exe.as_deref(),
+            Some("/usr/bin/pkcs11-tool")
+        );
     }
 
     #[test]
@@ -14864,17 +14878,17 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(reconciled.exec_from_exe, None);
+        assert_eq!(reconciled.exec_to_exe, None);
     }
 
     #[test]
@@ -14884,39 +14898,39 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exe link unreadable"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(reconciled.exec_from_exe, None);
+        assert_eq!(reconciled.exec_to_exe, None);
     }
 
     #[test]
     fn reconcile_caller_exec_drops_a_stale_transition_without_a_new_exec() {
         // Defense in depth: a transition rides only the reconcile that
         // proved it from its own two reads. A caller that somehow arrives
-        // with a stale `exec_from_exe` and no new exec loses it, while the
+        // with a stale `exec_to_exe` and no new exec loses it, while the
         // known exe still wins over the unknown end read.
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: Some("/usr/bin/stale".into()),
+            exec_to_exe: Some("/usr/bin/stale".into()),
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
         assert_eq!(reconciled.exe_unknown_reason, None);
-        assert_eq!(reconciled.exec_from_exe, None);
+        assert_eq!(reconciled.exec_to_exe, None);
     }
 
     #[test]
@@ -14924,12 +14938,12 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exe link unreadable"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: None,
             exe_unknown_reason: Some("target exited before its exe link was read"),
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(reconciled.exe, None);
@@ -14937,22 +14951,23 @@ pub(crate) mod tests {
             reconciled.exe_unknown_reason,
             Some("target exe link unreadable")
         );
-        assert_eq!(reconciled.exec_from_exe, None);
+        assert_eq!(reconciled.exec_to_exe, None);
     }
 
     #[test]
     fn pid_profile_text_names_both_programs_after_an_exec() {
         // After a mid-capture exec the stdout caller line names the
-        // end-of-capture program with the attach-time one beside it, at
-        // every verbosity, without the PID number.
+        // attach-time program with the end-of-capture one beside it, at
+        // every verbosity, without the PID number — matching the JSON
+        // caller, which keeps the attach-time exe.
         let caller = CaptureCaller {
-            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe: Some("/usr/bin/bash".into()),
             exe_unknown_reason: None,
-            exec_from_exe: Some("/usr/bin/bash".into()),
+            exec_to_exe: Some("/usr/bin/pkcs11-tool".into()),
         };
         assert_eq!(
             caller_text_line(Some(&caller)).as_deref(),
-            Some("caller: /usr/bin/pkcs11-tool (exec'd from /usr/bin/bash during the capture)")
+            Some("caller: /usr/bin/bash (exec'd to /usr/bin/pkcs11-tool during the capture)")
         );
         for verbosity in [
             crate::cli::TextVerbosity::Concise,
@@ -14960,12 +14975,12 @@ pub(crate) mod tests {
         ] {
             let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
             assert!(
-                line.contains("caller: /usr/bin/pkcs11-tool"),
-                "{verbosity:?} names the end-of-capture program: {line}"
+                line.contains("caller: /usr/bin/bash"),
+                "{verbosity:?} names the attach-time program: {line}"
             );
             assert!(
-                line.contains("/usr/bin/bash"),
-                "{verbosity:?} names the attach-time program too: {line}"
+                line.contains("/usr/bin/pkcs11-tool"),
+                "{verbosity:?} names the end-of-capture program too: {line}"
             );
             assert!(
                 !line.contains("pid 4242"),
@@ -14979,56 +14994,15 @@ pub(crate) mod tests {
         // Both exes are target-controlled: control bytes are rewritten at
         // this terminal boundary, never printed raw.
         let caller = CaptureCaller {
-            exe: Some("/tmp/new\x1b[1m".into()),
+            exe: Some("/tmp/old\x07".into()),
             exe_unknown_reason: None,
-            exec_from_exe: Some("/tmp/old\x07".into()),
+            exec_to_exe: Some("/tmp/new\x1b[1m".into()),
         };
         let line = caller_text_line(Some(&caller)).expect("a known caller renders a line");
         assert!(!line.contains('\x1b'), "{line}");
         assert!(!line.contains('\x07'), "{line}");
         assert!(line.contains("/tmp/new"), "{line}");
         assert!(line.contains("/tmp/old"), "{line}");
-    }
-
-    #[test]
-    fn pid_capture_json_carries_the_end_exe_without_new_keys_after_an_exec() {
-        // After a mid-capture exec the JSON caller names the end-of-capture
-        // exe through the existing allowlisted fields only: no new key
-        // carries the transition (text lines name both programs).
-        let mut ev = evidence();
-        ev.verdict();
-        let state = crate::semantics::State::with_policy(
-            &empty_plan(),
-            crate::attach::CapturePolicy::Allowlisted,
-        );
-        let attach = CaptureCaller {
-            exe: Some("/usr/bin/bash".into()),
-            exe_unknown_reason: None,
-            exec_from_exe: None,
-        };
-        let end = CaptureCaller {
-            exe: Some("/usr/bin/pkcs11-tool".into()),
-            exe_unknown_reason: None,
-            exec_from_exe: None,
-        };
-        let capture = CaptureMeta {
-            caller: Some(reconcile_caller_exec(&attach, end)),
-            ..capture_fixture()
-        };
-        assert_eq!(capture.scope, "pid");
-        for document in [
-            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
-            json(&[], &ev, &capture),
-        ] {
-            let caller = &document["capture"]["caller"];
-            assert_eq!(caller["exe"], "/usr/bin/pkcs11-tool", "{caller}");
-            assert!(caller["exe_unknown_reason"].is_null(), "{caller}");
-            assert_eq!(
-                caller.as_object().map(|map| map.len()),
-                Some(2),
-                "the JSON caller keeps exactly its two allowlisted keys: {caller}"
-            );
-        }
     }
 
     #[test]
@@ -15046,12 +15020,12 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/wrapper".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);
         assert_eq!(
@@ -15069,12 +15043,14 @@ pub(crate) mod tests {
             json(&[], &ev, &capture),
         ] {
             let caller = &document["capture"]["caller"];
-            assert_eq!(caller["exe"], "/usr/bin/wrapper", "{caller}");
-            assert!(caller["exe_unknown_reason"].is_null(), "{caller}");
             assert_eq!(
-                caller.get("exec_to_exe").and_then(|exe| exe.as_str()),
-                Some("/usr/bin/pkcs11-tool"),
-                "the post-exec program rides its own field: {caller}"
+                caller,
+                &serde_json::json!({
+                    "exe": "/usr/bin/wrapper",
+                    "exe_unknown_reason": null,
+                    "exec_to_exe": "/usr/bin/pkcs11-tool",
+                }),
+                "the caller keeps the attach-time exe and discloses the post-exec one: {caller}"
             );
         }
     }
@@ -15092,7 +15068,7 @@ pub(crate) mod tests {
         let attach = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
-            exec_from_exe: None,
+            exec_to_exe: None,
         };
         let capture = CaptureMeta {
             caller: Some(reconcile_caller_exec(&attach, attach.clone())),

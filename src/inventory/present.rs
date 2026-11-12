@@ -1467,12 +1467,18 @@ fn module_origin_suffix(presentation: &Presentation, module: ModuleId) -> Option
     }
 }
 
-/// One provider head for every inventory text view: the full retained
-/// path, a `[dev major:minor ino inode]` identity suffix when two
-/// modules would otherwise read identically (same path string, e.g. one
-/// file seen through two mounts), and the bracketed container origin
-/// when its callers carry one. Unique host paths print bare.
-pub(crate) fn module_display_name(presentation: &Presentation, module: ModuleId) -> String {
+/// Structured provider head for width-bounded cells: the retained
+/// path plus the optional `[dev major:minor ino inode]` identity and
+/// bracketed container-origin suffixes as one separate part (empty when
+/// neither applies). Width-bounded cells truncate only the path and keep
+/// the suffix part only when it fits alongside; the `[mN]` id keeps rows
+/// distinct and unbounded snapshots/JSON keep the full label via
+/// [`module_display_name`]. Returned parts are already escaped; callers
+/// must not re-split the flat label on ` [` since a path can contain it.
+pub(crate) fn module_display_parts(
+    presentation: &Presentation,
+    module: ModuleId,
+) -> (String, String) {
     use std::collections::BTreeMap;
     let mut heads: BTreeMap<String, usize> = BTreeMap::new();
     for candidate in &presentation.modules {
@@ -1485,14 +1491,14 @@ pub(crate) fn module_display_name(presentation: &Presentation, module: ModuleId)
     }
     let base = module_label(presentation, module);
     if base == "Unknown module" {
-        return base;
+        return (base, String::new());
     }
     let origin = module_origin_suffix(presentation, module).unwrap_or_default();
     let duplicate = heads
         .get(&format!("{base}{origin}"))
         .is_some_and(|count| *count > 1);
     if !duplicate {
-        return format!("{base}{origin}");
+        return (base, origin);
     }
     let identity = presentation
         .modules
@@ -1506,7 +1512,17 @@ pub(crate) fn module_display_name(presentation: &Presentation, module: ModuleId)
             )
         })
         .unwrap_or_default();
-    format!("{base}{identity}{origin}")
+    (base, format!("{identity}{origin}"))
+}
+
+/// One provider head for every inventory text view: the full retained
+/// path, a `[dev major:minor ino inode]` identity suffix when two
+/// modules would otherwise read identically (same path string, e.g. one
+/// file seen through two mounts), and the bracketed container origin
+/// when its callers carry one. Unique host paths print bare.
+pub(crate) fn module_display_name(presentation: &Presentation, module: ModuleId) -> String {
+    let (base, extra) = module_display_parts(presentation, module);
+    format!("{base}{extra}")
 }
 
 /// Human explanation of existing evidence, with positive history first.

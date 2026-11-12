@@ -615,15 +615,63 @@ fn truncate_path_tail_keeps_the_distinguishing_tail() {
         identity_path_cell(
             "module ",
             "/separate/physical/providers/provider.so",
+            "",
             "m0",
             40
         ),
         "module .../providers/provider.so [m0]"
     );
     assert_eq!(
-        identity_path_cell("module ", "/a/b.so", "m1", 40),
+        identity_path_cell("module ", "/a/b.so", "", "m1", 40),
         "module /a/b.so [m1]"
     );
+    // Suffix-aware cells truncate only the path and keep the `[dev ...]`
+    // / origin suffix only when it fits: the file name and `[mN]` id win
+    // over the suffix, rows stay distinct via the id.
+    assert_eq!(
+        identity_path_cell(
+            "module ",
+            "/separate/physical/providers/provider.so",
+            " [dev 8:1 ino 100000]",
+            "m0",
+            80
+        ),
+        "module /separate/physical/providers/provider.so [dev 8:1 ino 100000] [m0]"
+    );
+    assert_eq!(
+        identity_path_cell(
+            "module ",
+            "/separate/physical/providers/provider.so",
+            " [dev 8:1 ino 100000]",
+            "m0",
+            60
+        ),
+        "module /separate/physical/providers/provider.so [m0]"
+    );
+    assert_eq!(
+        identity_path_cell(
+            "module ",
+            "/separate/physical/providers/provider.so",
+            " [dev 8:1 ino 100000]",
+            "m0",
+            40
+        ),
+        "module .../providers/provider.so [m0]"
+    );
+    // A path containing ` [` is never split: the structured suffix is
+    // the only droppable part.
+    let tricky = identity_path_cell(
+        "module ",
+        "/tmp/we [ird]/providers/provider.so",
+        " [dev 8:1 ino 7]",
+        "m2",
+        40,
+    );
+    assert!(
+        tricky.contains("provider.so") && tricky.contains("[m2]"),
+        "{tricky}"
+    );
+    assert!(!tricky.contains("[dev"), "{tricky}");
 }
 
 #[test]

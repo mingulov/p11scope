@@ -730,9 +730,12 @@ fn render_compact_edge_window(
             head_width,
         );
         lines.push(if marked { format!("> {head}") } else { head });
+        let (module_path, module_extra) =
+            crate::inventory_present::module_display_parts(presentation, edge.module);
         lines.push(identity_path_cell(
             "module ",
-            &crate::inventory_present::module_display_name(presentation, edge.module),
+            &module_path,
+            &module_extra,
             &edge.module.label(),
             width,
         ));
@@ -1397,15 +1400,28 @@ fn identity_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
     truncate_cell(&format!("{text}{suffix}"), width)
 }
 
-/// Reserve the `module ` prefix and the physical reference before
-/// tail-truncating a provider path label: the row keeps its kind,
-/// its distinguishing path tail, and its id.
-fn identity_path_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
+/// Reserve the `module ` prefix and the physical reference, then
+/// tail-truncate only the provider path: the row keeps its kind, its
+/// full file name whenever the width allows it, and its id. The
+/// `[dev major:minor ino inode]` / container-origin suffix (`extra`,
+/// from [`crate::inventory_present::module_display_parts`]) is kept only
+/// when it fits alongside the (possibly truncated) path; rows stay
+/// distinct via `[id]` and unbounded snapshots/JSON keep the full label.
+fn identity_path_cell(prefix: &str, path: &str, extra: &str, id: &str, width: usize) -> String {
     let suffix = format!(" [{id}]");
     let label_width = width
         .saturating_sub(suffix.width())
         .saturating_sub(prefix.width());
-    let text = truncate_path_tail(label, label_width);
+    let candidate = if path.width() <= label_width {
+        path.to_string()
+    } else {
+        truncate_path_tail(path, label_width)
+    };
+    let text = if candidate.width() + extra.width() <= label_width {
+        format!("{candidate}{extra}")
+    } else {
+        candidate
+    };
     truncate_cell(&format!("{prefix}{text}{suffix}"), width)
 }
 
@@ -1432,9 +1448,12 @@ fn edge_identity_line(
         &edge.caller.label(),
         app_width,
     );
+    let (module_path, module_extra) =
+        crate::inventory_present::module_display_parts(presentation, edge.module);
     let module = identity_path_cell(
         "",
-        &crate::inventory_present::module_display_name(presentation, edge.module),
+        &module_path,
+        &module_extra,
         &edge.module.label(),
         module_width,
     );

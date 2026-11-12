@@ -4422,6 +4422,11 @@ struct ApplyOutcome {
     /// before or after any link mutation — and the apply blocked additions
     /// for the cycle (PD-T3-1).
     detach_failed: bool,
+    /// The apply refused via the proven-exit silent abort (stale only by
+    /// dead views, empty delta): nothing mutated, nothing marked. A loader
+    /// arm denied only by this abort defers to a re-arm instead of
+    /// recording an unbound context.
+    silent_proven_exit_abort: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11573,6 +11578,15 @@ enum LoaderArmFailure {
     /// no mark, no loader-registry record — retried next tick like any
     /// unarmed view.
     NotArmable,
+    /// Binding was never attempted: the loader apply was refused by the
+    /// silent proven-exit abort (usually a stale dead sibling in the
+    /// shared candidate) or additions already closed, while the view
+    /// stayed valid. Silent re-arm next tick, no record — the apply
+    /// committed nothing and disclosed nothing, so no context exists to
+    /// classify. Carries the apply's `changed` resync signal.
+    Deferred {
+        changed: bool,
+    },
 }
 
 impl LoaderArmFailure {
@@ -11649,6 +11663,9 @@ enum LoaderArmOutcome {
     },
     Invariant(anyhow::Error),
     NotArmable,
+    Deferred {
+        changed: bool,
+    },
 }
 
 fn loader_arm_outcome(
@@ -11656,8 +11673,13 @@ fn loader_arm_outcome(
     result: std::result::Result<bool, LoaderArmFailure>,
 ) -> LoaderArmOutcome {
     if !generation_valid {
+        let changed = match &result {
+            Ok(changed) => *changed,
+            Err(LoaderArmFailure::Deferred { changed }) => *changed,
+            Err(_) => false,
+        };
         return LoaderArmOutcome::GenerationLost {
-            changed: result.as_ref().is_ok_and(|changed| *changed),
+            changed,
             failure: result.err(),
         };
     }
@@ -11666,6 +11688,7 @@ fn loader_arm_outcome(
         Err(LoaderArmFailure::Ordinary(error)) => LoaderArmOutcome::OrdinaryFailure(error),
         Err(LoaderArmFailure::Invariant(error)) => LoaderArmOutcome::Invariant(error),
         Err(LoaderArmFailure::NotArmable) => LoaderArmOutcome::NotArmable,
+        Err(LoaderArmFailure::Deferred { changed }) => LoaderArmOutcome::Deferred { changed },
     }
 }
 
@@ -16806,6 +16829,8 @@ impl Engine {
                 // The mark stays silent but the publication inputs still
                 // changed (the abort drops this candidate's mutations), so
                 // the loader-plan cache goes, exactly as on the loud path.
+                // The refusal disclosed nothing and mutated nothing.
+                outcome.silent_proven_exit_abort = true;
                 self.loader_plan_cache = None;
                 self.counters.noise.note_skip(
                     "live discovery generation",
@@ -22541,6 +22566,21 @@ impl Engine {
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         if !outcome.accepted() || !*additions_allowed {
+            // A silent sibling-driven abort — or an already-closed tick —
+            // denied this arm before any binding was attempted: the
+            // refused apply committed nothing and disclosed nothing, so
+            // a still-valid view retries next tick instead of filing an
+            // unbound gap for loads that were never refused. Loud
+            // denials keep today's record under their disclosed cause.
+            let silent_deny =
+                outcome.silent_proven_exit_abort || (outcome.accepted() && !outcome.detach_failed);
+            let still_valid = self
+                .views
+                .get(position)
+                .is_some_and(|view| view.id() == view_id && view.still_the_same());
+            if silent_deny && still_valid {
+                return Err(LoaderArmFailure::Deferred { changed });
+            }
             return Ok(changed);
         }
         let context = self
@@ -23148,8 +23188,10 @@ impl Engine {
         // stays silent exactly when the skip accounting does
         // (`mark_generation_change` on an exited original). A context that
         // bound before the exit still records, as does any generation loss
-        // the exit does not explain; every other outcome records exactly
-        // as today.
+        // the exit does not explain. So does a deferred arm stay
+        // unrecorded: binding was never attempted, so no context exists
+        // to classify; the re-arm records honestly. Every other outcome
+        // records exactly as today.
         let not_armable = matches!(
             outcome,
             LoaderArmOutcome::NotArmable
@@ -23161,11 +23203,31 @@ impl Engine {
         let lost_to_expected_exit = matches!(outcome, LoaderArmOutcome::GenerationLost { .. })
             && self.original_exited(view_id)
             && !self.loader_view_has_live_context(view_id);
-        if !not_armable && !lost_to_expected_exit {
+        let deferred = matches!(
+            outcome,
+            LoaderArmOutcome::Deferred { .. }
+                | LoaderArmOutcome::GenerationLost {
+                    failure: Some(LoaderArmFailure::Deferred { .. }),
+                    ..
+                }
+        );
+        if !not_armable && !lost_to_expected_exit && !deferred {
             self.record_loader_arm(view_id, false);
         }
         match outcome {
             LoaderArmOutcome::NotArmable => Ok(false),
+            LoaderArmOutcome::Deferred { changed } => {
+                // The arm was denied before any binding was attempted,
+                // so — like an H-1 frame deferral — the next frame
+                // rescans and arms it, with no record. No frame note:
+                // this is per-view scheduling, not frame exhaustion,
+                // and the tick's U-07 sweep notes none either.
+                // (`generation_valid` held, so `position` still names
+                // this view.)
+                let pid = self.views[position].pid();
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+                Ok(changed)
+            }
             LoaderArmOutcome::Changed(changed) => Ok(changed),
             LoaderArmOutcome::OrdinaryFailure(error) => {
                 self.invalidate_causal_timing();

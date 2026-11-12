@@ -17137,6 +17137,7 @@ fn apply_outcome_keeps_static_timing_and_generation_loss_ownership() {
         selection_authorized: false,
         unpublished_views: BTreeSet::new(),
         detach_failed: false,
+        silent_proven_exit_abort: false,
     };
 
     engine.record_apply_timing(&outcome);

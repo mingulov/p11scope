@@ -16868,6 +16868,8 @@ mod tests {
         // A cross-object forward pair out of the first module: one
         // genuine interposition (binds), one wrong offset (refused) —
         // plus the interface-getter twins, which verify the same way.
+        // Each interface getter appears both verified and misdirected,
+        // so neither bind path can drop one getter's check unnoticed.
         let forward_key = raw[1].key;
         let forward_path = raw[1].path.clone();
         assert_ne!(forward_key, raw[0].key);
@@ -16888,6 +16890,12 @@ mod tests {
             object: forward_key,
             object_path: forward_path.clone(),
             file_offset: VERIFIED_OFFSET,
+        });
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetInterface",
+            object: forward_key,
+            object_path: forward_path.clone(),
+            file_offset: MISDIRECTED_OFFSET,
         });
         raw[0].tables[0].entries.push(ScannedEntry {
             name: "C_GetInterfaceList",
@@ -16932,6 +16940,20 @@ mod tests {
                 entry.name == "C_GetInterface" && entry.file_offset == VERIFIED_OFFSET
             }),
             "the verified interface forward binds: {expected_entries:?}"
+        );
+        assert!(
+            !expected_entries.iter().any(|entry| {
+                entry.name == "C_GetInterface" && entry.file_offset == MISDIRECTED_OFFSET
+            }),
+            "the misdirected interface forward never binds: {expected_entries:?}"
+        );
+        assert!(
+            expected_skips.iter().any(|skip| {
+                skip.subject == "C_GetInterface"
+                    && skip.reason.contains("C_GetInterface")
+                    && skip.reason.contains("not attached")
+            }),
+            "the misdirected interface forward refuses naming the check: {expected_skips:?}"
         );
         assert!(
             !expected_entries
@@ -16981,6 +17003,15 @@ mod tests {
                 entry.name == "C_GetInterface" && entry.file_offset == VERIFIED_OFFSET
             }),
             "the cursor binds the verified interface forward: {actual_entries:?}"
+        );
+        assert!(
+            rebind.skipped().unwrap().iter().any(|skip| {
+                skip.subject == "C_GetInterface"
+                    && skip.reason.contains("C_GetInterface")
+                    && skip.reason.contains("not attached")
+            }),
+            "the cursor refuses the misdirected interface forward: {:?}",
+            rebind.skipped().unwrap()
         );
         assert!(
             rebind.skipped().unwrap().iter().any(|skip| {

@@ -558,7 +558,12 @@ pub(crate) struct MarkOutcome {
 /// are skipped; escapes (`\040` etc.) are decoded. Paths stay
 /// byte-exact (`PathBuf`): a lossy string could miss a mark. A point
 /// mounted over keeps the last (topmost) entry, which is where the
-/// path resolves.
+/// path resolves — and a pseudo overmount (an `autofs` trigger over a
+/// real path) removes the lower same-path locator instead of leaving
+/// it behind: overmount replacement wins over the pseudo skip, so the
+/// hidden path never reaches the mark pass. Real entries mounted
+/// later at descendant paths are still visible and are kept; entries
+/// the trigger already hides are dropped with the lower mount.
 pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
     let mut mounts: Vec<MountToMark> = Vec::new();
     for line in mountinfo.lines() {
@@ -569,11 +574,19 @@ pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
         if fields.len() < 5 || fields.len() <= sep + 1 {
             continue;
         }
-        if PSEUDO_FS.contains(&fields[sep + 1]) {
-            continue;
-        }
         let point = unescape_mountinfo(fields[4]);
         if point.as_os_str().is_empty() {
+            continue;
+        }
+        if PSEUDO_FS.contains(&fields[sep + 1]) {
+            // What the trigger covers is hidden: drop the lower
+            // same-path locator and any descendant locators mounted
+            // before it, so neither reaches the mark pass (opening
+            // such a path would open the trigger). Marking through a
+            // real cover is harmless — the mark lands on the coverer
+            // and is credited there — but an `autofs` trigger must
+            // never be opened at all.
+            mounts.retain(|mount| !mount.point.starts_with(&point));
             continue;
         }
         let identity = parse_mount_identity(fields[0], fields[2]);

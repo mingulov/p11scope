@@ -28,6 +28,52 @@ pub(crate) const LEARN_CACHE_CAP: usize = 8192;
 /// never to silent loss.
 const LEARN_CHANNEL_DEPTH: usize = 64;
 
+/// Bound on learner workers that open mounts: the arming mark pass and
+/// the end-of-capture drain join each wait at most this long. A hung
+/// mount (unreachable NFS/CIFS, dead FUSE) must never wedge the start
+/// before `capturing:` or the report at the end. On timeout the worker
+/// is detached and the loss is reported so the engine files the named
+/// overflow/unavailable gap.
+const LEARN_WORKER_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs `work` on a named helper thread, waiting at most `bound` for
+/// it: `Some` when it finishes in time, `None` on timeout (the helper
+/// is detached — forgotten, so it finishes on its own holding only
+/// its own fds — and the caller never blocks past the bound), on
+/// spawn failure, or on panic. The arming mark pass uses this so a
+/// hung mount cannot wedge the start; the end join applies the same
+/// bound through the drain's done channel below.
+fn run_with_bound<T: Send + 'static>(
+    name: &str,
+    bound: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let helper = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = tx.send(work());
+        });
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(_) => return None,
+    };
+    match rx.recv_timeout(bound) {
+        Ok(value) => {
+            let _ = helper.join();
+            Some(value)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = helper.join();
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            std::mem::forget(helper);
+            None
+        }
+    }
+}
+
 /// How many open bytes prove (or refuse) ELF identity before the bounded
 /// export parse runs.
 const ELF_MAGIC_LEN: usize = 64;
@@ -447,6 +493,10 @@ impl LearnCache {
 /// Pseudo filesystems that never hold providers and are never marked.
 /// Anything else is attempted; per-mount failures (overlayfs/9p
 /// `EOPNOTSUPP`, racing unmounts) are tolerated, never fatal.
+/// `autofs` is skipped as well: opening the trigger would mount (and,
+/// re-opened every 30 s, keep mounted) NAS shares, and a dead server
+/// would hang the pass. A share already mounted still shows through
+/// its own real filesystem entry, which is marked.
 const PSEUDO_FS: &[&str] = &[
     "proc",
     "sysfs",
@@ -466,6 +516,7 @@ const PSEUDO_FS: &[&str] = &[
     "sockfs",
     "pipefs",
     "anon_inodefs",
+    "autofs",
 ];
 
 /// One mount's kernel identity: its mount id plus its filesystem
@@ -734,11 +785,22 @@ pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&
     (Some(exe), None)
 }
 
+/// The drain thread with its exit signal: the handle joins only after
+/// the done channel fires (or breaks on panic), so the end join can
+/// wait with the worker bound and detach a hung drain instead of
+/// hanging the report. Bundled so a thread never exists without its
+/// signal.
+struct LearnerThread {
+    handle: std::thread::JoinHandle<()>,
+    done: Receiver<()>,
+}
+
 /// The drain thread handle, owned by the engine. Drop signals shutdown and
-/// joins (the poll timeout bounds the wait).
+/// joins bounded (a hung drain is detached at the worker bound, never
+/// waited on past it).
 pub(crate) struct FileLearner {
     state: Arc<LearnShutdownState>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<LearnerThread>,
     /// Group + sender + startup mark coverage held between arming
     /// and `begin_drain`: the reader thread spawns post-shed so it
     /// never retains the transient startup `CAP_SYS_ADMIN`
@@ -778,7 +840,22 @@ impl FileLearner {
         }
         // SAFETY: fanotify_init returned an owned fd.
         let group = unsafe { OwnedFd::from_raw_fd(fd) };
-        let (covered, uncovered) = mark_visible_filesystems(&group, &BTreeSet::new());
+        // The mark pass opens every visible mount: on a hung mount
+        // (unreachable NFS/CIFS, dead FUSE) an open can block
+        // indefinitely, which would wedge `--system` start before
+        // `capturing:`. Run it on a helper under the worker bound; on
+        // timeout the helper is detached (it owns the group and closes
+        // it when the hang clears) and learning is unavailable — a
+        // named gap, never a hung start.
+        let pass = run_with_bound("p11scope-learn-mark", LEARN_WORKER_BOUND, move || {
+            let (covered, uncovered) = mark_visible_filesystems(&group, &BTreeSet::new());
+            (group, covered, uncovered)
+        });
+        let Some((group, covered, uncovered)) = pass else {
+            return Err(LearnAbsent {
+                reason: "mark pass did not finish within the hung-mount bound".to_string(),
+            });
+        };
         // An identity-less fallback mount that marked successfully
         // leaves the retained set empty with nothing uncovered: that
         // is still a working learner, re-decided at the next pass.
@@ -820,12 +897,18 @@ impl FileLearner {
             return Ok(());
         };
         let worker_state = Arc::clone(&self.state);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
             .name("p11scope-learn".to_string())
-            .spawn(move || drain_loop(group, tx, worker_state, covered, initial_gap_owed))
-        {
+            .spawn(move || {
+                drain_loop(group, tx, worker_state, covered, initial_gap_owed);
+                let _ = done_tx.send(());
+            }) {
             Ok(thread) => {
-                self.thread = Some(thread);
+                self.thread = Some(LearnerThread {
+                    handle: thread,
+                    done: done_rx,
+                });
                 Ok(())
             }
             Err(error) => Err(LearnAbsent {
@@ -835,19 +918,35 @@ impl FileLearner {
     }
 
     /// Stops the drain and joins it, reporting whether a tail was lost:
-    /// an unsent message or unread queue contents at shutdown, or a
-    /// drain thread that panicked. The engine files that loss loudly
-    /// (the overflow aggregate).
+    /// an unsent message or unread queue contents at shutdown, a drain
+    /// thread that panicked, or a join that hit the worker bound. A
+    /// drain stuck in a hung mark open (hard NFS, dead FUSE) is
+    /// detached at the bound — forgotten, holding only its own fds and
+    /// sender, exiting on its own once the hang clears — and counts as
+    /// lost. The engine files that loss loudly (the overflow
+    /// aggregate). Bounded: the report is never blocked.
     pub(crate) fn shutdown_and_join(&mut self) -> bool {
         self.state.shutdown.store(true, Ordering::Release);
         // A never-begun learner holds the only sender: drop it so the
         // channel closes terminally instead of dangling.
         self.pending = None;
         let mut lost = self.state.lost_tail.load(Ordering::Acquire);
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            lost = true;
+        if let Some(worker) = self.thread.take() {
+            // A panic breaks the channel (the sender drops unsent), so
+            // a disconnect also means the thread is gone and the join
+            // below reaps it without blocking.
+            let exited = match worker.done.recv_timeout(LEARN_WORKER_BOUND) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            };
+            if exited {
+                if worker.handle.join().is_err() {
+                    lost = true;
+                }
+            } else {
+                std::mem::forget(worker.handle);
+                lost = true;
+            }
         }
         lost || self.state.lost_tail.load(Ordering::Acquire)
     }
@@ -991,11 +1090,15 @@ fn mount_identity_of_fd(fd: &OwnedFd, mounts: &[MountToMark]) -> Option<MountIde
 
 /// Opens a mount point for a filesystem mark: a real `O_RDONLY`
 /// directory handle, never `O_PATH` (the kernel rejects
-/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF`).
-/// `O_DIRECTORY | O_NOFOLLOW` bind the handle to the directory
-/// itself, so the mark and its identity credit cannot slide onto a
-/// non-directory or through a trailing symlink. `None` (an
-/// unopenable mount point) is a named gap, never silent coverage.
+/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF` —
+/// probed, not just read from the man page — so `O_PATH` cannot
+/// carry the mark even though it would avoid automount triggers).
+/// Automount triggers are avoided by skipping the `autofs` fstype
+/// instead: the trigger is never opened at all. `O_DIRECTORY |
+/// O_NOFOLLOW` bind the handle to the directory itself, so the mark
+/// and its identity credit cannot slide onto a non-directory or
+/// through a trailing symlink. `None` (an unopenable mount point) is
+/// a named gap, never silent coverage.
 fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
@@ -1013,31 +1116,67 @@ fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Opens a file bind mount for a filesystem mark: a real `O_RDONLY`
-/// file handle, never `O_PATH` (the kernel rejects
-/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF`) and
-/// never `O_DIRECTORY` (a file bind refuses it with `ENOTDIR`).
-/// `O_NONBLOCK` keeps a fifo bind from hanging the pass;
-/// `O_NOFOLLOW` refuses a trailing symlink instead of marking
-/// through it. The mark covers the file's filesystem — the same
-/// superblock its own mount entry marks — so the bind needs no
-/// separate filesystem of its own. `None` (an unopenable file) is
-/// a named gap, never silent coverage.
+/// Opens a file bind mount for a filesystem mark. The type is probed
+/// first through an `O_PATH | O_NOFOLLOW | O_CLOEXEC` fd, which never
+/// opens the object itself (no device side effects, no automount
+/// trigger — open(2)): only a regular file is then opened read-only.
+/// A device bind (`/dev/watchdog`, a tty), fifo, socket or symlink is
+/// never opened `O_RDONLY` — opening a watchdog arms it, opening a
+/// tty without `O_NOCTTY` can take a controlling terminal — and is
+/// skipped instead (the uncovered count files the named gap, never
+/// silent coverage). The read-only handle carries `O_NONBLOCK` (a
+/// file swapped for a fifo between the probe and the open still
+/// cannot hang the pass), `O_NOCTTY` and `O_NOFOLLOW`, never `O_PATH`
+/// (the kernel rejects `FAN_MARK_FILESYSTEM` through an `O_PATH` fd
+/// with `EBADF`) and never `O_DIRECTORY` (a file bind refuses it
+/// with `ENOTDIR`). The final fd is re-statted so a file swapped
+/// for a device between the probe and the open is still refused.
+/// The mark covers the file's filesystem — the same superblock its
+/// own mount entry marks — so the bind needs no separate filesystem
+/// of its own.
 fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
     // SAFETY: libc call; the NUL-terminated path is valid.
+    let probe = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if probe < 0 {
+        return None;
+    }
+    // SAFETY: `probe` is a fresh owned descriptor from the open above.
+    let probe = unsafe { OwnedFd::from_raw_fd(probe) };
+    // SAFETY: fstat on our own held descriptor into a zeroed stat.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(probe.as_raw_fd(), &mut stat) } != 0 {
+        return None;
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    // SAFETY: libc call; the NUL-terminated path is valid.
     let raw = unsafe {
         libc::open(
             path.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if raw < 0 {
         return None;
     }
     // SAFETY: `raw` is a fresh owned descriptor from the open above.
-    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+    let held = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fstat on our own held descriptor into a zeroed stat.
+    let mut final_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(held.as_raw_fd(), &mut final_stat) } != 0
+        || final_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+    {
+        return None;
+    }
+    Some(held)
 }
 
 /// Adds one filesystem mark through a held descriptor for the
@@ -1692,6 +1831,28 @@ mod tests {
         assert_eq!(marks, vec!["/", "/dev", "/mnt/ovl", "/mnt/with space"]);
     }
 
+    /// An autofs trigger is never marked (opening it would mount and
+    /// keep mounted a NAS share every 30 s, and a dead server would hang
+    /// the pass): the fstype is skipped like other pseudo filesystems.
+    /// A share already mounted still shows through its own real
+    /// filesystem entry (nfs/cifs), which is kept.
+    #[test]
+    fn learn_mount_marks_skip_autofs_but_cover_mounted_share() {
+        let table = "100 1 0:100 / /mnt/nas rw,relatime - autofs systemd-1 rw\n\
+             101 1 0:101 / /mnt/nas/share rw,relatime - nfs server:/export rw\n\
+             1 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n";
+        let mut marks: Vec<String> = super::mounts_for_marks(table)
+            .iter()
+            .map(|mount| mount.point.to_string_lossy().into_owned())
+            .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec!["/", "/mnt/nas/share"],
+            "the autofs trigger is skipped but the mounted share is kept"
+        );
+    }
+
     fn mnt(mount_id: u64, dev_major: u32, dev_minor: u32) -> super::MountIdentity {
         super::MountIdentity {
             mount_id,
@@ -2195,6 +2356,27 @@ mod tests {
         );
     }
 
+    /// A char-device bind is never opened read-only for marking:
+    /// opening `/dev/watchdog` arms it, opening a tty can take a
+    /// controlling terminal. Only regular-file binds mark; any other
+    /// type is skipped (a fail-closed named gap via the uncovered
+    /// count, never silent coverage). The healthy twin (a regular
+    /// file) still opens.
+    #[test]
+    fn learn_file_mark_fd_skips_char_devices() {
+        assert!(
+            super::open_file_for_mark(std::path::Path::new("/dev/null")).is_none(),
+            "a char-device bind must never open read-only for marking"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bind-stand-in");
+        std::fs::write(&file, "a bound file").unwrap();
+        assert!(
+            super::open_file_for_mark(&file).is_some(),
+            "a regular-file bind still marks"
+        );
+    }
+
     /// The drain parses the pidfd info record beside the metadata, so the
     /// loader is named from a reuse-immune handle, never a bare pid.
     #[test]
@@ -2213,6 +2395,100 @@ mod tests {
         assert_eq!(event.fd, 7);
         assert_eq!(event.pidfd, Some(9));
         assert!(!event.overflow);
+    }
+
+    /// A drain stuck in a hung mark open (hard NFS, dead FUSE) must not
+    /// hang the capture end: the join is bounded (~1 s), the thread is
+    /// detached on timeout, and the loss is reported so the engine
+    /// files the overflow gap. The hung open is a fake mark opener
+    /// that never returns, run through the real mark evaluator — the
+    /// same shape as a drain wedged in its 30 s re-mark. The healthy
+    /// twin exits promptly with no loss.
+    #[test]
+    fn learn_bounded_join_detaches_blocked_drain() {
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let visible = vec![visible_mount("/", 51, 8, 1)];
+            let _ =
+                super::evaluate_mark_coverage(&std::collections::BTreeSet::new(), &visible, |_| {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    unresolved()
+                });
+            let _ = done_tx.send(());
+        });
+        let mut learner = super::FileLearner {
+            state,
+            thread: Some(super::LearnerThread {
+                handle,
+                done: done_rx,
+            }),
+            pending: None,
+        };
+        let start = std::time::Instant::now();
+        let lost = learner.shutdown_and_join();
+        let elapsed = start.elapsed();
+        assert!(lost, "a timed-out join must report loss (overflow gap)");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the join must be bounded (~1 s), not wait for the hung thread: {elapsed:?}"
+        );
+    }
+
+    /// The healthy twin of the bounded join: a drain that exits on
+    /// shutdown joins promptly with no loss and no gap.
+    #[test]
+    fn learn_bounded_join_healthy_drain_has_no_gap() {
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let worker_state = std::sync::Arc::clone(&state);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            while !worker_state
+                .shutdown
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = done_tx.send(());
+        });
+        let mut learner = super::FileLearner {
+            state,
+            thread: Some(super::LearnerThread {
+                handle,
+                done: done_rx,
+            }),
+            pending: None,
+        };
+        let start = std::time::Instant::now();
+        let lost = learner.shutdown_and_join();
+        let elapsed = start.elapsed();
+        assert!(!lost, "a healthy join reports no loss");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "a healthy join is prompt: {elapsed:?}"
+        );
+    }
+
+    /// The arming helper is bounded like the end join: blocking work
+    /// detaches at the bound with `None` (a hung mount cannot wedge
+    /// the start), quick work returns `Some`. The blocking case would
+    /// take its full sleep under an unbounded wait, so the elapsed
+    /// assertion is what proves the bound.
+    #[test]
+    fn learn_arming_helper_is_bounded() {
+        let bound = std::time::Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let blocked: Option<()> = super::run_with_bound("probe-blocked", bound, || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        assert!(blocked.is_none(), "blocking work detaches at the bound");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "the arming wait is bounded: {:?}",
+            start.elapsed()
+        );
+        let quick = super::run_with_bound("probe-quick", bound, || 7u32);
+        assert_eq!(quick, Some(7), "quick work returns its value");
     }
 
     /// A send blocked past shutdown gives up but marks the lost tail:

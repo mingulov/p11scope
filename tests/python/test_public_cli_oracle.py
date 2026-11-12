@@ -874,6 +874,21 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_lone_gap_with_modules_skipped_fails_in_strict_mode(self):
+        # The lone arm requires no skipped modules: one disclosed
+        # descendant gap bundled with a skipped module still fails
+        # strict at the gap gate, with exact owned counts otherwise.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["modules_skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_lone_gap_passes_on_mt_system_in_strict_mode(self):
         # Fix2 twin of the system lone-gap pass: mt-system carries
         # the same exactly-one-gap ceiling with exact owned counts.
@@ -931,6 +946,35 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["multi_rebuild_gaps"] = 1
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["multi_rebuild_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_modules_skipped_fails_on_mt_system_in_strict_mode(self):
+        # Mt-system twin of the system modules-skipped pin: one
+        # disclosed descendant gap bundled with a skipped module
+        # still fails strict at the gap gate, with exact counts.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["modules_skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_other_class_fails_on_mt_system_in_strict_mode(self):
+        # Mt-system twin of the system bundled-class pin: the lone
+        # arm stays narrow, so a descendant gap bundled with any
+        # other observation class still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps", "multi_rebuild_gaps"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("lossy or unknown observation gap class",

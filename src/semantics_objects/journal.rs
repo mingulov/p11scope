@@ -1848,17 +1848,16 @@ impl JournalAdapter {
     ) -> JournalDisposition {
         let key = (begin.thread(), begin.sequence());
         let image = Self::image_of_begin(&begin);
-        if self.is_tainted(image) {
-            // Its terminal will arrive unmatched: expected-absent
-            // because of this refusal, never a promotion.
-            self.note_taint_derived_absence(image, key);
-            return JournalDisposition::Refused;
-        }
-        // The frozen endpoint table is enforced here, before key
-        // mechanics: meaning before state. A negative-only invocation is
-        // the valid NO_END invalidation signal; anything outside the
-        // journaled set, or a negative-only call promising an END,
-        // contradicts the table. Tainted records advance no floors.
+        // The frozen endpoint table is enforced here, before the
+        // tainted shortcut and before key mechanics: meaning before
+        // state. A negative-only invocation is the valid NO_END
+        // invalidation signal; anything outside the journaled set, or
+        // a negative-only call promising an END, contradicts the
+        // table. This independent evidence must interpret even for an
+        // already-tainted image, so a shed-only taint still in grace
+        // promotes to permanent; only ordinary modeled staging keeps
+        // the refusal shortcut below. Tainted records advance no
+        // floors.
         let function = begin.descriptor() - 1;
         match endpoint_class(function) {
             Some(EndpointClass::ModeledAffecting) => {}
@@ -1873,6 +1872,12 @@ impl JournalAdapter {
                 );
                 return JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint);
             }
+        }
+        if self.is_tainted(image) {
+            // Its terminal will arrive unmatched: expected-absent
+            // because of this refusal, never a promotion.
+            self.note_taint_derived_absence(image, key);
+            return JournalDisposition::Refused;
         }
         if self.open.contains_key(&key) {
             self.taint_image(
@@ -2321,6 +2326,20 @@ impl JournalAdapter {
         self.is_tainted(image)
     }
 
+    /// Promote one image's taint to permanent for independent
+    /// raw/original-refusal evidence: shed-only lift eligibility is
+    /// revoked first, including for an already shed-tainted image,
+    /// then the taint is recorded as before. Telemetry, bounds and
+    /// per-key effects match `note_image_taint`; only the shed-only
+    /// provenance changes. Every refusal path that bypasses
+    /// `taint_image` must route through this.
+    fn promote_image_taint(&mut self, image: (u64, u64)) {
+        self.shed_only_taints.remove(&image);
+        if !self.is_tainted(image) {
+            self.note_image_taint(image);
+        }
+    }
+
     /// Record only the irreversible image evidence. A raw batch marks its
     /// images together, then disposes the existing bounded staging once.
     fn note_image_taint(&mut self, image: (u64, u64)) {
@@ -2360,9 +2379,7 @@ impl JournalAdapter {
     ) -> SealFailure {
         if !unlocalized {
             for image in images {
-                if !self.is_tainted(image) {
-                    self.note_image_taint(image);
-                }
+                self.promote_image_taint(image);
             }
         }
         // Image taint changes no key identity or era. The original affected
@@ -2600,7 +2617,7 @@ impl JournalAdapter {
                     }
                 } else {
                     image_fallback = true;
-                    self.note_image_taint((key.cookie, key.exec));
+                    self.promote_image_taint((key.cookie, key.exec));
                 }
             }
         }

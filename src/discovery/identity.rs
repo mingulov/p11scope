@@ -6708,26 +6708,35 @@ mod conservative_copy {
                     }
                     6 => {
                         drop(std::mem::take(&mut self.ids));
-                        drop(std::mem::take(&mut self.verified));
                         self.reclaim_stage = 7;
                     }
+                    // One live block per step: the per-entry forward
+                    // proof reclaims in its own stages beside the
+                    // identity rows it parallels.
                     7 => {
-                        let objects_done = self.entry_objects.pop().is_none();
-                        let verified_done = self.forward_verified.pop().is_none();
-                        if objects_done && verified_done {
-                            drop(std::mem::take(&mut self.entry_objects));
-                            drop(std::mem::take(&mut self.forward_verified));
-                            self.reclaim_stage = 8;
-                        }
+                        drop(std::mem::take(&mut self.verified));
+                        self.reclaim_stage = 8;
                     }
                     8 => {
-                        if let Some(module) = self.module.take() {
-                            self.module_drain = Some(ModuleDrain::new(module));
-                        } else {
+                        if self.entry_objects.pop().is_none() {
+                            drop(std::mem::take(&mut self.entry_objects));
                             self.reclaim_stage = 9;
                         }
                     }
                     9 => {
+                        if self.forward_verified.pop().is_none() {
+                            drop(std::mem::take(&mut self.forward_verified));
+                            self.reclaim_stage = 10;
+                        }
+                    }
+                    10 => {
+                        if let Some(module) = self.module.take() {
+                            self.module_drain = Some(ModuleDrain::new(module));
+                        } else {
+                            self.reclaim_stage = 11;
+                        }
+                    }
+                    11 => {
                         if let Some(originals) = &mut self.originals {
                             if let Some(module) = originals.next() {
                                 self.module_drain = Some(ModuleDrain::new(module));
@@ -6735,18 +6744,18 @@ mod conservative_copy {
                                 drop(self.originals.take());
                             }
                         } else {
-                            self.reclaim_stage = 10;
+                            self.reclaim_stage = 12;
                         }
                     }
-                    10 => {
+                    12 => {
                         if let Some(module) = self.modules.pop() {
                             self.reconciled_drain = Some(ReconciledDrain::new(module));
                         } else {
                             drop(std::mem::take(&mut self.modules));
-                            self.reclaim_stage = 11;
+                            self.reclaim_stage = 13;
                         }
                     }
-                    11 => {
+                    13 => {
                         if let Some(skip) = &mut self.skip_primary {
                             if reclaim_skip(skip) {
                                 self.skip_primary = None;
@@ -6755,27 +6764,27 @@ mod conservative_copy {
                             self.skip_primary = Some(skip);
                         } else {
                             drop(std::mem::take(&mut self.skipped));
-                            self.reclaim_stage = 12;
+                            self.reclaim_stage = 14;
                         }
                     }
-                    12 => {
+                    14 => {
                         if self.growth.pop_first().is_none() {
                             drop(std::mem::take(&mut self.growth));
-                            self.reclaim_stage = 13;
+                            self.reclaim_stage = 15;
                         }
                     }
                     // Refunds follow actual nested/suffix/empty-root teardown.
-                    13 => {
-                        self.input_storage = None;
-                        self.reclaim_stage = 14;
-                    }
-                    14 => {
-                        self.output_storage = None;
-                        self.reclaim_stage = 15;
-                    }
                     15 => {
-                        self.header_storage = None;
+                        self.input_storage = None;
                         self.reclaim_stage = 16;
+                    }
+                    16 => {
+                        self.output_storage = None;
+                        self.reclaim_stage = 17;
+                    }
+                    17 => {
+                        self.header_storage = None;
+                        self.reclaim_stage = 18;
                     }
                     _ => {
                         self.phase = BindPhase::Reclaimed;

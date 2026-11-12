@@ -20074,7 +20074,7 @@ mod tests {
             assert!(
                 outcome.failures[0]
                     .1
-                    .contains(&format!("fd table exhausted attaching slot 0")),
+                    .contains("fd table exhausted attaching slot 0"),
                 "errno {errno} keeps the summary shape: {}",
                 outcome.failures[0].1
             );

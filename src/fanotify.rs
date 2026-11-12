@@ -2595,6 +2595,74 @@ mod tests {
         assert_eq!(quick, Some(7), "quick work returns its value");
     }
 
+    /// A timed-out arming helper is really detached: its native thread
+    /// must not stay joinable (a forgotten `JoinHandle` leaks the
+    /// joinable thread resources until process exit). The worker reports
+    /// its native handle, stays blocked on a release channel past the
+    /// timeout, and `pthread_detach` on the live worker must report
+    /// `EINVAL` — already detached — never success.
+    #[test]
+    fn learn_arming_timeout_detaches_the_helper() {
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let bound = std::time::Duration::from_millis(200);
+        let timed_out: Option<()> = super::run_with_bound("probe-detach", bound, move || {
+            let _ = id_tx.send(unsafe { libc::pthread_self() });
+            let _ = release_rx.recv();
+        });
+        assert!(timed_out.is_none(), "the blocked helper times out");
+        let tid = id_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the worker reports its native handle");
+        // SAFETY: `pthread_detach` on a live thread id the worker itself
+        // reported; the worker stays blocked until released below.
+        let rc = unsafe { libc::pthread_detach(tid) };
+        let _ = release_tx.send(());
+        assert_eq!(
+            rc,
+            libc::EINVAL,
+            "an already-detached worker refuses a second detach (rc={rc})"
+        );
+    }
+
+    /// The end-join twin: a drain detached at the worker bound is
+    /// really detached too, not forgotten-but-joinable, while the
+    /// timeout still reports loss for the overflow gap.
+    #[test]
+    fn learn_bounded_join_detaches_the_drain_thread() {
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = id_tx.send(unsafe { libc::pthread_self() });
+            let _ = release_rx.recv();
+            let _ = done_tx.send(());
+        });
+        let mut learner = super::FileLearner {
+            state,
+            thread: Some(super::LearnerThread {
+                handle,
+                done: done_rx,
+            }),
+            pending: None,
+        };
+        let lost = learner.shutdown_and_join();
+        assert!(lost, "a timed-out join must report loss (overflow gap)");
+        let tid = id_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the drain reports its native handle");
+        // SAFETY: `pthread_detach` on a live thread id the drain itself
+        // reported; the drain stays blocked until released below.
+        let rc = unsafe { libc::pthread_detach(tid) };
+        let _ = release_tx.send(());
+        assert_eq!(
+            rc,
+            libc::EINVAL,
+            "an already-detached drain refuses a second detach (rc={rc})"
+        );
+    }
+
     /// A send blocked past shutdown gives up but marks the lost tail:
     /// the engine files that loss loudly instead of dropping it
     /// silently at the boundary.

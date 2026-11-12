@@ -9539,12 +9539,16 @@ mod tests {
 
     #[test]
     fn unfinished_rescan_with_renamed_slot_still_replaces() {
-        // Failure twin pinning the names gate: the layout re-proves
-        // (the renamed entry is not a required one, so the
-        // assumed-finished sole leg still holds), but the rename breaks
-        // table-wide exports agreement, so no rebuilt name reproduces
-        // its verified name — the old descriptors must not carry onto
-        // slots the new evidence cannot name.
+        // Failure twin: the rename breaks table-wide exports agreement,
+        // leaving no independent publication evidence (no linkage, live
+        // return, or full agreement), so the table is ineligible and
+        // re-proves nothing unfinished (ruling 05:25: every input that
+        // grants or carries semantics passes the same manifest-free
+        // test). The merge still replaces into count-only — the old
+        // descriptors must not carry onto slots the new evidence
+        // cannot name. (The assumed-finished sole leg still holds
+        // structurally — the renamed entry is not a required one — but
+        // eligibility refuses before the names gate is reached.)
         let initial = sole_complete_module();
         let mut plan =
             build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
@@ -9564,10 +9568,9 @@ mod tests {
         renamed.scanned.tables[0].entries[position].name = "C_Login";
         let rebuilt =
             plan.rebuild_from_sources(std::slice::from_ref(&renamed), &[], &PinnedObjects::empty());
-        assert_eq!(
-            rebuilt.reproven_unfinished_slots.len(),
-            68,
-            "the layout re-proves despite the rename"
+        assert!(
+            rebuilt.reproven_unfinished_slots.is_empty(),
+            "an ineligible renamed table re-proves nothing unfinished"
         );
         let delta = plan.extend_exact(rebuilt).unwrap();
         assert_eq!(

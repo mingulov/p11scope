@@ -47,15 +47,16 @@ lines; anything else using SoftHSM at the same time appears beside python3.14.
 p11scope — PID scope — up 00:00:15 — mode profile — /usr/lib64/pkcs11/libsofthsm2.so
 caller: /usr/bin/python3.14
 295 completed calls; 0 returned errors; 0 entries without an observed return.
-coverage: partial — counts complete; function names follow the standard PKCS#11 table and were not confirmed by a manifest (add --manifest to confirm)
+coverage: complete
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
 C_Sign                       libsofthsm2.so        148      0   524.3µs     1.0ms     1.0ms         0
 C_SignInit                   libsofthsm2.so        147      0   262.1µs   524.3µs   524.3µs         0
 run with -v for details
 ```
 
-Counts are exact for the window; names follow the standard table
-until confirmed with `--manifest`.
+Counts are exact for the window; SoftHSM's standard table layout is
+verified from the scan, so no manifest is needed. `--manifest` still
+matters only for providers with non-standard tables.
 
 ## Browsers
 

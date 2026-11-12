@@ -1117,9 +1117,10 @@ Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-
 A current capture's coverage line names why it is `PARTIAL`, grouped by the
 same classes `evidence.gap_classes` publishes, in plain words: for example
 `coverage: partial — counts complete; function names follow the standard PKCS#11 table
-and were not confirmed by a manifest (add --manifest to confirm)` for
-a clean scan-only capture (`verdict_detail: "attribution_only"`: counts are
-exact, only the names are unconfirmed), or
+but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding)`
+for a clean scan-only capture of a provider with a non-standard table
+(`verdict_detail: "attribution_only"`: counts are exact, only the names are
+unconfirmed), or
 `coverage: partial — calls may be missing (12 call records lost)` for a lossy
 one (`"concrete_gap"`). `coverage: partial — end of capture not fully
 confirmed (last calls may be missing)` means nothing concrete is behind the
@@ -1132,7 +1133,8 @@ this line appears only when the run did not pause (explicit `--pause
 never`). With `-v`, each plain reason is paired with its
 machine cause name, and the `Evidence:` line repeats the same verdict
 reasons after the probe and slot counts. A `COMPLETE` verdict reads
-`coverage: complete`.
+`coverage: complete`. `--manifest` still matters only for providers with
+non-standard tables, whose layout the scan cannot verify on its own.
 
 When calls fail, the profile text says why: an `ERROR REASONS:` section
 after the function table lists each failing function's return codes by

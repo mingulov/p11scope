@@ -15032,6 +15032,90 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pid_capture_json_keeps_the_attach_time_exe_after_an_exec() {
+        // Opus B6: a wrapper (A) that makes calls and then execs another
+        // tool (B), which makes calls too. JSON must not relabel A's
+        // calls as B's: `exe` keeps the attach-time program and the
+        // post-exec program rides a separate field, in both lanes.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/wrapper".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let end = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(
+            reconciled.exe.as_deref(),
+            Some("/usr/bin/wrapper"),
+            "the reconciled caller keeps the attach-time program"
+        );
+        let capture = CaptureMeta {
+            caller: Some(reconciled),
+            ..capture_fixture()
+        };
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            assert_eq!(caller["exe"], "/usr/bin/wrapper", "{caller}");
+            assert!(caller["exe_unknown_reason"].is_null(), "{caller}");
+            assert_eq!(
+                caller.get("exec_to_exe").and_then(|exe| exe.as_str()),
+                Some("/usr/bin/pkcs11-tool"),
+                "the post-exec program rides its own field: {caller}"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_capture_json_without_exec_keeps_exactly_its_two_keys() {
+        // Healthy twin: no exec, so the JSON caller is identical to
+        // today — exactly `{exe, exe_unknown_reason}`, no new key.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let capture = CaptureMeta {
+            caller: Some(reconcile_caller_exec(&attach, attach.clone())),
+            ..capture_fixture()
+        };
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            assert_eq!(
+                caller,
+                &serde_json::json!({
+                    "exe": "/usr/bin/pkcs11-tool",
+                    "exe_unknown_reason": null,
+                }),
+                "no exec means the caller shape is unchanged: {caller}"
+            );
+        }
+    }
+
+    #[test]
     fn profile_and_metrics_pid_capture_without_caller_omit_the_key() {
         // A pid scope that resolved nothing emits no caller key —
         // absent, never null — in both lanes.

@@ -618,10 +618,10 @@ def no_table_diagnostic_subjects(stderr_text):
     for line in stderr_text.splitlines():
         if not line.startswith("p11scope: discovery") or NO_TABLE_DIAGNOSTIC not in line:
             continue
-        match = re.search(r"discovery skipped (.+?) — ", line)
+        match = re.search(r"discovery skipped (.+?) - ", line)
         if match is None:
             continue
-        aggregated = re.match(r"^p11scope: discovery: [^:]+ ×[0-9]+: ", line) is not None
+        aggregated = re.match(r"^p11scope: discovery: [^:]+ x[0-9]+: ", line) is not None
         subjects.append({"subject": match[1], "aggregated": aggregated})
     return subjects
 

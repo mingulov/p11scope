@@ -6765,7 +6765,7 @@ fn scan_process_view_with_io_mode(
 fn check_pin_after_read(after: Result<Pin, String>, before: &Pin) -> Result<(), String> {
     match after {
         Ok(pin) if pin == *before => Ok(()),
-        Ok(_) => Err("file changed while it was being scanned — retry".into()),
+        Ok(_) => Err("file changed while it was being scanned - retry".into()),
         Err(error) => Err(error),
     }
 }
@@ -14410,7 +14410,7 @@ mod tests {
         // The refusal arm: a changed file keeps the retry message.
         assert_eq!(
             check_pin_after_read(Ok(other), &before),
-            Err("file changed while it was being scanned — retry".to_string())
+            Err("file changed while it was being scanned - retry".to_string())
         );
         // The stable arm: an unchanged file passes with no refusal.
         assert_eq!(check_pin_after_read(Ok(before), &before), Ok(()));
@@ -14801,7 +14801,7 @@ mod tests {
             "memory scan refused: final mapping validation unavailable: gone",
             "memory scan refused: initial mapping validation unavailable: gone",
             "memory scan refused: process generation changed during acquisition: gone",
-            "file changed while it was being scanned — retry",
+            "file changed while it was being scanned - retry",
             "partial snapshot of one data mapping: read 3 of 9 bytes: the read failed: gone",
             // Owner rule 2026-11-09 (data-always): a deleted mapping may
             // still carry executable code, so it truncates — never

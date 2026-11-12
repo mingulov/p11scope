@@ -162,14 +162,14 @@ pub(crate) fn denied_line(operation: &str, reason: &str, effective: u64, binary:
     if missing.is_empty() {
         format!(
             "live capture refused: the kernel refused to {operation}{reason} with CAP_BPF and \
-             CAP_PERFMON held — a kernel lockdown, an LSM policy, or a container's seccomp \
+             CAP_PERFMON held - a kernel lockdown, an LSM policy, or a container's seccomp \
              profile is refusing BPF here. Run 'p11scope doctor' for host readiness, or use \
              'p11scope inspect --pid N' for a scan without capture."
         )
     } else if effective & (1u64 << crate::caps::CAP_SYS_ADMIN_BIT) != 0 {
         format!(
             "live capture refused: the kernel refused to {operation}{reason} with CAP_SYS_ADMIN \
-             held — a kernel lockdown, an LSM policy, or a container's seccomp profile is \
+             held - a kernel lockdown, an LSM policy, or a container's seccomp profile is \
              refusing BPF here. Run 'p11scope doctor' for host readiness, or use 'p11scope \
              inspect --pid N' for a scan without capture."
         )

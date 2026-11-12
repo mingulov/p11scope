@@ -35,7 +35,7 @@ def check(lines):
 def self_test():
     good = [
         "CAPTURE privacy=allowlisted",
-        "01:44:49.558662 pid 7 tid 7 C_GetFunctionList → CKR_OK 18.1µs",
+        "01:44:49.558662 pid 7 tid 7 C_GetFunctionList -> CKR_OK 18.1us",
         "TRUNCATED at 1 events (--max-events 1)",
         'COUNT_EVIDENCE {"stats_entered":2,"stats_returned":1,"raw_calls":1}',
         'EVIDENCE {"trace_truncated":true}',

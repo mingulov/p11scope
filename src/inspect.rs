@@ -34,7 +34,7 @@ pub(crate) fn push_collapsed_lines(out: &mut String, lines: impl IntoIterator<It
     let flush = |out: &mut String, run: Option<(String, usize)>| {
         if let Some((line, count)) = run {
             if count > 1 {
-                let _ = writeln!(out, "{line}  (×{count} identical)");
+                let _ = writeln!(out, "{line}  (x{count} identical)");
             } else {
                 let _ = writeln!(out, "{line}");
             }
@@ -110,7 +110,7 @@ fn render_text_with_application(
     } else if !quiet && let Some(exe) = application_executable(application) {
         out.push_str(&exe);
     }
-    let _ = write!(out, "pid {pid} — {} {word} mapped", modules.len());
+    let _ = write!(out, "pid {pid} - {} {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
             if verbose {
@@ -169,7 +169,7 @@ fn render_text_with_application(
         for skipped in outcome.skipped() {
             let _ = writeln!(
                 out,
-                "skipped: {} — {}",
+                "skipped: {} - {}",
                 crate::render::escape_controls(&skipped.subject),
                 crate::render::escape_controls(&skipped.reason)
             );
@@ -241,14 +241,14 @@ fn render_module_summary(out: &mut String, module: &ScannedModule) {
     if tables == 0 {
         let _ = writeln!(
             out,
-            "module  {} — contents unknown (not deep-scanned)",
+            "module  {} - contents unknown (not deep-scanned)",
             crate::render::escape_controls(&module.path),
         );
         return;
     }
     let _ = writeln!(
         out,
-        "module  {} — {functions} function{} ({} table{})",
+        "module  {} - {functions} function{} ({} table{})",
         crate::render::escape_controls(&module.path),
         if functions == 1 { "" } else { "s" },
         tables,
@@ -262,7 +262,7 @@ fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
     if skipped.len() == 1 {
         let _ = writeln!(
             out,
-            "skipped: {} — {}",
+            "skipped: {} - {}",
             crate::render::escape_controls(&skipped[0].subject),
             crate::render::escape_controls(&skipped[0].reason)
         );
@@ -278,7 +278,7 @@ fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
     for (reason, count) in groups {
         let _ = writeln!(
             out,
-            "skipped: {count} item{} could not be read — {} (--json lists each)",
+            "skipped: {count} item{} could not be read - {} (--json lists each)",
             if count == 1 { "" } else { "s" },
             crate::render::escape_controls(reason)
         );
@@ -298,13 +298,13 @@ fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
             if *reason == "ptrace" {
                 let _ = writeln!(
                     out,
-                    "coverage: partial — cannot read process memory without root (sudo); \
+                    "coverage: partial - cannot read process memory without root (sudo); \
                      providers listed from its memory map only"
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "coverage: partial — target memory unreadable ({}); providers listed \
+                    "coverage: partial - target memory unreadable ({}); providers listed \
                      from its memory map only",
                     crate::render::escape_controls(reason)
                 );
@@ -339,7 +339,7 @@ fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
             }
             let _ = writeln!(
                 out,
-                "coverage: partial — {} (--json lists each)",
+                "coverage: partial - {} (--json lists each)",
                 parts.join(", "),
             );
         }
@@ -1429,7 +1429,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)  (×3 identical)",
+                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)  (x3 identical)",
                 "  table      3.2, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
                 "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
             ],
@@ -1942,7 +1942,7 @@ mod tests {
         assert!(!out.contains("interface  ["), "{out}");
         assert!(!out.contains("skipped: object A"), "{out}");
         assert!(
-            out.contains("skipped: 2 items could not be read — gone (--json lists each)"),
+            out.contains("skipped: 2 items could not be read - gone (--json lists each)"),
             "{out}"
         );
         assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
@@ -1979,11 +1979,11 @@ mod tests {
             crate::cli::TextVerbosity::Concise,
         );
         assert!(
-            out.contains("skipped: 1 item could not be read — gone (--json lists each)"),
+            out.contains("skipped: 1 item could not be read - gone (--json lists each)"),
             "{out}"
         );
         assert!(
-            out.contains("skipped: 1 item could not be read — moved (--json lists each)"),
+            out.contains("skipped: 1 item could not be read - moved (--json lists each)"),
             "{out}"
         );
         assert!(!out.contains("1 items"), "{out}");
@@ -2111,7 +2111,7 @@ mod tests {
         );
         assert!(
             concise.contains(
-                "coverage: partial — cannot read process memory without root (sudo); \
+                "coverage: partial - cannot read process memory without root (sudo); \
                  providers listed from its memory map only"
             ),
             "{concise}"

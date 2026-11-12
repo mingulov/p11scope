@@ -569,20 +569,20 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 usage:
   p11scope --version
   p11scope help [command]
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--mode profile|metrics] [--duration <…>] [-o <out.json>] [-v] [--quiet]
-  p11scope trace [--pid <n> | --cgroup <path> | --system] [--duration <…>] [--max-events <n>] [-o <out.file>] [-v] [--quiet]
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--mode profile|metrics] [--duration <...>] [-o <out.json>] [-v] [--quiet]
+  p11scope trace [--pid <n> | --cgroup <path> | --system] [--duration <...>] [--max-events <n>] [-o <out.file>] [-v] [--quiet]
   p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [--user <name|uid>] [-o <out>] [-v] [--quiet] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--json] [-v] [--quiet]
   p11scope inspect --system [--json] [-v] [--quiet]
-  p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
-  p11scope inventory --cgroup <path> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
-  p11scope inventory --system [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
+  p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <...>] [--json] [-v] [--quiet] [-o <out.json>]
+  p11scope inventory --cgroup <path> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <...>] [--json] [-v] [--quiet] [-o <out.json>]
+  p11scope inventory --system [--capture auto|scan|native] [--manifest <m.json>]... [--duration <...>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
   p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
   p11scope doctor [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
   p11scope-discover --module <provider.so> [-o <manifest.json>] [--isolation trusted|isolated]   (offline helper; executes provider code)
 
-discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
+discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file.
 Live capture needs root; inspect, inventory diff, inventory cbom and inventory --capture scan do not.
 Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head.
 Complete output: --json on inspect/inventory (incl. inventory diff, cbom); -o FILE on profile/run/inventory; trace streams text to -o FILE or -o -; inventory streams --event-log; doctor is text-only.
@@ -613,7 +613,7 @@ examples (4242 is an example PID, not a detected target):
   p11scope profile --pid 4242 --duration 30s -o profile.json
   p11scope profile --system --mode metrics --duration 30s -o metrics.json
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
+notes: discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M, 4M with --mode metrics, which writes no per-call records; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
@@ -648,7 +648,7 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
 const TRACE_HELP_HEAD: &str = "usage:
-  p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
+  p11scope trace   [same scope and discovery options] [--duration <...>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
@@ -661,7 +661,7 @@ const TRACE_HELP_HEAD: &str = "usage:
 example (4242 is an example PID, not a detected target):
   p11scope trace --pid 4242 --duration 10s --max-events 1000
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
+notes: discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
@@ -698,7 +698,7 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace [--max-events <n>]] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace [--max-events <n>]] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <...>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -713,7 +713,7 @@ example:
   sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib64/pkcs11/libsofthsm2.so -L  # Fedora/RHEL
   sudo p11scope run --pause auto --user alice -- pkcs11-tool --module ... -L
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
+notes: discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M, 4M with --mode metrics, which writes no per-call records; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
@@ -754,15 +754,15 @@ exit codes: the command's exit status; 1 if observing failed; 2 for wrong argume
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
 const INSPECT_HELP: &str = "usage:
-  p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
+  p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <...>]... [--json]
                    [-v] [--quiet]
-  p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
+  p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <...>]... [--json] [--max-scan-pids <n>]
                    [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope inspect --pid 4242 --json
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
+notes: discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
@@ -791,19 +791,19 @@ exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP_HEAD: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
@@ -816,7 +816,7 @@ example (4242 is an example PID, not a detected target):
   p11scope inventory --cgroup <path> --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
   sudo p11scope inventory --system --duration 30s
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
+notes: discovery scans the target's mapped memory - no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 Choose exactly one of --pid, --cgroup, or --system; --cgroup includes descendants.
 Idle cgroup usage remains unknown: endpoint samples do not prove continuous membership.
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
@@ -836,7 +836,7 @@ Inventory separates mapped modules from observed usage entries; entries are not 
 /// [`crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT`].
 fn inventory_max_endpoints_line() -> String {
     format!(
-        "--max-endpoints selects capture-lifetime physical endpoint IDs: 1–{}, default {}; unloading does not refund IDs.\n",
+        "--max-endpoints selects capture-lifetime physical endpoint IDs: 1-{}, default {}; unloading does not refund IDs.\n",
         crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT,
         crate::capacity::DEFAULT_INVENTORY_ENDPOINT_LIMIT,
     )
@@ -1422,7 +1422,7 @@ fn capture_option(
                 "metrics" => true,
                 "trace" => {
                     return Err(usage_err(
-                        "trace is a subcommand (`p11scope trace …`) or the `run --trace` flag, \
+                        "trace is a subcommand (`p11scope trace ...`) or the `run --trace` flag, \
                          not --mode trace",
                     ));
                 }
@@ -3114,7 +3114,7 @@ mod tests {
                 matches!(
                     parse(args(&["inventory", "--system", "--max-endpoints", value])),
                     Err(CliError::Usage { message, .. })
-                        if message.contains("--max-endpoints") && message.contains("1–131072")
+                        if message.contains("--max-endpoints") && message.contains("1-131072")
                 ),
                 "out-of-policy endpoint budget {value} names the accepted range"
             );
@@ -3155,7 +3155,7 @@ mod tests {
         // copy, so a limit change moves the help with it.
         assert!(
             help.contains(&format!(
-                "1–{}, default {}",
+                "1-{}, default {}",
                 crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT,
                 crate::capacity::DEFAULT_INVENTORY_ENDPOINT_LIMIT
             )),
@@ -3179,11 +3179,11 @@ mod tests {
         assert!(matches!(
             parse(args(&["inventory", "--system", "--max-endpoints", "131073"])),
             Err(CliError::Usage { message, .. })
-                if message.contains("--max-endpoints") && message.contains("1–131072")
+                if message.contains("--max-endpoints") && message.contains("1-131072")
         ));
         let help = HelpTopic::Inventory.text();
         assert!(
-            help.contains("1–131072") && help.contains("32768"),
+            help.contains("1-131072") && help.contains("32768"),
             "help must name the raised policy"
         );
     }
@@ -6152,8 +6152,12 @@ mod tests {
         // 3120/0x4fd7de9d62ec35ad pin is exactly
         // `, P11SCOPE_DISABLE_FILE_LEARNING` on the Environment line
         // (+32); no other drift.
-        assert_eq!(USAGE.len(), 3152);
-        assert_eq!(hash, 0xc83ab24b6cef5974);
+        // 3150 / 0x2652cac918725293 (ascii human output): diff vs the
+        // 3152/0xc83ab24b6cef5974 pin is exactly `<…>` to `<...>` on
+        // the four duration synopsis lines (+0, same byte length) and
+        // the em dash to `-` on the discovery line (-2); no other drift.
+        assert_eq!(USAGE.len(), 3150);
+        assert_eq!(hash, 0x2652cac918725293);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

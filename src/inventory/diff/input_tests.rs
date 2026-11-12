@@ -532,7 +532,7 @@ fn digest_normalization_and_nullable_identities() {
     );
     assert_eq!(snapshot.callers[0].start_time, None);
     for digest in [
-        "abc…",
+        "abc...",
         "g000000000000000000000000000000000000000000000000000000000000000",
         "a",
     ] {

@@ -456,7 +456,7 @@ const PID_NAMESPACE_ROW: &str = "PID namespace";
 fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bool) -> Check {
     use crate::pidns::{ObserverPidNs, ProcView};
     let status = if numbering.agrees() {
-        Status::Ok("initial — /proc PIDs are the kernel's PIDs".to_string())
+        Status::Ok("initial - /proc PIDs are the kernel's PIDs".to_string())
     } else {
         let mut why = Vec::new();
         if let ObserverPidNs::Unknown(reason) = &numbering.observer {
@@ -476,7 +476,7 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
         };
         let detail = if matches!(numbering.proc_view, ProcView::Unserved(_)) {
             format!(
-                "{}{why} — this observer cannot read its own /proc/self, so every capture \
+                "{}{why} - this observer cannot read its own /proc/self, so every capture \
                  except inventory --system is refused ({}; inventory --system warns \
                  and carries the pid namespace gap)",
                 numbering.observer.label(),
@@ -484,7 +484,7 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
             )
         } else {
             format!(
-                "{}{why} — the kernel numbers tasks in the initial PID namespace: --pid, run and \
+                "{}{why} - the kernel numbers tasks in the initial PID namespace: --pid, run and \
                  inventory --pid are refused ({}); --cgroup/--system captures stay PARTIAL \
                  (pid_namespace / proc_namespace_mismatch)",
                 numbering.observer.label(),
@@ -614,10 +614,10 @@ fn sysctl_status(
             match trimmed.parse::<i64>() {
                 Ok(v) if v >= warn_at => match lift {
                     Some(lift) if lift.held && v <= lift.up_to => Status::Ok(format!(
-                        "{v} — {warn_msg}; this process has {}",
+                        "{v} - {warn_msg}; this process has {}",
                         lift.capability
                     )),
-                    _ => Status::Warn(format!("{v} — {warn_msg}")),
+                    _ => Status::Warn(format!("{v} - {warn_msg}")),
                 },
                 Ok(v) => Status::Ok(v.to_string()),
                 Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
@@ -683,19 +683,19 @@ fn paranoid_status(
                 Ok(v) if v >= crate::uretprobe_hazard::PERF_OPEN_RESTRICT_PARANOID => {
                     if held_sysadmin {
                         Status::Ok(format!(
-                            "{v} — uprobe-multi links are not gated; this process holds \
+                            "{v} - uprobe-multi links are not gated; this process holds \
                              CAP_SYS_ADMIN for the singles fallback"
                         ))
                     } else {
                         Status::Warn(format!(
-                            "{v} — refuses perf_event_open without CAP_SYS_ADMIN (CAP_PERFMON does \
+                            "{v} - refuses perf_event_open without CAP_SYS_ADMIN (CAP_PERFMON does \
                              not lift it); the default uprobe-multi lane is unaffected, only \
                              --attach-backend singles needs it"
                         ))
                     }
                 }
                 Ok(v) => Status::Ok(format!(
-                    "{v} — does not limit uprobe attach for CAP_PERFMON; CAP_BPF+CAP_PERFMON \
+                    "{v} - does not limit uprobe attach for CAP_PERFMON; CAP_BPF+CAP_PERFMON \
                      suffice"
                 )),
                 Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
@@ -954,7 +954,7 @@ fn capabilities_status(read: Result<u64, String>) -> Status {
                     .iter()
                     .map(|cap| crate::caps::needs_line(cap))
                     .collect();
-                Status::Warn(format!("{have} — missing: {}", needs.join("; ")))
+                Status::Warn(format!("{have} - missing: {}", needs.join("; ")))
             }
         }
         Err(e) => Status::Warn(e),
@@ -1446,7 +1446,7 @@ fn proc_maps_check(pid: u32) -> Check {
     let status = match std::fs::File::open(&name) {
         Ok(_) => Status::Ok(String::new()),
         Err(e) => Status::Fail(format!(
-            "{} — module discovery unavailable for this target",
+            "{} - module discovery unavailable for this target",
             short_errno(&e)
         )),
     };
@@ -1458,7 +1458,7 @@ fn proc_mem_check(pid: u32) -> Check {
     let status = match std::fs::File::open(&name) {
         Ok(_) => Status::Ok(String::new()),
         Err(e) => Status::Fail(format!(
-            "{} — memory scan unavailable for this target",
+            "{} - memory scan unavailable for this target",
             short_errno(&e)
         )),
     };
@@ -3027,7 +3027,7 @@ mod tests {
             },
             Check {
                 name: "kernel.perf_event_paranoid".into(),
-                status: Status::Warn("4 — uprobes need CAP_SYS_ADMIN".into()),
+                status: Status::Warn("4 - uprobes need CAP_SYS_ADMIN".into()),
             },
             Check {
                 name: "uprobe attach".into(),
@@ -4527,7 +4527,7 @@ mod tests {
                 paranoid(true)
             );
         };
-        assert!(detail.starts_with("4 — "), "{detail}");
+        assert!(detail.starts_with("4 - "), "{detail}");
         assert!(
             detail.contains("this process has CAP_SYS_ADMIN"),
             "{detail}"
@@ -4577,7 +4577,7 @@ mod tests {
                 );
             };
             assert!(
-                detail.starts_with(&format!("{} — ", value.trim())),
+                detail.starts_with(&format!("{} - ", value.trim())),
                 "{detail}"
             );
             assert!(detail.contains("uprobe-multi"), "{detail}");
@@ -4756,7 +4756,7 @@ mod tests {
             },
             Check {
                 name: "kernel.perf_event_paranoid".into(),
-                status: Status::Warn("4 — needs privilege".into()),
+                status: Status::Warn("4 - needs privilege".into()),
             },
         ];
         assert_eq!(verdict(&checks), 0, "default verdict tolerates warns");
@@ -5051,7 +5051,7 @@ mod tests {
             },
             Check {
                 name: "kernel.yama.ptrace_scope".into(),
-                status: Status::Warn("1 — needs CAP_SYS_PTRACE".into()),
+                status: Status::Warn("1 - needs CAP_SYS_PTRACE".into()),
             },
             Check {
                 name: "run initial-set capture".into(),

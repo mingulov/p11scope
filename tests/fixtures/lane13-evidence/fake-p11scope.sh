@@ -13,6 +13,6 @@ if [ "$1" = profile ]; then
     output=; previous=
     for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
     [ -z "$output" ] || /usr/bin/python3 "$D2_FIXTURES/write-observed.py" "$output"
-    echo 'capture — privacy=aggregate-only'
+    echo 'capture - privacy=aggregate-only'
 fi
 exit 0

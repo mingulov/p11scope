@@ -2580,17 +2580,17 @@ fn provider_cell(row: &SlotReport, modules: &[DiscoveredModule]) -> String {
     if escaped.chars().count() <= WIDTH {
         escaped.into_owned()
     } else {
-        let mut short: String = escaped.chars().take(WIDTH - 1).collect();
-        short.push('…');
+        let mut short: String = escaped.chars().take(WIDTH - 3).collect();
+        short.push_str("...");
         short
     }
 }
 
 pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     match ns {
-        None => "—".into(),
+        None => "-".into(),
         Some(v) if v < 1_000 => format!("{v}ns"),
-        Some(v) if v < 1_000_000 => format!("{:.1}µs", v as f64 / 1e3),
+        Some(v) if v < 1_000_000 => format!("{:.1}us", v as f64 / 1e3),
         Some(v) if v < 1_000_000_000 => format!("{:.1}ms", v as f64 / 1e6),
         Some(v) => format!("{:.2}s", v as f64 / 1e9),
     }
@@ -2775,7 +2775,7 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
     } else {
         "not attached"
     };
-    let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
+    let mut body = format!("{status} - {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
         body.push_str(&closure_forwarding_hint(ev, reports, &skipped.name));
         body.push_str(". Calls the forwarding layer answers itself are not counted.");
@@ -3085,7 +3085,7 @@ fn has_unattested_provider(ev: &Evidence) -> bool {
 }
 
 /// Plain-words companion to the `semantic_unverified_slots` verdict
-/// fragment: how many mapped providers have no manifest at all, by name.
+/// fragment: how many mapped providers have no manifest at all, by path.
 /// Prints only when unverified slots remain and at least one mapped
 /// provider lacks any manifest source; partial manifest coverage keeps
 /// the machine fragment alone. Human text only; the JSON is unchanged.
@@ -3096,14 +3096,31 @@ fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
         return String::new();
     }
     let modules = &ev.discovery.modules;
+    // Same-path providers (one file seen through two mounts) keep their
+    // identity beside the path, like the inventory provider lines.
+    let mut path_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for module in modules
+        .iter()
+        .filter(|module| !module.sources.contains(&"manifest"))
+    {
+        *path_counts.entry(module.path.as_str()).or_default() += 1;
+    }
     let mut unattested: Vec<String> = modules
         .iter()
         .filter(|module| !module.sources.contains(&"manifest"))
         .map(|module| {
-            std::path::Path::new(&module.path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| module.path.clone())
+            if path_counts
+                .get(module.path.as_str())
+                .is_some_and(|count| *count > 1)
+            {
+                format!(
+                    "{} [dev {}:{} ino {}]",
+                    module.path, module.dev.0, module.dev.1, module.ino
+                )
+            } else {
+                module.path.clone()
+            }
         })
         .collect();
     if unattested.is_empty() {
@@ -3117,7 +3134,7 @@ fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
         shown.join(", ")
     };
     let remedy = if verbose {
-        " — rerun with --manifest for provider files with unverified tables (see Coverage) to confirm their layouts for mechanism decoding"
+        " - rerun with --manifest for provider files with unverified tables (see Coverage) to confirm their layouts for mechanism decoding"
     } else {
         ""
     };
@@ -3697,7 +3714,7 @@ fn session_login_line(
     if !logins.is_empty() {
         let parts: Vec<String> = logins
             .iter()
-            .map(|(user_type, n)| format!("{} ×{n}", login_user_type_name(*user_type)))
+            .map(|(user_type, n)| format!("{} x{n}", login_user_type_name(*user_type)))
             .collect();
         line.push_str(&format!("; logins: {}", parts.join(", ")));
     }
@@ -3724,12 +3741,12 @@ pub fn live_scoped_with_verbosity_and_sessions(
     // Concise states the scope once, in the header; the privacy mode
     // is verbose detail.
     let privacy = if verbosity == crate::cli::TextVerbosity::Verbose {
-        format!(" — privacy={}", policy.privacy_mode())
+        format!(" - privacy={}", policy.privacy_mode())
     } else {
         String::new()
     };
     s.push_str(&format!(
-        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {}{} — {}\n",
+        "p11scope - {} scope - up {:02}:{:02}:{:02} - mode {}{} - {}\n",
         scope_label(scope),
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
@@ -3755,7 +3772,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
     // header. One latency legend otherwise, above the table.
     if !rows.is_empty() {
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
-        s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
+        s.push_str("Latency units: ns/us/ms/s (microseconds shown as us); ~ = log2-bucket approximation, lower bound.\n");
         let forwarding = forwarding_module_ids(ev, reports);
         // The name field fits the longest rendered name in this frame (min 28),
         // so marked rows keep the columns aligned without fixed padding.
@@ -3886,7 +3903,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
                 ""
             };
             s.push_str(&format!(
-                "Mechanisms: none attributed — {} function{} named from the standard table, \
+                "Mechanisms: none attributed - {} function{} named from the standard table, \
                  unconfirmed{remedy} (see Coverage).\n",
                 ev.semantic_unverified_slots,
                 if ev.semantic_unverified_slots == 1 {
@@ -3918,7 +3935,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
     }
     if verbosity == crate::cli::TextVerbosity::Verbose {
         let mut evidence_line = format!(
-            "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
+            "Evidence: {}/{} probes attached, {} slots ({} active), {} aliased, {} skipped, {} in-flight",
             ev.attached_probes,
             ev.slots * 2,
             ev.slots,
@@ -3929,7 +3946,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
         );
         if ev.semantic_history_drops > 0 {
             evidence_line.push_str(&format!(
-                " · semantic_history_drops={}",
+                ", semantic_history_drops={}",
                 ev.semantic_history_drops
             ));
         }
@@ -3944,17 +3961,17 @@ pub fn live_scoped_with_verbosity_and_sessions(
             ),
         ] {
             if count > 0 {
-                info_fragments.push(format!("ℹ {count} {label}"));
+                info_fragments.push(format!("info {count} {label}"));
             }
         }
         if !info_fragments.is_empty() {
-            evidence_line.push_str(" · ");
+            evidence_line.push_str(", ");
             evidence_line.push_str(&info_fragments.join(" "));
         }
         // F-13: why the verdict is what it is, from the classes the verdict used,
         // so a gate can never force PARTIAL without being named here.
         evidence_line.push_str(&format!(
-            " → {}{}\n",
+            " -> {}{}\n",
             ev.completeness,
             verdict_reasons(ev, true)
         ));
@@ -3973,7 +3990,7 @@ pub fn live_scoped_with_verbosity_and_sessions(
 /// reason. Empty when `COMPLETE`. Concise text is plain words only;
 /// verbose pairs each machine name beside its plain words.
 fn verdict_reasons(ev: &Evidence, verbose: bool) -> String {
-    verdict_reason_body(ev, verbose).map_or_else(String::new, |body| format!(" — {body}"))
+    verdict_reason_body(ev, verbose).map_or_else(String::new, |body| format!(" - {body}"))
 }
 
 /// The [`verdict_reasons`] groups without the leading separator, so
@@ -4003,7 +4020,7 @@ fn verdict_reason_body(ev: &Evidence, verbose: bool) -> Option<String> {
     .collect();
     if groups.is_empty() && !ev.drain_proven {
         groups.push(if verbose {
-            "end of capture not fully confirmed — last calls may be missing \
+            "end of capture not fully confirmed - last calls may be missing \
              (terminal drain unproven)"
                 .into()
         } else {
@@ -4575,7 +4592,7 @@ fn skipped_item_list(ev: &Evidence) -> Vec<String> {
         .take(SHOWN)
         .map(|(name, reason, n)| {
             if *n > 1 {
-                format!("{name} ({reason}) ×{n}")
+                format!("{name} ({reason}) x{n}")
             } else {
                 format!("{name} ({reason})")
             }
@@ -4630,7 +4647,7 @@ pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
         return "coverage: complete".to_string();
     }
     if missed_provider_load(ev) {
-        let mut line = "coverage: partial — the command loaded its provider before probes \
+        let mut line = "coverage: partial - the command loaded its provider before probes \
              attached; rerun with --pause auto"
             .to_string();
         if verbose {
@@ -4651,15 +4668,15 @@ pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
     {
         let fragments = cause_fragments(ev, &classes.attribution.causes, verbose);
         if fragments.is_empty() {
-            return "coverage: partial — counts complete".to_string();
+            return "coverage: partial - counts complete".to_string();
         }
         return format!(
-            "coverage: partial — counts complete; {}",
+            "coverage: partial - counts complete; {}",
             escape_controls(&fragments.join("; "))
         );
     }
     match verdict_reason_body(ev, verbose) {
-        Some(body) => format!("coverage: partial — {}", escape_controls(&body)),
+        Some(body) => format!("coverage: partial - {}", escape_controls(&body)),
         None => "coverage: partial".to_string(),
     }
 }
@@ -5881,8 +5898,8 @@ pub(crate) mod tests {
     fn human_counter_percentiles_follow_capability_with_poisoned_buckets() {
         use p11scope_ebpf_common::bucket_of;
         for (mode, expected) in [
-            (CounterMode::Counts, "—"),
-            (CounterMode::Timestamps, "—"),
+            (CounterMode::Counts, "-"),
+            (CounterMode::Timestamps, "-"),
             (CounterMode::Latency, "64ns"),
         ] {
             let mut row = report("C_Sign", 25, 2, false);
@@ -8095,7 +8112,7 @@ pub(crate) mod tests {
         );
         assert!(
             output.contains(
-                "coverage: partial — counts complete; function names follow the standard PKCS#11 table"
+                "coverage: partial - counts complete; function names follow the standard PKCS#11 table"
             ),
             "{output}"
         );
@@ -8417,7 +8434,7 @@ pub(crate) mod tests {
             assert_eq!(
                 &line[15..],
                 format!(
-                    " Unknown executable (PID 100, TID 1) function #{ordinal} (unnamed) → {rv} 100ns"
+                    " Unknown executable (PID 100, TID 1) function #{ordinal} (unnamed) -> {rv} 100ns"
                 ),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
@@ -8505,7 +8522,7 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(
             ev.completeness, "PARTIAL",
-            "no modules ⇒ nothing was observed"
+            "no modules => nothing was observed"
         );
     }
 
@@ -8521,7 +8538,7 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(
             ev.completeness, "PARTIAL",
-            "no slots ⇒ nothing was observed"
+            "no slots => nothing was observed"
         );
     }
 
@@ -8874,14 +8891,14 @@ pub(crate) mod tests {
         };
         let concise = frame(crate::cli::TextVerbosity::Concise);
         assert!(
-            concise.contains("sessions: 3 opened, peak 2 at once, 2 still open; logins: user ×1"),
+            concise.contains("sessions: 3 opened, peak 2 at once, 2 still open; logins: user x1"),
             "{concise}"
         );
         let verbose = frame(crate::cli::TextVerbosity::Verbose);
         assert!(
             verbose.contains(
                 "sessions: 3 opened, 0 inherited, 1 closed, peak 2 at once, 2 still open; \
-                 logins: user ×1"
+                 logins: user x1"
             ),
             "{verbose}"
         );
@@ -8926,7 +8943,7 @@ pub(crate) mod tests {
         let out = frame(|ev| ev.event_loss = 12, false);
         assert!(
             out.contains(
-                "→ PARTIAL — calls may be missing (observation lossy) \
+                "-> PARTIAL - calls may be missing (observation lossy) \
                  (12 call records lost (event_loss))"
             ),
             "{out}"
@@ -8934,7 +8951,7 @@ pub(crate) mod tests {
         let out = frame(|ev| ev.semantic_unverified_slots = 68, true);
         assert!(
             out.contains(
-                "→ PARTIAL — names unconfirmed (attribution withheld) \
+                "-> PARTIAL - names unconfirmed (attribution withheld) \
                  (function names follow the standard PKCS#11 table but their layout was not verified \
                  from scan (add --manifest to confirm positions for mechanism decoding) (68 slots; semantic_unverified_slots))"
             ),
@@ -8956,7 +8973,7 @@ pub(crate) mod tests {
         let out = frame(|_| {}, true);
         assert!(out.contains("end of capture not fully confirmed"), "{out}");
         let out = frame(|_| {}, false);
-        assert!(out.trim_end().ends_with("→ COMPLETE"), "{out}");
+        assert!(out.trim_end().ends_with("-> COMPLETE"), "{out}");
     }
 
     fn ring_unexplained_fixture() -> (Evidence, Evidence) {
@@ -9150,8 +9167,8 @@ pub(crate) mod tests {
     #[test]
     fn concise_gaps_name_capacity_refusals_before_proxy_lines() {
         const PROXY_AWAITING: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole, as a prefix when named by the operator, or as published tables; an unnamed layer in a detailed capture attaches only its published tables); the providers it forwards to attach when they load";
-        const TRUST_CAPACITY: &str = "module needs 68 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105); 128 are reserved for providers with a corroborated function table — refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
-        const SNAP_CAPACITY: &str = "module needs 212 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105) — refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
+        const TRUST_CAPACITY: &str = "module needs 68 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105); 128 are reserved for providers with a corroborated function table - refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
+        const SNAP_CAPACITY: &str = "module needs 212 more; only 512 attach slots are available; 317 are in use (317 active, 0 retired; held by /usr/lib/x86_64-linux-gnu/libsoftokn3.so 212, /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so 105) - refusing to attach a prefix; to capture one provider, name it with --module <path>; to free slots, exclude an unneeded module with --exclude-module <name>";
         let mut ev = evidence();
         for name in [
             "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
@@ -9222,7 +9239,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Quiet,
         ] {
             let out = scope_summary_with_verbosity("pid", &reports_fixture(), &partial, verbosity);
-            assert!(out.contains("coverage: partial — "), "{verbosity:?}: {out}");
+            assert!(out.contains("coverage: partial - "), "{verbosity:?}: {out}");
             assert!(!out.contains("Coverage PARTIAL"), "{verbosity:?}: {out}");
             assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
         }
@@ -9635,7 +9652,7 @@ pub(crate) mod tests {
         );
         assert!(
             out.contains(
-                "coverage: partial — counts complete; function names follow the standard PKCS#11 table \
+                "coverage: partial - counts complete; function names follow the standard PKCS#11 table \
                  but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding)"
             ),
             "{out}"
@@ -9648,7 +9665,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(out.contains("coverage: partial — counts complete"), "{out}");
+        assert!(out.contains("coverage: partial - counts complete"), "{out}");
         assert!(out.contains("semantic_unverified_slots"), "{out}");
         assert!(out.contains("68"), "{out}");
         // Beside a concrete gap the group keeps its label, reworded.
@@ -9718,7 +9735,7 @@ pub(crate) mod tests {
         };
         let out = frame(crate::cli::TextVerbosity::Concise);
         assert!(
-            out.contains("p11scope — PID scope — up 00:00:00 — mode profile — /opt/p11.so\n"),
+            out.contains("p11scope - PID scope - up 00:00:00 - mode profile - /opt/p11.so\n"),
             "{out}"
         );
         assert!(!out.contains("privacy="), "{out}");
@@ -9756,7 +9773,7 @@ pub(crate) mod tests {
         ] {
             let out = scope_summary_with_verbosity("pid", &[], &ev, verbosity);
             assert!(
-                out.contains(&format!("coverage: partial — {REMEDY}")),
+                out.contains(&format!("coverage: partial - {REMEDY}")),
                 "{verbosity:?}: {out}"
             );
             assert!(
@@ -10511,7 +10528,7 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             crate::cli::TextVerbosity::Quiet,
         );
-        assert!(out.contains("p11scope — PID scope"), "{out}");
+        assert!(out.contains("p11scope - PID scope"), "{out}");
         assert!(out.contains("10 completed calls;"), "{out}");
         assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("FUNCTION"), "{out}");
@@ -10522,7 +10539,7 @@ pub(crate) mod tests {
     /// The omission record the planner writes for an admitted provider whose
     /// growth did not fit (`plan::tests` pins the planner to this shape).
     const GROWTH_OMISSION_RECORD: &str = "admitted module needs 2 more; only 512 attach slots \
-         are available; 511 are in use — 2 endpoints not attached; kept its 511 attached endpoints";
+         are available; 511 are in use - 2 endpoints not attached; kept its 511 attached endpoints";
 
     /// G-03: an admitted provider whose growth did not fit is partially
     /// covered, not refused. The live view counts it apart from the modules
@@ -10535,7 +10552,7 @@ pub(crate) mod tests {
             SkippedOut {
                 name: "/opt/new.so".into(),
                 reason: "module needs 3 more; only 512 attach slots are available; 511 are in \
-                         use — refusing to attach a prefix"
+                         use - refusing to attach a prefix"
                     .into(),
             },
             SkippedOut {
@@ -10574,7 +10591,7 @@ pub(crate) mod tests {
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/p11-kit-trust.so".into(),
             reason: "module needs 68 more; only 512 attach slots are available; 480 are in use \
-                 (480 active, 0 retired; held by /opt/other.so 480) — refusing to attach a prefix"
+                 (480 active, 0 retired; held by /opt/other.so 480) - refusing to attach a prefix"
                 .into(),
         });
         ev.verdict();
@@ -10587,7 +10604,7 @@ pub(crate) mod tests {
         assert!(text.contains("1 provider file not watched"), "{text}");
         assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
         assert!(
-            text.contains("/opt/p11-kit-trust.so: not attached — "),
+            text.contains("/opt/p11-kit-trust.so: not attached - "),
             "{text}"
         );
         assert!(text.contains("module needs 68 more"), "{text}");
@@ -10623,7 +10640,7 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains(
-                "Attribution: 1 of 2 mapped provider files has no manifest (libsoftokn3.so); \
+                "Attribution: 1 of 2 mapped provider files has no manifest (/opt/firefox/libsoftokn3.so); \
                  counts are exact, names are unconfirmed"
             ),
             "{text}"
@@ -10657,7 +10674,7 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains(
-                "Attribution: 2 of 3 mapped provider files have no manifest (a.so, b.so); \
+                "Attribution: 2 of 3 mapped provider files have no manifest (/opt/a.so, /opt/b.so); \
                  counts are exact, names are unconfirmed"
             ),
             "{text}"
@@ -10815,7 +10832,7 @@ pub(crate) mod tests {
         );
         assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
-            text.contains("/opt/grown.so: partially covered — "),
+            text.contains("/opt/grown.so: partially covered - "),
             "{text}"
         );
         assert!(text.contains("kept its 511 attached endpoints"), "{text}");
@@ -10841,7 +10858,7 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: format!(
                 "module needs 6530 more; only 512 attach slots are available; 68 are in use \
-                 (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
+                 (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) - refusing to attach a \
                  prefix of its 64 lookalike function tables {}",
                 crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
             ),
@@ -10850,7 +10867,7 @@ pub(crate) mod tests {
         let text =
             scope_summary_with_verbosity("pid", &[row], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(
-            text.contains("/opt/libp11-kit.so: not attached — "),
+            text.contains("/opt/libp11-kit.so: not attached - "),
             "{text}"
         );
         assert!(text.contains("64 lookalike function tables"), "{text}");
@@ -10893,7 +10910,7 @@ pub(crate) mod tests {
         );
         assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
-            text.contains("/opt/p11-kit-client.so: partially covered — "),
+            text.contains("/opt/p11-kit-client.so: partially covered - "),
             "{text}"
         );
         assert!(text.contains("4 of 64 template tables attached"), "{text}");
@@ -11190,7 +11207,7 @@ pub(crate) mod tests {
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libforward.so".into(),
             reason: format!(
-                "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix of its 67 lookalike function tables {}",
+                "module needs 5966 more; only 512 attach slots are available - refusing to attach a prefix of its 67 lookalike function tables {}",
                 crate::plan::CLOSURE_ARRAY_NOTE_WHOLE
             ),
         });
@@ -11450,7 +11467,7 @@ pub(crate) mod tests {
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libbackend.so".into(),
             reason: "module needs 100 more; only 512 attach slots are available; 412 are in use \
-                 (412 active, 0 retired) — refusing to attach a prefix; to capture one provider, \
+                 (412 active, 0 retired) - refusing to attach a prefix; to capture one provider, \
                  name it with --module <path>; to free slots, exclude an unneeded module with \
                  --exclude-module <name>"
                 .into(),
@@ -11467,7 +11484,7 @@ pub(crate) mod tests {
             "no forwarding line when the backend is refused: {text}"
         );
         assert!(
-            text.contains("/opt/libbackend.so: not attached — "),
+            text.contains("/opt/libbackend.so: not attached - "),
             "the refused backend is still named as a gap: {text}"
         );
         let document = json(&[outer, other], &ev, &capture_fixture());
@@ -11701,7 +11718,7 @@ pub(crate) mod tests {
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libother.so".into(),
             reason: "module needs 100 more; only 512 attach slots are available; 412 are in use \
-                 (412 active, 0 retired) — refusing to attach a prefix; to capture one provider, \
+                 (412 active, 0 retired) - refusing to attach a prefix; to capture one provider, \
                  name it with --module <path>; to free slots, exclude an unneeded module with \
                  --exclude-module <name>"
                 .into(),
@@ -12047,7 +12064,7 @@ pub(crate) mod tests {
         );
         assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
-            text.contains("/opt/mixed.so: partially covered — "),
+            text.contains("/opt/mixed.so: partially covered - "),
             "{text}"
         );
         assert!(text.contains("100 of 150 endpoints attached"), "{text}");
@@ -12073,7 +12090,7 @@ pub(crate) mod tests {
         );
         assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
-            text.contains("/opt/trust.so: partially covered — "),
+            text.contains("/opt/trust.so: partially covered - "),
             "{text}"
         );
         assert!(text.contains("40 of 68 endpoints attached"), "{text}");
@@ -12087,7 +12104,7 @@ pub(crate) mod tests {
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/crowded.so".into(),
             reason: "module needs 150 more; only 512 attach slots are available; 400 are in use \
-                 (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+                 (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) - refusing to attach \
                  a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
                  an unneeded module with --exclude-module <name>"
                 .into(),
@@ -12101,7 +12118,7 @@ pub(crate) mod tests {
         );
         assert!(text.contains("1 provider file not watched"), "{text}");
         assert!(!text.contains("partially covered"), "{text}");
-        assert!(text.contains("/opt/crowded.so: not attached — "), "{text}");
+        assert!(text.contains("/opt/crowded.so: not attached - "), "{text}");
         assert!(!text.contains("partially covered"), "{text}");
     }
 
@@ -12345,7 +12362,7 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: format!(
                 "module needs 6530 more; only 512 attach slots are available; 0 are in use \
-                 (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 (0 active, 0 retired) - refusing to attach a prefix of its 64 lookalike function \
                  tables {}",
                 crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
             ),
@@ -12354,7 +12371,7 @@ pub(crate) mod tests {
         let text =
             scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(
-            text.contains("/opt/libp11-kit.so: not attached — "),
+            text.contains("/opt/libp11-kit.so: not attached - "),
             "{text}"
         );
         assert!(text.contains("no provider below it was captured"), "{text}");
@@ -12373,7 +12390,7 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: format!(
                 "module needs 6530 more; only 512 attach slots are available; 68 are in use \
-                 (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 (68 active, 0 retired) - refusing to attach a prefix of its 64 lookalike function \
                  tables {}",
                 crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
             ),
@@ -12412,8 +12429,8 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(text.contains("Module gaps (showing 5 of 7):"), "{text}");
-        assert!(text.contains("/opt/refused0.so: not attached — "), "{text}");
-        assert!(text.contains("/opt/refused4.so: not attached — "), "{text}");
+        assert!(text.contains("/opt/refused0.so: not attached - "), "{text}");
+        assert!(text.contains("/opt/refused4.so: not attached - "), "{text}");
         assert!(!text.contains("/opt/refused5.so"), "{text}");
         assert!(text.contains("and 2 more"), "{text}");
     }
@@ -13226,7 +13243,7 @@ pub(crate) mod tests {
         );
         assert!(
             out.contains(
-                "Mechanisms: none attributed — 212 functions named from the standard table, \
+                "Mechanisms: none attributed - 212 functions named from the standard table, \
                  unconfirmed; add --manifest for provider files with unverified tables to confirm their layouts (see Coverage)."
             ),
             "{out}"
@@ -13505,7 +13522,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(
-            out.contains("· ℹ 1 process trackers using /proc"),
+            out.contains(", info 1 process trackers using /proc"),
             "lone fallback fragment must be single-spaced: {out}"
         );
     }
@@ -13562,13 +13579,13 @@ pub(crate) mod tests {
                 e.template_tail_failures = 1;
             }),
             (
-                "coverage: partial — counts complete; function names follow the standard PKCS#11 table",
+                "coverage: partial - counts complete; function names follow the standard PKCS#11 table",
                 |e| {
                     e.semantic_unverified_slots = 1;
                 },
             ),
             (
-                "coverage: partial — counts complete; function names follow the standard PKCS#11 table",
+                "coverage: partial - counts complete; function names follow the standard PKCS#11 table",
                 |e| {
                     e.semantic_unverified_slots = 2;
                 },
@@ -13606,10 +13623,10 @@ pub(crate) mod tests {
             |e| e.pending_at_end = 1,
         ];
         let info_cases: [(&str, EvidenceMutation); 4] = [
-            ("ℹ 1 orphan ops", |e| e.orphan_ops = 1),
-            ("ℹ 1 unmatched closes", |e| e.unmatched_closes = 1),
-            ("ℹ 1 shape decode gaps", |e| e.shape_decode_failures = 1),
-            ("ℹ 1 process trackers using /proc", |e| {
+            ("info 1 orphan ops", |e| e.orphan_ops = 1),
+            ("info 1 unmatched closes", |e| e.unmatched_closes = 1),
+            ("info 1 shape decode gaps", |e| e.shape_decode_failures = 1),
+            ("info 1 process trackers using /proc", |e| {
                 e.process_tracking_fallbacks = 1;
             }),
         ];
@@ -15698,11 +15715,11 @@ pub(crate) mod tests {
         assert_eq!(false_names, vec!["CKA_PRIVATE"]);
         assert!(
             !true_names.contains(&"CKA_SIGN"),
-            "never present — not true"
+            "never present - not true"
         );
         assert!(
             !false_names.contains(&"CKA_SIGN"),
-            "never present — not false either"
+            "never present - not false either"
         );
     }
 
@@ -17760,6 +17777,160 @@ pub(crate) mod tests {
         assert_eq!(profile["lane"], "profile");
         let metrics = json(&reports_fixture(), &evidence(), &capture_fixture());
         assert_eq!(metrics["lane"], "metrics");
+    }
+
+    /// Human stdout/stderr text is plain ASCII: help, the concise and
+    /// verbose inventory/profile/trace views, coverage, and error
+    /// lines. Target-controlled data (paths, names) may legitimately
+    /// be non-ASCII; every fixture here is ASCII, so any non-ASCII
+    /// byte is p11scope's own vocabulary and fails.
+    #[test]
+    fn human_output_is_ascii_only() {
+        fn assert_ascii(label: &str, text: &str) {
+            if let Some((index, byte)) = text.bytes().enumerate().find(|(_, byte)| *byte > 127) {
+                panic!("non-ASCII byte {byte:#x} at offset {index} in {label}: {text:?}");
+            }
+        }
+        // Help: every topic plus the shared hint.
+        for topic in [
+            crate::cli::HelpTopic::Global,
+            crate::cli::HelpTopic::Profile,
+            crate::cli::HelpTopic::Trace,
+            crate::cli::HelpTopic::Run,
+            crate::cli::HelpTopic::Inspect,
+            crate::cli::HelpTopic::Doctor,
+            crate::cli::HelpTopic::Inventory,
+            crate::cli::HelpTopic::InventoryDiff,
+            crate::cli::HelpTopic::InventoryCbom,
+        ] {
+            assert_ascii("help", &topic.text());
+        }
+        assert_ascii("verbose hint", crate::cli::VERBOSE_HINT);
+        // Inventory concise + verbose, with gap lines that exercise
+        // the count marker, the tail truncation, and the coverage line.
+        let mut harness = crate::discovery::inventory_workload::Harness::new(
+            crate::discovery::caller_registry::RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        harness.stage_scale(&crate::discovery::inventory_workload::ScaleSpec {
+            name: "ascii-scan",
+            callers: 3,
+            modules: 2,
+            edges_per_caller: 2,
+            endpoints_per_module: 4,
+            first_pid: 70_000,
+        });
+        harness.commit();
+        harness.advance(10);
+        let mut presentation = crate::inventory_present::Presentation::capture(
+            harness.coordinator(),
+            "workload",
+            1,
+            2,
+            1,
+        );
+        for (pid, subject) in [
+            (
+                11u32,
+                "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so (deleted)",
+            ),
+            (12u32, "kernel threads"),
+        ] {
+            presentation.gaps.push(crate::inventory_present::GapView {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: subject.into(),
+                reason: "replaced on disk while running; not examined, calls not counted".into(),
+                budget: None,
+                repeats: 1,
+            });
+        }
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            assert_ascii(
+                "inventory snapshot",
+                &crate::inventory_present::render_snapshot_with_verbosity(&presentation, verbosity),
+            );
+        }
+        assert_ascii(
+            "truncation mark",
+            crate::inventory_dashboard::TRUNCATION_MARK,
+        );
+        // Profile summaries + live frames, concise through quiet,
+        // over PARTIAL evidence with module gaps.
+        let reports = reports_fixture();
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.discovery.conflicts = 1;
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/x.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            assert_ascii(
+                "scope summary",
+                &scope_summary_with_verbosity("system", &reports, &ev, verbosity),
+            );
+        }
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            assert_ascii(
+                "live frame",
+                &live_scoped_with_verbosity(
+                    &reports,
+                    &ev,
+                    Duration::ZERO,
+                    "/opt/p11.so (+1 more)",
+                    "profile",
+                    CapturePolicy::Allowlisted,
+                    "system",
+                    &BTreeMap::new(),
+                    verbosity,
+                ),
+            );
+        }
+        // Trace header, one event line, and the tail lines.
+        assert_ascii("trace header", crate::trace::identity_note());
+        let event = p11scope_ebpf_common::Event {
+            ts_ns: 1_000,
+            duration_ns: 3_000,
+            pid_tgid: (100u64 << 32) | 1,
+            rv: 0,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        assert_ascii(
+            "trace line",
+            &crate::trace::format_line(&event, 0, "C_GetInfo", Some(7)),
+        );
+        assert_ascii(
+            "trace lost",
+            &crate::trace::lost_line(3).unwrap_or_default(),
+        );
+        assert_ascii("trace truncated", &crate::trace::truncated_line(100, true));
+        assert_ascii(
+            "trace capture",
+            &crate::trace::capture_line(CapturePolicy::Allowlisted),
+        );
+        // Error lines.
+        assert_ascii(
+            "capacity error",
+            &crate::capacity::inventory_endpoint_budget(Some(999_999)).unwrap_err(),
+        );
+        assert_ascii(
+            "duration error",
+            &crate::cli::parse_duration("bogus").unwrap_err(),
+        );
     }
 }
 

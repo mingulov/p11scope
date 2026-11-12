@@ -4559,7 +4559,7 @@ mod tests {
             .expect("scene seals its prepared child");
         healthy
             .validate_and_bind(&expected, Some(domain), &delivered_a)
-            .expect("A-reservation→A-child binds");
+            .expect("A-reservation->A-child binds");
         assert_eq!(
             cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4593,7 +4593,7 @@ mod tests {
                 .validate_and_bind(&expected, Some(domain), &delivered_a2)
                 .unwrap_err(),
             NativeActivationRefusal::BindingMismatch,
-            "A-reservation→worker-B refuses before the CAS"
+            "A-reservation->worker-B refuses before the CAS"
         );
         assert_eq!(
             cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -5547,7 +5547,7 @@ mod tests {
         assert_eq!(inside.window, Some((20, 30)));
         let span10 = inside
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((span10[0].entered, span10[0].returned), (10, 10));
         assert_eq!((span10[3].entered, span10[3].returned), (10, 10));
         let aggregate10 =
@@ -5579,7 +5579,7 @@ mod tests {
         assert_eq!(after.window, Some((30, 40)));
         let span20 = after
             .deltas()
-            .expect("the 110→120 interval carries its deltas");
+            .expect("the 110->120 interval carries its deltas");
         assert_eq!((span20[0].entered, span20[0].returned), (10, 10));
         let aggregate20 =
             render_aggregate_bracket(span20, CounterMode::Counts, inside.seq, after.seq);
@@ -5804,7 +5804,7 @@ mod tests {
         assert_eq!(bracket.window, Some((20, 30)));
         let deltas = bracket
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         assert_eq!((deltas[3].entered, deltas[3].returned), (10, 10));
         let aggregate =
@@ -5913,7 +5913,7 @@ mod tests {
         assert_eq!(after.window, Some((20, 30)));
         let deltas = after
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
@@ -6003,7 +6003,7 @@ mod tests {
         assert_eq!(bracket.window, Some((20, 30)));
         let deltas = bracket
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         assert_eq!((deltas[3].entered, deltas[3].returned), (10, 10));
         let aggregate =
@@ -6117,7 +6117,7 @@ mod tests {
         assert_eq!(after.window, Some((20, 30)));
         let deltas = after
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
@@ -6262,7 +6262,7 @@ mod tests {
         assert_eq!(bracket.window, Some((20, 30)));
         let deltas = bracket
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
@@ -6354,7 +6354,7 @@ mod tests {
         assert_eq!(bracket.seq, 2);
         let deltas = bracket
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
@@ -6768,7 +6768,7 @@ mod tests {
         assert_eq!(bracket.window, Some((20, 30)));
         let deltas = bracket
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
@@ -6870,7 +6870,7 @@ mod tests {
         assert_eq!(after.seq, 2);
         let deltas = after
             .deltas()
-            .expect("the 100→110 interval carries its deltas");
+            .expect("the 100->110 interval carries its deltas");
         assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
         let aggregate =
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
@@ -6945,7 +6945,7 @@ mod tests {
         assert_eq!(seq, 2);
         let first = refused
             .bracket
-            .expect("the refused 100→110 interval publishes its receipt");
+            .expect("the refused 100->110 interval publishes its receipt");
         assert_eq!(first.seq, 2);
         assert_eq!(first.window, Some((20, 30)));
         let first_deltas = first
@@ -6976,7 +6976,7 @@ mod tests {
             &scene.pool.reserver(),
             &custody,
         )
-        .expect("the next 110→120 acquisition succeeds");
+        .expect("the next 110->120 acquisition succeeds");
         assert_eq!((seq, second.seq), (3, 3));
         assert_eq!(second.window, Some((30, 40)));
         let second_deltas = second

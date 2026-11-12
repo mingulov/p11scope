@@ -5,7 +5,7 @@
 
 The stopped canary proves the privacy tier post-exit from the observer
 log: trace lanes match the unconditional `CAPTURE privacy=` line, while
-profile/metrics lanes require the live frame's ` — privacy=` marker,
+profile/metrics lanes require the live frame's ` - privacy=` marker,
 which the observer prints only under `-v`/`--verbose`. The harness must
 therefore request verbose text on every non-trace observer launch and
 leave trace launches concise (trace terminal wording is itself

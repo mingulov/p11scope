@@ -86,15 +86,15 @@ sudo p11scope inventory --system --duration 15s
 
 ```
 inventory system (2 passes, 179 callers, 5 provider files, 29 edges)
-coverage: PARTIAL — 304 gaps, 0 refused, 0 more not shown
+coverage: partial - 304 gaps, 0 refused, 0 more not shown
 key operations: not reported (per-key tracking is off)
-libp11-kit.so.0.4.5: mapped by 1 application (snapd-desktop-integration); activity unknown
-libp11-kit.so.0.4.8: mapped by 24 applications (NetworkManager, chronyd, cups-browsed, …); activity unknown
-libp11-kit.so.0.4.8: mapped by 2 applications (cups-proxyd, cupsd); activity unknown
-opensc-pkcs11.so: mapped by 1 application (gsd-smartcard); activity unknown
-p11-kit-trust.so: mapped by 1 application (gsd-smartcard); activity unknown
+/snap/snapd-desktop-integration/391/gnome-platform/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.5: mapped by 1 application (snapd-desktop-integration); activity unknown
+/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 0:35 ino 38051]: mapped by 24 applications (NetworkManager, chronyd, cups-browsed, ...); activity unknown
+/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 7:6 ino 4518]: mapped by 2 applications (cups-proxyd, cupsd); activity unknown
+/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so: mapped by 1 application (gsd-smartcard); activity unknown
+/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so: mapped by 1 application (gsd-smartcard); activity unknown
 limits: 179 callers, 5 provider files, 29 edges (0 refused); 19607 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
-gaps: 26 × maps attribution — maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 × /home/user/.local/bin/muse-bin-1.4.14-R7309.1 — object is 414927192 bytes; limit is 268435456; 11 × maps attribution — maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 × /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0 (deleted) — replaced on disk while running; not examined, calls not counted; and 35 more (--json has every item)
+gaps: 26 x maps attribution - maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 x /home/user/.local/bin/muse-bin-1.4.14-R7309.1 - object is 414927192 bytes; limit is 268435456; 11 x maps attribution - maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 x /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0 (deleted) - replaced on disk while running; not examined, calls not counted; and 35 more (--json has every item)
 run with -v for details
 ```
 
@@ -104,11 +104,11 @@ sudo p11scope inventory --pid 920308 --duration 15s
 
 ```
 inventory pid:920308 (15 passes, 1 caller, 1 provider file, 1 edge)
-coverage: PARTIAL — 1 gap, 0 refused, 0 more not shown
+coverage: partial - 1 gap, 0 refused, 0 more not shown
 key operations: not reported (per-key tracking is off)
-libsofthsm2.so: mapped by 1 application (python3.14); 30 entries observed
+/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so: mapped by 1 application (python3.14); 30 entries observed
 limits: 1 caller, 1 provider file, 1 edge (0 refused); 68 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
-gaps: 1 × process identity checked from /proc (PID and start time), not by the kernel — some processes were identified from /proc only (--json has every item)
+gaps: 1 x process identity checked from /proc (PID and start time), not by the kernel - some processes were identified from /proc only (--json has every item)
 run with -v for details
 ```
 

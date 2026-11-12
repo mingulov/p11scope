@@ -734,8 +734,8 @@ fn validate_whole_admission(
 }
 
 // Literal public refusal shapes; no planner or provider-demand computation.
-const NSS_WIDE_REFUSAL: &str = "module needs 544 more; only 2112 attach slots are available; 1700 are in use (1700 active, 0 retired) — refusing to attach a prefix";
-const CLOSURE_WIDE_REFUSAL: &str = "module needs 532 more; only 2112 attach slots are available; 1207 are in use (1207 active, 0 retired); 528 are reserved for providers with a corroborated function table — refusing to attach a prefix of its 65 lookalike function tables";
+const NSS_WIDE_REFUSAL: &str = "module needs 544 more; only 2112 attach slots are available; 1700 are in use (1700 active, 0 retired) - refusing to attach a prefix";
+const CLOSURE_WIDE_REFUSAL: &str = "module needs 532 more; only 2112 attach slots are available; 1207 are in use (1207 active, 0 retired); 528 are reserved for providers with a corroborated function table - refusing to attach a prefix of its 65 lookalike function tables";
 
 #[test]
 fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
@@ -753,7 +753,7 @@ fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
             .unwrap();
         for invalid_reason in [
             "provider metadata unavailable",
-            "module needs 68 more; only 2112 attach slots are available — refusing to attach a prefix",
+            "module needs 68 more; only 2112 attach slots are available - refusing to attach a prefix",
         ] {
             let json = serde_json::json!({
                 "state": "refused", "class": class, "reason": invalid_reason,

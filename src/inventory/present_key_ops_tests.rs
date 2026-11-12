@@ -338,7 +338,7 @@ fn key_ops_line_unavailable_names_reason() {
         .expect("coverage line");
     assert_eq!(
         lines[coverage + 1],
-        "key operations: not available — per-key tracking never started, so no key can be named yet",
+        "key operations: not available - per-key tracking never started, so no key can be named yet",
         "the unavailable line sits directly after coverage:\n{snapshot}"
     );
     assert_eq!(
@@ -524,7 +524,7 @@ fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: libsofthsm2.so's function table cannot be verified \
+        "key operations: the function table of /usr/lib64/pkcs11/libsofthsm2.so cannot be verified \
          without --manifest; rerun with --manifest",
         "the SoftHSM line names the file and the rerun:\n{snapshot}"
     );
@@ -533,7 +533,7 @@ fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
 #[test]
 fn key_ops_line_subset_refused_names_basename_for_other_providers() {
     // Same refusal, an unfamiliar provider file: the line names the
-    // file's basename, never a guessed product.
+    // file's full path, never a guessed product.
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.modules[0].paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
@@ -543,9 +543,9 @@ fn key_ops_line_subset_refused_names_basename_for_other_providers() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: libfoo-pkcs11.so's function table cannot be verified \
+        "key operations: the function table of /opt/vendor/libfoo-pkcs11.so cannot be verified \
          without --manifest; rerun with --manifest",
-        "generic providers read by basename:\n{snapshot}"
+        "generic providers read by full path:\n{snapshot}"
     );
 }
 
@@ -605,7 +605,7 @@ fn key_ops_line_manifest_path_refusal_names_check_remedy() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: libfoo-pkcs11.so's function table cannot be verified \
+        "key operations: the function table of /opt/vendor/libfoo-pkcs11.so cannot be verified \
          from the supplied --manifest inputs; check the manifest",
         "manifest-path line checks, never reruns:\n{snapshot}"
     );
@@ -652,8 +652,8 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavailable — live capture refused (missing capabilities); run \
-             'p11scope…",
+            "  1 x native usage feed unavailable - live capture refused (missing capabilities); run \
+             'p11scope...",
         ],
         "the concise gaps block:\n{concise}"
     );
@@ -686,7 +686,7 @@ fn concise_gap_summary_folds_unproven_capture_refusal() {
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavailable — live capture refused (see 'p11scope doctor')",
+            "  1 x native usage feed unavailable - live capture refused (see 'p11scope doctor')",
         ],
         "the concise gaps block:\n{concise}"
     );
@@ -713,7 +713,7 @@ fn concise_gap_summary_folds_old_kernel_counts_gap() {
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavailable — call counts unavailable on this host (see \
+            "  1 x native usage feed unavailable - call counts unavailable on this host (see \
              'p11scope doctor')",
         ],
         "the concise gaps block:\n{concise}"
@@ -1385,7 +1385,7 @@ fn unavailable_key_operations_name_plain_reason_with_machine_code() {
         let concise =
             render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
         assert!(
-            concise.contains(&format!("key operations: not available — {plain}")),
+            concise.contains(&format!("key operations: not available - {plain}")),
             "{reason}: {concise}"
         );
         assert!(!concise.contains(reason), "{reason} leaked: {concise}");
@@ -1722,8 +1722,8 @@ fn key_operations_line_wraps_per_provider() {
         block,
         vec![
             "key operations: 4 keys on 2 providers; rev 3 populated; 2 sessions",
-            "  libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations",
-            "  libsofthsm2.so: sign 5 completed, 1 returned an error, 1 active operations",
+            "  /opt/vendor/libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations",
+            "  /usr/lib/x86_64-linux-gnu/softhsm/l...: sign 5 completed, 1 returned an error, 1 active operations",
         ],
         "header plus one line per provider:\n{concise}"
     );
@@ -1758,8 +1758,8 @@ fn key_ops_verbose_provider_lines_keep_instance_labels() {
         block,
         vec![
             "key operations: 4 keys on 2 providers; rev 3 populated; 2 sessions",
-            "  libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations (i1)",
-            "  libsofthsm2.so: sign 5 completed, 1 returned an error, 1 active operations (i0)",
+            "  /opt/vendor/libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations (i1)",
+            "  /usr/lib/x86_64-linux-gnu/soft...: sign 5 completed, 1 returned an error, 1 active operations (i0)",
         ],
         "verbose keeps instance labels in parentheses:\n{verbose}"
     );
@@ -1867,7 +1867,7 @@ fn key_ops_verbose_many_instances_stay_within_100_chars() {
         block[1]
     );
     assert!(
-        block[1].contains('…'),
+        block[1].contains("..."),
         "truncation is marked: {:?}",
         block[1]
     );
@@ -1916,7 +1916,7 @@ fn key_ops_verbose_many_instances_stay_within_100_chars() {
         block[1]
     );
     assert!(
-        block[1].contains('…'),
+        block[1].contains("..."),
         "truncation is marked: {:?}",
         block[1]
     );
@@ -1980,12 +1980,12 @@ fn key_ops_verbose_long_name_many_instances_stay_within_100_chars() {
         block[1].chars().take(160).collect::<String>()
     );
     assert!(
-        block[1].contains('…'),
+        block[1].contains("..."),
         "truncation is marked: {:?}",
         block[1].chars().take(160).collect::<String>()
     );
     assert!(
-        block[1].starts_with("  lib"),
+        block[1].starts_with("  /opt/vendor/lib"),
         "the provider name stays first: {:?}",
         block[1].chars().take(160).collect::<String>()
     );
@@ -2068,11 +2068,11 @@ fn key_ops_long_provider_name_truncates_line_to_100_chars() {
         block[1]
     );
     assert!(
-        block[1].contains('…'),
+        block[1].contains("..."),
         "truncation is marked: {:?}",
         block[1]
     );
-    assert!(block[1].starts_with("  lib"), "{:?}", block[1]);
+    assert!(block[1].starts_with("  /opt/vendor/lib"), "{:?}", block[1]);
 }
 
 /// A non-`none` publication reason reads on its own indented line so
@@ -2129,9 +2129,9 @@ fn gaps_line_lists_one_reason_per_line() {
         block,
         vec![
             "gaps: 3",
-            "  1 × key row — caller not confirmed",
-            "  1 × scope-a — reason-a",
-            "  1 × scope-b — reason-b",
+            "  1 x key row - caller not confirmed",
+            "  1 x scope-a - reason-a",
+            "  1 x scope-b - reason-b",
         ],
         "one indented line per reason:\n{concise}"
     );
@@ -2309,8 +2309,8 @@ fn gaps_block_folds_beyond_twenty_groups() {
         "header plus twenty groups plus the fold line: {many:?}"
     );
     assert_eq!(many[0], "gaps: 25", "the header count stays exact");
-    assert_eq!(many[1], "  1 × scope-00 — reason-x");
-    assert_eq!(many[20], "  1 × scope-19 — reason-x");
+    assert_eq!(many[1], "  1 x scope-00 - reason-x");
+    assert_eq!(many[20], "  1 x scope-19 - reason-x");
     assert_eq!(
         many[21], "  and 5 more groups (--json has every item)",
         "the fold line names the remainder: {many:?}"
@@ -2347,8 +2347,8 @@ fn gaps_block_fold_header_counts_rows_not_groups() {
         "header plus twenty groups plus the fold line: {block:?}"
     );
     assert_eq!(block[0], "gaps: 23", "the header counts rows, not groups");
-    assert_eq!(block[1], "  3 × scope-hot — reason-x");
-    assert_eq!(block[20], "  1 × scope-18 — reason-x");
+    assert_eq!(block[1], "  3 x scope-hot - reason-x");
+    assert_eq!(block[20], "  1 x scope-18 - reason-x");
     assert_eq!(
         block[21], "  and 1 more group (--json has every item)",
         "the fold line names the remainder: {block:?}"
@@ -2376,7 +2376,7 @@ fn gaps_long_subject_truncates_line_to_100_chars() {
     assert_eq!(block.len(), 2, "header plus one group line: {block:?}");
     assert_eq!(block[0], "gaps: 1");
     assert!(
-        block[1].ends_with(" — reason-x"),
+        block[1].ends_with(" - reason-x"),
         "the reason stays intact: {:?}",
         block[1]
     );
@@ -2386,7 +2386,7 @@ fn gaps_long_subject_truncates_line_to_100_chars() {
         block[1]
     );
     assert!(
-        block[1].contains('…'),
+        block[1].contains("..."),
         "truncation is marked: {:?}",
         block[1]
     );

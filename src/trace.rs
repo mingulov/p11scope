@@ -198,7 +198,7 @@ pub(crate) fn format_line_with_executable(
         line.push_str(&render_mechanism(ev));
     }
     line.push_str(&format!(
-        " \u{2192} {} {}",
+        " -> {} {}",
         rv_name(ev.rv),
         render::fmt_ns(Some(ev.duration_ns))
     ));
@@ -236,7 +236,7 @@ fn format_line_with_owned(
         line.push_str(&render_mechanism(ev));
     }
     line.push_str(&format!(
-        " \u{2192} {} {}",
+        " -> {} {}",
         rv_name(ev.rv),
         render::fmt_ns(Some(ev.duration_ns))
     ));
@@ -270,7 +270,7 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// Context for completed event lines without a producer-backed image label.
 /// This header is human text; terminal EVIDENCE and count records stay intact.
 pub fn identity_note() -> &'static str {
-    "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+    "Trace - completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
 }
 
 /// The event clock, stated once: trace stamps are UTC wall time
@@ -900,7 +900,7 @@ mod trace_identity_renderer_tests {
             assert_eq!(atoms.next().unwrap().unwrap(), escaped_path);
             assert_eq!(
                 &rest[atoms.byte_offset()..],
-                " sess#7 C_GetInfo → CKR_OK 3.0µs"
+                " sess#7 C_GetInfo -> CKR_OK 3.0us"
             );
         }
     }
@@ -909,7 +909,7 @@ mod trace_identity_renderer_tests {
     fn trace_identity_renderer_context_and_public_unknown_wrapper() {
         assert_eq!(
             identity_note(),
-            "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+            "Trace - completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
         );
         let ev = Event {
             pid_tgid: (123u64 << 32) | 456,
@@ -918,7 +918,7 @@ mod trace_identity_renderer_tests {
         };
         assert_eq!(
             format_line(&ev, 0, "C_GetInfo", None),
-            "00:00:00.000000 Unknown executable (PID 123, TID 456) C_GetInfo → CKR_OK 3.0µs"
+            "00:00:00.000000 Unknown executable (PID 123, TID 456) C_GetInfo -> CKR_OK 3.0us"
         );
     }
 
@@ -1091,7 +1091,7 @@ mod tests {
         assert_eq!(
             line,
             "12:00:01.123456 Unknown executable (PID 12345, TID 12401) sess#7 C_SignInit \
-             CKM_RSA_PKCS_PSS(hash=SHA256 mgf=MGF1_SHA256 salt=32) \u{2192} CKR_OK 18.0\u{b5}s"
+             CKM_RSA_PKCS_PSS(hash=SHA256 mgf=MGF1_SHA256 salt=32) -> CKR_OK 18.0us"
         );
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
 
         let line = format_line(&ev, 0, "C_EncryptInit", None);
         assert!(
-            line.contains(" C_EncryptInit 0xffffffffffffffff \u{2192} CKR_OK"),
+            line.contains(" C_EncryptInit 0xffffffffffffffff -> CKR_OK"),
             "line: {line}"
         );
     }
@@ -1665,7 +1665,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "00:00:00.000000 Unknown executable (PID 100, TID 1) C_OpenSession → CKR_OK 18.0µs"
+            "00:00:00.000000 Unknown executable (PID 100, TID 1) C_OpenSession -> CKR_OK 18.0us"
         );
         for forbidden in [
             "sess#",
@@ -1738,7 +1738,7 @@ mod tests {
         let mut unknown = dynamic;
         unknown.slot = 99;
         let unknown_line = tracer.on_event(&unknown, &mut state);
-        assert!(unknown_line.contains(" slot#99 →"), "{unknown_line}");
+        assert!(unknown_line.contains(" slot#99 ->"), "{unknown_line}");
         assert!(!unknown_line.contains("CKM_"), "{unknown_line}");
     }
 
@@ -1863,7 +1863,7 @@ mod tests {
             vec![
                 "19 completed calls; 0 returned errors; 0 entries without an observed return."
                     .to_string(),
-                "coverage: partial — calls may be missing (1 call record lost)".to_string(),
+                "coverage: partial - calls may be missing (1 call record lost)".to_string(),
                 crate::cli::VERBOSE_HINT.to_string(),
             ]
         );
@@ -1888,7 +1888,7 @@ mod tests {
         let plan = test_plan();
         assert_eq!(
             header(CapturePolicy::Allowlisted, &plan),
-            "CAPTURE privacy=allowlisted\nTrace — completed call events in arrival order\nExecutable \
+            "CAPTURE privacy=allowlisted\nTrace - completed call events in arrival order\nExecutable \
              labels use verified observed paths; event PID/TID remain diagnostic \
              identifiers.\nTrace times are UTC."
         );

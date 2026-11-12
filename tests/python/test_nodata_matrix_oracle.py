@@ -78,7 +78,7 @@ def trace_text(per_fn, caller='"harness"', raw_calls=None, extra="",
         for _ in range(count):
             lines.append(
                 "12:00:00.00000%d %s (PID 123, TID 123) exe=\"/work/harness\" "
-                "%s \u2192 CKR_OK 1.0\u00b5s" % (index, caller, name))
+                "%s -> CKR_OK 1.0us" % (index, caller, name))
             n += 1
     total = n if raw_calls is None else raw_calls
     lines.append("COUNT_EVIDENCE {\"stats_entered\":%d,"

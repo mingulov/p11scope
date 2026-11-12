@@ -20,8 +20,8 @@ ROW = re.compile(
     rf'\(PID (?P<pid>[1-9]\d*), TID (?P<tid>[1-9]\d*)\)'
     rf'(?: exe=(?P<path>{JSON_STRING}))?(?: sess#[1-9]\d*)? '
     r'(?P<fn>C_[A-Za-z0-9_]+)(?: \[semantics unverified\])? '
-    r'→ (?P<rv>CKR_[A-Z0-9_]+|0x[0-9a-fA-F]+) '
-    r'(?P<duration>[0-9]+(?:\.[0-9]+)?(?:ns|µs|ms|s))')
+    r'-> (?P<rv>CKR_[A-Z0-9_]+|0x[0-9a-fA-F]+) '
+    r'(?P<duration>[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s))')
 IMAGE_FIELDS = ('image', 'pid', 'start_time', 'path', 'dev', 'ino', 'mtime_ns',
                 'pid_namespace', 'time_namespace')
 TRACE_TOTALS = re.compile(
@@ -63,7 +63,7 @@ def parse_trace(text):
             except ValueError as error:
                 errors.append(f'invalid caller record: {error}')
         elif not line or line in (
-                'Trace — completed call events in arrival order',
+                'Trace - completed call events in arrival order',
                 'Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.',
                 'Trace times are UTC.',
                 'Calls on unverified functions are not decoded (names only).',

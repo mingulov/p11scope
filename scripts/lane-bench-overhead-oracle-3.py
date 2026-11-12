@@ -199,7 +199,7 @@ def self_test():
         lines = []
         if with_capture:
             lines.append("CAPTURE privacy=allowlisted")
-        lines.append("12:00:01.000000 pid 1 tid 1 C_GenerateRandom \u2192 CKR_OK 1.0\u00b5s")
+        lines.append("12:00:01.000000 pid 1 tid 1 C_GenerateRandom -> CKR_OK 1.0us")
         if truncated:
             lines.append("TRUNCATED at 1 events (--max-events 1)")
         if with_counts:
@@ -224,7 +224,7 @@ def self_test():
     cases.append(("trace missing evidence fails", "trace", trace_text(returned=1005, with_evidence=False), ["1005"], ERROR))
     cases.append(("trace truncated fails", "trace", trace_text(returned=1005, truncated=True), ["1005"], ERROR))
     cases.append(("trace zero probes fails", "trace", trace_text(returned=1005, probes=0), ["1005"], ERROR))
-    tail = ("coverage: partial — 1 entry without an observed return", "run with -v for details")
+    tail = ("coverage: partial - 1 entry without an observed return", "run with -v for details")
     cases.append(("trace human tail valid", "trace", trace_text(returned=1005, tail=("1005 completed calls; 0 returned errors; 0 entries without an observed return.", *tail)), ["1005"], VALID))
     cases.append(("trace singular tail valid", "trace", trace_text(returned=1, tail=("1 completed call; 0 returned errors; 1 entry without an observed return.", *tail)), ["1"], VALID))
     cases.append(("trace garbage tail fails", "trace", trace_text(returned=1005, tail=("smuggled line",)), ["1005"], ERROR))

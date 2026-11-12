@@ -109,16 +109,16 @@ def profile_exact(document, iters, module_suffix=PROVIDER, expect_observer=None)
     }
 
 
-CALL_LINE = re.compile(r"^\S+ pid (\d+) tid (\d+) (?:sess#\d+ )?(C_\w+)\b.* → (CKR_\w+)")
+CALL_LINE = re.compile(r"^\S+ pid (\d+) tid (\d+) (?:sess#\d+ )?(C_\w+)\b.* -> (CKR_\w+)")
 UNKNOWN_CALL_LINE = re.compile(
     r"^\d{2}:\d{2}:\d{2}\.\d{6} Unknown executable \(PID ([0-9]+), TID ([0-9]+)\) "
-    r"(?:sess#\d+ )?(C_\w+)\b.* → (CKR_\w+)")
+    r"(?:sess#\d+ )?(C_\w+)\b.* -> (CKR_\w+)")
 TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
 NAMED_CALL_LINE = re.compile(
     rf"^\d{{2}}:\d{{2}}:\d{{2}}\.\d{{6}} {TRACE_JSON_STRING} \(PID ([0-9]+), TID ([0-9]+)\) exe={TRACE_JSON_STRING} "
-    r"(?:sess#[0-9]+ )?(C_\w+)\b.* → (CKR_\w+)")
+    r"(?:sess#[0-9]+ )?(C_\w+)\b.* -> (CKR_\w+)")
 TRACE_CONTEXT_LINES = frozenset((
-    "Trace — completed call events in arrival order",
+    "Trace - completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
 ))
@@ -318,7 +318,7 @@ def good_profile(iters=400, path="/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.
 
 def good_trace(iters=2):
     lines = [
-        f"03:48:03.{i:06d} pid 77 tid 77 {name} [semantics unverified] → CKR_OK 3.0µs"
+        f"03:48:03.{i:06d} pid 77 tid 77 {name} [semantics unverified] -> CKR_OK 3.0us"
         for i in range(iters)
         for name in sorted(LEDGER_FUNCTIONS)
     ]
@@ -423,9 +423,9 @@ def self_test():
     text = good_trace()
     for label, bad in [
         ("dropped call line", text.replace(" C_Digest [", " C_Nothing [", 1)),
-        ("extra call line", "03:48:03.9 pid 77 tid 77 C_Digest [x] → CKR_OK 1µs\n" + text),
+        ("extra call line", "03:48:03.9 pid 77 tid 77 C_Digest [x] -> CKR_OK 1us\n" + text),
         ("second pid", text.replace("pid 77 tid 77 C_Digest", "pid 78 tid 78 C_Digest")),
-        ("error rv", text.replace("→ CKR_OK", "→ CKR_GENERAL_ERROR", 1)),
+        ("error rv", text.replace("-> CKR_OK", "-> CKR_GENERAL_ERROR", 1)),
         ("no evidence", "\n".join(l for l in text.splitlines() if not l.startswith("EVIDENCE"))),
         ("no count evidence", "\n".join(l for l in text.splitlines() if not l.startswith("COUNT_EVIDENCE"))),
         ("stats mismatch", text.replace('"stats_entered": 12', '"stats_entered": 13')),

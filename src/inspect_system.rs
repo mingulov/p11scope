@@ -2819,7 +2819,7 @@ fn assemble(
             if unreadable > 0 {
                 let _ = write!(
                     reason,
-                    "; {unreadable} selected processes were unreadable (permission denied) — the scan cap is not what limited this pass"
+                    "; {unreadable} selected processes were unreadable (permission denied) - the scan cap is not what limited this pass"
                 );
             }
         }
@@ -3143,13 +3143,13 @@ fn empty_explanation(collection: &Collection, matched: usize, skipped: &[PidGap]
     {
         parts.push(format!(
             "some processes could not be read (permission denied); their modules are unknown, \
-             not absent — {}",
+             not absent - {}",
             crate::process_access::FIX
         ));
     } else if denied {
         parts.push(
             "some processes could not be read (permission denied); their modules are unknown, \
-             not absent — rerun with `sudo p11scope inspect --system` for full coverage"
+             not absent - rerun with `sudo p11scope inspect --system` for full coverage"
                 .to_string(),
         );
     }
@@ -3455,7 +3455,7 @@ fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerb
     });
     let _ = writeln!(
         out,
-        "system — {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms{}; {})",
+        "system - {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms{}; {})",
         catalog.objects.len(),
         catalog.processes.len(),
         catalog.cap,
@@ -3566,7 +3566,7 @@ fn render_coverage(out: &mut String, catalog: &Catalog) {
     } else {
         let _ = writeln!(
             out,
-            "coverage: partial — {} (--json has every item)",
+            "coverage: partial - {} (--json has every item)",
             parts.join("; ")
         );
     }
@@ -3918,7 +3918,7 @@ fn render_process_summary(
             .join(", ");
         let _ = writeln!(
             out,
-            "  {} — {}; objects [{}]",
+            "  {} - {}; objects [{}]",
             application_label(&process.application, process.pid),
             process.status.label(),
             objects,
@@ -4046,7 +4046,7 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
                 Some(pid) => {
                     let _ = writeln!(
                         out,
-                        "{title}: pid {pid} {} — {}",
+                        "{title}: pid {pid} {} - {}",
                         crate::render::escape_controls(&gap.subject),
                         crate::render::escape_controls(&gap.reason)
                     );
@@ -4054,7 +4054,7 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
                 None => {
                     let _ = writeln!(
                         out,
-                        "{title}: {} — {}",
+                        "{title}: {} - {}",
                         crate::render::escape_controls(&gap.subject),
                         crate::render::escape_controls(&gap.reason)
                     );
@@ -4107,7 +4107,7 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
             let gap = group[0];
             let _ = writeln!(
                 out,
-                "{title}: pid {} {} — {}",
+                "{title}: pid {} {} - {}",
                 gap.pid.expect("member gap carries its pid"),
                 crate::render::escape_controls(&gap.subject),
                 crate::render::escape_controls(&gap.reason),
@@ -4128,7 +4128,7 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
     for gap in gaps.iter().filter(|gap| gap.pid.is_none()) {
         let _ = writeln!(
             out,
-            "{title}: {} — {}",
+            "{title}: {} - {}",
             crate::render::escape_controls(&gap.subject),
             crate::render::escape_controls(&gap.reason)
         );
@@ -8566,7 +8566,7 @@ mod tests {
             assert_eq!(process.status, MemberStatus::NotSelected { loss: None });
             let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
-                text.contains("(PID 20005) — not_selected"),
+                text.contains("(PID 20005) - not_selected"),
                 "unexamined unmatched pid must stay listed: {text}"
             );
         }
@@ -8604,7 +8604,7 @@ mod tests {
             );
             let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
-                text.contains("(PID 20006) — not_selected"),
+                text.contains("(PID 20006) - not_selected"),
                 "unavailable pid must stay listed: {text}"
             );
         }
@@ -9312,7 +9312,7 @@ mod tests {
             },
         )]);
         let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
-        assert!(text.contains("system — 1 provider file"), "{text}");
+        assert!(text.contains("system - 1 provider file"), "{text}");
         assert!(text.contains("/opt/provider.so"), "{text}");
         assert!(text.contains("sha256 aa"), "{text}");
         assert!(
@@ -9416,7 +9416,7 @@ mod tests {
     #[test]
     fn text_keeps_capacity_closure_refusal_verbatim() {
         let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
-             use — refusing to attach a prefix of its 67 lookalike function tables \
+             use - refusing to attach a prefix of its 67 lookalike function tables \
              (a proxy closure array is admitted whole, as a prefix when mapped before the \
              capture's first plan beside a provider or named by the operator, or as published \
              tables)";
@@ -9651,7 +9651,7 @@ mod tests {
     #[test]
     fn concise_capacity_refusal_is_plain_budget_line() {
         let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
-             use — refusing to attach a prefix of its 67 lookalike function tables \
+             use - refusing to attach a prefix of its 67 lookalike function tables \
              (a proxy closure array is admitted whole, as a prefix when mapped before the \
              capture's first plan beside a provider or named by the operator, or as published \
              tables)";
@@ -10024,7 +10024,7 @@ mod tests {
         let text = render_text(&catalog);
         assert!(
             text.contains(
-                "skipped: pid 7 /opt/a.so — identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)"
+                "skipped: pid 7 /opt/a.so - identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)"
             ),
             "{text}"
         );
@@ -10063,8 +10063,8 @@ mod tests {
             lines,
             [
                 "    table      3.2, 68 known functions (newer functions unknown)",
-                "    table      3.2, 104 functions (fully walked)  (×65 identical)",
-                "    table      3.2, 68 known functions (newer functions unknown)  (×2 identical)",
+                "    table      3.2, 104 functions (fully walked)  (x65 identical)",
+                "    table      3.2, 68 known functions (newer functions unknown)  (x2 identical)",
             ],
             "{text}"
         );
@@ -10138,24 +10138,24 @@ mod tests {
 
         let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
-            text.contains("Unknown executable (PID 100) — scanned"),
+            text.contains("Unknown executable (PID 100) - scanned"),
             "{text}"
         );
         for hidden in [200, 300, 400] {
             assert!(
-                !text.contains(&format!("(PID {hidden}) —")),
+                !text.contains(&format!("(PID {hidden}) -")),
                 "pid {hidden} maps nothing and has no reason: {text}"
             );
         }
-        assert!(text.contains("(PID 500) — unreadable"), "{text}");
+        assert!(text.contains("(PID 500) - unreadable"), "{text}");
         assert!(text.contains("permission denied"), "{text}");
-        assert!(text.contains("(PID 600) — not_selected"), "{text}");
+        assert!(text.contains("(PID 600) - not_selected"), "{text}");
         assert!(
-            text.contains("(PID 700) — scanned"),
+            text.contains("(PID 700) - scanned"),
             "a process with its own skipped record stays listed: {text}"
         );
         assert!(
-            text.contains("(PID 800) — scanned"),
+            text.contains("(PID 800) - scanned"),
             "a process with only a per-pid note stays listed: {text}"
         );
         assert!(text.contains("maps changed"), "{text}");

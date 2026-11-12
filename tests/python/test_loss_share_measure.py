@@ -32,7 +32,7 @@ def trace_fixture(*, lost_values=(), truncated=False, functions=(),
         if mechanism:
             label += " CKM_RSA_PKCS_PSS(hash=CKM_SHA256 mgf=CKG_MGF1_SHA256 salt=32)"
         lines.append(
-            f"03:15:44.123456 pid 111 tid 111 {label} \u2192 CKR_OK 1.23\u00b5s")
+            f"03:15:44.123456 pid 111 tid 111 {label} -> CKR_OK 1.23us")
     for value in lost_values:
         lines.append(f"LOST {value} events")
     if truncated:
@@ -52,7 +52,7 @@ class TraceIdentityConsumerTests(unittest.TestCase):
     def test_singular_human_tail_after_evidence_is_accepted(self):
         text = trace_fixture(functions=["C_Sign"])
         text += ("1 completed call; 0 returned errors; 1 entry without an observed return.\n"
-                 "coverage: partial — 1 entry without an observed return\n"
+                 "coverage: partial - 1 entry without an observed return\n"
                  "run with -v for details\n")
         result = MEASURE["parse_trace_stream"](text.splitlines())
         self.assertEqual(result["per_function"], {"C_Sign": 1})
@@ -67,7 +67,7 @@ class TraceIdentityConsumerTests(unittest.TestCase):
         text = trace_fixture(functions=["C_Sign", "C_Sign"])
         text = text.replace("pid 111 tid 111", "Unknown executable (PID 111, TID 111)", 1)
         text = text.replace("CAPTURE privacy=allowlisted\n", "CAPTURE privacy=allowlisted\n"
-            "Trace — completed call events in arrival order\n"
+            "Trace - completed call events in arrival order\n"
             "Executable identity unavailable; event PID/TID remain diagnostic identifiers.\n")
         result = MEASURE["parse_trace_stream"](text.splitlines())
         self.assertEqual(result["call_lines_total"], 2)
@@ -87,9 +87,9 @@ class TraceIdentityConsumerTests(unittest.TestCase):
 
     def test_canary_scanner_strips_only_diagnostic_prefix(self):
         checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
-        line = "00:00:00.000000 Unknown executable (PID 111, TID 112) C_Sign → CKR_OK 12.0µs"
+        line = "00:00:00.000000 Unknown executable (PID 111, TID 112) C_Sign -> CKR_OK 12.0us"
         rest = checker["trace_scannable"]("fixture", line)
-        self.assertEqual(rest, "C_Sign → CKR_OK 12.0µs")
+        self.assertEqual(rest, "C_Sign -> CKR_OK 12.0us")
         for prefix in ["python3 (PID 111, TID 112)",
             "Unknown executable (PID 111 TID 112)",
             "Unknown executable (PID 111, TID 112) pid 111 tid 112",
@@ -116,7 +116,7 @@ class TraceIdentityConsumerTests(unittest.TestCase):
         for prefix in ["python3 (PID 77, TID 77)", "Unknown executable (PID 77 TID 77)",
             "Unknown executable (PID 77, TID 77) pid 77 tid 77",
             "pid 77 tid 77 Unknown executable (PID 77, TID 77)"]:
-            line = f"03:48:03.000000 {prefix} C_Digest → CKR_OK 1.0µs\n"
+            line = f"03:48:03.000000 {prefix} C_Digest -> CKR_OK 1.0us\n"
             with self.subTest(prefix=prefix), self.assertRaises(AssertionError):
                 oracle["trace_exact"](new + line, 2)
 
@@ -141,7 +141,7 @@ class TraceIdentityConsumerTests(unittest.TestCase):
                 self.assertEqual(MEASURE["parse_trace_stream"](text.splitlines())["per_function"], {function: 1})
                 self.assertTrue(checker["trace_scannable"]("fixture", text.splitlines()[1]).startswith("sess#7 " + function))
             sentinel = next(iter(checker["LOADER_PAUSE_IDENTITIES"].values()))
-            line = f"03:15:44.123456 {first} sess#7 C_Sign {sentinel} → CKR_OK 1.0µs"
+            line = f"03:15:44.123456 {first} sess#7 C_Sign {sentinel} -> CKR_OK 1.0us"
             with self.assertRaises(AssertionError):
                 checker["assert_no_loader_pause_identity"]("fixture", checker["trace_scannable"]("fixture", line))
 
@@ -154,7 +154,7 @@ class TraceIdentityConsumerTests(unittest.TestCase):
         def extract(prefix, *, nested=7, copies=6):
             with tempfile.TemporaryDirectory() as raw:
                 tmp = Path(raw)
-                event = f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs\n"
+                event = f"00:00:00.000000 {prefix} C_Sign -> CKR_OK 12.0us\n"
                 evidence = {"pid_namespace": {"observer": "nested", "kernel_pids": "initial"},
                             "gap_classes": {"observation": {"status": "lossy"}}}
                 (tmp / "nested-trace.txt").write_text(event * copies + "EVIDENCE " + json.dumps(evidence) + "\n")
@@ -199,7 +199,7 @@ class NamedTraceIdentityConsumerTests(unittest.TestCase):
         block = source.split('  d=$(python3 - "$OUT" "$ITERS" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
-            line = f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs\n"
+            line = f"00:00:00.000000 {prefix} C_Sign -> CKR_OK 12.0us\n"
             evidence = {"pid_namespace": {"observer": "nested", "kernel_pids": "initial"}}
             (tmp / "nested-trace.txt").write_text(line * 6 + "EVIDENCE " + json.dumps(evidence) + "\n")
             (tmp / "nested-trace.wl").write_text("READY pid=7\n")
@@ -218,7 +218,7 @@ class NamedTraceIdentityConsumerTests(unittest.TestCase):
         for prefix in prefixes:
             text = text.replace("pid 111 tid 111", prefix + " sess#7", 1)
         text = text.replace("CAPTURE privacy=allowlisted\n", "CAPTURE privacy=allowlisted\n"
-            "Trace — completed call events in arrival order\n"
+            "Trace - completed call events in arrival order\n"
             "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.\n")
         result = MEASURE["parse_trace_stream"](text.splitlines())
         self.assertEqual(result["call_lines_total"], len(prefixes))
@@ -229,12 +229,12 @@ class NamedTraceIdentityConsumerTests(unittest.TestCase):
         checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
         # Whitespace/quotes/fake prefix words inside JSON strings are data.
         prefix = self.prefix('name "pid 999"', '/owned/(PID 1, TID 2) sess#9 (deleted)')
-        line = f"00:00:00.000000 {prefix} sess#7 C_Sign → CKR_OK 12.0µs"
+        line = f"00:00:00.000000 {prefix} sess#7 C_Sign -> CKR_OK 12.0us"
         rest = checker["trace_scannable"]("fixture", line)
         self.assertIn('name "pid 999"', rest)
         self.assertIn('/owned/(PID 1, TID 2) sess#9 (deleted)', rest)
         self.assertIn(json.dumps('name "pid 999"'), rest)
-        self.assertIn("sess#7 C_Sign → CKR_OK 12.0µs", rest)
+        self.assertIn("sess#7 C_Sign -> CKR_OK 12.0us", rest)
         self.assertNotIn("PID 111", rest)
         sentinel = next(iter(checker["LOADER_PAUSE_IDENTITIES"].values()))
         encoded = '"' + ''.join(f"\\u{ord(c):04x}" for c in str(sentinel)) + '"'
@@ -242,7 +242,7 @@ class NamedTraceIdentityConsumerTests(unittest.TestCase):
             bad_prefix = (f'{encoded} (PID 111, TID 112) exe="/owned/clean"' if position == "basename"
                           else f'"clean" (PID 111, TID 112) exe={encoded}' if position == "path"
                           else self.prefix())
-            bad = f"00:00:00.000000 {bad_prefix} C_Sign → CKR_OK 12.0µs"
+            bad = f"00:00:00.000000 {bad_prefix} C_Sign -> CKR_OK 12.0us"
             if position == "suffix":
                 bad += " " + str(sentinel)
             with self.subTest(position=position), self.assertRaises(AssertionError):
@@ -301,7 +301,7 @@ class NamedTraceIdentityConsumerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "trace.output"
             def write(prefix, suffix=""):
-                path.write_text(f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs{suffix}\n")
+                path.write_text(f"00:00:00.000000 {prefix} C_Sign -> CKR_OK 12.0us{suffix}\n")
             write(self.prefix())
             checker["assert_final_artifact_privacy"]([path])
             for family in ["KEY", "PIN"]:

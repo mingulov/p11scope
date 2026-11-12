@@ -3460,7 +3460,7 @@ grep_calls=0
 grep() {
     grep_calls=$((grep_calls + 1))
     if [ "$grep_calls" -eq 1 ]; then
-        printf '%s\n' 'capture — privacy=aggregate-only' > "$log"
+        printf '%s\n' 'capture - privacy=aggregate-only' > "$log"
         return 1
     fi
     command grep "$@"
@@ -3482,7 +3482,7 @@ wait_for_capture_ready "$log" aggregate-only metrics
 
 #[test]
 fn capture_readiness_accepts_the_attach_complete_line() {
-    // Since cb59e2e the profile/metrics live frame (and its ` — privacy=`
+    // Since cb59e2e the profile/metrics live frame (and its ` - privacy=`
     // marker) is drawn only on a terminal, so an observer logging to a file
     // announces readiness with `capture_ready_line` alone. Lanes without a
     // pty (build-release.sh, verify-attach-e2e.sh) must synchronize on it.
@@ -9690,7 +9690,7 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
     }
     assert!(
         p11scope::cli::USAGE
-            .contains("discovery scans the target's mapped memory — no manifest and no helper")
+            .contains("discovery scans the target's mapped memory - no manifest and no helper")
     );
 
     let bin = env!("CARGO_BIN_EXE_p11scope");
@@ -11831,7 +11831,7 @@ fn hosted_pipeline_retains_the_job_log() {
     assert_eq!(
         permission_lines(block_under(&ci, "permissions:")),
         ["  contents: read"],
-        "the workflow default must stay exactly contents: read — the check and coverage \
+        "the workflow default must stay exactly contents: read - the check and coverage \
          jobs have no job-level block, so they inherit this while building third-party crates"
     );
     for job in CARGO_JOBS {

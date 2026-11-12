@@ -5835,7 +5835,7 @@ def self_test():
     prefix_reason = proxy_prefix_reason(PROXY_PREFIX_TABLES)
     growth_reason = (
         "admitted module needs 5406 more; only 2112 attach slots are available; 1498 are in use "
-        "(1498 active, 0 retired) — 5406 endpoints not attached; kept its 1430 attached endpoints"
+        "(1498 active, 0 retired) - 5406 endpoints not attached; kept its 1430 attached endpoints"
     )
     proxy_path = PROXY_MODULE_FIXTURE["path"]
     grown = copy.deepcopy(proven_proxy)

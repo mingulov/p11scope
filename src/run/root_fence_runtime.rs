@@ -582,9 +582,9 @@ fn scenario(
         ensure!(
             lines.len() == 2
                 && lines[0].contains(" C_OpenSession ")
-                && lines[0].contains("→ CKR_OK ")
+                && lines[0].contains("-> CKR_OK ")
                 && lines[1].contains(" C_FindObjectsInit ")
-                && lines[1].contains("→ CKR_PENDING ")
+                && lines[1].contains("-> CKR_PENDING ")
                 && !text.contains("semantics unverified"),
             "unexpected production trace: {text}"
         );

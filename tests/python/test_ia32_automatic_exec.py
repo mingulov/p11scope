@@ -413,7 +413,7 @@ int main(int argc, char **argv) {
         path = image["path"] if path is None else path
         return (f'21:37:58.638119 {json.dumps(Path(path).name)} '
                 f'(PID {image["pid"]}, TID {image["pid"]}) exe={json.dumps(path)} '
-                'C_GetInfo [semantics unverified] → CKR_OK 10µs\n')
+                'C_GetInfo [semantics unverified] -> CKR_OK 10us\n')
 
     def test_trace_exec_waits_for_old_shared_return_after_held_ack(self):
         self.trace_exec_boundary()
@@ -455,7 +455,7 @@ int main(int argc, char **argv) {
                                    if r["kind"] == "call" and r["fn"] == "C_OpenSession")
                         self.assertEqual((row["image"], row["phase"], row["rv"]), (0, "setup", 0))
                         text = (f'21:37:58.638119 Unknown executable (PID {row["pid"]}, TID {row["tid"]}) '
-                                'C_OpenSession [semantics unverified] → CKR_OK 10µs\n')
+                                'C_OpenSession [semantics unverified] -> CKR_OK 10us\n')
                         if change == "duplicate": text += text
                         elif change == "pid": text = text.replace(f'PID {row["pid"]}', f'PID {row["pid"] + 1}')
                         elif change == "tid": text = text.replace(f'TID {row["tid"]}', f'TID {row["tid"] + 1}')
@@ -537,10 +537,10 @@ int main(int argc, char **argv) {
                                 for scope in case.scopes))
 
     def live_frame(self, calls, complete=True):
-        text = ("\x1b[2J\x1b[Hp11scope — profile\n"
+        text = ("\x1b[2J\x1b[Hp11scope - profile\n"
                 f"{calls} completed calls; 0 returned errors; 0 entries without an observed return.\n"
                 "FUNCTION CALLS ERR p50 p95 p99 IN-FLIGHT\n"
-                f"C_GetInfo {calls} 0 1µs 1µs 1µs 0\n"
+                f"C_GetInfo {calls} 0 1us 1us 1us 0\n"
                 "(~ = log2-bucket approximation, lower bound)\n")
         return text + ("Evidence: controlled public transport\n" if complete else "")
 
@@ -560,7 +560,7 @@ int main(int argc, char **argv) {
                     path = "/wrong-current-image" if sequence == 1 else driver.images[1]["path"]
                     data = self.trace_marker(driver.images[1], path).encode()
                     # Exercise the real incremental UTF-8 pipe decoder.
-                    cut = data.index("→".encode()) + 1
+                    cut = data.index("->".encode()) + 1
                     os.write(write_fd, data[:cut]); os.write(write_fd, data[cut:])
                     return phase
                 proof = gate["H6"]["warm_successor"](capture, driver.images[1], attempt,
@@ -752,8 +752,8 @@ int main(int argc, char **argv) {
         paths = {r["image"]: r["path"] for r in snapshot["images"]}
         rows = [f'21:37:58.638119 {json.dumps(Path(paths[r["image"]]).name)} '
                 f'(PID {r["pid"]}, TID {r["tid"]}) exe={json.dumps(paths[r["image"]])} '
-                f'{r["fn"]} [semantics unverified] → '
-                f'{"CKR_OK" if r["rv"] == 0 else "CKR_GENERAL_ERROR"} 10µs' for r in calls]
+                f'{r["fn"]} [semantics unverified] -> '
+                f'{"CKR_OK" if r["rv"] == 0 else "CKR_GENERAL_ERROR"} 10us' for r in calls]
         abandoned = int(mode == "leader")
         ev = {"privacy_mode": "aggregate-only" if kind == "metrics" else "allowlisted",
               "trace_truncated": False, "final_drain": True, "completeness": "PARTIAL",
@@ -763,7 +763,7 @@ int main(int argc, char **argv) {
               "in_flight_at_end": abandoned, "task_uprobe_link_losses": 0,
               "attach_backend": {"selection": backend, "fallback": None,
                                  "scope_filter": "perf-task+bpf" if backend == "singles" else "kernel-pid+bpf"}}
-        text = "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers.\nCAPTURE privacy=allowlisted\n"
+        text = "Trace - completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers.\nCAPTURE privacy=allowlisted\n"
         text += "\n".join(rows) + "\nCOUNT_EVIDENCE " + json.dumps({
             "stats_entered": 32 if mode == "leader" else 30,
             "stats_returned": 31 if mode == "leader" else 30,
@@ -793,12 +793,12 @@ int main(int argc, char **argv) {
         doc = None
         if kind != "trace":
             def live(functions):
-                return ("\x1b[2J\x1b[Hp11scope — profile\n"
+                return ("\x1b[2J\x1b[Hp11scope - profile\n"
                         f'{sum(c for _, c, _, _ in functions)} completed calls; '
                         f'{sum(e for _, _, e, _ in functions)} returned errors; '
                         f'{sum(f for _, _, _, f in functions)} entries without an observed return.\n'
                         "FUNCTION CALLS ERR p50 p95 p99 IN-FLIGHT\n"
-                        + "".join(f"{fn} {c} {e} 1µs 1µs 1µs {f}\n" for fn, c, e, f in functions)
+                        + "".join(f"{fn} {c} {e} 1us 1us 1us {f}\n" for fn, c, e, f in functions)
                         + "(~ = log2-bucket approximation, lower bound)\nEvidence: owned controlled output\n")
             text = live([("C_Initialize", 11, 5, 1), ("C_OpenSession", 2, 0, 0)])
             text += live([("C_Initialize", 11, 5, 1), ("C_OpenSession", 2, 0, 0), ("C_GetInfo", 1, 0, 0)])
@@ -837,7 +837,7 @@ int main(int argc, char **argv) {
                 elif change == "wrong": lines[16] = lines[16].replace(receipt["images"][1]["path"], "/wrong")
                 elif change == "unknown":
                     row = ledger[0]["pid"]
-                    lines[16] = f"21:37:58.638119 Unknown executable (PID {row}, TID {row}) C_GetInfo [semantics unverified] → CKR_OK 10µs"
+                    lines[16] = f"21:37:58.638119 Unknown executable (PID {row}, TID {row}) C_GetInfo [semantics unverified] -> CKR_OK 10us"
                 elif change == "missing": del lines[17]
                 elif change == "duplicate": lines.insert(18, lines[17])
                 elif change == "rv": lines[17] = lines[17].replace("CKR_OK", "CKR_GENERAL_ERROR")
@@ -882,7 +882,7 @@ int main(int argc, char **argv) {
         lines = text.splitlines()
         pid = receipt["pid"]
         lines[3] = (f"21:37:58.638119 Unknown executable (PID {pid}, TID {pid}) "
-                    "C_OpenSession [semantics unverified] → CKR_OK 10µs")
+                    "C_OpenSession [semantics unverified] -> CKR_OK 10us")
         # Only the shared row is drained. Six old unique-key returns arrive after
         # the cursor; the first five are absent. Never assign a missing kth call.
         del lines[4:9]

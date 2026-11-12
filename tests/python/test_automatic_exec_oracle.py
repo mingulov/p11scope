@@ -47,15 +47,15 @@ PIN = {"path": "/w/lib.so", "dev": [8, 1], "ino": 111,
        "sha256": "0" * 64}
 
 
-def named_row(pid, tid, path, fn, rv="CKR_OK", dur="10µs", wall="21:37:58.638119"):
+def named_row(pid, tid, path, fn, rv="CKR_OK", dur="10us", wall="21:37:58.638119"):
     label = json.dumps(Path(path).name)
     return (f'{wall} {label} (PID {pid}, TID {tid}) exe={json.dumps(path)} '
-            f'{fn} [semantics unverified] → {rv} {dur}')
+            f'{fn} [semantics unverified] -> {rv} {dur}')
 
 
-def unknown_row(pid, tid, fn, rv="CKR_OK", dur="10µs", wall="21:37:58.638119"):
+def unknown_row(pid, tid, fn, rv="CKR_OK", dur="10us", wall="21:37:58.638119"):
     return (f"{wall} Unknown executable (PID {pid}, TID {tid}) "
-            f"{fn} [semantics unverified] → {rv} {dur}")
+            f"{fn} [semantics unverified] -> {rv} {dur}")
 
 
 def evidence(backend="singles", in_flight=0, losses=0, **over):
@@ -72,7 +72,7 @@ def evidence(backend="singles", in_flight=0, losses=0, **over):
 
 
 def trace_text(rows, entered, returned, ev):
-    lines = ["Trace — completed call events in arrival order",
+    lines = ["Trace - completed call events in arrival order",
              "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
              "CAPTURE privacy=allowlisted"]
     lines.extend(rows)
@@ -271,14 +271,14 @@ def b_style_inputs(raw=False):
     return (text, ledger, receipt) if raw else add_trace_successor_control(text, ledger, receipt)
 
 
-def live_frame(functions, evidence_line="Evidence: 4/4 probes attached → PARTIAL: attribution withheld (count-only slots)"):
+def live_frame(functions, evidence_line="Evidence: 4/4 probes attached -> PARTIAL: attribution withheld (count-only slots)"):
     completed = sum(row[1] for row in functions)
     errors = sum(row[2] for row in functions)
     opened = sum(row[3] for row in functions)
-    return ("\x1b[2J\x1b[Hp11scope — pid scope — up 00:00:01 — mode profile — privacy=allowlisted — provider\n"
+    return ("\x1b[2J\x1b[Hp11scope - pid scope - up 00:00:01 - mode profile - privacy=allowlisted - provider\n"
             + profile_stdout(completed, errors, opened).split("\n", 1)[1]
             + "FUNCTION CALLS ERR p50~ p95~ p99~ IN-FLIGHT\n"
-            + "".join(f"{fn} {calls} {err} 1µs 1µs 1µs {flight}\n"
+            + "".join(f"{fn} {calls} {err} 1us 1us 1us {flight}\n"
                       for fn, calls, err, flight in functions)
             + "(~ = log2-bucket approximation, lower bound)\n" + evidence_line + "\n")
 
@@ -1699,21 +1699,21 @@ class LiveFrameTest(unittest.TestCase):
         # Second complete frame from installed836b Multi/profile: SlotReports
         # retain two C_GetInfo rows with different latency buckets.
         captured = "\x1b[2J\x1b[H" + textwrap.dedent("""\
-            p11scope — PID scope — up 00:00:01 — mode profile — privacy=allowlisted — /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+            p11scope - PID scope - up 00:00:01 - mode profile - privacy=allowlisted - /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
             Scope: PID scope
             8 completed calls; 0 returned errors; 0 entries without an observed return.
             Coverage PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
             CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.
-            Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.
+            Latency units: ns/us/ms/s (microseconds shown as us); ~ = log2-bucket approximation, lower bound.
             FUNCTION                        CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-            C_GenerateRandom                    3      0    32.8µs    65.5µs    65.5µs         0
-            C_GetFunctionList                   1      0    16.4µs    16.4µs    16.4µs         0
-            C_GetInfo                           1      0     8.2µs     8.2µs     8.2µs         0
-            C_GetInfo                           1      0    16.4µs    16.4µs    16.4µs         0
-            C_GetSlotList                       1      0     8.2µs     8.2µs     8.2µs         0
-            C_OpenSession                       1      0     4.1µs     4.1µs     4.1µs         0
+            C_GenerateRandom                    3      0    32.8us    65.5us    65.5us         0
+            C_GetFunctionList                   1      0    16.4us    16.4us    16.4us         0
+            C_GetInfo                           1      0     8.2us     8.2us     8.2us         0
+            C_GetInfo                           1      0    16.4us    16.4us    16.4us         0
+            C_GetSlotList                       1      0     8.2us     8.2us     8.2us         0
+            C_OpenSession                       1      0     4.1us     4.1us     4.1us         0
             (~ = log2-bucket approximation, lower bound)
-            Evidence: 272/272 probes attached · 136 slots (68 active) · 0 aliased · 3 skipped · 0 in-flight → PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
+            Evidence: 272/272 probes attached, 136 slots (68 active), 0 aliased, 3 skipped, 0 in-flight -> PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
             """)
         frames = self.parse(live_frame([("C_GenerateRandom", 1, 0, 0)]) + captured)
         self.assertEqual(len(frames), 2)

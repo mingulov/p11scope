@@ -371,7 +371,7 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
         );
         // The header carries the validated kind; the body keeps no Scope: line.
         assert!(
-            header.starts_with(&format!("p11scope — {label} scope — ")),
+            header.starts_with(&format!("p11scope - {label} scope - ")),
             "{text}"
         );
         assert!(!text.contains("Scope: "), "{text}");
@@ -396,7 +396,7 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
     assert!(trace::identity_note().contains("PID/TID remain diagnostic identifiers"));
     assert_eq!(
         trace::identity_note(),
-        "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+        "Trace - completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
     );
 }
 
@@ -461,7 +461,7 @@ fn singular_trace_tail_is_accepted_by_canary_privacy_consumer() {
     let text = format!(
         "{}\n{}\n{}\n{}\n{line}\nCOUNT_EVIDENCE {{\"stats_entered\": 1}}\nEVIDENCE \
          {{\"privacy_mode\": \"allowlisted\"}}\n1 completed call; 0 returned errors; 1 entry \
-         without an observed return.\ncoverage: partial — nothing known was \
+         without an observed return.\ncoverage: partial - nothing known was \
          lost\nrun with -v for details\n",
         trace::capture_line(CapturePolicy::Allowlisted),
         trace::identity_note(),

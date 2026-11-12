@@ -165,7 +165,7 @@ impl DiscoveryNoiseAggregator {
             let scrubbed_subject = scrub_discovery_noise_text(subject);
             let scrubbed_reason = scrub_discovery_noise_text(reason);
             let sample = format!(
-                "discovery skipped {} — {}",
+                "discovery skipped {} - {}",
                 crate::render::escape_controls(&scrubbed_subject),
                 crate::render::escape_controls(&scrubbed_reason)
             );
@@ -238,7 +238,7 @@ impl DiscoveryNoiseAggregator {
                     )
                 } else {
                     format!(
-                        "p11scope: discovery: {} ×{}: {} … ×{}",
+                        "p11scope: discovery: {} x{}: {} ... x{}",
                         class.label(),
                         entry.count,
                         entry.first_sample,
@@ -444,15 +444,15 @@ mod tests {
         assert_eq!(lines.len(), 3, "one summary line per class: {lines:#?}");
         let joined = lines.join("\n");
         assert!(
-            joined.contains("… \u{00d7}231"),
+            joined.contains("... x231"),
             "ESRCH summary carries its exact count: {joined:?}"
         );
         assert!(
-            joined.contains("… \u{00d7}122"),
+            joined.contains("... x122"),
             "maps summary carries its exact count: {joined:?}"
         );
         assert!(
-            joined.contains("… \u{00d7}20"),
+            joined.contains("... x20"),
             "ENOENT summary carries its exact count: {joined:?}"
         );
         assert!(
@@ -521,7 +521,7 @@ mod tests {
             lines[0]
         );
         assert!(
-            !lines[0].contains("… \u{00d7}"),
+            !lines[0].contains("... x"),
             "a single occurrence needs no repetition suffix: {:?}",
             lines[0]
         );

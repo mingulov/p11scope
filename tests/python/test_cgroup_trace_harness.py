@@ -223,7 +223,7 @@ class ReadinessTests(unittest.TestCase):
 
     def event(self, pid=2399485, tid=2399485, rv='CKR_OK'):
         return (f'11:53:22.120433 Unknown executable (PID {pid}, TID {tid}) '
-                f'C_OpenSession [semantics unverified] → {rv} 6.3µs\n')
+                f'C_OpenSession [semantics unverified] -> {rv} 6.3us\n')
 
     def test_observed_zero_start_then_authentic_dynamic_setup_is_ready(self):
         errors = self.reader([

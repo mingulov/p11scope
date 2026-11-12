@@ -25,7 +25,7 @@ import json
 import re
 import sys
 
-EVENT_FN_RE = re.compile(r" (C_[A-Za-z0-9]+) \u2192 ")
+EVENT_FN_RE = re.compile(r" (C_[A-Za-z0-9]+) -> ")
 TRUNCATED_RE = re.compile(r"^TRUNCATED at \d+ events")
 
 

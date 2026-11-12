@@ -16981,7 +16981,7 @@ pub(crate) mod tests {
         let partial = AttachVerdict::Admitted {
             endpoints: 2,
             reasons: vec![
-                "admitted module needs 3 more; the set is full — 3 endpoints not added; kept its 2 retained endpoints"
+                "admitted module needs 3 more; the set is full - 3 endpoints not added; kept its 2 retained endpoints"
                     .into(),
             ],
         };
@@ -32325,7 +32325,7 @@ int main(void) {
         );
         let device = p11scope_manifest::maps::Device::from_kdev(dev);
         let detail = format!(
-            "{} host pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via scan record; ambiguous: same identity as 1 other file: {})",
+            "{} host pid 9 (first call 1.8us ago; dev {}:{} ino {ino}; via scan record; ambiguous: same identity as 1 other file: {})",
             first.display(),
             device.major,
             device.minor,
@@ -32517,7 +32517,7 @@ int main(void) {
         );
         let device = p11scope_manifest::maps::Device::from_kdev(dev);
         let resolved = format!(
-            "{} host pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via system index)",
+            "{} host pid 9 (first call 1.8us ago; dev {}:{} ino {ino}; via system index)",
             path.display(),
             device.major,
             device.minor,
@@ -32527,7 +32527,7 @@ int main(void) {
             "verbose names the resolved executable:\n{text}"
         );
         assert!(
-            text.contains("executable unknown (exec record lost) host pid 10 (first call 1.8µs ago; dev 0:0 ino 0; lifecycle evidence lost)"),
+            text.contains("executable unknown (exec record lost) host pid 10 (first call 1.8us ago; dev 0:0 ino 0; lifecycle evidence lost)"),
             "verbose names the lost executable with its reason:\n{text}"
         );
     }
@@ -32887,7 +32887,7 @@ int main(void) {
         );
         assert!(
             text.contains(
-                "host pids: 9 (first call 1.8µs ago), 11 (first call 800ns ago) (not running now or never scanned)"
+                "host pids: 9 (first call 1.8us ago), 11 (first call 800ns ago) (not running now or never scanned)"
             ),
             "verbose lists every pid with its first call:\n{text}"
         );

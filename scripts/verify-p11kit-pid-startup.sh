@@ -516,7 +516,7 @@ def main(binary, work, keep):
                 require(False, "observer exited %d before readiness:\n%s"
                                % (observer.returncode, tail(profile_log)))
             text = profile_log.read_text()
-            return "p11scope: capturing: " in text or " — privacy=" in text
+            return "p11scope: capturing: " in text or " - privacy=" in text
 
         wait_for(ready, 120, "observer never became ready", logs)
         (sig / "go").touch()

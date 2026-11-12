@@ -264,9 +264,9 @@ pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 131_072;
 pub fn inventory_endpoint_budget(requested: Option<u64>) -> Result<InventoryBudget, String> {
     let endpoints = requested.unwrap_or(DEFAULT_INVENTORY_ENDPOINT_LIMIT);
     if !(1..=MAX_INVENTORY_ENDPOINT_LIMIT).contains(&endpoints) {
-        // The en-dash range matches the help this error points at.
+        // The hyphen range matches the help this error points at.
         return Err(format!(
-            "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
+            "--max-endpoints must be in 1-{MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
         ));
     }
     let payload = endpoints
@@ -2823,7 +2823,7 @@ mod tests {
         }
         for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
             let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
-            assert!(refusal.contains("--max-endpoints") && refusal.contains("1–131072"));
+            assert!(refusal.contains("--max-endpoints") && refusal.contains("1-131072"));
         }
         // The public policy does not narrow the general, checked ID API.
         let general = u64::from(u32::MAX);
@@ -2844,7 +2844,7 @@ mod tests {
         assert_eq!(
             refusal,
             format!(
-                "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested 999999)"
+                "--max-endpoints must be in 1-{MAX_INVENTORY_ENDPOINT_LIMIT} (requested 999999)"
             )
         );
         assert!(!refusal.contains("1..="), "{refusal}");
@@ -2882,7 +2882,7 @@ mod tests {
         assert!(!refusal.contains("--max-endpoints"), "{refusal}");
         for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
             let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
-            assert!(refusal.contains("1–131072"), "{refusal}");
+            assert!(refusal.contains("1-131072"), "{refusal}");
         }
     }
 

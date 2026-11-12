@@ -955,8 +955,8 @@ class AuthoritativePhaseTests(unittest.TestCase):
 class DiscoveryMarkerTests(unittest.TestCase):
     def test_summaries_before_completion_do_not_move_discovery(self):
         rows = [
-            {"t_mono_ns": 100, "line": "p11scope: discovery: stale-view ×12: "
-             "view 3 went stale … ×12"},
+            {"t_mono_ns": 100, "line": "p11scope: discovery: stale-view x12: "
+             "view 3 went stale ... x12"},
             {"t_mono_ns": 200, "line": "p11scope: discovery: broad "
              "fixed-family: /lib/x.so: 2 table(s) added, 0 already covered, "
              "0 refused at [] (first reason: unknown)"},

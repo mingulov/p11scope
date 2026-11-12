@@ -159,7 +159,7 @@ def refusal_case(limit=4096):
             admission = {"state": "refused", "endpoints": None,
                          "reasons": [f"module needs {unique} more; only {limit} attach slots are available; "
                                      f"{admitted_endpoints} are in use ({admitted_endpoints} active, 0 retired; "
-                                     f"held by /owned/0.so 68) \u2014 refusing to attach a prefix; to capture one "
+                                     f"held by /owned/0.so 68) - refusing to attach a prefix; to capture one "
                                      f"provider, name it with --module <path>"]}
         else:
             admission = {"state": "admitted", "endpoints": unique, "reasons": []}
@@ -390,7 +390,7 @@ class CapacityOracleTests(unittest.TestCase):
             path = "/owned/60.so"
             late["modules"][-1]["admission"]["reasons"] = [
                 f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
-                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+                f"capture-lifetime endpoints and never reuses an endpoint ID - refusing to add a prefix"]
             late["gaps"].append({"caller": None, "module": "m60", "pid": None,
                                  "subject": "inventory attach set refused module",
                                  "reason": late["modules"][-1]["admission"]["reasons"][0],
@@ -460,7 +460,7 @@ class CapacityOracleTests(unittest.TestCase):
             path = "/owned/60.so"
             late["modules"][-1]["admission"]["reasons"] = [
                 f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
-                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+                f"capture-lifetime endpoints and never reuses an endpoint ID - refusing to add a prefix"]
         self.run_refusal_case(unrecorded, 1, "CAPACITY-REFUSAL-GAP")
 
     def test_refusal_rejects_wrong_module_records(self):
@@ -476,7 +476,7 @@ class CapacityOracleTests(unittest.TestCase):
                 unique = sizes[provider["key"]]
                 module["admission"] = {"state": "refused", "endpoints": None,
                                         "reasons": [f"module needs {unique} more; only {limit} attach slots "
-                                                    f"are available; 0 are in use (0 active, 0 retired) \u2014 "
+                                                    f"are available; 0 are in use (0 active, 0 retired) - "
                                                     f"refusing to attach a prefix; to capture one provider, "
                                                     f"name it with --module <path>"]}
             late["budgets"]["inventory_endpoints"]["occupied"] = 0
@@ -496,7 +496,7 @@ class CapacityOracleTests(unittest.TestCase):
             late["modules"][-2]["admission"] = {"state": "refused", "endpoints": None,
                                                 "reasons": [f"module needs {unique} more; only {limit} attach slots "
                                                             f"are available; {admitted} are in use ({admitted} active, "
-                                                            f"0 retired; held by /owned/0.so 68) \u2014 refusing to "
+                                                            f"0 retired; held by /owned/0.so 68) - refusing to "
                                                             f"attach a prefix; to capture one provider, name it "
                                                             f"with --module <path>"]}
             late["budgets"]["inventory_endpoints"]["occupied"] = admitted

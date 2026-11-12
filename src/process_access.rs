@@ -194,7 +194,7 @@ pub(crate) fn warn_once(block: &AccessBlock) -> bool {
 /// The stderr line text (pure, for tests).
 pub(crate) fn stderr_line(block: &AccessBlock) -> String {
     format!(
-        "p11scope: AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable); discovery will see almost nothing — {FIX}",
+        "p11scope: AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable); discovery will see almost nothing - {FIX}",
         block.label, block.denied, block.attempted
     )
 }
@@ -211,7 +211,7 @@ pub(crate) fn gap_reason(block: &AccessBlock, unreadable_selected: Option<usize>
             ", {unreadable} selected processes unreadable this pass"
         ));
     }
-    reason.push_str(&format!("); discovery sees almost nothing — {FIX}"));
+    reason.push_str(&format!("); discovery sees almost nothing - {FIX}"));
     reason
 }
 
@@ -233,7 +233,7 @@ pub(crate) fn check_row(
         }
         Some(label) => match assess(Some(label), sample, true) {
             Some(block) => Status::Fail(format!(
-                "AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable) — {FIX}",
+                "AppArmor label `{}` blocks reading other processes although CAP_SYS_PTRACE is held ({} of {} sampled processes unreadable) - {FIX}",
                 block.label, block.denied, block.attempted
             )),
             None if is_unconfined(label) => Status::Ok(format!(

@@ -926,7 +926,7 @@ class Coordinator:
         return any(attach in line for line in lines)
 
     def final_privacy_present(self, deadline):
-        marker = f' — privacy={self.config.privacy}'.encode()
+        marker = f' - privacy={self.config.privacy}'.encode()
         lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
         return any(marker in line for line in lines)
 

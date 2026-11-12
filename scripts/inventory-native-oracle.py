@@ -4799,7 +4799,7 @@ def self_test():
         if not controls_ok:
             failures.append("gaps-input-healthy-controls")
         # Production identity lines (`{label} [{id}] -> {label} [{id}]`, an
-        # optional `> ` promotion cursor, labels truncated with `…` before
+        # optional `> ` promotion cursor, labels truncated with `...` before
         # the always-reserved bracketed reference) must parse to their edge.
         frame_items = {"mapping": "mapped", "presence": "mapped", "capture": "armed",
                        "activity": "quiet", "entries": "0", "semantics": "unknown"}
@@ -4807,7 +4807,7 @@ def self_test():
                                    "  mapping mapped | presence mapped | capture armed | "
                                    "activity quiet | entries 0 | semantics unknown"])
         frame_selected = frame_edges(["> /wl/bin/ledger [c4] -> /wl/cells/a.so [m0]"])
-        frame_truncated = frame_edges(["/wl/bin/ledg… [c4] -> /wl/cells/a… [m0]"])
+        frame_truncated = frame_edges(["/wl/bin/ledg... [c4] -> /wl/cells/a... [m0]"])
         frame_prod_ok = (frame_plain == {("c4", "m0"): {"pid": None, "items": frame_items}}
                          and set(frame_selected) == {("c4", "m0")}
                          and set(frame_truncated) == {("c4", "m0")})

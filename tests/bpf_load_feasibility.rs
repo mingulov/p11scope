@@ -808,7 +808,7 @@ fn parallel_load_measures_kernel_overlap() {
                 );
             }
             println!(
-                "{CELL}: WARNING: {BASELINE_ENV} unset; dealing by the dev-host 7.0 const order — pass this host's per_program JSONL on other kernels"
+                "{CELL}: WARNING: {BASELINE_ENV} unset; dealing by the dev-host 7.0 const order - pass this host's per_program JSONL on other kernels"
             );
             (
                 COST_ORDER.iter().map(|name| name.to_string()).collect(),

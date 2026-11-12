@@ -142,7 +142,7 @@ class OwnedCoverageTests(unittest.TestCase):
                                 "ino": 12, "sha256": "bb", "tables": [{}]}],
                     skipped=[{"name": "owned.so",
                               "reason": "capacity: controlled workload refused"}]),
-                stderr_lines=["p11scope: module refused: owned.so — capacity"],
+                stderr_lines=["p11scope: module refused: owned.so - capacity"],
                 truth={"C_GenerateRandom": 7},
                 receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
                           "path": "controlled-owned.so"}])
@@ -257,7 +257,7 @@ class OwnedCoverageTests(unittest.TestCase):
                     discovery=[{"path": "foreign.so", "dev": [8, 1],
                                 "ino": 12, "sha256": "bb", "tables": [{}]}],
                     skipped=[{"name": "owned.so", "reason": "capacity"}]),
-                stderr_lines=["p11scope: module refused: owned.so — capacity"],
+                stderr_lines=["p11scope: module refused: owned.so - capacity"],
                 truth={"C_GenerateRandom": 7},
                 receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
                           "path": "controlled-owned.so"}])
@@ -272,7 +272,7 @@ class OwnedCoverageTests(unittest.TestCase):
         # calls, so a refused owned workload fails even with covering,
         # cross-checked totals.
         lines = ["03:15:44.123456 pid 111 tid 111 C_GenerateRandom "
-                 "→ CKR_OK 1.23µs"] * 7
+                 "-> CKR_OK 1.23us"] * 7
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
         evidence.update(schema="p11scope/capture-evidence/v1",
                         completeness="PARTIAL", attached_probes=136,
@@ -288,7 +288,7 @@ class OwnedCoverageTests(unittest.TestCase):
                 report_text=trace_stream(
                     lines=lines, stats_returned=7, raw_calls=7,
                     evidence=evidence),
-                stderr_lines=["p11scope: module refused: owned.so — capacity"],
+                stderr_lines=["p11scope: module refused: owned.so - capacity"],
                 truth={"C_GenerateRandom": 7},
                 receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
                           "path": "controlled-owned.so"}])
@@ -300,7 +300,7 @@ class OwnedCoverageTests(unittest.TestCase):
 
     def test_trace_system_admission_does_not_attribute_global_totals(self):
         lines = ["03:15:44.123456 pid 111 tid 111 C_GenerateRandom "
-                 "→ CKR_OK 1.23µs"] * 7
+                 "-> CKR_OK 1.23us"] * 7
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
         evidence.update(schema="p11scope/capture-evidence/v1",
                         completeness="PARTIAL", attached_probes=136,
@@ -325,7 +325,7 @@ class OwnedCoverageTests(unittest.TestCase):
 
     def test_unknown_executable_trace_preserves_aggregate_attribution_limits(self):
         lines = ["03:15:44.123456 Unknown executable (PID 111, TID 111) "
-                 "C_GenerateRandom → CKR_OK 1.23µs"] * 7
+                 "C_GenerateRandom -> CKR_OK 1.23us"] * 7
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
         evidence.update(schema="p11scope/capture-evidence/v1", completeness="PARTIAL",
                         attached_probes=136, slots=68,
@@ -351,7 +351,7 @@ class OwnedCoverageTests(unittest.TestCase):
 class NamedTraceAttributionTests(unittest.TestCase):
     def test_named_executable_trace_preserves_aggregate_attribution_limits(self):
         lines = ['03:15:44.123456 "controlled-owned.so" (PID 111, TID 111) '
-                 'exe="/owned/controlled-owned.so" C_GenerateRandom → CKR_OK 1.23µs'] * 7
+                 'exe="/owned/controlled-owned.so" C_GenerateRandom -> CKR_OK 1.23us'] * 7
         evidence = {name: 0 for name in CHECKER["COUNTERS"]}
         evidence.update(schema="p11scope/capture-evidence/v1", completeness="PARTIAL",
                         attached_probes=136, slots=68,

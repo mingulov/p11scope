@@ -57,11 +57,11 @@ pub(crate) const MIN_FULL_HEIGHT: usize = 14;
 /// Bounded observer-log tail: at most this many lines / bytes.
 pub(crate) const LOG_TAIL_MAX_LINES: usize = 100;
 pub(crate) const LOG_TAIL_MAX_BYTES: usize = 8192;
-/// One log line is capped here (overlong lines truncate with `…` and
+/// One log line is capped here (overlong lines truncate with `...` and
 /// the dropped bytes are accounted).
 pub(crate) const LOG_LINE_MAX_CHARS: usize = 1024;
 /// In-cell truncation marker.
-pub(crate) const TRUNCATION_MARK: &str = "…";
+pub(crate) const TRUNCATION_MARK: &str = "...";
 /// Distinct failed baseline callers remembered per candidate frame.
 /// Past this many, the stalest caller drops (a liveness valve, not
 /// unbounded growth): at most one acquisition per service tick can
@@ -69,7 +69,7 @@ pub(crate) const TRUNCATION_MARK: &str = "…";
 const BASELINE_MISSED_CALLERS_MAX: usize = 32;
 
 /// Truncate to `width` display cells on a character boundary, marking
-/// omitted content with `…`. Callers escape controls before layout.
+/// omitted content with `...`. Callers escape controls before layout.
 pub(crate) fn truncate_cell(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -77,11 +77,15 @@ pub(crate) fn truncate_cell(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
     }
+    let mark_width = TRUNCATION_MARK.width();
+    if width <= mark_width {
+        return TRUNCATION_MARK.chars().take(width).collect();
+    }
     let mut kept = String::new();
     for ch in text.chars() {
         let previous = kept.len();
         kept.push(ch);
-        if kept.width() > width - 1 {
+        if kept.width() > width - mark_width {
             kept.truncate(previous);
             break;
         }
@@ -682,7 +686,7 @@ fn render_compact_edge_window(
         lines.push(if marked { format!("> {head}") } else { head });
         lines.push(identity_cell(
             "module ",
-            &crate::inventory_present::module_label(presentation, edge.module),
+            &crate::inventory_present::module_display_name(presentation, edge.module),
             &edge.module.label(),
             width,
         ));
@@ -1372,7 +1376,7 @@ fn edge_identity_line(
     );
     let module = identity_cell(
         "",
-        &crate::inventory_present::module_label(presentation, edge.module),
+        &crate::inventory_present::module_display_name(presentation, edge.module),
         &edge.module.label(),
         module_width,
     );

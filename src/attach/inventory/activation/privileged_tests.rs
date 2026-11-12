@@ -2186,7 +2186,7 @@ fn task4_file_replay_rejects_swapped_physical_calls_and_changed_rendering() -> R
         );
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        rendered.extend_from_slice(format!("owned_{slot} → {rv_label} \n").as_bytes());
+        rendered.extend_from_slice(format!("owned_{slot} -> {rv_label} \n").as_bytes());
     }
     for slot in 0..2 {
         raw.push(
@@ -2685,7 +2685,7 @@ fn task4_highslot_replay_requires_old_worker_start_and_new_image() -> Result<()>
         raw.push(task4_synthetic_terminal(1));
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        let rendered = format!("owned_2048 → {rv_label} \n");
+        let rendered = format!("owned_2048 -> {rv_label} \n");
         ensure!(
             task4_replay_files(case, &ledger, &lines(&raw)?, rendered.as_bytes(), &offsets)?
                 == (1, 1)
@@ -5277,7 +5277,7 @@ fn task4_replay_files(
             let rv_label = pkcs11_types::CkRv(rv).to_string();
             let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
             ensure!(
-                rendered_lines[position].contains(&format!("owned_{slot} → {rv_label} ")),
+                rendered_lines[position].contains(&format!("owned_{slot} -> {rv_label} ")),
                 "replay rendered slot/RV differs at {position}"
             );
         }
@@ -6322,7 +6322,7 @@ fn multi_prefix_population(with_over_budget: bool) -> Result<MultiPrefixPopulati
         let expected_reason = format!(
             "module needs 1 more; only 8192 attach slots are available; 8192 are in use \
              (8192 active, 0 retired; held by {} 8192); 2048 are reserved for providers \
-             with a corroborated function table \u{2014} refusing to attach a prefix; to \
+             with a corroborated function table - refusing to attach a prefix; to \
              capture one provider, name it with --module <path>; to free slots, exclude \
              an unneeded module with --exclude-module <name>",
             a.path.to_str().unwrap(),
@@ -7667,7 +7667,7 @@ fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
         let rv_label = pkcs11_types::CkRv(event.rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
         ensure!(
-            rendered.contains(&format!("owned_{} → {rv_label} ", event.slot)),
+            rendered.contains(&format!("owned_{} -> {rv_label} ", event.slot)),
             "Tracer failed to render exact fixture slot and RV without authority: {rendered}"
         );
         rendered_hash.update(rendered.as_bytes());
@@ -9513,7 +9513,7 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
     evidence.event(&events[0], &fixture, "successor_completed")?;
     evidence.render(&rendered)?;
     ensure!(
-        tracer.raw_calls() == 1 && rendered.contains("owned_2048 →"),
+        tracer.raw_calls() == 1 && rendered.contains("owned_2048 ->"),
         "high-slot successor was not rendered by real Tracer"
     );
     ensure!(

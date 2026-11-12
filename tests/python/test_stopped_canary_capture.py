@@ -85,7 +85,7 @@ def config_for(pid, directory, lane='aggregate-only-metrics'):
         # frame at the end; the fixture prints both up front so readiness and
         # the post-exit privacy proof each have their line.
         script = ('import time; print(\'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\', flush=True); '
-                  f'print({f"fixture — privacy={privacy}"!r}, flush=True); time.sleep(.2)')
+                  f'print({f"fixture - privacy={privacy}"!r}, flush=True); time.sleep(.2)')
     config.observer_args = [sys.executable, '-c', script]
     if not config.ready.exists():
         config.ready.write_text(json.dumps({'schema': 'p11scope/canary-roster/v1', 'mode': workload_mode,
@@ -537,7 +537,7 @@ def coordinator_case(pid, directory, case):
         config.observer_args = [sys.executable, '-c',
             f"import signal,time,sys; signal.signal(signal.SIGCONT,lambda *_: sys.exit({0 if kind == 'immediate_exit' else 7})); "
             "print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C',flush=True); "
-            "print('fixture — privacy=aggregate-only',flush=True); time.sleep(10)"]
+            "print('fixture - privacy=aggregate-only',flush=True); time.sleep(10)"]
     if kind == 'missing_privacy':
         # Attach-complete without any privacy frame: readiness must succeed on
         # the capturing line, the capture must run to a clean exit, and only
@@ -933,7 +933,7 @@ assert args[15] == 'matrix'
 ready, done, finish = (pathlib.Path(args[i]) for i in (16, 18, 19))
 def marker():
     print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C', flush=True)
-    print('fixture — privacy=aggregate-only', flush=True)
+    print('fixture - privacy=aggregate-only', flush=True)
 def record(pid):
     with (root / 'owned-pids').open('a') as stream:
         stream.write(str(pid) + '\n')
@@ -2353,7 +2353,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         for mode, privacy in (('profile', 'allowlisted'), ('metrics', 'aggregate-only')):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 log = Path(directory) / 'observer.log'
-                log.write_bytes(f'p11scope \u2014 test \u2014 up 00:00:06 \u2014 mode {mode} \u2014 privacy={privacy}\n'.encode())
+                log.write_bytes(f'p11scope - test - up 00:00:06 - mode {mode} - privacy={privacy}\n'.encode())
                 config = SimpleNamespace(mode=mode, privacy=privacy, observer_log=log)
                 coordinator = capture.Coordinator(config, None)
                 self.assertFalse(coordinator.capture_ready(time.monotonic() + 1))
@@ -2369,7 +2369,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
             coordinator = capture.Coordinator(config, None)
             self.assertFalse(coordinator.final_privacy_present(time.monotonic() + 1))
             with log.open('ab') as stream:
-                stream.write('p11scope \u2014 test \u2014 privacy=allowlisted\n'.encode())
+                stream.write('p11scope - test - privacy=allowlisted\n'.encode())
             self.assertTrue(coordinator.final_privacy_present(time.monotonic() + 1))
 
     def test_ready_bound_declares_20s_for_modern_observer_startup(self):

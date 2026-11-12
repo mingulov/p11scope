@@ -36,7 +36,7 @@ def inputs():
     evidence = ('EVIDENCE {"privacy_mode":"allowlisted","final_drain":true,'
                 '"trace_truncated":false,"event_loss":0}\n')
     counts = 'COUNT_EVIDENCE {"stats_entered":3,"stats_returned":3,"raw_calls":3}\n'
-    rows = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GenerateRandom → CKR_OK 1.0µs\n'
+    rows = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GenerateRandom -> CKR_OK 1.0us\n'
             % (i, 'Unknown executable' if i == 0 else '"trace-a"',
                '' if i == 0 else ' exe="/owned/trace-a"') for i in range(3)]
     return ''.join(rows) + counts + evidence, ledger, receipt
@@ -55,7 +55,7 @@ def exec_inputs(mode='leader'):
                                           t0=133, t1=136, request=copy.deepcopy(request))])
     receipt['images'].append(copy.deepcopy(image))
     lines = trace.splitlines()
-    lines[3:3] = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GetSessionInfo → CKR_OK 1.0µs'
+    lines[3:3] = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GetSessionInfo -> CKR_OK 1.0us'
                  % (i + 3, 'Unknown executable' if i == 0 else '"trace-a"',
                     '' if i == 0 else ' exe="/owned/trace-a"') for i in range(3)]
     return ('\n'.join(lines) + '\n').replace(':3', ':6'), ledger, receipt
@@ -76,7 +76,7 @@ def short_setup_inputs():
         ledger.extend((dict(kind='target', image=0, fn=fn, dev=[8, 1], ino=9, file_offset=100),
                        dict(kind='call', image=0, pid=123, tid=123, fn=fn, rv=0,
                             phase=phase, scope='selected', t0=110 + index * 10, t1=111 + index * 10)))
-        rows.append('12:00:00.00000%d %s (PID 123, TID 123)%s %s → CKR_OK 1.0µs\n'
+        rows.append('12:00:00.00000%d %s (PID 123, TID 123)%s %s -> CKR_OK 1.0us\n'
                     % (index, 'Unknown executable' if index == 0 else '"trace-a"',
                        '' if index == 0 else ' exe="/owned/trace-a"', fn))
     return ''.join(rows) + '\n'.join(trace.splitlines()[3:]).replace(':3', ':7') + '\n', ledger, receipt
@@ -311,7 +311,7 @@ class OracleTests(unittest.TestCase):
         receipt['images'].append(copy.deepcopy(successor))
         receipt['require_named_images'] = [0, 1]
         lines = trace.splitlines()
-        lines[2] = '12:00:00.000002 Unknown executable (PID 123, TID 123) C_GetSessionInfo → CKR_OK 1.0µs'
+        lines[2] = '12:00:00.000002 Unknown executable (PID 123, TID 123) C_GetSessionInfo -> CKR_OK 1.0us'
         self.assertFalse(ORACLE['evaluate']('\n'.join(lines) + '\n', ledger, receipt)['pass'])
 
     def test_spaced_calls_must_obey_the_independently_commanded_gap(self):
@@ -388,7 +388,7 @@ class OracleTests(unittest.TestCase):
 
     def test_unledgered_setup_call_is_rejected(self):
         trace, ledger, receipt = inputs()
-        trace = '12:00:00.000000 "trace-b" (PID 123, TID 123) exe="/owned/trace-b" C_Initialize → CKR_OK 1.0µs\n' + trace
+        trace = '12:00:00.000000 "trace-b" (PID 123, TID 123) exe="/owned/trace-b" C_Initialize -> CKR_OK 1.0us\n' + trace
         self.assertFalse(ORACLE["evaluate"](trace, ledger, receipt)["pass"])
 
     def test_stdout_file_disagreement_fails(self):
@@ -434,7 +434,7 @@ class OracleTests(unittest.TestCase):
         result = ORACLE['evaluate'](trace, ledger, receipt)
         self.assertTrue(result['pass'], result)
         self.assertEqual(result['possible_setup_calls'], 1)
-        setup_row = '12:00:00.000000 Unknown executable (PID 123, TID 123) C_Initialize → CKR_OK 1.0µs\n'
+        setup_row = '12:00:00.000000 Unknown executable (PID 123, TID 123) C_Initialize -> CKR_OK 1.0us\n'
         captured = (setup_row + trace).replace(':3', ':4')
         result = ORACLE['evaluate'](captured, ledger, receipt)
         self.assertTrue(result['pass'], result)
@@ -456,7 +456,7 @@ class OracleTests(unittest.TestCase):
         receipt['images'].append(copy.deepcopy(successor))
         receipt['require_named_images'] = [0, 1]
         lines = trace.splitlines()
-        lines[2] = '12:00:00.000002 Unknown executable (PID 123, TID 123) C_GetSessionInfo → CKR_OK 1.0µs'
+        lines[2] = '12:00:00.000002 Unknown executable (PID 123, TID 123) C_GetSessionInfo -> CKR_OK 1.0us'
         self.assertFalse(ORACLE['evaluate']('\n'.join(lines) + '\n', ledger, receipt)['pass'])
 
     def test_controller_phase_count_is_not_derived_from_fixture_output(self):
@@ -473,7 +473,7 @@ class OracleTests(unittest.TestCase):
 
 
 class TraceTailTests(unittest.TestCase):
-    HEADERS = ("Trace — completed call events in arrival order\n"
+    HEADERS = ("Trace - completed call events in arrival order\n"
                "Executable labels use verified observed paths; "
                "event PID/TID remain diagnostic identifiers.\n"
                "CAPTURE privacy=allowlisted\n"

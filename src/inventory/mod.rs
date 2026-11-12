@@ -1343,7 +1343,7 @@ fn pin_inventory_prearm(
     // good pins continue.
     for skip in &pinning.skipped {
         eprintln!(
-            "p11scope: discovery skipped {} — {}",
+            "p11scope: discovery skipped {} - {}",
             crate::render::escape_controls(&skip.subject),
             crate::render::escape_controls(&skip.reason)
         );
@@ -11823,7 +11823,7 @@ mod tests {
                 .unwrap_err();
                 assert!(
                     error.to_string().contains("--max-endpoints")
-                        && error.to_string().contains("1–131072")
+                        && error.to_string().contains("1-131072")
                 );
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             }

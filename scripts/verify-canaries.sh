@@ -356,7 +356,7 @@ run_lane() {
     test -f "$WORK/$lane.ready" || { echo "$lane workload never became ready"; exit 1; }
 
     set -- "$lane_observer" "$lane_command"
-    # The stopped canary proves the tier from the live frame's ` — privacy=`
+    # The stopped canary proves the tier from the live frame's ` - privacy=`
     # marker, which the observer prints only under -v. Trace lanes stay
     # concise: their CAPTURE marker is unconditional and their terminal
     # wording is itself verbosity-sensitive.
@@ -465,7 +465,7 @@ run_start_lane() {
         exit 1
     }
     # Verbose: the stopped canary proves the tier from the live frame's
-    # ` — privacy=` marker, which the observer prints only under -v.
+    # ` - privacy=` marker, which the observer prints only under -v.
     set -- "$start_observer" profile -v --manifest "$WORK/privacy-manifest.json" \
         --pid "$WPID" \
         --mode profile --duration 8 -o "$WORK/$start_lane.output"
@@ -564,7 +564,7 @@ run_object_cell() {
     test -f "$WORK/$object_lane.ready" || { echo "$object_lane workload never became ready"; exit 1; }
     object_completed_pid=$WPID
     # Both object observers run -v: the stopped canary proves the tier from
-    # the live frame's ` — privacy=` marker, which is verbose-only.
+    # the live frame's ` - privacy=` marker, which is verbose-only.
     sudo python3 -I scripts/capture-stopped-canary.py \
         --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
@@ -682,7 +682,7 @@ run_owned_lane() {
     echo "=== $owned_lane ($owned_build owned metrics) ==="
     refuse_lane_destinations "$owned_lane"
     # Verbose (before the workload's `--`): the stopped canary proves the
-    # tier from the live frame's ` — privacy=` marker, verbose-only.
+    # tier from the live frame's ` - privacy=` marker, verbose-only.
     set -- "$owned_observer" run -v --manifest "$WORK/matrix-manifest.json" \
         --mode metrics --pause never --duration 35 -o "$WORK/$owned_lane.output" -- \
         "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" matrix \

@@ -94,7 +94,7 @@ mod tests {
     fn ineligible_multi_probe_retains_the_exact_named_reason() {
         for reason in [
             "live capture needs CAP_BPF (load BPF programs and attach probes); needs CAP_PERFMON (load BPF programs alongside CAP_BPF): the kernel refused to load p11scope's BPF programs (Operation not permitted). Grant the minimal set: sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' /usr/bin/p11scope, or use 'p11scope inspect --pid N' for a scan without capture.",
-            "live capture refused: the kernel refused to load p11scope's BPF programs (Operation not permitted) with CAP_BPF and CAP_PERFMON held — a kernel lockdown, an LSM policy, or a container's seccomp profile is refusing BPF here. Run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
+            "live capture refused: the kernel refused to load p11scope's BPF programs (Operation not permitted) with CAP_BPF and CAP_PERFMON held - a kernel lockdown, an LSM policy, or a container's seccomp profile is refusing BPF here. Run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
             "live capture unavailable: loading p11scope's BPF programs is not supported on this host; run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
             "live capture did not start: loading p11scope's BPF programs failed; run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
         ] {

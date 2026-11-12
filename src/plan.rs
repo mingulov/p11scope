@@ -586,7 +586,7 @@ fn growth_omission_reason(details: &GrowthOmission) -> String {
     let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
     let mut reason = format!(
         "{GROWTH_OMISSION} {omitted} more; only {capacity} {} are available; \
-         {} — {omitted} {} not attached; kept its {kept} attached {}",
+         {} - {omitted} {} not attached; kept its {kept} attached {}",
         details.policy.capacity_subject(),
         slot_use(details.in_use, details.retired, details.holders),
         endpoints(details.omitted),
@@ -872,7 +872,7 @@ impl CapacityRefusal<'_> {
                 "; {reserve} are reserved for providers with a corroborated function table"
             ));
         }
-        reason.push_str(" — refusing to attach a prefix");
+        reason.push_str(" - refusing to attach a prefix");
         if let Some(tables) = self.closure_tables {
             reason.push_str(&format!(
                 " of its {tables} lookalike function tables {note}"
@@ -2074,7 +2074,7 @@ impl AttachPlan {
             let resource = self.admission_policy.capacity_subject();
             return Err(format!(
                 "selection table needs {table_additions} more of the {capacity} {resource}; \
-                 {pending} are allocated or pending — refusing to attach a prefix"
+                 {pending} are allocated or pending - refusing to attach a prefix"
             ));
         }
 
@@ -13370,12 +13370,12 @@ mod tests {
         assert_eq!(
             growth_omission_reason(&plain_omission(1, 512, 512, 0, 1)),
             "admitted module needs 1 more; only 512 attach slots are available; 512 are in use \
-             (512 active, 0 retired) — 1 endpoint not attached; kept its 1 attached endpoint"
+             (512 active, 0 retired) - 1 endpoint not attached; kept its 1 attached endpoint"
         );
         assert_eq!(
             growth_omission_reason(&plain_omission(2, 512, 511, 11, 500)),
             "admitted module needs 2 more; only 512 attach slots are available; 511 are in use \
-             (500 active, 11 retired) — 2 endpoints not attached; kept its 500 attached endpoints"
+             (500 active, 11 retired) - 2 endpoints not attached; kept its 500 attached endpoints"
         );
         // A provider omission names what holds the room and the remedies.
         let named = growth_omission_reason(&GrowthOmission {
@@ -13397,7 +13397,7 @@ mod tests {
         assert!(is_growth_omission(&growth_omission_reason(
             &plain_omission(1, 512, 512, 0, 1)
         )));
-        let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use — \
+        let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use - \
                      refusing to attach a prefix";
         assert!(!is_growth_omission(whole));
         // The omitted count round-trips through the record the engine ranks.
@@ -13605,7 +13605,7 @@ mod tests {
         );
         assert!(
             omission.reason.contains(&format!(
-                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired) — 2 endpoints not \
+                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired) - 2 endpoints not \
                  attached; kept its {MAX_SLOTS} attached endpoints"
             )),
             "M5: the holder list excludes the omitted module itself: {omission:?}"
@@ -14665,7 +14665,7 @@ mod tests {
                 subject: path.into(),
                 reason: format!(
                     "module needs 2 more; only {MAX_SLOTS} attach slots are available; \
-                     {admitted} are in use ({admitted} active, 0 retired) — refusing to attach \
+                     {admitted} are in use ({admitted} active, 0 retired) - refusing to attach \
                      a prefix; to capture one provider, name it with --module <path>; to free \
                      slots, exclude an unneeded module with --exclude-module <name>"
                 ),
@@ -14845,7 +14845,7 @@ mod tests {
         // The re-admitted endpoint is not called new.
         assert!(
             omission.reason.contains(&format!(
-                "— 1 endpoint not attached; kept its {} attached endpoints",
+                "- 1 endpoint not attached; kept its {} attached endpoints",
                 MAX_SLOTS - 1
             )),
             "{omission:?}"
@@ -18081,7 +18081,7 @@ mod tests {
     #[test]
     fn provider_prefix_classifier_ignores_holder_paths_naming_the_tag() {
         let whole = "module needs 150 more; only 512 attach slots are available; 400 are in use \
-             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) - refusing to attach \
              a prefix; to capture one provider, name it with --module <path>; to free slots, exclude \
              an unneeded module with --exclude-module <name>";
         assert!(
@@ -18110,7 +18110,7 @@ mod tests {
     #[test]
     fn partial_coverage_classifier_joins_the_three_partial_kinds() {
         for partial in [
-            "admitted module needs 2 more; only 512 attach slots are available; 511 are in use — \
+            "admitted module needs 2 more; only 512 attach slots are available; 511 are in use - \
              2 endpoints not attached; kept its 511 attached endpoints",
             "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)",
             "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)",
@@ -18122,12 +18122,12 @@ mod tests {
         }
         for whole in [
             "module needs 150 more; only 512 attach slots are available; 400 are in use \
-             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) - refusing to attach \
              a prefix",
             "module needs 150 more; only 512 attach slots are available; 400 are in use \
              (400 active, 0 retired; held by /opt/template tables attached; calls through the others \
-             are not counted/lib.so 400) — refusing to attach a prefix",
-            "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix \
+             are not counted/lib.so 400) - refusing to attach a prefix",
+            "module needs 5966 more; only 512 attach slots are available - refusing to attach a prefix \
              of its 67 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
              when mapped before the capture's first plan beside a provider or named by the operator, or \
              as published tables)",
@@ -18333,7 +18333,7 @@ mod tests {
             refusal.reason.contains(&format!(
                 "{open} are in use ({open} active, 0 retired; held by /opt/ambient-a.so {}, \
                  /opt/ambient-b.so {}); {reserve} are reserved for providers with a \
-                 corroborated function table — refusing to attach a prefix;",
+                 corroborated function table - refusing to attach a prefix;",
                 open / 2,
                 open / 2
             )),
@@ -18385,7 +18385,7 @@ mod tests {
             refusal.reason,
             format!(
                 "module needs 20 more; only {capacity} attach slots are available; {} are in \
-                 use ({} active, 200 retired; held by /opt/kept.so {}) — refusing to attach \
+                 use ({} active, 200 retired; held by /opt/kept.so {}) - refusing to attach \
                  a prefix; to capture one provider, name it with --module <path>; to free \
                  slots, exclude an unneeded module with --exclude-module <name>",
                 capacity - 12,

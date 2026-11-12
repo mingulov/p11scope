@@ -1687,7 +1687,7 @@ impl InventoryAttachSet {
             AttachVerdict::Admitted {
                 endpoints: kept,
                 reasons: vec![format!(
-                    "admitted module needs {needed} more; {cause} — {needed} {} not added; \
+                    "admitted module needs {needed} more; {cause} - {needed} {} not added; \
                      kept its {kept} retained {}",
                     endpoint_noun(needed),
                     endpoint_noun(kept)
@@ -1696,7 +1696,7 @@ impl InventoryAttachSet {
         } else {
             AttachVerdict::Refused {
                 reason: format!(
-                    "{path} needs {needed} more {}; {cause} — refusing to add a prefix",
+                    "{path} needs {needed} more {}; {cause} - refusing to add a prefix",
                     endpoint_noun(needed)
                 ),
             }

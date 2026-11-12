@@ -1902,12 +1902,12 @@ set -e
 printf '%s\n' "$DOCTOR_OUT"
 [ "$DOCTOR_RC" -ne 0 ] || { echo "unprivileged doctor unexpectedly succeeded" >&2; exit 1; }
 printf '%s\n' "$DOCTOR_OUT" | grep -Eq \
-    "/proc/$ANCHOR_PID/maps +\\.+ +FAIL +EACCES — module discovery unavailable" \
+    "/proc/$ANCHOR_PID/maps +\\.+ +FAIL +EACCES - module discovery unavailable" \
     || { echo "doctor did not surface the target module-discovery denial" >&2; exit 1; }
 printf '%s\n' "$DOCTOR_OUT" \
     | grep -Fq "/proc/$ANCHOR_PID/mem" \
     || { echo "doctor did not diagnose the anchor process" >&2; exit 1; }
-printf '%s\n' "$DOCTOR_OUT" | grep -Eq 'FAIL +EACCES — memory scan unavailable' \
+printf '%s\n' "$DOCTOR_OUT" | grep -Eq 'FAIL +EACCES - memory scan unavailable' \
     || { echo "doctor did not surface the target memory-scan denial" >&2; exit 1; }
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \

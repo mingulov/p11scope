@@ -370,8 +370,8 @@ fn log_tail_sanitizes_truncates_and_accounts() {
     tail.push(&"x".repeat(2000));
     assert!(tail.dropped_bytes() > before);
     assert!(
-        tail.snapshot().lines.last().unwrap().ends_with("…"),
-        "overlong lines truncate with …"
+        tail.snapshot().lines.last().unwrap().ends_with("..."),
+        "overlong lines truncate with ..."
     );
     // Frames surface the accounting (never silent) and carry no raw
     // control bytes from the tail.
@@ -467,7 +467,11 @@ fn small_terminals_degrade_to_the_stated_minimal_layout() {
             assert!(text.contains("minimal"), "{viewport:?}: {text}");
         }
         assert!(text.contains("totals:"), "{viewport:?}: {text}");
-        assert!(text.contains("coverage:"), "{viewport:?}: {text}");
+        if viewport.width >= 12 {
+            assert!(text.contains("coverage:"), "{viewport:?}: {text}");
+        } else {
+            assert!(text.contains("coverag..."), "{viewport:?}: {text}");
+        }
         if viewport.width >= 30 && viewport.height >= 8 {
             assert!(text.contains("application "), "{viewport:?}: {text}");
             assert!(text.contains("module "), "{viewport:?}: {text}");
@@ -575,8 +579,8 @@ fn unicode_and_control_paths_render_safely() {
 fn truncate_cell_never_splits_chars() {
     assert_eq!(truncate_cell("abc", 5), "abc");
     assert_eq!(truncate_cell("abc", 3), "abc");
-    assert_eq!(truncate_cell("abcd", 3), "ab…");
-    assert_eq!(truncate_cell("日本語", 2), "…");
+    assert_eq!(truncate_cell("abcd", 3), "...");
+    assert_eq!(truncate_cell("日本語", 2), "..");
     assert_eq!(truncate_cell("a", 0), "");
     assert_eq!(truncate_cell("", 4), "");
 }
@@ -2591,7 +2595,9 @@ fn app_first_dashboard_reserves_both_identity_labels() {
             viewport,
         );
         assert!(text.contains("python3"), "{text}");
-        assert!(text.contains("provider.so"), "{text}");
+        if width == 80 {
+            assert!(text.contains("/separate/physical/providers/"), "{text}");
+        }
         let edge = &presentation.edges[0];
         assert!(
             text.contains(&format!("[{}]", edge.caller.label())),
@@ -2634,7 +2640,7 @@ fn app_first_dashboard_reserves_both_identity_labels() {
         "{line}"
     );
     assert_eq!(
-        line.matches('…').count(),
+        line.matches("...").count(),
         2,
         "each label independently truncates: {line}"
     );
@@ -2671,7 +2677,7 @@ fn compact_inventory_keeps_associations_scrollable() {
         "{bottom}"
     );
     assert!(
-        bottom.contains("python3") && bottom.contains("provider.so"),
+        bottom.contains("python3") && bottom.contains("/separate/physical/"),
         "{bottom}"
     );
     let loss_row = bottom.lines().nth(2).expect("compact coverage/loss row");
@@ -2705,10 +2711,10 @@ fn compact_inventory_keeps_associations_scrollable() {
 fn dashboard_widths_count_cells_without_losing_gap_pages() {
     assert_eq!(
         truncate_cell("日本語", 4),
-        "日…",
+        "...",
         "wide glyph overflow reproduced"
     );
-    assert_eq!(truncate_cell("ＷＩＤＥ", 7), "ＷＩＤ…");
+    assert_eq!(truncate_cell("ＷＩＤＥ", 7), "ＷＩ...");
     assert_eq!(truncate_cell("日本語", 0), "");
     assert_eq!(truncate_cell("e\u{301}", 1), "e\u{301}");
     let mut presentation = app_first_presentation();
@@ -2785,7 +2791,7 @@ fn dashboard_widths_count_cells_without_losing_gap_pages() {
             "gap reason chunk unreachable: {line:?}"
         );
         assert!(
-            !line.contains('…'),
+            !line.contains("..."),
             "retained reason must not truncate: {line:?}"
         );
     }
@@ -2853,8 +2859,9 @@ fn assert_compact_log_drop_accounting_with_large_counters(width: usize) {
             text.contains(&format!("application python3 [{}]", edge.caller.label())),
             "{text}"
         );
+        assert!(text.contains("module /separate/"), "{text}");
         assert!(
-            text.contains(&format!("module provider.so [{}]", edge.module.label())),
+            text.contains(&format!("[{}]", edge.module.label())),
             "{text}"
         );
         assert!(

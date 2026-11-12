@@ -7622,7 +7622,7 @@ fn discover_plan(
         // Structurally invalid and whole-budget refusals still bail above.
         for skip in &pinning.skipped {
             eprintln!(
-                "p11scope: discovery skipped {} — {}",
+                "p11scope: discovery skipped {} - {}",
                 crate::render::escape_controls(&skip.subject),
                 crate::render::escape_controls(&skip.reason)
             );
@@ -7677,7 +7677,7 @@ fn discover_plan(
         // good pins continue and the capture reads PARTIAL.
         for skip in &pinning.skipped {
             eprintln!(
-                "p11scope: discovery skipped {} — {}",
+                "p11scope: discovery skipped {} - {}",
                 crate::render::escape_controls(&skip.subject),
                 crate::render::escape_controls(&skip.reason)
             );
@@ -7955,7 +7955,7 @@ fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
     plan.slots.is_empty().then(|| {
         format!(
             "every module discovery found was refused at the {} attach-slot ceiling, \
-             leaving nothing to attach — first refusal: {} — {}",
+             leaving nothing to attach - first refusal: {} - {}",
             p11scope_ebpf_common::MAX_SLOTS,
             refused.subject,
             refused.reason
@@ -8384,7 +8384,7 @@ const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained
 #[cfg(test)]
 fn format_discovery_skip(subject: &str, reason: &str) -> String {
     format!(
-        "p11scope: discovery skipped {} — {}",
+        "p11scope: discovery skipped {} - {}",
         render::escape_controls(subject),
         render::escape_controls(reason)
     )
@@ -8410,7 +8410,7 @@ fn format_module_refusal(subject: &str, reason: &str) -> String {
         "module refused"
     };
     format!(
-        "p11scope: {verb}: {} — {}",
+        "p11scope: {verb}: {} - {}",
         render::escape_controls(subject),
         render::escape_controls(reason)
     )
@@ -8436,7 +8436,7 @@ fn format_capacity_refusal_summary(refused: &[&str]) -> Option<String> {
     if refused.len() > 3 {
         line.push_str(&format!(" and {} more", refused.len() - 3));
     }
-    line.push_str(" — see Module gaps in the report");
+    line.push_str(" - see Module gaps in the report");
     Some(line)
 }
 
@@ -9040,7 +9040,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                     ),
                 };
                 eprintln!(
-                    "p11scope: discovery skipped {} — {}",
+                    "p11scope: discovery skipped {} - {}",
                     crate::render::escape_controls(&skip.subject),
                     crate::render::escape_controls(&skip.reason)
                 );
@@ -9108,7 +9108,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                             .into(),
                     };
                     eprintln!(
-                        "p11scope: discovery skipped {} — {}",
+                        "p11scope: discovery skipped {} - {}",
                         crate::render::escape_controls(&skip.subject),
                         crate::render::escape_controls(&skip.reason)
                     );
@@ -9134,7 +9134,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 reason: format!("manifest object unavailable: {error}"),
             };
             eprintln!(
-                "p11scope: discovery skipped {} — {}",
+                "p11scope: discovery skipped {} - {}",
                 crate::render::escape_controls(&skip.subject),
                 crate::render::escape_controls(&skip.reason)
             );

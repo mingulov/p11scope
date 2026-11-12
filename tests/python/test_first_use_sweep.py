@@ -99,16 +99,16 @@ def healthy_campaign(missed_at=None):
             for mode in MODES for delay in DELAYS for arm in ARMS]
 
 
-TRACE_HEAD = ("Trace \u2014 completed call events in arrival order\n"
+TRACE_HEAD = ("Trace - completed call events in arrival order\n"
               "Executable labels use verified observed paths; "
               "event PID/TID remain diagnostic identifiers.\n"
               "CAPTURE privacy=allowlisted\n")
 
 
 def trace_row(pid=4242, tid=4242, fn="C_Initialize", label='"fixture"',
-              path=' exe="/tmp/fixture"', rv="CKR_OK", duration="3.0\u00b5s"):
+              path=' exe="/tmp/fixture"', rv="CKR_OK", duration="3.0us"):
     return (f"00:00:01.000000 {label} (PID {pid}, TID {tid}){path} "
-            f"{fn} \u2192 {rv} {duration}\n")
+            f"{fn} -> {rv} {duration}\n")
 
 
 def trace_tail(count=1):
@@ -459,7 +459,7 @@ class TraceParseTests(unittest.TestCase):
                         + "Calls on unverified functions are not decoded (names only).\n"
                         + trace_row() + trace_tail()
                         + totals + "\n"
-                        + "coverage: partial — 1 entry without an observed return\n"
+                        + "coverage: partial - 1 entry without an observed return\n"
                         + "run with -v for details\n")
                 parsed = sweep.parse_trace(text)
                 self.assertEqual(parsed["errors"], [])
@@ -667,7 +667,7 @@ class FixtureBuildTests(unittest.TestCase):
 
 def _stream_row(pid=4242, fn="C_Initialize"):
     return {"label": "fixture", "pid": pid, "tid": pid, "path": "/tmp/fixture",
-            "fn": fn, "rv": "CKR_OK", "duration": "3.0µs"}
+            "fn": fn, "rv": "CKR_OK", "duration": "3.0us"}
 
 
 def _stream_counts(count=1):

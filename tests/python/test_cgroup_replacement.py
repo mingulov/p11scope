@@ -74,12 +74,12 @@ def synthetic_inputs():
                        rv=0, phase="measured", scope="selected", t0=71 + n, t1=72 + n)
                   for n in range(5))
     rows = ['21:37:58.638119 "caller" (PID 222, TID 222) exe="/w/caller" '
-            'C_GenerateRandom [semantics unverified] → CKR_OK 10µs'] * 5
+            'C_GenerateRandom [semantics unverified] -> CKR_OK 10us'] * 5
     ledger.insert(1, dict(kind="target", image=0, fn="C_GetInfo", dev=[8, 1], ino=77, file_offset=5000))
     ledger.insert(2, dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
                          phase="initial-1", scope="selected", t0=65, t1=66))
     rows.insert(0, '21:37:58.638119 "caller" (PID 222, TID 222) exe="/w/caller" '
-                   'C_GetInfo [semantics unverified] → CKR_OK 10µs')
+                   'C_GetInfo [semantics unverified] -> CKR_OK 10us')
     receipt["phases"].insert(0, dict(image=0, fn="C_GetInfo", phase="initial-1", scope="selected",
                                       count=1, t0=65, t1=66))
     receipt["warmup"] = dict(label="initial public image", t0=65, t1=66,
@@ -97,7 +97,7 @@ def synthetic_inputs():
 
 
 def trace_text(rows, evidence):
-    return "\n".join(["Trace — completed call events in arrival order",
+    return "\n".join(["Trace - completed call events in arrival order",
         "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
         "CAPTURE privacy=allowlisted", *rows,
         "COUNT_EVIDENCE " + json.dumps(dict(stats_entered=len(rows), stats_returned=len(rows),
@@ -179,7 +179,7 @@ class ReplacementOracleTests(unittest.TestCase):
         ledger.append(dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
                            phase="initial-2", scope="selected", t0=66, t1=67))
         rows.insert(1, "21:37:58.638119 Unknown executable (PID 222, TID 222) "
-                       "C_GetInfo [semantics unverified] → CKR_OK 10µs")
+                       "C_GetInfo [semantics unverified] -> CKR_OK 10us")
         receipt["phases"].insert(1, dict(image=0, fn="C_GetInfo", phase="initial-2", scope="selected",
                                       count=1, t0=66, t1=67))
         receipt["warmup"].update(t1=67, expected_calls=2, phases=["initial-1", "initial-2"])
@@ -237,7 +237,7 @@ class ReplacementOracleTests(unittest.TestCase):
         receipt["phases"].insert(0, dict(image=0, fn="C_GetSessionInfo", phase="warm", scope="selected",
                                          count=1, t0=64, t1=66))
         rows.insert(0, "21:37:58.638119 Unknown executable (PID 222, TID 222) "
-                       "C_GetSessionInfo [semantics unverified] → CKR_OK 10µs")
+                       "C_GetSessionInfo [semantics unverified] -> CKR_OK 10us")
         receipt["initial_ready"].update(output_cursor=4, proof_cursor=5)
         result = self.evaluate(rows, evidence, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
@@ -432,7 +432,7 @@ def stop(*_):
     global done
     done=True
 signal.signal(signal.SIGINT,stop)
-lines=['Trace — completed call events in arrival order',
+lines=['Trace - completed call events in arrival order',
        'Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.',
        'CAPTURE privacy=allowlisted']
 path=pathlib.Path(sys.argv[2]); path.write_text('\n'.join(lines)+'\n')
@@ -451,7 +451,7 @@ while True:
             '21:37:58.638119 Unknown executable (PID '+str(row['pid'])+', TID '+str(row['tid'])+')')
         if len(sys.argv)>4 and sys.argv[4]=='warm-wrong-image' and warm>=3:
             prefix=prefix.replace(json.dumps(image['path']),json.dumps('/foreign/image'))
-        line=prefix+' '+row['fn']+' [semantics unverified] → CKR_OK 10µs'
+        line=prefix+' '+row['fn']+' [semantics unverified] -> CKR_OK 10us'
         lines.append(line); print(line,flush=True)
         with path.open('a') as stream: stream.write(line+'\n')
     seen=len(calls)

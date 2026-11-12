@@ -631,7 +631,7 @@ pub(super) fn render_verbose(projection: &Projection, out: &mut Vec<u8>) -> std:
     for provider in &projection.providers {
         let mut detail = Vec::new();
         if let Some(sha256) = &provider.sha256 {
-            detail.push(format!("sha256 {}…", &sha256[..8.min(sha256.len())]));
+            detail.push(format!("sha256 {}...", &sha256[..8.min(sha256.len())]));
         }
         if let Some(admission) = &provider.admission {
             detail.push(escape_controls(admission).into_owned());

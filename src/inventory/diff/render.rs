@@ -433,7 +433,7 @@ fn short_label(label: &str) -> String {
     let mut characters = label.chars();
     let prefix: String = characters.by_ref().take(40).collect();
     if characters.next().is_some() {
-        format!("{prefix}… (full paths in module details)")
+        format!("{prefix}... (full paths in module details)")
     } else {
         prefix
     }
@@ -485,7 +485,7 @@ impl Human<'_> {
                 module
                     .paths
                     .first()
-                    .map(|path| short_label(basename(path)))
+                    .map(|path| short_label(path))
                     .unwrap_or_else(|| "Unknown module path".to_owned())
             ),
         )?;

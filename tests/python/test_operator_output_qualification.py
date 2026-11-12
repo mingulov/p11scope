@@ -78,7 +78,7 @@ def fixture():
 
 def render(counts, evidence, rows=3):
     text = ''.join('12:00:00.000001 Unknown executable (PID 123, TID 123) '
-                   'C_GenerateRandom → CKR_OK 1µs\n' for _ in range(rows))
+                   'C_GenerateRandom -> CKR_OK 1us\n' for _ in range(rows))
     return (text + (f"LOST {evidence['event_loss']} events\n" if evidence['event_loss'] else '') + 'COUNT_EVIDENCE ' + json.dumps(counts) + '\nEVIDENCE '
             + json.dumps(evidence) + '\n').encode()
 

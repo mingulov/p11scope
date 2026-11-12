@@ -608,7 +608,7 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, binary: &s
         return format!(
             "cannot attach a per-probe uprobe ({why}): kernel.perf_event_paranoid \
              is {level}, and at {PERF_OPEN_RESTRICT_PARANOID} or above this kernel refuses \
-             perf_event_open to any process without CAP_SYS_ADMIN — CAP_BPF and CAP_PERFMON do \
+             perf_event_open to any process without CAP_SYS_ADMIN - CAP_BPF and CAP_PERFMON do \
              not lift it. Per-probe (singles) uprobes attach through \
              perf_event_open, so this attach needs CAP_SYS_ADMIN (root normally has it), or \
              kernel.perf_event_paranoid at 2 or below. `p11scope doctor` shows this host's row"

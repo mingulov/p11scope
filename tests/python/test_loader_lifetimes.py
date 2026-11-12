@@ -127,13 +127,13 @@ def valid_report(expected, pin=None, l4=None):
 
 
 def valid_trace(expected, l4=None):
-    lines = ["Trace — completed call events in arrival order",
+    lines = ["Trace - completed call events in arrival order",
              "CAPTURE privacy=allowlisted"]
     pid = 2000
     for _ in range(expected):
         for fn in ("C_GetInfo", "C_GetSlotList"):
             lines.append(f"12:00:00.000001 \"driver\" (PID {pid}, TID {pid}) "
-                         f"exe=\"/d\" {fn} → CKR_OK 1µs")
+                         f"exe=\"/d\" {fn} -> CKR_OK 1us")
         pid += 1
     evidence = {"completeness": "COMPLETE", "verdict_detail": "clean_proven",
                 "drain_proven": True, "trace_truncated": False,
@@ -1124,12 +1124,12 @@ class FixtureWorkloadTests(unittest.TestCase):
 
 class TraceNoteAndTailTests(unittest.TestCase):
     NOTE = "Calls on unverified functions are not decoded (names only)."
-    HEADERS = ("Trace — completed call events in arrival order\n"
+    HEADERS = ("Trace - completed call events in arrival order\n"
                "Executable labels use verified observed paths; "
                "event PID/TID remain diagnostic identifiers.\n"
                "CAPTURE privacy=allowlisted\n")
     ROW = ("00:00:01.000000 \"fixture\" (PID 4242, TID 4242) "
-           "exe=\"/tmp/fixture\" C_Initialize → CKR_OK 3.0µs\n")
+           "exe=\"/tmp/fixture\" C_Initialize -> CKR_OK 3.0us\n")
     RECORDS = ('COUNT_EVIDENCE {"stats_entered": 1}\n'
                'EVIDENCE {"completeness": "COMPLETE"}\n')
 
@@ -1139,7 +1139,7 @@ class TraceNoteAndTailTests(unittest.TestCase):
             with self.subTest(totals=totals):
                 text = (self.HEADERS + self.NOTE + "\n" + self.ROW + self.RECORDS
                         + totals + "\n"
-                        + "coverage: partial — 1 entry without an observed return\n"
+                        + "coverage: partial - 1 entry without an observed return\n"
                         + "run with -v for details\n")
                 _, _, _, errors = ORACLE.parse_trace(text)
                 self.assertEqual(errors, [])

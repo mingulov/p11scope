@@ -503,11 +503,11 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
     );
     assert_eq!(
         module_label(&presentation, presentation.modules[0].id),
-        "provider.so"
+        "/opt/a/provider.so"
     );
     assert_eq!(
         module_label(&presentation, presentation.modules[1].id),
-        "provider.so"
+        "/opt/b/provider.so"
     );
     for caller in &presentation.callers {
         let _ = caller_lifecycle_label(caller);
@@ -543,12 +543,19 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
                 .all(|line| line.starts_with("application python3 ["))
         );
     }
-    for module in &presentation.modules[..2] {
+    for (module, path) in presentation.modules[..2]
+        .iter()
+        .zip(["/opt/a/provider.so", "/opt/b/provider.so"])
+    {
+        let rows: Vec<_> = overview
+            .iter()
+            .filter(|line| line.contains(&format!("[{}]: ", module.id.label())))
+            .collect();
+        assert!(!rows.is_empty());
         assert!(
-            overview
-                .iter()
-                .filter(|line| line.contains(&format!("[{}]: ", module.id.label())))
-                .all(|line| line.contains("-> module provider.so ["))
+            rows.iter()
+                .all(|line| line.contains(&format!("-> module {path} ["))),
+            "{rows:?}"
         );
     }
     for path in [
@@ -696,7 +703,7 @@ fn launcher_chain_collapses_wrappers_and_shows_init_parent_units() {
     let unit = presentation.callers[1].id;
     assert_eq!(
         launcher_chain_text(&presentation, folded).as_deref(),
-        Some("pkcs11-tool <- sh (×2) <- cron")
+        Some("pkcs11-tool <- sh (x2) <- cron")
     );
     assert_eq!(
         caller_origin_suffix(&presentation, unit).as_deref(),
@@ -898,12 +905,12 @@ fn coverage_line_uses_lowercase_verdict_and_omits_zero_counts() {
         snapshot.lines().nth(1).unwrap().to_string()
     };
     assert_eq!(coverage_of(0, 0, 0), "coverage: complete");
-    assert_eq!(coverage_of(2, 0, 0), "coverage: partial — 2 gaps");
-    assert_eq!(coverage_of(1, 1, 0), "coverage: partial — 1 gap, 1 refused");
-    assert_eq!(coverage_of(0, 0, 3), "coverage: partial — 3 more not shown");
+    assert_eq!(coverage_of(2, 0, 0), "coverage: partial - 2 gaps");
+    assert_eq!(coverage_of(1, 1, 0), "coverage: partial - 1 gap, 1 refused");
+    assert_eq!(coverage_of(0, 0, 3), "coverage: partial - 3 more not shown");
     assert_eq!(
         coverage_of(2, 1, 3),
-        "coverage: partial — 2 gaps, 1 refused, 3 more not shown"
+        "coverage: partial - 2 gaps, 1 refused, 3 more not shown"
     );
 }
 
@@ -2482,10 +2489,10 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
         snapshot,
         concat!(
             "inventory f7 (1 pass, 2 callers, 2 provider files, 2 edges)\n",
-            "coverage: partial — 1 gap\n",
-            "key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)\n",
-            "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
-            "application f7-app1 [c1 pid 70001 incarnation 0] -> module m1.so [m1]: At least 55 entries observed\n",
+            "coverage: partial - 1 gap\n",
+            "key operations: not available - per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)\n",
+            "application f7-app0 [c0 pid 70000 incarnation 0] -> module /scale/m0.so [m0]: At least 34 entries observed\n",
+            "application f7-app1 [c1 pid 70001 incarnation 0] -> module /scale/m1.so [m1]: At least 55 entries observed\n",
             "Details: retained paths, identities, states and coverage follow.\n",
             "budgets: callers 2/2 refused 0 | modules 2/2 refused 0 | edges 2/2 refused 0 | endpoints 8/8 refused 0 | counters observed 2 saturated 0 | semantic_state withheld held 0/4 unknown 2 refused 1 | retained_history 1/4 suppressed 0 | inventory_endpoints 0/8 refused 0 | inventory_attach_modules 0/2 refused 0 | semantic 128/4096B peak=256 refused=1 | open=0 active=0 pending=0 detached=0 mechanisms=0 categories=0 functions=0 function_bytes=0 function_capacity=0 returns=0 async_bytes=0 async_capacity=0 origins=0 origin_elements=0 origin_capacity=0\n",
             "caller c0 pid 70000 incarnation 0 mapped (/usr/bin/f7-app0)\n",
@@ -3733,7 +3740,7 @@ fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
         "a foreign-root failure is not an exit race: {concise}"
     );
     assert!(
-        concise.contains("3 ×")
+        concise.contains("3 x")
             && concise.contains("/etc/avahi")
             && concise.contains("--json lists each"),
         "concise folds the three identical foreign reasons into one counted line: {concise}"
@@ -3780,7 +3787,7 @@ fn concise_folds_map_files_fallback_foreign_root_gaps() {
     }
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        concise.contains("2 ×")
+        concise.contains("2 x")
             && concise.contains("in root /etc/avahi")
             && concise.contains("map_files fallback")
             && concise.contains("--json lists each"),
@@ -3845,7 +3852,7 @@ fn concise_folds_unreachable_process_races_into_one_counted_line() {
     );
     assert!(
         concise.contains(
-            "5 × mapped objects not examined — in 2 processes ended or unreachable (--json lists each)"
+            "5 x mapped objects not examined - in 2 processes ended or unreachable (--json lists each)"
         ),
         "one family line carries exact object and process counts: {concise}"
     );
@@ -3951,7 +3958,7 @@ fn concise_keeps_other_object_failures_out_of_the_unreachable_line() {
         "an ESRCH row with a fallback attempt keeps the foreign fold: {concise}"
     );
     assert!(
-        concise.contains("2 ×")
+        concise.contains("2 x")
             && concise.contains("/etc/avahi")
             && concise.contains("--json lists each"),
         "foreign ENOENT keeps its per-root fold: {concise}"
@@ -3997,7 +4004,7 @@ fn concise_unreachable_line_handles_single_and_pidless_rows() {
     let concise = render_snapshot_with_verbosity(&single, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "1 × mapped objects not examined — in 1 process ended or unreachable (--json lists each)"
+            "1 x mapped objects not examined - in 1 process ended or unreachable (--json lists each)"
         ),
         "a single race reads as one counted line: {concise}"
     );
@@ -4018,7 +4025,7 @@ fn concise_unreachable_line_handles_single_and_pidless_rows() {
     let concise = render_snapshot_with_verbosity(&pidless, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "2 × mapped objects not examined — 2 mapped objects unreachable (--json lists each)"
+            "2 x mapped objects not examined - 2 mapped objects unreachable (--json lists each)"
         ),
         "pidless rows read as unreachable objects: {concise}"
     );
@@ -4057,7 +4064,7 @@ fn concise_folds_many_replaced_files_into_one_counted_line() {
     assert!(concise.contains("gaps: 5"), "header counts rows: {concise}");
     assert!(
         concise.contains(
-            "5 × replaced files not examined — 4 files replaced while running (--json lists each)"
+            "5 x replaced files not examined - 4 files replaced while running (--json lists each)"
         ),
         "one family line carries exact row and file counts: {concise}"
     );
@@ -4132,7 +4139,7 @@ fn concise_keeps_replaced_admitted_providers_named_in_a_flood() {
     assert!(concise.contains("gaps: 5"), "header counts rows: {concise}");
     assert!(
         concise.contains(
-            "3 × replaced files not examined — 3 files replaced while running (--json lists each)"
+            "3 x replaced files not examined - 3 files replaced while running (--json lists each)"
         ),
         "the fold counts only the non-provider rest: {concise}"
     );
@@ -4199,7 +4206,7 @@ fn concise_keeps_small_replaced_and_unparsable_maps_rows_named() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(concise.contains("gaps: 3"), "header counts rows: {concise}");
     assert!(
-        concise.contains("libsoftokn3") && concise.contains("p11-kit-trust"),
+        concise.contains("libsoftokn3") && concise.contains("11-kit-trust.so (deleted)"),
         "small replaced families stay named per file: {concise}"
     );
     assert!(
@@ -4257,7 +4264,7 @@ fn concise_folds_maps_attribution_into_one_counted_line() {
     assert!(concise.contains("gaps: 4"), "header counts rows: {concise}");
     assert!(
         concise.contains(
-            "4 × maps attribution — 3 processes; 8 mappings summed over passes (--json lists each)"
+            "4 x maps attribution - 3 processes; 8 mappings summed over passes (--json lists each)"
         ),
         "one family line carries exact row and process counts with the summed mappings: {concise}"
     );
@@ -4538,10 +4545,10 @@ fn concise_gap_summary_lists_small_groups_without_fold() {
         block,
         &[
             "gaps: 4",
-            "  1 × scope-a — reason-a",
-            "  1 × scope-b — reason-b",
-            "  1 × scope-c — reason-c",
-            "  1 × scope-d — reason-d",
+            "  1 x scope-a - reason-a",
+            "  1 x scope-b - reason-b",
+            "  1 x scope-c - reason-c",
+            "  1 x scope-d - reason-d",
         ],
         "{out}"
     );
@@ -4914,7 +4921,7 @@ fn concise_replaced_providers_read_as_gaps() {
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "coverage: partial — 3 gaps"),
+        out.lines().any(|line| line == "coverage: partial - 3 gaps"),
         "replaced providers count as gaps: {out}"
     );
     let lines: Vec<&str> = out.lines().collect();
@@ -4924,14 +4931,14 @@ fn concise_replaced_providers_read_as_gaps() {
         .expect("gaps header");
     let block = &lines[start + 1..start + 4];
     assert!(
-        block.contains(&"  1 × fixture scope — fixture reason"),
+        block.contains(&"  1 x fixture scope - fixture reason"),
         "the gaps block holds the fixture gap: {out}"
     );
-    for fragment in ["libsoftokn3", "p11-kit-trust"] {
+    for fragment in ["libsoftokn3", "11-kit-trust.so (deleted)"] {
         assert!(
             block.iter().any(|line| line.contains(fragment)
                 && line.ends_with(
-                    " — replaced on disk while running; not examined, calls not counted"
+                    " - replaced on disk while running; not examined, calls not counted"
                 )),
             "the gaps block names the {fragment} running copy with its loss: {out}"
         );
@@ -4968,7 +4975,7 @@ fn replaced_only_gaps_force_partial_with_gaps_block() {
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "coverage: partial — 1 gap"),
+        out.lines().any(|line| line == "coverage: partial - 1 gap"),
         "a replaced provider alone forces PARTIAL: {out}"
     );
     assert!(
@@ -5006,7 +5013,7 @@ fn replaced_provider_gap_forces_partial_coverage() {
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "coverage: partial — 1 gap"),
+        out.lines().any(|line| line == "coverage: partial - 1 gap"),
         "a replaced-provider gap forces PARTIAL: {out}"
     );
     assert!(
@@ -5879,7 +5886,7 @@ fn gap_group_line_keeps_path_tail() {
         "replaced on disk while running; not examined, calls not counted",
     );
     assert!(
-        line.starts_with("  1 × …"),
+        line.starts_with("  1 x ..."),
         "the line keeps the path tail: {line}"
     );
     assert!(
@@ -5907,7 +5914,7 @@ fn gap_group_line_keeps_prose_head() {
     );
     assert_eq!(
         line,
-        "  1 × native usage feed… — live capture refused (missing capabilities); run \
+        "  1 x native usage feed... - live capture refused (missing capabilities); run \
          'p11scope doctor'"
     );
 }
@@ -5922,10 +5929,10 @@ fn gap_group_line_cuts_prose_on_word_boundary() {
         "live capture refused (missing capabilities); run 'p11scope doctor'",
     );
     assert!(
-        line.contains("native usage feed…"),
+        line.contains("native usage feed..."),
         "cuts on a word boundary: {line}"
     );
-    assert!(!line.contains("unavai…"), "never cuts mid-word: {line}");
+    assert!(!line.contains("unavai..."), "never cuts mid-word: {line}");
     assert!(line.chars().count() <= 100, "over 100 chars: {line}");
 }
 /// F1: an empty inventory with replaced-file gaps names the loss:
@@ -6311,7 +6318,7 @@ fn concise_gap_summary_folds_kernel_thread_notes_with_summed_total() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "  5 × kernel threads — 583 processes examined are kernel threads with no user memory to scan"
+            "  5 x kernel threads - 583 processes examined are kernel threads with no user memory to scan"
         ),
         "one folded line carries the summed total:\n{concise}"
     );
@@ -6373,7 +6380,7 @@ fn concise_kernel_thread_fold_sums_repeats_and_singular_template() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "  2 × kernel threads — 217 processes examined are kernel threads with no user memory to scan"
+            "  2 x kernel threads - 217 processes examined are kernel threads with no user memory to scan"
         ),
         "two rows fold with repeats multiplied (108x2 + 1):\n{concise}"
     );
@@ -6496,4 +6503,174 @@ fn concise_gap_summary_shows_per_key_off_once() {
         .as_array()
         .expect("JSON keeps a gaps array");
     assert_eq!(gaps.len(), 2, "JSON keeps every record: {document}");
+}
+
+/// Provider lines name the full retained path, so two same-named files
+/// in different directories stay distinguishable in concise text.
+#[test]
+fn concise_provider_line_names_full_path() {
+    let harness = varied_harness();
+    let presentation = capture_for(&harness, &harness.render());
+    let with_edges: BTreeSet<_> = presentation.edges.iter().map(|edge| edge.module).collect();
+    assert!(!with_edges.is_empty(), "fixture must map a module");
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    for module in &presentation.modules {
+        if !with_edges.contains(&module.id) {
+            continue;
+        }
+        let path = module.paths.first().expect("fixture paths");
+        let line = concise
+            .lines()
+            .find(|line| line.starts_with(&format!("{path}:")))
+            .unwrap_or_else(|| panic!("missing full-path line for {path}:\n{concise}"));
+        assert!(line.contains("mapped by"), "{line}");
+    }
+}
+
+/// A deleted provider keeps its full path plus the retained marker.
+#[test]
+fn provider_display_name_keeps_deleted_marker() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.modules[0].paths = vec!["/opt/gone/prov.so (deleted)".into()];
+    assert_eq!(
+        module_display_name(&presentation, presentation.modules[0].id),
+        "/opt/gone/prov.so (deleted)"
+    );
+}
+
+/// Two modules sharing one path string (one file seen through two
+/// mounts) each carry their JSON identity beside the path; unique
+/// paths print bare.
+#[test]
+fn duplicate_provider_paths_carry_device_inode_identity() {
+    use crate::discovery::caller_registry::ModuleId;
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let twin = presentation.modules[0].clone();
+    let twin_id = ModuleId(9000);
+    assert!(
+        presentation
+            .modules
+            .iter()
+            .all(|module| module.id != twin_id),
+        "fixture must leave the twin id free"
+    );
+    let mut twin_view = twin.clone();
+    twin_view.id = twin_id;
+    twin_view.device_major = 7;
+    twin_view.device_minor = 6;
+    twin_view.inode = 4518;
+    presentation.modules.push(twin_view);
+    presentation.modules.sort_by_key(|module| module.id);
+    let path = twin.paths.first().expect("fixture paths").clone();
+    let first = module_display_name(&presentation, twin.id);
+    let second = module_display_name(&presentation, twin_id);
+    assert_ne!(first, second, "twins must read distinctly");
+    for display in [&first, &second] {
+        assert!(
+            display.starts_with(&format!("{path} [dev ")),
+            "identity sits beside the path: {display}"
+        );
+    }
+    assert!(
+        first.contains(&format!(
+            " [dev {}:{} ino {}]",
+            twin.device_major, twin.device_minor, twin.inode
+        )),
+        "{first}"
+    );
+    assert!(second.contains(" [dev 7:6 ino 4518]"), "{second}");
+    // A module with a unique path prints bare.
+    let unique = presentation
+        .modules
+        .iter()
+        .find(|module| module.id != twin.id && module.id != twin_id)
+        .expect("fixture has a third module");
+    assert_eq!(
+        module_display_name(&presentation, unique.id),
+        unique.paths.first().expect("fixture paths").clone()
+    );
+}
+
+/// A provider whose mapping callers agree on one container shows that
+/// origin in brackets on its concise line.
+#[test]
+fn provider_line_carries_container_origin() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    assert!(!callers.is_empty(), "fixture must map the first module");
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers.iter().map(|id| (*id, docker)).collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let path = presentation.modules[0]
+        .paths
+        .first()
+        .expect("fixture paths")
+        .clone();
+    let line = concise
+        .lines()
+        .find(|line| line.starts_with(path.as_str()))
+        .unwrap_or_else(|| panic!("missing provider line for {path}:\n{concise}"));
+    assert!(
+        line.contains("[container 0123456789ab (docker, cgroup hint)]"),
+        "{line}"
+    );
+}
+
+/// Callers in two containers behind one provider read as multiple
+/// origins rather than one wrong container.
+#[test]
+fn provider_line_with_split_callers_reads_multiple_origins() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let module = presentation.modules[0].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == module)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "fixture must map two callers to one module"
+    );
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let pod = scope_metadata_for(&format!(
+        "kubepods/burstable/pod{SCOPE_POD_UID}/{SCOPE_DOCKER_ID}"
+    ));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = callers
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, if index == 0 { docker } else { pod }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert_eq!(
+        module_display_name(&presentation, module)
+            .strip_prefix(
+                presentation.modules[0]
+                    .paths
+                    .first()
+                    .expect("fixture paths")
+                    .as_str()
+            )
+            .expect("display starts with the path"),
+        " [multiple origins]"
+    );
 }

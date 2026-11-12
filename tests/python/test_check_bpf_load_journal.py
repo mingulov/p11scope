@@ -75,7 +75,7 @@ def journal_rows():
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
-key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)
+key operations: not available - per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)
 """
 
 #: The linked run under -v with verbose per-process Joint gap detail:
@@ -215,7 +215,7 @@ class JournalGateTests(unittest.TestCase):
             "linked-joint": {"rc": 0, "text": LINKED_JOINT_TEXT},
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
-                "key operations: not available — per-key tracking never started, so no "
+                "key operations: not available - per-key tracking never started, so no "
                 "key can be named yet (reason: bootstrap_unavailable)",
                 "key operations: not reported (per-key tracking is off)")},
             "refused-build": {"rc": 0, "text":

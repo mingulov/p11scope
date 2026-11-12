@@ -567,7 +567,7 @@ def build_record(meta, report, samples, stderr_rows, truth, observed,
         line = row.get("line", "")
         if "module refused:" in line:
             rest = line.split("module refused:", 1)[1].strip()
-            path, _, reason = rest.partition(" — ")
+            path, _, reason = rest.partition(" - ")
             refused.append({"path": path, "reason": reason or "unknown"})
     broad_lines = [row.get("line", "") for row in stderr_rows
                    if "broad fixed-family:" in row.get("line", "")]
@@ -718,7 +718,7 @@ def build_summary(record):
                      f"sources={','.join(module['sources'])} "
                      f"corroboration={','.join(module['corroboration'])}")
     for module in ev["refused_modules"]:
-        lines.append(f"    refused: {module['path']} — {module['reason']}")
+        lines.append(f"    refused: {module['path']} - {module['reason']}")
     for text in ev["broad_lines"]:
         lines.append(f"    {text}")
     observed_nz = {k: v for k, v in tvo["observed"].items() if v}

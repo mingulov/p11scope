@@ -241,7 +241,7 @@ fn a_target_claimed_by_two_modules_is_attached_once_and_marked_ambiguous() {
     assert_eq!(
         plan.slots.len(),
         1,
-        "one {{object, offset}} ⇒ one slot, never two probes"
+        "one {{object, offset}} => one slot, never two probes"
     );
     assert_eq!(plan.slots[0].module_ids, vec![ModuleId(0), ModuleId(1)]);
     assert_eq!(plan.module_ambiguous, 1);
@@ -552,7 +552,7 @@ fn a_second_finalize_reporting_not_initialized_stays_within_its_module() {
     assert_eq!(
         state.semantic_evidence().state_reconciliations,
         0,
-        "the proxy had no state left to reconcile — counting one would be a false signal"
+        "the proxy had no state left to reconcile - counting one would be a false signal"
     );
 
     // The backend's own close still matches.

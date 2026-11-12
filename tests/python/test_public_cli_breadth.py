@@ -131,7 +131,7 @@ def trace_stream(*, calls_per_function=7, lost=0, event_loss=0, semantic_failure
     for name in NAMES:
         for _ in range(calls_per_function):
             seq += 1
-            lines.append(f"00:00:{seq // 60:02d}.{seq % 60:06d} pid 123 tid 456 {name} -> CKR_OK 1.0us".replace("->", "\u2192"))
+            lines.append(f"00:00:{seq // 60:02d}.{seq % 60:06d} pid 123 tid 456 {name} -> CKR_OK 1.0us")
     if lost:
         lines.append(f"LOST {lost} events")
     if truncated:
@@ -303,7 +303,7 @@ def trace_stream_mt(*, calls_per_function=8, lost=0, event_loss=0, semantic_fail
     for name in MT_NAMES:
         for _ in range(calls_per_function):
             seq += 1
-            lines.append(f"00:00:{seq // 60:02d}.{seq % 60:06d} pid 123 tid 456 {name} \u2192 CKR_OK 1.0us")
+            lines.append(f"00:00:{seq // 60:02d}.{seq % 60:06d} pid 123 tid 456 {name} -> CKR_OK 1.0us")
     if lost:
         lines.append(f"LOST {lost} events")
     if truncated:
@@ -1271,7 +1271,7 @@ class MtOracleTests(unittest.TestCase):
         self.run_case_mt(cell="mt-trace", want=1, calls=3, report_text=text)
 
     def test_mt_trace_malformed_stream_fails(self):
-        self.run_case_mt(cell="mt-trace", want=1, report_text="CALL \u2192 done\n" * 42)
+        self.run_case_mt(cell="mt-trace", want=1, report_text="CALL -> done\n" * 42)
 
     def test_mt_system_runner_noise_disclosed(self):
         def mutate(d, l, r):

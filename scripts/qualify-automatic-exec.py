@@ -4227,7 +4227,7 @@ def parse_live_frames(text, final=True):
             if final or next_frame >= 0:
                 raise ValueError("incomplete public live frame")
             break
-        if not lines[0].startswith("p11scope — ") or "\x1b" in frame:
+        if not lines[0].startswith("p11scope - ") or "\x1b" in frame:
             raise ValueError("malformed public live frame")
         totals = [LIVE_TOTALS.fullmatch(line.strip()) for line in lines]
         totals = [match for match in totals if match]

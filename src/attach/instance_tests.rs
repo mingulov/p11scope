@@ -4817,7 +4817,7 @@ fn privileged_instance_small_state_lru_eviction_never_joins() -> Result<()> {
     );
     ensure!(
         unstamped >= 1,
-        "no eviction observed — is this a small-state build?"
+        "no eviction observed - is this a small-state build?"
     );
     ensure!(joined >= 1, "no positive routing at all");
     ensure!(harness.events >= 100, "drain went vacuous");

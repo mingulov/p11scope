@@ -362,10 +362,10 @@ pub fn refuse_nested_empty_capture(
     Err(anyhow::Error::new(NumberingMismatch(format!(
         "{MISMATCH_CODE}: refusing {what}: it found no countable modules, but this observer runs \
          in a container PID namespace with its own /proc, so host processes are not visible and \
-         providers only they map are never discovered — an empty result here cannot mean \
+         providers only they map are never discovered - an empty result here cannot mean \
          nothing uses PKCS#11. Run p11scope in the host's initial PID namespace with its own \
          /proc (Kubernetes: hostPID: true on a real node; docker: --pid host); on a nested \
-         kind/k3d node hostPID is already set — use a real node or capture a workload pod \
+         kind/k3d node hostPID is already set - use a real node or capture a workload pod \
          with --cgroup"
     ))))
 }

@@ -4852,7 +4852,7 @@ mod tests {
         assert_eq!(s.orphan_ops(), 1);
         assert!(
             s.mechanisms().is_empty(),
-            "an orphan op names no mechanism — never a guess"
+            "an orphan op names no mechanism - never a guess"
         );
     }
 
@@ -5132,7 +5132,7 @@ mod tests {
         assert_eq!(
             s.total_shape_decode_failures(),
             1,
-            "one mechanism id, wholly failed — the completeness-gating count"
+            "one mechanism id, wholly failed - the completeness-gating count"
         );
     }
 
@@ -5193,12 +5193,12 @@ mod tests {
         assert_eq!(
             t.bools_true & attr_bool::SIGN,
             0,
-            "never present — not true"
+            "never present - not true"
         );
         assert_eq!(
             t.bools_false & attr_bool::SIGN,
             0,
-            "never present — not false either"
+            "never present - not false either"
         );
         assert!(!t.truncated);
     }

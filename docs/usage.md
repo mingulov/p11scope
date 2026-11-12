@@ -400,7 +400,7 @@ semantics, use the separate
 Terminal text is short by default: the main results (providers, callers,
 functions and mechanisms, key-operation rows), one coverage status line
 (`coverage: complete`, or `coverage: partial` with plain-word reasons —
-including `coverage: partial — counts complete; …` when only names are
+including `coverage: partial - counts complete; ...` when only names are
 unconfirmed), and a
 `run with -v for details` hint. `-v` / `--verbose` shows the full detail —
 every gap and limitation with reasons, evidence, per-slot or per-table data,
@@ -1121,18 +1121,18 @@ Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-
 
 A current capture's coverage line names why it is `PARTIAL`, grouped by the
 same classes `evidence.gap_classes` publishes, in plain words: for example
-`coverage: partial — counts complete; function names follow the standard PKCS#11 table
+`coverage: partial - counts complete; function names follow the standard PKCS#11 table
 but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding)`
 for a clean scan-only capture of a provider with a non-standard table
 (`verdict_detail: "attribution_only"`: counts are exact, only the names are
 unconfirmed), or
-`coverage: partial — calls may be missing (12 call records lost)` for a lossy
-one (`"concrete_gap"`). `coverage: partial — end of capture not fully
+`coverage: partial - calls may be missing (12 call records lost)` for a lossy
+one (`"concrete_gap"`). `coverage: partial - end of capture not fully
 confirmed (last calls may be missing)` means nothing concrete is behind the
 verdict (`"clean_but_unproven"`): the stop gate did not prove the final drain
 (see `evidence.stop_quiescence`). An owned run whose command ran ahead of
 probe attachment without pausing says
-`coverage: partial — the command loaded its provider before probes attached;
+`coverage: partial - the command loaded its provider before probes attached;
 rerun with --pause auto`. Since 0.7.0 the default is `--pause auto`, so
 this line appears only when the run did not pause (explicit `--pause
 never`). With `-v`, each plain reason is paired with its

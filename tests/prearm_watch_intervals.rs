@@ -873,7 +873,7 @@ fn inventory_prearm_section_empty_without_flag() {
     assert_eq!(
         document["prearm"],
         serde_json::Value::Array(Vec::new()),
-        "no flag, no rows — but the section exists"
+        "no flag, no rows - but the section exists"
     );
 }
 
@@ -1080,7 +1080,7 @@ fn discovery_prearm_row_mapped_live_shape() {
     assert_eq!(
         post_json["watch"],
         serde_json::json!({"since_ns": null, "state": "pinned_unarmed"}),
-        "still unarmed — discovery never arms: {post_json}"
+        "still unarmed - discovery never arms: {post_json}"
     );
     assert_row_identity(&post_json, &lifecycle.provider);
     barrier.shutdown();

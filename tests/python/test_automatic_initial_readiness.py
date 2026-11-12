@@ -212,7 +212,7 @@ def ledger():
     return [json.loads(line[9:]) for line in ledger_path.read_text().splitlines()
             if line.startswith('N3LEDGER ')]
 seen=sum(row['kind']=='call' for row in ledger()); warm={}; count=0
-headers=['Trace — completed call events in arrival order',
+headers=['Trace - completed call events in arrival order',
     'Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.',
     'CAPTURE privacy=allowlisted']
 output.write_text('\n'.join(headers)+'\n');print('\n'.join(headers),flush=True)
@@ -227,7 +227,7 @@ while True:
         prefix=('21:37:58.638119 '+json.dumps(pathlib.Path(image['path']).name)+
             ' (PID '+str(row['pid'])+', TID '+str(row['tid'])+') exe='+json.dumps(image['path'])) if warm.get(row['image'],0)>=3 else (
             '21:37:58.638119 Unknown executable (PID '+str(row['pid'])+', TID '+str(row['tid'])+')')
-        line=prefix+' '+row['fn']+' [semantics unverified] → CKR_OK 10µs'
+        line=prefix+' '+row['fn']+' [semantics unverified] -> CKR_OK 10us'
         print(line,flush=True)
         with output.open('a') as stream:stream.write(line+'\n')
         count+=1

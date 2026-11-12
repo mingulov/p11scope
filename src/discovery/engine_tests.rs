@@ -4336,7 +4336,7 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
     // the lookalike tables with the first-plan wording, and a prefix names
     // its covered templates. Same subject, same module.
     let whole = "module needs 6283 more; only 512 attach slots are available; 68 are in use \
-         (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a prefix \
+         (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) - refusing to attach a prefix \
          of its 64 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
          when mapped before the capture's first plan, or as published tables)";
     let prefix = "2 of 64 template tables attached; calls through the others are not counted (closure_prefix)";
@@ -11528,7 +11528,7 @@ fn scan_pin_diagnostics_escape_target_controls() {
         format_discovery_skip("/opt/p\u{1b}[2Jevil\r.so", "scan failed: \u{1b}[31mboom\r");
     assert_eq!(
         message,
-        r"p11scope: discovery skipped /opt/p\u{1b}[2Jevil\r.so — scan failed: \u{1b}[31mboom\r"
+        r"p11scope: discovery skipped /opt/p\u{1b}[2Jevil\r.so - scan failed: \u{1b}[31mboom\r"
     );
     assert!(!message.contains('\u{1b}') && !message.contains('\r'));
 }
@@ -11548,7 +11548,7 @@ fn module_refusal_diagnostics_escape_target_controls() {
     let message = format_module_refusal("/opt/p\u{1b}[2Jevil\r.so", "capacity: \u{1b}[31mboom\r");
     assert_eq!(
         message,
-        r"p11scope: module refused: /opt/p\u{1b}[2Jevil\r.so — capacity: \u{1b}[31mboom\r"
+        r"p11scope: module refused: /opt/p\u{1b}[2Jevil\r.so - capacity: \u{1b}[31mboom\r"
     );
     assert!(!message.contains('\u{1b}') && !message.contains('\r'));
 }
@@ -11559,7 +11559,7 @@ fn capacity_refusal_summary_names_up_to_three_providers_once() {
     assert_eq!(
         format_capacity_refusal_summary(&["/opt/trust.so"]),
         Some(
-            "p11scope: 1 provider file(s) not watched (attach slots): /opt/trust.so — see Module gaps in the report"
+            "p11scope: 1 provider file(s) not watched (attach slots): /opt/trust.so - see Module gaps in the report"
                 .into()
         )
     );
@@ -11572,7 +11572,7 @@ fn capacity_refusal_summary_names_up_to_three_providers_once() {
             "/opt/e.so"
         ]),
         Some(
-            r"p11scope: 5 provider file(s) not watched (attach slots): /opt/a.so, /opt/b\u{1b}[2Jevil\r.so, /opt/c.so and 2 more — see Module gaps in the report"
+            r"p11scope: 5 provider file(s) not watched (attach slots): /opt/a.so, /opt/b\u{1b}[2Jevil\r.so, /opt/c.so and 2 more - see Module gaps in the report"
                 .into()
         )
     );
@@ -11614,21 +11614,21 @@ fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
     for reason in [
         "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)",
         "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)",
-        "admitted module needs 2 more; only 512 attach slots are available; 511 are in use — 2 endpoints not attached; kept its 511 attached endpoints",
+        "admitted module needs 2 more; only 512 attach slots are available; 511 are in use - 2 endpoints not attached; kept its 511 attached endpoints",
     ] {
         let message = format_module_refusal("/opt/prefix.so", reason);
         assert!(
-            message.starts_with("p11scope: module partially covered: /opt/prefix.so — "),
+            message.starts_with("p11scope: module partially covered: /opt/prefix.so - "),
             "a partial gap must not read refused: {message}"
         );
         assert!(message.contains(reason), "{message}");
     }
     let whole = format_module_refusal(
         "/opt/crowded.so",
-        "module needs 150 more; only 512 attach slots are available — refusing to attach a prefix",
+        "module needs 150 more; only 512 attach slots are available - refusing to attach a prefix",
     );
     assert!(
-        whole.starts_with("p11scope: module refused: /opt/crowded.so — "),
+        whole.starts_with("p11scope: module refused: /opt/crowded.so - "),
         "a whole refusal keeps its verb: {whole}"
     );
 }
@@ -38982,7 +38982,7 @@ fn a_manifest_naming_its_object_and_its_provenance_differently_is_still_retarget
         let plan = plan::build_from_sources(&[], std::slice::from_ref(&m), &pins);
         let attach = pins.attach_path_for(plan.slots[0].object).expect(
             "a manifest whose recorded identity is not the live one must still \
-                 resolve — that reuse is what pinning by build-id and sha256 is for",
+                 resolve - that reuse is what pinning by build-id and sha256 is for",
         );
         assert_eq!(
             std::fs::metadata(&attach).unwrap().ino(),
@@ -45340,7 +45340,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     assert_eq!(engine.budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
     let noise = engine.counters.noise.lines();
     assert!(noise.contains(&format!(
-        "p11scope: discovery: process-view: discovery skipped process view — the process generation could not be retained: {SCAN_DEADLINE_REASON}"
+        "p11scope: discovery: process-view: discovery skipped process view - the process generation could not be retained: {SCAN_DEADLINE_REASON}"
     )), "the scrubbed bounded diagnostic preserves the actual deadline: {noise:?}");
     assert_eq!(
         engine.refresh_requested.get(&newcomer),

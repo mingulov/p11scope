@@ -451,9 +451,9 @@ class H6ReduceRawEvidence(unittest.TestCase):
     REFUSAL = [{"name": "discovery subject", "reason": E16.TABLE_UNAVAILABLE}]
 
     def diagnostics(self, *subjects, aggregated=False):
-        count = " ×2" if aggregated else ""
+        count = " x2" if aggregated else ""
         return "\n".join(
-            f"p11scope: discovery: other{count}: discovery skipped {subject} — matched a "
+            f"p11scope: discovery: other{count}: discovery skipped {subject} - matched a "
             f"--module hint; {E16.NO_TABLE_DIAGNOSTIC}; a table built at run time" for subject in subjects)
 
     def test_owned_no_table_refusal_binds_only_its_own_label(self):
@@ -652,7 +652,7 @@ if mode == "silent":
 for member in spec:
     if member["expect"] == "explicit-unsupported" and member["hinted"]:
         subject = member["hint"] + (".FOREIGN.so" if mode == "foreign-diagnostic" else "")
-        err.write("p11scope: discovery: other: discovery skipped " + subject + " — matched a "
+        err.write("p11scope: discovery: other: discovery skipped " + subject + " - matched a "
                   "--module hint; no function table was found in its file-backed data; a table "
                   "built at run time in .bss or on the heap is outside the memory scan's reach; "
                   "to observe it, run p11scope-discover --module " + subject + " -o <manifest.json> "

@@ -468,7 +468,7 @@ class CapabilityIntegrityTest(unittest.TestCase):
             trace = trace.replace("COUNT_EVIDENCE ", "BROKEN\nCOUNT_EVIDENCE ")
         file_trace = trace
         if change == "file-disagreement":
-            file_trace = trace.replace("→ CKR_OK", "→ CKR_GENERAL_ERROR", 1)
+            file_trace = trace.replace("-> CKR_OK", "-> CKR_GENERAL_ERROR", 1)
         source = H6["evaluate_trace_h6"](trace, ledger, receipt, file_trace)
         return source, receipt
 

@@ -7867,7 +7867,7 @@ fn pin_manifest_objects_with_read_policy(
             Ok(_) => {
                 skipped.push(Skipped {
                     subject: object.path.clone(),
-                    reason: "manifest object unavailable: file changed while it was being identified — retry".into(),
+                    reason: "manifest object unavailable: file changed while it was being identified - retry".into(),
                 });
                 continue;
             }
@@ -7966,7 +7966,7 @@ fn pin_manifest_objects_with_read_policy(
                 path: object.path.clone(),
                 reason: ManifestStaleReason::IdentityMismatch,
                 diagnostic: format!(
-                    "{}: identity changed since discovery (manifest {:?} {} sha256 {}, current {:?} {} sha256 {}) — re-run `p11scope-discover`",
+                    "{}: identity changed since discovery (manifest {:?} {} sha256 {}, current {:?} {} sha256 {}) - re-run `p11scope-discover`",
                     object.path,
                     object.identity.kind,
                     object.identity.value.as_deref().unwrap_or("-"),
@@ -8328,7 +8328,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             Ok(_) => {
                 skipped.push(Skipped {
                     subject: spelling.clone(),
-                    reason: "prearm object unavailable: file changed while it was being identified — retry"
+                    reason: "prearm object unavailable: file changed while it was being identified - retry"
                         .into(),
                 });
                 continue;
@@ -9374,7 +9374,7 @@ fn pin_scanned_object(
     // The clock read precedes the verification it timestamps.
     let verified_ns = crate::attach::monotonic_ns();
     if pin_of(&file)? != before {
-        return Err("file changed while it was being identified — retry".into());
+        return Err("file changed while it was being identified - retry".into());
     }
     // Only the stable read lands here: a file that changed mid-read is never cached.
     if cacheable {
@@ -11175,7 +11175,7 @@ mod tests {
         assert_eq!(skipped.len(), 1, "the changed object is reported once");
         assert_eq!(
             skipped[0].reason,
-            "file changed while it was being identified — retry"
+            "file changed while it was being identified - retry"
         );
     }
 

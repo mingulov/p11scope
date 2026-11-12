@@ -300,7 +300,7 @@ fn joint_cells_name_existing_tests() {
         let id = format!("joint_cell_{}_{}", state_id(*state), event_id(*event));
         assert!(
             file.contains(&id),
-            "{state:?}×{event:?} ({home_name}): the home file lacks `{id}`"
+            "{state:?}x{event:?} ({home_name}): the home file lacks `{id}`"
         );
         checked += 1;
     }
@@ -341,10 +341,10 @@ fn joint_cells_cover_every_pair_once() {
                 let home = CellHome::Unconstructible("a completion exists only after Complete");
                 assert_eq!(
                     hits, 0,
-                    "{state:?}×{event:?} is {home:?}: it must stay absent"
+                    "{state:?}x{event:?} is {home:?}: it must stay absent"
                 );
             } else {
-                assert_eq!(hits, 1, "{state:?}×{event:?}: missing or duplicate pair");
+                assert_eq!(hits, 1, "{state:?}x{event:?}: missing or duplicate pair");
             }
         }
     }

@@ -241,27 +241,27 @@ C
         exit 1
     fi
     printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED \
-        'p11scope — privacy=aggregate-only' \
-        'p11scope — privacy=aggregate-only' \
+        'p11scope - privacy=aggregate-only' \
+        'p11scope - privacy=aggregate-only' \
         > "$self_root/presnapshot.log"
     WAIT_PID=$$
     wait_mapped_and_drained "$self_root/presnapshot.log" dlopen
     printf '%s\n' 'p11scope — provider diagnostic HARNESS_PROVIDER_LATE_LOAD ... HARNESS_PROVIDER_MAPPED' \
         > "$self_root/interleaved.log"
     (sleep 0.25; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.5) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.03; \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.5) \
         >> "$self_root/interleaved.log" &
     WAIT_PID=$!
     wait_mapped_and_drained "$self_root/interleaved.log" dlopen
     wait "$WAIT_PID"
     printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED \
-        'p11scope — privacy=aggregate-only' \
+        'p11scope - privacy=aggregate-only' \
         > "$self_root/topology-race.log"
     (
         sleep 0.5
         printf '%s\n' HARNESS_PROVIDER_INITIAL_SET \
-            'p11scope — privacy=aggregate-only' >> "$self_root/topology-race.log"
+            'p11scope - privacy=aggregate-only' >> "$self_root/topology-race.log"
         sleep 0.3
     ) &
     WAIT_PID=$!
@@ -273,7 +273,7 @@ C
     WAIT_ATTEMPTS=20 WAIT_DELAY=0.01
     : > "$self_root/one.log"
     (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/one.log" &
     WAIT_PID=$!
     if wait_mapped_and_drained "$self_root/one.log" dlopen; then
@@ -283,16 +283,16 @@ C
     wait "$WAIT_PID"
     : > "$self_root/two.log"
     (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.15; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.03; \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/two.log" &
     WAIT_PID=$!
     wait_mapped_and_drained "$self_root/two.log" dlopen
     wait "$WAIT_PID"
     : > "$self_root/initial.log"
     (printf '%s\n' HARNESS_PROVIDER_INITIAL_SET HARNESS_PROVIDER_MAPPED; sleep 0.15; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.03; \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/initial.log" &
     WAIT_PID=$!
     wait_mapped_and_drained "$self_root/initial.log" initial-set
@@ -304,7 +304,7 @@ C
     fi
     : > "$self_root/duplicate.log"
     (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only privacy=aggregate-only'; sleep 0.3) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/duplicate.log" &
     WAIT_PID=$!
     if wait_mapped_and_drained "$self_root/duplicate.log" dlopen; then
@@ -314,8 +314,8 @@ C
     wait "$WAIT_PID"
     : > "$self_root/unterminated.log"
     (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.03; \
-        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
-        printf '%s' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
+        printf '%s\n' 'p11scope - privacy=aggregate-only'; sleep 0.03; \
+        printf '%s' 'p11scope - privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/unterminated.log" &
     WAIT_PID=$!
     if wait_mapped_and_drained "$self_root/unterminated.log" dlopen; then

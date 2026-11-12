@@ -344,9 +344,9 @@ CALL_PREFIX_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
     r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
     rf"{TRACE_JSON_STRING} \(PID [0-9]+, TID [0-9]+\) exe={TRACE_JSON_STRING}) (?P<body>.*)$")
-CALL_LINE_RE = re.compile(r"^(\S+)(.*) \u2192 (\S+) (.+)$")
+CALL_LINE_RE = re.compile(r"^(\S+)(.*) -> (\S+) (.+)$")
 TRACE_CONTEXT_LINES = frozenset((
-    "Trace — completed call events in arrival order",
+    "Trace - completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
     "Trace times are UTC.",
@@ -1734,7 +1734,7 @@ def build_summary(record):
                      f"sources={','.join(module['sources'])} "
                      f"corroboration={','.join(module['corroboration'])}")
     for module in ev["refused_modules"]:
-        lines.append(f"    refused: {module['path']} — {module['reason']}")
+        lines.append(f"    refused: {module['path']} - {module['reason']}")
     observed_nz = {k: v for k, v in tvo["observed"].items() if v}
     n_zero = len(tvo["observed"]) - len(observed_nz)
     lines += [
@@ -1880,9 +1880,9 @@ def main(argv):
     for row in stderr_rows:
         line = row.get("line", "")
         if "module refused:" in line:
-            # p11scope: module refused: <path> — <reason>
+            # p11scope: module refused: <path> - <reason>
             rest = line.split("module refused:", 1)[1].strip()
-            path, _, reason = rest.partition(" — ")
+            path, _, reason = rest.partition(" - ")
             refused.append({"path": path, "reason": reason or "unknown"})
     surfaces = evidence.get("surfaces", [])
     tables_admitted = sum(1 for s in surfaces if s.get("walk") == "full")

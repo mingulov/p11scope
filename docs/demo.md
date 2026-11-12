@@ -26,9 +26,9 @@ through pkcs11-provider.
 
 ```
 inventory system (16 passes, 221 callers, 2 provider files, 4 edges)
-coverage: partial — 43 gaps
+coverage: partial - 43 gaps
 unidentified executables: openssl (15129 calls, host pids 2912721, 2912724, 2912726, 2912728, 2912730 (+305 more)); pkcs11-tool (6655 calls, host pids 2912722, 2912723, 2912725, 2912727, 2912729 (+347 more))
-libsofthsm2.so: mapped by 2 applications (python3.14); 110 entries observed
+/usr/lib64/pkcs11/libsofthsm2.so: mapped by 2 applications (python3.14); 110 entries observed
 run with -v for details
 ```
 
@@ -44,13 +44,13 @@ lines; anything else using SoftHSM at the same time appears beside python3.14.
 `sudo p11scope profile --pid <python-pid>` (trimmed):
 
 ```
-p11scope — PID scope — up 00:00:15 — mode profile — /usr/lib64/pkcs11/libsofthsm2.so
+p11scope - PID scope - up 00:00:15 - mode profile - /usr/lib64/pkcs11/libsofthsm2.so
 caller: /usr/bin/python3.14
 295 completed calls; 0 returned errors; 0 entries without an observed return.
 coverage: complete
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_Sign                       libsofthsm2.so        148      0   524.3µs     1.0ms     1.0ms         0
-C_SignInit                   libsofthsm2.so        147      0   262.1µs   524.3µs   524.3µs         0
+C_Sign                       libsofthsm2.so        148      0   524.3us     1.0ms     1.0ms         0
+C_SignInit                   libsofthsm2.so        147      0   262.1us   524.3us   524.3us         0
 run with -v for details
 ```
 
@@ -95,9 +95,9 @@ Firefox 157, Chromium 156):
 
 ```
 inventory system (5 passes, 255 callers, 7 provider files, 21 edges)
-coverage: partial — 553 gaps
-libsofthsm2.so: mapped by 2 applications (chrome (from bash), firefox (from bash)); no use in the covered interval; 2 of 2 mappings predate the watch, earlier calls are not counted
-libsoftokn3.so: mapped by 1 application (firefox (from bash)); 19 entries observed
+coverage: partial - 553 gaps
+/usr/lib64/pkcs11/libsofthsm2.so: mapped by 2 applications (chrome (from bash), firefox (from bash)); no use in the covered interval; 2 of 2 mappings predate the watch, earlier calls are not counted
+/usr/lib64/libsoftokn3.so: mapped by 1 application (firefox (from bash)); 19 entries observed
 run with -v for details
 ```
 
@@ -116,14 +116,14 @@ sudo p11scope profile --system --duration 45 -o browser-profile.json
 eight seconds in):
 
 ```
-p11scope — system scope — up 00:00:47 — mode profile — /usr/lib64/opensc-pkcs11.so (+3 more)
+p11scope - system scope - up 00:00:47 - mode profile - /usr/lib64/opensc-pkcs11.so (+3 more)
 Aggregate across the selected scope; counts are not per application.
 79 completed calls; 0 returned errors; 0 entries without an observed return.
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_FindObjects                libsofthsm2.so         26      0     8.2µs    16.4µs    16.4µs         0
-C_FindObjectsFinal           libsofthsm2.so         26      0     8.2µs    16.4µs    32.8µs         0
-C_FindObjectsInit            libsofthsm2.so         26      0    65.5µs   131.1µs   262.1µs         0
-C_GetSessionInfo             libsofthsm2.so          1      0    16.4µs    16.4µs    16.4µs         0
+C_FindObjects                libsofthsm2.so         26      0     8.2us    16.4us    16.4us         0
+C_FindObjectsFinal           libsofthsm2.so         26      0     8.2us    16.4us    32.8us         0
+C_FindObjectsInit            libsofthsm2.so         26      0    65.5us   131.1us   262.1us         0
+C_GetSessionInfo             libsofthsm2.so          1      0    16.4us    16.4us    16.4us         0
 run with -v for details
 ```
 
@@ -251,8 +251,8 @@ its NSS softokn):
 
 ```
 inventory system (2 passes, 168 callers, 6 provider files, 33 edges)
-coverage: partial — 401 gaps
-libsoftokn3.so: mapped by 5 applications (firefox (from firefox), firefox (from xfce4-panel)); no use in the covered interval; 5 of 5 mappings predate the watch, earlier calls are not counted
+coverage: partial - 401 gaps
+/usr/lib64/libsoftokn3.so: mapped by 5 applications (firefox (from firefox), firefox (from xfce4-panel)); no use in the covered interval; 5 of 5 mappings predate the watch, earlier calls are not counted
 run with -v for details
 ```
 
@@ -260,13 +260,13 @@ run with -v for details
 Firefox's NSS softokn in the window):
 
 ```
-p11scope — system scope — up 00:01:10 — mode profile — /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so (+1 more)
+p11scope - system scope - up 00:01:10 - mode profile - /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so (+1 more)
 Aggregate across the selected scope; counts are not per application.
 3 completed calls; 0 returned errors; 0 entries without an observed return.
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_DecryptMessage             libsoftokn3.so          1      0    32.8µs    32.8µs    32.8µs         0
-C_EncryptMessage             libsoftokn3.so          1      0     8.2µs     8.2µs     8.2µs         0
-C_GenerateRandom             libsoftokn3.so          1      0     4.1µs     4.1µs     4.1µs         0
+C_DecryptMessage             libsoftokn3.so          1      0    32.8us    32.8us    32.8us         0
+C_EncryptMessage             libsoftokn3.so          1      0     8.2us     8.2us     8.2us         0
+C_GenerateRandom             libsoftokn3.so          1      0     4.1us     4.1us     4.1us         0
 run with -v for details
 ```
 

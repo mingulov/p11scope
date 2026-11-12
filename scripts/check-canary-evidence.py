@@ -271,7 +271,7 @@ TRACE_EVENT = re.compile(
     r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
     rf"(?P<basename>{TRACE_JSON_STRING}) \(PID [0-9]+, TID [0-9]+\) exe=(?P<path>{TRACE_JSON_STRING})) (?P<rest>.*)$")
 TRACE_CONTEXT_LINES = frozenset((
-    "Trace — completed call events in arrival order",
+    "Trace - completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
     "Trace times are UTC.",
@@ -522,14 +522,14 @@ def assert_safe_trace(text):
         assert str(value) not in text and f"0x{value:x}" not in text, value
     if TARGET_BITS == 32:
         # The narrow unknown ids may appear only as mechanism tokens
-        # (` C_<name> 0x… → `, exactly one occurrence on the line).
+        # (` C_<name> 0x... -> `, exactly one occurrence on the line).
         for value in (UNKNOWN, MAXIMUM):
             assert str(value) not in text, value
             token = f"0x{value:x}"
             hits = [line for line in events if token in line]
             assert hits, f"unregistered {token} missing from trace"
             assert all(
-                re.search(rf" C_[A-Za-z]+ {token} → ", line) is not None
+                re.search(rf" C_[A-Za-z]+ {token} -> ", line) is not None
                 and line.count(token) == 1
                 for line in hits
             ), hits
@@ -690,9 +690,9 @@ def assert_scan_only_hostile_output(doc, text, hostile):
                   "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
               ))]
     assert events == [
-        "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
-        "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
-        "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_PENDING 100ns",
+        "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_OK 100ns",
+        "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_GENERAL_ERROR 100ns",
+        "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_PENDING 100ns",
     ], events
 
 
@@ -2009,11 +2009,11 @@ def strip_approved_unregistered_rows(content):
 
 
 def strip_approved_mechanism_tokens(content):
-    """Drop exact ` C_<name> 0x<approved> → ` tokens from trace text."""
+    """Drop exact ` C_<name> 0x<approved> -> ` tokens from trace text."""
     stripped = content
     for value in (UNKNOWN, MAXIMUM):
         token = f"0x{value:x}".encode()
-        stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " → ".encode(),
+        stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " -> ".encode(),
                           b" ", stripped)
     return stripped
 
@@ -2532,11 +2532,11 @@ def main(argv=None):
         ))
 
         # 32-bit targets render the narrow unknown ids only as mechanism
-        # tokens (` C_<name> 0x… → `); parameter values stay absent.
+        # tokens (` C_<name> 0x... -> `); parameter values stay absent.
         initialize(32)
         trace32 = ("CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n"
-                   f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK 1ns\n"
-                   f"op C_DecryptInit 0x{MAXIMUM:x} → CKR_OK 1ns\n"
+                   f"op C_EncryptInit 0x{UNKNOWN:x} -> CKR_OK 1ns\n"
+                   f"op C_DecryptInit 0x{MAXIMUM:x} -> CKR_OK 1ns\n"
                    + count_line() + "EVIDENCE " + json.dumps(
                        terminal("allowlisted", 3, 2)))
         assert_safe_trace(trace32)
@@ -2546,8 +2546,8 @@ def main(argv=None):
         ))
         reject("safe trace 32-bit misplaced mechanism value",
                lambda: assert_safe_trace(trace32.replace(
-                   f"0x{UNKNOWN:x} → CKR_OK",
-                   f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
+                   f"0x{UNKNOWN:x} -> CKR_OK",
+                   f"0x{UNKNOWN:x} -> CKR_OK 0x{UNKNOWN:x}")))
         reject("safe trace 32-bit digit in function name",
                lambda: assert_safe_trace(trace32.replace(
                    "C_EncryptInit", "C_Encrypt123")))
@@ -2615,13 +2615,13 @@ def main(argv=None):
                '"mechanism_hex": "0x%x", "registered": false, "calls": 1}]}'
                % (UNKNOWN, UNKNOWN, UNKNOWN)).encode()
         assert alias_hits(strip_approved_unregistered_rows(dup)) == {"mechanism"}
-        token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        token_line = f"op C_EncryptInit 0x{UNKNOWN:x} -> CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
         misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
         packed = struct.pack("<Q", UNKNOWN)
         assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
-        digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} -> CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(digit_name)) == {"mechanism"}
         with tempfile.TemporaryDirectory() as tmp:
             lane_out = Path(tmp) / "default-safe-trace.output"
@@ -2634,7 +2634,7 @@ def main(argv=None):
             reject("observer log misplaced mechanism value",
                    lambda: assert_safe_lane_alias_privacy(
                        "default-safe-trace", [lane_out, lane_log]))
-            log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} → note\n".encode()
+            log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} -> note\n".encode()
             lane_log.write_bytes(token_line + log_only)
             reject("observer log token on a log-only line",
                    lambda: assert_safe_lane_alias_privacy(
@@ -2882,9 +2882,9 @@ def main(argv=None):
             "semantic_capture_failures": 0,
         }
         scan_trace = "CAPTURE privacy=allowlisted\n" + "\n".join([
-            "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
-            "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
-            "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_PENDING 100ns",
+            "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_OK 100ns",
+            "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_GENERAL_ERROR 100ns",
+            "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] -> CKR_PENDING 100ns",
         ]) + "\n" + count_line() + "EVIDENCE " + json.dumps(scan_terminal)
         assert_scan_only_hostile_output(scan_only, scan_trace, hostile)
         reject("scan-only hostile trace payload", lambda: assert_scan_only_hostile_output(
@@ -3296,7 +3296,7 @@ def main(argv=None):
         allowlisted_trace = (
             "CAPTURE privacy=allowlisted\n"
             f"00:00:00.000000 pid {LOADER_PAUSE_IDENTITIES['child_pid']} "
-            f"tid {LOADER_PAUSE_IDENTITIES['child_tid']} C_Sign → CKR_OK 100ns\n"
+            f"tid {LOADER_PAUSE_IDENTITIES['child_tid']} C_Sign -> CKR_OK 100ns\n"
             "LOST 2 events\nEVIDENCE " + clean_aggregate
         )
         assert_no_loader_pause_identity(
@@ -3304,7 +3304,7 @@ def main(argv=None):
         )
         for label, line in (
             ("trace session identity", "00:00:00.000000 pid 100 tid 1 C_Sign "
-                                       f"sess#{LOADER_PAUSE_IDENTITIES['marker']} → CKR_OK 100ns"),
+                                       f"sess#{LOADER_PAUSE_IDENTITIES['marker']} -> CKR_OK 100ns"),
             ("unfrozen trace line", "loader /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
         ):
             reject(label, lambda line=line: assert_no_loader_pause_identity(

@@ -1377,7 +1377,23 @@ pub(crate) fn application_label(presentation: &Presentation, caller: CallerId) -
     }
 }
 
-/// Module name from its first retained path, keeping physical IDs separate.
+/// Full retained path, preserving only the trailing deletion marker.
+/// Provider lines name the whole path so two same-named files stay
+/// distinguishable; escaping happens before a label reaches any layout.
+fn retained_full_path_label(path: Option<&str>, unknown: &str) -> String {
+    let Some(path) = path else {
+        return unknown.into();
+    };
+    let (path, deleted) = path
+        .strip_suffix(" (deleted)")
+        .map_or((path, ""), |path| (path, " (deleted)"));
+    if path.is_empty() {
+        return unknown.into();
+    }
+    escape_controls(&format!("{path}{deleted}")).into_owned()
+}
+
+/// Module path from its first retained path, keeping physical IDs separate.
 pub(crate) fn module_label(presentation: &Presentation, module: ModuleId) -> String {
     let path = presentation
         .modules
@@ -1385,7 +1401,81 @@ pub(crate) fn module_label(presentation: &Presentation, module: ModuleId) -> Str
         .ok()
         .and_then(|index| presentation.modules[index].paths.first())
         .map(String::as_str);
-    retained_path_label(path, "Unknown module")
+    retained_full_path_label(path, "Unknown module")
+}
+
+/// Bracketed origin for a provider head from its mapping callers' opt-in
+/// container metadata: `[container <12hex> (<runtime>, cgroup hint)]` when
+/// every labeled caller agrees, `[multiple origins]` when they disagree,
+/// and none when no caller carries a label (host-only callers or the
+/// `--caller-metadata` frame off). Display-only: the per-caller scope
+/// lines and JSON carry the full IDs. Reuses the caller scope label so
+/// the two cannot drift; never reads new process data.
+fn module_origin_suffix(presentation: &Presentation, module: ModuleId) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut labels: BTreeSet<String> = BTreeSet::new();
+    for edge in &presentation.edges {
+        if edge.module != module {
+            continue;
+        }
+        let metadata = presentation.caller_metadata.metadata(edge.caller);
+        if let Some(metadata) = metadata
+            && let Some(label) =
+                crate::caller_metadata::presentation::concise_scope_label(&metadata, false)
+        {
+            labels.insert(label);
+        }
+    }
+    match labels.len() {
+        0 => None,
+        1 => {
+            let only = labels.into_iter().next().expect("one label counted");
+            Some(format!(" [{only}]"))
+        }
+        _ => Some(" [multiple origins]".to_string()),
+    }
+}
+
+/// One provider head for every inventory text view: the full retained
+/// path, a `[dev major:minor ino inode]` identity suffix when two
+/// modules would otherwise read identically (same path string, e.g. one
+/// file seen through two mounts), and the bracketed container origin
+/// when its callers carry one. Unique host paths print bare.
+pub(crate) fn module_display_name(presentation: &Presentation, module: ModuleId) -> String {
+    use std::collections::BTreeMap;
+    let mut heads: BTreeMap<String, usize> = BTreeMap::new();
+    for candidate in &presentation.modules {
+        let head = format!(
+            "{}{}",
+            module_label(presentation, candidate.id),
+            module_origin_suffix(presentation, candidate.id).unwrap_or_default()
+        );
+        *heads.entry(head).or_default() += 1;
+    }
+    let base = module_label(presentation, module);
+    if base == "Unknown module" {
+        return base;
+    }
+    let origin = module_origin_suffix(presentation, module).unwrap_or_default();
+    let duplicate = heads
+        .get(&format!("{base}{origin}"))
+        .is_some_and(|count| *count > 1);
+    if !duplicate {
+        return format!("{base}{origin}");
+    }
+    let identity = presentation
+        .modules
+        .binary_search_by_key(&module, |view| view.id)
+        .ok()
+        .map(|index| {
+            let view = &presentation.modules[index];
+            format!(
+                " [dev {}:{} ino {}]",
+                view.device_major, view.device_minor, view.inode
+            )
+        })
+        .unwrap_or_default();
+    format!("{base}{identity}{origin}")
 }
 
 /// Human explanation of existing evidence, with positive history first.
@@ -1459,7 +1549,7 @@ fn launcher_link_name(ancestor: &LauncherAncestor) -> String {
 }
 
 /// The `-v` launcher chain for one caller (`app <- parent <- ...`,
-/// repeated identical wrappers collapsed as `sh (×2)`), or `None` when
+/// repeated identical wrappers collapsed as `sh (x2)`), or `None` when
 /// no ancestors were captured and no unit applies. A partial chain
 /// keeps the ancestors read plus the named gap; an init-only parent
 /// with a unit renders `app (from unit)`; gap-only detail stays in JSON.
@@ -1481,7 +1571,7 @@ pub(crate) fn launcher_chain_text(presentation: &Presentation, caller: CallerId)
     for (ancestor, folded) in collapse_launcher_chain(&record.launched_by) {
         let mut link = launcher_link_name(&ancestor);
         if folded > 0 {
-            link.push_str(&format!(" (×{})", folded + 1));
+            link.push_str(&format!(" (x{})", folded + 1));
         }
         parts.push(link);
     }
@@ -1737,7 +1827,7 @@ fn key_provider_groups(
         .into_iter()
         .map(|(module, (tallies, instances))| {
             let (name, unidentified) = match module {
-                Some(module) => (module_label(presentation, module), false),
+                Some(module) => (module_display_name(presentation, module), false),
                 None => ("unidentified provider".to_string(), true),
             };
             let tallies = tallies
@@ -1817,9 +1907,9 @@ fn key_tally_segment(tally: &KeyOpTally) -> String {
 /// One indented key-operations detail line: `  {name}: {segment}{suffix}`.
 /// A provider file name shrinks first so the tally stays exact; when
 /// the line still overflows, the verbose parenthesized suffix
-/// (instance labels) shrinks next, marked with `…`. When a long name
+/// (instance labels) shrinks next, marked with `...`. When a long name
 /// meets a long suffix, neither stage fits alone, so the suffix stage
-/// retries with the name shrunk against the minimal suffix (`" (…)"`).
+/// retries with the name shrunk against the minimal suffix (`" (...)"`).
 /// Fixed labels never shrink (they are short — only a pathological
 /// tally beside one may exceed the cap, since counts are never
 /// truncated).
@@ -1830,9 +1920,9 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
         return format!("  {name}{rest}");
     }
     let budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(fixed);
-    let shown_name = if shrink_name && budget >= 2 {
-        let kept: String = name.chars().take(budget - 1).collect();
-        format!("{kept}…")
+    let shown_name = if shrink_name && budget >= 4 {
+        let kept: String = name.chars().take(budget - 3).collect();
+        format!("{kept}...")
     } else {
         name.to_string()
     };
@@ -1842,7 +1932,7 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
     }
     // The tally stays exact, so only the verbose suffix can still
     // shrink: a parenthesized list truncates its inner content with
-    // `…`, keeping the closing paren.
+    // `...`, keeping the closing paren.
     let Some(inner) = suffix
         .strip_prefix(" (")
         .and_then(|tail| tail.strip_suffix(')'))
@@ -1851,27 +1941,27 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
     };
     let head = format!("  {shown_name}: {segment}");
     let suffix_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(head.chars().count());
-    if suffix_budget >= 4 {
+    if suffix_budget >= 6 {
         let shrunk = ellipsize_to(inner, suffix_budget - 3);
         return format!("{head} ({shrunk})");
     }
     // Both stages gave up: the name stage kept a long provider name
     // because the full suffix already blew the budget, so the head
     // alone overflows. Shrink the name against the minimal suffix
-    // (`" (…)"`) and retry the suffix stage; fixed labels keep the
+    // (`" (...)"`) and retry the suffix stage; fixed labels keep the
     // over-long line instead (their tally stays exact).
     if !shrink_name {
         return line;
     }
-    // 2 indent + ": " + segment + " (…)".
-    let name_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(2 + 2 + segment.chars().count() + 4);
-    if name_budget < 2 {
+    // 2 indent + ": " + segment + " (...)".
+    let name_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(2 + 2 + segment.chars().count() + 6);
+    if name_budget < 4 {
         return line;
     }
     let shown_name = ellipsize_to(name, name_budget);
     let head = format!("  {shown_name}: {segment}");
     let suffix_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(head.chars().count());
-    if suffix_budget < 4 {
+    if suffix_budget < 6 {
         return line;
     }
     let shrunk = ellipsize_to(inner, suffix_budget - 3);
@@ -2213,20 +2303,17 @@ fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
     // reruns. Both arms stay generic over providers.
     let manifest_path = refused_reason.contains("check the manifest");
     if let [single] = presentation.modules.as_slice()
-        && let Some(base) = single
-            .paths
-            .first()
-            .and_then(|path| path.rsplit('/').next())
-            .filter(|base| !base.is_empty())
+        && let Some(path) = single.paths.first().filter(|path| !path.is_empty())
     {
+        let path = escape_controls(path);
         if manifest_path {
             return Some(format!(
-                "key operations: {base}'s function table cannot be verified \
+                "key operations: the function table of {path} cannot be verified \
                  from the supplied --manifest inputs; check the manifest"
             ));
         }
         return Some(format!(
-            "key operations: {base}'s function table cannot be verified \
+            "key operations: the function table of {path} cannot be verified \
              without --manifest; rerun with --manifest"
         ));
     }
@@ -2250,47 +2337,47 @@ fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
 /// counts are never truncated — exact digits win over the cap.
 const SUMMARY_LINE_MAX_CHARS: usize = 100;
 
-/// Char-safe truncation to `max_chars` chars, marked with `…`. Fits
+/// Char-safe truncation to `max_chars` chars, marked with `...`. Fits
 /// already return unchanged.
 fn ellipsize_to(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{kept}…")
+    let kept: String = text.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{kept}...")
 }
 
 /// Char-safe truncation to `max_chars` chars on a word boundary, marked
-/// with `…`. Cuts at the last space within the budget so titles read
+/// with `...`. Cuts at the last space within the budget so titles read
 /// whole; a text without spaces in range falls back to a char cut so
 /// long machine names still fit. Fits already return unchanged.
 fn ellipsize_words_to(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    if max_chars < 2 {
+    if max_chars < 4 {
         return ellipsize_to(text, max_chars);
     }
-    let kept: String = text.chars().take(max_chars - 1).collect();
+    let kept: String = text.chars().take(max_chars - 3).collect();
     if let Some(last_space) = kept.rfind(' ') {
         let trimmed = kept[..last_space].trim_end();
         if !trimmed.is_empty() {
-            return format!("{trimmed}…");
+            return format!("{trimmed}...");
         }
     }
     ellipsize_to(text, max_chars)
 }
 
-/// One concise gap group line: `  {count} × {subject} — {reason}`.
-/// Short subjects stay whole (cutting a machine name to `nati…`
+/// One concise gap group line: `  {count} x {subject} - {reason}`.
+/// Short subjects stay whole (cutting a machine name to `nati...`
 /// loses it while saving little); the reason gives way instead.
-/// Long paths keep their tail at a `/` boundary (`…/libc.so.6`) so
+/// Long paths keep their tail at a `/` boundary (`.../libc.so.6`) so
 /// distinct files stay distinct; other long subjects keep their head
 /// on a word boundary, never mid-word. Only a reason overflowing on
 /// its own truncates the whole line, likewise on a word boundary.
 fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
-    let head = format!("  {count} × ");
-    let tail = format!(" — {reason}");
+    let head = format!("  {count} x ");
+    let tail = format!(" - {reason}");
     let fixed = head.chars().count() + tail.chars().count();
     if subject.chars().count() + fixed <= SUMMARY_LINE_MAX_CHARS {
         return format!("{head}{subject}{tail}");
@@ -2299,12 +2386,12 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     /// Subjects at most this long are never cut: the whole-line
     /// fallback below trims the reason instead.
     const SHORT_SUBJECT_KEEP: usize = 32;
-    if subject.chars().count() <= SHORT_SUBJECT_KEEP || budget < 2 {
+    if subject.chars().count() <= SHORT_SUBJECT_KEEP || budget < 4 {
         return ellipsize_words_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS);
     }
     if subject.starts_with('/') {
         let chars: Vec<char> = subject.chars().collect();
-        let tail_start = chars.len().saturating_sub(budget - 1);
+        let tail_start = chars.len().saturating_sub(budget - 3);
         let mut cut = tail_start;
         while cut < chars.len() && chars[cut] != '/' {
             cut += 1;
@@ -2315,19 +2402,19 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
             chars[tail_start..].iter().collect()
         };
         if shown.chars().count() >= 2 {
-            return format!("{head}…{shown}{tail}");
+            return format!("{head}...{shown}{tail}");
         }
     }
-    let kept_full: String = subject.chars().take(budget - 1).collect();
+    let kept_full: String = subject.chars().take(budget - 3).collect();
     // Cut prose on a word boundary so titles read whole; a subject
     // without spaces still fits via the char cut.
     if let Some(last_space) = kept_full.rfind(' ') {
         let trimmed = kept_full[..last_space].trim_end();
         if !trimmed.is_empty() {
-            return format!("{head}{trimmed}…{tail}");
+            return format!("{head}{trimmed}...{tail}");
         }
     }
-    format!("{head}{kept_full}…{tail}")
+    format!("{head}{kept_full}...{tail}")
 }
 
 /// The neutral successor spelling of
@@ -3365,7 +3452,7 @@ fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &Edg
         out,
         "application {} [{identity}] -> module {} [{}]: {}",
         application_label(presentation, edge.caller),
-        module_label(presentation, edge.module),
+        module_display_name(presentation, edge.module),
         edge.module.label(),
         observation_label_at(edge, presentation.ended_ns),
     );
@@ -3591,7 +3678,7 @@ fn render_concise_edges(out: &mut String, presentation: &Presentation) {
         by_module.entry(edge.module).or_default().push(edge);
     }
     let mut groups: Vec<(ModuleId, Vec<&EdgeView>)> = by_module.into_iter().collect();
-    groups.sort_by_key(|(module, _)| module_label(presentation, *module));
+    groups.sort_by_key(|(module, _)| module_display_name(presentation, *module));
     for (module, edges) in groups {
         let mut callers: BTreeSet<CallerId> = BTreeSet::new();
         let mut names: BTreeSet<String> = BTreeSet::new();
@@ -3612,13 +3699,13 @@ fn render_concise_edges(out: &mut String, presentation: &Presentation) {
         let all_names: Vec<String> = names.into_iter().collect();
         let mut shown: Vec<String> = all_names.iter().take(3).cloned().collect();
         if all_names.len() > 3 {
-            shown.push("…".to_string());
+            shown.push("...".to_string());
         }
         let status = concise_module_status(presentation, module, &edges);
         let _ = writeln!(
             out,
             "{}: mapped by {count} {noun} ({}); {status}",
-            module_label(presentation, module),
+            module_display_name(presentation, module),
             shown.join(", "),
         );
     }
@@ -3777,7 +3864,7 @@ fn render_snapshot_inner(
         if presentation.gaps_suppressed > 0 {
             segments.push(format!("{} more not shown", presentation.gaps_suppressed));
         }
-        let _ = writeln!(out, "coverage: partial — {}", segments.join(", "));
+        let _ = writeln!(out, "coverage: partial - {}", segments.join(", "));
     }
     // The edge list below never carries module-level use no caller could
     // claim: short-lived callers exit before their witness rows bind, so
@@ -3956,11 +4043,11 @@ fn render_snapshot_inner(
                 if verbose && plain != observations.reason {
                     let _ = writeln!(
                         out,
-                        "key operations: not available — {plain} (reason: {})",
+                        "key operations: not available - {plain} (reason: {})",
                         observations.reason
                     );
                 } else {
-                    let _ = writeln!(out, "key operations: not available — {plain}");
+                    let _ = writeln!(out, "key operations: not available - {plain}");
                 }
             }
         } else {

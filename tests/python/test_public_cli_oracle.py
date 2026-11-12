@@ -167,7 +167,7 @@ class OracleTests(unittest.TestCase):
                 paths[key] = tmp / key
                 text = json.dumps(value)
                 if key == "report" and cell == "trace-pid":
-                    text = "CALL → done\n" * 42
+                    text = "CALL -> done\n" * 42
                 paths[key].write_text(text)
             paths["ledger"] = tmp / "ledger"
             paths["ledger"].write_text("\n".join(ledger) + "\n")

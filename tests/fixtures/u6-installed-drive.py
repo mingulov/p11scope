@@ -223,7 +223,7 @@ def trace_base():
     evidence = ('EVIDENCE {"privacy_mode":"allowlisted","final_drain":true,'
                 '"trace_truncated":false,"event_loss":0}\n')
     counts = 'COUNT_EVIDENCE {"stats_entered":3,"stats_returned":3,"raw_calls":3}\n'
-    rows = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GenerateRandom \u2192 CKR_OK 1.0\u00b5s\n'
+    rows = ['12:00:00.00000%d %s (PID 123, TID 123)%s C_GenerateRandom -> CKR_OK 1.0us\n'
             % (i, "Unknown executable" if i == 0 else '"trace-a"',
                "" if i == 0 else ' exe="/owned/trace-a"') for i in range(3)]
     return "".join(rows) + counts + evidence, ledger, receipt
@@ -232,7 +232,7 @@ def trace_base():
 def trace_row(pid, tid, fn, label, path, stamp):
     rendered = "Unknown executable" if label is None else json.dumps(label)
     suffix = "" if path is None else " exe=%s" % json.dumps(path)
-    return ("12:00:00.00000%d %s (PID %d, TID %d)%s %s \u2192 CKR_OK 1.0\u00b5s\n"
+    return ("12:00:00.00000%d %s (PID %d, TID %d)%s %s -> CKR_OK 1.0us\n"
             % (stamp, rendered, pid, tid, suffix, fn))
 
 

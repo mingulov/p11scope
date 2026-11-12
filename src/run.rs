@@ -6999,7 +6999,7 @@ fn empty_plan_pairs(skips: &[&crate::discovery::scan::Skipped], reasons_only: bo
                 crate::render::escape_controls(&skip.reason).into_owned()
             } else {
                 format!(
-                    "{} — {}",
+                    "{} - {}",
                     crate::render::escape_controls(&skip.subject),
                     crate::render::escape_controls(&skip.reason),
                 )
@@ -7252,7 +7252,7 @@ fn format_handed_back_exit_note(pid: u32, code: i32) -> String {
 /// carries the same target-controlled path bytes.
 fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> String {
     format!(
-        "p11scope: {failed}/{attempted} attach attempts failed, every one the same way — this \
+        "p11scope: {failed}/{attempted} attach attempts failed, every one the same way - this \
          almost always means the environment cannot attach BPF uprobes at all: missing \
          CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
          kernel.perf_event_paranoid sysctl. First underlying error: {}",
@@ -13925,7 +13925,7 @@ mod tests {
             &BTreeMap::new(),
             crate::cli::TextVerbosity::Quiet,
         );
-        assert!(out.contains("p11scope — PID scope"), "{out}");
+        assert!(out.contains("p11scope - PID scope"), "{out}");
         assert!(out.contains("10 completed calls;"), "{out}");
         assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("FUNCTION"), "{out}");
@@ -26906,7 +26906,7 @@ int main(int argc, char **argv) {
     /// the final frame prints once, as plain text without escapes.
     #[test]
     fn owned_run_display_never_clears_and_prints_final_once() {
-        let frame = "p11scope — PID scope — up 00:00:01 — mode profile — /bin/false\n";
+        let frame = "p11scope - PID scope - up 00:00:01 - mode profile - /bin/false\n";
         let owned = LiveDisplay::for_capture(true);
         assert_eq!(owned.frame_bytes(frame, false), None);
         assert_eq!(owned.frame_bytes(frame, true).as_deref(), Some(frame));
@@ -28229,12 +28229,12 @@ int main(int argc, char **argv) {
     /// without the escape.
     #[test]
     fn live_frames_redraw_only_on_a_terminal() {
-        let frame = "p11scope — 3 calls\n";
+        let frame = "p11scope - 3 calls\n";
         let terminal = LiveDisplay { terminal: true };
         for final_frame in [false, true] {
             assert_eq!(
                 terminal.frame_bytes(frame, final_frame).as_deref(),
-                Some("\x1b[2J\x1b[Hp11scope — 3 calls\n")
+                Some("\x1b[2J\x1b[Hp11scope - 3 calls\n")
             );
         }
         let piped = LiveDisplay { terminal: false };
@@ -30680,7 +30680,7 @@ int main(int argc, char **argv) {
         state.observe_delivery(libc::SIGINT, Some(T0));
         state.observe_delivery(libc::SIGINT, Some(T0 + 20_000));
         assert_eq!(state.first_signal(), Some(libc::SIGINT));
-        assert_eq!(state.sigint_deliveries(), 1, "a 20 µs duplicate escalated");
+        assert_eq!(state.sigint_deliveries(), 1, "a 20 us duplicate escalated");
         // Two handlers on two threads can stamp out of order.
         state.observe_delivery(libc::SIGINT, Some(T0 - 5_000));
         assert_eq!(
@@ -30893,7 +30893,7 @@ int main(int argc, char **argv) {
             )),
             "{hint}"
         );
-        assert!(!hint.contains("capture discovery — "), "{hint}");
+        assert!(!hint.contains("capture discovery - "), "{hint}");
     }
 
     /// A stop beside an unexamined file takes the "stopped early"

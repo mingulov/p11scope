@@ -476,7 +476,7 @@ tracked) while rows follow. Measured: the pre-fix baseline was 4 of
 `bootstrap_unavailable` with thousands of `ImageTainted` birth
 refusals; after the fix, 0 of 20 runs ended that way (load 3-10),
 with zero `ImageTainted` birth refusals for the browser, and a
-20-valid-run re-proof under heavier load (13-44, with 5
+20-valid-run re-proof under heavier load (13-83, with 5
 environmental errors discarded) showed 19 of 20 without
 `bootstrap_unavailable` — the one failure never admitted a browser
 caller (short-lived children under load), with zero taint vocabulary,

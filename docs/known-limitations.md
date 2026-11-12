@@ -476,11 +476,14 @@ tracked) while rows follow. Measured: the pre-fix baseline was 4 of
 `bootstrap_unavailable` with thousands of `ImageTainted` birth
 refusals; after the fix, 0 of 20 runs ended that way (load 3-10),
 with zero `ImageTainted` birth refusals for the browser, and a
-20-valid-run re-proof under heavier load (13-83, with 5
-environmental errors discarded) showed 19 of 20 without
-`bootstrap_unavailable` — the one failure never admitted a browser
-caller (short-lived children under load), with zero taint vocabulary,
-a separate admission-coverage limitation. The same harness measured
+20-browser-engaged-cell re-proof (61 attempts under load 3-83)
+showed 0 of 20 `bootstrap_unavailable`, with per-key rows tracked in
+12 and the shed→bind trigger exercised in 10. Cells where desktop
+saturation kept the observer from ever engaging the browser (no
+browser bindings, births, rows, or gaps) carry no verdict on this fix
+and sit outside the counted set; short-lived children the scan never
+admits under extreme load stay a separate admission-coverage
+limitation. The same harness measured
 0 of 22 release Firefox runs (plus 0 of 5 debug-confounded runs) and
 0 of 2 quiet-host Chromium runs at baseline.
 

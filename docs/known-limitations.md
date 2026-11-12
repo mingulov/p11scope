@@ -457,23 +457,32 @@ keeps every event up to about 10,000 calls/s with no loss; at
 50,000 and 100,000 calls/s; `profile --system` stayed exact with no
 loss up to 50,000 calls/s (448,750 records lost at 100,000/s).
 
-### Browser after a background caller: per-key tracking may not start
+### Browser after a background caller: its first calls stay unattributed
 
 A Chromium started after a background PKCS#11 process is already
-running can, intermittently, end without per-key operation tracking
-(reported as `bootstrap_unavailable` with status `partial` and zero
-key-operation rows). Its calls and counts are still recorded
-(counted as `started_before_attach`). Measured: 4 of 20
-observer-first Chromium runs on a busy desktop (load 6-14) ended
-this way; the same harness measured 0 of 22 with Firefox and 0 of
-2 with Chromium on a quiet host. Cause: the browser child's first
-calls shed as unrouted before the scan binds it, and the
-pre-existing background binding lets the finalizer prove the new
-image an unbound caller, tainting it permanently
-(`joint_image_refused`, then `joint_birth_claim_ImageTainted` for
-every later birth), so no Joint feed ever installs. The fix (hold
-never-admitted images' sheds until they bind or exit instead of
-tainting on first shed) is planned for a later release.
+running sheds its first calls as unrouted before the scan binds it;
+the pre-existing background binding lets the finalizer prove the new
+image an unbound caller, so its image taints at once
+(`joint_image_refused`). When the exact image binds within a bounded
+grace (16 finalizes), its shed-taint lifts and its birth falls back
+to attach-observed above the unattributed pre-bind sheds, so per-key
+tracking starts and rows populate. Images with a genuine
+contradiction, images proven only by another exec of the same
+process, and images that never bind within grace stay refused (fail
+closed). Residual: a lifted browser child keeps its
+`joint_image_refused` gap row (its first calls genuinely were not
+tracked) while rows follow. Measured: the pre-fix baseline was 4 of
+20 observer-first Chromium runs on a busy desktop (load 6-14) ending
+`bootstrap_unavailable` with thousands of `ImageTainted` birth
+refusals; after the fix, 0 of 20 runs ended that way (load 3-10),
+with zero `ImageTainted` birth refusals for the browser, and a
+20-valid-run re-proof under heavier load (13-44, with 5
+environmental errors discarded) showed 19 of 20 without
+`bootstrap_unavailable` — the one failure never admitted a browser
+caller (short-lived children under load), with zero taint vocabulary,
+a separate admission-coverage limitation. The same harness measured
+0 of 22 release Firefox runs (plus 0 of 5 debug-confounded runs) and
+0 of 2 quiet-host Chromium runs at baseline.
 
 ### Starting Firefox mid-capture can withhold mechanism names
 

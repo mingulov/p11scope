@@ -635,6 +635,7 @@ fn owning_module_for_test(
         },
         object,
         entry_objects: vec![vec![object; slots.len()]],
+        forward_verified: vec![vec![false; slots.len()]],
         exports: Default::default(),
         getter_present: false,
         witness_fault: false,

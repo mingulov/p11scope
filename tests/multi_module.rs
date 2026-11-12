@@ -81,6 +81,11 @@ fn build_from_modules(modules: &[p11scope::discovery::scan::ScannedModule]) -> A
                         .collect()
                 })
                 .collect(),
+            forward_verified: scanned
+                .tables
+                .iter()
+                .map(|table| vec![false; table.entries.len()])
+                .collect(),
             scanned,
         })
         .collect();
@@ -131,7 +136,13 @@ fn equal_raw_keys_with_distinct_pinned_objects_never_share_slots() {
         witness_fault: false,
         scanned: module,
         object: PinnedObjectId(object),
-        entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],
+        entry_objects: vec![
+            targets
+                .iter()
+                .map(|target| PinnedObjectId(*target))
+                .collect(),
+        ],
+        forward_verified: vec![targets.iter().map(|_| false).collect()],
     };
     let raw_key = 10;
     let plan = build_from_reconciled_modules(&[
@@ -176,7 +187,13 @@ fn one_exact_pinned_object_keeps_every_views_nonempty_target_union() {
         witness_fault: false,
         scanned: module,
         object: PinnedObjectId(7),
-        entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],
+        entry_objects: vec![
+            targets
+                .iter()
+                .map(|target| PinnedObjectId(*target))
+                .collect(),
+        ],
+        forward_verified: vec![targets.iter().map(|_| false).collect()],
     };
     let plan = build_from_reconciled_modules(&[
         reconcile(

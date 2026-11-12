@@ -3488,6 +3488,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         },
         object,
         entry_objects: vec![vec![object; per_table as usize]; 4],
+        forward_verified: vec![vec![false; per_table as usize]; 4],
     };
     let mut selected_counters = DiscoveryCounters::default();
     let mut tombstones = BTreeSet::new();
@@ -3580,6 +3581,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         },
         object: small_object,
         entry_objects: vec![vec![small_object; 10]],
+        forward_verified: vec![vec![false; 10]],
     };
     let mut mixed_counters = DiscoveryCounters::default();
     let mixed = build_current_plan(

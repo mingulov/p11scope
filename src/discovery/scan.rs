@@ -10751,6 +10751,10 @@ mod tests {
                     .iter()
                     .map(|table| vec![PinnedObjectId(object); table.entries.len()])
                     .collect(),
+                forward_verified: tables
+                    .iter()
+                    .map(|table| vec![false; table.entries.len()])
+                    .collect(),
                 object: PinnedObjectId(object),
                 exports: exports.into(),
                 getter_present: false,

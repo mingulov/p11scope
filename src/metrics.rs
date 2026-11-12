@@ -1327,6 +1327,7 @@ mod tests {
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
             object,
             entry_objects: vec![vec![object; 3]],
+            forward_verified: vec![vec![false; 3]],
             exports: Default::default(),
             getter_present: false,
             witness_fault: false,

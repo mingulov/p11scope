@@ -8147,6 +8147,7 @@ pub(crate) mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![vec![object, object], vec![object]],
+            forward_verified: vec![vec![false, false], vec![false]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -8261,6 +8262,7 @@ pub(crate) mod tests {
             witness_fault: false,
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
+            forward_verified: vec![vec![false]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -13853,6 +13855,7 @@ pub(crate) mod tests {
             scanned,
             object,
             entry_objects: vec![vec![object; entry_count]],
+            forward_verified: vec![vec![false; entry_count]],
             exports,
             getter_present,
             witness_fault,
@@ -14341,6 +14344,7 @@ pub(crate) mod tests {
             scanned,
             object,
             entry_objects: vec![vec![object; 104]],
+            forward_verified: vec![vec![false; 104]],
             exports,
             getter_present: false,
             witness_fault: false,

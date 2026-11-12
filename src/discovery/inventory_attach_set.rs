@@ -2099,6 +2099,7 @@ pub(crate) mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![entry_objects],
+            forward_verified: vec![vec![false; targets.len()]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -3077,6 +3078,7 @@ pub(crate) mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![entry_objects],
+            forward_verified: vec![vec![false; offsets.len()]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,

@@ -1058,6 +1058,7 @@ pub(super) mod tests {
         let module = ReconciledModule {
             object,
             entry_objects: vec![vec![object]],
+            forward_verified: vec![vec![false]],
             exports: Default::default(),
             getter_present: false,
             witness_fault: false,

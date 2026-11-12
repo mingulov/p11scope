@@ -1199,6 +1199,13 @@ pub struct ReconciledModule {
     pub object: PinnedObjectId,
     /// Parallel to `scanned.tables[*].entries`.
     pub entry_objects: Vec<Vec<PinnedObjectId>>,
+    /// Parallel to `scanned.tables[*].entries`: whether the binder
+    /// verified this retained entry as a genuine cross-object getter
+    /// forward (see `forwarded_bootstrap_verified`). Only the two bind
+    /// paths set it; any other producer leaves it false, so the
+    /// standard-layout core's forward exemption admits only forwards
+    /// the binder actually proved.
+    pub forward_verified: Vec<Vec<bool>>,
     /// The module object's own standard-name `.dynsym` definitions, from its
     /// pinned inspection: the export-linkage witness for its tables.
     pub exports: Arc<[(String, u64)]>,
@@ -5584,7 +5591,9 @@ mod conservative_copy {
             old_skip_leaf: Option<Skipped>,
             entry: Option<ScannedEntry>,
             ids: Vec<PinnedObjectId>,
+            verified: Vec<bool>,
             entry_objects: Vec<Vec<PinnedObjectId>>,
+            forward_verified: Vec<Vec<bool>>,
             normalize: Option<Normalize>,
             normalized: Option<String>,
             skip_copy: Option<SkipCopy>,
@@ -5634,7 +5643,9 @@ mod conservative_copy {
                     old_skip_leaf: None,
                     entry: None,
                     ids: Vec::new(),
+                    verified: Vec::new(),
                     entry_objects: Vec::new(),
+                    forward_verified: Vec::new(),
                     normalize: None,
                     normalized: None,
                     skip_copy: None,
@@ -6089,6 +6100,7 @@ mod conservative_copy {
                                 } else {
                                     self.object = Some(object);
                                     self.entry_objects = Vec::with_capacity(module.tables.len());
+                                    self.forward_verified = Vec::with_capacity(module.tables.len());
                                     self.table_pos = 0;
                                     self.phase = BindPhase::TableStart;
                                 }
@@ -6133,6 +6145,7 @@ mod conservative_copy {
                             self.entries = Some(std::mem::take(&mut table.entries).into_iter());
                             table.entries = Vec::with_capacity(count);
                             self.ids = Vec::with_capacity(count);
+                            self.verified = Vec::with_capacity(count);
                             let wanted = table
                                 .unpinned
                                 .len()
@@ -6206,7 +6219,14 @@ mod conservative_copy {
                                 self.phase = BindPhase::EntrySkip;
                                 return Ok(());
                             }
+                            // The same per-entry forward proof as
+                            // `bind_scanned_modules`: the
+                            // standard-layout core exempts only
+                            // forwards this check proved.
+                            let verified = entry.object != module_key
+                                && forwarded_bootstrap_verified(entry, &pins.exports_for(id));
                             self.ids.push(id);
+                            self.verified.push(verified);
                             let entry = self.entry.take().ok_or(GraphRefusal::Identity)?;
                             self.module
                                 .as_mut()
@@ -6281,6 +6301,8 @@ mod conservative_copy {
                         }
                         drop(self.entries.take());
                         self.entry_objects.push(std::mem::take(&mut self.ids));
+                        self.forward_verified
+                            .push(std::mem::take(&mut self.verified));
                         self.table_pos += 1;
                         self.phase = BindPhase::TableStart;
                     }
@@ -6357,6 +6379,7 @@ mod conservative_copy {
                             scanned: self.module.take().ok_or(GraphRefusal::Identity)?,
                             object,
                             entry_objects: std::mem::take(&mut self.entry_objects),
+                            forward_verified: std::mem::take(&mut self.forward_verified),
                             exports,
                             getter_present,
                             witness_fault,
@@ -6685,11 +6708,15 @@ mod conservative_copy {
                     }
                     6 => {
                         drop(std::mem::take(&mut self.ids));
+                        drop(std::mem::take(&mut self.verified));
                         self.reclaim_stage = 7;
                     }
                     7 => {
-                        if self.entry_objects.pop().is_none() {
+                        let objects_done = self.entry_objects.pop().is_none();
+                        let verified_done = self.forward_verified.pop().is_none();
+                        if objects_done && verified_done {
                             drop(std::mem::take(&mut self.entry_objects));
+                            drop(std::mem::take(&mut self.forward_verified));
                             self.reclaim_stage = 8;
                         }
                     }
@@ -6786,6 +6813,7 @@ mod conservative_copy {
             object: PinnedObjectId,
             module: Option<ModuleDrain>,
             ids: Vec<Vec<PinnedObjectId>>,
+            verified: Vec<Vec<bool>>,
             exports: Option<Arc<[(String, u64)]>>,
             drained: usize,
         }
@@ -6795,6 +6823,7 @@ mod conservative_copy {
                     object: module.object,
                     module: Some(ModuleDrain::new(module.scanned)),
                     ids: module.entry_objects,
+                    verified: module.forward_verified,
                     exports: Some(module.exports),
                     drained: 0,
                 }
@@ -6814,8 +6843,15 @@ mod conservative_copy {
                 if self.ids.pop().is_some() {
                     return Ok(false);
                 }
+                if self.verified.pop().is_some() {
+                    return Ok(false);
+                }
                 if self.ids.capacity() != 0 {
                     drop(std::mem::take(&mut self.ids));
+                    return Ok(false);
+                }
+                if self.verified.capacity() != 0 {
+                    drop(std::mem::take(&mut self.verified));
                     return Ok(false);
                 }
                 if let Some(exports) = self.exports.as_mut() {
@@ -8716,8 +8752,10 @@ pub fn bind_scanned_modules(
         }
         let mut scanned = module.clone();
         let mut entry_objects = Vec::with_capacity(scanned.tables.len());
+        let mut forward_verified = Vec::with_capacity(scanned.tables.len());
         for table in &mut scanned.tables {
             let mut ids = Vec::with_capacity(table.entries.len());
+            let mut verified = Vec::with_capacity(table.entries.len());
             let mut kept = Vec::with_capacity(table.entries.len());
             for entry in std::mem::take(&mut table.entries) {
                 match pinned.id_for_scanned(module, entry.object, &entry.object_path) {
@@ -8731,9 +8769,15 @@ pub fn bind_scanned_modules(
                         // name in the pinned target's own exports; anything
                         // else is refused, keeping export agreement
                         // fail-closed (see `forwarded_bootstrap_verified`).
+                        // The verdict is recorded per entry: the
+                        // standard-layout core exempts only forwards the
+                        // binder proved, never a retained entry whose
+                        // producer bypassed this check.
+                        let verified_forward = entry.object != module.key
+                            && forwarded_bootstrap_verified(&entry, &pinned.exports_for(id));
                         if entry.object != module.key
                             && forwardable_getter(entry.name)
-                            && !forwarded_bootstrap_verified(&entry, &pinned.exports_for(id))
+                            && !verified_forward
                         {
                             let skip = Skipped {
                                 subject: entry.name.to_string(),
@@ -8747,6 +8791,7 @@ pub fn bind_scanned_modules(
                             lost.push(skip);
                         } else {
                             ids.push(id);
+                            verified.push(verified_forward);
                             kept.push(entry);
                         }
                     }
@@ -8772,6 +8817,7 @@ pub fn bind_scanned_modules(
             }
             table.entries = kept;
             entry_objects.push(ids);
+            forward_verified.push(verified);
         }
         let claims = pinned.ownership.entry(module.view).or_default();
         claims
@@ -8789,6 +8835,7 @@ pub fn bind_scanned_modules(
             scanned,
             object,
             entry_objects,
+            forward_verified,
             exports: pinned.exports_for(object),
             getter_present,
             witness_fault,

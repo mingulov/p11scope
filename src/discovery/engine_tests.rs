@@ -22519,6 +22519,7 @@ fn optional_export_absence_is_complete_independently_of_table_version() {
                 extension_impossible: false,
             }];
             module.entry_objects = vec![Vec::new()];
+            module.forward_verified = vec![Vec::new()];
         }
         engine.capture_facts.history = CaptureHistory::default();
         engine
@@ -22785,6 +22786,7 @@ fn c_get_interface_selection_exact_match_keeps_inventory_aliases() {
         extension_impossible: false,
     });
     engine.modules[0].entry_objects.push(Vec::new());
+    engine.modules[0].forward_verified.push(Vec::new());
     engine.modules[0].scanned.interfaces.extend([
         ScannedInterface {
             index: 0,
@@ -37104,6 +37106,7 @@ fn discovery_fallback_binding_rejects_a_proof_table_lost_during_reconciliation()
     let (mut reconciled, _, _) = reconcile_scanned_modules(std::slice::from_ref(&scan), &mut pins);
     reconciled[0].scanned.tables.clear();
     reconciled[0].entry_objects.clear();
+    reconciled[0].forward_verified.clear();
 
     assert!(
         bind_fallback_proof(&proof, &reconciled).is_none(),
@@ -37763,6 +37766,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         witness_fault: false,
         object,
         entry_objects: vec![vec![object]],
+        forward_verified: vec![vec![false]],
         scanned: ScannedModule {
             module_hint: None,
             mapped_identity: None,
@@ -37863,6 +37867,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         witness_fault: false,
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
+        forward_verified: vec![vec![false]],
         scanned: ScannedModule {
             module_hint: None,
             mapped_identity: None,
@@ -37938,6 +37943,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         witness_fault: false,
         object,
         entry_objects: vec![vec![object]],
+        forward_verified: vec![vec![false]],
         scanned: ScannedModule {
             module_hint: None,
             mapped_identity: None,
@@ -44189,6 +44195,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
             interfaces: Vec::new(),
         },
         entry_objects: Vec::new(),
+        forward_verified: Vec::new(),
     }];
     let before = engine.modules.clone();
     // A fake loader id is fine here: the stale scan errors before any
@@ -44355,6 +44362,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
+                forward_verified: Vec::new(),
             }],
             manifests: Vec::new(),
             ordinals: Vec::new(),
@@ -44378,6 +44386,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
+                forward_verified: Vec::new(),
             }],
             manifests: Vec::new(),
             ordinals: Vec::new(),
@@ -44396,6 +44405,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
                     object_without_identity;
                     reconciled.scanned.tables[0].entries.len()
                 ]],
+                forward_verified: vec![vec![false; reconciled.scanned.tables[0].entries.len()]],
             }],
             manifests: Vec::new(),
             ordinals: Vec::new(),
@@ -60740,6 +60750,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
         witness_fault: false,
         object,
         entry_objects: vec![offsets.iter().map(|_| object).collect()],
+        forward_verified: vec![offsets.iter().map(|_| false).collect()],
         scanned: ScannedModule {
             module_hint: None,
             mapped_identity: None,

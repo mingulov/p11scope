@@ -5686,14 +5686,20 @@ fn standard_layout_shape(table: &ScannedTable) -> bool {
 /// resolving outside the provider's own object keeps the proof.
 /// Both bind paths refuse a cross-object forward the pinned
 /// target's own `.dynsym` does not define at that exact offset
-/// (see `forwarded_bootstrap_verified`), so a retained forward was
-/// resolved by name: ordinary linker interposition when a provider
-/// loads first and globally visible (p11-kit-proxy loads
+/// (see `forwarded_bootstrap_verified`), so a binder-kept forward
+/// was resolved by name: ordinary linker interposition when a
+/// provider loads first and globally visible (p11-kit-proxy loads
 /// `libp11-kit.so` first). The exempted slots are getter
 /// descriptors, so they stay count-only and never read arguments;
 /// only proven own-object slots gain authority. Any other foreign
 /// entry, or a wrong-offset forward (bind moves it to `unpinned`,
 /// which refuses above), still refuses the whole table.
+///
+/// B5 2026-11-12: the exemption checks the binder's per-entry
+/// `forward_verified` proof, not just the getter name. A retained
+/// cross-object getter the binder never verified — a module
+/// produced on a path that bypassed bind verification — refuses,
+/// exactly as before the exemption.
 fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
     let scanned = &module.scanned;
     let table = &scanned.tables[index];
@@ -5703,14 +5709,19 @@ fn standard_layout_core(module: &ReconciledModule, index: usize) -> bool {
     let Some(objects) = module.entry_objects.get(index) else {
         return false;
     };
+    let Some(verified) = module.forward_verified.get(index) else {
+        return false;
+    };
     objects.len() == table.entries.len()
+        && verified.len() == table.entries.len()
         && table
             .entries
             .iter()
             .zip(objects.iter())
-            .all(|(entry, object)| {
+            .zip(verified.iter())
+            .all(|((entry, object), verified)| {
                 (entry.object == scanned.key && *object == module.object)
-                    || (entry.object != scanned.key && forwardable_getter(entry.name))
+                    || (entry.object != scanned.key && forwardable_getter(entry.name) && *verified)
             })
 }
 
@@ -8616,6 +8627,7 @@ mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![vec![object; entries.len()]],
+            forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -8679,6 +8691,7 @@ mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![vec![object; entries.len()]],
+            forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -9260,6 +9273,7 @@ mod tests {
             .expect("entry to move aside");
         let entry = table.entries.remove(position);
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         if unpinned {
             table.unpinned.push(Skipped {
                 subject: entry.name.to_string(),
@@ -9837,6 +9851,7 @@ mod tests {
             witness_fault: false,
             object,
             entry_objects: vec![vec![object; entries.len()]],
+            forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
                 module_hint: None,
                 mapped_identity: None,
@@ -9936,6 +9951,7 @@ mod tests {
             .expect("C_GetInfo entry");
         let entry = table.entries.remove(position);
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         module.scanned.tables[0].unpinned.push(Skipped {
             subject: entry.name.to_string(),
             reason: "target not pinned to a comparable object".into(),
@@ -9990,6 +10006,10 @@ mod tests {
         table.entries[position].object = other_key;
         table.entries[position].object_path = "/opt/other.so".into();
         module.entry_objects[0][position] = PinnedObjectId(43);
+        // The binder's per-entry proof this fixture stands in for:
+        // the pinned target's own `.dynsym` defines this same name
+        // at this exact offset.
+        module.forward_verified[0][position] = true;
         let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
         assert_eq!(plan.slots.len(), 92);
         assert!(
@@ -10444,6 +10464,9 @@ mod tests {
         module
             .entry_objects
             .push(vec![module.object; module.scanned.tables[0].entries.len()]);
+        module
+            .forward_verified
+            .push(vec![false; module.scanned.tables[0].entries.len()]);
         assert!(
             !sole_scan_semantic(&module),
             "a second table candidate refuses the sole-table grant"
@@ -10484,6 +10507,7 @@ mod tests {
         let dropped = table.entries.pop().expect("68 entries");
         assert_eq!(dropped.name, "C_WaitForSlotEvent");
         module.entry_objects[0].pop();
+        module.forward_verified[0].pop();
         let exports: Vec<(String, u64)> = table
             .entries
             .iter()
@@ -10520,6 +10544,10 @@ mod tests {
         table.entries[position].object = other_key;
         table.entries[position].object_path = "/opt/other.so".into();
         module.entry_objects[0][position] = PinnedObjectId(43);
+        // The binder's per-entry proof this fixture stands in for:
+        // the pinned target's own `.dynsym` defines this same name
+        // at this exact offset.
+        module.forward_verified[0][position] = true;
         assert!(
             sole_scan_semantic(&module),
             "a verified forwarded bootstrap keeps the sole-table grant"
@@ -10571,6 +10599,36 @@ mod tests {
     }
 
     #[test]
+    fn sole_complete_unverified_retained_forward_refuses() {
+        // B5 (Opus 2026-11-12): a retained cross-object getter entry
+        // the binder did NOT verify — a `ReconciledModule` produced on
+        // a path that bypassed bind verification — must not take the
+        // verified-forward exemption. Only a binder-verified forward
+        // keeps the layout proof; anything else stays count-only,
+        // exactly as before the exemption.
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetFunctionList")
+            .expect("bootstrap entry");
+        let other_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 43,
+        };
+        table.entries[position].object = other_key;
+        table.entries[position].object_path = "/opt/other.so".into();
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unverified retained forward refuses the sole-table grant"
+        );
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "unverified retained forward");
+    }
+
+    #[test]
     fn sole_complete_required_null_refuses() {
         let mut module = sole_complete_module();
         let table = &mut module.scanned.tables[0];
@@ -10582,6 +10640,7 @@ mod tests {
         table.entries.remove(position);
         table.null_entries.push("C_SignInit");
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         let exports: Vec<(String, u64)> = table
             .entries
             .iter()
@@ -10606,6 +10665,7 @@ mod tests {
         table.entries.remove(position);
         table.null_entries.push("C_GetInfo");
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         let exports: Vec<(String, u64)> = table
             .entries
             .iter()
@@ -10644,6 +10704,7 @@ mod tests {
         table.entries.remove(position);
         table.null_entries.push("C_GetFunctionList");
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         let exports: Vec<(String, u64)> = table
             .entries
             .iter()
@@ -10764,6 +10825,7 @@ mod tests {
             .expect("non-required entry");
         let entry = table.entries.remove(position);
         module.entry_objects[0].remove(position);
+        module.forward_verified[0].remove(position);
         table.unpinned.push(Skipped {
             subject: entry.name.to_string(),
             reason: "target not pinned to a comparable object".into(),
@@ -10973,6 +11035,7 @@ mod tests {
             .collect();
         module.scanned.tables[0].extension_impossible = true;
         module.entry_objects = vec![vec![module.object; 68]];
+        module.forward_verified = vec![vec![false; 68]];
         module.exports = (0..68)
             .map(|ordinal| {
                 (
@@ -11205,6 +11268,7 @@ mod tests {
             })
             .collect();
         scanned.entry_objects = vec![vec![object]; count];
+        scanned.forward_verified = vec![vec![false]; count];
         scanned
     }
 
@@ -12729,6 +12793,7 @@ mod tests {
         let mut tableless = scanned_with(key, "/opt/p11.so", []);
         tableless.scanned.tables.clear();
         tableless.entry_objects.clear();
+        tableless.forward_verified.clear();
 
         let rebuilt = plan.rebuild_from_sources(&[tableless], &[], &PinnedObjects::empty());
         assert_eq!(rebuilt.entries_seen, 0);
@@ -12826,6 +12891,7 @@ mod tests {
         let mut tableless = scanned_with(key, "/opt/p11.so", []);
         tableless.scanned.tables.clear();
         tableless.entry_objects.clear();
+        tableless.forward_verified.clear();
         let rebuilt = plan.rebuild_from_sources(&[tableless], &[], &PinnedObjects::empty());
         let delta = plan.extend_exact(rebuilt).unwrap();
         assert!(delta.new.is_empty());
@@ -13710,6 +13776,7 @@ mod tests {
             extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
+        grown.forward_verified.push(vec![false; 8]);
         let before = plan.clone();
 
         let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
@@ -13777,6 +13844,7 @@ mod tests {
             },
         );
         grown.entry_objects.insert(0, vec![existing; 2]);
+        grown.forward_verified.insert(0, vec![false; 2]);
         let before = plan.clone();
 
         let rebuilt = plan.rebuild_from_sources(&[grown], &[], &PinnedObjects::empty());
@@ -13869,6 +13937,13 @@ mod tests {
             vec![existing],
             vec![existing],
             vec![existing],
+        ];
+        grown.forward_verified = vec![
+            vec![false; 3],
+            vec![false],
+            vec![false],
+            vec![false],
+            vec![false],
         ];
         let filler_scan = scanned_with(
             scanned_key(filler),
@@ -13982,6 +14057,7 @@ mod tests {
             table(0x7100, 0x1000, &[8, 0x10000, 0x10008]),
         ];
         grown.entry_objects = vec![vec![existing], vec![existing; 3]];
+        grown.forward_verified = vec![vec![false], vec![false; 3]];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14095,6 +14171,7 @@ mod tests {
             table(0x7100, 0x1000, &[8, 0x10000, 0x10008]),
         ];
         grown.entry_objects = vec![vec![existing; 0], vec![existing], vec![existing; 3]];
+        grown.forward_verified = vec![vec![false; 0], vec![false], vec![false; 3]];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14199,6 +14276,7 @@ mod tests {
             table(0x7200, 0x2000, &[8, 0x10010]),
         ];
         grown.entry_objects = vec![vec![existing], vec![existing; 2], vec![existing; 2]];
+        grown.forward_verified = vec![vec![false], vec![false; 2], vec![false; 2]];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14313,6 +14391,7 @@ mod tests {
             vec![existing; 2],
             vec![existing],
         ];
+        grown.forward_verified = vec![vec![false], vec![false], vec![false; 2], vec![false]];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14430,6 +14509,7 @@ mod tests {
             table(0x7400, 0x4000),
         ];
         unchanged.entry_objects = vec![vec![existing; 2]; 5];
+        unchanged.forward_verified = vec![vec![false; 2]; 5];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14541,6 +14621,7 @@ mod tests {
             table(0x7400, 0x4000, &[24]),
         ];
         refreshed.entry_objects = vec![vec![existing]; 5];
+        refreshed.forward_verified = vec![vec![false]; 5];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
@@ -14736,6 +14817,7 @@ mod tests {
             extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
+        grown.forward_verified.push(vec![false; 8]);
         // Equal published evidence keeps discovery order: the attached table
         // stays the strongest, so its demand is zero and only the published
         // union can refuse.
@@ -14928,6 +15010,7 @@ mod tests {
             file_offset: other_offset,
         });
         grown.entry_objects[0].push(other_object);
+        grown.forward_verified[0].push(false);
         // The other provider still forwards into the shared endpoint.
         let mut other = scanned_with(
             scanned_key(other_object),
@@ -14941,6 +15024,7 @@ mod tests {
             file_offset: 0,
         });
         other.entry_objects[0].push(grown_object);
+        other.forward_verified[0].push(false);
 
         let rebuilt = plan.rebuild_from_sources(&[grown, other], &[], &PinnedObjects::empty());
         assert_eq!(rebuilt.modules_skipped.len(), 1);
@@ -15858,6 +15942,7 @@ mod tests {
             file_offset: 0x20,
         });
         scanned.entry_objects[0].push(PinnedObjectId(77));
+        scanned.forward_verified[0].push(false);
         scanned.scanned.tables.push(ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -15876,6 +15961,7 @@ mod tests {
             extension_impossible: false,
         });
         scanned.entry_objects.push(vec![scanned.object]);
+        scanned.forward_verified.push(vec![false]);
 
         let aliased = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Verify", 0x10)]);
         let mut equal_bytes_other_object = manifest_with(vec![resolved("C_Sign", 0x10)]);
@@ -16084,6 +16170,7 @@ mod tests {
             })
             .collect();
         module.entry_objects = vec![vec![object; entries]; tables];
+        module.forward_verified = vec![vec![false; entries]; tables];
         module
     }
 
@@ -16142,6 +16229,7 @@ mod tests {
             .iter()
             .map(|&(_, object, _)| PinnedObjectId(object))
             .collect();
+        module.forward_verified[table] = vec![false; targets.len()];
     }
 
     /// The first table's three fresh keys already fail, but the whole group
@@ -16999,6 +17087,7 @@ mod tests {
             extension_impossible: false,
         });
         closure.entry_objects.push(vec![closure.object; 68]);
+        closure.forward_verified.push(vec![false; 68]);
         let first = scoped_plan(&[filler, closure], AdmissionScope::Named);
 
         assert_eq!(slots_of(&first, 50), 250);
@@ -19329,6 +19418,7 @@ mod tests {
         closure.scanned.tables[0].entries.clear();
         closure.scanned.tables[0].unpinned = moved;
         closure.entry_objects[0].clear();
+        closure.forward_verified[0].clear();
         let first = scoped_plan(&[filler.clone(), closure.clone()], AdmissionScope::Named);
         let settled = first.rebuild_from_sources(&[filler, closure], &[], &PinnedObjects::empty());
         assert!(

@@ -167,6 +167,7 @@ impl ProviderFixture {
             },
             object,
             entry_objects: vec![vec![object; 2]],
+            forward_verified: vec![vec![false; 2]],
             exports: std::sync::Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
@@ -317,6 +318,7 @@ impl ProviderFixture {
             source
                 .entry_objects
                 .push(vec![source.object; entries.len()]);
+            source.forward_verified.push(vec![false; entries.len()]);
             source.scanned.tables.push(ScannedTable {
                 version: (3, 2),
                 walk: "full",
@@ -334,6 +336,7 @@ impl ProviderFixture {
         // too. It cannot vanish merely because the selected plan hit capacity.
         let count_only = offset + 100;
         source.entry_objects.push(vec![source.object]);
+        source.forward_verified.push(vec![false]);
         source.scanned.tables.push(ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -1001,6 +1004,7 @@ fn sole_complete_source(fixture: &ProviderFixture) -> ReconciledModule {
         },
         object,
         entry_objects: vec![vec![object; 68]],
+        forward_verified: vec![vec![false; 68]],
         exports,
         getter_present: false,
         witness_fault: false,
@@ -1061,6 +1065,8 @@ fn native_semantic_scan_subset_sole_complete_exports_only_second_table_refuses()
     sole.scanned.tables.push(second);
     sole.entry_objects
         .push(vec![sole.object; sole.scanned.tables[0].entries.len()]);
+    sole.forward_verified
+        .push(vec![false; sole.scanned.tables[0].entries.len()]);
     let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
     let prepared = prepare_scan_attested_subset(&engine);
     assert!(
@@ -1084,6 +1090,8 @@ fn native_semantic_scan_subset_sole_complete_one_vs_two_views_refuse_both_orders
     two.scanned.tables.push(second);
     two.entry_objects
         .push(vec![two.object; two.scanned.tables[0].entries.len()]);
+    two.forward_verified
+        .push(vec![false; two.scanned.tables[0].entries.len()]);
     for (label, modules) in [
         ("one-first", vec![one.clone(), two.clone()]),
         ("two-first", vec![two.clone(), one.clone()]),
@@ -1113,6 +1121,7 @@ fn sole_empty_source(fixture: &ProviderFixture) -> ReconciledModule {
     let mut empty = sole_complete_source(fixture);
     empty.scanned.tables.clear();
     empty.entry_objects.clear();
+    empty.forward_verified.clear();
     empty
 }
 
@@ -2047,6 +2056,7 @@ fn native_semantic_unattested_overlap_stays_count_only() {
         .unwrap();
     assert_ne!(rival.object, first_object);
     rival.entry_objects = vec![vec![first_object; 2]];
+    rival.forward_verified = vec![vec![false; 2]];
     for entry in &mut rival.scanned.tables[0].entries {
         entry.object = target_key;
         entry.object_path = fixture.manifest.module_path.clone();

@@ -956,14 +956,19 @@ its closed exact key set; this addition touches the `capture` section only.
 
 `capture.caller` names the pid-scope target: `{exe, exe_unknown_reason}`
 with exactly one non-null — the `/proc/<pid>/exe` link text (lossy
-UTF-8; non-UTF-8 bytes become U+FFFD) at report time, or the
+UTF-8; non-UTF-8 bytes become U+FFFD) at attach time, or the
 finite reason it could not be read. The attach-time read is re-read at
 report time from the same target, each read bound to the target's
 retained pin, so a recycled pid never misattaches an unrelated
-program's exe. If the target execs mid-capture, `exe` names the
-end-of-capture executable — the program that made the calls — while the
-stderr `target:` end note and the stdout `caller:` line name both
-programs; the JSON caller keeps exactly its two keys. It
+program's exe. If the target execs mid-capture, `exe` keeps the
+attach-time program — calls it made are never relabeled — and
+`exec_to_exe` names the end-of-capture program; the stderr `target:`
+end note and the stdout `caller:` line name both programs the same
+way. Per-program call counts are not attributed: nothing says which
+program made which calls, at most one transition is provable from the
+two reads (an intermediate program reads as a single hop, and a
+re-exec of the same path is invisible), and `exec_to_exe` is absent,
+never null, without a proven exec. It
 is present if and only if the scope is `pid` with resolved caller
 identity (a pid scope that resolved nothing emits no key; that arm is
 test-only — production always resolves exactly one of the two for pid

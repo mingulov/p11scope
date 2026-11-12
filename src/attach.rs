@@ -10204,7 +10204,7 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
-        self.detach_producers_driven(|| false, &mut std::io::stderr())
+        self.detach_producers_driven(|| false, &mut *crate::sink::bounded_stderr_writer())
     }
 
     /// Submit this Session's original producer ownership once, without

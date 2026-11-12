@@ -2,17 +2,13 @@
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Cleanup progress is optional diagnostics, never a blocking dependency.
 
-use std::io::{self, Write};
-use std::os::fd::AsRawFd as _;
+use std::io::Write;
 
 pub(super) fn terminal_diagnostics() -> Box<dyn Write> {
-    match crate::sink::stdout_transport_on_fd(io::stderr().as_raw_fd()) {
-        Ok(writer) => Box::new(writer),
-        // Optional diagnostics have no blocking fallback. This discards
-        // only progress text; the cleanup driver still returns its actual
-        // owned join/interruption/failure result to the caller.
-        Err(_) => Box::new(io::sink()),
-    }
+    // Optional diagnostics have no blocking fallback. This discards
+    // only progress text; the cleanup driver still returns its actual
+    // owned join/interruption/failure result to the caller.
+    crate::sink::bounded_stderr_writer()
 }
 
 #[cfg(test)]
@@ -20,7 +16,7 @@ mod tests {
     use super::*;
     use crate::fixture_guard::DieWithParent as _;
     use std::io::Read as _;
-    use std::os::fd::FromRawFd as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 

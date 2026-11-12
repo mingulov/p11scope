@@ -201,6 +201,25 @@ fn try_diagnostic_bytes_on_fd(fd: RawFd, bytes: &[u8]) -> io::Result<SinkDrops> 
     Ok(sink.take_drops())
 }
 
+/// A no-wait stderr `Write` for drivers that own their own text (detach
+/// progress, doctor probes): the raw transport takes what it takes now —
+/// pipes and sockets never wait, files write through the page cache —
+/// and a transport that cannot be opened sheds every line to the sink.
+/// Write errors are immediate (a full pipe fails fast); callers drop
+/// them, so diagnostics never fail or stall the driver. Unlike
+/// [`SinkWriter`], this never polls and never holds bytes past the call.
+pub(crate) fn bounded_stderr_writer() -> Box<dyn Write> {
+    bounded_writer_on_fd(std::io::stderr().as_raw_fd())
+}
+
+/// [`bounded_stderr_writer`] over any writer fd (tests pass their pipe).
+pub(crate) fn bounded_writer_on_fd(fd: RawFd) -> Box<dyn Write> {
+    match stdout_transport_on_fd(fd) {
+        Ok(writer) => Box::new(writer),
+        Err(_) => Box::new(std::io::sink()),
+    }
+}
+
 /// Builds the stdout sink for any writer fd (production passes fd 1),
 /// dispatching on file type so the shared description's status flags
 /// are never changed: pipes and terminals are reopened as private
@@ -1549,5 +1568,54 @@ mod tests {
         reader.read_exact(&mut received).unwrap();
         assert_eq!(&received, b"partial");
         assert_eq!(drops, SinkDrops::default());
+    }
+
+    /// v070-stderr-stall: drivers that own their own text (detach
+    /// progress) write stderr through a transport that never waits: a
+    /// full pipe fails fast — the driver drops the line — instead of
+    /// parking the run past its stop.
+    #[test]
+    fn bounded_writer_on_a_full_pipe_fails_fast_without_waiting() {
+        let (writer, _reader) = pair();
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        while filler.write(&[7; 65536]).is_ok() {}
+        filler.set_nonblocking(false).unwrap();
+        let mut out = bounded_writer_on_fd(writer.as_raw_fd());
+        let started = Instant::now();
+        let result = out.write_all(b"p11scope: cleanup completed, 5/5 links released, 0 s\n");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            result.is_err(),
+            "a full pipe must fail fast, not park: {result:?}"
+        );
+    }
+
+    /// The same writer delivers whole lines to a draining reader.
+    #[test]
+    fn bounded_writer_delivers_whole_lines_to_a_draining_reader() {
+        let (writer, mut reader) = pair();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut out = bounded_writer_on_fd(writer.as_raw_fd());
+        out.write_all(b"p11scope: cleanup completed, 5/5 links released, 0 s\n")
+            .unwrap();
+        out.flush().unwrap();
+        let mut got = vec![0u8; 53];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(
+            got,
+            b"p11scope: cleanup completed, 5/5 links released, 0 s\n"
+        );
+    }
+
+    /// A fd no transport can be opened on sheds every line to the sink:
+    /// writes succeed and the driver never learns stderr is gone.
+    #[test]
+    fn bounded_writer_on_an_unusable_fd_sheds_to_the_sink() {
+        let mut out = bounded_writer_on_fd(-1);
+        out.write_all(b"anything").unwrap();
+        out.flush().unwrap();
     }
 }

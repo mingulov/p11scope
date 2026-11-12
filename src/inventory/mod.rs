@@ -2082,7 +2082,10 @@ fn finish_semantic_native_cleanup(
     second_signal: &dyn Fn() -> bool,
 ) -> Result<()> {
     lane.map_or(Ok(()), |lane| {
-        lane.finish_owned_terminal_cleanup(second_signal, &mut std::io::stderr())
+        lane.finish_owned_terminal_cleanup(
+            second_signal,
+            &mut *crate::sink::bounded_stderr_writer(),
+        )
     })
 }
 
@@ -4331,7 +4334,8 @@ impl ClassicDriver<'_> {
             }
             JointFinishDriver::Published => {
                 let wound = match lane.as_mut() {
-                    Some(lane) => lane.poll_wound_down(coordinator, &mut std::io::stderr()),
+                    Some(lane) => lane
+                        .poll_wound_down(coordinator, &mut *crate::sink::bounded_stderr_writer()),
                     None => return JointStepOutcome::Stayed,
                 };
                 match wound {
@@ -4491,7 +4495,10 @@ impl ClassicDriver<'_> {
             let Some(lane) = winding.lane.as_mut() else {
                 return false;
             };
-            match lane.poll_wound_down(&mut *self.coordinator, &mut std::io::stderr()) {
+            match lane.poll_wound_down(
+                &mut *self.coordinator,
+                &mut *crate::sink::bounded_stderr_writer(),
+            ) {
                 Ok(false) => Outcome::Pending,
                 Ok(true) => Outcome::Joined,
                 Err(error) => {

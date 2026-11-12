@@ -6148,8 +6148,12 @@ mod tests {
         // 3089/0x3817fa600ead7f15 pin is exactly
         // ` [--isolation trusted|isolated]` on the discover line (+31);
         // no other drift.
-        assert_eq!(USAGE.len(), 3120);
-        assert_eq!(hash, 0x4fd7de9d62ec35ad);
+        // 3152 / 0xc83ab24b6cef5974 (learn off switch): diff vs the
+        // 3120/0x4fd7de9d62ec35ad pin is exactly
+        // `, P11SCOPE_DISABLE_FILE_LEARNING` on the Environment line
+        // (+32); no other drift.
+        assert_eq!(USAGE.len(), 3152);
+        assert_eq!(hash, 0xc83ab24b6cef5974);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

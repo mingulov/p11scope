@@ -459,10 +459,21 @@ loss up to 50,000 calls/s (448,750 records lost at 100,000/s).
 
 ### Browser after a background caller: per-key tracking may not start
 
-A browser started after a background PKCS#11 process is already
+A Chromium started after a background PKCS#11 process is already
 running can, intermittently, end without per-key operation tracking
-(reported as `bootstrap_unavailable`). Its calls and counts are still
-recorded. The fix is planned for a later release.
+(reported as `bootstrap_unavailable` with status `partial` and zero
+key-operation rows). Its calls and counts are still recorded
+(counted as `started_before_attach`). Measured: 4 of 20
+observer-first Chromium runs on a busy desktop (load 6-14) ended
+this way; the same harness measured 0 of 22 with Firefox and 0 of
+2 with Chromium on a quiet host. Cause: the browser child's first
+calls shed as unrouted before the scan binds it, and the
+pre-existing background binding lets the finalizer prove the new
+image an unbound caller, tainting it permanently
+(`joint_image_refused`, then `joint_birth_claim_ImageTainted` for
+every later birth), so no Joint feed ever installs. The fix (hold
+never-admitted images' sheds until they bind or exit instead of
+tainting on first shed) is planned for a later release.
 
 ### Starting Firefox mid-capture can withhold mechanism names
 

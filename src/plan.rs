@@ -6020,8 +6020,14 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // scan. `extend_exact_prepared` may carry a verified basis across
         // exactly this transient; forged, rivaled or otherwise unproven
         // tables fail the assumed-finished legs and stay refused.
-        let reproven_unfinished =
-            standard_layout_evidence.is_none() && !scan_finished && (sole_proven || getter_proven);
+        // Carry permission passes the same manifest-free eligibility
+        // test as every grant (ruling 05:25): a stale fallback lends
+        // names only, so a stale-backed disagreeing replacement re-proves
+        // nothing and the merge still replaces into count-only.
+        let reproven_unfinished = semantic_eligible
+            && standard_layout_evidence.is_none()
+            && !scan_finished
+            && (sole_proven || getter_proven);
         let scan_semantic = semantic_eligible && standard_layout_evidence.is_some();
         tables.push(TableSummary {
             version: table.version,

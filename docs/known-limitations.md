@@ -71,7 +71,7 @@ but one shape stays a counted gap: a provider file rewritten in place
 disclosed gaps `Could not read file magic` and `no comparable pinned
 identity`, single-instant edges, and nothing attached. That output is
 honest; folding the undigested record into the same-key digested
-record is 0.7.x work.
+record is planned for a later release.
 
 ### Same-namespace subreapers shown as launcher
 
@@ -168,7 +168,7 @@ detail stays empty, and the run can exit nonzero. The shed counts are
 exact, never silent; smaller scopes are unaffected. Workaround:
 narrow the scope (`--pid` or `--cgroup`), or rerun on a quieter host
 — the same capture passes and fails across hosts and runs. Under
-investigation for a 0.7.x release.
+investigation for a later release.
 
 ### Observer memory grows under heavy process churn
 
@@ -378,7 +378,7 @@ physical-identity and non-leader-exec qualifications under
 when probes attach; if the target execs another program during the
 capture, `capture.caller` and the stderr `target:` line keep the
 attach-time name while the new program's calls still count. Reporting
-the end-of-capture executable is 0.7.x work.
+the end-of-capture executable is planned for a later release.
 
 ### Key-tracking rate ceiling
 
@@ -482,7 +482,8 @@ providers p11scope already watches; those calls are still counted.
 `--pid`, `run` and selected-endpoint captures keep the count, and so
 does any capture that lost or dropped discovery records. The count can still over-report in a few cases
 (a thread's record racing the exit, an unknown exit order). Seeing
-those later loads needs a kernel-side witness and is 0.7.x work.
+those later loads needs a kernel-side witness and is planned
+for a later release.
 
 ### Multi attach steps stall the loop; detach can outlast the report
 
@@ -498,7 +499,8 @@ under full-suite load only (panic `prearm_witness_tests.rs:194`:
 PreAttach])`): the fixture's post-load refresh missed the mapping.
 The same binary passes in isolation and on rerun, so this is a test
 fixture race, not a product regression. The fix (make the fixture
-wait for the mapping observation) is 0.7.x work; a gate failure still
+wait for the mapping observation) is planned for a later release;
+a gate failure still
 counts.
 
 ## Known limitations in 0.6.0
@@ -1359,7 +1361,7 @@ detail during a counter capture (`--select-endpoint`).
   (a later release).
 - Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
-  exits (0.7.x).
+  exits (a later release).
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

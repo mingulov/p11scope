@@ -229,4 +229,4 @@ before calling a rerun green.
 - Disposition: counted campaign FAIL, shipped as a known issue. The
   harness rewrite stays as is (a real in-place rewrite shape); the
   product follow-up (fold an undigested record into the same-key
-  digested record) is 0.7.x work. Do not loosen the oracle.
+  digested record) is planned for a later release. Do not loosen the oracle.

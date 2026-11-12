@@ -109,6 +109,7 @@ FIXTURE_SOURCES = (
     "tests/fixtures/e16/e16_direct_exports.c",
     "tests/fixtures/e16/e16_vendor_only.c",
     "tests/fixtures/e16/e16_hsm_proxy.c",
+    "tests/fixtures/e16/e16_linked_forged.c",
 )
 # Everything this runner executes or imports as authority. The provenance
 # manifest binds their bytes to the observer's source revision.

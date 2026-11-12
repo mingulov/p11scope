@@ -2417,6 +2417,73 @@ fn joint_attach_birth_for_already_present_provider() {
     );
 }
 
+/// Shed-then-bind (browser-bootstrap): a fresh exec whose READY marker
+/// is stamped under the sealed closure, but whose pre-bind calls were
+/// already sighted below the birth cut. Exec novelty breaks, yet the
+/// birth succeeds as attach-observed at the same cut — pre-cut history
+/// stays first-observed / not attributed — instead of refusing and
+/// leaving the feed S1Only forever.
+#[test]
+fn joint_shed_then_bind_birth_falls_back_to_attach_observed() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    let image = harness.io.current_image;
+    // Quantum 1: the new image's first calls ingest (sighted) before
+    // any birth is offered — the shed-then-bind shape. No birth yet.
+    harness.push_create(1);
+    let mut first = harness.collect();
+    let (_first_report, first_admitted) = harness.route(&mut first);
+    harness.ingest(first, &first_admitted);
+    // The image binds between quanta: its next observation mints an
+    // admitted-first birth above the sighted history.
+    let (_, endpoint) = harness.fixture.endpoint_for("C_CreateObject");
+    harness
+        .capture
+        .router
+        .mark_admitted(image, endpoint.file_slot);
+    harness.push_create(2);
+    let mut second = harness.collect();
+    let (mut report, admitted) = harness.route(&mut second);
+    assert!(
+        report.observations.contains(&ObserveOutcome::AdmittedFirst),
+        "the bound image mints its admitted-first birth: {:?}",
+        report.observations
+    );
+    let (_, proof) = harness.ingest(second, &admitted);
+    let publisher = NativePublisher::build();
+    let sealed = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    let mut rows = NativeBirthRows { row, control };
+    let candidate = report
+        .take_current()
+        .pop()
+        .unwrap()
+        .into_birth_candidate()
+        .unwrap_or_else(|_| panic!("admitted-first birth candidate"));
+    harness
+        .capture
+        .validate_birth_candidate(&mut harness.io, &candidate, false)
+        .unwrap();
+    let witness = harness
+        .capture
+        .finish_birth(
+            candidate,
+            None,
+            &admitted,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &proof,
+            &harness.adapter,
+            &mut rows,
+        )
+        .expect("a novelty-broken fresh exec still births as attach-observed");
+    assert_eq!(
+        witness.receipt().birth(),
+        crate::semantics_objects::journal::BirthKind::AttachObserved,
+        "pre-cut sheds stay unattributed; later history tracks"
+    );
+}
+
 /// v0.7.0 issue 1 (observe level): a task stamped under this closure
 /// whose marker word is DIRTY (a watched call was refused or lost, so
 /// the scope-gap root dirtied it) can never exec-birth — DIRTY sticks

@@ -6396,6 +6396,155 @@ mod finalizer_history_tests {
         assert_eq!(unrouted_gap_calls(&coordinator), 3);
     }
 
+    #[test]
+    fn post_binding_hold_defers_taint_until_binding() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // JK-19b healthy twin (browser-bootstrap): background bound
+        // (41); a new image (77) sheds before it binds. Its sheds
+        // dispose without barrier AND without tainting (held). It
+        // binds within grace, so it is never refused; its later shed
+        // barriers as its own loss.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+                unrouted_call(domain, 77, 3),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 3,
+                    pending_floor: None
+                }
+            ),
+            "held sheds dispose without barrier: {first:?}"
+        );
+        assert!(
+            !coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((77, 3)),
+            "a never-admitted image is held, not tainted on first shed"
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 3,
+            },
+        );
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    4,
+                ),
+                unrouted_call(domain, 77, 5),
+            ],
+        );
+        assert!(
+            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
+            "the bound image's own shed barriers as its loss: {second:?}"
+        );
+        assert!(
+            !coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((77, 3)),
+            "binding within grace never taints"
+        );
+    }
+
+    #[test]
+    fn post_binding_hold_taints_after_grace_without_binding() {
+        // JK-19b expiry twin: background bound (41); a new image (77)
+        // sheds and never binds. It is held first (no taint), then
+        // tainted once its bounded grace expires without a binding —
+        // today's eventual refusal, delayed, never removed.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            !coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((77, 3)),
+            "a never-admitted image is held, not tainted on first shed"
+        );
+        let mut position = 10u64;
+        let mut tainted_at: Option<u64> = None;
+        for _ in 0..64u64 {
+            commit_outcomes(
+                &mut coordinator,
+                &mut lane,
+                domain,
+                vec![invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    position,
+                )],
+            );
+            position += 1;
+            if coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((77, 3))
+            {
+                tainted_at = Some(position);
+                break;
+            }
+        }
+        assert!(
+            tainted_at.is_some(),
+            "an image that never binds is still refused after a bounded grace"
+        );
+    }
+
     /// Gap reasons by subject for the two unrouted subjects.
     fn unrouted_subject_calls(
         coordinator: &InventoryCoordinator<OsProcessSource>,

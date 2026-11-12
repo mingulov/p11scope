@@ -944,7 +944,7 @@ def prearmed_module(evidence):
 
 def completed_calls(text, function):
     return sum(1 for line in text.splitlines()
-               if f" {function} " in line and " \u2192 " in line)
+               if f" {function} " in line and " -> " in line)
 
 pre_68 = kernel_is_pre_68()
 held_evidence, held_ledger, held_text = load("held")

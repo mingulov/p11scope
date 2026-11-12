@@ -886,5 +886,48 @@ class CounterRefusalTests(unittest.TestCase):
             self.assertEqual(rows[0]["qualification"], "failed")
 
 
+def load_completed_calls():
+    """Compile completed_calls from the real oracle block.
+
+    AST-extracted (not copied) so the tests track the shipped oracle;
+    only the function is compiled, never the block's top-level capture
+    assertions.
+    """
+    tree = ast.parse(extract_handoff_oracle())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "completed_calls":
+            namespace = {}
+            exec(compile(ast.Module(body=[node], type_ignores=[]),
+                         "<completed>", "exec"), namespace)
+            return namespace["completed_calls"]
+    raise AssertionError("completed_calls missing from the run-prearm oracle")
+
+
+class CompletedCallsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.count = staticmethod(load_completed_calls())
+
+    def test_counts_ascii_completed_calls(self):
+        # Product trace is ASCII-only since 3cac05e06: " C_Foo -> CKR_OK ".
+        text = (
+            '13:03:29.479265 "w" (PID 1, TID 1) '
+            "C_GetFunctionList -> CKR_OK 1.0us\n"
+            '13:03:29.479266 "w" (PID 1, TID 1) '
+            "C_Initialize -> CKR_OK 1.0ms\n"
+            '13:03:29.479267 "w" (PID 1, TID 1) '
+            "C_Finalize -> CKR_OK 1.0us\n"
+        )
+        self.assertEqual(self.count(text, "C_Initialize"), 1)
+        self.assertEqual(self.count(text, "C_Finalize"), 1)
+        self.assertEqual(self.count(text, "C_GetFunctionList"), 1)
+
+    def test_oracle_uses_ascii_arrow(self):
+        block = extract_handoff_oracle()
+        self.assertIn('" -> "', block)
+        self.assertNotIn("\\u2192", block)
+        self.assertNotIn("→", block)
+
+
 if __name__ == "__main__":
     unittest.main()

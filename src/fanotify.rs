@@ -1853,6 +1853,46 @@ mod tests {
         );
     }
 
+    /// An autofs overmount at an already-mounted real path hides the
+    /// lower mount: overmount replacement wins over the pseudo skip, so
+    /// the lower locator is removed and never reaches the mark pass
+    /// (opening it would open the trigger). A real share already
+    /// mounted at a descendant path stays covered through its own entry.
+    #[test]
+    fn learn_mount_marks_autofs_overmount_hides_lower_real_mount() {
+        let table = "1 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+             100 1 8:2 / /mnt/nas rw,relatime - ext4 /dev/sda2 rw\n\
+             101 1 0:101 / /mnt/nas rw,relatime - autofs systemd-1 rw\n\
+             102 101 0:102 / /mnt/nas/share rw,relatime - nfs server:/export rw\n";
+        let mut marks: Vec<String> = super::mounts_for_marks(table)
+            .iter()
+            .map(|mount| mount.point.to_string_lossy().into_owned())
+            .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec!["/", "/mnt/nas/share"],
+            "the autofs overmount hides the lower /mnt/nas locator; the mounted share stays"
+        );
+        // A real descendant mounted *before* the overmount is hidden by
+        // it too: opening that path would traverse the trigger, so it
+        // is dropped as well.
+        let table = "1 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+             102 1 0:102 / /mnt/nas/share rw,relatime - nfs server:/export rw\n\
+             100 1 8:2 / /mnt/nas rw,relatime - ext4 /dev/sda2 rw\n\
+             101 1 0:101 / /mnt/nas rw,relatime - autofs systemd-1 rw\n";
+        let mut marks: Vec<String> = super::mounts_for_marks(table)
+            .iter()
+            .map(|mount| mount.point.to_string_lossy().into_owned())
+            .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec!["/"],
+            "paths hidden under the trigger are dropped, not marked through it"
+        );
+    }
+
     fn mnt(mount_id: u64, dev_major: u32, dev_minor: u32) -> super::MountIdentity {
         super::MountIdentity {
             mount_id,

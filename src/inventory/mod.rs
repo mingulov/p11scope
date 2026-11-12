@@ -1707,6 +1707,7 @@ fn run_with_terminal_budget(
                 attach_backend,
                 key_operations,
                 false,
+                None,
             )
         })
     };
@@ -3444,12 +3445,28 @@ impl ClassicDriver<'_> {
             if !self.settle_scan_seal() {
                 return;
             }
+            // Late-stop recheck (F1): the settle peek outlives the
+            // hook-entry sample, so a stop latching during settle
+            // must still forbid the start below. The cgroup run
+            // control is live (a shared latch), so the startup
+            // rechecks it at every new-start boundary.
+            if self.stop_requested
+                || self.suspended
+                || self
+                    .cgroup
+                    .as_ref()
+                    .is_some_and(|cgroup| cgroup.control.check().is_err())
+            {
+                return;
+            }
+            let run_control = self.cgroup.as_ref().map(|cgroup| cgroup.control.clone());
             if let Some(lane) = start_semantic_lane(
                 self.coordinator,
                 &engine_scope,
                 self.attach_backend,
                 true,
                 true,
+                run_control.as_ref(),
             ) {
                 // A refused live start returns the fallback shell:
                 // drop it and keep the seal pending so the next
@@ -5684,14 +5701,27 @@ where
 /// its honest `unavailable` summary; broad Inventory runs either way.
 /// Under `--key-operations` the lane first attempts a linked journal
 /// start; a refused journal start keeps S1 with the finite journal
-/// reason and retries ordinary.
+/// reason and retries ordinary. A live run control rechecks at every
+/// new-start boundary below, so a stop latching during settle, mints
+/// or an earlier start still forbids later capture work (F1); `None`
+/// keeps the existing always-attempt behavior.
 fn start_semantic_lane(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     key_operations: bool,
     scan_subset: bool,
+    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
+    // Late-stop admission (F1): a stop latching after hook entry
+    // still forbids new capture work (the coordinator's no-new-start
+    // stop contract). An already-started attempt finishes its own
+    // disposition; nothing later begins. The seal stays pending for
+    // the terminal disclosure.
+    let stopped = || run_control.is_some_and(|control| control.check().is_err());
+    if stopped() {
+        return None;
+    }
     // The bytes rule before any semantic-lane BPF work: a stale or
     // mismatched embedded object degrades here with the plain mismatch
     // message (never the bare attachment code); broad inventory continues.
@@ -5722,13 +5752,30 @@ fn start_semantic_lane(
                     return None;
                 }
             };
-        match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
+        // The mints above are slow: recheck before the journal start.
+        if stopped() {
+            return None;
+        }
+        match seal_start_live(
+            attach_subset,
+            convert_subset,
+            scope,
+            backend,
+            Some(&spec),
+            run_control,
+        ) {
             Ok(lane) => {
                 note_semantic_lane_sealed();
                 coordinator.note_semantic_sealed();
                 return Some(lane);
             }
             Err(journal_refusal) => {
+                // The ordinary retry below is a separate new capture
+                // attempt: a stop latching during the journal start
+                // forbids it, so it never begins.
+                if stopped() {
+                    return None;
+                }
                 let reason = key_operations_refusal_reason(&journal_refusal);
                 coordinator.note_scope_gap(
                     "key operations unavailable".into(),
@@ -5743,17 +5790,38 @@ fn start_semantic_lane(
             }
         }
     }
+    // A refused journal start consumed its subsets above; the retry
+    // re-mints here. Recheck first (a stop latching during the
+    // journal start forbids the retry) and again after the mints.
+    if stopped() {
+        return None;
+    }
     let Ok((attach_subset, convert_subset)) = seal_mint_start_subsets(coordinator, scan_subset)
     else {
         return None;
     };
-    match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
+    if stopped() {
+        return None;
+    }
+    match seal_start_live(
+        attach_subset,
+        convert_subset,
+        scope,
+        backend,
+        None,
+        run_control,
+    ) {
         Ok(lane) => {
             note_semantic_lane_sealed();
             coordinator.note_semantic_sealed();
             Some(lane)
         }
         Err(refusal) => {
+            // A stop latching during the start skips even the
+            // fallback shell: no new work past the stop.
+            if stopped() {
+                return None;
+            }
             coordinator.note_scope_gap(
                 "semantic lane unavailable".into(),
                 format!("{refusal}; broad inventory continues without instance semantics"),
@@ -5946,17 +6014,26 @@ fn seal_prepare_subset(
 
 /// The seal boundary of the lane startup (BPF): the live lane start
 /// in production; tests script the verdict through
-/// `seal_startup_test::with` instead of loading BPF.
+/// `seal_startup_test::with` instead of loading BPF. A live run
+/// control refuses the start before any capture work begins.
 fn seal_start_live(
     attach_subset: crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
     convert_subset: crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     journal: Option<&crate::attach::journal::JournalSpec>,
+    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
 ) -> Result<
     crate::inventory_semantics::AttestedSemanticLane,
     crate::inventory_semantics::SemanticRefusal,
 > {
+    // The last-line admission check (F1): immediately before new
+    // capture work begins, without consuming a verdict or recording
+    // a start. Callers recheck after a refusal, so this variant
+    // never surfaces as a gap on its own.
+    if run_control.is_some_and(|control| control.check().is_err()) {
+        return Err(crate::inventory_semantics::SemanticRefusal::Unavailable);
+    }
     #[cfg(test)]
     if let Some(verdict) = seal_startup_test::take_start_verdict() {
         seal_startup_test::record_start_scope(scope);
@@ -11534,6 +11611,7 @@ mod tests {
             crate::attach::BackendSelection::Auto,
             false,
             false,
+            None,
         );
         assert!(
             lane.as_ref().is_none_or(|lane| !lane.is_live()),
@@ -29859,6 +29937,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -29887,6 +29966,7 @@ mod seal_readiness_tests {
             crate::attach::BackendSelection::Auto,
             false,
             false,
+            None,
         );
         assert!(lane.is_none(), "no subset seats no lane");
         assert!(
@@ -29917,6 +29997,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -29954,6 +30035,7 @@ mod seal_readiness_tests {
                         crate::attach::BackendSelection::Auto,
                         key_operations,
                         false,
+                        None,
                     )
                 },
             );
@@ -29996,6 +30078,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -30032,6 +30115,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     true,
+                    None,
                 )
             },
         );
@@ -30073,6 +30157,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
+                    None,
                 )
             },
         );
@@ -30119,6 +30204,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     true,
+                    None,
                 )
             },
         );
@@ -30149,6 +30235,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -30293,6 +30380,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
+                    None,
                 )
             },
         );
@@ -30347,6 +30435,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
+                    None,
                 )
             },
         );
@@ -30404,6 +30493,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
+                    None,
                 )
             });
             assert!(lane.is_none(), "refused subsets seat no lane");
@@ -30436,6 +30526,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -30499,6 +30590,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );
@@ -30529,6 +30621,7 @@ mod seal_readiness_tests {
                     crate::attach::BackendSelection::Auto,
                     false,
                     false,
+                    None,
                 )
             },
         );

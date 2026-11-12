@@ -14,7 +14,7 @@ use crate::discovery::native_binding::BoundImage;
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::inspect_system::inventory_cgroup::ScopedCollectionGap;
 use crate::process::PidPin;
-use crate::scope::inventory_cgroup::CgroupIncomplete;
+use crate::scope::inventory_cgroup::{CgroupIncomplete, CollectionStop};
 use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, DiscoveryRecord};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -4115,6 +4115,103 @@ fn cgroup_native_owner_incomplete_pass_never_suspends() {
         scene.coordinator.owner_of(scene.caller),
         Some(owner),
         "an incomplete pass retains the owner"
+    );
+    assert_no_suspended_gap(&scene);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+}
+
+#[test]
+fn cgroup_native_owner_deadline_straddle_refuses_refresh_and_retains_facts() {
+    // CI run 43309778622, inventory-cgroup v6.6 leg: a pass that
+    // starts just before the run deadline stages a refresh of the
+    // active owner, then the deadline latches before the commit
+    // gate. The transaction is incomplete and the final-sample
+    // permit is gone, so the pass refuses the refresh BY NAME with
+    // the facts-retained reason, marks nobody, and keeps the owner:
+    // work state, not a lost member, and the qualifier oracle
+    // knows this exact reason alongside the deadline row. The
+    // manual run clock flips past the deadline exactly at
+    // GateSampled (staging done, permits not yet polled).
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene.coordinator.owner_of(scene.caller).expect("active");
+    assert_eq!(acquired.borrow().calls(), 5);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipped_clock = std::sync::Arc::clone(&flipped);
+    let control = CollectionControl::with_clock(Some(deadline), move || {
+        if flipped_clock.load(std::sync::atomic::Ordering::Acquire) {
+            deadline + std::time::Duration::from_secs(1)
+        } else {
+            deadline - std::time::Duration::from_secs(60)
+        }
+    });
+    let pid = scene.child_id();
+    let flipped_gate = std::sync::Arc::clone(&flipped);
+    let completion = scene.commit_gated_pass(pid, control, move |phase| {
+        if phase == super::scoped_commit_gate_test::Phase::GateSampled {
+            flipped_gate.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    assert_eq!(
+        completion.outcome,
+        ScopedCollectionOutcome::Cancelled(CollectionStop::Deadline),
+        "the straddling pass cancels at the run deadline"
+    );
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "the refresh fully prepared before the gate"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        Some(owner),
+        "a deadline-cancelled pass retains the owner"
+    );
+    assert!(
+        matches!(
+            scene
+                .coordinator
+                .adapter()
+                .record(scene.caller)
+                .unwrap()
+                .authority,
+            ImageAuthority::NativeExact { .. }
+        ),
+        "retained facts keep native-exact authority"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == REFRESH_REFUSED_SUBJECT
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(pid)
+                && gap.module.is_none()
+                && gap.budget.is_none()
+                && gap.reason
+                    == "the final-sample permit was not granted; prior owner facts retained"
+        }),
+        "the straddled refresh refusal names the caller and the retention: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "cgroup scope transaction incomplete"
+                && gap.reason == "cgroup collection deadline reached"
+                && gap.caller.is_none()
+                && gap.module.is_none()
+                && gap.pid.is_none()
+        }),
+        "the straddling pass also records the deadline row"
     );
     assert_no_suspended_gap(&scene);
     assert_eq!(staged_counts(&scene), (1, 0, 0));

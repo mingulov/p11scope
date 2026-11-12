@@ -30,6 +30,10 @@ UNPROVEN = ("original_file_unproven: kernel witness unavailable: "
             "scoped collection deactivates the kernel proof")
 NATIVE = ("no settled expected native image for this caller in the "
           "acquisition domain; scan-pinned fallback retained")
+REFRESH_RETAINED = ("the final-sample permit was not granted; "
+                    "prior owner facts retained")
+REFRESH_MEMBER_LOST = "the final-sample permit was not granted"
+DEADLINE = "cgroup collection deadline reached"
 UNBOUND_SUBJECT = "used by an unidentified caller image"
 UNBOUND_FIRST = "no live caller incarnation held the tgid when the row was read"
 UNBOUND_FIRST_EXITED = "the pinned caller exited before its cookie could be queried"
@@ -151,6 +155,29 @@ class AcceptTests(unittest.TestCase):
         rc, out = run_oracle(decided_report(), modfs="ext4")
         self.assertEqual(rc, 0, out)
         self.assertIn("unproven=2 gaps=5", out)
+
+    def test_deadline_straddle_with_retained_refresh_passes(self):
+        # CI run 43309778622, v6.6.157 leg: twelve passes, two of
+        # them deadline-cancelled; one cancelled pass had staged a
+        # refresh of the already-active c0 owner, so the producer
+        # refused it by name and retained the owner's facts (c0
+        # kept native_exact with its 1507 counted entries). The
+        # deadline is the designed run bound and the facts-retained
+        # refusal its designed disclosure, so the shape qualifies.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 2})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=2 gaps=7", out)
 
     def test_witness_available_unbound_positive_passes_off_overlay(self):
         # Host leg (7.0.0-azure): the witness ran, so no unproven gaps
@@ -283,6 +310,23 @@ class RefuseTests(unittest.TestCase):
         report["gaps"].append(
             {"caller": None, "module": None, "pid": None,
              "reason": "something new", "subject": "novel gap",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay published extra gap", out)
+
+    def test_member_lost_refresh_refusal_still_fails(self):
+        # Only the facts-retained variant is a known deadline
+        # consequence. The bare variant means the member was lost
+        # after the final sample of a still-complete transaction
+        # (its admission standing was withdrawn, its owner
+        # suspended): a different, stronger disclosure that must
+        # keep failing loudly here.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_MEMBER_LOST,
+             "subject": "native owner refresh refused",
              "repeats": 1})
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)

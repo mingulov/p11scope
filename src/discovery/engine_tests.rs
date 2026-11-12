@@ -79278,3 +79278,196 @@ fn cgroup_mark_naming_a_proven_kthread_never_gaps() {
     engine.settle_frame_deferrals_at_capture_end();
     assert_eq!(engine.pid_descendant_gaps(), 0);
 }
+
+/// Fix6: a stale kthread mark must not suppress a later unknown user
+/// generation reusing the pid. System scope: prove kthread 4242, two
+/// absent walks confirm its death, then an unlisted user generation
+/// reusing 4242 exits. Fail-closed counts it.
+#[test]
+fn system_reused_pid_after_two_absent_walks_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    engine.note_scope_walk(&BTreeSet::new(), Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "a reused-pid user exit after two absent walks must count"
+    );
+}
+
+/// Fix6 cgroup twin of the reused-pid suppression above.
+#[test]
+fn cgroup_reused_pid_after_two_absent_walks_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    engine.note_scope_walk(&BTreeSet::new(), Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "a reused-pid user exit after two absent walks must count"
+    );
+}
+
+/// Fix6 inverse: a delayed exit record from the old proved kthread
+/// must still skip after the pid is relisted as a user, while the
+/// new user generation's own exit counts. System scope.
+#[test]
+fn system_delayed_kthread_exit_after_user_relisting_skips() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    // The pid returns as a user generation.
+    std::fs::write(pid_dir.join("stat"), stat_line(4242, "u", 0)).unwrap();
+    std::fs::write(
+        pid_dir.join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a delayed old-kthread exit must still skip after user relisting"
+    );
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "the new user generation's own exit must count"
+    );
+}
+
+/// Fix6 cgroup twin of the delayed-kthread inverse above.
+#[test]
+fn cgroup_delayed_kthread_exit_after_user_relisting_skips() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    std::fs::write(pid_dir.join("stat"), stat_line(4242, "u", 0)).unwrap();
+    std::fs::write(
+        pid_dir.join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a delayed old-kthread exit must still skip after user relisting"
+    );
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "the new user generation's own exit must count"
+    );
+}
+
+/// Fix6: departed kthread marks must not permanently exhaust the
+/// bounded exclusion. After 256 proved kthreads depart, a fresh
+/// proved kthread still earns its exemption.
+#[test]
+fn departed_kthreads_do_not_exhaust_future_exclusions() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for pid in 5000u32..5256u32 {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(
+            pid_dir.join("stat"),
+            stat_line(pid, "k", crate::process::PF_KTHREAD),
+        )
+        .unwrap();
+        std::fs::write(pid_dir.join("maps"), "").unwrap();
+    }
+    let fresh_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    std::fs::write(
+        fresh_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(fresh_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = (5000u32..5256u32).collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    let fresh: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&fresh, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 320);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a fresh proved kthread must still skip after 256 departures"
+    );
+}

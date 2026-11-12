@@ -494,12 +494,18 @@ def assert_safe_profile(doc):
         rows = entry.get("mechanisms", [])
         assert isinstance(rows, list), entry
         for row in rows:
-            assert set(row) == {"mechanism", "mechanism_hex", "registered",
+            assert set(row) == {"mechanism", "mechanism_hex", "name",
+                                "registered", "attribution_basis",
                                 "calls", "errors"}, row
             assert isinstance(row["mechanism"], int) and row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            assert row["attribution_basis"] == "manifest", row
+            assert row["name"] is None or isinstance(row["name"], str), row
+            if row["mechanism"] == REGISTERED:
+                assert row["name"] == "CKM_SHA256", row
             if TARGET_BITS == 32:
                 if row["registered"] is False:
                     assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
+                    assert row["name"] is None, row
             else:
                 assert row["registered"] is True, row
     assert doc["templates"]["operations"] == [], doc["templates"]
@@ -2426,7 +2432,8 @@ def main(argv=None):
             "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
             "mechanisms": [
                 {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
-                 "registered": False, "calls": 1, "errors": 0},
+                 "name": None, "registered": False,
+                 "attribution_basis": "manifest", "calls": 1, "errors": 0},
             ],
         }]
         reject("safe profile 64-bit cgroup unregistered row",
@@ -2436,7 +2443,9 @@ def main(argv=None):
             "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
             "mechanisms": [
                 {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
-                 "registered": True, "calls": 1, "errors": 0, "note": "x"},
+                 "name": "CKM_SHA256", "registered": True,
+                 "attribution_basis": "manifest", "calls": 1, "errors": 0,
+                 "note": "x"},
             ],
         }]
         reject("safe profile 64-bit cgroup extra key",
@@ -2490,9 +2499,11 @@ def main(argv=None):
             "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
             "mechanisms": [
                 {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
-                 "registered": False, "calls": 1, "errors": 0},
+                 "name": None, "registered": False,
+                 "attribution_basis": "manifest", "calls": 1, "errors": 0},
                 {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
-                 "registered": True, "calls": 1, "errors": 0},
+                 "name": "CKM_SHA256", "registered": True,
+                 "attribution_basis": "manifest", "calls": 1, "errors": 0},
             ],
         }]
         assert_safe_profile(cgood)
@@ -2504,6 +2515,22 @@ def main(argv=None):
         cwrong["cgroups"][0]["mechanisms"][0]["mechanism"] = ALIASES["pss_hash"]
         reject("safe profile 32-bit cgroup unregistered id",
                lambda: assert_safe_profile(cwrong))
+        cbasis = json.loads(json.dumps(cgood))
+        cbasis["cgroups"][0]["mechanisms"][1]["attribution_basis"] = "standard_layout"
+        reject("safe profile 32-bit cgroup non-manifest basis",
+               lambda: assert_safe_profile(cbasis))
+        cnoname = json.loads(json.dumps(cgood))
+        del cnoname["cgroups"][0]["mechanisms"][1]["name"]
+        reject("safe profile 32-bit cgroup missing name",
+               lambda: assert_safe_profile(cnoname))
+        cwrongname = json.loads(json.dumps(cgood))
+        cwrongname["cgroups"][0]["mechanisms"][1]["name"] = "CKM_SHA512"
+        reject("safe profile 32-bit cgroup wrong registered name",
+               lambda: assert_safe_profile(cwrongname))
+        cnamednarrow = json.loads(json.dumps(cgood))
+        cnamednarrow["cgroups"][0]["mechanisms"][0]["name"] = "CKM_SHA256"
+        reject("safe profile 32-bit cgroup named narrow row",
+               lambda: assert_safe_profile(cnamednarrow))
         initialize(64)
 
         initialize(64)

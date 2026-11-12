@@ -106,7 +106,11 @@ captures the observer does not own; the report carries that window as
 a counted gap only when the post-ready completion added coverage (a
 new plan slot or a newly attached dynamic export hook), whose calls
 before it attached were not counted. `--pid` captures arm before the
-`capturing:` line and have no such window.
+`capturing:` line and have no such window. On quiet Docker and
+`--cgroup` scopes the same window can mark a fully counted capture
+PARTIAL: the post-ready completion attached only provider-publication
+hooks, which count no calls, yet the gap fires anyway. All calls are
+counted; only the verdict is wrong. Fixed in 0.7.1.
 
 ### Long captures go blind to new processes once the 262,144 identity budget is spent
 
@@ -154,6 +158,17 @@ exact counts and named causes, never silently dropped.
 
 Avoid it with `--prearm-module PATH`, `run`, or a narrower
 `--pid`/`--cgroup` scope. A scheduling redesign is planned for 0.7.1.
+
+### Manifest captures at very large endpoint counts may shed calls
+
+An `inventory --system --manifest ...` capture watching around four
+thousand endpoints or more (measured at 4,097 with `--max-endpoints
+8192`) can shed calls with exact counted causes while per-endpoint
+detail stays empty, and the run can exit nonzero. The shed counts are
+exact, never silent; smaller scopes are unaffected. Workaround:
+narrow the scope (`--pid` or `--cgroup`), or rerun on a quieter host
+— the same capture passes and fails across hosts and runs. Under
+investigation for a 0.7.x release.
 
 ### Observer memory grows under heavy process churn
 
@@ -404,6 +419,26 @@ silently dropped. Sustained rates above 6,250 key operations per
 second with exact per-call rows need the independent event reader,
 planned for 0.7.1.
 
+### System key operations without a manifest show no per-key rows
+
+`inventory --system --key-operations` without `--manifest` prints
+`key operations: requested, but per-key tracking needs --manifest`
+and shows no per-key rows. Workaround: build a manifest with the
+offline helper (`p11scope-discover --module <path> -o manifest.json`)
+and pass `--manifest manifest.json`, or capture the process by
+`--pid`. Per-key rows without a manifest are planned for 0.7.1.
+
+### Calls through the p11-kit proxy can publish no mechanism names
+
+When the application reaches its provider through the p11-kit proxy,
+the mechanism table can come back empty: calls are counted exactly
+at the provider, but no `CKM_*` rows publish and `mechanisms[]`
+stays empty. Measured: 140 proxy calls counted with 0 mechanism
+rows, while the same workload against the provider directly
+publishes its rows. Workaround: point the application at the
+provider itself instead of the proxy when mechanism names matter.
+Fixed in 0.7.1.
+
 ### `trace --system` and `profile` rate ceilings on a small VM
 
 On a 3-vCPU VM (sm1, fedora guest, rc-8 build), `trace --system`
@@ -438,6 +473,16 @@ Firefox started after the capture begins attaches and its calls count
 normally (the per-key tracking gap above can still leave it without
 per-key operation tracking). A fix is in review; if it misses this
 release it lands in 0.7.1.
+
+### Starting Firefox mid-capture can withhold mechanism names
+
+On some desktops, starting Firefox while a capture is already
+running triggers a one-time hook re-attach: coverage reads PARTIAL
+with the `static probes detached and exact pairs reattached` and
+`static probe coverage gap incomplete` skips, and mechanism names
+are withheld (slots fall back to count-only). Calls are still
+counted exactly. There is no workaround for the names; the counts
+stay valid. Fixed in 0.7.1.
 
 ### Main thread exits first: a later library load can go unreported
 

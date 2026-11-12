@@ -787,11 +787,11 @@ pub struct Engine {
     /// Pids proven to be kernel threads with no user address space
     /// (`PF_KTHREAD` plus empty maps) while live: their exits never
     /// count descendant gaps, matching the deep-scan exclusion. Fed
-    /// by scope walks for newly listed pids (and by live checks at
-    /// the ledger's other entries); a reused pid re-classifies on
-    /// its next listing, so a user generation never inherits the
-    /// mark. Bounded: past `MAX_SCAN_PIDS` new marks drop and count
-    /// (fail-closed).
+    /// only by scope walks for newly listed pids; a reused pid
+    /// re-classifies on its next listing, so a user generation
+    /// never inherits the mark (a death plus reuse inside one walk
+    /// interval is the documented hole). Bounded: past
+    /// `MAX_SCAN_PIDS` new marks drop and count (fail-closed).
     known_kernel_threads: BTreeSet<u32>,
     /// Proc root the kernel-thread classifier reads (`/proc` in
     /// production; tests point it at a fixture dir).
@@ -13771,14 +13771,14 @@ impl Engine {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
-        // Kernel threads never count: a proven kthread's exit leaves
-        // the ledger untouched (no gap, no hint, no stash drop — a
-        // reused pid's user generation owns its entries now).
-        // Fail-closed: unclassifiable pids count on.
-        if self.known_kernel_threads.contains(&pid) || pid_is_kernel_thread(&self.proc_root, pid) {
-            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
-                self.known_kernel_threads.insert(pid);
-            }
+        // Kernel threads never count: an exit for a pid the walks
+        // proved a kernel thread leaves the ledger untouched (no
+        // gap, no hint, no stash drop — a reused pid's user
+        // generation owns its entries now). Only walk-observed
+        // state judges here: a live /proc read would classify
+        // whatever generation holds the pid now, not the dead one
+        // this record is for. Fail-closed: unknown pids count on.
+        if self.known_kernel_threads.contains(&pid) {
             return;
         }
         if self
@@ -15389,15 +15389,12 @@ impl Engine {
         if self.newcomer_first_seen.contains_key(&pid) {
             return;
         }
-        // Kernel threads never count: a proven kthread takes no
-        // arrival mark, so its departure never gaps at prune or
-        // finish. The scope walk usually classified it already; the
-        // live check covers direct marks. Fail-closed: unclassifiable
-        // pids mark on.
-        if self.known_kernel_threads.contains(&pid) || pid_is_kernel_thread(&self.proc_root, pid) {
-            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
-                self.known_kernel_threads.insert(pid);
-            }
+        // Kernel threads never count: a pid the walks proved a
+        // kernel thread takes no arrival mark, so its departure
+        // never gaps at prune or finish. Only walk-observed state
+        // judges here, like the exit path above. Fail-closed:
+        // unknown pids mark on.
+        if self.known_kernel_threads.contains(&pid) {
             return;
         }
         if self.newcomer_first_seen.len() >= crate::timing::MAX_NEWCOMER_MARKS {

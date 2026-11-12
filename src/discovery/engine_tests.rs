@@ -5540,10 +5540,22 @@ fn drain_newcomer_exit(engine: &mut Engine, pid: u32, hook_ts: u64) {
 }
 
 /// One complete scope walk listing exactly `live`, from `start` to
-/// `start + 5`.
+/// `start + 5`. Hermetic: synthetic pids never consult host /proc
+/// (a colliding host kernel thread would poison the ledger), so the
+/// walk classifies nothing. Tests that need classification fixtures
+/// call `note_scope_walk` directly with their own `proc_root`.
 fn walk_scope(engine: &mut Engine, live: &[u32], start: u64) {
+    engine.proc_root = test_empty_proc_root();
     let live: BTreeSet<u32> = live.iter().copied().collect();
     engine.note_scope_walk(&live, Some(start), Some(start + 5));
+}
+
+/// Shared empty proc root for hermetic walks: never written, so
+/// parallel tests share it safely and every pid stays unproven.
+fn test_empty_proc_root() -> PathBuf {
+    let dir = std::env::temp_dir().join("p11scope-test-empty-procroot");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn system_generation_engine() -> Engine {
@@ -78977,7 +78989,10 @@ fn system_walk_proves_kworker_so_its_exit_never_gaps() {
     .unwrap();
     let mut engine = system_generation_engine();
     engine.proc_root = proc_root.to_path_buf();
-    walk_scope(&mut engine, &[4242, 4343], 100);
+    // Direct walks: the shared helper pins an empty proc root, which
+    // would discard this test's fixtures.
+    let live: BTreeSet<u32> = [4242, 4343].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
     assert_eq!(engine.known_kernel_threads, BTreeSet::from([4242]));
     engine.mark_newcomer_arrival(4242, Some(110));
     engine.mark_newcomer_arrival(4343, Some(110));
@@ -78987,7 +79002,7 @@ fn system_walk_proves_kworker_so_its_exit_never_gaps() {
     assert_eq!(engine.pid_descendant_gaps(), 0);
     drain_newcomer_exit(&mut engine, 4343, 130);
     assert_eq!(engine.pid_descendant_gaps(), 1);
-    walk_scope(&mut engine, &[], 200);
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
     assert_eq!(engine.pid_descendant_gaps(), 1);
 }
 

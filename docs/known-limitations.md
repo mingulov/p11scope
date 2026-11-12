@@ -531,7 +531,14 @@ names the source SHA behind each check the release rounds re-measured.
   of 12 measured cells, at every call rate): no birth is offered for
   the tracked process, reported as `joint_birth_unoffered` with "Joint
   birth unavailable; retained S1". Plain call counts stay exact in
-  those runs; re-running the capture is the workaround.
+  those runs; re-running the capture is the workaround. Re-measured
+  2026-11-12 on the v0.7.0 pre-release candidate c94555552 (Fedora
+  7.2.9, SoftHSM HMAC workload): tracking started in all 40 short
+  cells (20 `--pid` and 20 `--system`, half at 1,000 calls/s and half
+  at 6,250 calls/s, 4 s each), with exact per-key rows every run and
+  no `joint_birth_unoffered` gap; the v0.6.0 miss shape was not seen.
+  Those cells ran one workload at a time; concurrent foreign SoftHSM
+  callers were out of scope for this re-measurement.
 - On busy hosts the kernel can skip re-entrant runs of the mapping
   hooks; each skip raises a new fault era. Calls across the skip are
   shed with exact counts and a named cause, affected instance rows read

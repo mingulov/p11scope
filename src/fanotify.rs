@@ -490,6 +490,17 @@ pub(crate) struct MountToMark {
     identity: Option<MountIdentity>,
 }
 
+/// One mark attempt: the mount the held open resolved to, and the
+/// mount actually marked when the syscall succeeded. A failed add
+/// keeps its resolved identity so the evaluator can credit a path
+/// that still reaches an already-marked filesystem (an unchanged
+/// shadow after the capability shed) instead of filing a false gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarkOutcome {
+    resolved: Option<MountIdentity>,
+    marked: Option<MountIdentity>,
+}
+
 /// Mounts to mark, parsed from `/proc/self/mountinfo` text: field 1
 /// is the mount id, field 3 the filesystem device, field 5 the mount
 /// point, and the field after `" - "` is the fstype. Malformed lines
@@ -861,16 +872,18 @@ const MARK_COVERAGE_CAP: usize = 8192;
 /// landed after the snapshot, a triggered automount: opens at the
 /// path hit the marked filesystem either way). A failure still
 /// covers the path when the snapshot mount carries a retained mark
-/// from an earlier pass on the *same mount identity* (the startup
-/// marks survive the post-setup capability shed and keep
-/// delivering), and a failure on a mount never covered before
-/// counts as uncovered. The next covered set retains exactly the
-/// mounts actually marked plus the retained snapshot mounts still
-/// visible — never a shadowed snapshot identity, so a shadowing
-/// mount that goes away leaves the reappeared snapshot honestly
-/// uncovered. A remount or a replacement filesystem at an already
-/// covered path carries a new mount id, so it never inherits the
-/// dead mount's coverage. Coverage therefore comes from this
+/// from an earlier pass on the *same mount identity*, or when the
+/// failed add resolved to an already-marked identity (an unchanged
+/// shadow after the capability shed: the startup mark on the
+/// resolving mount survives the shed and keeps delivering). A
+/// failure that resolved to an unmarked identity, or never resolved
+/// at all, counts as uncovered. The next covered set retains exactly
+/// the mounts actually marked plus the retained snapshot mounts
+/// still visible — never a shadowed snapshot identity, so a
+/// shadowing mount that goes away leaves the reappeared snapshot
+/// honestly uncovered. A remount or a replacement filesystem at an
+/// already covered path carries a new mount id, so it never inherits
+/// the dead mount's coverage. Coverage therefore comes from this
 /// retained-identity set alone — traffic on older filesystems can
 /// never stand in for a filesystem whose mark failed. Returns the
 /// next covered set and the uncovered-visible count; a nonzero
@@ -878,17 +891,18 @@ const MARK_COVERAGE_CAP: usize = 8192;
 pub(crate) fn evaluate_mark_coverage(
     previously_covered: &BTreeSet<MountIdentity>,
     visible: &[MountToMark],
-    mut mark: impl FnMut(&std::path::Path) -> Option<MountIdentity>,
+    mut mark: impl FnMut(&std::path::Path) -> MarkOutcome,
 ) -> (BTreeSet<MountIdentity>, usize) {
     // Each entry is judged by its own mark outcome alone, so one
     // pass over the snapshot cannot credit the wrong mount however
-    // the table is ordered. The callback returns the identity of
-    // the mount actually marked, derived from the held descriptor
-    // it marked — never the snapshot's say-so. A successful mark
-    // covers its path even when the open resolved to a different
-    // mount than the snapshot (the marked filesystem is what the
-    // path reaches now); only a failed mark on a never-covered
-    // mount owes the gap.
+    // the table is ordered. The callback reports the mount the held
+    // open resolved to alongside the mount actually marked, both
+    // derived from the held descriptor — never the snapshot's
+    // say-so. A successful mark covers its path even when the open
+    // resolved to a different mount than the snapshot; a failed add
+    // covers its path only when it resolved to an already-marked
+    // identity, whether retained from an earlier pass or marked
+    // earlier in this same pass.
     let mut covered = BTreeSet::new();
     let mut uncovered = 0usize;
     for mount in visible {
@@ -899,12 +913,22 @@ pub(crate) fn evaluate_mark_coverage(
             covered.insert(identity);
             continue;
         }
-        match mark(&mount.point) {
-            Some(marked) if covered.len() < MARK_COVERAGE_CAP => {
-                covered.insert(marked);
-            }
-            _ => uncovered += 1,
+        let outcome = mark(&mount.point);
+        if let Some(marked) = outcome.marked
+            && covered.len() < MARK_COVERAGE_CAP
+        {
+            covered.insert(marked);
+            continue;
         }
+        if outcome.marked.is_none()
+            && let Some(resolved) = outcome.resolved
+            && covered.len() < MARK_COVERAGE_CAP
+            && (previously_covered.contains(&resolved) || covered.contains(&resolved))
+        {
+            covered.insert(resolved);
+            continue;
+        }
+        uncovered += 1;
     }
     (covered, uncovered)
 }
@@ -1017,26 +1041,34 @@ fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
 }
 
 /// Adds one filesystem mark through a held descriptor for the
-/// mount point (the NULL-pathname fd form), returning the marked
-/// mount's identity read from that same descriptor against the
-/// pass snapshot. Directories mark through the directory handle;
-/// file bind mounts (a file where the snapshot shows a mount
-/// point) mark through a file handle, covering the file's
-/// filesystem. `None` when the mount point cannot be held (for
-/// example an `O_RDONLY` open refused with `EACCES`), when the
-/// kernel refuses the mark (for example without `CAP_SYS_ADMIN`
-/// after the capability shed), or when the identity cannot be
-/// read: an uncredited mark is a named gap, never silent coverage.
-/// Marking the held object — not re-resolving the pathname inside
-/// the syscall — is what binds the credit to the mount actually
-/// marked when an overmount races the mountinfo snapshot.
+/// mount point (the NULL-pathname fd form), returning the mount the
+/// held open resolved to alongside the mount actually marked, both
+/// read from that same descriptor against the pass snapshot.
+/// Directories mark through the directory handle; file bind mounts
+/// (a file where the snapshot shows a mount point) mark through a
+/// file handle, covering the file's filesystem. The resolved
+/// identity is reported even when the kernel refuses the add (for
+/// example without `CAP_SYS_ADMIN` after the capability shed), so a
+/// path that still reaches an already-marked filesystem stays
+/// covered; an unresolvable open (for example an `O_RDONLY` open
+/// refused with `EACCES`) or an unreadable identity marks nothing
+/// and resolves to nothing: an uncredited mark is a named gap,
+/// never silent coverage. Marking the held object — not re-resolving
+/// the pathname inside the syscall — is what binds the credit to
+/// the mount actually marked when an overmount races the mountinfo
+/// snapshot.
 fn try_mark_filesystem(
     group: &OwnedFd,
     point: &std::path::Path,
     mounts: &[MountToMark],
-) -> Option<MountIdentity> {
-    let held = open_mount_for_mark(point).or_else(|| open_file_for_mark(point))?;
-    let identity = mount_identity_of_fd(&held, mounts);
+) -> MarkOutcome {
+    let Some(held) = open_mount_for_mark(point).or_else(|| open_file_for_mark(point)) else {
+        return MarkOutcome {
+            resolved: None,
+            marked: None,
+        };
+    };
+    let resolved = mount_identity_of_fd(&held, mounts);
     // SAFETY: libc call; the group and held descriptors are valid,
     // and a NULL pathname marks the held descriptor's object.
     let rc = unsafe {
@@ -1049,9 +1081,15 @@ fn try_mark_filesystem(
         )
     };
     if rc != 0 {
-        return None;
+        return MarkOutcome {
+            resolved,
+            marked: None,
+        };
     }
-    identity
+    MarkOutcome {
+        resolved,
+        marked: resolved,
+    }
 }
 
 /// One (re-)mark pass over the visible filesystems, retaining the
@@ -1674,6 +1712,28 @@ mod tests {
         }
     }
 
+    fn marked(mount_id: u64, dev_major: u32, dev_minor: u32) -> super::MarkOutcome {
+        let identity = mnt(mount_id, dev_major, dev_minor);
+        super::MarkOutcome {
+            resolved: Some(identity),
+            marked: Some(identity),
+        }
+    }
+
+    fn failed(mount_id: u64, dev_major: u32, dev_minor: u32) -> super::MarkOutcome {
+        super::MarkOutcome {
+            resolved: Some(mnt(mount_id, dev_major, dev_minor)),
+            marked: None,
+        }
+    }
+
+    fn unresolved() -> super::MarkOutcome {
+        super::MarkOutcome {
+            resolved: None,
+            marked: None,
+        }
+    }
+
     /// The mark parser carries mount identity (mount id + filesystem
     /// device) beside each point, and an overmounted point keeps the
     /// topmost (last) mount's identity: the path resolves there.
@@ -1769,7 +1829,7 @@ mod tests {
             visible_mount("/data", 52, 8, 2),
         ];
         // Every add fails now (no CAP_SYS_ADMIN after the shed).
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| unresolved());
         assert_eq!(uncovered, 0, "retained marks stay covered");
         assert_eq!(next, covered);
     }
@@ -1783,7 +1843,8 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 2)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 2));
         assert_eq!(uncovered, 1, "the replacement filesystem was never marked");
         assert!(next.is_empty(), "the dead mount's coverage is not retained");
     }
@@ -1796,7 +1857,8 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/mnt/provider", 68, 8, 1)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 1));
         assert_eq!(uncovered, 1, "a remount is not the marked mount");
         assert!(next.is_empty());
     }
@@ -1809,7 +1871,7 @@ mod tests {
         let covered: std::collections::BTreeSet<super::MountIdentity> =
             [mnt(51, 8, 1)].into_iter().collect();
         let visible = vec![visible_mount("/moved/provider", 51, 8, 1)];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| unresolved());
         assert_eq!(uncovered, 0, "the moved mount's mark still delivers");
         assert_eq!(next, covered);
     }
@@ -1825,7 +1887,8 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/mnt/new", 68, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| failed(68, 8, 2));
         assert_eq!(uncovered, 1, "the unmarked new filesystem is a gap");
         assert_eq!(next, covered, "only the retained filesystem is covered");
     }
@@ -1841,7 +1904,11 @@ mod tests {
             visible_mount("/mnt/new", 68, 8, 2),
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
-            (point.as_os_str() == "/mnt/new").then(|| mnt(68, 8, 2))
+            if point.as_os_str() == "/mnt/new" {
+                marked(68, 8, 2)
+            } else {
+                unresolved()
+            }
         });
         assert_eq!(uncovered, 0);
         assert!(next.contains(&mnt(68, 8, 2)));
@@ -1862,7 +1929,7 @@ mod tests {
         // The syscall marked the racing overmount (68), not the
         // snapshot mount (51).
         let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(68, 8, 2)));
+            super::evaluate_mark_coverage(&covered, &visible, |_| marked(68, 8, 2));
         assert_eq!(uncovered, 0, "the resolving overmount is marked");
         assert!(
             !next.contains(&mnt(51, 8, 1)),
@@ -1874,7 +1941,8 @@ mod tests {
         );
         // After the overmount goes away, a failed re-mark of the
         // reappeared snapshot mount is uncovered, not retained.
-        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 8, 1));
         assert_eq!(uncovered, 1);
         assert!(next.is_empty());
     }
@@ -1888,7 +1956,13 @@ mod tests {
             visible_mount("/", 51, 8, 1),
             visible_mount("/data", 52, 8, 2),
         ];
-        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
+            if point.as_os_str() == "/" {
+                failed(51, 8, 1)
+            } else {
+                failed(52, 8, 2)
+            }
+        });
         assert_eq!(uncovered, 2);
         assert!(next.is_empty());
     }
@@ -1906,7 +1980,7 @@ mod tests {
         // The syscall marked the resolving overmount (51), not the
         // snapshot mount (39).
         let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(51, 0, 42)));
+            super::evaluate_mark_coverage(&covered, &visible, |_| marked(51, 0, 42));
         assert_eq!(uncovered, 0, "the resolving filesystem is marked");
         assert!(
             next.contains(&mnt(51, 0, 42)),
@@ -1928,7 +2002,7 @@ mod tests {
         let covered = std::collections::BTreeSet::new();
         let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
         let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(68, 8, 2)));
+            super::evaluate_mark_coverage(&covered, &visible, |_| marked(68, 8, 2));
         assert_eq!(uncovered, 0, "the overmount's mark covers the path");
         assert_eq!(
             next,
@@ -1937,7 +2011,8 @@ mod tests {
         );
         // The overmount is gone; the reappeared snapshot mount cannot
         // be marked (post-shed re-mark without CAP_SYS_ADMIN).
-        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 8, 1));
         assert_eq!(uncovered, 1, "the unmarked reappearance owes the gap");
         assert!(next.is_empty(), "the dead overmount is not retained");
     }
@@ -1957,7 +2032,7 @@ mod tests {
         // Startup: both paths resolve to the shadowing mount 51 and
         // both marks succeed.
         let (next, uncovered) =
-            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(51, 0, 42)));
+            super::evaluate_mark_coverage(&covered, &visible, |_| marked(51, 0, 42));
         assert_eq!(uncovered, 0, "startup marks cover the shadowed path");
         assert_eq!(
             next,
@@ -1967,7 +2042,8 @@ mod tests {
         // Unchanged topology after the shed: the retained mount's
         // re-mark is skipped, the shadowed mount's re-mark fails,
         // but the path still resolves to the marked 51.
-        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&next, &visible, |_| failed(51, 0, 42));
         assert_eq!(
             uncovered, 0,
             "unchanged shadow resolving to a marked mount stays covered"
@@ -1992,11 +2068,11 @@ mod tests {
         ];
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
             if point.as_os_str() == "/" {
-                Some(mnt(51, 8, 1))
+                marked(51, 8, 1)
             } else if point.as_os_str() == "/usr/lib" {
-                Some(mnt(68, 0, 42))
+                marked(68, 0, 42)
             } else {
-                None
+                failed(52, 8, 2)
             }
         });
         assert_eq!(uncovered, 1, "only the failed mark owes a gap");

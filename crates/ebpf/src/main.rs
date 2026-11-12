@@ -93,7 +93,7 @@ use p11scope_ebpf_common::object_flow::{
     adapter_derive_entry, adapter_emit_find_control, adapter_emit_get_control,
     adapter_fill_return_control, adapter_kem_entry, adapter_tail_fill, continuity_joins,
     decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
-    join_refusal_bump, preserve_refused_base,
+    join_refusal_bump, preserve_refused_base, refused_join_accounting,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_journal::{
@@ -4886,8 +4886,17 @@ fn object_return_ordinary(
         if outcome == RefusedBaseOutcome::OutputFailed {
             bump_evidence(EVIDENCE_RING_LOSS);
         }
-        if bump || outcome == RefusedBaseOutcome::RetirementFailed {
+        // Retired starts are matched (their base was emitted above):
+        // only a failed retirement is a return without a recorded
+        // start. The coverage gate silences retired joins when
+        // continuity was never active; a failed retirement still
+        // reports unmatched on every coverage state.
+        let (unmatched, semantic) = refused_join_accounting(outcome, bump);
+        if unmatched {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        if semantic {
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         }
         return 0;
     }
@@ -5095,8 +5104,17 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         if JOURNAL {
             journal_roots::program::gap();
         }
-        if bump || outcome == RefusedBaseOutcome::RetirementFailed {
+        // Retired starts are matched (their base was emitted above):
+        // only a failed retirement is a return without a recorded
+        // start. The coverage gate silences retired joins when
+        // continuity was never active; a failed retirement still
+        // reports unmatched on every coverage state.
+        let (unmatched, semantic) = refused_join_accounting(outcome, bump);
+        if unmatched {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        if semantic {
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         }
         return 0;
     }

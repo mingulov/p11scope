@@ -1422,6 +1422,27 @@ pub fn preserve_refused_base(
     }
 }
 
+/// Refused-join accounting shared by every gated return arm: the outcome
+/// decides which counter names the refusal. Returns
+/// `(unmatched, semantic)`. A failed START retirement is genuinely a
+/// return without a recorded start and always bumps unmatched. A retired
+/// start with a refused join is a matched return whose object detail was
+/// withheld: it bumps semantic capture (the call was observed and its
+/// ordinary base emitted) when `predicate_counts`, and stays silent
+/// otherwise (never-active continuity). Ring loss stays
+/// `OutputFailed`-only in the caller.
+#[inline(always)]
+pub fn refused_join_accounting(
+    outcome: RefusedBaseOutcome,
+    predicate_counts: bool,
+) -> (bool, bool) {
+    if outcome == RefusedBaseOutcome::RetirementFailed {
+        (true, false)
+    } else {
+        (false, predicate_counts)
+    }
+}
+
 /// Production entry attribute-inspection path (H7-E4 seam).
 ///
 /// Inspects one authorized creation-template pair and populates `out`
@@ -3402,5 +3423,45 @@ mod tests {
             join_refusal_bump(&continuity_of(blank, recorded), u64::MAX),
             "unstamped refusal with an unreadable cell bumps"
         );
+    }
+
+    /// Healthy twin (trace-cgroup): a refused join on a RETIRED start is
+    /// a matched return with withheld object detail, never a return
+    /// without a recorded start. With a counting predicate it reports a
+    /// semantic capture failure; with a silent predicate (never-active
+    /// continuity) it reports nothing. Neither bumps unmatched.
+    #[test]
+    fn retired_refused_join_reports_semantic_or_silent_never_unmatched() {
+        use super::{refused_join_accounting, RefusedBaseOutcome};
+        for outcome in [
+            RefusedBaseOutcome::Emitted,
+            RefusedBaseOutcome::OutputFailed,
+        ] {
+            assert_eq!(
+                refused_join_accounting(outcome, true),
+                (false, true),
+                "retired+counting reports semantic, not unmatched: {outcome:?}"
+            );
+            assert_eq!(
+                refused_join_accounting(outcome, false),
+                (false, false),
+                "retired+silent stays silent: {outcome:?}"
+            );
+        }
+    }
+
+    /// Failure twin (trace-cgroup): a failed START retirement is genuinely
+    /// a return without a recorded start and always bumps unmatched, on
+    /// every predicate. Ring loss stays OutputFailed-only in the caller.
+    #[test]
+    fn failed_retirement_always_reports_unmatched() {
+        use super::{refused_join_accounting, RefusedBaseOutcome};
+        for predicate in [false, true] {
+            assert_eq!(
+                refused_join_accounting(RefusedBaseOutcome::RetirementFailed, predicate),
+                (true, false),
+                "failed retirement bumps unmatched on predicate {predicate}"
+            );
+        }
     }
 }

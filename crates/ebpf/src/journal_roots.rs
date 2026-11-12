@@ -382,8 +382,17 @@ pub(super) mod program {
                 bump_evidence(EVIDENCE_RING_LOSS);
             }
             gap();
-            if bump || outcome == RefusedBaseOutcome::RetirementFailed {
+            // Retired starts are matched (their base was emitted above):
+            // only a failed retirement is a return without a recorded
+            // start. The coverage gate silences retired joins when
+            // continuity was never active; a failed retirement still
+            // reports unmatched on every coverage state.
+            let (unmatched, semantic) = refused_join_accounting(outcome, bump);
+            if unmatched {
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+            if semantic {
+                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
             }
             return 0;
         }

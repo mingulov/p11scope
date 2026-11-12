@@ -1916,9 +1916,11 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
     pin_continuity_gate_precedes_fills();
     let source = bpf_source();
     // Both object copies preserve exactly the initialized 368-byte base
-    // on refused continuity: same output shape and stamps, same loss
-    // accounting, no fill/emission in the refused arm, no second record
-    // on the healthy path. Only the retirement differs per copy.
+    // on refused continuity: same output shape and stamps, same
+    // outcome-split accounting (unmatched only when the retirement
+    // failed, semantic capture otherwise), no fill/emission in the
+    // refused arm, no second record on the healthy path. Only the
+    // retirement differs per copy.
     for (name, start, end, retire) in [
         (
             "ordinary copy",
@@ -1956,7 +1958,13 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
         );
         assert!(arm.contains("RefusedBaseOutcome::OutputFailed"));
         assert!(arm.contains("bump_evidence(EVIDENCE_RING_LOSS)"));
+        // Outcome-split accounting (trace-cgroup): only a failed
+        // retirement bumps unmatched (genuinely no recorded start); a
+        // retired start with a refused join bumps semantic capture
+        // (observed call, withheld object detail).
+        assert!(arm.contains("refused_join_accounting(outcome, true)"));
         assert!(arm.contains("bump_evidence(EVIDENCE_UNMATCHED_RETURNS)"));
+        assert!(arm.contains("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)"));
         assert!(
             !arm[discard..].contains("raw"),
             "{name}: never read a discarded reservation"
@@ -3263,8 +3271,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            150410,
-            "51b42eebe66b6dab9e6e55c95f984d66e2529ece7b0294abed3005086beb6f49"
+            150775,
+            "7ee8059dfb25dfd523cbd52f5ab859a3131c2f479ee9e772fa716e9a44c316be"
         ),
         "stripped BPF dump must stay byte-identical"
     );

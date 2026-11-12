@@ -267,8 +267,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Failure pair: an unreadable directory yields no count (fail-closed:
-    /// the caller treats it as breached).
+    /// Failure pair: an unreadable directory yields no count (fail-open:
+    /// the caller proceeds and reports once under the fixed name, never
+    /// defers).
     #[test]
     fn open_fd_count_missing_directory_yields_none() {
         let dir = std::env::temp_dir().join(format!(
@@ -280,5 +281,106 @@ mod tests {
                 .as_nanos()
         ));
         assert_eq!(open_fd_count_in(&dir), None);
+    }
+
+    /// Healthy: a breached snapshot still defers the rest to the next tick
+    /// (the guard guards); at exactly the reserve it admits.
+    #[test]
+    fn reserve_defers_when_headroom_below_reserve() {
+        let soft = 1024u64;
+        let breached = FdReserveTick::from_counts(soft - FD_RESERVE + 1, soft);
+        assert!(reserve_defers(Some(&breached)));
+        let admitted = FdReserveTick::from_counts(soft - FD_RESERVE, soft);
+        assert!(!reserve_defers(Some(&admitted)));
+    }
+
+    /// Failure pair: an unreadable snapshot never defers (fail open): the
+    /// scan proceeds without the reserve guard instead of deferring every
+    /// process on every tick.
+    #[test]
+    fn reserve_proceeds_when_snapshot_unreadable() {
+        assert!(!reserve_defers(None));
+    }
+
+    /// Healthy: the tick snapshot counts exactly the fd directory entries
+    /// and judges by the same pure predicate.
+    #[test]
+    fn tick_snapshot_counts_directory_entries() {
+        let dir = std::env::temp_dir().join(format!("fd-budget-tick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["0", "1", "2"] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        let tick = FdReserveTick::sample_in(&dir).expect("a readable dir snapshots");
+        assert_eq!(tick.open, 3);
+        assert_eq!(
+            tick.breached(),
+            fd_reserve_breached(3, tick.soft, FD_RESERVE)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failure pair: an unreadable fd directory yields no snapshot (fail
+    /// open at the call site, never a deferred tick).
+    #[test]
+    fn tick_snapshot_unreadable_yields_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "fd-budget-tick-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(FdReserveTick::sample_in(&dir).is_none());
+    }
+
+    /// Healthy: views opened during the tick count against the reserve, so
+    /// one snapshot guards the whole tick without re-reading `/proc`.
+    #[test]
+    fn tick_counter_trips_reserve_as_views_open() {
+        let soft = 1024u64;
+        let mut tick = FdReserveTick::from_counts(soft - FD_RESERVE, soft);
+        assert!(!tick.breached());
+        tick.note_opened();
+        assert_eq!(tick.opened, 1);
+        assert!(tick.breached());
+    }
+
+    /// Failure pair: absurd counts saturate instead of wrapping past the
+    /// reserve (no overflow panic in debug, no wrap into admission).
+    #[test]
+    fn tick_counter_saturates_on_absurd_counts() {
+        let mut tick = FdReserveTick::from_counts(u64::MAX, u64::MAX);
+        assert!(tick.breached());
+        tick.note_opened();
+        assert!(tick.breached());
+    }
+
+    /// Healthy: the unreadable snapshot reports under its fixed name, once.
+    #[test]
+    fn unreadable_report_claims_once_under_its_fixed_name() {
+        assert_eq!(UNREADABLE_SUBJECT, "capture file-descriptor reserve");
+        assert_eq!(
+            UNREADABLE_REASON,
+            "the capture's open file count could not be read (/proc/self/fd), so the \
+             file-descriptor reserve guard is blind; views proceed without it"
+        );
+        let slot = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            claim_unreadable_report(&slot),
+            "the first unreadable snapshot reports"
+        );
+    }
+
+    /// Failure pair: after the claim, repeated unreadable snapshots report
+    /// nothing more (no per-tick gap spam while `/proc` stays unreadable).
+    #[test]
+    fn unreadable_report_stays_silent_after_the_claim() {
+        let slot = std::sync::atomic::AtomicBool::new(false);
+        assert!(claim_unreadable_report(&slot));
+        assert!(!claim_unreadable_report(&slot));
+        assert!(!claim_unreadable_report(&slot));
     }
 }

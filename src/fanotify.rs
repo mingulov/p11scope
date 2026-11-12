@@ -1158,21 +1158,38 @@ fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
 /// mount entry marks — so the bind needs no separate filesystem of
 /// its own.
 fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
-    open_file_for_mark_impl(point, || {})
+    open_file_for_mark_impl(point, || {}, |_| {})
 }
 
-/// Test seam: `pre_reopen` runs after the `O_PATH` type check and before
-/// the read-only reopen, so the ancestor-swap twin can prove the final
-/// handle never re-resolves the pathname. Production passes a no-op.
+/// Test seam: `on_readable_open` observes the file type (`S_IFMT` bits)
+/// of every successful read-only reopen, including opens the final
+/// identity check later refuses, so the device-safety tests prove a
+/// device is never opened — not merely refused afterwards. A failed
+/// post-open fstat reports `0` (unknown type, fail-closed). Production
+/// passes a no-op.
 #[cfg(test)]
-fn open_file_for_mark_with_pre_reopen(
+fn open_file_for_mark_with_readable_observer(
+    point: &std::path::Path,
+    on_readable_open: impl FnMut(u32),
+) -> Option<OwnedFd> {
+    open_file_for_mark_impl(point, || {}, on_readable_open)
+}
+
+/// Test seam combining both hooks for the ancestor-swap twin.
+#[cfg(test)]
+fn open_file_for_mark_with_hooks(
     point: &std::path::Path,
     pre_reopen: impl FnOnce(),
+    on_readable_open: impl FnMut(u32),
 ) -> Option<OwnedFd> {
-    open_file_for_mark_impl(point, pre_reopen)
+    open_file_for_mark_impl(point, pre_reopen, on_readable_open)
 }
 
-fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -> Option<OwnedFd> {
+fn open_file_for_mark_impl(
+    point: &std::path::Path,
+    pre_reopen: impl FnOnce(),
+    mut on_readable_open: impl FnMut(u32),
+) -> Option<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
     // SAFETY: libc call; the NUL-terminated path is valid.
@@ -1221,8 +1238,12 @@ fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -
     let held = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: fstat on our own held descriptor into a zeroed stat.
     let mut final_stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(held.as_raw_fd(), &mut final_stat) } != 0
-        || final_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+    if unsafe { libc::fstat(held.as_raw_fd(), &mut final_stat) } != 0 {
+        on_readable_open(0);
+        return None;
+    }
+    on_readable_open(final_stat.st_mode & libc::S_IFMT);
+    if final_stat.st_mode & libc::S_IFMT != libc::S_IFREG
         || (final_stat.st_dev, final_stat.st_ino) != (probed_dev, probed_ino)
     {
         return None;
@@ -2468,20 +2489,65 @@ mod tests {
     /// opening `/dev/watchdog` arms it, opening a tty can take a
     /// controlling terminal. Only regular-file binds mark; any other
     /// type is skipped (a fail-closed named gap via the uncovered
-    /// count, never silent coverage). The healthy twin (a regular
-    /// file) still opens.
+    /// count, never silent coverage). The readable-open observer proves
+    /// the refusal happens before the open: removing the pre-open type
+    /// guard opens `/dev/null` and fails this test. The healthy twin
+    /// (a regular file) still opens exactly once, as a regular file.
     #[test]
     fn learn_file_mark_fd_skips_char_devices() {
+        let mut device_opens = Vec::new();
         assert!(
-            super::open_file_for_mark(std::path::Path::new("/dev/null")).is_none(),
+            super::open_file_for_mark_with_readable_observer(
+                std::path::Path::new("/dev/null"),
+                |file_type| device_opens.push(file_type),
+            )
+            .is_none(),
             "a char-device bind must never open read-only for marking"
+        );
+        assert!(
+            device_opens.is_empty(),
+            "a char-device bind must never reach the read-only open: {device_opens:?}"
         );
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("bind-stand-in");
         std::fs::write(&file, "a bound file").unwrap();
+        let mut regular_opens = Vec::new();
         assert!(
-            super::open_file_for_mark(&file).is_some(),
+            super::open_file_for_mark_with_readable_observer(&file, |file_type| {
+                regular_opens.push(file_type)
+            })
+            .is_some(),
             "a regular-file bind still marks"
+        );
+        assert_eq!(
+            regular_opens,
+            vec![libc::S_IFREG],
+            "a regular-file bind opens exactly once, as a regular file: {regular_opens:?}"
+        );
+    }
+
+    /// A fifo bind is never opened read-only for marking either: the
+    /// pre-open type guard refuses it before the open, so no read-only
+    /// handle is ever created. Removing the guard opens the fifo and
+    /// fails this test.
+    #[test]
+    fn learn_file_mark_fd_skips_fifos() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("bind-fifo");
+        let path = std::ffi::CString::new(fifo.to_string_lossy().into_owned()).unwrap();
+        // SAFETY: mkfifo on an owned path; mode bits only.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        let mut fifo_opens = Vec::new();
+        assert!(
+            super::open_file_for_mark_with_readable_observer(&fifo, |file_type| {
+                fifo_opens.push(file_type)
+            })
+            .is_none(),
+            "a fifo bind must never open read-only for marking"
+        );
+        assert!(
+            fifo_opens.is_empty(),
+            "a fifo bind must never reach the read-only open: {fifo_opens:?}"
         );
     }
 
@@ -2492,6 +2558,8 @@ mod tests {
     /// the probed regular file (still returned, same identity): a
     /// pathname re-resolution would open the device instead, and its
     /// driver side effects would happen before any final fstat refuses it.
+    /// The readable-open observer proves exactly one regular open happened
+    /// and no device open did.
     #[test]
     fn learn_file_mark_fd_survives_ancestor_swap_to_device() {
         use std::os::unix::fs::FileTypeExt as _;
@@ -2505,11 +2573,21 @@ mod tests {
         std::fs::write(&file, "still the probed file").unwrap();
         let expected = std::fs::metadata(&file).unwrap();
         let moved = dir.path().join("real.moved");
-        let held = super::open_file_for_mark_with_pre_reopen(&file, || {
-            std::fs::rename(&ancestor, &moved).unwrap();
-            std::os::unix::fs::symlink("/dev", &ancestor).unwrap();
-        })
+        let mut swap_opens = Vec::new();
+        let held = super::open_file_for_mark_with_hooks(
+            &file,
+            || {
+                std::fs::rename(&ancestor, &moved).unwrap();
+                std::os::unix::fs::symlink("/dev", &ancestor).unwrap();
+            },
+            |file_type| swap_opens.push(file_type),
+        )
         .expect("the probed file reopens through its own descriptor, not the swapped pathname");
+        assert_eq!(
+            swap_opens,
+            vec![libc::S_IFREG],
+            "the swap reopened the probed file once, never the device: {swap_opens:?}"
+        );
         assert!(
             std::fs::metadata(&file).is_ok_and(|meta| meta.file_type().is_char_device()),
             "the fixture swapped the pathname onto a live device"

@@ -855,13 +855,22 @@ const MARK_COVERAGE_CAP: usize = 8192;
 
 /// Decides filesystem-mark coverage for one (re-)mark pass: each
 /// visible mount is offered to `mark` by its point; a success covers
-/// its identity, a failure still covers it when a mark from an
-/// earlier pass on the *same mount identity* is retained (the
-/// startup marks survive the post-setup capability shed and keep
+/// the path it resolved through, whether that is the snapshot mount
+/// itself (a direct hit) or a shadowing mount the open resolved to
+/// instead (a file bind's underlying filesystem, an overmount that
+/// landed after the snapshot, a triggered automount: opens at the
+/// path hit the marked filesystem either way). A failure still
+/// covers the path when the snapshot mount carries a retained mark
+/// from an earlier pass on the *same mount identity* (the startup
+/// marks survive the post-setup capability shed and keep
 /// delivering), and a failure on a mount never covered before
-/// counts as uncovered. A remount or a replacement filesystem at an
-/// already covered path carries a new mount id, so it never inherits
-/// the dead mount's coverage. Coverage therefore comes from this
+/// counts as uncovered. The next covered set retains exactly the
+/// mounts actually marked plus the retained snapshot mounts still
+/// visible — never a shadowed snapshot identity, so a shadowing
+/// mount that goes away leaves the reappeared snapshot honestly
+/// uncovered. A remount or a replacement filesystem at an already
+/// covered path carries a new mount id, so it never inherits the
+/// dead mount's coverage. Coverage therefore comes from this
 /// retained-identity set alone — traffic on older filesystems can
 /// never stand in for a filesystem whose mark failed. Returns the
 /// next covered set and the uncovered-visible count; a nonzero
@@ -871,32 +880,29 @@ pub(crate) fn evaluate_mark_coverage(
     visible: &[MountToMark],
     mut mark: impl FnMut(&std::path::Path) -> Option<MountIdentity>,
 ) -> (BTreeSet<MountIdentity>, usize) {
+    // Each entry is judged by its own mark outcome alone, so one
+    // pass over the snapshot cannot credit the wrong mount however
+    // the table is ordered. The callback returns the identity of
+    // the mount actually marked, derived from the held descriptor
+    // it marked — never the snapshot's say-so. A successful mark
+    // covers its path even when the open resolved to a different
+    // mount than the snapshot (the marked filesystem is what the
+    // path reaches now); only a failed mark on a never-covered
+    // mount owes the gap.
     let mut covered = BTreeSet::new();
     let mut uncovered = 0usize;
     for mount in visible {
         if let Some(identity) = mount.identity
-            && covered.contains(&identity)
+            && previously_covered.contains(&identity)
+            && covered.len() < MARK_COVERAGE_CAP
         {
+            covered.insert(identity);
             continue;
         }
-        // The callback returns the identity of the mount actually
-        // marked, derived from the held descriptor it marked — never
-        // the snapshot's say-so. An overmount landing between the
-        // mountinfo snapshot and the mark therefore credits nothing:
-        // the snapshot mount stays uncovered (the actually-marked
-        // mount is seen and credited by a later pass).
-        let marked = mark(&mount.point);
-        match mount.identity {
-            Some(identity)
-                if (marked == Some(identity) || previously_covered.contains(&identity))
-                    && covered.len() < MARK_COVERAGE_CAP =>
-            {
-                covered.insert(identity);
+        match mark(&mount.point) {
+            Some(marked) if covered.len() < MARK_COVERAGE_CAP => {
+                covered.insert(marked);
             }
-            // Marked now, but without a parsed identity its coverage
-            // cannot be retained for later passes; it is covered for
-            // this pass and re-decided (fail-closed) next time.
-            None if marked.is_some() => {}
             _ => uncovered += 1,
         }
     }
@@ -922,16 +928,31 @@ fn visible_mounts() -> Vec<MountToMark> {
         })
 }
 
-/// The mount identity of a held descriptor, from its fdinfo mount id
-/// and its filesystem device: the identity of the object itself, so
-/// a mark placed through this descriptor is credited to the mount
-/// actually marked.
-fn mount_identity_of_fd(fd: &OwnedFd) -> Option<MountIdentity> {
+/// The mount identity of a held descriptor: its fdinfo mount id
+/// keys into the pass snapshot for the snapshot device, so a mark
+/// placed through this descriptor is credited to the mount actually
+/// marked. The table device wins over the fd's own because btrfs
+/// reports a per-subvolume anonymous device from fstat while
+/// mountinfo carries the shared superblock device — comparing fd
+/// devices would leave every subvolume mount falsely uncovered. A
+/// mount id absent from the snapshot (an automount the open itself
+/// triggered, an overmount that landed after the snapshot) falls
+/// back to the fd's own device: the mark went somewhere real, and
+/// the fallback credits that mount instead of silence. `None` only
+/// when the mount id cannot be read at all.
+fn mount_identity_of_fd(fd: &OwnedFd, mounts: &[MountToMark]) -> Option<MountIdentity> {
     let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
     let mount_id = text.lines().find_map(|line| {
         line.strip_prefix("mnt_id:")
             .and_then(|value| value.trim().parse().ok())
     })?;
+    if let Some(identity) = mounts
+        .iter()
+        .filter_map(|mount| mount.identity)
+        .find(|identity| identity.mount_id == mount_id)
+    {
+        return Some(identity);
+    }
     // SAFETY: fstat on our own held descriptor into a zeroed stat.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
@@ -968,20 +989,54 @@ fn open_mount_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Adds one filesystem mark through a held `O_RDONLY` descriptor for
-/// the mount point (the NULL-pathname dirfd form), returning the
-/// marked mount's identity read from that same descriptor. `None`
-/// when the mount point cannot be held (for example an `O_RDONLY`
-/// open refused with `EACCES`), when the kernel refuses the mark
-/// (for example without `CAP_SYS_ADMIN` after the capability shed),
-/// or when the identity cannot be read: an uncredited mark is a
-/// named gap, never silent coverage. Marking the held object — not
-/// re-resolving the pathname inside the syscall — is what binds the
-/// credit to the mount actually marked when an overmount races the
-/// mountinfo snapshot.
-fn try_mark_filesystem(group: &OwnedFd, point: &std::path::Path) -> Option<MountIdentity> {
-    let held = open_mount_for_mark(point)?;
-    let identity = mount_identity_of_fd(&held);
+/// Opens a file bind mount for a filesystem mark: a real `O_RDONLY`
+/// file handle, never `O_PATH` (the kernel rejects
+/// `FAN_MARK_FILESYSTEM` through an `O_PATH` fd with `EBADF`) and
+/// never `O_DIRECTORY` (a file bind refuses it with `ENOTDIR`).
+/// `O_NONBLOCK` keeps a fifo bind from hanging the pass;
+/// `O_NOFOLLOW` refuses a trailing symlink instead of marking
+/// through it. The mark covers the file's filesystem — the same
+/// superblock its own mount entry marks — so the bind needs no
+/// separate filesystem of its own. `None` (an unopenable file) is
+/// a named gap, never silent coverage.
+fn open_file_for_mark(point: &std::path::Path) -> Option<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(point.as_os_str().as_bytes()).ok()?;
+    // SAFETY: libc call; the NUL-terminated path is valid.
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh owned descriptor from the open above.
+    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Adds one filesystem mark through a held descriptor for the
+/// mount point (the NULL-pathname fd form), returning the marked
+/// mount's identity read from that same descriptor against the
+/// pass snapshot. Directories mark through the directory handle;
+/// file bind mounts (a file where the snapshot shows a mount
+/// point) mark through a file handle, covering the file's
+/// filesystem. `None` when the mount point cannot be held (for
+/// example an `O_RDONLY` open refused with `EACCES`), when the
+/// kernel refuses the mark (for example without `CAP_SYS_ADMIN`
+/// after the capability shed), or when the identity cannot be
+/// read: an uncredited mark is a named gap, never silent coverage.
+/// Marking the held object — not re-resolving the pathname inside
+/// the syscall — is what binds the credit to the mount actually
+/// marked when an overmount races the mountinfo snapshot.
+fn try_mark_filesystem(
+    group: &OwnedFd,
+    point: &std::path::Path,
+    mounts: &[MountToMark],
+) -> Option<MountIdentity> {
+    let held = open_mount_for_mark(point).or_else(|| open_file_for_mark(point))?;
+    let identity = mount_identity_of_fd(&held, mounts);
     // SAFETY: libc call; the group and held descriptors are valid,
     // and a NULL pathname marks the held descriptor's object.
     let rc = unsafe {
@@ -1008,7 +1063,7 @@ fn mark_visible_filesystems(
 ) -> (BTreeSet<MountIdentity>, usize) {
     let mounts = visible_mounts();
     evaluate_mark_coverage(previously_covered, &mounts, |point| {
-        try_mark_filesystem(group, point)
+        try_mark_filesystem(group, point, &mounts)
     })
 }
 
@@ -1680,7 +1735,7 @@ mod tests {
             "the mark fd is close-on-exec: {fd_flags}"
         );
         assert!(
-            super::mount_identity_of_fd(&held).is_some(),
+            super::mount_identity_of_fd(&held, &[]).is_some(),
             "the held object still yields its mount identity"
         );
         // O_DIRECTORY: a regular file refuses.
@@ -1794,22 +1849,28 @@ mod tests {
     }
 
     /// An overmount landing between the mountinfo snapshot and the
-    /// mark must not credit the snapshot mount: the mark callback
-    /// reports the mount actually marked (the overmount), so the
-    /// underlying snapshot mount stays uncovered and owes the gap,
-    /// and a later failed re-mark cannot inherit its identity.
+    /// mark covers the path through the overmount: the mark callback
+    /// reports the mount actually marked, and opens at the path hit
+    /// that marked filesystem, not the unreachable snapshot mount.
+    /// The retained set keeps the overmount's identity alone, so
+    /// after the overmount goes away a failed re-mark of the
+    /// reappeared snapshot mount is uncovered, never inherited.
     #[test]
-    fn learn_overmount_between_snapshot_and_mark_claims_no_coverage() {
+    fn learn_overmount_between_snapshot_and_mark_covers_the_path() {
         let covered = std::collections::BTreeSet::new();
         let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
         // The syscall marked the racing overmount (68), not the
         // snapshot mount (51).
         let (next, uncovered) =
             super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(68, 8, 2)));
-        assert_eq!(uncovered, 1, "the snapshot mount was never marked");
+        assert_eq!(uncovered, 0, "the resolving overmount is marked");
         assert!(
             !next.contains(&mnt(51, 8, 1)),
-            "the unmarked mount claims no retained coverage: {next:?}"
+            "the shadowed mount claims no retained coverage: {next:?}"
+        );
+        assert!(
+            next.contains(&mnt(68, 8, 2)),
+            "the actually-marked mount is retained: {next:?}"
         );
         // After the overmount goes away, a failed re-mark of the
         // reappeared snapshot mount is uncovered, not retained.
@@ -1830,6 +1891,195 @@ mod tests {
         let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |_| None);
         assert_eq!(uncovered, 2);
         assert!(next.is_empty());
+    }
+
+    /// A mark placed through a shadowing mount covers the path: the
+    /// open resolved to the overmount (a vng `/usr` overlay hiding
+    /// `/usr/lib`, a triggered autofs), so opens at the path hit the
+    /// marked filesystem, not the unreachable snapshot mount. The
+    /// retained set keeps the mount actually marked, never the
+    /// shadowed snapshot identity.
+    #[test]
+    fn learn_mark_through_shadowing_mount_covers_the_path() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![visible_mount("/usr/lib", 39, 0, 30)];
+        // The syscall marked the resolving overmount (51), not the
+        // snapshot mount (39).
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(51, 0, 42)));
+        assert_eq!(uncovered, 0, "the resolving filesystem is marked");
+        assert!(
+            next.contains(&mnt(51, 0, 42)),
+            "the marked mount is retained: {next:?}"
+        );
+        assert!(
+            !next.contains(&mnt(39, 0, 30)),
+            "the shadowed snapshot claims no coverage: {next:?}"
+        );
+    }
+
+    /// Transitive coverage never retains the snapshot identity: when
+    /// the shadowing mount goes away, a failed re-mark of the
+    /// reappeared snapshot mount is uncovered, not inherited. The
+    /// first pass covers the path through the overmount; the second
+    /// pass honestly reports the unmarked reappearance.
+    #[test]
+    fn learn_transitive_coverage_does_not_retain_the_snapshot() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![visible_mount("/mnt/provider", 51, 8, 1)];
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(68, 8, 2)));
+        assert_eq!(uncovered, 0, "the overmount's mark covers the path");
+        assert_eq!(
+            next,
+            [mnt(68, 8, 2)].into_iter().collect(),
+            "only the actually-marked mount is retained"
+        );
+        // The overmount is gone; the reappeared snapshot mount cannot
+        // be marked (post-shed re-mark without CAP_SYS_ADMIN).
+        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        assert_eq!(uncovered, 1, "the unmarked reappearance owes the gap");
+        assert!(next.is_empty(), "the dead overmount is not retained");
+    }
+
+    /// A mixed pass counts exactly the failed marks: a direct hit, a
+    /// shadowing-mount hit and a failure leave one gap, and the
+    /// retained set holds both marked mounts.
+    #[test]
+    fn learn_mixed_pass_counts_only_failed_marks() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![
+            visible_mount("/", 51, 8, 1),
+            visible_mount("/data", 52, 8, 2),
+            visible_mount("/usr/lib", 39, 0, 30),
+        ];
+        let (next, uncovered) = super::evaluate_mark_coverage(&covered, &visible, |point| {
+            if point.as_os_str() == "/" {
+                Some(mnt(51, 8, 1))
+            } else if point.as_os_str() == "/usr/lib" {
+                Some(mnt(68, 0, 42))
+            } else {
+                None
+            }
+        });
+        assert_eq!(uncovered, 1, "only the failed mark owes a gap");
+        assert!(next.contains(&mnt(51, 8, 1)));
+        assert!(next.contains(&mnt(68, 0, 42)));
+        assert_eq!(next.len(), 2);
+    }
+
+    /// The held descriptor's mount identity takes the snapshot
+    /// device: btrfs reports a per-subvolume anonymous device from
+    /// fstat while mountinfo carries the shared superblock device,
+    /// so the fdinfo mount id keys into the pass table and the
+    /// table's device wins. A mount id absent from the table falls
+    /// back to the fd's own device (a triggered autofs whose mount
+    /// postdates the snapshot), never to silence.
+    #[test]
+    fn learn_mount_identity_of_fd_prefers_snapshot_device() {
+        let text = std::fs::read_to_string("/proc/self/mountinfo")
+            .expect("the test host has a mount table");
+        let mut table = super::mounts_for_marks(&text);
+        assert!(!table.is_empty(), "the test host shows mounts");
+        // SAFETY: open(2) on / for a held directory descriptor.
+        let raw = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        assert!(raw >= 0, "root opens for the identity probe");
+        // SAFETY: `raw` is a fresh owned descriptor from the open above.
+        let held: std::os::unix::io::OwnedFd =
+            unsafe { std::os::unix::io::FromRawFd::from_raw_fd(raw) };
+        let fdinfo = std::fs::read_to_string(format!(
+            "/proc/self/fdinfo/{}",
+            std::os::unix::io::AsRawFd::as_raw_fd(&held)
+        ))
+        .expect("fdinfo reads");
+        let mnt_id: u64 = fdinfo
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("mnt_id:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .expect("fdinfo carries mnt_id");
+        // Corrupt the table device for this mount id to a value no
+        // fstat can produce: the lookup must return the table's
+        // device, proving the fd's own device never leaks through.
+        let mut found = false;
+        for mount in &mut table {
+            if let Some(identity) = mount.identity.as_mut()
+                && identity.mount_id == mnt_id
+            {
+                identity.dev_major = 0xDEAD;
+                identity.dev_minor = 0xBEEF;
+                found = true;
+            }
+        }
+        assert!(found, "the table shows the held mount id");
+        assert_eq!(
+            super::mount_identity_of_fd(&held, &table),
+            Some(mnt(mnt_id, 0xDEAD, 0xBEEF)),
+            "the snapshot device wins over the fd device"
+        );
+        // Without the mount id in the table, the fd's own device
+        // still identifies the marked mount (fail-open toward the
+        // mark actually placed, never silent).
+        let empty: Vec<super::MountToMark> = Vec::new();
+        let fallback = super::mount_identity_of_fd(&held, &empty);
+        assert_eq!(
+            fallback.map(|identity| identity.mount_id),
+            Some(mnt_id),
+            "the fallback keeps the fdinfo mount id"
+        );
+    }
+
+    /// A file bind mount (vng's `/etc/hosts`, dpkg locks) opens for
+    /// marking as a real `O_RDONLY` file handle: never `O_PATH` (its
+    /// marks fail `EBADF`), never `O_DIRECTORY` (files refuse it),
+    /// `O_NONBLOCK` so a fifo bind cannot hang the pass, and
+    /// `O_NOFOLLOW | O_CLOEXEC` like the directory handle. A
+    /// trailing symlink still refuses.
+    #[test]
+    fn learn_file_mark_fd_opens_non_directories_for_marking() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bind-stand-in");
+        std::fs::write(&file, "a bound file").unwrap();
+        let held = super::open_file_for_mark(&file).expect("a file opens for marking");
+        // SAFETY: fcntl on our own live fd.
+        let flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL reads the file mark fd flags");
+        assert_eq!(
+            flags & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "the file mark fd opens O_RDONLY: {flags}"
+        );
+        assert_eq!(
+            flags & libc::O_PATH,
+            0,
+            "the file mark fd is never O_PATH: {flags}"
+        );
+        assert_eq!(
+            flags & libc::O_DIRECTORY,
+            0,
+            "the file mark fd carries no O_DIRECTORY: {flags}"
+        );
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "the file mark fd never blocks on a fifo: {flags}"
+        );
+        assert!(
+            flags & libc::O_NOFOLLOW != 0,
+            "the file mark fd never follows a trailing symlink: {flags}"
+        );
+        // SAFETY: fcntl on our own live fd.
+        let fd_flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            fd_flags & libc::FD_CLOEXEC != 0,
+            "the file mark fd is close-on-exec: {fd_flags}"
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            super::open_file_for_mark(&link).is_none(),
+            "a symlink is never a mark fd"
+        );
     }
 
     /// The drain parses the pidfd info record beside the metadata, so the

@@ -1964,7 +1964,10 @@ fn pin_refused_join_accounting_mutations(name: &str, arm: &str) {
         ("if unmatched {", "if unmatched && false {"),
         ("if unmatched {", "if true {"),
         ("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);", ""),
-        ("refused_join_accounting(outcome, bump)", "refused_join_accounting(outcome, true)"),
+        (
+            "refused_join_accounting(outcome, bump)",
+            "refused_join_accounting(outcome, true)",
+        ),
     ] {
         assert!(
             arm.contains(before),

@@ -7043,12 +7043,22 @@ pub(crate) fn credited_scan_shape(
 /// after a successful scan, before the pins are stored: without it a
 /// small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
 ///
+/// Fix6 A1 (owner 20:02 + 20:15): the incoming pins first share one
+/// retained pin per physical file across all views (see
+/// [`share_scan_pins_with_retained`]), and only the fds the admission
+/// newly holds are debited — the reserve stays a safety net over what
+/// remains after the duplicates are released, not over the duplicates.
+///
 /// [`FdReserveTick::note_opened`]: crate::fd_budget::FdReserveTick::note_opened
-pub(crate) fn note_retained_scan_pins(
+/// [`share_scan_pins_with_retained`]: crate::discovery::identity::share_scan_pins_with_retained
+pub(crate) fn note_retained_scan_pins<'a>(
     tick: &mut crate::fd_budget::FdReserveTick,
-    pins: &PinnedObjects,
+    pins: &mut PinnedObjects,
+    retained: impl IntoIterator<Item = &'a PinnedObjects>,
 ) {
-    tick.note_opened_n(pins.retained_open_count() as u64);
+    tick.note_opened_n(crate::discovery::identity::share_scan_pins_with_retained(
+        pins, retained,
+    ));
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -7826,7 +7836,7 @@ fn discover_plan(
         elf_needed::learn_view_exe(&mut discovered.extensive, &view);
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
-            Ok((found, pins, complete, scan_examined, scan_shape)) => {
+            Ok((found, mut pins, complete, scan_examined, scan_shape)) => {
                 // Only a complete scan that proved every member of its
                 // own shape examined covers it: incomplete scans,
                 // skipped members, and unopened data-only `.so` files
@@ -7839,11 +7849,17 @@ fn discover_plan(
                     examined_shapes.insert(shape);
                 }
                 // The pass retains this scan's pins from here (beside
-                // the view's pidfd, counted at open): debit them before
-                // the next admission decision, or a small hard
-                // `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
+                // the view's pidfd, counted at open): share one pin per
+                // physical file with the already-admitted views, then
+                // debit what newly remains before the next admission
+                // decision, or a small hard `RLIMIT_NOFILE` reaches
+                // `EMFILE` mid-pass.
                 if let Some(tick) = reserve_tick.as_mut() {
-                    note_retained_scan_pins(tick, &pins);
+                    note_retained_scan_pins(
+                        tick,
+                        &mut pins,
+                        discovered.scan_inputs.values().map(|input| &input.pins),
+                    );
                 }
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
@@ -27303,15 +27319,20 @@ impl Engine {
                 // Completeness is otherwise unused here: a new view has
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
-                Ok((modules, pins, complete)) => {
+                Ok((modules, mut pins, complete)) => {
                     // The tick retains this scan's pins from here (staged
                     // or pushed below; a staged yield that completes drops
                     // them at the next loop-top without a refund, staying
-                    // conservative): debit them before the next admission
-                    // decision, or a small hard `RLIMIT_NOFILE` reaches
-                    // `EMFILE` mid-tick.
+                    // conservative): share one pin per physical file with
+                    // the already-retained views, then debit what newly
+                    // remains before the next admission decision, or a
+                    // small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-tick.
                     if let Some(tick) = reserve_tick.as_mut() {
-                        note_retained_scan_pins(tick, &pins);
+                        note_retained_scan_pins(
+                            tick,
+                            &mut pins,
+                            self.scan_inputs.values().map(|input| &input.pins),
+                        );
                     }
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot

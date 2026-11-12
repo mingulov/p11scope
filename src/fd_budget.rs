@@ -543,7 +543,8 @@ mod tests {
             held_pins.push(pins);
             crate::discovery::engine::note_retained_scan_pins(
                 &mut tick,
-                held_pins.last().expect("just pushed"),
+                held_pins.last_mut().expect("just pushed"),
+                std::iter::empty::<&crate::discovery::identity::PinnedObjects>(),
             );
             admitted = admitted.saturating_add(1);
             assert!(admitted < 2000, "the reserve never deferred");

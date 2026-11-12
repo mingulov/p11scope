@@ -2155,10 +2155,12 @@ impl PinnedObjects {
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
     }
 
-    /// Upper bound on the open fds this set retains: one held file per
-    /// entry. Entries sharing one `Arc` over-count, never under-count,
-    /// so the capture fd-reserve debit stays conservative.
-    pub(crate) fn retained_open_count(&self) -> usize {
+    /// Entries this set retains: before cross-view sharing each entry
+    /// holds its own fd, so this was the fd-reserve debit; sharing (see
+    /// [`share_scan_pins_with_retained`]) now debits only the fds an
+    /// admission newly holds instead.
+    #[cfg(test)]
+    fn entry_count_for_test(&self) -> usize {
         self.by_id.len()
     }
 
@@ -8485,6 +8487,66 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
 /// `limits` are the scan's own byte caps and bind here too: hashing reads each object
 /// whole, and the object set comes from the target's mappings, so an unbounded pin
 /// would let a target turn a bounded memory scan into unbounded reads on the observer.
+/// Lends one retained scan pin per physical file to a newly scanned
+/// view (view-collapse fix6 A1, owner 20:02 + 20:15): for every entry
+/// whose maps key a retained pin proves is that file's identity, the
+/// entry's own freshly opened fd is dropped and the retained `Arc` is
+/// shared instead, so all views hold one fd per physical file. The proof
+/// is the retained entry's own reusable `MappedFile` through
+/// [`MappedFile::key_is_identity`] — the
+/// [`KEY_IS_IDENTITY_FILESYSTEMS`] allowlist, never a new list.
+/// Collapsed entries (which stand for more than one file) and
+/// pre-copy-up observations (whose key names the merged mapping, not the
+/// pinned lower file) never lend or borrow. A borrower that carries no
+/// `mapped` proof inherits the lender's, so a third view can share
+/// transitively. Returns the entries that kept their own fd: the reserve
+/// debit for this admission.
+///
+/// Soundness: `key_is_identity` proves a range rendered under the key in
+/// ANY process is the retained file, so the incoming entry — pinned for
+/// a range under that same key — names the same file its own validation
+/// opened. Only the `file` handle is swapped; every entry keeps its own
+/// validated metadata, so `check_unchanged`, digests and attach paths
+/// behave exactly as with per-view opens. Release is through the shared
+/// `Arc`: a view's drop releases its share, and the fd closes with the
+/// last share.
+pub(crate) fn share_scan_pins_with_retained<'a>(
+    pins: &mut PinnedObjects,
+    retained: impl IntoIterator<Item = &'a PinnedObjects>,
+) -> u64 {
+    // One transient lookup over the already-retained sets (first proof
+    // wins per key): the share applies once per entry, so the kept count
+    // below is exactly the admission's new fds.
+    let mut lenders: BTreeMap<ObjectKey, (Arc<std::fs::File>, MappedFile)> = BTreeMap::new();
+    for set in retained {
+        for entry in set.by_id.values() {
+            if entry.pre_copy_up || entry.collapsed || lenders.contains_key(&entry.raw.key) {
+                continue;
+            }
+            if let Some(mapped) = entry.reusable_mapped_file()
+                && mapped.key_is_identity(entry.raw.key)
+            {
+                lenders.insert(entry.raw.key, (Arc::clone(&entry.file), mapped));
+            }
+        }
+    }
+    let mut kept = 0u64;
+    for entry in pins.by_id.values_mut() {
+        if !entry.pre_copy_up
+            && !entry.collapsed
+            && let Some((file, mapped)) = lenders.get(&entry.raw.key)
+        {
+            entry.file = Arc::clone(file);
+            if entry.mapped.is_none() {
+                entry.mapped = Some(*mapped);
+            }
+        } else {
+            kept = kept.saturating_add(1);
+        }
+    }
+    kept
+}
+
 pub fn pin_scanned_objects(
     pid: u32,
     modules: &[ScannedModule],
@@ -19635,5 +19697,165 @@ mod tests {
         let pin = pinning.pins.summary(object).expect("pinned");
         let held_meta = held.metadata().unwrap();
         assert_eq!(pin.key.inode, held_meta.ino());
+    }
+
+    /// A retained pin over one file plus a second view's pin over the same
+    /// file, with the retained proof's filesystem magic injected. The
+    /// scripted `mapped` proof keeps the share twins filesystem-independent:
+    /// reading it live would pin TMPDIR's filesystem instead of the
+    /// allowlist boundary. `None` leaves the retained pin unproven.
+    fn share_pair_for(
+        path: &Path,
+        magic: Option<u64>,
+    ) -> (PinnedObjects, PinnedObjectId, PinnedObjects, PinnedObjectId) {
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut retained = test_fixture::real_scan_pin(path, None, 0, sha);
+        if let Some(entry) = retained.by_id.values_mut().next() {
+            let metadata = entry.file.metadata().unwrap();
+            entry.mapped = magic.map(|fs_magic| MappedFile {
+                identity: FileIdentity {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                fs_magic: Some(fs_magic),
+            });
+        }
+        let incoming = test_fixture::real_scan_pin(path, None, 1, sha);
+        let retained_id = *retained.by_id.keys().next().unwrap();
+        let incoming_id = *incoming.by_id.keys().next().unwrap();
+        (retained, retained_id, incoming, incoming_id)
+    }
+
+    /// View-collapse fix6 A1 (owner 20:02 + 20:15): one scan pin per
+    /// physical file shared across all views. A second view pins the same
+    /// file the first view proved; the admission shares the retained fd
+    /// instead of holding its own, so the reserve debit counts zero new
+    /// fds for it. The share rides the retained pin's own
+    /// `key_is_identity` proof (ext4: on `KEY_IS_IDENTITY_FILESYSTEMS`),
+    /// never a new list.
+    #[test]
+    fn reviewed_one_scan_pin_per_physical_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, retained_id, mut incoming, incoming_id) =
+            share_pair_for(&path, Some(0xef53));
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 0, "a fully shared admission holds no new fd");
+        assert!(
+            std::ptr::eq(
+                retained.file_for(retained_id).unwrap(),
+                incoming.file_for(incoming_id).unwrap(),
+            ),
+            "the second view shares the retained pin's fd",
+        );
+    }
+
+    /// Healthy control for the share twin above: each view opens its own
+    /// fd at pin time, before any sharing. Passes before and after the
+    /// fix: sharing swaps the fd afterwards, construction still opens.
+    #[test]
+    fn reviewed_scan_pins_open_per_view_before_sharing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, retained_id, incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        assert_eq!(retained.entry_count_for_test(), 1);
+        assert_eq!(incoming.entry_count_for_test(), 1);
+        assert!(
+            !std::ptr::eq(
+                retained.file_for(retained_id).unwrap(),
+                incoming.file_for(incoming_id).unwrap(),
+            ),
+            "each view opens its own fd before sharing",
+        );
+    }
+
+    /// The share twin's filesystem boundary: btrfs is retained by
+    /// `may_retain` but is NOT on `KEY_IS_IDENTITY_FILESYSTEMS` (one maps
+    /// device for every subvolume), so the same key there never shares.
+    #[test]
+    fn reviewed_shared_scan_pin_refuses_unproven_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0x9123_683e));
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 1, "btrfs keys never share a pin");
+        let retained_id = *retained.by_id.keys().next().unwrap();
+        assert!(
+            !std::ptr::eq(
+                retained.file_for(retained_id).unwrap(),
+                incoming.file_for(incoming_id).unwrap(),
+            ),
+            "the unproven filesystem keeps its own fd",
+        );
+    }
+
+    /// Fail-closed twin: a retained pin without a `mapped` proof shares
+    /// nothing, even for the same file and key.
+    #[test]
+    fn reviewed_shared_scan_pin_refuses_without_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, _, mut incoming, _) = share_pair_for(&path, None);
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 1, "an unproven pin never lends its fd");
+    }
+
+    /// Healthy twin: distinct files never share, however proven both pins
+    /// are. The incoming admission keeps its own fd and debits it.
+    #[test]
+    fn reviewed_shared_scan_pin_keeps_distinct_files_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::write(&first, b"first-bytes").unwrap();
+        std::fs::write(&second, b"second-bytes").unwrap();
+        let (retained, _, _, _) = share_pair_for(&first, Some(0xef53));
+        let (_, _, mut incoming, _) = share_pair_for(&second, Some(0xef53));
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 1, "a distinct file keeps its own fd");
+    }
+
+    /// Release twin (owner 20:02): a shared pin's fd outlives each single
+    /// view but closes with the last one — release on view drop, through
+    /// the shared `Arc`, with no explicit close path.
+    #[test]
+    fn reviewed_shared_scan_pin_releases_with_last_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 0);
+        let held = incoming.by_id[&incoming_id].file.clone();
+        let weak = std::sync::Arc::downgrade(&held);
+        drop(held);
+        drop(incoming);
+        assert!(
+            weak.upgrade().is_some(),
+            "one dropped view leaves the shared fd open",
+        );
+        drop(retained);
+        assert!(
+            weak.upgrade().is_none(),
+            "the last dropped view closes the shared fd",
+        );
+    }
+
+    /// A witness-proven pre-copy-up observation pins the lower file behind
+    /// the merged mapping: its key names another file, so it never shares
+    /// (and is never lent to) a plain pin under the same key.
+    #[test]
+    fn reviewed_shared_scan_pin_refuses_pre_copy_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::write(&path, b"shared-bytes").unwrap();
+        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        incoming.by_id.get_mut(&incoming_id).unwrap().pre_copy_up = true;
+        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
+        assert_eq!(new_fds, 1, "a pre-copy-up pin keeps its own fd");
     }
 }

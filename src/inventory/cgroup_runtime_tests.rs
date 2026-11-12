@@ -832,6 +832,93 @@ fn cgroup_runtime_operator_stop_after_return_keeps_completed_pass0() {
     assert_kept_completed_pass0(&mut driver);
 }
 
+/// Stop-boundary twin of the operator-stop-after-return scenario,
+/// through the real collector, apply, commit, operator-stop source
+/// and finalizing loop: the completed pass-0 collection still
+/// publishes its caller, but the terminal finish must not start a
+/// new seal — the eighth stable peek arrives after the operator
+/// stop latched. Refusal verdicts stand in at the BPF-start
+/// boundary, so no BPF is loaded either way.
+#[test]
+fn cgroup_runtime_operator_stop_drain_attempts_no_new_seal() {
+    use crate::discovery::engine::inventory_coordinator::semantics::{
+        AttestedSubset, SubsetPreparation,
+    };
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::inventory_semantics::SemanticRefusal;
+    use std::collections::{BTreeMap, BTreeSet};
+    fn scripted_preparation() -> SubsetPreparation {
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        SubsetPreparation {
+            subset: Some(AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![slot]),
+                crate::discovery::identity::PinnedObjects::empty(),
+                BTreeMap::from([(PinnedObjectId(0), BTreeSet::from([0]))]),
+            )),
+            refusals: Vec::new(),
+        }
+    }
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let source = Arc::new(AtomicUsize::new(0));
+    let control = CollectionControl::new(None).with_operator_stop_source(Arc::clone(&source));
+    let mut driver = ObservedDriver::new(&mut coordinator, control.clone());
+    // One more stable peek seats: the settle state is primed, the
+    // start itself must never run past the stop.
+    driver.inner.scan_seal_pending = true;
+    let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+    driver.inner.scan_seal_last_sets = Some(one.clone());
+    driver.inner.scan_seal_stable_runs = super::SCAN_SEAL_STABLE_PEEKS - 1;
+    let worker_source = Arc::clone(&source);
+    driver.wrapper = Some(Box::new(move |job| {
+        Box::new(move || {
+            let collection = job();
+            worker_source.store(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            collection
+        })
+    }));
+    let preparations = (0..8).map(|_| scripted_preparation()).collect::<Vec<_>>();
+    let verdicts = (0..4)
+        .map(|_| Err(SemanticRefusal::Unavailable))
+        .collect::<Vec<_>>();
+    let (result, start_scopes) =
+        super::seal_startup_test::with_peek_queue(vec![Some(one)], preparations, verdicts, || {
+            let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+                &mut driver,
+                None,
+                &clock(&|| source.load(Ordering::SeqCst) != 0),
+                None,
+                &mut |_, _| Ok(()),
+            );
+            (result, super::seal_startup_test::take_start_scopes())
+        });
+    assert!(result.error.is_none());
+    assert_eq!(driver.collections.load(Ordering::SeqCst), 1);
+    assert_eq!(control.check(), Err(CollectionStop::OperatorStop));
+    assert_kept_completed_pass0(&mut driver);
+    assert!(
+        driver.inner.semantic.is_none(),
+        "the stop drain seats no lane"
+    );
+    assert!(
+        start_scopes.is_empty(),
+        "the stop drain attempts no new seal: {start_scopes:?}"
+    );
+}
+
 #[test]
 fn cgroup_runtime_spawn_failure_never_runs_collection_inline() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

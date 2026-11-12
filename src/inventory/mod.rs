@@ -6711,7 +6711,20 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // settle, mint, start and authority rules are the same; only
         // the hook and the scope differ. Legacy passes attempt in
         // `apply` and must not attempt again here.
-        if matches!(self.scope, InventoryRunScope::Cgroup) {
+        // The stop boundary: the retained drain and the ordinary
+        // post-publication path both reach this hook after the host
+        // stopped. The owned completion above still publishes, but a
+        // new seal attempt starts a new capture — allowed only while
+        // the driver and the cgroup run control remain active (the
+        // coordinator's no-new-start stop contract). A frozen
+        // Completed outcome does not prove the run is still active.
+        let seal_run_active = !self.stop_requested
+            && !self.suspended
+            && self
+                .cgroup
+                .as_ref()
+                .is_some_and(|cgroup| cgroup.control.check().is_ok());
+        if matches!(self.scope, InventoryRunScope::Cgroup) && seal_run_active {
             let engine_scope = self.seal_scope.clone();
             self.attempt_deferred_scan_seal(engine_scope);
         }
@@ -29082,6 +29095,187 @@ mod seal_readiness_tests {
         assert!(untouched, "legacy finish_pass mints and starts nothing");
         assert!(driver.semantic.is_none());
         assert!(driver.scan_seal_pending, "legacy finish keeps pending");
+    }
+
+    /// Stop-boundary twin: a cancelled cgroup completion with a
+    /// latched operator stop must still be consumed, but the eighth
+    /// stable peek must not start a new seal — starting a capture
+    /// during teardown violates the coordinator's no-new-start stop
+    /// contract.
+    #[test]
+    fn cgroup_finish_pass_operator_stop_must_not_start_new_seal() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        let source = Arc::new(AtomicUsize::new(0));
+        driver.cgroup = Some(
+            CgroupDriverState::new(None, Some(Arc::clone(&source)))
+                .expect("cgroup driver state builds"),
+        );
+        let root = tempfile::tempdir().expect("cgroup root");
+        driver.seal_scope = Scope::Cgroup {
+            id: 7,
+            path: root.path().to_path_buf(),
+            dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+        };
+        driver.scan_seal_pending = true;
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let start_scopes = seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for _ in 1..attempts {
+                    driver.coordinator.pose_cgroup_completion_for_test(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Cancelled(
+                            crate::scope::inventory_cgroup::CollectionStop::OperatorStop,
+                        ),
+                    );
+                    driver.finish_pass(&mut report).expect("finish consumes");
+                }
+                // Ctrl-C lands after the seventh stable peek: the run
+                // control latches the stop before the eighth finish.
+                source.store(1, Ordering::SeqCst);
+                driver.coordinator.pose_cgroup_completion_for_test(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Cancelled(
+                        crate::scope::inventory_cgroup::CollectionStop::OperatorStop,
+                    ),
+                );
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_start_scopes()
+            },
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "a stopped cgroup must not start a new lane"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "the unattempted seal stays pending for the terminal disclosure"
+        );
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line without a start"
+        );
+        assert!(
+            start_scopes.is_empty(),
+            "a stopped cgroup must not start a new lane: {start_scopes:?}"
+        );
+        assert!(
+            driver.coordinator.take_cgroup_completion().is_none(),
+            "the owned completion is still consumed"
+        );
+    }
+
+    /// Stop-boundary twins: a frozen Completed outcome does not prove
+    /// the run is still active — publication suspension, a stop
+    /// request, and a reached collection deadline each forbid the new
+    /// seal attempt on their own, while the owned completion still
+    /// publishes.
+    #[test]
+    fn cgroup_finish_pass_stopped_completed_must_not_start_new_seal() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        for variant in ["suspended", "stop_requested", "deadline"] {
+            take_sealed_for_test();
+            let mut coordinator = coordinator();
+            let headless = headless_display();
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            driver.scope = InventoryRunScope::Cgroup;
+            if variant == "deadline" {
+                let past = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(60))
+                    .expect("a past collection deadline");
+                driver.cgroup = Some(
+                    CgroupDriverState::new(Some(past), None).expect("cgroup driver state builds"),
+                );
+            } else {
+                driver.cgroup =
+                    Some(CgroupDriverState::new(None, None).expect("cgroup driver state builds"));
+            }
+            let root = tempfile::tempdir().expect("cgroup root");
+            driver.seal_scope = Scope::Cgroup {
+                id: 7,
+                path: root.path().to_path_buf(),
+                dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+            };
+            driver.scan_seal_pending = true;
+            if variant == "suspended" {
+                driver.on_publication_suspended();
+            }
+            if variant == "stop_requested" {
+                driver.stop_requested = true;
+            }
+            let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+            let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+            let attempts = peeks.len();
+            let mut report = PassReport {
+                pass: 0,
+                scanned: 0,
+                maps_matched: 0,
+                native_callers: 0,
+                scan_callers: 0,
+                engine_changed: false,
+                pending_refresh: Vec::new(),
+                events: Vec::new(),
+                timings: crate::timing::StageTimings::new(),
+            };
+            let start_scopes = seal_startup_test::with_peek(
+                peeks,
+                vec![some_preparation(), some_preparation()],
+                Some(Ok(joint_lane(WindDownIo::completing(), false))),
+                || {
+                    for _ in 0..attempts {
+                        driver.coordinator.pose_cgroup_completion_for_test(
+                            crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                        );
+                        driver.finish_pass(&mut report).expect("finish consumes");
+                    }
+                    seal_startup_test::take_start_scopes()
+                },
+            );
+            assert!(
+                driver.semantic.is_none(),
+                "{variant}: a stopped cgroup must not start a new lane"
+            );
+            assert!(
+                driver.scan_seal_pending,
+                "{variant}: the unattempted seal stays pending for the terminal disclosure"
+            );
+            assert!(
+                take_sealed_for_test().is_empty(),
+                "{variant}: no seal line without a start"
+            );
+            assert!(
+                start_scopes.is_empty(),
+                "{variant}: a stopped cgroup must not start a new lane: {start_scopes:?}"
+            );
+            assert!(
+                driver.coordinator.take_cgroup_completion().is_none(),
+                "{variant}: the owned completion is still consumed"
+            );
+        }
     }
 
     /// `--cgroup` attempts the seal like every scope now: a pending

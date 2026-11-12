@@ -1325,7 +1325,12 @@ class BrowserCells(unittest.TestCase):
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"), env={})
         rows = [self._twin_row(["C_FindObjects"], 3, sha)]
-        result = self._twin_result("FF-PINBOUND", rows, self._twin_evidence())
+        # A healthy FF-PINBOUND report earns clean_proven (standard-layout
+        # verification without a manifest); the rig simulates the live cell,
+        # so its synthetic evidence carries the same verdict the cell pins.
+        result = self._twin_result(
+            "FF-PINBOUND", rows,
+            self._twin_evidence(verdict_detail="clean_proven"))
         doc = json.loads(result.report_path.read_text())
         doc.update({"mechanisms": [], "sessions": healthy_sessions(),
                     "logins": {}})

@@ -36,6 +36,7 @@ anyhow = "1"
 aya = "=0.14.0"
 aya-obj = "=0.3.0"
 cryptoki-sys = "0.5"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 libc = "0.2"
 p11scope-bpf-multi = { version = "0.0.0", path = "crates/bpf-multi" }
 p11scope-ebpf-common = { version = "0.0.0", path = "crates/ebpf-common", features = ["user"] }

@@ -272,6 +272,12 @@ emit_judged() {
     trace-cgroup)
       case "$detail" in
         *trace\ lossy\ or\ unknown\ observation*) known=1 ;;
+        # The same observation gap through the earlier loss-counter
+        # tripwire (every ledgered call delivered, but a return
+        # misses its entry stamp): unmatched_returns > 0 always sets
+        # an observation cause (render.rs gap_classes), so the
+        # gap-class tripwire would fire next. Same known gap.
+        *trace\ loss\ or\ unknown\ unmatched_returns*) known=1 ;;
       esac ;;
   esac
   if [ "$known" = 1 ]; then

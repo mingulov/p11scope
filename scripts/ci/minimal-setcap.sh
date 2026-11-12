@@ -439,7 +439,11 @@ run_profile() { # PARANOID — profile-pid cell as nobody with the full set
   detail="exit=$rc paranoid=$paranoid"
   pass=1
   [ "$rc" -eq 0 ] || pass=0
-  grep -q "counts complete" "$out" || pass=0
+  # No-manifest standard-layout tables verify from scan (b52d0f669,
+  # reviewed mech-nomanifest lane; owner rule: no manifest needed for
+  # standard providers), so the attached SoftHSM capture is COMPLETE
+  # (clean_proven), not partial-with-counts-complete.
+  grep -q "^coverage: complete" "$out" || pass=0
   if python3 -I - "$json" <<'PY'; then
 import json, sys
 evidence = json.load(open(sys.argv[1]))["evidence"]
@@ -480,10 +484,14 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
       ;;
     CAP_CHECKPOINT_RESTORE)
       # Degraded proof only: the capture still counts calls completely
-      # (mountinfo identity stands in for the map_files proof).
+      # (mountinfo identity stands in for the map_files proof), and the
+      # missing cap stays disclosed on stderr (the needs-line pinned
+      # above). COMPLETE since b52d0f669 (no-manifest standard-layout
+      # verification); the old partial line pinned the names-unconfirmed
+      # attribution gap, now closed for standard tables.
       [ "$rc" -eq 0 ] || pass=0
       grep -qE "^[1-9][0-9]* completed calls" "$out" || pass=0
-      grep -q "^coverage: partial — counts complete" "$out" || pass=0
+      grep -q "^coverage: complete" "$out" || pass=0
       ;;
     CAP_DAC_READ_SEARCH)
       # No target read: the coverage line must disclose the partial

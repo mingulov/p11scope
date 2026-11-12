@@ -66,7 +66,7 @@ class InitialExecControllerTests(unittest.TestCase):
         self.events, self.callers = [], []
         self.addCleanup(H6["cleanup_leg_resources"], self.ctx)
 
-    def drive(self, lines=None, mode="trace", changes=None, short_setup=False):
+    def drive(self, lines=None, mode="trace", changes=None, short_leg=False):
         directory = self.directory / f"{self._testMethodName}-{time.monotonic_ns()}"
         directory.mkdir()
         observer_path = directory / "synthetic-observer"
@@ -96,7 +96,7 @@ class InitialExecControllerTests(unittest.TestCase):
             return real_spawn(owners, argv, os.getuid(), **options)
 
         def ordinary_initial(owners, argv, **options):
-            self.assertEqual(len(os.listdir("/proc/self/task")), 1)
+            source["INITIAL_EXEC"]["_single_task"]()
             self.assertEqual(options["uid"], os.getuid())
             self.assertEqual(options["gid"], os.getgid())
             return source["INITIAL_EXEC"]["_spawn_initial_exec"](
@@ -130,9 +130,13 @@ class InitialExecControllerTests(unittest.TestCase):
                    "evaluate_trace_h6": lambda *_: {"pass": True, "scope": "controller-only"},
                    "evaluate_profile_h6": lambda *_: {"pass": True, "scope": "controller-only"},
                    "evaluate_metrics_h6": lambda *_: {"pass": True, "scope": "controller-only"}}
-        if short_setup:
+        if short_leg:
             budget = source["LegBudget"]
-            patches["LegBudget"] = lambda **kwargs: budget(budgets={"setup": 0.4}, leg_seconds=3, **kwargs)
+            # Compressed leg as a hang backstop for content-driven negative
+            # legs, with production phases. A short setup phase would race
+            # load-dependent spawn/observer overhead plus the 0.3s deliberate
+            # pre-transition drain before the successor-recovery transition.
+            patches["LegBudget"] = lambda **kwargs: budget(leg_seconds=3, **kwargs)
         patches.update(changes or {})
         with mock.patch.dict(source, patches):
             result = H6["run_pid_caller_leg"](
@@ -168,8 +172,22 @@ class InitialExecControllerTests(unittest.TestCase):
         self.assertFalse(Path(f"/proc/{caller.pid}").exists())
         self.assertFalse(self.ctx.cleanup_failed, self.ctx.cleanup_errors)
 
-    def test_short_setup_can_finish_warmup_and_measurement_within_the_leg_budget(self):
-        result, receipt, directory = self.drive(short_setup=True)
+    def test_short_original_deadline_can_finish_warmup_and_measurement(self):
+        source = H6["run_pid_caller_leg"].__globals__
+        release = source["release_initial_exec_load"]
+
+        def short_original_deadline(ctx, caller, reader, pin, provider, proof):
+            image, load = release(ctx, caller, reader, pin, provider, proof)
+            # Fault injection, not a wall-clock race: the leg proved release
+            # under normal budgets, so the original deadline is now short and
+            # the remaining phases must complete without consulting it. The leg
+            # itself runs under full budgets; fixed wall completion races load.
+            seeded = time.monotonic_ns() + 400_000_000
+            caller.deadline_ns = proof["deadline_ns"] = load["deadline_ns"] = seeded
+            return image, load
+
+        result, receipt, directory = self.drive(
+            changes={"release_initial_exec_load": short_original_deadline})
         self.assertTrue(result["pass"])
         caller = self.callers[0]
         self.assertEqual(caller.deadline_ns, receipt["initial_load"]["deadline_ns"])
@@ -192,7 +210,7 @@ class InitialExecControllerTests(unittest.TestCase):
                       ["p11scope: loader readiness: 1 active hook(s)", "foreign line", capturing]):
             with self.subTest(lines=lines):
                 with self.assertRaises(H6["SetupError"]):
-                    self.drive(lines=lines, short_setup=True)
+                    self.drive(lines=lines, short_leg=True)
                 caller = self.callers[-1]
                 self.assertFalse(caller.detached)
                 self.assertTrue(caller.reaped)
@@ -204,8 +222,15 @@ class InitialExecControllerTests(unittest.TestCase):
                 self.assertFalse(Path(f"/proc/{caller.pid}").exists())
 
     def test_missing_loop_start_exhausts_original_setup_deadline_and_reaps(self):
+        source = H6["run_pid_caller_leg"].__globals__
+        budget = source["LegBudget"]
+        # The only short setup left: no loop-start line can ever arrive, so
+        # every path raises TimeoutError deterministically, with leg room for
+        # cleanup. A leg-bound timeout would starve cleanup instead.
+        short_setup = lambda **kwargs: budget(budgets={"setup": 0.4}, leg_seconds=3, **kwargs)
         with self.assertRaises(TimeoutError):
-            self.drive(lines=["p11scope: loader readiness: 1 active hook(s)"], short_setup=True)
+            self.drive(lines=["p11scope: loader readiness: 1 active hook(s)"],
+                       changes={"LegBudget": short_setup})
         caller = self.callers[-1]
         self.assertTrue(caller.reaped)
         self.assertFalse(caller.detached)
@@ -223,7 +248,7 @@ class InitialExecControllerTests(unittest.TestCase):
             return observer(owners, readers, directory, altered, env, **kwargs)
 
         with self.assertRaises(H6["SetupError"]):
-            self.drive(changes={"spawn_observer": foreign}, short_setup=True)
+            self.drive(changes={"spawn_observer": foreign}, short_leg=True)
         self.assertTrue(self.callers[-1].reaped)
         self.assertFalse(self.callers[-1].detached)
 
@@ -238,7 +263,7 @@ class InitialExecControllerTests(unittest.TestCase):
             return result
 
         with self.assertRaises(H6["SetupError"]):
-            self.drive(changes={"observer_initial_exec_ready": backwards}, short_setup=True)
+            self.drive(changes={"observer_initial_exec_ready": backwards}, short_leg=True)
         self.assertFalse(self.callers[-1].detached)
         self.assertTrue(self.callers[-1].reaped)
 
@@ -259,7 +284,7 @@ class InitialExecControllerTests(unittest.TestCase):
                     with mock.patch.object(reader, "record", side_effect=record):
                         return release(ctx, caller, reader, pin, provider, proof)
                 with self.assertRaises(H6["SetupError"]):
-                    self.drive(changes={"release_initial_exec_load": changed}, short_setup=True)
+                    self.drive(changes={"release_initial_exec_load": changed}, short_leg=True)
                 self.assertTrue(self.callers[-1].reaped)
         for field in ("size", "ctime_ns"):
             with self.subTest(field=field):
@@ -267,7 +292,7 @@ class InitialExecControllerTests(unittest.TestCase):
                     proof["held"][field] += 1
                     return release(ctx, caller, reader, pin, provider, proof)
                 with self.assertRaises(H6["SetupError"]):
-                    self.drive(changes={"release_initial_exec_load": changed_metadata}, short_setup=True)
+                    self.drive(changes={"release_initial_exec_load": changed_metadata}, short_leg=True)
                 self.assertTrue(self.callers[-1].reaped)
 
     def test_real_load_wait_may_arrive_during_detach_syscall(self):

@@ -149,6 +149,22 @@ int main(int argc, char **argv) {
             blocked.set()
             thread.join()
 
+    def test_single_task_gate_awaits_joined_teardown_instead_of_failing(self):
+        guard = self.module["_single_task"]
+        self_tid = str(threading.get_native_id())
+        lingering = [[self_tid, "424242"], [self_tid, "424242"], [self_tid]]
+        with mock.patch.object(os, "listdir", side_effect=lingering) as listdir:
+            guard()
+        self.assertGreaterEqual(listdir.call_count, 3)
+
+    def test_repeated_join_then_guard_never_observes_teardown(self):
+        guard = self.module["_single_task"]
+        for _ in range(1000):
+            thread = threading.Thread(target=lambda: None)
+            thread.start()
+            thread.join()
+            guard()
+
     def test_inherited_python_profile_callback_prevents_raw_fork(self):
         previous = sys.getprofile()
         sys.setprofile(lambda *_args: None)

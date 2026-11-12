@@ -4182,3 +4182,264 @@ fn object_journal_exec_birth_present_in_journal_object() {
         "the journal object must retain its exec root"
     );
 }
+
+/// F1: the refused arm's unmatched decision stays outcome-aware. A failed
+/// START retirement (`RetirementFailed`) bumps `EVIDENCE_UNMATCHED_RETURNS`
+/// even when the continuity/coverage predicate (`bump`) is silent
+/// (never-active guest: unstamped entry + `COVERAGE_DISABLED`). Ring loss
+/// stays `OutputFailed`-only. Whitespace/comment-insensitive; the caller
+/// supplies the arm body plus its end marker (`let tail =` for the two
+/// `main.rs` copies, `let Some(reason)` for the journal copy).
+fn refused_unmatched_is_retirement_aware(body: &str, end_marker: &str) -> bool {
+    let Some((_, refused)) = body.split_once("if !joined {") else {
+        return false;
+    };
+    let Some((refused, _)) = refused.split_once(end_marker) else {
+        return false;
+    };
+    let code: String = refused
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let ring_loss =
+        "ifoutcome==RefusedBaseOutcome::OutputFailed{bump_evidence(EVIDENCE_RING_LOSS);}";
+    let unmatched_aware = "ifbump||outcome==RefusedBaseOutcome::RetirementFailed{bump_evidence(EVIDENCE_UNMATCHED_RETURNS);}";
+    match (code.find(ring_loss), code.find(unmatched_aware)) {
+        (Some(loss), Some(unmatched)) => {
+            loss < unmatched
+                && code
+                    .matches("bump_evidence(EVIDENCE_UNMATCHED_RETURNS);")
+                    .count()
+                    == 1
+                && code.matches("bump_evidence(EVIDENCE_RING_LOSS);").count() == 1
+        }
+        _ => false,
+    }
+}
+
+/// F1 composition: the real predicate + preservation + the expected final
+/// decision. Healthy never-active emits silently (0/0); failed retirement
+/// bumps unmatched (1) without output or ring loss; output failure bumps
+/// ring loss only; an active predicate bumps on every outcome. The final
+/// decision here is the fixed `bump || RetirementFailed` contract; the
+/// per-caller source pin above binds it to production.
+fn check_refused_retirement_composition(tag: &str) {
+    use p11scope_ebpf_common::object_flow::{
+        RefusedBaseOutcome, continuity_joins, join_refusal_bump, preserve_refused_base,
+    };
+    use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp, instance};
+    use std::cell::Cell;
+
+    let recorded = InstanceStamp {
+        epoch: 7,
+        global: 3,
+        fault: 1,
+        file_slot_plus1: 5,
+        flags: instance::STAMP_VALID,
+    };
+    let blank = InstanceStamp::default();
+    let continuity = InstanceContinuity {
+        entry_ip: 0x1000,
+        entry_stamp: blank,
+        return_stamp: recorded,
+    };
+    assert!(
+        !continuity_joins(&continuity),
+        "{tag}: the guest fixture must refuse the join"
+    );
+    let bump = join_refusal_bump(&continuity, instance::COVERAGE_DISABLED);
+    assert!(
+        !bump,
+        "{tag}: never-active unstamped predicate stays silent"
+    );
+
+    let final_unmatched =
+        |bump: bool, outcome: RefusedBaseOutcome| bump || outcome == RefusedBaseOutcome::RetirementFailed;
+    let final_ring_loss =
+        |outcome: RefusedBaseOutcome| outcome == RefusedBaseOutcome::OutputFailed;
+
+    {
+        let output_called = Cell::new(false);
+        let fault_called = Cell::new(false);
+        let outcome = preserve_refused_base(
+            || true,
+            || fault_called.set(true),
+            || {
+                output_called.set(true);
+                true
+            },
+        );
+        assert_eq!(
+            outcome,
+            RefusedBaseOutcome::Emitted,
+            "{tag}: healthy retires and emits"
+        );
+        assert!(
+            fault_called.get(),
+            "{tag}: healthy still faults object continuity"
+        );
+        assert!(
+            output_called.get(),
+            "{tag}: healthy outputs the preserved base"
+        );
+        assert!(
+            !final_unmatched(bump, outcome),
+            "{tag}: healthy never-active emits silently (0 unmatched)"
+        );
+        assert!(
+            !final_ring_loss(outcome),
+            "{tag}: healthy has no ring loss"
+        );
+    }
+    {
+        let output_called = Cell::new(false);
+        let fault_called = Cell::new(false);
+        let outcome = preserve_refused_base(
+            || false,
+            || fault_called.set(true),
+            || {
+                output_called.set(true);
+                true
+            },
+        );
+        assert_eq!(
+            outcome,
+            RefusedBaseOutcome::RetirementFailed,
+            "{tag}: failed retirement reports RetirementFailed"
+        );
+        assert!(
+            fault_called.get(),
+            "{tag}: failed retirement still faults"
+        );
+        assert!(
+            !output_called.get(),
+            "{tag}: failed retirement never outputs"
+        );
+        assert!(
+            final_unmatched(bump, outcome),
+            "{tag}: failed retirement bumps unmatched even when the predicate is silent"
+        );
+        assert!(
+            !final_ring_loss(outcome),
+            "{tag}: failed retirement is not ring loss"
+        );
+    }
+    {
+        let outcome = preserve_refused_base(|| true, || {}, || false);
+        assert_eq!(outcome, RefusedBaseOutcome::OutputFailed);
+        assert!(
+            !final_unmatched(bump, outcome),
+            "{tag}: OutputFailed with a silent predicate stays unmatched-silent"
+        );
+        assert!(
+            final_ring_loss(outcome),
+            "{tag}: OutputFailed bumps ring loss"
+        );
+    }
+    {
+        let active_bump = join_refusal_bump(&continuity, instance::COVERAGE_ENABLED);
+        assert!(
+            active_bump,
+            "{tag}: active unstamped predicate bumps"
+        );
+        for outcome in [
+            RefusedBaseOutcome::Emitted,
+            RefusedBaseOutcome::OutputFailed,
+            RefusedBaseOutcome::RetirementFailed,
+        ] {
+            assert!(
+                final_unmatched(active_bump, outcome),
+                "{tag}: active predicate bumps on {outcome:?}"
+            );
+        }
+    }
+}
+
+/// The pin itself is non-vacuous: it accepts the fixed shape and rejects
+/// the pre-fix `if bump` shape, a wrong outcome, and a dropped ring-loss
+/// guard. Runs before the production assertion so RED still proves the
+/// helper works.
+fn assert_retirement_pin_is_nonvacuous(end_marker: &str) {
+    let fixed = format!(
+        "if !joined {{ let bump = join_refusal_bump(); let outcome = preserve_refused_base(); \
+         entry.discard(0); if outcome == RefusedBaseOutcome::OutputFailed {{ \
+         bump_evidence(EVIDENCE_RING_LOSS); }} \
+         if bump || outcome == RefusedBaseOutcome::RetirementFailed {{ \
+         bump_evidence(EVIDENCE_UNMATCHED_RETURNS); }} return 0; }} {end_marker}"
+    );
+    assert!(
+        refused_unmatched_is_retirement_aware(&fixed, end_marker),
+        "the pin must accept the fixed shape"
+    );
+    let buggy = fixed.replace(
+        "if bump || outcome == RefusedBaseOutcome::RetirementFailed",
+        "if bump",
+    );
+    assert!(
+        !refused_unmatched_is_retirement_aware(&buggy, end_marker),
+        "the pin must reject the pre-fix `if bump` shape"
+    );
+    let wrong_outcome = fixed.replace("RetirementFailed", "Emitted");
+    assert!(
+        !refused_unmatched_is_retirement_aware(&wrong_outcome, end_marker),
+        "the pin must reject a wrong outcome"
+    );
+    let dropped_loss = fixed.replace(
+        "if outcome == RefusedBaseOutcome::OutputFailed { bump_evidence(EVIDENCE_RING_LOSS); }",
+        "",
+    );
+    assert!(
+        !refused_unmatched_is_retirement_aware(&dropped_loss, end_marker),
+        "the pin must reject a dropped ring-loss guard"
+    );
+}
+
+#[test]
+fn guest_returns_ordinary_retirement_failure_is_still_unmatched() {
+    assert_retirement_pin_is_nonvacuous("let tail =");
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let (_, ordinary) = source
+        .split_once("fn object_return_ordinary(")
+        .expect("ordinary object half");
+    let (ordinary, _) = ordinary
+        .split_once("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .expect("ordinary object half end");
+    assert!(
+        refused_unmatched_is_retirement_aware(ordinary, "let tail ="),
+        "ordinary refused arm must OR unmatched with RetirementFailed"
+    );
+    check_refused_retirement_composition("ordinary");
+}
+
+#[test]
+fn guest_returns_generic_retirement_failure_is_still_unmatched() {
+    assert_retirement_pin_is_nonvacuous("let tail =");
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let (_, object) = source
+        .split_once("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .expect("object half");
+    let (object, _) = object
+        .split_once("pub extern \"C\" fn p11_link_fork_allowed")
+        .expect("object half end");
+    assert!(
+        refused_unmatched_is_retirement_aware(object, "let tail ="),
+        "generic refused arm must OR unmatched with RetirementFailed"
+    );
+    check_refused_retirement_composition("generic");
+}
+
+#[test]
+fn guest_returns_journal_retirement_failure_is_still_unmatched() {
+    assert_retirement_pin_is_nonvacuous("let Some(reason)");
+    let source =
+        std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
+    let (_, journal) = source
+        .split_once("pub(crate) fn ordinary_return(")
+        .expect("journal ordinary half");
+    assert!(
+        refused_unmatched_is_retirement_aware(journal, "let Some(reason)"),
+        "journal refused arm must OR unmatched with RetirementFailed"
+    );
+    check_refused_retirement_composition("journal");
+}

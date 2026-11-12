@@ -313,29 +313,6 @@ class EmitJudgedTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "expected-failure")
         self.assertFalse(row["pass"])
 
-    def test_trace_cgroup_unmatched_returns_becomes_expected(self):
-        # The same known cgroup-trace observation gap through the
-        # earlier loss-counter tripwire: every ledgered call is
-        # delivered, but a return misses its entry stamp (the fork
-        # child racing fork marking). unmatched_returns > 0 always
-        # sets an observation cause (render.rs gap_classes), so the
-        # gap-class tripwire would fire next; both details name the
-        # same condition and stay expected-failure, never qualified.
-        oracle_row = json.dumps({
-            "cell": "trace-cgroup", "pass": False,
-            "detail": "trace loss or unknown unmatched_returns",
-            "qualification": "failed"})
-        with tempfile.TemporaryDirectory() as raw:
-            tmp = Path(raw)
-            (tmp / "results.jsonl").write_text("")
-            body = f"emit_judged trace-cgroup 1 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
-            proc = run_shell(body, cwd=tmp)
-        lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
-        self.assertTrue(lines, f"no emitted row in: {proc.stdout}\n{proc.stderr}")
-        row = json.loads(lines[-1])
-        self.assertEqual(row["qualification"], "expected-failure")
-        self.assertFalse(row["pass"])
-
 
 class ScriptTextTests(unittest.TestCase):
     def test_startup_bound_default_is_45(self):

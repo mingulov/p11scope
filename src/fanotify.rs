@@ -1205,8 +1205,7 @@ fn open_file_for_mark_impl(point: &std::path::Path, pre_reopen: impl FnOnce()) -
     // `O_NOFOLLOW` here: the fd link is traversed by the kernel to
     // the held object itself, and `O_NOFOLLOW` would refuse it with
     // `ELOOP` (probed, not just read from the man page).
-    let fd_path =
-        std::ffi::CString::new(format!("/proc/self/fd/{}", probe.as_raw_fd())).ok()?;
+    let fd_path = std::ffi::CString::new(format!("/proc/self/fd/{}", probe.as_raw_fd())).ok()?;
     // SAFETY: libc call; the NUL-terminated fd link is valid, and the
     // probe is alive for this whole call so the link cannot dangle.
     let raw = unsafe {

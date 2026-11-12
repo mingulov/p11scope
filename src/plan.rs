@@ -9591,6 +9591,103 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_rescan_with_consistent_rename_replaces_only_renamed_slot() {
+        // Names-gate twin (stale-port F1 follow-up): the rename is
+        // consistent — the new name lands in the scanned table AND the
+        // module's own exports — so per-ordinal export agreement holds,
+        // the table stays eligible, and the unfinished rescan re-proves
+        // every slot. The merge must still refuse the renamed slot
+        // alone: its rebuilt name differs from the verified name, so the
+        // old descriptor must not carry onto it, while the 67 untouched
+        // slots carry. (The table-only rename twin refuses earlier at
+        // eligibility with an empty re-proof; this twin reaches the
+        // `slot.names == old.names` gate in `extend_exact_prepared`.)
+        // `C_Initialize` is not in `SOLE_COMPLETE_REQUIRED_2X`, so the
+        // assumed-finished sole leg still holds structurally.
+        let initial = sole_complete_module();
+        let mut plan =
+            build_from_sources(std::slice::from_ref(&initial), &[], &PinnedObjects::empty());
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the sole-complete scan grants first"
+        );
+        let mut renamed = sole_complete_module();
+        renamed.scanned.tables_scan_finished = false;
+        let position = renamed.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_Initialize")
+            .expect("C_Initialize entry");
+        let renamed_offset = renamed.scanned.tables[0].entries[position].file_offset;
+        renamed.scanned.tables[0].entries[position].name = "C_RenamedInitialize";
+        let exports: Vec<(String, u64)> = renamed.scanned.tables[0]
+            .entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect();
+        renamed.exports = std::sync::Arc::from(exports);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&renamed), &[], &PinnedObjects::empty());
+        assert_eq!(
+            rebuilt.modules[0].tables[0].linkage, "exports",
+            "the consistent rename keeps export agreement"
+        );
+        assert_eq!(
+            rebuilt.modules[0].tables[0].exports_agreeing,
+            Some(68),
+            "every ordinal still agrees with the provider's own exports"
+        );
+        assert_eq!(
+            rebuilt.reproven_unfinished_slots.len(),
+            68,
+            "an eligible table re-proves every slot unfinished"
+        );
+        let old_names = plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == renamed_offset)
+            .expect("renamed offset attached")
+            .names
+            .clone();
+        let new_names = rebuilt
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == renamed_offset)
+            .expect("renamed offset rebuilt")
+            .names
+            .clone();
+        assert_eq!(old_names, ["C_Initialize"], "the verified name");
+        assert_eq!(new_names, ["C_RenamedInitialize"], "the rebuilt name");
+        assert_ne!(new_names, old_names, "the rename reaches the names gate");
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty() && delta.retire.is_empty());
+        assert_eq!(
+            delta.replace.len(),
+            1,
+            "only the renamed slot refuses the carry"
+        );
+        assert_eq!(
+            delta.replace[0].file_offset, renamed_offset,
+            "the refused slot is the renamed one"
+        );
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.descriptor_index == 0)
+                .count(),
+            1,
+            "only the renamed slot loses its descriptor"
+        );
+        assert_eq!(
+            plan.standard_layout_slot_count(),
+            67,
+            "the carried slots keep their standard-layout basis"
+        );
+    }
+
+    #[test]
     fn unfinished_first_scan_grants_nothing() {
         // Unknown tables never carry: without a verified basis the
         // unfinished lowering stays count-only on first sight.

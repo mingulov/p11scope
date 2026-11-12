@@ -481,6 +481,102 @@
       "identical": [],
       "lane": "guest-returns retirement-failure unmatched",
       "rationale": "The fix1 repair on top of transition 6 (400083030: the three refused arms OR the final unmatched decision with outcome == RetirementFailed, so a failed START retirement stays visible even when the never-active predicate is silent; OutputFailed still bumps ring loss only): the Detailed object gains .text +40 to cumulative +1296 for the three outcome-aware branches, with matching debug/BTF moves (.BTF.ext +16, .debug_line +16, .debug_loclists +58, .debug_rnglists +51, .rel.BTF.ext +16; .debug_addr -8, .debug_info -19, .rel.debug_addr -16); no new symbol (.symtab/.strtab unchanged), no section added or removed, uprobe (+184) and maps (+28) unchanged. Both Inventory objects keep exactly the transition-6 shape (.text +112/+176, uprobe +128, maps +28)."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "v0.7.0 wave-1 combined tip (measured at fd54df1920415b844776123b81d023ac6b91a83a; the record commit adds only this record, which is not a BPF input)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF": 213,
+            ".BTF.ext": 712,
+            ".debug_abbrev": 1,
+            ".debug_addr": 176,
+            ".debug_frame": 24,
+            ".debug_info": 2003,
+            ".debug_line": 554,
+            ".debug_loclists": 2007,
+            ".debug_rnglists": 416,
+            ".debug_str": 312,
+            ".debug_str_offsets": 48,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 720,
+            ".rel.debug_addr": 352,
+            ".rel.debug_frame": 32,
+            ".rel.debug_info": 944,
+            ".rel.debug_line": 16,
+            ".rel.debug_str_offsets": 192,
+            ".rel.text": 144,
+            ".reluprobe": 32,
+            ".strtab": 36,
+            ".symtab": 48,
+            ".text": 1320,
+            "maps": 28,
+            "uprobe": 184
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 128,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1024,
+            ".debug_line": 97,
+            ".debug_loclists": 383,
+            ".debug_rnglists": 41,
+            ".debug_str": 84,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 128,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 112,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 144,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1058,
+            ".debug_line": 101,
+            ".debug_loclists": 391,
+            ".debug_rnglists": 51,
+            ".debug_str": 72,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 144,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 176,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "trace-cgroup retired-join split on the guest-returns gate",
+      "rationale": "The trace-cgroup repair on top of transition 7 (931c251ba merged with the guest-returns fix1 arms: the three refused arms split through refused_join_accounting(outcome, bump), so a retired start with a refused join reports a semantic capture failure when continuity was active and stays silent when never-active, while a failed START retirement stays unmatched on every coverage state; OutputFailed still bumps ring loss only): the Detailed object gains .text +24 to cumulative +1320 for the helper calls with their unmatched/semantic guards, with matching debug/BTF moves (.BTF.ext +32, .debug_line +14, .debug_loclists +107, .debug_str +19, .debug_addr +16, .debug_info +158, .debug_str_offsets +8, .rel.BTF.ext +32, .rel.debug_addr +32, .rel.debug_info +32, .rel.debug_str_offsets +32, .rel.text +16; .debug_rnglists -15); no new symbol (.symtab/.strtab unchanged), no section added or removed, uprobe (+184) and maps (+28) unchanged. Both Inventory objects keep exactly the transition-7 shape (.text +112/+176, uprobe +128, maps +28)."
     }
   ],
   "version": 1

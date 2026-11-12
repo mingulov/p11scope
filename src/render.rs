@@ -5615,7 +5615,13 @@ pub fn reconcile_caller_exec(attach: &CaptureCaller, end: CaptureCaller) -> Capt
             exe_unknown_reason: None,
             exec_from_exe: None,
         },
-        _ => attach.clone(),
+        // A transition rides only the reconcile that proved it from its own
+        // two reads: keeping the attach identity never carries a stale one.
+        _ => CaptureCaller {
+            exe: attach.exe.clone(),
+            exe_unknown_reason: attach.exe_unknown_reason,
+            exec_from_exe: None,
+        },
     }
 }
 
@@ -14883,6 +14889,28 @@ pub(crate) mod tests {
         let end = CaptureCaller {
             exe: Some("/usr/bin/pkcs11-tool".into()),
             exe_unknown_reason: None,
+            exec_from_exe: None,
+        };
+        let reconciled = reconcile_caller_exec(&attach, end);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/pkcs11-tool"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_from_exe, None);
+    }
+
+    #[test]
+    fn reconcile_caller_exec_drops_a_stale_transition_without_a_new_exec() {
+        // Defense in depth: a transition rides only the reconcile that
+        // proved it from its own two reads. A caller that somehow arrives
+        // with a stale `exec_from_exe` and no new exec loses it, while the
+        // known exe still wins over the unknown end read.
+        let attach = CaptureCaller {
+            exe: Some("/usr/bin/pkcs11-tool".into()),
+            exe_unknown_reason: None,
+            exec_from_exe: Some("/usr/bin/stale".into()),
+        };
+        let end = CaptureCaller {
+            exe: None,
+            exe_unknown_reason: Some("target exited before its exe link was read"),
             exec_from_exe: None,
         };
         let reconciled = reconcile_caller_exec(&attach, end);

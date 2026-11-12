@@ -10312,6 +10312,250 @@ fn arming_a_view_exited_mid_arm_is_silent_not_unavailable() {
     assert_eq!(aggregate.dlopen_timing.none, 0);
 }
 
+/// fix5 twin (CI run 43274912275 mt-system v6.18.58, 346d2c875): a live
+/// view whose loader arm is denied by a SIBLING's silent proven-exit abort
+/// must retry, not record unbound. The loader candidate spans every
+/// module, so a stale dead sibling aborts the shared apply at steady
+/// state (empty delta); the victim's arm binds nothing, yet the `Changed`
+/// outcome used to file a sticky `(view, Unbound)` — `unavailable=1` that
+/// no later bind cleared. The deferred arm records nothing, queues its
+/// rescan+re-arm, and leaves the aggregate exactly zero.
+#[test]
+fn sibling_silent_abort_defers_loader_arm_without_recording() {
+    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let sibling_id = ProcessViewId(3);
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let victim_pid = victim.id();
+    let victim_id = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(victim_id, victim_pid).unwrap());
+    engine.next_view_id = 5;
+    engine.scope = Scope::Pid(victim_pid);
+    // Zombie, not reaped: the pid stays held (no reuse race) while the
+    // generation reads stale, the pin proves the exit, and the pid reads
+    // dead — the exact silent-abort conjuncts. The kill is async: wait
+    // for the zombie state before asserting staleness.
+    sibling.kill().unwrap();
+    let sibling_pid = sibling.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !process::process_is_zombie(sibling_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        process::process_is_zombie(sibling_pid),
+        "the killed sibling is unreaped"
+    );
+    assert!(
+        !engine.views[0].still_the_same(),
+        "the zombied sibling reads stale"
+    );
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+    assert!(process::generation_dead(sibling_pid));
+    assert!(
+        engine.views[1].still_the_same(),
+        "the victim stays a live generation"
+    );
+
+    let mut session = ScriptedSession::default();
+    let mut pending = PendingViewRetirements::new();
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(1, &mut session, &mut additions_allowed, &mut pending);
+    victim.kill().unwrap();
+    victim.wait().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("a sibling-denied arm of a live view defers, it does not fail");
+
+    assert!(
+        !additions_allowed,
+        "the silent abort closed the tick: the denial fired"
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .any(|line| line.contains("candidate generation exited before mutation")),
+        "the abort stayed on the silent path: {:?}",
+        engine.counters.noise.lines()
+    );
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a silent denial marks nothing: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.loader_contexts.is_empty(),
+        "a denied arm records no loader context: {:?}",
+        engine.loader_contexts
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(victim_id).is_empty(),
+        "nothing bound and nothing stuck prepared: the re-arm starts clean"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&victim_pid),
+        "the deferred arm queues its rescan+re-arm: {:?}",
+        engine.refresh_requested
+    );
+    assert_eq!(
+        engine.loader_discovery(),
+        render::LoaderDiscovery::default(),
+        "the aggregate stays exactly zero"
+    );
+    assert_eq!(
+        pending.get(&sibling_id),
+        Some(&RetirementCause::ExpectedRemoval),
+        "the proven exit retires as an expected end, so the re-arm binds clean: {pending:?}"
+    );
+}
+
+/// fix5 hardening twin: a later successful bind replaces a stale
+/// `(view, Unbound)` entry instead of leaving it sticky. The aggregate
+/// counts contexts, not attempts: once the view owns a live loader
+/// context it must not also count as unavailable. The entry the denied
+/// arm recorded (loud paths still record) clears on the retry's bind.
+#[test]
+fn bound_loader_arm_replaces_a_stale_unbound_entry() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let view = ProcessViewId(6);
+    let mut engine = Engine::empty();
+    engine.record_loader_arm(view, false);
+    assert_eq!(
+        engine.loader_discovery().strategies.unavailable,
+        1,
+        "precondition: the denied arm recorded unbound"
+    );
+    let spec = LoaderContextSpec {
+        view,
+        loader: PinnedObjectId(9),
+        mapping: Some(MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        }),
+        hook: SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let first = engine.loader_registry.preflight(spec.clone()).unwrap();
+    let first = engine.loader_registry.prepare(first).unwrap();
+    engine.loader_registry.mark_attached(first).unwrap();
+    engine.record_loader_arm(view, false);
+
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 0,
+        "the bind replaces the stale unbound entry"
+    );
+    assert_eq!(aggregate.strategies.debug_state_every_hit, 1);
+    assert_eq!(aggregate.dlopen_timing.unproven, 1);
+    assert_eq!(aggregate.dlopen_timing.none, 0);
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "the unkeyed disclosure still stands: only the aggregate moves to current truth"
+    );
+}
+
+/// fix5 guard twin (no hiding real gaps): the same sibling-denied shape,
+/// but the stale sibling is a LIVE reused pid, so the abort stays loud —
+/// and the victim's arm still records its unbound gap under the disclosed
+/// cause. Only the silent abort defers; every loud denial records.
+#[test]
+fn sibling_loud_abort_still_records_the_loader_gap() {
+    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let sibling_id = ProcessViewId(3);
+    let sibling_pid = sibling.id();
+    engine.views[0] =
+        crate::process::reused_process_view_for_test(sibling_id, sibling_pid).unwrap();
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let victim_pid = victim.id();
+    let victim_id = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(victim_id, victim_pid).unwrap());
+    engine.next_view_id = 5;
+    engine.scope = Scope::Pid(victim_pid);
+    assert!(
+        sibling.try_wait().unwrap().is_none(),
+        "the reused sibling pid stays live, so the abort stays loud"
+    );
+    assert!(
+        !engine.views[0].still_the_same(),
+        "the reused sibling reads stale"
+    );
+    assert!(
+        engine.views[1].still_the_same(),
+        "the victim stays a live generation"
+    );
+
+    let mut session = ScriptedSession::default();
+    let mut pending = PendingViewRetirements::new();
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(1, &mut session, &mut additions_allowed, &mut pending);
+    victim.kill().unwrap();
+    victim.wait().unwrap();
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("a loud-denied arm still returns");
+
+    assert!(
+        !additions_allowed,
+        "the loud abort closed the tick: the denial fired"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason
+                == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "the dropped candidate keeps its named mark: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .all(|line| !line.contains("candidate generation exited before mutation")),
+        "no silence note on the loud path: {:?}",
+        engine.counters.noise.lines()
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 1,
+        "a loud denial still records its gap"
+    );
+    assert_eq!(aggregate.dlopen_timing.none, 1);
+    assert_eq!(aggregate.strategies.debug_state_every_hit, 0);
+    assert_eq!(
+        pending.get(&sibling_id),
+        Some(&RetirementCause::ExpectedRemoval),
+        "the proven exit retires as an expected end: {pending:?}"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(victim_id).is_empty(),
+        "the loud denial binds nothing either: the gap is the record"
+    );
+}
+
 #[test]
 fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
     let (fixture, view, _module, _pins) = loaded_seed_provider();

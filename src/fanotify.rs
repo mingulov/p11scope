@@ -2892,14 +2892,17 @@ mod tests {
             }
         }
         let candidate = got.expect("the drain reports the held provider");
-        // /bin/sh is dash on Debian but bash on Fedora: either names the shell holder.
+        // The holder shell is dash on Debian; on Fedora it is bash, which execs the
+        // trailing `sleep` (verified: only `sleep` survives), so the live pid reads
+        // as bash or sleep depending on when the drain samples /proc/pid/exe.
         assert!(
             candidate
                 .loader_exe
                 .as_deref()
                 .is_some_and(|exe| exe.ends_with("/sh")
                     || exe.ends_with("/dash")
-                    || exe.ends_with("/bash")),
+                    || exe.ends_with("/bash")
+                    || exe.ends_with("/sleep")),
             "the still-live holder is named: {:?} / {:?}",
             candidate.loader_exe,
             candidate.loader_unknown_reason

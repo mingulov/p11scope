@@ -2002,8 +2002,8 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         self.assertIn('close-input: OSError', message)
                     self.assertEqual(open_descriptors(), before)
 
-    def live_inventory(self):
-        """Live kernel metadata shaped from the pinned ELF policy.
+    def live_inventory_from(self, defs):
+        """Live kernel metadata shaped from one pinned ELF map inventory.
 
         Linux reports only permanent map flags on the map object and
         moves WRONLY to the created FD, so the two private IMAGE hash
@@ -2011,13 +2011,17 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         declares 17; every other field stays exact.
         """
         rows = []
-        for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items())):
+        for index, (name, row) in enumerate(sorted(defs.items())):
             flags = capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])
             rows.append(capture.dumper.normalize_map_metadata({
                 'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
                 'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
                 'max_entries': row['max_entries'], 'flags': flags}, index + 100))
         return rows
+
+    def live_inventory(self):
+        """Live kernel metadata shaped from the pinned 512-slot ELF policy."""
+        return self.live_inventory_from(capture.definitions.SAFE_MAPS)
 
     def test_image_map_flag_validation_preserves_protection(self):
         """G23: the live IMAGE expectation is narrowed, nothing else.
@@ -2215,6 +2219,68 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=CGROUP_FILTER'):
             capture.validate_inventory(retyped, 'default')
+
+    def test_wide_object_against_512_expectation_is_refused(self):
+        """Failure twin for the v0.7.0 release canary: width is exact.
+
+        The FULL default build embeds the wide object (STATS 2112), so a
+        wide live inventory validated against the 512 expectation must be
+        refused, naming a width-drifted map. A 512 inventory with only
+        STATS widened reproduces the rehearsal's exact
+        `map definition mismatch name=STATS` signature. The fix must
+        select the wide expectation for wide builds, never accept any
+        max_entries.
+        """
+        wide = self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS)
+        with self.assertRaisesRegex(capture.CaptureError, 'map definition mismatch name='):
+            capture.validate_inventory(wide, 'default')
+        drifted = self.live_inventory()
+        next(item for item in drifted if item['name'] == 'STATS')['max_entries'] = 2112
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=STATS'):
+            capture.validate_inventory(drifted, 'default')
+        wide_unsafe = self.live_inventory_from(capture.definitions.WIDE_UNSAFE_MAPS)
+        with self.assertRaisesRegex(capture.CaptureError, 'map definition mismatch name='):
+            capture.validate_inventory(wide_unsafe, 'diagnostic')
+
+    def test_wide_inventory_validates_exact_width(self):
+        """Healthy wide twin: the FULL live inventory validates as wide.
+
+        The canary builds keep default features, so every live lane runs
+        the wide object. The wide expectation accepts exactly the frozen
+        wide geometry; a single-slot drift in either direction still
+        fails, and an unknown variant fails closed.
+        """
+        self.assertEqual(capture.definitions.WIDE_MARKER_MAPS['STATS']['max_entries'], 2112)
+        capture.validate_inventory(
+            self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS), 'wide')
+        capture.validate_inventory(
+            self.live_inventory_from(capture.definitions.WIDE_UNSAFE_MAPS), 'wide-diagnostic')
+        shrunk = self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS)
+        next(item for item in shrunk if item['name'] == 'STATS')['max_entries'] = 512
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=STATS'):
+            capture.validate_inventory(shrunk, 'wide')
+        grown = self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS)
+        next(item for item in grown if item['name'] == 'SLOT_FILE')['max_entries'] = 2113
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=SLOT_FILE'):
+            capture.validate_inventory(grown, 'wide')
+        with self.assertRaises(capture.CaptureError):
+            capture.validate_inventory(
+                self.live_inventory_from(capture.definitions.WIDE_MARKER_MAPS), 'bogus')
+
+    def test_512_inventory_still_validates(self):
+        """Healthy 512 twin: the comparison build keeps its exact expectation.
+
+        `--no-default-features` still produces the 512 object (the release
+        p0 official build), so the 512 expectation keeps validating the
+        512 geometry exactly, in both safe and diagnostic flavors.
+        """
+        self.assertEqual(capture.definitions.SAFE_MAPS['STATS']['max_entries'], 512)
+        capture.validate_inventory(self.live_inventory(), 'default')
+        capture.validate_inventory(
+            self.live_inventory_from(capture.definitions.UNSAFE_MAPS), 'diagnostic')
 
     def test_real_stop_refusal_resumes_only_observer_and_never_publishes(self):
         self.probe('first_refusal')

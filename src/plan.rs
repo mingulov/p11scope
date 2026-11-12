@@ -5886,10 +5886,13 @@ fn sole_complete_table_authorized(
 /// 2026-11-11: no manifest needed for standard providers): targets of
 /// name-authorized tables whose standard layout is proven by scan-time
 /// evidence the observer already has — exact interface linkage (the
-/// provider's own "PKCS 11" static data names this table), manifest
-/// corroboration, the sole-complete-table leg (KO-SOLE), or an observed
-/// typed-getter return — carry semantic authority in every lowering, so
-/// profile/trace attribute mechanism ids without --manifest. The
+/// provider's own "PKCS 11" static data names this table), the
+/// sole-complete-table leg (KO-SOLE), a typed-getter export with full
+/// per-ordinal export agreement, or an observed typed-getter return —
+/// carry semantic authority in every lowering, so profile/trace
+/// attribute mechanism ids without --manifest. A stale manifest's
+/// fallback proof lends names only, never semantics (controller
+/// 2026-11-12 05:25). The
 /// live-return leg runs in every lowering: the subset takes any
 /// core-passing return (heap-first tables), while the main plan only
 /// takes a return that confirms the provider's own exports per-ordinal.
@@ -5948,8 +5951,16 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // agreement (the table reached through the provider's own
         // exports), or an observed typed-getter return (the main plan
         // additionally requires per-ordinal export confirmation; the
-        // subset takes heap-first returns). Manifest corroboration is
-        // confirmed authority, not standard-layout.
+        // subset takes heap-first returns). A stale manifest's
+        // fallback proof (`manifest_supported`, the only source of
+        // `score.manifest` here — every caller passes empty manifest
+        // offsets) lends NAME authority so the proof completes in the
+        // plan, but never semantic authority: the stale manifest's
+        // entries are outdated by definition, so no slot may be
+        // authorized because of them (controller ruling 2026-11-12
+        // 05:25). A replacement that proves the standard layout from
+        // its OWN scan evidence keeps exactly the authority it would
+        // have with no manifest at all.
         // Unknown or vendor-shifted tables stay count-only: no
         // argument is ever read through an unproven slot.
         // Every leg is gated once by the clause-1 core
@@ -5969,28 +5980,27 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         let scan_finished = scanned.tables_scan_finished;
         let sole_proven = sole_complete_table_authorized(module, index, &exports, true);
         let getter_proven = getter_export_authorized(module, index, &exports, &score, true);
-        let standard_layout_evidence =
-            if !authorized || score.manifest || !standard_layout_core(module, index) {
-                None
-            } else if score.linked {
-                Some("interface linkage")
-            } else if scan_finished && sole_proven {
-                Some("sole complete table")
-            } else if scan_finished && getter_proven {
-                Some("typed getter export")
-            } else if score.live_return && (scan_authorized || score.exports) {
-                // The subset takes any core-passing return (heap-first
-                // tables); the main plan only takes a return that
-                // confirms the provider's own exports per-ordinal — the
-                // observed table a caller reaches. Denying a confirming
-                // return after the scan legs granted churns the capture
-                // through a detach+reattach static episode, while a
-                // non-confirming (heap-novel, forged-name) return keeps
-                // no layout proof and stays count-only.
-                Some("typed getter return")
-            } else {
-                None
-            };
+        let standard_layout_evidence = if !authorized || !standard_layout_core(module, index) {
+            None
+        } else if score.linked {
+            Some("interface linkage")
+        } else if scan_finished && sole_proven {
+            Some("sole complete table")
+        } else if scan_finished && getter_proven {
+            Some("typed getter export")
+        } else if score.live_return && (scan_authorized || score.exports) {
+            // The subset takes any core-passing return (heap-first
+            // tables); the main plan only takes a return that
+            // confirms the provider's own exports per-ordinal — the
+            // observed table a caller reaches. Denying a confirming
+            // return after the scan legs granted churns the capture
+            // through a detach+reattach static episode, while a
+            // non-confirming (heap-novel, forged-name) return keeps
+            // no layout proof and stays count-only.
+            Some("typed getter return")
+        } else {
+            None
+        };
         // Re-proof, not a grant: no leg granted, the scan is unfinished,
         // and a static leg would grant this same table on a finished
         // scan. `extend_exact_prepared` may carry a verified basis across
@@ -5998,7 +6008,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // tables fail the assumed-finished legs and stay refused.
         let reproven_unfinished =
             standard_layout_evidence.is_none() && !scan_finished && (sole_proven || getter_proven);
-        let scan_semantic = authorized && (score.manifest || standard_layout_evidence.is_some());
+        let scan_semantic = authorized && standard_layout_evidence.is_some();
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -8755,6 +8765,63 @@ mod tests {
             state.mechanisms().get(&0x101).map(|stat| stat.calls),
             Some(1),
             "mechanism id from a standard-layout slot is attributed without a manifest"
+        );
+    }
+
+    #[test]
+    fn stale_supported_sole_complete_table_keeps_own_layout_evidence() {
+        // Controller ruling 2026-11-12 05:25, clause 1: a stale
+        // manifest must not make a verified standard-layout
+        // replacement WORSE than having no manifest at all. The
+        // fallback proof (`manifest_supported`) lends names; the
+        // semantic authority comes from the replacement's OWN sole
+        // leg, with the layout basis recorded — never confirmed.
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].manifest_supported = true;
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a sole-complete replacement keeps its own authority under a stale manifest"
+        );
+        assert_eq!(
+            plan.standard_layout_evidence(),
+            ["sole complete table"],
+            "the basis is the replacement's own layout leg, not the stale manifest"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| plan.is_standard_layout_slot(slot.index)),
+            "stale-supported layout slots stay membership-gated, never confirmed"
+        );
+    }
+
+    #[test]
+    fn stale_supported_nonstandard_table_stays_count_only() {
+        // Controller ruling 2026-11-12 05:25, clause 2: the stale
+        // manifest itself grants NOTHING. A 67-slot replacement
+        // (non-standard count, no layout leg of its own) keeps its
+        // fallback lent names but stays count-only.
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].manifest_supported = true;
+        module.scanned.tables[0].entries.pop();
+        module.entry_objects[0].pop();
+        assert_eq!(module.scanned.tables[0].decoded_slot_count(), 67);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 67);
+        assert!(
+            plan.slots.iter().all(|slot| !slot.semantic_authorized
+                && slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+            "a stale-supported table with no layout leg of its own stays count-only"
+        );
+        assert!(
+            plan.slots.iter().all(|slot| slot.names != ["unknown"]),
+            "the stale fallback still lends names so the proof completes"
+        );
+        assert!(
+            plan.standard_layout_evidence().is_empty(),
+            "no layout basis is recorded for a stale-only table"
         );
     }
 

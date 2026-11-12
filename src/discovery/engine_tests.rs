@@ -36507,6 +36507,62 @@ fn discovery_open_stale_manifest_object_uses_only_the_exact_scanned_replacement(
 }
 
 #[test]
+fn discovery_open_stale_manifest_object_ignores_diverging_manifest_entries() {
+    // Controller ruling 2026-11-12 05:25, clause 2: the stale
+    // manifest's entries are never used. Every manifest entry
+    // diverges from the scanned table (a valid executable offset,
+    // but not a scanned one); the fallback still proves by
+    // names/version, the slot lands on the exact scanned target and
+    // stays count-only.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = dir.path().join("provider.so");
+    std::fs::copy("/bin/sh", &provider).unwrap();
+    let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+    let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+    let scan_offset = inspected.executable_ranges[0].0;
+    let divergent = inspected
+        .executable_ranges
+        .iter()
+        .find_map(|(start, end)| {
+            (*start..*end)
+                .step_by(8)
+                .find(|offset| *offset != scan_offset)
+        })
+        .expect("the fixture has a second executable offset");
+    let paths = vec![provider.clone()];
+    let targets = vec![0; 67];
+    let mut manifest = valid_manifest_for(&paths, &targets);
+    for function in &mut manifest.surfaces[0].functions {
+        let Resolution::Resolved { file_offset, .. } = &mut function.resolution else {
+            unreachable!()
+        };
+        *file_offset = divergent;
+    }
+    let scan = scanned_manifest_replacement(&paths, &targets);
+    assert_eq!(scan.tables[0].entries[0].file_offset, scan_offset);
+    let scan_pins = pin_scan(&scan);
+    std::fs::remove_file(&provider).unwrap();
+    let input = manifest_input_from_pinning("open-stale-divergent.json", manifest);
+    assert_eq!(input.stale[0].reason, ManifestStaleReason::OpenStale);
+
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
+
+    assert_eq!(discovered.plan.modules[0].source, "scan");
+    assert_eq!(discovered.plan.slots.len(), 1);
+    assert_eq!(discovered.plan.slots[0].file_offset, scan_offset);
+    assert!(
+        !discovered.plan.slots[0].semantic_authorized,
+        "diverging stale entries grant no semantic authority"
+    );
+    assert_eq!(
+        discovered.plan.slots[0].semantics,
+        p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+    );
+    assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
+}
+
+#[test]
 fn discovery_identity_stale_object_with_invalid_offset_is_skipped_before_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let provider = dir.path().join("provider.so");

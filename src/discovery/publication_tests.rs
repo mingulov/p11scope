@@ -1269,9 +1269,11 @@ fn assert_costing(engine: &Engine, wall: std::time::Duration, label: &str) {
 }
 
 /// Count-only treatment: pure live/heuristic publication evidence never
-/// authorizes semantics on its own in the main plan. Manifest
+/// authorizes semantics on its own in the main plan. Fresh-manifest
 /// corroboration, exact interface linkage and sole-complete tables do
-/// (owner 2026-11-11); tests with those use their own assertions.
+/// (owner 2026-11-11); a stale manifest's fallback proof lends names
+/// only (controller 2026-11-12 05:25). Tests with those use their own
+/// assertions.
 fn assert_count_only(engine: &Engine) {
     assert!(
         engine
@@ -3152,13 +3154,17 @@ fn legacy_static_table_scan_manifest_and_live() {
         assert_ne!(slot.names[0], "unknown", "manifest authorizes names");
     }
     assert_eq!(engine_b.counters.manifest_fallbacks.len(), 1);
-    // Owner 2026-11-11: the manifest-bound ls table carries authority
-    // via corroboration; the heuristic sidecar stays count-only.
+    // Controller ruling 2026-11-12 05:25: the stale manifest lends
+    // the bound table names only, never semantics. The five-table
+    // closure passes no layout leg on its own (sole/getter legs
+    // need exactly one static table; no linkage or export
+    // agreement), so the ls slots stay count-only with the
+    // heuristic sidecar.
     for slot in engine_b.plan().slots.iter() {
         if slot.object_path.ends_with("ls/provider.so") {
             assert!(
-                slot.semantic_authorized && slot.descriptor_index != 0,
-                "manifest-bound ls slot carries authority: {slot:?}"
+                !slot.semantic_authorized && slot.descriptor_index == 0,
+                "stale-bound ls slot stays count-only: {slot:?}"
             );
         } else {
             assert!(

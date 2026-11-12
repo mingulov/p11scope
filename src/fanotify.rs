@@ -2512,8 +2512,7 @@ mod tests {
         })
         .expect("the probed file reopens through its own descriptor, not the swapped pathname");
         assert!(
-            std::fs::metadata(&file)
-                .is_ok_and(|meta| meta.file_type().is_char_device()),
+            std::fs::metadata(&file).is_ok_and(|meta| meta.file_type().is_char_device()),
             "the fixture swapped the pathname onto a live device"
         );
         // SAFETY: fstat on our own held descriptor into a zeroed stat.

@@ -40564,6 +40564,70 @@ fn under_cap_order_unchanged() {
     assert_eq!(select_deep_scan_candidates(&sweep, 256), vec![7, 9001]);
 }
 
+/// View-collapse fix1 (RED): over the cap, unselected processes sharing
+/// an examined exact `.so`-set count as shape-covered; unique shapes
+/// past truncation and unmapped individuals do not. Three shapes over
+/// a 2-cap: the two survivors share one shape, the third shape is
+/// truncated. Kernel-thread exclusions never count.
+#[test]
+fn deep_scan_shape_covered_counts_same_shape_sharing() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // Collapse with full coverage: A=[10], B=[20,21,22]; cap 2 selects
+    // [10,20], leaving [21,22] sharing B with the examined 20.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/rare-p11.so", 1)]),
+        (20, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (21, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (22, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+    ];
+    let selected = select_deep_scan_candidates(&sweep, 2);
+    assert_eq!(selected, vec![10, 20]);
+    let excluded = BTreeSet::new();
+    assert_eq!(
+        deep_scan_shape_covered(&sweep, &selected, &excluded),
+        2,
+        "21,22 share B with examined 20"
+    );
+    // Truncation: three singleton shapes over a 2-cap; the third shape
+    // has no examined representative.
+    let truncated: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![map_entry("/tmp/b.so", 2)]),
+        (30, vec![map_entry("/tmp/c.so", 3)]),
+    ];
+    let selected = select_deep_scan_candidates(&truncated, 2);
+    assert_eq!(selected, vec![10, 20]);
+    assert_eq!(
+        deep_scan_shape_covered(&truncated, &selected, &excluded),
+        0,
+        "30's unique shape was never examined"
+    );
+    // Unmapped individuals never count as shape-covered, even when
+    // unselected past the cap.
+    let unmapped: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![]),
+        (21, vec![]),
+    ];
+    let selected = select_deep_scan_candidates(&unmapped, 2);
+    assert_eq!(selected, vec![10, 20]);
+    assert_eq!(
+        deep_scan_shape_covered(&unmapped, &selected, &excluded),
+        0,
+        "empty keys share no examination"
+    );
+}
+
 /// Task 3 (F3) helpers: the same C-fixture bodies as `tests/system_scope.rs`
 /// (`build_fixture`, `build_driver`, `spawn_loaded`), duplicated here
 /// because a `--lib` unit test cannot import `tests/support`. Two owned

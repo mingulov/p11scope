@@ -723,6 +723,30 @@ pub struct DiscoveryEvidence {
     /// live engine state on every `capture_facts()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_sizing: Option<crate::capacity::SlotSizing>,
+    /// Deep-scan selection over the cap (view-collapse fix1): the
+    /// initial discovery pass's counted gap. `None` under the cap, so
+    /// under-cap documents are byte-identical. Counts only, no
+    /// identities: user processes seen (kernel threads excluded),
+    /// deep-scanned views retained, unselected processes sharing an
+    /// examined shape, and the configured scan cap. Stamped from live
+    /// engine state on every `capture_facts()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_scan_selection: Option<DeepScanSelection>,
+}
+
+/// Deep-scan selection counts over the cap: what the initial pass
+/// examined and what it left to same-shape sharing. All four are
+/// counts from the already-observed sweep, never new reads.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct DeepScanSelection {
+    /// User processes in scope at discovery (kernel threads excluded).
+    pub processes: u64,
+    /// Processes deep-scanned (retained views).
+    pub deep_scanned: u64,
+    /// Unselected processes sharing an examined same-shape view.
+    pub shape_covered: u64,
+    /// Configured deep-scan cap (`--max-scan-pids`, default 256).
+    pub scan_cap: u64,
 }
 
 /// 6.14 Option A exit-time split of the novel unmatched-exit
@@ -879,6 +903,7 @@ impl Default for DiscoveryEvidence {
             unmatched_forwarding: Vec::new(),
             gap_exit_mappings: None,
             slot_sizing: None,
+            deep_scan_selection: None,
         }
     }
 }
@@ -1849,6 +1874,7 @@ const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was
 const MANIFEST_OBJECT_UNAVAILABLE: &str = "manifest object unavailable";
 const PREARM_OBJECT_UNAVAILABLE: &str = "prearm object unavailable";
 const DISCOVERY_TRANSPORT_UNAVAILABLE: &str = "discovery transport unavailable";
+const DEEP_SCAN_SELECTION_CAPPED: &str = "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers";
 
 /// The engine's view-capacity sentence with its configured limit value
 /// still in place: exact prefix, ASCII digits, exact suffix, whole string
@@ -1867,11 +1893,98 @@ fn is_view_capacity_exhaustion(reason: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Split leading ASCII digits: `Some((digits, rest))` when non-empty,
+/// else `None`. A path can never satisfy the digit prefix, so the
+/// values that normalize out are counts alone, never target data.
+fn split_leading_digits(text: &str) -> Option<(&str, &str)> {
+    let end = text.bytes().take_while(u8::is_ascii_digit).count();
+    if end == 0 {
+        return None;
+    }
+    Some((&text[..end], &text[end..]))
+}
+
+/// The engine's three scan-cap sentences with their count values still
+/// in place: initial discovery, live selection, and live deferral.
+/// Each is exact fixed wording plus ASCII-digit counts, whole string
+/// consumed. Anything appended, prepended or non-numeric fails.
+fn is_scan_cap_selection(reason: &str) -> bool {
+    // All three open with "{total} processes in scope; ".
+    let Some((_, rest)) = split_leading_digits(reason) else {
+        return false;
+    };
+    let rest = match rest.strip_prefix(" processes in scope; ") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    // Initial: "discovery selected {selected} for deep scanning by
+    // provider rarity (limit {cap}); unselected processes may contain
+    // undiscovered providers".
+    if let Some(rest) = rest.strip_prefix("discovery selected ") {
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        let rest = match rest.strip_prefix(" for deep scanning by provider rarity (limit ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        return rest == "); unselected processes may contain undiscovered providers";
+    }
+    // Live: "live discovery selected {selected} new candidate(s) for
+    // deep scanning by provider rarity (limit {cap})".
+    if let Some(rest) = rest.strip_prefix("live discovery selected ") {
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        let rest = match rest.strip_prefix(" new candidate") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        // Singular "candidate" or plural "candidates"; both are engine
+        // forms (1 vs otherwise). Either suffix is fixed wording.
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        let rest = match rest.strip_prefix(" for deep scanning by provider rarity (limit ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        return rest == ")";
+    }
+    // Deferred: "live discovery deferred {deferred} unscanned processes
+    // to the periodic reconciliation sweep (limit {cap})".
+    if let Some(rest) = rest.strip_prefix("live discovery deferred ") {
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        let rest = match rest
+            .strip_prefix(" unscanned processes to the periodic reconciliation sweep (limit ")
+        {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let Some((_, rest)) = split_leading_digits(rest) else {
+            return false;
+        };
+        return rest == ")";
+    }
+    false
+}
+
 /// Closed allowlist of fixed product-limit skips (OD34/E1): the user must
 /// read WHICH limit was hit. Each entry matches an exact internal
 /// (subject, reason) pair whose text is fixed product wording with no
 /// target-derived data (no path, pid, name or bytes) and maps it to its
 /// finite public reason. Everything else keeps today's redaction.
+/// The scan-cap entry matches by reason shape alone: its subjects are
+/// scope labels (`system`, a cgroup path, `pid N`), and the public
+/// name is always the generic discovery subject, so no subject text
+/// leaks. The reason template carries only digit counts plus fixed
+/// wording; the counts normalize out to the finite sentence.
 fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     if subject == "process view" && is_view_capacity_exhaustion(reason) {
         return Some(PROCESS_VIEW_CAPACITY_EXHAUSTED);
@@ -1886,6 +1999,9 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     }
     if subject == "post-arm provider discovery" && reason == LOADER_ARM_LEDGER_FULL {
         return Some(LOADER_ARM_LEDGER_FULL);
+    }
+    if is_scan_cap_selection(reason) {
+        return Some(DEEP_SCAN_SELECTION_CAPPED);
     }
     None
 }
@@ -4226,6 +4342,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 // raw skip text, so no target data can reach this line.
                 for reason in [
                     PROCESS_VIEW_CAPACITY_EXHAUSTED,
+                    DEEP_SCAN_SELECTION_CAPPED,
                     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
@@ -4245,6 +4362,20 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     if hits > 0 {
                         fragments.push(tag(format!("{reason}: {hits}")));
                     }
+                }
+                // Deep-scan selection over the cap: the counted gap. User
+                // processes only (kernel threads excluded); the same
+                // counts ride in `evidence.deep_scan_selection`.
+                if let Some(selection) = ev.discovery.deep_scan_selection {
+                    let noun = if selection.processes == 1 {
+                        "process"
+                    } else {
+                        "processes"
+                    };
+                    fragments.push(tag(format!(
+                        "discovery: {} {}, {} examined in detail (limit {} total); same-library processes share one examination",
+                        selection.processes, noun, selection.deep_scanned, selection.scan_cap
+                    )));
                 }
                 if verbose {
                     let items = skipped_item_list(ev);
@@ -15404,8 +15535,10 @@ pub(crate) mod tests {
 
     #[test]
     fn cap_skip_forces_partial_in_profile_and_metrics() {
-        // A scan-cap skip alone flips a clean evidence to PARTIAL, and the
-        // public record stays categorical: no pid, path, or count details.
+        // A scan-cap skip alone flips a clean evidence to PARTIAL. The
+        // public reason names the limit but stays count-free: no pid,
+        // path, or digits; the counts ride in
+        // `evidence.deep_scan_selection`, never in the reason.
         let mut ev = evidence();
         ev.skipped = vec![capture_skipped_out(&Skipped {
             subject: "system".into(),
@@ -15415,7 +15548,7 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
         let expected = serde_json::json!({
             "name": "discovery subject",
-            "reason": "discovery unavailable",
+            "reason": "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers",
         });
         let profile = profile_json(
             &reports_fixture(),
@@ -15429,6 +15562,14 @@ pub(crate) mod tests {
             !profile["evidence"]["skipped"][0]
                 .to_string()
                 .contains("processes in scope")
+        );
+        assert!(
+            !profile["evidence"]["skipped"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .bytes()
+                .any(|byte| byte.is_ascii_digit()),
+            "counts ride separately, never in the reason"
         );
         let metrics = json(&[], &ev, &capture_fixture());
         assert_eq!(metrics["evidence"]["completeness"], "PARTIAL");
@@ -17388,6 +17529,149 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
         assert!(text.contains("10 discovery steps unavailable"), "{text}");
+    }
+
+    /// View-collapse fix1 (RED): the deep-scan selection cap projects to
+    /// one finite named reason, not the generic redaction. The three
+    /// engine forms (initial, live, deferred) carry only digit counts
+    /// plus fixed wording; the public record keeps the finite sentence
+    /// and the counts ride in `evidence.deep_scan_selection`.
+    #[test]
+    fn scan_cap_selection_names_the_limit_with_a_finite_reason() {
+        use crate::discovery::scan::Skipped;
+        let finite = "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers";
+        for (subject, reason) in [
+            (
+                "system",
+                "358 processes in scope; discovery selected 234 for deep scanning by provider rarity (limit 256); unselected processes may contain undiscovered providers",
+            ),
+            (
+                "system",
+                "358 processes in scope; live discovery selected 5 new candidates for deep scanning by provider rarity (limit 256)",
+            ),
+            (
+                "system",
+                "358 processes in scope; live discovery selected 1 new candidate for deep scanning by provider rarity (limit 256)",
+            ),
+            (
+                "system",
+                "358 processes in scope; live discovery deferred 124 unscanned processes to the periodic reconciliation sweep (limit 256)",
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(projected.reason, finite, "{subject} {reason}");
+        }
+        // Anything carrying more (a path, a detail suffix, wrong shape)
+        // stays redacted — the allowlist is exact, never prefix.
+        for (subject, reason) in [
+            (
+                "system",
+                "358 processes in scope; discovery selected 234 for deep scanning by provider rarity (limit 256); unselected processes may contain undiscovered providers; extra /private/PATH_SUFFIX",
+            ),
+            (
+                "system",
+                "358 processes in scope; discovery selected many for deep scanning by provider rarity (limit 256); unselected processes may contain undiscovered providers",
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+    }
+
+    /// View-collapse fix1 (RED): over the cap the capture reports a
+    /// counted, named gap. JSON carries the four counts (user processes
+    /// seen, deep-scanned views, same-shape represented, cap); the
+    /// one-line text coverage names them plainly. Kernel threads are
+    /// not counted as processes.
+    #[test]
+    fn deep_scan_selection_reports_counted_gap_in_text_and_json() {
+        use crate::discovery::scan::Skipped;
+        let finite = "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers";
+        let internal = Skipped {
+            subject: "system".into(),
+            reason: "358 processes in scope; discovery selected 234 for deep scanning by provider rarity (limit 256); unselected processes may contain undiscovered providers".into(),
+        };
+        let mut ev = evidence();
+        ev.skipped = vec![capture_skipped_out(&internal)];
+        ev.discovery.deep_scan_selection = Some(DeepScanSelection {
+            processes: 358,
+            deep_scanned: 234,
+            shape_covered: 124,
+            scan_cap: 256,
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                document["evidence"]["skipped"],
+                serde_json::json!([{"name": "discovery subject", "reason": finite}])
+            );
+            assert_eq!(
+                document["evidence"]["deep_scan_selection"],
+                serde_json::json!({
+                    "processes": 358,
+                    "deep_scanned": 234,
+                    "shape_covered": 124,
+                    "scan_cap": 256,
+                })
+            );
+        }
+        let text = scope_summary("system", &reports_fixture(), &ev);
+        assert!(text.contains("1 discovery step unavailable"), "{text}");
+        assert!(text.contains(&format!("{finite}: 1")), "{text}");
+        let plain = "discovery: 358 processes, 234 examined in detail (limit 256 total); same-library processes share one examination";
+        assert!(text.contains(plain), "{text}");
+        let line = coverage_line(&ev, false);
+        assert!(line.contains(plain), "{line}");
+        let verbose = coverage_line(&ev, true);
+        assert!(verbose.contains(plain), "{verbose}");
+    }
+
+    /// View-collapse fix1 healthy twin: under the cap nothing changes.
+    /// No selection object, no discovery fragment, no new JSON key.
+    #[test]
+    fn deep_scan_selection_absent_keeps_output_unchanged() {
+        let mut ev = evidence();
+        assert!(ev.discovery.deep_scan_selection.is_none());
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert_eq!(coverage_line(&ev, false), "coverage: complete");
+        for document in [
+            profile_json(
+                &reports_fixture(),
+                VersionedEvidence::wrap(&ev),
+                &state_fixture(),
+                &capture_fixture(),
+            ),
+            json(&reports_fixture(), &ev, &capture_fixture()),
+        ] {
+            assert!(document["evidence"].get("deep_scan_selection").is_none());
+            assert_eq!(document["evidence"]["completeness"], "COMPLETE");
+        }
+        let text = scope_summary("system", &reports_fixture(), &ev);
+        assert!(!text.contains("examined in detail"), "{text}");
+        assert!(!text.contains("same-library processes"), "{text}");
     }
 
     /// With the compiled-in timing catalog empty (D3), debug-state discovery

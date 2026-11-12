@@ -181,6 +181,17 @@
         "discovery_truncated": {"type": "integer", "minimum": 0},
         "discovery_uncorroborated": {"type": "integer", "minimum": 0},
         "discovery_uncorroborated_candidates": {"type": "integer", "minimum": 0},
+        "deep_scan_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["processes", "deep_scanned", "shape_covered", "scan_cap"],
+          "properties": {
+            "processes": {"type": "integer", "minimum": 0},
+            "deep_scanned": {"type": "integer", "minimum": 0},
+            "shape_covered": {"type": "integer", "minimum": 0},
+            "scan_cap": {"type": "integer", "minimum": 0}
+          }
+        },
         "drain_proven": {"type": "boolean"},
         "stop_quiescence": {
           "type": "object",
@@ -568,6 +579,7 @@
                   "static probe coverage gap incomplete",
                   "static probes detached and exact pairs reattached",
                   "capture process-view capacity was exhausted; remaining generations were not scanned",
+                  "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers",
                   "loader context capacity 256 is exhausted",
                   "a deferred loader memory scan exceeded the bounded loader-context ledger",
                   "the bounded loader-arm catch-up ledger was full",

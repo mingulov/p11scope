@@ -534,6 +534,26 @@ wait for the mapping observation) is planned for a later release;
 a gate failure still
 counts.
 
+### System captures past 256 processes share one deep examination per library set
+
+A `profile`, `metrics` or `trace --system` (or `--cgroup`) capture on
+a host with more than 256 user processes deep-scans at most 256 of
+them, one view per exact `.so`-set in rarity order; processes with
+the same libraries share their representative's examination. A busy
+desktop (a few hundred processes) routinely crosses the cap. The
+capture stays `PARTIAL` and names what it did not examine: the
+coverage line reads `discovery: N processes, M examined in detail
+(limit 256 total); same-library processes share one examination`,
+and `evidence.deep_scan_selection` carries the four counts
+(`processes`, `deep_scanned`, `shape_covered`, `scan_cap`).
+`processes` counts user processes only — kernel threads never consume
+slots and are not counted. Calls through already-mapped providers
+still count (attach is process-wide); lost is per-process loader
+tracking for viewless processes and any provider mapped only past
+truncation (only when distinct shapes exceed 256). Raising the cap
+needs measurements and is not in this release; narrow the scope
+(`--pid`, `--cgroup`) or pass `--max-scan-pids` to cover more.
+
 ## Known limitations in 0.6.0
 
 The following limits apply to the v0.6.0 release. Rate, latency and

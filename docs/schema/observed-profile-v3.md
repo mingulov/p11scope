@@ -454,6 +454,22 @@ vocabulary below), and every learned row forces `PARTIAL` through the
 files its own row once and the capture continues with ordinary
 discovery only.
 
+`deep_scan_selection` is present if and only if the initial discovery
+pass ran over the deep-scan cap (`--max-scan-pids`, default 256);
+otherwise the key is absent, never null. The profile, metrics and
+terminal trace lanes all publish it there. It carries the counted gap
+as four u64 counts: `processes` (user processes in scope at
+discovery, kernel threads excluded), `deep_scanned` (retained
+deep-scanned views), `shape_covered` (unselected processes sharing an
+examined exact `.so`-set with one retained view), and `scan_cap`
+(the configured cap). `processes` is strictly above `scan_cap`;
+`deep_scanned` never exceeds the cap; `deep_scanned` plus
+`shape_covered` never exceeds `processes`. The remainder
+(`processes` minus both) held unique shapes past truncation, unmapped
+individuals, or unavailable snapshots — truly unexamined, never
+guessed. The object never feeds verdicts by itself; the paired
+finite skip below carries the `skipped` observation cause.
+
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
 tracking is not attached there. For cgroup scope it counts destination-
@@ -1022,6 +1038,19 @@ of:
 - `discovery transport unavailable`: one live discovery-ring dequeue failed
   after a prefix was already pulled. The prefix is applied, the failure is
   counted here, and the capture continues to the next tick.
+
+Deep-scan selection gaps file under the discovery subject with one
+finite reason (in addition to the v2 list and the three above).
+The record is `{name: "discovery subject", reason}` with `reason`
+exactly:
+
+- `discovery deep-scan selection was capped; unselected processes may
+  contain undiscovered providers`: the initial pass ran over the
+  deep-scan cap and selected a rarity-ordered subset for deep
+  scanning; same-shape processes share one examination. Live
+  reconciliation passes file the same row when they hit the cap.
+  The counts ride in `evidence.deep_scan_selection`, never in the
+  reason, which carries no digits.
 
 Run-tree scope gaps file under their own subject. Each record is
 `{name: "run process tree", reason}` with `reason` exactly one of:

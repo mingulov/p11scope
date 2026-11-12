@@ -927,6 +927,11 @@ pub struct Engine {
     /// rescans) — the E06 oracle alongside maps bytes, never derived from
     /// them.
     deep_scans: u64,
+    /// Initial deep-scan selection over the cap (view-collapse fix1):
+    /// the counted gap snapshot from `discover_plan`, stamped into
+    /// `DiscoveryEvidence` on every `capture_facts()`. `None` under
+    /// the cap, so under-cap documents are unchanged.
+    deep_scan_selection: Option<render::DeepScanSelection>,
     /// Loader-arm attempts driven by inventory (`arm_loader_or_partial`
     /// calls) — the hook half of the same oracle.
     loader_arms: u64,
@@ -6889,6 +6894,47 @@ pub(crate) fn select_deep_scan_candidates(
         .collect()
 }
 
+/// View-collapse fix1: counts unselected eligible pids whose exact
+/// `.so`-set matches an examined representative's set — the collapsed
+/// processes file discovery still covers through one view per shape.
+/// Empty keys (unmapped individuals, unavailable snapshots) never
+/// count: each needs its own slot. Kernel-thread exclusions never
+/// count either. Pure over the phase-1 sweep, so the selection twin
+/// pins it without `/proc`.
+pub(crate) fn deep_scan_shape_covered(
+    sweep: &[(u32, Vec<MapEntry>)],
+    selected: &[u32],
+    excluded: &BTreeSet<u32>,
+) -> usize {
+    let selected_set: BTreeSet<u32> = selected.iter().copied().collect();
+    let mut examined: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
+    for (pid, entries) in sweep {
+        if !selected_set.contains(pid) {
+            continue;
+        }
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if !key.is_empty() {
+            examined.insert(key);
+        }
+    }
+    sweep
+        .iter()
+        .filter(|(pid, _)| !selected_set.contains(pid) && !excluded.contains(pid))
+        .filter(|(_, entries)| {
+            let key: BTreeSet<ObjectKey> = entries
+                .iter()
+                .filter(|entry| is_provider_mapping(entry))
+                .map(ObjectKey::of)
+                .collect();
+            !key.is_empty() && examined.contains(&key)
+        })
+        .count()
+}
+
 /// Pids in `sweep` that are kernel threads with no user address space, to
 /// be excluded before the deep-scan cap is applied: a successfully-read
 /// but empty maps snapshot (never an unavailable one) plus the
@@ -7405,50 +7451,65 @@ fn discover_plan(
     // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
     // deep-scans the selected candidates only. Under the cap selection is
     // the identity, so the sweep (and its budget charge) is skipped there.
-    let selected = if pids.len() > max_scan_pids {
-        let sweep_start = crate::attach::monotonic_ns();
-        let (sweep, sweep_unavailable, unavailable) =
-            sweep_process_maps(&pids, &mut discovered.budget).into_selection_with_unavailable();
-        discovered.stage_timings.span(
-            crate::timing::StageKind::Scan,
-            "sweep_process_maps",
-            sweep_start,
-            crate::attach::monotonic_ns(),
-        );
-        if let Some(skipped) = unavailable {
+    // Over the cap the sweep is kept for the counted gap below: user
+    // processes only (kernel threads excluded), with same-shape sharing
+    // counted from the retained views after the scans.
+    let (selected, over_cap_sweep): (Vec<u32>, Option<(SweepSnapshots, BTreeSet<u32>)>) =
+        if pids.len() > max_scan_pids {
+            let sweep_start = crate::attach::monotonic_ns();
+            let (sweep, sweep_unavailable, unavailable) =
+                sweep_process_maps(&pids, &mut discovered.budget).into_selection_with_unavailable();
+            discovered.stage_timings.span(
+                crate::timing::StageKind::Scan,
+                "sweep_process_maps",
+                sweep_start,
+                crate::attach::monotonic_ns(),
+            );
+            if let Some(skipped) = unavailable {
+                attribution::note(&skipped);
+                discovered.base_counters.object_skips.push(skipped);
+            }
+            let select_start = crate::attach::monotonic_ns();
+            let selected = select_excluding_kernel_threads(
+                &sweep,
+                &sweep_unavailable,
+                Path::new("/proc"),
+                max_scan_pids,
+                &mut discovered.budget,
+                // Capture refresh keeps its own scheduler; no cross-pass set.
+                &BTreeSet::new(),
+            );
+            discovered.stage_timings.span(
+                crate::timing::StageKind::Scan,
+                "select_deep_scan_candidates",
+                select_start,
+                crate::attach::monotonic_ns(),
+            );
+            // Recomputed for counts only (no double budget note): the
+            // selection above already counted these on the budget.
+            let excluded = kernel_thread_exclusions(&sweep, &sweep_unavailable, Path::new("/proc"));
+            let context = Some((sweep, excluded));
+            (selected, context)
+        } else {
+            (pids.clone(), None)
+        };
+    if let Some((sweep, excluded)) = &over_cap_sweep {
+        // User processes only: kernel threads never consume slots and
+        // never call providers, so a kthread-only overage (total past
+        // the cap, eligible within it) files no gap — every user
+        // process was selected.
+        let eligible = sweep.len().saturating_sub(excluded.len());
+        if eligible > max_scan_pids {
+            // Published, not just noted: a provider mapped only by a process past the
+            // cap is undiscovered, unprobed, and has nothing else to show for it.
+            // Formed after selection so the counts describe the actual set.
+            let skipped = Skipped {
+                subject: scope_label(scope),
+                reason: scan_cap_reason(eligible, selected.len(), max_scan_pids, false),
+            };
             attribution::note(&skipped);
             discovered.base_counters.object_skips.push(skipped);
         }
-        let select_start = crate::attach::monotonic_ns();
-        let selected = select_excluding_kernel_threads(
-            &sweep,
-            &sweep_unavailable,
-            Path::new("/proc"),
-            max_scan_pids,
-            &mut discovered.budget,
-            // Capture refresh keeps its own scheduler; no cross-pass set.
-            &BTreeSet::new(),
-        );
-        discovered.stage_timings.span(
-            crate::timing::StageKind::Scan,
-            "select_deep_scan_candidates",
-            select_start,
-            crate::attach::monotonic_ns(),
-        );
-        selected
-    } else {
-        pids.clone()
-    };
-    if pids.len() > max_scan_pids {
-        // Published, not just noted: a provider mapped only by a process past the
-        // cap is undiscovered, unprobed, and has nothing else to show for it.
-        // Formed after selection so the counts describe the actual set.
-        let skipped = Skipped {
-            subject: scope_label(scope),
-            reason: scan_cap_reason(pids.len(), selected.len(), max_scan_pids, false),
-        };
-        attribution::note(&skipped);
-        discovered.base_counters.object_skips.push(skipped);
     }
     for pid in selected.iter() {
         let opened = if named {
@@ -7589,6 +7650,26 @@ fn discover_plan(
                     discovered.base_counters.object_skips.push(skipped);
                 }
             }
+        }
+    }
+
+    // View-collapse fix1: the counted gap snapshot. User processes only;
+    // deep-scanned counts retained views (failed scans file their own
+    // gaps beside this one), and shape sharing counts unselected
+    // processes whose exact `.so`-set matches a retained view. `None`
+    // under the cap, so under-cap documents are unchanged.
+    if let Some((sweep, excluded)) = over_cap_sweep {
+        let eligible = sweep.len().saturating_sub(excluded.len());
+        if eligible > max_scan_pids {
+            let views_pids: Vec<u32> = discovered.views.iter().map(|view| view.pid()).collect();
+            let deep_scanned = discovered.views.len();
+            let shape_covered = deep_scan_shape_covered(&sweep, &views_pids, &excluded);
+            discovered.deep_scan_selection = Some(render::DeepScanSelection {
+                processes: eligible as u64,
+                deep_scanned: deep_scanned as u64,
+                shape_covered: shape_covered as u64,
+                scan_cap: max_scan_pids as u64,
+            });
         }
     }
 
@@ -11649,6 +11730,7 @@ impl Engine {
             counter_hint: false,
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
+            deep_scan_selection: None,
             loader_arms: 0,
             initial_arming_pending: false,
             inventory_passes: 0,
@@ -12834,6 +12916,10 @@ impl Engine {
         // only when the budget trimmed the compiled ceiling, absent
         // otherwise, and never wiped by a live re-projection.
         discovery.slot_sizing = self.slot_sizing.filter(|sizing| sizing.downsized());
+        // View-collapse fix1: the initial deep-scan selection snapshot
+        // rides every read the same way, so a live re-projection never
+        // wipes the counted gap.
+        discovery.deep_scan_selection = self.deep_scan_selection;
         render::CaptureFacts {
             discovery,
             table_entries: self.plan.entries_seen,

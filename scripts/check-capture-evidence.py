@@ -636,6 +636,15 @@ LOADER_SCAN_LEDGER_EXCEEDED = (
     "a deferred loader memory scan exceeded the bounded loader-context ledger"
 )
 LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
+# View-collapse fix1: the deep-scan selection cap names its limit with one
+# finite sentence (render.rs `capture_skipped_out` scan-cap arm). The three
+# engine forms (initial, live, deferred) carry only digit counts plus fixed
+# wording; the counts normalize out here and ride in
+# `evidence.deep_scan_selection`, never in the reason.
+DEEP_SCAN_SELECTION_CAPPED = (
+    "discovery deep-scan selection was capped; "
+    "unselected processes may contain undiscovered providers"
+)
 # Never-stop (2026-11-05): per-object manifest/pre-arm skips and live
 # discovery transport failures project to these finite reasons.
 MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
@@ -791,6 +800,7 @@ DISCOVERY_REASONS = {
     "static probe coverage gap incomplete",
     "static probes detached and exact pairs reattached",
     PROCESS_VIEW_CAPACITY_EXHAUSTED,
+    DEEP_SCAN_SELECTION_CAPPED,
     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
     LOADER_SCAN_LEDGER_EXCEEDED,
     LOADER_ARM_LEDGER_FULL,
@@ -823,6 +833,15 @@ SHARED_SCOPE_RESERVE = max(MAX_SLOTS * 25 // 100, 104)
 SLOT_SIZING_KEYS = {
     "requested_slots", "effective_slots", "possible_cpus",
     "mem_total_bytes", "budget_bytes", "stats_bytes",
+}
+# View-collapse fix1: the initial deep-scan selection counted gap
+# (`evidence.deep_scan_selection`, render.rs `DeepScanSelection`).
+# Present only over the cap; absent, never null, under it. Counts
+# only: user processes seen (kernel threads excluded), retained
+# deep-scanned views, unselected same-shape-covered processes, and
+# the configured scan cap.
+DEEP_SCAN_SELECTION_KEYS = {
+    "processes", "deep_scanned", "shape_covered", "scan_cap",
 }
 SLOT_STATS_BYTES = 296
 SLOT_SIZING_RV_ENTRIES = 8192
@@ -1292,6 +1311,14 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and "slot_sizing" in evidence:
         wanted.add("slot_sizing")
         exact_slot_sizing(evidence["slot_sizing"])
+    # View-collapse fix1: the initial deep-scan selection counted gap
+    # (schema v3 `deep_scan_selection`): additive in every current lane
+    # that renders it — profile, metrics, owned-run and terminal trace
+    # evidence all flow through here — while retained v2-metrics
+    # documents predate it.
+    if not historical and "deep_scan_selection" in evidence:
+        wanted.add("deep_scan_selection")
+        exact_deep_scan_selection(evidence["deep_scan_selection"])
     # The refused-pause annotation, additive in every lane that renders
     # it (owned runs only in practice; the key stays absent elsewhere).
     if not historical and "pause_refused" in evidence:
@@ -1493,6 +1520,36 @@ def exact_slot_sizing(sizing):
     require(
         stats <= budget or effective == MIN_SIZED_SLOTS,
         f"slot_sizing over-budget cost above the floor: {sizing!r}",
+    )
+
+
+def exact_deep_scan_selection(selection):
+    """The additive deep-scan selection counted gap (schema v3
+    `deep_scan_selection`): closed four-count shape plus the producer's
+    over-cap relationship. Present only over the cap, so the user
+    process count sits strictly above the configured cap; the
+    deep-scanned and shape-covered counts partition the examined and
+    shared subsets below it. Counts only, never identities; it never
+    feeds verdicts by itself — the paired finite skip carries the
+    `skipped` cause."""
+    exact_keys(selection, DEEP_SCAN_SELECTION_KEYS, "deep_scan_selection")
+    processes = selection["processes"]
+    deep_scanned = selection["deep_scanned"]
+    shape_covered = selection["shape_covered"]
+    scan_cap = selection["scan_cap"]
+    for key in DEEP_SCAN_SELECTION_KEYS:
+        require(u64(selection[key]), f"invalid deep_scan_selection.{key}: {selection!r}")
+    require(
+        processes > scan_cap,
+        f"an under-cap deep_scan_selection object must be omitted: {selection!r}",
+    )
+    require(
+        deep_scanned <= scan_cap,
+        f"deep_scan_selection deep_scanned exceeds its cap: {selection!r}",
+    )
+    require(
+        deep_scanned + shape_covered <= processes,
+        f"deep_scan_selection counts exceed its processes: {selection!r}",
     )
 
 

@@ -1942,6 +1942,43 @@ mod tests {
         assert!(next.is_empty(), "the dead overmount is not retained");
     }
 
+    /// An unchanged shadowed mount stays covered after the capability
+    /// shed: both passes resolve `/usr/lib` (snapshot 39) to the
+    /// already-marked `/usr` (51), so the post-shed re-mark failure
+    /// files no gap. Reproduces the codex rv2 F1 probe
+    /// `review_persistent_shadow_after_capability_shed`.
+    #[test]
+    fn learn_unchanged_shadow_after_capability_shed_stays_covered() {
+        let covered = std::collections::BTreeSet::new();
+        let visible = vec![
+            visible_mount("/usr", 51, 0, 42),
+            visible_mount("/usr/lib", 39, 0, 30),
+        ];
+        // Startup: both paths resolve to the shadowing mount 51 and
+        // both marks succeed.
+        let (next, uncovered) =
+            super::evaluate_mark_coverage(&covered, &visible, |_| Some(mnt(51, 0, 42)));
+        assert_eq!(uncovered, 0, "startup marks cover the shadowed path");
+        assert_eq!(
+            next,
+            [mnt(51, 0, 42)].into_iter().collect(),
+            "only the actually-marked mount is retained"
+        );
+        // Unchanged topology after the shed: the retained mount's
+        // re-mark is skipped, the shadowed mount's re-mark fails,
+        // but the path still resolves to the marked 51.
+        let (next, uncovered) = super::evaluate_mark_coverage(&next, &visible, |_| None);
+        assert_eq!(
+            uncovered, 0,
+            "unchanged shadow resolving to a marked mount stays covered"
+        );
+        assert_eq!(
+            next,
+            [mnt(51, 0, 42)].into_iter().collect(),
+            "the marked mount stays retained, never the shadowed entry"
+        );
+    }
+
     /// A mixed pass counts exactly the failed marks: a direct hit, a
     /// shadowing-mount hit and a failure leave one gap, and the
     /// retained set holds both marked mounts.

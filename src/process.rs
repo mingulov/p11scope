@@ -2658,18 +2658,21 @@ int main(int argc, char **argv) {
     }
 
     /// The single-read stat helper returns the same content
-    /// `read_to_string` would: same comm, same state, same starttime
-    /// (compared field-wise — fault and rss counters move between any
-    /// two live reads). A missing pid stays `NotFound` so exit
-    /// detection keeps working.
+    /// `read_to_string` would: same comm, same starttime (compared
+    /// field-wise — the scheduler state and the fault/rss counters
+    /// move between any two live reads, so they are not compared; CI
+    /// observed `R` vs `S` across the two reads). A missing pid stays
+    /// `NotFound` so exit detection keeps working.
     #[test]
     fn single_read_stat_matches_read_to_string() {
-        fn stable(stat: &str) -> (String, String, String) {
+        fn stable(stat: &str) -> (String, String) {
             let comm_end = stat.rfind(')').unwrap();
             let mut tail = stat[comm_end + 1..].split_whitespace();
+            // The live scheduler word is read (so the starttime index
+            // below stays put) but never compared.
+            let _state = tail.next().unwrap();
             (
                 stat[..=comm_end].to_string(),
-                tail.next().unwrap().to_string(),
                 tail.nth(18).unwrap().to_string(),
             )
         }

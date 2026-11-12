@@ -4189,9 +4189,18 @@ fn object_journal_exec_birth_present_in_journal_object() {
 /// (never-active guest: unstamped entry + `COVERAGE_DISABLED`). Ring loss
 /// stays `OutputFailed`-only. Whitespace/comment-insensitive; the caller
 /// supplies the arm body plus its end marker (`let tail =` for the two
-/// `main.rs` copies, `let Some(reason)` for the journal copy).
+/// `main.rs` copies, `let Some(reason)` for the journal copy). Accepts both
+/// refused shapes: `if !joined {` (main.rs) and
+/// `if !unsafe { continuity_joins(..) } {` (journal_roots.rs).
 fn refused_unmatched_is_retirement_aware(body: &str, end_marker: &str) -> bool {
-    let Some((_, refused)) = body.split_once("if !joined {") else {
+    let refused = if let Some((_, refused)) = body.split_once("if !joined {") {
+        refused
+    } else if let Some((_, after_pred)) = body.split_once("if !unsafe { continuity_joins") {
+        let Some((_, refused)) = after_pred.split_once("} {") else {
+            return false;
+        };
+        refused
+    } else {
         return false;
     };
     let Some((refused, _)) = refused.split_once(end_marker) else {
@@ -4254,10 +4263,10 @@ fn check_refused_retirement_composition(tag: &str) {
         "{tag}: never-active unstamped predicate stays silent"
     );
 
-    let final_unmatched =
-        |bump: bool, outcome: RefusedBaseOutcome| bump || outcome == RefusedBaseOutcome::RetirementFailed;
-    let final_ring_loss =
-        |outcome: RefusedBaseOutcome| outcome == RefusedBaseOutcome::OutputFailed;
+    let final_unmatched = |bump: bool, outcome: RefusedBaseOutcome| {
+        bump || outcome == RefusedBaseOutcome::RetirementFailed
+    };
+    let final_ring_loss = |outcome: RefusedBaseOutcome| outcome == RefusedBaseOutcome::OutputFailed;
 
     {
         let output_called = Cell::new(false);
@@ -4287,10 +4296,7 @@ fn check_refused_retirement_composition(tag: &str) {
             !final_unmatched(bump, outcome),
             "{tag}: healthy never-active emits silently (0 unmatched)"
         );
-        assert!(
-            !final_ring_loss(outcome),
-            "{tag}: healthy has no ring loss"
-        );
+        assert!(!final_ring_loss(outcome), "{tag}: healthy has no ring loss");
     }
     {
         let output_called = Cell::new(false);
@@ -4308,10 +4314,7 @@ fn check_refused_retirement_composition(tag: &str) {
             RefusedBaseOutcome::RetirementFailed,
             "{tag}: failed retirement reports RetirementFailed"
         );
-        assert!(
-            fault_called.get(),
-            "{tag}: failed retirement still faults"
-        );
+        assert!(fault_called.get(), "{tag}: failed retirement still faults");
         assert!(
             !output_called.get(),
             "{tag}: failed retirement never outputs"
@@ -4339,10 +4342,7 @@ fn check_refused_retirement_composition(tag: &str) {
     }
     {
         let active_bump = join_refusal_bump(&continuity, instance::COVERAGE_ENABLED);
-        assert!(
-            active_bump,
-            "{tag}: active unstamped predicate bumps"
-        );
+        assert!(active_bump, "{tag}: active unstamped predicate bumps");
         for outcome in [
             RefusedBaseOutcome::Emitted,
             RefusedBaseOutcome::OutputFailed,
@@ -4359,10 +4359,16 @@ fn check_refused_retirement_composition(tag: &str) {
 /// The pin itself is non-vacuous: it accepts the fixed shape and rejects
 /// the pre-fix `if bump` shape, a wrong outcome, and a dropped ring-loss
 /// guard. Runs before the production assertion so RED still proves the
-/// helper works.
+/// helper works. Uses the journal refused shape when the journal end
+/// marker is given, so both production spellings are covered.
 fn assert_retirement_pin_is_nonvacuous(end_marker: &str) {
+    let head = if end_marker == "let Some(reason)" {
+        "if !unsafe { continuity_joins(&(*raw).continuity) } {"
+    } else {
+        "if !joined {"
+    };
     let fixed = format!(
-        "if !joined {{ let bump = join_refusal_bump(); let outcome = preserve_refused_base(); \
+        "{head} let bump = join_refusal_bump(); let outcome = preserve_refused_base(); \
          entry.discard(0); if outcome == RefusedBaseOutcome::OutputFailed {{ \
          bump_evidence(EVIDENCE_RING_LOSS); }} \
          if bump || outcome == RefusedBaseOutcome::RetirementFailed {{ \

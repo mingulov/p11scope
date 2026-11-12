@@ -4886,7 +4886,7 @@ fn object_return_ordinary(
         if outcome == RefusedBaseOutcome::OutputFailed {
             bump_evidence(EVIDENCE_RING_LOSS);
         }
-        if bump {
+        if bump || outcome == RefusedBaseOutcome::RetirementFailed {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         }
         return 0;
@@ -5095,7 +5095,7 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         if JOURNAL {
             journal_roots::program::gap();
         }
-        if bump {
+        if bump || outcome == RefusedBaseOutcome::RetirementFailed {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         }
         return 0;

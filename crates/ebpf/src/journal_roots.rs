@@ -382,7 +382,7 @@ pub(super) mod program {
                 bump_evidence(EVIDENCE_RING_LOSS);
             }
             gap();
-            if bump {
+            if bump || outcome == RefusedBaseOutcome::RetirementFailed {
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
             return 0;

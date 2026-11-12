@@ -3248,6 +3248,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// with the decision hoisted before the reservation discard, plus
 /// their comment lines): 150308 B, measured with this same lexer on
 /// the integrated source; the previous pin matches its parent.
+/// Re-baselined for the retirement-failure unmatched repair (the only
+/// BPF source changes: the two main.rs refused arms OR the final
+/// unmatched decision with `outcome == RetirementFailed`; the journal
+/// copy lives outside this reader's main.rs-only dump): 150410 B,
+/// measured with this same lexer on the integrated source; the
+/// previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3257,8 +3263,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            150308,
-            "7a7e9902b32552416ddae32812f272f5d9190616829911ed401be063993ed634"
+            150410,
+            "51b42eebe66b6dab9e6e55c95f984d66e2529ece7b0294abed3005086beb6f49"
         ),
         "stripped BPF dump must stay byte-identical"
     );

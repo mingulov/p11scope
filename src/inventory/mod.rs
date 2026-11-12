@@ -5986,6 +5986,9 @@ mod seal_startup_test {
         crate::inventory_semantics::AttestedSemanticLane,
         crate::inventory_semantics::SemanticRefusal,
     >;
+    /// A boundary stimulus: runs once when its scripted event is
+    /// consumed, before the production caller sees the value.
+    type StartupHook = Box<dyn FnOnce()>;
     thread_local! {
         static PREPARE: std::cell::RefCell<VecDeque<Preparation>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
@@ -5993,12 +5996,26 @@ mod seal_startup_test {
             const { std::cell::RefCell::new(VecDeque::new()) };
         static START_SCOPES: std::cell::RefCell<Vec<Scope>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        // Late-stop probes (F1): one hook per consumed scripted
+        // boundary event, in order. A peek hook latches the run
+        // control while `take_peek` returns; a start hook latches
+        // while `take_start_verdict` returns. Tests queue them
+        // after priming earlier events, so each fires exactly at
+        // the scripted stimulus. Empty in every other test.
+        static PEEK_HOOKS: std::cell::RefCell<VecDeque<StartupHook>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
+        static START_HOOKS: std::cell::RefCell<VecDeque<StartupHook>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
     }
     pub(super) fn take_prepared() -> Option<Preparation> {
         PREPARE.with(|queued| queued.borrow_mut().pop_front())
     }
     pub(super) fn take_start_verdict() -> Option<StartVerdict> {
-        START.with(|queued| queued.borrow_mut().pop_front())
+        let verdict = START.with(|queued| queued.borrow_mut().pop_front());
+        if verdict.is_some() {
+            run_start_hook();
+        }
+        verdict
     }
     /// Record one scripted start's attach scope, in order. Twins
     /// drain it through `take_start_scopes` to prove the lane
@@ -6031,6 +6048,7 @@ mod seal_startup_test {
                 PREPARE.with(|queued| queued.borrow_mut().clear());
                 START.with(|queued| queued.borrow_mut().clear());
                 START_SCOPES.with(|recorded| recorded.borrow_mut().clear());
+                START_HOOKS.with(|queued| queued.borrow_mut().clear());
             }
         }
         PREPARE.with(|queued| queued.borrow_mut().extend(prepares));
@@ -6049,7 +6067,11 @@ mod seal_startup_test {
             const { std::cell::RefCell::new(VecDeque::new()) };
     }
     pub(super) fn take_peek() -> Option<PeekScript> {
-        PEEK.with(|queued| queued.borrow_mut().pop_front())
+        let peek = PEEK.with(|queued| queued.borrow_mut().pop_front());
+        if peek.is_some() {
+            run_peek_hook();
+        }
+        peek
     }
     /// Queue settle peeks plus one start script, consumed in order;
     /// like `with`, leftovers are cleared.
@@ -6075,11 +6097,33 @@ mod seal_startup_test {
         impl Drop for RestorePeek {
             fn drop(&mut self) {
                 PEEK.with(|queued| queued.borrow_mut().clear());
+                PEEK_HOOKS.with(|queued| queued.borrow_mut().clear());
             }
         }
         PEEK.with(|queued| queued.borrow_mut().extend(peeks));
         let _restore = RestorePeek;
         with_start_queue(prepares, starts, run)
+    }
+    /// Queue one peek stimulus: it runs when the next scripted
+    /// peek is consumed. Queued after priming so it fires exactly
+    /// at the intended settle event.
+    pub(super) fn queue_peek_hook(hook: StartupHook) {
+        PEEK_HOOKS.with(|queued| queued.borrow_mut().push_back(hook));
+    }
+    /// Queue one live-start stimulus: it runs when the next
+    /// scripted start verdict is consumed.
+    pub(super) fn queue_start_hook(hook: StartupHook) {
+        START_HOOKS.with(|queued| queued.borrow_mut().push_back(hook));
+    }
+    fn run_peek_hook() {
+        if let Some(hook) = PEEK_HOOKS.with(|queued| queued.borrow_mut().pop_front()) {
+            hook();
+        }
+    }
+    fn run_start_hook() {
+        if let Some(hook) = START_HOOKS.with(|queued| queued.borrow_mut().pop_front()) {
+            hook();
+        }
     }
 }
 
@@ -29276,6 +29320,351 @@ mod seal_readiness_tests {
                 "{variant}: the owned completion is still consumed"
             );
         }
+    }
+
+    /// F1 late-stop twin (settle/operator stop): the run control is
+    /// still active when the eighth finish starts, but Ctrl-C lands
+    /// while the eighth peek returns — after the hook-entry sample
+    /// and before the first start. No new seal may start; the owned
+    /// Complete completion still publishes.
+    #[test]
+    fn review_stop_during_settle_must_not_start() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use crate::scope::inventory_cgroup::CollectionStop;
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        let source = Arc::new(AtomicUsize::new(0));
+        driver.cgroup = Some(
+            CgroupDriverState::new(None, Some(Arc::clone(&source)))
+                .expect("cgroup driver state builds"),
+        );
+        let root = tempfile::tempdir().expect("cgroup root");
+        driver.seal_scope = Scope::Cgroup {
+            id: 7,
+            path: root.path().to_path_buf(),
+            dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+        };
+        driver.scan_seal_pending = true;
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let start_scopes = seal_startup_test::with_peek_queue(
+            peeks,
+            refused_attempt_preparations(),
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || {
+                for _ in 1..attempts {
+                    driver.coordinator.pose_cgroup_completion_for_test(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                    );
+                    driver.finish_pass(&mut report).expect("finish consumes");
+                }
+                // The run control is still active here: the stop
+                // latches only while the eighth peek returns.
+                assert_eq!(
+                    driver
+                        .cgroup
+                        .as_ref()
+                        .expect("cgroup state")
+                        .control
+                        .check(),
+                    Ok(()),
+                    "the run control is active before the eighth peek"
+                );
+                let hook_source = Arc::clone(&source);
+                let hook_control = driver
+                    .cgroup
+                    .as_ref()
+                    .expect("cgroup state")
+                    .control
+                    .clone();
+                seal_startup_test::queue_peek_hook(Box::new(move || {
+                    hook_source.store(1, Ordering::SeqCst);
+                    assert_eq!(
+                        hook_control.check(),
+                        Err(CollectionStop::OperatorStop),
+                        "the eighth peek latches the operator stop"
+                    );
+                }));
+                driver.coordinator.pose_cgroup_completion_for_test(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                );
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_start_scopes()
+            },
+        );
+        assert!(
+            start_scopes.is_empty(),
+            "a stop during settle must not start a new seal: {start_scopes:?}"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "a stop during settle seats no lane"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "the unattempted seal stays pending for the terminal disclosure"
+        );
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line without a start"
+        );
+        assert!(
+            driver.coordinator.take_cgroup_completion().is_none(),
+            "the owned completion is still consumed"
+        );
+    }
+
+    /// F1 late-stop twin (settle/deadline): like the operator-stop
+    /// twin, but the collection deadline lapses while the eighth
+    /// peek returns. An already-expired deadline at entry would not
+    /// exercise this path; the injected clock crosses it mid-seal.
+    #[test]
+    fn review_deadline_during_settle_must_not_start() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use crate::scope::inventory_cgroup::{
+            CgroupWalkLimits, CgroupWalkState, CollectionControl, CollectionStop,
+        };
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        let tick = Arc::new(Mutex::new(Instant::now()));
+        let deadline = tick
+            .lock()
+            .expect("test clock")
+            .checked_add(Duration::from_secs(60))
+            .expect("a future collection deadline");
+        let clock_tick = Arc::clone(&tick);
+        let control = CollectionControl::with_clock(Some(deadline), move || {
+            *clock_tick.lock().expect("test clock")
+        });
+        driver.cgroup = Some(CgroupDriverState {
+            continuation: Some(CgroupWalkState::default()),
+            limits: CgroupWalkLimits::default(),
+            control: control.clone(),
+            deadline: Some(deadline),
+            observer: None,
+        });
+        let root = tempfile::tempdir().expect("cgroup root");
+        driver.seal_scope = Scope::Cgroup {
+            id: 7,
+            path: root.path().to_path_buf(),
+            dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+        };
+        driver.scan_seal_pending = true;
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let start_scopes = seal_startup_test::with_peek_queue(
+            peeks,
+            refused_attempt_preparations(),
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || {
+                for _ in 1..attempts {
+                    driver.coordinator.pose_cgroup_completion_for_test(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                    );
+                    driver.finish_pass(&mut report).expect("finish consumes");
+                }
+                assert_eq!(
+                    control.check(),
+                    Ok(()),
+                    "the run control is active before the eighth peek"
+                );
+                let hook_tick = Arc::clone(&tick);
+                let hook_control = control.clone();
+                seal_startup_test::queue_peek_hook(Box::new(move || {
+                    let past = deadline
+                        .checked_add(Duration::from_secs(1))
+                        .expect("past the deadline");
+                    *hook_tick.lock().expect("test clock") = past;
+                    assert_eq!(
+                        hook_control.check(),
+                        Err(CollectionStop::Deadline),
+                        "the eighth peek latches the collection deadline"
+                    );
+                }));
+                driver.coordinator.pose_cgroup_completion_for_test(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                );
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_start_scopes()
+            },
+        );
+        assert!(
+            start_scopes.is_empty(),
+            "a deadline during settle must not start a new seal: {start_scopes:?}"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "a deadline during settle seats no lane"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "the unattempted seal stays pending for the terminal disclosure"
+        );
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line without a start"
+        );
+        assert!(
+            driver.coordinator.take_cgroup_completion().is_none(),
+            "the owned completion is still consumed"
+        );
+    }
+
+    /// F1 late-stop twin (journal start/ordinary retry): the stop
+    /// latches while the first scripted journal attempt returns its
+    /// refusal. That already-started attempt finishes its
+    /// disposition, but the ordinary fallback is a later attempt and
+    /// must not begin.
+    #[test]
+    fn review_stop_during_journal_start_must_not_retry() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use crate::scope::inventory_cgroup::CollectionStop;
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scope = InventoryRunScope::Cgroup;
+        let source = Arc::new(AtomicUsize::new(0));
+        driver.cgroup = Some(
+            CgroupDriverState::new(None, Some(Arc::clone(&source)))
+                .expect("cgroup driver state builds"),
+        );
+        let root = tempfile::tempdir().expect("cgroup root");
+        driver.seal_scope = Scope::Cgroup {
+            id: 7,
+            path: root.path().to_path_buf(),
+            dir: std::sync::Arc::new(std::fs::File::open(root.path()).expect("cgroup dir")),
+        };
+        driver.scan_seal_pending = true;
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        let mut report = PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let start_scopes = seal_startup_test::with_peek_queue(
+            peeks,
+            refused_attempt_preparations(),
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || {
+                for _ in 1..attempts {
+                    driver.coordinator.pose_cgroup_completion_for_test(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                    );
+                    driver.finish_pass(&mut report).expect("finish consumes");
+                }
+                assert_eq!(
+                    driver
+                        .cgroup
+                        .as_ref()
+                        .expect("cgroup state")
+                        .control
+                        .check(),
+                    Ok(()),
+                    "the run control is active before the eighth peek"
+                );
+                let hook_source = Arc::clone(&source);
+                let hook_control = driver
+                    .cgroup
+                    .as_ref()
+                    .expect("cgroup state")
+                    .control
+                    .clone();
+                seal_startup_test::queue_start_hook(Box::new(move || {
+                    hook_source.store(1, Ordering::SeqCst);
+                    assert_eq!(
+                        hook_control.check(),
+                        Err(CollectionStop::OperatorStop),
+                        "the journal start latches the operator stop"
+                    );
+                }));
+                driver.coordinator.pose_cgroup_completion_for_test(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete,
+                );
+                driver.finish_pass(&mut report).expect("finish consumes");
+                seal_startup_test::take_start_scopes()
+            },
+        );
+        assert_eq!(
+            start_scopes.len(),
+            1,
+            "a stop during the journal start must not retry ordinary: {start_scopes:?}"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "a refused journal start seats no lane"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "the unseated seal stays pending for the terminal disclosure"
+        );
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line without a sealed start"
+        );
+        assert!(
+            driver.coordinator.take_cgroup_completion().is_none(),
+            "the owned completion is still consumed"
+        );
     }
 
     /// `--cgroup` attempts the seal like every scope now: a pending

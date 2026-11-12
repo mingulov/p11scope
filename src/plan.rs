@@ -8825,6 +8825,122 @@ mod tests {
         );
     }
 
+    fn assert_disagreeing_sole_table_refuses_with_and_without_stale(
+        mutate: impl Fn(&mut ReconciledModule),
+        agreeing: usize,
+        why: &str,
+    ) {
+        // F1 toggle (ruling 05:25a): an exports-disagreeing 68-slot
+        // replacement refuses identically with and without stale
+        // support, in both the main and the scan-authorized lowering.
+        // The stale manifest lends names only; the replacement must
+        // establish semantic authority independently.
+        for stale in [false, true] {
+            let mut module = sole_complete_module();
+            mutate(&mut module);
+            module.scanned.tables[0].manifest_supported = stale;
+            for (label, plan) in [
+                (
+                    "main",
+                    build_from_sources(
+                        std::slice::from_ref(&module),
+                        &[],
+                        &PinnedObjects::empty(),
+                    ),
+                ),
+                (
+                    "scan-authorized",
+                    build_from_sources_scan_authorized(
+                        std::slice::from_ref(&module),
+                        &[],
+                        &PinnedObjects::empty(),
+                    ),
+                ),
+            ] {
+                let context = format!("{why} ({label}, stale={stale})");
+                assert_eq!(
+                    plan.slots.len(),
+                    68,
+                    "{context}: all entries stay admitted"
+                );
+                assert_eq!(
+                    plan.modules[0].tables[0].exports_agreeing,
+                    Some(agreeing),
+                    "{context}: the replacement disagrees with its own exports"
+                );
+                assert_eq!(
+                    plan.modules[0].tables[0].linkage,
+                    if stale { "manifest" } else { "heuristic" },
+                    "{context}: stale support reaches the score"
+                );
+                assert_plan_count_only(&plan, &context);
+                assert!(
+                    plan.standard_layout_evidence().is_empty(),
+                    "{context}: no layout basis is recorded for a refused table"
+                );
+                if stale {
+                    assert!(
+                        plan.slots.iter().all(|slot| slot.names != ["unknown"]),
+                        "{context}: the stale fallback still lends names"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_supported_sole_table_with_swapped_targets_stays_count_only() {
+        // F1 twin (swapped-own-targets): swapping two own-object
+        // targets keeps all 68 entries present and unique but breaks
+        // per-ordinal export agreement (66/68). The 68-slot sole
+        // predicate does not itself require full agreement, so the
+        // semantic-eligibility gate must refuse — with stale support
+        // exactly as without it.
+        assert_disagreeing_sole_table_refuses_with_and_without_stale(
+            |module| {
+                let entries = &mut module.scanned.tables[0].entries;
+                let sign_init = entries
+                    .iter()
+                    .position(|entry| entry.name == "C_SignInit")
+                    .expect("C_SignInit entry");
+                let verify = entries
+                    .iter()
+                    .position(|entry| entry.name == "C_Verify")
+                    .expect("C_Verify entry");
+                let swapped = entries[sign_init].file_offset;
+                entries[sign_init].file_offset = entries[verify].file_offset;
+                entries[verify].file_offset = swapped;
+            },
+            66,
+            "swapped-targets sole table",
+        );
+    }
+
+    #[test]
+    fn stale_supported_sole_table_with_missing_export_stays_count_only() {
+        // F1 twin (missing-export): dropping one export symbol (67/68)
+        // leaves the (d) export and all 68 entries in place, so only
+        // export agreement refuses — with stale support exactly as
+        // without it.
+        assert_disagreeing_sole_table_refuses_with_and_without_stale(
+            |module| {
+                let exports: Vec<(String, u64)> = module
+                    .exports
+                    .iter()
+                    .filter(|(name, _)| *name != "C_Sign")
+                    .cloned()
+                    .collect();
+                assert!(
+                    exports.iter().any(|(name, _)| name == "C_GetFunctionList"),
+                    "the (d) export stays, so only agreement refuses"
+                );
+                module.exports = std::sync::Arc::from(exports);
+            },
+            67,
+            "missing-export sole table",
+        );
+    }
+
     #[test]
     fn standard_layout_slot_publishes_only_registered_mechanisms() {
         // Membership gate (controller ruling 2026-11-11 clause 2): a

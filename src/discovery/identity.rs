@@ -8526,31 +8526,43 @@ pub(crate) fn share_scan_pins_with_retained<'a>(
     pins: &mut PinnedObjects,
     retained: impl IntoIterator<Item = &'a PinnedObjects>,
 ) -> u64 {
-    // One transient lookup over the already-retained sets (first proof
-    // wins per key): the share applies once per entry, so the kept count
-    // below is exactly the admission's new fds.
-    let mut lenders: BTreeMap<ObjectKey, (Arc<std::fs::File>, MappedFile)> = BTreeMap::new();
+    // Lender candidates by maps key (integer compares only, no
+    // syscalls): only a retained entry under an incoming entry's own
+    // key can lend to it, so only those pay for the held-fd proof
+    // below. A full retained scan per admission would cost an fstat
+    // per entry and tip wall-time-sensitive scale ticks.
+    let mut candidates: BTreeMap<ObjectKey, Vec<&Entry>> = BTreeMap::new();
     for set in retained {
         for entry in set.by_id.values() {
-            if entry.pre_copy_up || entry.collapsed || lenders.contains_key(&entry.raw.key) {
-                continue;
-            }
-            if let Some(mapped) = entry.reusable_mapped_file()
-                && mapped.key_is_identity(entry.raw.key)
-            {
-                lenders.insert(entry.raw.key, (Arc::clone(&entry.file), mapped));
+            if !entry.pre_copy_up && !entry.collapsed {
+                candidates.entry(entry.raw.key).or_default().push(entry);
             }
         }
     }
+    if candidates.is_empty() {
+        return pins.by_id.len() as u64;
+    }
+    // The share applies once per entry (first proof wins per key), so
+    // the kept count is exactly the admission's new fds.
     let mut kept = 0u64;
     for entry in pins.by_id.values_mut() {
-        if !entry.pre_copy_up
-            && !entry.collapsed
-            && let Some((file, mapped)) = lenders.get(&entry.raw.key)
-        {
-            entry.file = Arc::clone(file);
+        let key = entry.raw.key;
+        let loan = if entry.pre_copy_up || entry.collapsed {
+            None
+        } else {
+            candidates.get(&key).and_then(|offers| {
+                offers.iter().find_map(|lender| {
+                    let mapped = lender.reusable_mapped_file()?;
+                    mapped
+                        .key_is_identity(key)
+                        .then(|| (Arc::clone(&lender.file), mapped))
+                })
+            })
+        };
+        if let Some((file, mapped)) = loan {
+            entry.file = file;
             if entry.mapped.is_none() {
-                entry.mapped = Some(*mapped);
+                entry.mapped = Some(mapped);
             }
         } else {
             kept = kept.saturating_add(1);

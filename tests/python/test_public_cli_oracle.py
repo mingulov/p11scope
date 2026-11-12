@@ -719,6 +719,56 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         self.run_case(mutate, cell="system", want=1)
 
+    def test_lone_gap_with_two_gaps_fails_in_strict_mode(self):
+        # The wave-1 lone-gap ceiling is exactly one disclosed
+        # descendant gap: two ambient exits are not a lone gap and
+        # still fail strict, with exact owned counts otherwise.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 2
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_unknown_status_fails_in_strict_mode(self):
+        # Only the disclosed lossy lone class qualifies: an unknown
+        # observation status with the same gap count still fails.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "unknown", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_lone_gap_with_count_mismatch_fails_in_strict_mode(self):
+        # The lone arm never waives exact owned counts: one
+        # disclosed gap with a 499/500 deficit still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 499
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_lone_gap_with_solo_other_gap_fails_in_strict_mode(self):
+        # Any other gap kind alone is not the lone descendant gap:
+        # a solo multi_rebuild_gaps disclosure still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 0
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["multi_rebuild_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps
         # (strict discloses them via PARTIAL); relaxed mode must accept

@@ -619,21 +619,22 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0)
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
     # ruling to the system cell): quiet VNG guests disclose exactly
-    # the ambient descendant exit with no skip (60906ccca stopped
+    # one ambient descendant exit with no skip (60906ccca stopped
     # filing the bogus B4 post-ready window gap, and the exit itself
     # predates wave 1 on every leg, previously bundled into the
-    # ambient shape). The system cell accepts the disclosed lone gap
-    # with exact owned counts (checked below), zero loss (checked
-    # above) and no other class; any other cell, cause set or skip
-    # still fails. Mirrors the mt-system-only precedent of the
-    # relaxed skip family above.
+    # ambient shape). The system cell accepts exactly that one
+    # disclosed gap with exact owned counts (checked below), zero
+    # loss (checked above) and no other class; any other cell, cause
+    # set, skip or gap count (zero, two or more) still fails.
+    # Mirrors the mt-system-only precedent of the relaxed skip
+    # family above.
     ok_lone_gap = (
         cell == "system"
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["pid_descendant_gaps"]
         and skip_entries == []
         and evidence.get("modules_skipped") == []
-        and evidence.get("pid_descendant_gaps", 0) != 0)
+        and evidence.get("pid_descendant_gaps", 0) == 1)
     if relaxed:
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])

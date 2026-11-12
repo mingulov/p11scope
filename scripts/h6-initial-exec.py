@@ -26,6 +26,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -75,9 +76,42 @@ def _remaining(deadline_ns):
     return remaining
 
 
+# Thread.join does not imply kernel task exit: a joined reader's task can
+# linger past the next leg's spawn. Fork safety needs user teardown
+# complete (no inherited locks), so await only already-joined tasks here.
+# A live thread is still an immediate violation, never awaited.
+_TEARDOWN_DRAIN_SECONDS = 10.0
+_TEARDOWN_DRAIN_POLL_SECONDS = 0.001
+
+
+def _drain_exited_tasks():
+    self_tid = threading.get_native_id()
+
+    def settled():
+        # Dead threads leave threading._active before join returns; anything
+        # still registered here is live. Refresh per pass so a thread that
+        # starts mid-drain is rejected, never awaited.
+        live = {thread.native_id for thread in threading.enumerate()
+                if thread.native_id is not None and thread.native_id != self_tid}
+        tasks = [int(task) for task in os.listdir("/proc/self/task") if int(task) != self_tid]
+        if any(task in live for task in tasks):
+            raise RuntimeError("initial exec requires exactly one OS task before raw fork")
+        return not tasks
+
+    if settled():
+        return
+    deadline = time.monotonic() + _TEARDOWN_DRAIN_SECONDS
+    while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("initial exec joined-thread teardown did not settle before raw fork")
+        time.sleep(_TEARDOWN_DRAIN_POLL_SECONDS)
+        if settled():
+            return
+
+
 def _single_task():
     if len(os.listdir("/proc/self/task")) != 1:
-        raise RuntimeError("initial exec requires exactly one OS task before raw fork")
+        _drain_exited_tasks()
     monitoring = getattr(sys, "monitoring", None)
     if (sys.gettrace() is not None or sys.getprofile() is not None
             or monitoring is not None and any(monitoring.get_tool(tool) is not None
@@ -468,6 +502,7 @@ def _spawn_initial_exec(owners, caller_argv, *, caller_pin, setarch_pin, uid, gi
             gc_enabled = gc.isenabled()
             gc.disable()  # child allocations must not invoke cyclic finalizers
             _single_task()
+            _remaining(deadline_ns)  # the teardown drain consumes spawn budget too
             pid = _raw_fork()
             if pid == 0:
                 try:

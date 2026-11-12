@@ -7579,13 +7579,26 @@ fn discover_plan(
     // for the counted gap below. Only the over-cap path fills this;
     // under the cap it stays empty and unused.
     let mut examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
+    // FD reserve (scan-1k guard), sampled once for the whole pass: one
+    // pidfd per retained view crosses a small soft limit fast; when fewer
+    // than the reserve remains, the rest wait for the next tick instead of
+    // dying on EMFILE. The reconciliation sweep admits never-scanned pids
+    // first, so a deferred pid is still reached. Fail open: an unreadable
+    // snapshot proceeds and reports once under its fixed name, never defers.
+    let mut reserve_tick = crate::fd_budget::FdReserveTick::sample();
+    if reserve_tick.is_none() && crate::fd_budget::note_unreadable_reported() {
+        let skipped = Skipped {
+            subject: crate::fd_budget::UNREADABLE_SUBJECT.into(),
+            reason: crate::fd_budget::UNREADABLE_REASON.into(),
+        };
+        attribution::note(&skipped);
+        discovered.base_counters.object_skips.push(skipped);
+    }
     for pid in selected.iter() {
-        // FD reserve (scan-1k guard): one pidfd per retained view crosses a
-        // small soft limit fast; when fewer than the reserve remains, the
-        // rest wait for the next tick instead of dying on EMFILE. The
-        // reconciliation sweep admits never-scanned pids first, so a
-        // deferred pid is still reached.
-        if crate::fd_budget::fd_reserve_breached_now() {
+        // The pass counts its own opens against the snapshot (conservative
+        // within the pass: drops are not subtracted; the fresh snapshot
+        // bounds the drift every pass).
+        if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
             let skipped = Skipped {
                 subject: "process view".into(),
                 reason: "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
@@ -7660,6 +7673,12 @@ fn discover_plan(
                 continue;
             }
         };
+        // The pass holds this view's pidfd from here (conservative: a
+        // named-view reuse double-counts one fd against the snapshot; the
+        // reserve slack absorbs it).
+        if let Some(tick) = reserve_tick.as_mut() {
+            tick.note_opened();
+        }
         if discovered.retain_view_id(view.id()).is_err() {
             let skipped = Skipped {
                 subject: "process view".into(),
@@ -26949,6 +26968,20 @@ impl Engine {
         // loop-top, and the last admitted pid never stages (empty tail).
         let mut staged_yield: Option<(u32, InventoryNewView)> = None;
         let mut unprocessed = admitted.into_iter();
+        // FD reserve (scan-1k guard), sampled once for the tick: one pidfd
+        // per admitted view crosses a small soft limit fast; when fewer
+        // than the reserve remains, this pid and the rest defer with their
+        // requests retained, exactly like the quantum-expiry tail, so
+        // fanotify/file learning and later attaches never hit EMFILE. Fail
+        // open: an unreadable snapshot proceeds and reports once under its
+        // fixed name, never defers.
+        let mut reserve_tick = crate::fd_budget::FdReserveTick::sample();
+        if reserve_tick.is_none() && crate::fd_budget::note_unreadable_reported() {
+            skipped.push(Skipped {
+                subject: crate::fd_budget::UNREADABLE_SUBJECT.into(),
+                reason: crate::fd_budget::UNREADABLE_REASON.into(),
+            });
+        }
         while let Some(pid) = unprocessed.next() {
             // The tick quantum stops admissions before another scan: this
             // pid and the rest defer with their requests retained. This
@@ -26992,12 +27025,12 @@ impl Engine {
                 });
                 break;
             }
-            // FD reserve (scan-1k guard): after the quantum poll (which stays
-            // first: injected clocks count polls), before another view opens.
-            // This pid and the rest defer with their requests retained,
-            // exactly like the quantum-expiry tail, so fanotify/file
-            // learning and later attaches never hit EMFILE.
-            if crate::fd_budget::fd_reserve_breached_now() {
+            // FD reserve (scan-1k guard), sampled once above: after the
+            // quantum poll (which stays first: injected clocks count polls),
+            // before another view opens. The tick counts its own opens
+            // against the snapshot (conservative within the tick: staged
+            // yields and scan-failed drops are not subtracted).
+            if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
                     failed_refresh_pids.insert(deferred_pid);
@@ -27128,6 +27161,10 @@ impl Engine {
                     continue;
                 }
             };
+            // The tick holds the new view's pidfd from here.
+            if let Some(tick) = reserve_tick.as_mut() {
+                tick.note_opened();
+            }
             let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &view,

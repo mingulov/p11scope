@@ -7,6 +7,7 @@
 //! the next tick instead of failing.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Fds that must stay free under the soft limit before another process view
 /// may open: one fanotify group fd, a late provider attach burst (a full
@@ -154,30 +155,94 @@ pub(crate) fn open_fd_count_in(dir: &Path) -> Option<usize> {
     Some(count)
 }
 
-/// This process's open fd count via `/proc/self/fd`, counted conservatively
-/// (the enumeration fd itself is listed). Follows the `FdSnapshot` reader
-/// in `attach::counter_banks`.
-pub(crate) fn open_fd_count() -> Option<u64> {
-    u64::try_from(open_fd_count_in(Path::new("/proc/self/fd"))?).ok()
+/// One tick's (or one discovery pass's) file-descriptor reserve reading:
+/// the open count and soft limit sampled once before the loop, plus the
+/// views opened since. Call sites sample once per tick and count their own
+/// opens instead of re-reading `/proc` per pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FdReserveTick {
+    open: u64,
+    soft: u64,
+    opened: u64,
 }
 
-/// The live reserve check: true when the next views must wait for the next
-/// tick. Fail-closed: an unreadable limit or count also waits (a delay,
-/// never an `EMFILE`).
-pub(crate) fn fd_reserve_breached_now() -> bool {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes one initialized writable rlimit; no limit changes.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return true;
+impl FdReserveTick {
+    /// A reading over injected counts (tests).
+    pub(crate) fn from_counts(open: u64, soft: u64) -> Self {
+        Self {
+            open,
+            soft,
+            opened: 0,
+        }
     }
-    let (soft, open) = match open_fd_count() {
-        Some(open) => (limit.rlim_cur, open),
-        None => return true,
-    };
-    fd_reserve_breached(open, soft, FD_RESERVE)
+
+    /// Sample the live reading: the soft limit plus this process's open
+    /// count via `/proc/self/fd`, counted conservatively (the enumeration
+    /// fd itself is listed; follows the `FdSnapshot` reader in
+    /// `attach::counter_banks`). `None` when either cannot be read (fail
+    /// open at the call site: proceed, report once, never defer).
+    pub(crate) fn sample() -> Option<Self> {
+        Self::sample_in(Path::new("/proc/self/fd"))
+    }
+
+    /// [`sample`] with the fd directory injected (tests).
+    pub(crate) fn sample_in(fd_dir: &Path) -> Option<Self> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit; no limit changes.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return None;
+        }
+        let open = u64::try_from(open_fd_count_in(fd_dir)?).ok()?;
+        Some(Self::from_counts(open, limit.rlim_cur))
+    }
+
+    /// True when fewer than the reserve remains under the soft limit after
+    /// this tick's own opens: the next views must wait for the next tick.
+    /// Saturating: absurd counts breach, never wrap into admission.
+    pub(crate) fn breached(&self) -> bool {
+        fd_reserve_breached(self.open.saturating_add(self.opened), self.soft, FD_RESERVE)
+    }
+
+    /// Count one view opened since the snapshot (conservative within the
+    /// tick: drops are not subtracted; the fresh snapshot bounds the drift
+    /// every tick).
+    pub(crate) fn note_opened(&mut self) {
+        self.opened = self.opened.saturating_add(1);
+    }
+}
+
+/// True when the next views must wait for the next tick. Fail open: an
+/// unreadable snapshot never defers (the caller proceeds and reports once
+/// under [`UNREADABLE_SUBJECT`]).
+pub(crate) fn reserve_defers(sample: Option<&FdReserveTick>) -> bool {
+    sample.is_some_and(FdReserveTick::breached)
+}
+
+/// The fixed subject of the one unreadable-snapshot report: the reserve
+/// guard went blind and views proceed without it.
+pub(crate) const UNREADABLE_SUBJECT: &str = "capture file-descriptor reserve";
+
+/// The fixed reason beside it: no pids, paths or run detail beyond the
+/// `/proc/self/fd` source itself.
+pub(crate) const UNREADABLE_REASON: &str = "the capture's open file count could not be read (/proc/self/fd), so the file-descriptor reserve guard is blind; views proceed without it";
+
+/// The one unreadable-snapshot report per process: `/proc` unreadable once
+/// stays unreadable, so every later tick must not file another gap.
+static UNREADABLE_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Claim the one unreadable-snapshot report: true on the first unreadable
+/// snapshot, false after. Pure over the caller's slot, so the twin pins
+/// the once-only shape without touching the process flag.
+pub(crate) fn claim_unreadable_report(slot: &AtomicBool) -> bool {
+    !slot.swap(true, Ordering::SeqCst)
+}
+
+/// Claim the process-wide report (production call sites).
+pub(crate) fn note_unreadable_reported() -> bool {
+    claim_unreadable_report(&UNREADABLE_REPORTED)
 }
 
 #[cfg(test)]

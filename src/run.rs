@@ -8479,17 +8479,74 @@ pub(crate) const TARGET_CALLER_EXITED: &str = "target exited before its exe link
 /// (hidden by a `/proc` hidepid mount, or denied).
 pub(crate) const TARGET_CALLER_EXE_UNREADABLE: &str = "target exe link unreadable";
 
+/// One coherent executable observation: the exe path and the file identity
+/// behind it, taken through the same held descriptor, so the pair always
+/// describes a single object. Private exec evidence, never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExeObservation {
+    /// The exe path, lossy UTF-8 from the held descriptor's link.
+    path: String,
+    /// The `(st_dev, st_ino)` behind `path`, or `None` when the fstat
+    /// failed; an unknown identity withholds exec proof.
+    id: Option<(u64, u64)>,
+}
+
+/// Acquire the target's executable object once: open `/proc/<pid>/exe`
+/// (following the magic link) as an `O_PATH` descriptor, then derive both
+/// the path (via `/proc/self/fd/<fd>`) and the identity (`fstat`) through
+/// that same held descriptor — never by reopening the returned pathname.
+/// An exec racing the acquisition still yields a coherent pair (wholly the
+/// old or the new object), never the old path with the new image's
+/// identity. `None` when the object cannot be acquired; the caller then
+/// withholds exec proof.
+fn read_exe_observation(path: &str) -> Option<ExeObservation> {
+    read_exe_observation_with(path, || {})
+}
+
+/// [`read_exe_observation`] with a hook fired after the descriptor is open
+/// but before the path and identity are derived: tests park a gated exec
+/// there to prove the pair stays coherent.
+fn read_exe_observation_with(path: &str, after_open: impl FnOnce()) -> Option<ExeObservation> {
+    let cpath = CString::new(path).ok()?;
+    // SAFETY: `open(2)` with `O_PATH|O_CLOEXEC` on a NUL-terminated path
+    // returns a new descriptor or -1; the magic link is followed, so the
+    // descriptor names the executable object itself.
+    let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a new owned descriptor from the successful `open`.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    after_open();
+    // Both derivations run through the held descriptor: an exec (or a
+    // rename) racing them cannot split the pair across two objects.
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat(2)` on a live descriptor with a valid out-pointer.
+    let id = if unsafe { libc::fstat(fd.as_raw_fd(), &mut status) } == 0 {
+        Some((status.st_dev as u64, status.st_ino as u64))
+    } else {
+        None
+    };
+    let link = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let exe = std::fs::read_link(&link)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    Some(ExeObservation { path: exe, id })
+}
+
 /// Resolve the pid-scope target's caller identity from
-/// `/proc/<pid>/exe`: the link text and the exe file identity (device
-/// and inode from the same object), or the finite reason it could not
-/// be read. The read is bound to the target's retained pin when one is
-/// held: a generation change under the read discards even a readable
-/// path, so a recycled pid never misattaches an unrelated program's
-/// exe. Without a pin, only a proven exit (`kill(pid, 0)` `ESRCH`, a
-/// zombie/dead `/proc` stat, or a stat `NotFound`) names the exit; the
-/// `NotFound` arm counts as an exit only because pid scope already
-/// refused an invisible pid when the view opened. A `/proc` miss on a
-/// live pid stays unreadable, never presumed exited. The pid itself
+/// `/proc/<pid>/exe`: the executable object is acquired once through a
+/// held `O_PATH` descriptor, and the link text and the exe file identity
+/// (device and inode) are both derived through it, or the finite reason
+/// it could not be read. The read is bound to the target's retained pin
+/// when one is held: a generation change under the read discards even a
+/// readable path, so a recycled pid never misattaches an unrelated
+/// program's exe. Without a pin, only a proven exit (`kill(pid, 0)`
+/// `ESRCH`, a zombie/dead `/proc` stat, or a stat `NotFound`) names the
+/// exit; the `NotFound` arm counts as an exit only because pid scope
+/// already refused an invisible pid when the view opened. A `/proc` miss
+/// on a live pid stays unreadable, never presumed exited. The pid itself
 /// never enters the report — stderr diagnostics name it beside this
 /// identity. No cwd, cmdline, environ, argument, or payload read; the
 /// exit proof reuses the existing signal and stat checks.
@@ -8499,16 +8556,7 @@ pub(crate) fn resolve_pid_caller(
 ) -> render::CaptureCaller {
     resolve_pid_caller_with(
         pid,
-        |path| {
-            std::fs::read_link(path)
-                .ok()
-                .map(|link| link.to_string_lossy().into_owned())
-        },
-        |path| {
-            std::fs::metadata(path)
-                .ok()
-                .map(|meta| (meta.dev(), meta.ino()))
-        },
+        read_exe_observation,
         // A zombie still answers `kill(pid, 0)`, so the signal proof
         // alone would mislabel an unreaped exit as hidepid: the stat
         // verdict covers it (a fallback pin cannot see zombies either).
@@ -8517,16 +8565,15 @@ pub(crate) fn resolve_pid_caller(
     )
 }
 
-/// [`resolve_pid_caller`] over injected readers, so every outcome is
-/// unit-testable without live `/proc` state. The `still_same` bracket
+/// [`resolve_pid_caller`] over an injected observation, so every outcome
+/// is unit-testable without live `/proc` state. The `still_same` bracket
 /// mirrors `ProcessView::run_while_same`: false before the read, or
-/// after it, discards the path and names the exit. The identity reader
-/// stats the same exe object the link reader names, inside the same
-/// bracket, and only for a readable link.
+/// after it, discards the path and names the exit. The observation carries
+/// path and identity together from one held object, inside the same
+/// bracket.
 fn resolve_pid_caller_with(
     pid: u32,
-    read_exe_link: impl Fn(&str) -> Option<String>,
-    read_exe_id: impl Fn(&str) -> Option<(u64, u64)>,
+    read_exe: impl Fn(&str) -> Option<ExeObservation>,
     proven_exited: impl Fn(u32) -> bool,
     mut still_same: impl FnMut() -> bool,
 ) -> render::CaptureCaller {
@@ -8540,20 +8587,15 @@ fn resolve_pid_caller_with(
         return exited();
     }
     let path = format!("/proc/{pid}/exe");
-    let exe = read_exe_link(&path);
-    let exe_id = if exe.is_some() {
-        read_exe_id(&path)
-    } else {
-        None
-    };
+    let observed = read_exe(&path);
     if !still_same() {
         return exited();
     }
-    if let Some(exe) = exe {
+    if let Some(observed) = observed {
         return render::CaptureCaller {
-            exe: Some(exe),
+            exe: Some(observed.path),
             exe_unknown_reason: None,
-            exe_id,
+            exe_id: observed.id,
             exec_to_exe: None,
         };
     }
@@ -26626,58 +26668,53 @@ int main(int argc, char **argv) {
 
     #[test]
     fn resolve_pid_caller_with_names_all_outcomes() {
-        // Named: the link text wins without consulting the exit proof.
+        // Named: the observed path wins without consulting the exit proof.
         let named = resolve_pid_caller_with(
             7,
-            |_| Some("/bin/app".to_string()),
-            |_| None,
-            |_| panic!("a readable link never consults the exit proof"),
+            |_| {
+                Some(ExeObservation {
+                    path: "/bin/app".to_string(),
+                    id: None,
+                })
+            },
+            |_| panic!("a readable observation never consults the exit proof"),
             || true,
         );
         assert_eq!(named.exe.as_deref(), Some("/bin/app"));
         assert_eq!(named.exe_unknown_reason, None);
         // Unreadable plus proven exit: the exit is named.
-        let exited = resolve_pid_caller_with(
-            7,
-            |_| None,
-            |_| panic!("an unreadable link never consults the identity proof"),
-            |_| true,
-            || true,
-        );
+        let exited = resolve_pid_caller_with(7, |_| None, |_| true, || true);
         assert_eq!(exited.exe, None);
         assert_eq!(exited.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
         // Unreadable but live: unreadable, never presumed exited.
-        let hidden = resolve_pid_caller_with(
-            7,
-            |_| None,
-            |_| panic!("an unreadable link never consults the identity proof"),
-            |_| false,
-            || true,
-        );
+        let hidden = resolve_pid_caller_with(7, |_| None, |_| false, || true);
         assert_eq!(hidden.exe, None);
         assert_eq!(
             hidden.exe_unknown_reason,
             Some(TARGET_CALLER_EXE_UNREADABLE)
         );
-        // Changed generation: a readable link is discarded, never
+        // Changed generation: a readable observation is discarded, never
         // misattached, and the exit is named without consulting the
         // proof.
         let changed = resolve_pid_caller_with(
             7,
-            |_| Some("/bin/recycled".to_string()),
-            |_| panic!("a changed generation never consults the identity proof"),
+            |_| panic!("a changed generation never consults the observation"),
             |_| panic!("a changed generation never consults the exit proof"),
             || false,
         );
         assert_eq!(changed.exe, None);
         assert_eq!(changed.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
         // Changed under the read: same discard when the bracket fails
-        // after the link was already read.
+        // after the observation was already taken.
         let mut first = true;
         let raced = resolve_pid_caller_with(
             7,
-            |_| Some("/bin/recycled".to_string()),
-            |_| None,
+            |_| {
+                Some(ExeObservation {
+                    path: "/bin/recycled".to_string(),
+                    id: None,
+                })
+            },
             |_| panic!("a changed generation never consults the exit proof"),
             || std::mem::replace(&mut first, false),
         );
@@ -26748,13 +26785,17 @@ int main(int argc, char **argv) {
 
     #[test]
     fn resolve_pid_caller_with_carries_the_exe_file_identity() {
-        // The injected identity reader rides the named outcome: a known
-        // exe carries its file identity for the exec reconcile.
+        // The injected observation rides the named outcome: a known exe
+        // carries its file identity for the exec reconcile.
         let caller = resolve_pid_caller_with(
             7,
-            |_| Some("/bin/app".to_string()),
-            |_| Some((9, 9)),
-            |_| panic!("a readable link never consults the exit proof"),
+            |_| {
+                Some(ExeObservation {
+                    path: "/bin/app".to_string(),
+                    id: Some((9, 9)),
+                })
+            },
+            |_| panic!("a readable observation never consults the exit proof"),
             || true,
         );
         assert_eq!(caller.exe.as_deref(), Some("/bin/app"));
@@ -26937,21 +26978,8 @@ int main(int argc, char **argv) {
     const GATED_LINGER_SOURCE: &str =
         "#include <unistd.h>\nint main(void) { for (;;) pause(); return 0; }\n";
 
-    /// Test mirrors of the production readers in [`resolve_pid_caller`]:
-    /// the real readlink, metadata and exit proof, so gated twins
-    /// exercise real `/proc` state through the injected seam.
-    fn twin_read_link(path: &str) -> Option<String> {
-        std::fs::read_link(path)
-            .ok()
-            .map(|link| link.to_string_lossy().into_owned())
-    }
-
-    fn twin_read_id(path: &str) -> Option<(u64, u64)> {
-        std::fs::metadata(path)
-            .ok()
-            .map(|meta| (meta.dev(), meta.ino()))
-    }
-
+    /// Test mirror of the production exit proof in [`resolve_pid_caller`],
+    /// so gated twins exercise the real proof through the injected seam.
     fn twin_proven_exited(pid: u32) -> bool {
         crate::process::process_proven_exited(pid) || crate::process::generation_dead(pid)
     }
@@ -26960,11 +26988,12 @@ int main(int argc, char **argv) {
     fn resolve_pid_caller_withholds_a_renamed_path_when_an_exec_lands_between_its_reads() {
         // Terminal-acquisition twin: attach coherently reads program A;
         // the still-running A is renamed; the end-of-capture acquisition
-        // reads the renamed link text, then the child execs program B
-        // before the identity lookup. The mixed pair (renamed old path +
-        // new image identity) must never publish the renamed path as an
-        // exec destination: the rename was never an exec, and the real
-        // destination is B.
+        // opens the renamed executable, then the child execs program B
+        // before the path and identity are derived through the held
+        // descriptor. The coherent pre-exec pair (renamed old path + old
+        // identity) must never publish the renamed path as an exec
+        // destination: the rename was never an exec, and the observation
+        // predates the exec to B.
         let dir = tempfile::tempdir().unwrap();
         let race_a = compile_gated_fixture(dir.path(), "race-A", GATED_EXEC_SOURCE);
         let race_b = compile_gated_fixture(dir.path(), "race-B", GATED_LINGER_SOURCE);
@@ -26980,13 +27009,9 @@ int main(int argc, char **argv) {
         let pid = child.0.id();
         wait_for_exe_suffix(pid, "race-A", "the gated fixture never exec'd race-A");
         let pin = crate::process::PidPin::open(pid).expect("pinning the live child");
-        let attach = resolve_pid_caller_with(
-            pid,
-            twin_read_link,
-            twin_read_id,
-            twin_proven_exited,
-            || pin.still_the_same(),
-        );
+        let attach = resolve_pid_caller_with(pid, read_exe_observation, twin_proven_exited, || {
+            pin.still_the_same()
+        });
         assert!(
             attach
                 .exe
@@ -26995,31 +27020,22 @@ int main(int argc, char **argv) {
                 .ends_with("race-A"),
             "{attach:?}"
         );
-        assert!(
-            attach.exe_id.is_some(),
-            "a readable attach exe carries its file identity: {attach:?}"
-        );
+        let attach_id = attach
+            .exe_id
+            .expect("a readable attach exe carries its file identity");
         let renamed = dir.path().join("race-A-renamed");
         std::fs::rename(&race_a, &renamed).unwrap();
         let end = resolve_pid_caller_with(
             pid,
             |path| {
-                let link = twin_read_link(path);
-                assert!(
-                    link.as_deref()
-                        .unwrap_or_default()
-                        .ends_with("race-A-renamed"),
-                    "the end read starts from the renamed link text: {link:?}"
-                );
-                std::fs::write(&gate, b"go").unwrap();
-                wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
-                link
+                read_exe_observation_with(path, || {
+                    std::fs::write(&gate, b"go").unwrap();
+                    wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
+                })
             },
-            twin_read_id,
             twin_proven_exited,
             || pin.still_the_same(),
         );
-        let meta_b = std::fs::metadata(&race_b).expect("statting race-B");
         assert!(
             end.exe
                 .as_deref()
@@ -27029,8 +27045,8 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             end.exe_id,
-            Some((meta_b.dev(), meta_b.ino())),
-            "the exec landed between the link read and the identity lookup: {end:?}"
+            Some(attach_id),
+            "the held descriptor pins the pre-exec object: {end:?}"
         );
         assert!(
             pin.still_the_same(),
@@ -27059,10 +27075,10 @@ int main(int argc, char **argv) {
 
     #[test]
     fn resolve_pid_caller_withholds_a_mixed_attach_when_an_exec_lands_between_its_reads() {
-        // Attach-acquisition twin: the attach read takes program A's link
-        // text, then the child execs program B before the identity
-        // lookup. The mixed attach (old path + new identity) suppresses
-        // the real A->B exec; a coherent attach instead proves it and
+        // Attach-acquisition twin: the attach acquisition opens program A,
+        // then the child execs program B before the path and identity are
+        // derived through the held descriptor. The coherent pre-exec
+        // attach (old path + old identity) proves the real A->B exec and
         // names the true destination B.
         let dir = tempfile::tempdir().unwrap();
         let race_a = compile_gated_fixture(dir.path(), "race-A", GATED_EXEC_SOURCE);
@@ -27082,19 +27098,15 @@ int main(int argc, char **argv) {
         let attach = resolve_pid_caller_with(
             pid,
             |path| {
-                let link = twin_read_link(path);
-                assert!(
-                    link.as_deref().unwrap_or_default().ends_with("race-A"),
-                    "the attach read starts from program A: {link:?}"
-                );
-                std::fs::write(&gate, b"go").unwrap();
-                wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
-                link
+                read_exe_observation_with(path, || {
+                    std::fs::write(&gate, b"go").unwrap();
+                    wait_for_exe_suffix(pid, "race-B", "the gated child never exec'd race-B");
+                })
             },
-            twin_read_id,
             twin_proven_exited,
             || pin.still_the_same(),
         );
+        let meta_a = std::fs::metadata(&race_a).expect("statting race-A");
         let meta_b = std::fs::metadata(&race_b).expect("statting race-B");
         assert!(
             attach
@@ -27106,16 +27118,12 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             attach.exe_id,
-            Some((meta_b.dev(), meta_b.ino())),
-            "the exec landed between the link read and the identity lookup: {attach:?}"
+            Some((meta_a.dev(), meta_a.ino())),
+            "the held descriptor pins the pre-exec object: {attach:?}"
         );
-        let end = resolve_pid_caller_with(
-            pid,
-            twin_read_link,
-            twin_read_id,
-            twin_proven_exited,
-            || pin.still_the_same(),
-        );
+        let end = resolve_pid_caller_with(pid, read_exe_observation, twin_proven_exited, || {
+            pin.still_the_same()
+        });
         assert!(
             end.exe.as_deref().unwrap_or_default().ends_with("race-B"),
             "{end:?}"

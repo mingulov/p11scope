@@ -5941,6 +5941,19 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
             &exports,
         );
         let authorized = table_name_authorized(&score);
+        // Semantic eligibility is name authorization with the manifest
+        // contribution removed (controller ruling 2026-11-12 05:25): a
+        // stale fallback proof lends names only, so a granting arm
+        // additionally needs independent publication evidence —
+        // linkage, a live return, or full export agreement. The sole
+        // leg proves layout from scan structure alone, so without this
+        // gate a stale-backed exports-disagreeing replacement would
+        // authorize 68/68 semantic slots while the same replacement
+        // without stale support stays count-only.
+        let semantic_eligible = table_name_authorized(&TableEvidenceScore {
+            manifest: false,
+            ..score
+        });
         // Argument-read (semantic) authority from a scan needs the
         // table's standard layout proven by scan-time evidence
         // (controller ruling 2026-11-11 clause 1): the version field
@@ -5980,7 +5993,8 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         let scan_finished = scanned.tables_scan_finished;
         let sole_proven = sole_complete_table_authorized(module, index, &exports, true);
         let getter_proven = getter_export_authorized(module, index, &exports, &score, true);
-        let standard_layout_evidence = if !authorized || !standard_layout_core(module, index) {
+        let standard_layout_evidence = if !semantic_eligible || !standard_layout_core(module, index)
+        {
             None
         } else if score.linked {
             Some("interface linkage")
@@ -6008,7 +6022,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // tables fail the assumed-finished legs and stay refused.
         let reproven_unfinished =
             standard_layout_evidence.is_none() && !scan_finished && (sole_proven || getter_proven);
-        let scan_semantic = authorized && standard_layout_evidence.is_some();
+        let scan_semantic = semantic_eligible && standard_layout_evidence.is_some();
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -8842,11 +8856,7 @@ mod tests {
             for (label, plan) in [
                 (
                     "main",
-                    build_from_sources(
-                        std::slice::from_ref(&module),
-                        &[],
-                        &PinnedObjects::empty(),
-                    ),
+                    build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty()),
                 ),
                 (
                     "scan-authorized",
@@ -8858,11 +8868,7 @@ mod tests {
                 ),
             ] {
                 let context = format!("{why} ({label}, stale={stale})");
-                assert_eq!(
-                    plan.slots.len(),
-                    68,
-                    "{context}: all entries stay admitted"
-                );
+                assert_eq!(plan.slots.len(), 68, "{context}: all entries stay admitted");
                 assert_eq!(
                     plan.modules[0].tables[0].exports_agreeing,
                     Some(agreeing),

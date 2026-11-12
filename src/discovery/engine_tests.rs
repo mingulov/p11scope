@@ -47800,6 +47800,111 @@ fn tick_quantum_expires_mid_path_in_newcomer_admission() {
         "the deferral publishes explicit evidence: {skipped:?}"
     );
 }
+
+/// View-collapse fix6 A2 (owner 20:20): past the concurrent library-handle
+/// cap the newcomer-admission loop defers with its requests retained and a
+/// counted named gap, never dropping. The test cap of 2 exercises the same
+/// gate the thousand does; two pre-held `/dev/null` handles trip it before
+/// the live pid is attempted.
+#[test]
+fn library_handle_budget_defers_newcomer_past_cap() {
+    let mut engine = Engine::empty();
+    for id in [1001u32, 1002] {
+        let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+            std::path::Path::new("/dev/null"),
+            None,
+            0,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        engine.scan_inputs.insert(
+            ProcessViewId(id),
+            ScanInput {
+                modules: Vec::new(),
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+    }
+    engine.library_handle_cap_for_test = Some(2);
+    let live_pid = std::process::id();
+    let tick_start = 1_000_000u64;
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, failed, skipped) = engine.admit_inventory_new_views(
+        vec![live_pid],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut tick_now,
+    );
+    assert!(
+        failed.contains(&live_pid),
+        "the over-budget pid stays queued: {failed:?}"
+    );
+    assert!(
+        !new_views.iter().any(|(view, _, _)| view.pid() == live_pid),
+        "the over-budget pid stages no view"
+    );
+    assert!(
+        skipped.iter().any(|skip| skip.subject == "library handles"
+            && skip.reason.contains("library-handle budget")
+            && skip.reason.contains("deferred to the next tick")),
+        "the deferral files the counted named gap: {skipped:?}"
+    );
+}
+
+/// Healthy control for the budget twin above: under the cap the same
+/// newcomer stages. Passes before the gate exists (nothing defers) and
+/// after (two held handles are below the thousand).
+#[test]
+fn library_handle_headroom_admits_newcomer() {
+    let mut engine = Engine::empty();
+    for id in [1001u32, 1002] {
+        let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+            std::path::Path::new("/dev/null"),
+            None,
+            0,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        engine.scan_inputs.insert(
+            ProcessViewId(id),
+            ScanInput {
+                modules: Vec::new(),
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+    }
+    let live_pid = std::process::id();
+    let tick_start = 1_000_000u64;
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, failed, skipped) = engine.admit_inventory_new_views(
+        vec![live_pid],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut tick_now,
+    );
+    assert!(
+        new_views.iter().any(|(view, _, _)| view.pid() == live_pid),
+        "the under-budget pid stages: {failed:?} {skipped:?}"
+    );
+    assert!(
+        !skipped.iter().any(|skip| skip.subject == "library handles"),
+        "no budget gap under the cap: {skipped:?}"
+    );
+}
 /// C3: discovery-before-semantics ordering. The discovery batch publishes
 /// synchronously before it returns: when the arrival batch (refresh commit
 /// plus tail) completes, the published artifact already carries the

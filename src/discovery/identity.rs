@@ -2164,6 +2164,18 @@ impl PinnedObjects {
         self.by_id.len()
     }
 
+    /// Inserts every distinct held library fd of this set into `fds`
+    /// (fix6 A2): entries sharing one `Arc` insert once, so the union
+    /// over all retained sets is exactly the capture's concurrent
+    /// library handles. Raw fd numbers: unique per process at an
+    /// instant, never reopened or compared across time.
+    pub(crate) fn held_library_fds(&self, fds: &mut BTreeSet<std::os::unix::io::RawFd>) {
+        use std::os::unix::io::AsRawFd as _;
+        for entry in self.by_id.values() {
+            fds.insert(entry.file.as_raw_fd());
+        }
+    }
+
     /// The held object's `vm_file` identity ([`self_mapped_file`]):
     /// what another process's `map_files` range must equal before a maps
     /// key may stand for this object there (C1b sweep matching).
@@ -19857,5 +19869,37 @@ mod tests {
         incoming.by_id.get_mut(&incoming_id).unwrap().pre_copy_up = true;
         let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
         assert_eq!(new_fds, 1, "a pre-copy-up pin keeps its own fd");
+    }
+
+    /// View-collapse fix6 A2 (owner 20:20): the concurrent library-handle
+    /// budget counts distinct held files, so views sharing one pin count
+    /// once. The sharing here is a manual `Arc` clone (no dependence on
+    /// the A1 share path): the counter must see through any aliasing.
+    #[test]
+    fn held_library_fds_counts_shared_files_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::write(&first, b"first-bytes").unwrap();
+        std::fs::write(&second, b"second-bytes").unwrap();
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let retained = test_fixture::real_scan_pin(&first, None, 0, sha);
+        let incoming = test_fixture::real_scan_pin(&second, None, 1, sha);
+        let mut shared = test_fixture::real_scan_pin(&first, None, 1, sha);
+        let shared_id = *shared.by_id.keys().next().unwrap();
+        let retained_arc = retained.by_id.values().next().unwrap().file.clone();
+        shared.by_id.get_mut(&shared_id).unwrap().file = retained_arc;
+        let mut fds = std::collections::BTreeSet::new();
+        retained.held_library_fds(&mut fds);
+        assert_eq!(fds.len(), 1);
+        incoming.held_library_fds(&mut fds);
+        assert_eq!(fds.len(), 2);
+        shared.held_library_fds(&mut fds);
+        assert_eq!(fds.len(), 2, "the shared pin adds no new handle");
+        drop(incoming);
+        let mut fds = std::collections::BTreeSet::new();
+        retained.held_library_fds(&mut fds);
+        shared.held_library_fds(&mut fds);
+        assert_eq!(fds.len(), 1, "two views over one file hold one handle");
     }
 }

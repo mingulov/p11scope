@@ -552,6 +552,13 @@ pub struct Engine {
     /// follows the process-wide environment variable the gate reads).
     #[cfg(test)]
     candidate_reuse_for_test: Option<bool>,
+    /// Test-only override for the concurrent library-handle cap (fix6
+    /// A2). Production always gates on
+    /// [`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    /// the budget twin scripts a small cap so the deferral is drivable
+    /// without holding a thousand fds.
+    #[cfg(test)]
+    library_handle_cap_for_test: Option<usize>,
     /// Test-only staging: latch the committed pin-set changed flags between
     /// the tick's First and Final candidate builds, exactly as a
     /// between-builds `check_unchanged` detection would. The reuse twin
@@ -7048,17 +7055,24 @@ pub(crate) fn credited_scan_shape(
 /// [`share_scan_pins_with_retained`]), and only the fds the admission
 /// newly holds are debited — the reserve stays a safety net over what
 /// remains after the duplicates are released, not over the duplicates.
+/// Sharing runs unconditionally; the debit needs the tick, so an
+/// unreadable snapshot still shares (fail open on the guard, never on
+/// the dedupe). Returns the newly held count so the library-handle
+/// budget (fix6 A2) can track the pass exactly without recounting per
+/// pid.
 ///
 /// [`FdReserveTick::note_opened`]: crate::fd_budget::FdReserveTick::note_opened
 /// [`share_scan_pins_with_retained`]: crate::discovery::identity::share_scan_pins_with_retained
 pub(crate) fn note_retained_scan_pins<'a>(
-    tick: &mut crate::fd_budget::FdReserveTick,
+    tick: Option<&mut crate::fd_budget::FdReserveTick>,
     pins: &mut PinnedObjects,
     retained: impl IntoIterator<Item = &'a PinnedObjects>,
-) {
-    tick.note_opened_n(crate::discovery::identity::share_scan_pins_with_retained(
-        pins, retained,
-    ));
+) -> u64 {
+    let new_fds = crate::discovery::identity::share_scan_pins_with_retained(pins, retained);
+    if let Some(tick) = tick {
+        tick.note_opened_n(new_fds);
+    }
+    new_fds
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -7715,6 +7729,13 @@ fn discover_plan(
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
     }
+    // Library-handle budget (fix6 A2, owner 20:20), counted once for the
+    // whole pass: at most 1000 distinct library files held at once. The
+    // pass tracks its own admissions exactly (see the share step below);
+    // only removals and rebuilds move the count otherwise, and the next
+    // pass recounts from the live sets.
+    let library_cap = discovered.library_handle_cap();
+    let mut held_handles = discovered.count_held_library_handles();
     for pid in selected.iter() {
         // The pass counts its own opens against the snapshot (conservative
         // within the pass: drops are not subtracted; the fresh snapshot
@@ -7724,6 +7745,18 @@ fn discover_plan(
                 subject: "process view".into(),
                 reason: "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
                     .into(),
+            };
+            attribution::note(&skipped);
+            discovered.base_counters.object_skips.push(skipped);
+            break;
+        }
+        // Past the handle cap the rest wait for the next tick with their
+        // counted named gap, never dropped; a later pass with freed
+        // handles serves them instead of losing the work.
+        if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
+            let skipped = Skipped {
+                subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
+                reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL.into(),
             };
             attribution::note(&skipped);
             discovered.base_counters.object_skips.push(skipped);
@@ -7853,14 +7886,15 @@ fn discover_plan(
                 // physical file with the already-admitted views, then
                 // debit what newly remains before the next admission
                 // decision, or a small hard `RLIMIT_NOFILE` reaches
-                // `EMFILE` mid-pass.
-                if let Some(tick) = reserve_tick.as_mut() {
-                    note_retained_scan_pins(
-                        tick,
-                        &mut pins,
-                        discovered.scan_inputs.values().map(|input| &input.pins),
-                    );
-                }
+                // `EMFILE` mid-pass. The same new-fd count tracks the
+                // pass's library-handle budget exactly.
+                let new_fds = note_retained_scan_pins(
+                    reserve_tick.as_mut(),
+                    &mut pins,
+                    discovered.scan_inputs.values().map(|input| &input.pins),
+                );
+                held_handles =
+                    held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
@@ -11872,6 +11906,8 @@ impl Engine {
             disable_publish_deferral_for_test: false,
             #[cfg(test)]
             candidate_reuse_for_test: None,
+            #[cfg(test)]
+            library_handle_cap_for_test: None,
             #[cfg(test)]
             latch_pinned_changed_between_builds_for_test: false,
             plan_rebuild_stable: false,
@@ -27086,6 +27122,38 @@ impl Engine {
         }
     }
 
+    /// The concurrent library-handle cap for this capture (fix6 A2):
+    /// [`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
+    /// or the test override when one is set.
+    fn library_handle_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.library_handle_cap_for_test {
+            return cap;
+        }
+        crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES
+    }
+
+    /// Distinct library files this capture currently holds (fix6 A2):
+    /// the union over per-view scan pins, manifest pins, pre-arm pins
+    /// and the engine aggregate (whose entries alias the same `Arc`s, so
+    /// the union counts them once). Each admission pass counts once up
+    /// front, then tracks its own additions exactly through the share
+    /// step's new-fd count instead of recounting per pid.
+    fn count_held_library_handles(&self) -> usize {
+        let mut fds = BTreeSet::new();
+        for input in self.scan_inputs.values() {
+            input.pins.held_library_fds(&mut fds);
+        }
+        for input in &self.manifest_inputs {
+            input.pins.held_library_fds(&mut fds);
+        }
+        if let Some(prearm) = &self.prearm_input {
+            prearm.pins.held_library_fds(&mut fds);
+        }
+        self.pinned.held_library_fds(&mut fds);
+        fds.len()
+    }
+
     fn admit_inventory_new_views(
         &mut self,
         admitted: Vec<u32>,
@@ -27103,6 +27171,10 @@ impl Engine {
         // one is ever staged: every staging resolves at the very next
         // loop-top, and the last admitted pid never stages (empty tail).
         let mut staged_yield: Option<(u32, InventoryNewView)> = None;
+        // The staged admission's newly held library handles (fix6 A2):
+        // counted at staging like any admission, subtracted if the yield
+        // completes and drops the staged pins at the next loop-top.
+        let mut staged_new_fds: u64 = 0;
         let mut unprocessed = admitted.into_iter();
         // FD reserve (scan-1k guard), sampled once for the tick: one
         // pidfd plus the retained scan pins per admitted view cross a
@@ -27119,6 +27191,13 @@ impl Engine {
                 reason: crate::fd_budget::UNREADABLE_REASON.into(),
             });
         }
+        // Library-handle budget (fix6 A2, owner 20:20), counted once for
+        // the tick: at most 1000 distinct library files held at once.
+        // This tick's own admissions track their exact new-fd counts
+        // (see the share step below); the next tick recounts from the
+        // live sets, so releases between ticks free budget.
+        let library_cap = self.library_handle_cap();
+        let mut held_handles = self.count_held_library_handles();
         while let Some(pid) = unprocessed.next() {
             // The tick quantum stops admissions before another scan: this
             // pid and the rest defer with their requests retained. This
@@ -27128,6 +27207,11 @@ impl Engine {
             if let Some((staged_pid, (staged_view, staged_modules, staged_pins))) =
                 staged_yield.take()
             {
+                // The staged admission's handles were counted at staging;
+                // a completion drops the staged pins, so the count drops
+                // with them. A keep carries the count into the push below.
+                let staged_held = staged_new_fds;
+                staged_new_fds = 0;
                 if quantum_expired {
                     // The tail is never attempted: the head keeps the
                     // slot it proved, exactly as without the yield.
@@ -27146,6 +27230,8 @@ impl Engine {
                     self.newcomer_first_seen.remove(&staged_pid);
                     self.newcomer_counted.remove(&staged_pid);
                     self.probationary_completions = self.probationary_completions.saturating_add(1);
+                    held_handles = held_handles
+                        .saturating_sub(usize::try_from(staged_held).unwrap_or(usize::MAX));
                 }
             }
             if quantum_expired {
@@ -27176,6 +27262,21 @@ impl Engine {
                     subject: "live discovery tick".into(),
                     reason: "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
                         .into(),
+                });
+                break;
+            }
+            // Library-handle budget (fix6 A2, owner 20:20): past the cap
+            // this pid and the rest defer with their requests retained,
+            // exactly like the quantum-expiry tail, with their counted
+            // named gap — never dropped.
+            if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
+                for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
+                    self.mark_unattempted_fresh(deferred_pid, ledger);
+                    failed_refresh_pids.insert(deferred_pid);
+                }
+                skipped.push(Skipped {
+                    subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
+                    reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into(),
                 });
                 break;
             }
@@ -27321,19 +27422,22 @@ impl Engine {
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, mut pins, complete)) => {
                     // The tick retains this scan's pins from here (staged
-                    // or pushed below; a staged yield that completes drops
-                    // them at the next loop-top without a refund, staying
-                    // conservative): share one pin per physical file with
-                    // the already-retained views, then debit what newly
-                    // remains before the next admission decision, or a
-                    // small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-tick.
-                    if let Some(tick) = reserve_tick.as_mut() {
-                        note_retained_scan_pins(
-                            tick,
-                            &mut pins,
-                            self.scan_inputs.values().map(|input| &input.pins),
-                        );
-                    }
+                    // or pushed below): share one pin per physical file
+                    // with the already-retained views, then debit what
+                    // newly remains before the next admission decision, or
+                    // a small hard `RLIMIT_NOFILE` reaches `EMFILE`
+                    // mid-tick. The reserve stays conservative (a staged
+                    // yield that completes drops its pins at the next
+                    // loop-top without a refund); the library-handle
+                    // budget tracks the same new-fd count exactly (its
+                    // staged share is subtracted on completion above).
+                    let new_fds = note_retained_scan_pins(
+                        reserve_tick.as_mut(),
+                        &mut pins,
+                        self.scan_inputs.values().map(|input| &input.pins),
+                    );
+                    held_handles =
+                        held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot
                     // when a pending waiter follows in this window — the
@@ -27366,6 +27470,7 @@ impl Engine {
                             staged_yield.is_none(),
                             "the previous staging resolved at this pid's loop-top"
                         );
+                        staged_new_fds = new_fds;
                         staged_yield = Some((pid, (view, modules, pins)));
                         continue;
                     }

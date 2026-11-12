@@ -17,6 +17,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// raise makes this bind only where the hard limit is tiny too.
 pub(crate) const FD_RESERVE: u64 = 128;
 
+/// Concurrent library handles a capture may hold at once (view-collapse
+/// fix6 A2, owner 20:20): scan pins, manifest pins and pre-arm pins hold
+/// one fd per physical file (see `share_scan_pins_with_retained`), and
+/// their distinct held files never exceed this. Past it, admissions wait
+/// for the next tick under the counted named gap below, never dropped.
+/// The lifetime number of distinct libraries stays unlimited: handles
+/// release when their view drops (or their duplicate closes at share
+/// time) and every pass recounts from the live sets.
+pub(crate) const MAX_CONCURRENT_LIBRARY_HANDLES: usize = 1000;
+
+/// True when `held` distinct library handles reach the concurrent `cap`:
+/// the next admissions must wait for the next tick. Production passes
+/// [`MAX_CONCURRENT_LIBRARY_HANDLES`]; tests script small caps.
+pub(crate) fn library_handle_budget_exhausted(held: usize, cap: usize) -> bool {
+    held >= cap
+}
+
+/// The fixed subject of the over-budget deferral gap: admissions held
+/// back by the concurrent library-handle cap.
+pub(crate) const LIBRARY_HANDLE_BUDGET_SUBJECT: &str = "library handles";
+
+/// The fixed reasons beside it, per admission loop (mirroring the fd
+/// reserve's initial/live pair): the cap, the wait, never a drop.
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_INITIAL: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining processes deferred to the next tick";
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LIVE: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining new processes deferred to the next tick";
+
 /// The soft-limit target for the startup raise: the hard limit, literally
 /// (standard practice). The `max` only guards an insane `getrlimit` result
 /// (`soft > hard` never happens); it never lowers.
@@ -542,7 +568,7 @@ mod tests {
             );
             held_pins.push(pins);
             crate::discovery::engine::note_retained_scan_pins(
-                &mut tick,
+                Some(&mut tick),
                 held_pins.last_mut().expect("just pushed"),
                 std::iter::empty::<&crate::discovery::identity::PinnedObjects>(),
             );
@@ -665,5 +691,35 @@ mod tests {
         assert!(claim_unreadable_report(&slot));
         assert!(!claim_unreadable_report(&slot));
         assert!(!claim_unreadable_report(&slot));
+    }
+
+    /// View-collapse fix6 A2 (owner 20:20): the handle limit is
+    /// concurrent — at most 1000 library handles held at once, while the
+    /// lifetime number of distinct libraries stays unlimited.
+    #[test]
+    fn library_handle_budget_holds_a_thousand_concurrent_handles() {
+        assert_eq!(MAX_CONCURRENT_LIBRARY_HANDLES, 1000);
+        assert!(!library_handle_budget_exhausted(
+            999,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_exhausted(
+            1000,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_exhausted(
+            1001,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+    }
+
+    /// Failure pair: the gate defers at any cap, so the admission twin's
+    /// small test cap exercises the same boundary the thousand does.
+    #[test]
+    fn library_handle_budget_defers_at_any_cap() {
+        assert!(!library_handle_budget_exhausted(0, 2));
+        assert!(!library_handle_budget_exhausted(1, 2));
+        assert!(library_handle_budget_exhausted(2, 2));
+        assert!(library_handle_budget_exhausted(3, 2));
     }
 }

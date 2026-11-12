@@ -10251,8 +10251,7 @@ fn arming_a_view_exited_mid_arm_is_silent_not_unavailable() {
             .unwrap(),
     );
     let pid = child.0.id();
-    let view =
-        crate::process::reused_process_view_for_test(ProcessViewId(0), pid).unwrap();
+    let view = crate::process::reused_process_view_for_test(ProcessViewId(0), pid).unwrap();
     assert!(
         !view.still_the_same(),
         "the reused view must lose the generation postcheck"

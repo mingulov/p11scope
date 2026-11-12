@@ -40564,11 +40564,13 @@ fn under_cap_order_unchanged() {
     assert_eq!(select_deep_scan_candidates(&sweep, 256), vec![7, 9001]);
 }
 
-/// View-collapse fix1 (RED): over the cap, unselected processes sharing
-/// an examined exact `.so`-set count as shape-covered; unique shapes
-/// past truncation and unmapped individuals do not. Three shapes over
-/// a 2-cap: the two survivors share one shape, the third shape is
-/// truncated. Kernel-thread exclusions never count.
+/// View-collapse fix1c (stable): over the cap, unselected processes
+/// sharing an examined exact `.so`-set count as shape-covered; unique
+/// shapes past truncation and unmapped individuals do not. Three
+/// shapes over a 2-cap: the two survivors share one shape, the third
+/// shape is truncated. Kernel-thread exclusions never count. Each
+/// retained scan was complete and saw its sweep shape (stable maps),
+/// so the examined set holds the retained sweep shapes.
 #[test]
 fn deep_scan_shape_covered_counts_same_shape_sharing() {
     fn map_entry(path: &str, inode: u64) -> MapEntry {
@@ -40582,6 +40584,17 @@ fn deep_scan_shape_covered_counts_same_shape_sharing() {
             raw_path: Some(path.as_bytes().to_vec()),
         }
     }
+    fn examined_of(
+        sweep: &[(u32, Vec<MapEntry>)],
+        retained: &[u32],
+    ) -> BTreeSet<BTreeSet<ObjectKey>> {
+        retained
+            .iter()
+            .filter_map(|pid| sweep.iter().find(|(p, _)| p == pid))
+            .map(|(_, entries)| shape_key(entries))
+            .filter(|key| !key.is_empty())
+            .collect()
+    }
     // Collapse with full coverage: A=[10], B=[20,21,22]; cap 2 selects
     // [10,20], leaving [21,22] sharing B with the examined 20.
     let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
@@ -40594,7 +40607,12 @@ fn deep_scan_shape_covered_counts_same_shape_sharing() {
     assert_eq!(selected, vec![10, 20]);
     let excluded = BTreeSet::new();
     assert_eq!(
-        deep_scan_shape_covered(&sweep, &selected, &excluded),
+        deep_scan_shape_covered(
+            &sweep,
+            &selected,
+            &excluded,
+            &examined_of(&sweep, &selected)
+        ),
         2,
         "21,22 share B with examined 20"
     );
@@ -40608,7 +40626,12 @@ fn deep_scan_shape_covered_counts_same_shape_sharing() {
     let selected = select_deep_scan_candidates(&truncated, 2);
     assert_eq!(selected, vec![10, 20]);
     assert_eq!(
-        deep_scan_shape_covered(&truncated, &selected, &excluded),
+        deep_scan_shape_covered(
+            &truncated,
+            &selected,
+            &excluded,
+            &examined_of(&truncated, &selected)
+        ),
         0,
         "30's unique shape was never examined"
     );
@@ -40622,9 +40645,78 @@ fn deep_scan_shape_covered_counts_same_shape_sharing() {
     let selected = select_deep_scan_candidates(&unmapped, 2);
     assert_eq!(selected, vec![10, 20]);
     assert_eq!(
-        deep_scan_shape_covered(&unmapped, &selected, &excluded),
+        deep_scan_shape_covered(
+            &unmapped,
+            &selected,
+            &excluded,
+            &examined_of(&unmapped, &selected)
+        ),
         0,
         "empty keys share no examination"
+    );
+}
+
+/// View-collapse fix1c: both PIDs initially map A; selection chooses
+/// 10; 10 unloads A and loads B before its view/deep scan. The
+/// retained scan examines B, so unselected 20 (still A) shares no
+/// examined shape and stays in the remainder.
+#[test]
+fn changed_retained_maps_must_not_cover_old_shape() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![map_entry("/tmp/a.so", 1)]),
+    ];
+    // Retained PID 10; its complete scan saw B (unloaded A, loaded B).
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    let scanned_b = vec![map_entry("/tmp/b.so", 2)];
+    let examined: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::from([shape_key(&scanned_b)]);
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; retained scan saw B, unselected PID 20 maps only A"
+    );
+}
+
+/// View-collapse fix1c: both PIDs map A; 10 is retained but its scan
+/// was incomplete (unavailable/truncated), so it examined nothing and
+/// contributes no shape. Unselected 20 stays in the remainder.
+#[test]
+fn incomplete_retained_scan_must_not_cover_old_shape() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![map_entry("/tmp/a.so", 1)]),
+    ];
+    // Retained PID 10; its scan was incomplete: no examined shape.
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    let examined: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; retained scan incomplete, unselected PID 20 unexamined"
     );
 }
 

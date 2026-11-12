@@ -3739,14 +3739,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let seq = state.finalize_seq;
             let mut lift: Vec<(u64, u64)> = Vec::new();
             state.taint_lift.retain(|image, first| {
-                let own = self.semantic_bindings.has_ticket(domain, image.0)
+                // The lift needs the exact image (cookie and exec): a
+                // process keeps its ticket across exec, so another
+                // exec's binding or admission must never clear this
+                // image's taint.
+                let exact = ImageIdentity {
+                    task_cookie: image.0,
+                    exec_id: image.1,
+                };
+                let own = self
+                    .semantic_bindings
+                    .find_by_image(domain, exact)
+                    .is_some()
                     || self
                         .semantic_bindings
                         .admission_images
                         .values()
-                        .any(|history| {
-                            history.domain == domain && history.image.task_cookie == image.0
-                        });
+                        .any(|history| history.domain == domain && history.image == exact);
                 let expired = seq.saturating_sub(*first) >= finalizer::TAINT_LIFT_GRACE;
                 if own && !expired {
                     lift.push(*image);
@@ -6222,9 +6231,10 @@ mod finalizer_history_tests {
     fn refused_other_caller_sheds_after_its_own_binding_keep_the_bound_history() {
         use crate::semantics_objects::journal::H3DispositionEvidence;
         // The live intruder shape: a foreign caller's first unrouted
-        // calls prove it another caller; held past its grace without
-        // binding, its image is refused in the journal and it can never
-        // join Joint. It then binds (S1 only, named). A later unrouted
+        // calls prove it another caller; tainted at once, its lift
+        // window expires unbound, so its image stays refused in the
+        // journal and it can never join Joint. It then binds (S1 only,
+        // named). A later unrouted
         // call of that same image is still provably not the bound Joint
         // caller's: it must dispose, not barrier, even though its own
         // binding and admission history now hold its cookie.
@@ -6266,9 +6276,10 @@ mod finalizer_history_tests {
             ),
             "the unbound foreign sheds dispose as before: {first:?}"
         );
-        // JK-19b: the foreign sheds dispose AND hold (no taint yet).
-        // Quiet batches past the bounded grace expire the hold, and
-        // only then is the never-bound image refused.
+        // JK-19b: the foreign sheds dispose AND taint at once.
+        // Quiet batches past the bounded grace expire the lift window,
+        // and only then is the never-bound image permanently refused
+        // (a late bind no longer lifts).
         for position in 10u64..30u64 {
             commit_outcomes(
                 &mut coordinator,
@@ -6465,8 +6476,9 @@ mod finalizer_history_tests {
                 unrouted_call(domain, 77, 2),
             ],
         );
-        // JK-19b: expire the hold before the S1-only bind, so the later
-        // shed below still exercises the refused-image disposal path.
+        // JK-19b: expire the lift window before the S1-only bind, so
+        // the bind does not lift and the later shed below still
+        // exercises the refused-image disposal path.
         for position in 10u64..30u64 {
             commit_outcomes(
                 &mut coordinator,

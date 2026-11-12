@@ -1258,11 +1258,36 @@ pub(crate) struct JournalAdapter {
     /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
     taint_overflow: bool,
+    /// Shed-only taint provenance (JK-19b): tainted images whose only
+    /// cause is a shed refusal, hence eligible to lift on timely
+    /// binding. Any non-shed taint promotes the image to permanent by
+    /// removing it here — including re-taints before the early
+    /// return — so a genuine contradiction during grace is never
+    /// cleared by the lift. Terminals expected-absent because of
+    /// taint never reach `taint_image`, so a bursting shed-tainted
+    /// image's own later ENDs do not promote. A lifted image leaves
+    /// this set; a later fresh shed re-enters it. Capped at the
+    /// sighting bound; past it the taint lands but never lifts (fail
+    /// closed).
+    shed_only_taints: BTreeSet<(u64, u64)>,
+    /// Terminals expected-absent because of taint (JK-19b): (image,
+    /// native key) pairs whose BEGIN was refused-due-to-taint or
+    /// dropped by a taint. Their terminal keeps the Contradiction
+    /// disposition and telemetry, but it is the taint working as
+    /// intended — a bursting shed-tainted image's own later ENDs —
+    /// not new evidence, so it never promotes the shed-taint to
+    /// permanent. Consumed on arrival: a second terminal for one key
+    /// is genuinely duplicative and promotes. Image-scoped, so one
+    /// image's refused keys never excuse another image's unmatched
+    /// terminal. Capped at the open-table bound (the same key
+    /// population); past the cap new keys are not recorded and their
+    /// terminals promote (fail closed).
+    taint_derived_absent: BTreeSet<((u64, u64), JournalNativeKey)>,
     /// Shed-taints lifted by timely binding (JK-19b): images whose
     /// pre-bind sheds stay first-observed / not attributed, eligible
     /// for the Exec-to-attach birth fallback. Capped like the taint
-    /// set; past the cap new lifts simply never fall back (fail
-    /// closed). Only `untaint_shed_image` inserts.
+    /// set; past the cap the taint stays (fail closed). Only
+    /// `untaint_shed_image` inserts.
     lifted_images: BTreeSet<(u64, u64)>,
     contradictions: JournalContradictionDiagnosis,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
@@ -1371,6 +1396,8 @@ impl JournalAdapter {
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
+            shed_only_taints: BTreeSet::new(),
+            taint_derived_absent: BTreeSet::new(),
             lifted_images: BTreeSet::new(),
             contradictions: JournalContradictionDiagnosis::default(),
             sightings: BTreeMap::new(),
@@ -1822,6 +1849,9 @@ impl JournalAdapter {
         let key = (begin.thread(), begin.sequence());
         let image = Self::image_of_begin(&begin);
         if self.is_tainted(image) {
+            // Its terminal will arrive unmatched: expected-absent
+            // because of this refusal, never a promotion.
+            self.note_taint_derived_absence(image, key);
             return JournalDisposition::Refused;
         }
         // The frozen endpoint table is enforced here, before key
@@ -1962,6 +1992,18 @@ impl JournalAdapter {
     fn ingest_end(&mut self, ordinal: u64, end: ValidatedJournalEnd) -> JournalDisposition {
         let key = (end.thread(), end.sequence());
         let Some(entry) = self.open.get(&key) else {
+            if self.take_taint_derived_absence(end_image(&end), key) {
+                // The taint itself refused or dropped this call's
+                // BEGIN, so its END is expected-absent: keep the
+                // disposition and telemetry, but do not promote a
+                // shed-taint to permanent for it.
+                self.contradictions.note(TaintCause::Contradiction(
+                    JournalContradiction::TerminalBeforeBegin,
+                ));
+                return JournalDisposition::Contradiction(
+                    JournalContradiction::TerminalBeforeBegin,
+                );
+            }
             self.taint_image(
                 end_image(&end),
                 TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
@@ -2017,8 +2059,20 @@ impl JournalAdapter {
             // Pre-BEGIN removals carry no staged custody to dispose; the
             // accompanying fault independently invalidates. Without a BEGIN
             // the key is unrepresentable, never silently absorbed.
+            let image = (abandon.image_cookie(), abandon.image_exec());
+            if self.take_taint_derived_absence(image, key) {
+                // The taint itself refused or dropped this call's
+                // BEGIN: keep the disposition and telemetry, but do
+                // not promote a shed-taint to permanent for it.
+                self.contradictions.note(TaintCause::Contradiction(
+                    JournalContradiction::TerminalBeforeBegin,
+                ));
+                return JournalDisposition::Contradiction(
+                    JournalContradiction::TerminalBeforeBegin,
+                );
+            }
             self.taint_image(
-                (abandon.image_cookie(), abandon.image_exec()),
+                image,
                 TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
@@ -2148,10 +2202,38 @@ impl JournalAdapter {
 
     fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
         self.contradictions.note(cause);
-        if self.is_tainted(image) {
-            return;
+        if cause == TaintCause::OtherCallerRefused {
+            // A shed-taint is lift-eligible only when it lands on a
+            // never-tainted image: a shed after a contradiction must
+            // not gain eligibility. Past the provenance cap the taint
+            // lands but never lifts (fail closed).
+            if self.is_tainted(image) {
+                return;
+            }
+            if self.shed_only_taints.len() < self.limits.image_sightings {
+                self.shed_only_taints.insert(image);
+            }
+        } else {
+            // Any non-shed taint promotes to permanent, including a
+            // re-taint of a shed-tainted image still inside its grace.
+            self.shed_only_taints.remove(&image);
+            if self.is_tainted(image) {
+                return;
+            }
         }
         self.note_image_taint(image);
+        // Opens dropped by this taint leave their terminals
+        // expected-absent: record their keys so the unmatched
+        // terminals do not promote a shed-taint to permanent.
+        let dropped_keys: Vec<JournalNativeKey> = self
+            .open
+            .iter()
+            .filter(|(_, entry)| entry.image == image)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in dropped_keys {
+            self.note_taint_derived_absence(image, key);
+        }
         self.remove_open_where(|_, entry| entry.image == image);
         let dropped: Vec<RefusedBegin> = self
             .refused
@@ -2170,17 +2252,27 @@ impl JournalAdapter {
     /// stay first-observed / not attributed, while post-bind history
     /// births normally above them. Only the finalizer calls this, and
     /// only for images it recorded as freshly shed-tainted; taint
-    /// overflow states never lift (fail closed). A lifted image is
-    /// recorded for the Exec-to-attach birth fallback; past the cap
-    /// the taint still lifts but no fallback follows (fail closed).
+    /// overflow states never lift (fail closed). Only shed-only
+    /// provenance lifts: a contradiction before or during grace made
+    /// the taint permanent, and an old finalizer entry must not
+    /// override that. Past the lifted cap the taint stays too (fail
+    /// closed). A lifted image is recorded for the Exec-to-attach
+    /// birth fallback.
     pub(crate) fn untaint_shed_image(&mut self, image: (u64, u64)) {
         if self.taint_overflow || !self.tainted_images.contains(&image) {
             return;
         }
-        self.tainted_images.remove(&image);
-        if self.lifted_images.len() < self.limits.image_sightings {
-            self.lifted_images.insert(image);
+        if !self.shed_only_taints.contains(&image) {
+            return;
         }
+        if !self.lifted_images.contains(&image)
+            && self.lifted_images.len() >= self.limits.image_sightings
+        {
+            return;
+        }
+        self.tainted_images.remove(&image);
+        self.shed_only_taints.remove(&image);
+        self.lifted_images.insert(image);
         self.claims_prune_dirty = true;
     }
 
@@ -2190,6 +2282,22 @@ impl JournalAdapter {
     /// grants this; voids, absences and contradiction taints never do.
     pub(crate) fn shed_taint_lifted(&self, image: (u64, u64)) -> bool {
         self.lifted_images.contains(&image)
+    }
+
+    /// Record one (image, key) whose terminal is expected-absent
+    /// because of taint. Capped at the open-table bound; past the cap
+    /// the key is not recorded and its terminal promotes (fail closed).
+    fn note_taint_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) {
+        if self.taint_derived_absent.len() < self.limits.open_calls {
+            self.taint_derived_absent.insert((image, key));
+        }
+    }
+
+    /// Consume one expected-absent terminal: true when this image's key
+    /// was recorded taint-derived. A second terminal for one key finds
+    /// nothing and promotes (genuinely duplicative).
+    fn take_taint_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) -> bool {
+        self.taint_derived_absent.remove(&(image, key))
     }
 
     /// Refuse an image S1 proved to be another caller's (its calls shed
@@ -13627,6 +13735,127 @@ pub(crate) mod tests {
             "past the lifted cap the taint must stay (fail closed)"
         );
         assert!(!scene.adapter.shed_taint_lifted(other));
+    }
+
+    #[test]
+    fn review_taint_refused_begin_end_stays_liftable() {
+        // JK-19b F1 pin: a bursting shed-tainted image's own later
+        // calls refuse their BEGINs, so their ENDs arrive unmatched.
+        // Those terminals keep the Contradiction disposition and
+        // telemetry, but they are the taint working as intended, not
+        // new evidence: the shed-taint must still lift.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a taint-derived terminal must not promote"
+        );
+        assert!(scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("lifted image attests");
+    }
+
+    #[test]
+    fn review_taint_dropped_begin_end_stays_liftable() {
+        // JK-19b F1 pin, other derived shape: a BEGIN staged before
+        // the shed-taint is dropped by it, so its END arrives
+        // unmatched. Still taint-derived, never a promotion.
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a dropped-open terminal must not promote"
+        );
+        let admitted = scene.fixture.admit();
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("lifted image attests");
+    }
+
+    #[test]
+    fn review_duplicate_terminal_after_derived_promotes() {
+        // JK-19b F1 pin: derived absence is consumed on arrival. A
+        // second terminal for one refused key is genuinely
+        // duplicative and promotes the shed-taint to permanent.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a duplicate terminal after a derived one promotes"
+        );
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review_derived_absence_is_image_scoped() {
+        // JK-19b F1 pin: derived absence never crosses images. A
+        // refused key of the shed image does not excuse another
+        // image's unmatched terminal for the same native key.
+        let mut scene = Scene::new(image_default());
+        let other = (COOKIE + 11, EXEC);
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        let foreign_begin = begin_bytes_image(1, 1, create, 0, other);
+        let foreign_end = end_bytes(&foreign_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&foreign_end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused(other),
+            "another image's unmatched terminal still taints"
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "the shed image itself still lifts"
+        );
+        scene.adapter.untaint_shed_image(other);
+        assert!(
+            scene.adapter.image_refused(other),
+            "the contradiction-tainted image never lifts"
+        );
     }
 
     #[test]

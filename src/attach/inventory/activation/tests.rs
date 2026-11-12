@@ -52,6 +52,7 @@ impl Fixture {
         assert!(end > offset + 576);
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,

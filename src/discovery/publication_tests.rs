@@ -3471,6 +3471,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         getter_present: false,
         witness_fault: false,
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -3546,6 +3547,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         getter_present: false,
         witness_fault: false,
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,

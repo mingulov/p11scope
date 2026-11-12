@@ -4588,6 +4588,9 @@ impl ScannedModuleCopy {
             // Base shell: scalars plus exact-capacity vectors.
             0 => {
                 rows.push(ScannedModule {
+                    // The copy inherits the observation's key-global
+                    // proof (like its mapped identity below).
+                    key_is_identity: source.key_is_identity,
                     module_hint: source.module_hint.clone(),
                     mapped_identity: source.mapped_identity,
                     view: source.view,
@@ -5839,7 +5842,8 @@ struct BoundFallbackProof {
 /// fixed reserve, so file learning stays available at 1k identity). The
 /// 512 choice is superseded; 2048 still needs a clean sm1 TTC re-measure
 /// (one 8.66 s sample over the +3 s gate on the old binary) and stays
-/// behind `--max-scan-pids`.
+/// behind `--max-scan-pids`. The unmatched-leader-exit event buffer
+/// shares this bound (kept at 1024 with the raise).
 pub(crate) const MAX_SCAN_PIDS: usize = 1024;
 
 /// How a marked newcomer generation's descendant gap was counted.
@@ -6963,9 +6967,11 @@ fn shape_key(entries: &[MapEntry]) -> BTreeSet<ObjectKey> {
 /// whose scan left any shape member unproved contributes nothing, and
 /// its old sweep shape stays in the remainder. Empty keys (unmapped
 /// individuals, unavailable snapshots) never count: each needs its own
-/// slot. Kernel-thread exclusions never count either. Pure over the
-/// sweep plus the caller-supplied examined set, so the twins pin it
-/// without `/proc`.
+/// slot. Kernel-thread exclusions never count either. Key comparison is
+/// sound here because every credited shape carries key-global proof for
+/// every member (see [`credited_scan_shape`]); unproved shapes never
+/// enter `examined`. Pure over the sweep plus the caller-supplied
+/// examined set, so the twins pin it without `/proc`.
 pub(crate) fn deep_scan_shape_covered(
     sweep: &[(u32, Vec<MapEntry>)],
     retained: &[u32],
@@ -6983,18 +6989,27 @@ pub(crate) fn deep_scan_shape_covered(
         .count()
 }
 
-/// View-collapse fix4: the shape one retained deep scan may cover —
-/// `Some` only when the scan was complete and proved every member of
-/// its own shape examined. `own_shape` is the provider `.so`-set of the
-/// scan's own initial maps snapshot (never a caller-side pre-read, so a
-/// representative that churned between sweep and scan cannot credit its
-/// stale old shape). Proof is the union of actual provider observations
-/// (`modules`, post-bracket) and negative examined-file evidence
-/// (`examined`): a member the scan skipped, narrowed out, excluded, or
-/// never opened (notably a data-only `.so` dropped before the scan
-/// loop) withholds the whole shape, and the unselected processes
-/// sharing it stay counted in the remainder. Pure over the scan's
-/// own result, so the twins pin it without `/proc`.
+/// View-collapse fix4, hardened by fix5 F1: the shape one retained deep
+/// scan may cover — `Some` only when the scan was complete and proved
+/// every member of its own shape examined. `own_shape` is the provider
+/// `.so`-set of the scan's own initial maps snapshot (never a caller-side
+/// pre-read, so a representative that churned between sweep and scan cannot
+/// credit its stale old shape). Proof is the union of actual provider
+/// observations (`modules`, post-bracket) and negative examined-file
+/// evidence (`examined`): a member the scan skipped, narrowed out,
+/// excluded, or never opened (notably a data-only `.so` dropped before
+/// the scan loop) withholds the whole shape, and the unselected processes
+/// sharing it stay counted in the remainder.
+///
+/// A maps key is not one physical file (Btrfs subvolumes share one maps
+/// device while numbering inodes independently), so each member counts
+/// as proved only with key-global proof (`key_is_identity`): negative
+/// evidence for file A must never credit a process mapping different
+/// file B under the same key. Without that proof the whole shape is
+/// withheld — per-range `map_files` proof in unselected processes is not
+/// wired into this counter, so absence of proof stays in the remainder
+/// rather than crediting. Pure over the scan's own result, so the twins
+/// pin it without `/proc`.
 pub(crate) fn credited_scan_shape(
     complete: bool,
     own_shape: &BTreeSet<ObjectKey>,
@@ -7006,14 +7021,34 @@ pub(crate) fn credited_scan_shape(
     }
     let proved: BTreeSet<ObjectKey> = modules
         .iter()
+        .filter(|module| module.key_is_identity)
         .map(|module| module.key)
-        .chain(examined.iter().map(|object| object.key))
+        .chain(
+            examined
+                .iter()
+                .filter(|object| object.key_is_identity)
+                .map(|object| object.key),
+        )
         .collect();
     if own_shape.iter().all(|key| proved.contains(key)) {
         Some(own_shape.clone())
     } else {
         None
     }
+}
+
+/// Debit the scan pins one admission retains against the tick's fd
+/// reserve, beside the view's own pidfd (counted at open through
+/// [`FdReserveTick::note_opened`]). Both admission loops call this
+/// after a successful scan, before the pins are stored: without it a
+/// small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
+///
+/// [`FdReserveTick::note_opened`]: crate::fd_budget::FdReserveTick::note_opened
+pub(crate) fn note_retained_scan_pins(
+    tick: &mut crate::fd_budget::FdReserveTick,
+    pins: &PinnedObjects,
+) {
+    tick.note_opened_n(pins.retained_open_count() as u64);
 }
 
 /// Pids in `sweep` that are kernel threads with no user address space, to
@@ -7051,9 +7086,11 @@ pub(crate) fn kernel_thread_exclusions(
 
 /// The user processes among `pids`: everything without the `PF_KTHREAD`
 /// flag in `{proc_root}/<pid>/stat`. Kernel threads have no user address
-/// space and can never call a provider, so the deep-scan cap counts user
-/// processes only. Fail-closed: an unreadable or unparsable stat keeps
-/// the pid. `proc_root` is `/proc` live, a fixture tree in tests.
+/// space and can never call a provider, so the capture-discovery
+/// deep-scan cap counts user processes only (`inspect --system` still
+/// triggers over-cap on the unfiltered pid count; see its own path).
+/// Fail-closed: an unreadable or unparsable stat keeps the pid.
+/// `proc_root` is `/proc` live, a fixture tree in tests.
 pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
     pids.iter()
         .copied()
@@ -7653,11 +7690,12 @@ fn discover_plan(
     // unused.
     let mut examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = BTreeSet::new();
     // FD reserve (scan-1k guard), sampled once for the whole pass: one
-    // pidfd per retained view crosses a small soft limit fast; when fewer
-    // than the reserve remains, the rest wait for the next tick instead of
-    // dying on EMFILE. The reconciliation sweep admits never-scanned pids
-    // first, so a deferred pid is still reached. Fail open: an unreadable
-    // snapshot proceeds and reports once under its fixed name, never defers.
+    // pidfd plus the retained scan pins per view cross a small soft limit
+    // fast; when fewer than the reserve remains, the rest wait for the
+    // next tick instead of dying on EMFILE. The reconciliation sweep
+    // admits never-scanned pids first, so a deferred pid is still
+    // reached. Fail open: an unreadable snapshot proceeds and reports
+    // once under its fixed name, never defers.
     let mut reserve_tick = crate::fd_budget::FdReserveTick::sample();
     if reserve_tick.is_none() && crate::fd_budget::note_unreadable_reported() {
         let skipped = Skipped {
@@ -7799,6 +7837,13 @@ fn discover_plan(
                         credited_scan_shape(complete, &scan_shape, &found, &scan_examined)
                 {
                     examined_shapes.insert(shape);
+                }
+                // The pass retains this scan's pins from here (beside
+                // the view's pidfd, counted at open): debit them before
+                // the next admission decision, or a small hard
+                // `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
+                if let Some(tick) = reserve_tick.as_mut() {
+                    note_retained_scan_pins(tick, &pins);
                 }
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
@@ -10289,6 +10334,7 @@ fn publication_module(
         _ => Vec::new(),
     };
     ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -11697,6 +11743,7 @@ fn validate_loader_record_context<'a>(
 
 fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
     ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -18269,6 +18316,7 @@ impl Engine {
             observed.walk = "known_prefix";
             let view = &self.views[position];
             let module = ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -22184,6 +22232,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -27039,13 +27088,14 @@ impl Engine {
         // loop-top, and the last admitted pid never stages (empty tail).
         let mut staged_yield: Option<(u32, InventoryNewView)> = None;
         let mut unprocessed = admitted.into_iter();
-        // FD reserve (scan-1k guard), sampled once for the tick: one pidfd
-        // per admitted view crosses a small soft limit fast; when fewer
-        // than the reserve remains, this pid and the rest defer with their
-        // requests retained, exactly like the quantum-expiry tail, so
-        // fanotify/file learning and later attaches never hit EMFILE. Fail
-        // open: an unreadable snapshot proceeds and reports once under its
-        // fixed name, never defers.
+        // FD reserve (scan-1k guard), sampled once for the tick: one
+        // pidfd plus the retained scan pins per admitted view cross a
+        // small soft limit fast; when fewer than the reserve remains,
+        // this pid and the rest defer with their requests retained,
+        // exactly like the quantum-expiry tail, so fanotify/file learning
+        // and later attaches never hit EMFILE. Fail open: an unreadable
+        // snapshot proceeds and reports once under its fixed name, never
+        // defers.
         let mut reserve_tick = crate::fd_budget::FdReserveTick::sample();
         if reserve_tick.is_none() && crate::fd_budget::note_unreadable_reported() {
             skipped.push(Skipped {
@@ -27254,6 +27304,15 @@ impl Engine {
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, pins, complete)) => {
+                    // The tick retains this scan's pins from here (staged
+                    // or pushed below; a staged yield that completes drops
+                    // them at the next loop-top without a refund, staying
+                    // conservative): debit them before the next admission
+                    // decision, or a small hard `RLIMIT_NOFILE` reaches
+                    // `EMFILE` mid-tick.
+                    if let Some(tick) = reserve_tick.as_mut() {
+                        note_retained_scan_pins(tick, &pins);
+                    }
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot
                     // when a pending waiter follows in this window — the

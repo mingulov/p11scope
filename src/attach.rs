@@ -22394,6 +22394,7 @@ mod tests {
                 inode: mapping.inode,
             };
             let module = crate::discovery::scan::ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,

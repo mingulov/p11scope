@@ -8629,6 +8629,7 @@ mod tests {
             entry_objects: vec![vec![object; entries.len()]],
             forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -8693,6 +8694,7 @@ mod tests {
             entry_objects: vec![vec![object; entries.len()]],
             forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -9950,6 +9952,7 @@ mod tests {
             entry_objects: vec![vec![object; entries.len()]],
             forward_verified: vec![vec![false; entries.len()]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,

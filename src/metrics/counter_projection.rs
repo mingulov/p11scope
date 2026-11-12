@@ -1063,6 +1063,7 @@ pub(super) mod tests {
             getter_present: false,
             witness_fault: false,
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,

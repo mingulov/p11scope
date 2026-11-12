@@ -2257,6 +2257,7 @@ fn pin_file_via_self_view(
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,

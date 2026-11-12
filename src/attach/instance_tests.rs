@@ -204,6 +204,7 @@ fn pin_and_plan_for_abi(
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -1607,6 +1608,7 @@ fn pin_and_plan_multi(
         };
         keyed.push((key, elf));
         modules.push(ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,

@@ -25,6 +25,7 @@ fn module(
 ) -> p11scope::discovery::scan::ScannedModule {
     use p11scope::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
     ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,

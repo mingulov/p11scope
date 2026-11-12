@@ -2101,6 +2101,7 @@ pub(crate) mod tests {
             entry_objects: vec![entry_objects],
             forward_verified: vec![vec![false; targets.len()]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -3080,6 +3081,7 @@ pub(crate) mod tests {
             entry_objects: vec![entry_objects],
             forward_verified: vec![vec![false; offsets.len()]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,

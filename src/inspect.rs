@@ -897,6 +897,7 @@ mod tests {
 
     fn copyup_module(key: ObjectKey, pre: Option<u32>) -> ScannedModule {
         ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -1288,6 +1289,7 @@ mod tests {
     fn sample() -> ScanOutcome {
         ScanOutcome::Scanned {
             modules: vec![ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -1490,6 +1492,7 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -2136,6 +2139,7 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,

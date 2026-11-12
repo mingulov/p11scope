@@ -130,6 +130,7 @@ impl ProviderFixture {
                 .unwrap();
         ReconciledModule {
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 view: view.id(),
@@ -976,6 +977,7 @@ fn sole_complete_source(fixture: &ProviderFixture) -> ReconciledModule {
     );
     ReconciledModule {
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             view: view.id(),

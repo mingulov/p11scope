@@ -5110,6 +5110,7 @@ mod tests {
             .collect::<Vec<_>>();
         crate::discovery::identity::ReconciledModule {
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 view: crate::process::ProcessViewId(0),

@@ -157,8 +157,8 @@ pub(crate) fn open_fd_count_in(dir: &Path) -> Option<usize> {
 
 /// One tick's (or one discovery pass's) file-descriptor reserve reading:
 /// the open count and soft limit sampled once before the loop, plus the
-/// views opened since. Call sites sample once per tick and count their own
-/// opens instead of re-reading `/proc` per pid.
+/// views opened and scan pins retained since. Call sites sample once per
+/// tick and count their own opens instead of re-reading `/proc` per pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FdReserveTick {
     open: u64,
@@ -208,9 +208,18 @@ impl FdReserveTick {
 
     /// Count one view opened since the snapshot (conservative within the
     /// tick: drops are not subtracted; the fresh snapshot bounds the drift
-    /// every tick).
+    /// every tick). The scan pins the admission retains are debited
+    /// separately through [`note_opened_n`].
     pub(crate) fn note_opened(&mut self) {
         self.opened = self.opened.saturating_add(1);
+    }
+
+    /// Count `count` further persistent fds opened since the snapshot:
+    /// the scan pins an admission retains beside its view's pidfd.
+    /// Saturating, like [`note_opened`]: absurd counts breach, never
+    /// wrap into admission.
+    pub(crate) fn note_opened_n(&mut self, count: u64) {
+        self.opened = self.opened.saturating_add(count);
     }
 }
 
@@ -421,6 +430,214 @@ mod tests {
         assert!(tick.breached());
         tick.note_opened();
         assert!(tick.breached());
+    }
+
+    /// Healthy: one admission debits its view plus the scan pins it
+    /// retains, so the once-per-tick estimate tracks every persistent
+    /// fd without re-reading `/proc`.
+    #[test]
+    fn tick_counter_debits_view_plus_retained_pins() {
+        let soft = 1024u64;
+        let mut tick = FdReserveTick::from_counts(soft - FD_RESERVE, soft);
+        assert!(!tick.breached());
+        tick.note_opened();
+        tick.note_opened_n(2);
+        assert_eq!(tick.opened, 3);
+        assert!(tick.breached());
+    }
+
+    /// Failure pair: the pin debit saturates instead of wrapping past
+    /// the reserve (no overflow panic in debug, no wrap into admission).
+    #[test]
+    fn tick_pin_debit_saturates_on_absurd_counts() {
+        let mut tick = FdReserveTick::from_counts(0, 1000);
+        tick.note_opened_n(u64::MAX);
+        assert_eq!(tick.opened, u64::MAX);
+        assert!(tick.breached());
+    }
+
+    /// View-collapse fix5 F2 (codex
+    /// `reviewed_fd_snapshot_must_count_retained_scan_pins`): each
+    /// admission retains its view's pidfd plus its scan pins, and the
+    /// once-per-tick estimate must debit both. With soft AND hard
+    /// `RLIMIT_NOFILE` at 512 (a host whose hard limit itself is small,
+    /// where the startup raise cannot help), admissions holding one
+    /// pidfd plus one real scan pin must defer while the 128-fd reserve
+    /// still holds — never reach `EMFILE`. Runs in an isolated child:
+    /// lowering the hard limit is process-global and irreversible.
+    #[test]
+    fn reviewed_fd_snapshot_must_count_retained_scan_pins() {
+        const CHILD: &str = "P11SCOPE_FD_PIN_RESERVE_CHILD";
+        const COMPLETED: &str = "P11SCOPE_FD_PIN_RESERVE_COMPLETED";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fd_budget::tests::reviewed_fd_snapshot_must_count_retained_scan_pins",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "pin-reserve child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "pin-reserve child did not complete its assertions:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_max >= 512,
+            "the box must allow a 512 hard fd limit for the pin-reserve child"
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: 512,
+            rlim_max: 512,
+        };
+        // SAFETY: lowering both limits in the isolated child; the child
+        // exits after its assertions, so the irreversible hard-limit drop
+        // never escapes to siblings.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let mut tick = FdReserveTick::sample().expect("a readable snapshot under 512");
+        assert_eq!(tick.soft, 512);
+        let dir = tempfile::tempdir().expect("a pin file directory");
+        let pin_path = dir.path().join("pin.so");
+        std::fs::write(&pin_path, b"pin").expect("a pin file");
+        let mut held_views: Vec<std::fs::File> = Vec::new();
+        let mut held_pins = Vec::new();
+        let mut admitted = 0u32;
+        let deferred = loop {
+            if reserve_defers(Some(&tick)) {
+                break true;
+            }
+            // One admission: its pidfd plus one real retained scan pin,
+            // debited through the production path.
+            let pidfd = std::fs::File::open("/dev/null")
+                .expect("a pidfd stand-in must open before the reserve trips");
+            held_views.push(pidfd);
+            tick.note_opened();
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &pin_path,
+                None,
+                0,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+            held_pins.push(pins);
+            crate::discovery::engine::note_retained_scan_pins(
+                &mut tick,
+                held_pins.last().expect("just pushed"),
+            );
+            admitted = admitted.saturating_add(1);
+            assert!(admitted < 2000, "the reserve never deferred");
+        };
+        assert!(deferred, "admissions must defer, never fail");
+        assert!(admitted > 0, "the guard must admit under headroom");
+        let open = open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+            .expect("a readable count after the loop");
+        assert!(
+            open as u64 + FD_RESERVE <= 512 + 4,
+            "held {open} fds against soft 512 with reserve {FD_RESERVE}: the estimate undercounted"
+        );
+        println!("\n{COMPLETED}");
+    }
+
+    /// View-collapse fix5 F2 healthy control: pidfd-only admissions (no
+    /// scan pins) under the same 512/512 ceiling hold the reserve with
+    /// the view debit alone. Passes before and after the pin-debit fix:
+    /// it proves the child harness reaches deferral without `EMFILE`
+    /// when the accounting is complete.
+    #[test]
+    fn reviewed_fd_snapshot_pidfd_only_views_hold_reserve() {
+        const CHILD: &str = "P11SCOPE_FD_PIDFD_ONLY_CHILD";
+        const COMPLETED: &str = "P11SCOPE_FD_PIDFD_ONLY_COMPLETED";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fd_budget::tests::reviewed_fd_snapshot_pidfd_only_views_hold_reserve",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "pidfd-only child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "pidfd-only child did not complete its assertions:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_max >= 512,
+            "the box must allow a 512 hard fd limit for the pidfd-only child"
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: 512,
+            rlim_max: 512,
+        };
+        // SAFETY: lowering both limits in the isolated child; the child
+        // exits after its assertions.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let mut tick = FdReserveTick::sample().expect("a readable snapshot under 512");
+        assert_eq!(tick.soft, 512);
+        let mut held: Vec<std::fs::File> = Vec::new();
+        let mut admitted = 0u32;
+        let deferred = loop {
+            if reserve_defers(Some(&tick)) {
+                break true;
+            }
+            let pidfd = std::fs::File::open("/dev/null")
+                .expect("a pidfd stand-in must open before the reserve trips");
+            held.push(pidfd);
+            tick.note_opened();
+            admitted = admitted.saturating_add(1);
+            assert!(admitted < 2000, "the reserve never deferred");
+        };
+        assert!(deferred, "admissions must defer, never fail");
+        assert!(admitted > 0, "the guard must admit under headroom");
+        let open = open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+            .expect("a readable count after the loop");
+        assert!(
+            open as u64 + FD_RESERVE <= 512 + 4,
+            "held {open} fds against soft 512 with reserve {FD_RESERVE}"
+        );
+        println!("\n{COMPLETED}");
     }
 
     /// Healthy: the unreadable snapshot reports under its fixed name, once.

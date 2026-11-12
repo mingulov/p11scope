@@ -2244,6 +2244,13 @@ pub struct ScannedModule {
     /// the later pin must reopen exactly this file (a maps key alone is
     /// not one file on btrfs). `None` when unreadable or not scanned.
     pub mapped_identity: Option<crate::discovery::identity::FileIdentity>,
+    /// Whether this scan proved the maps key is this file's identity
+    /// ([`MappedFile::key_is_identity`]): any range rendered under `key`
+    /// in any process is this file, so shape coverage may credit it.
+    /// False for synthesized modules (heap-lowered records, loader
+    /// prearm, projections, manifests) and whenever the proof was
+    /// unavailable.
+    pub key_is_identity: bool,
     /// Capture-local owner of every table and target contribution in this module.
     pub view: ProcessViewId,
     pub mount_namespace: MountNamespaceId,
@@ -7255,6 +7262,10 @@ fn scan_view_examined_mode(
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
         let mut scanned_identity = held.map(|held| held.identity);
+        // The `MappedFile` the module below is built from: the opened
+        // file's, or the proven lower file's after a copy-up join. Its
+        // key-global proof decides shape credit (fix5 F1).
+        let mut module_mapped = held;
         let guarded = match mapped_file_guard(io, view, held, key, &group, budget) {
             Ok(outcome) => outcome,
             Err(reason) => {
@@ -7450,6 +7461,7 @@ fn scan_view_examined_mode(
                     hook_exports = lower_hooks;
                     named_hint = lower_hint;
                     scanned_identity = Some(proof.mapped.identity);
+                    module_mapped = Some(proof.mapped);
                     pre_copy_up = Some(proof.candidate);
                 }
             }
@@ -7467,6 +7479,9 @@ fn scan_view_examined_mode(
         // the planner reads it for the operator-named closure exception.
         let module_hint = named_hint;
         let mut module = ScannedModule {
+            // Fix5 F1: key-global proof for shape credit — without it a
+            // same-key different file (Btrfs subvolumes) must not credit.
+            key_is_identity: module_mapped.is_some_and(|mapped| mapped.key_is_identity(key)),
             module_hint,
             mapped_identity: scanned_identity,
             view: view.id(),
@@ -10788,6 +10803,7 @@ mod tests {
                 getter_present: false,
                 witness_fault: false,
                 scanned: ScannedModule {
+                    key_is_identity: false,
                     module_hint: None,
                     mapped_identity: None,
                     view: ProcessViewId(object),

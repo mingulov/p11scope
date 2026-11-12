@@ -745,7 +745,7 @@ pub struct DeepScanSelection {
     pub deep_scanned: u64,
     /// Unselected processes sharing an examined same-shape view.
     pub shape_covered: u64,
-    /// Configured deep-scan cap (`--max-scan-pids`, default 256).
+    /// Configured deep-scan cap (`--max-scan-pids`, default 1024).
     pub scan_cap: u64,
 }
 
@@ -8379,6 +8379,7 @@ pub(crate) mod tests {
             entry_objects: vec![vec![object, object], vec![object]],
             forward_verified: vec![vec![false, false], vec![false]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -8494,6 +8495,7 @@ pub(crate) mod tests {
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             forward_verified: vec![vec![false]],
             scanned: ScannedModule {
+                key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
@@ -14063,6 +14065,7 @@ pub(crate) mod tests {
         let object = PinnedObjectId(0);
         let entry_count = table.entries.len();
         let scanned = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             view: ProcessViewId(0),
@@ -14552,6 +14555,7 @@ pub(crate) mod tests {
             })
             .collect();
         let scanned = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             view: ProcessViewId(0),

@@ -2155,6 +2155,13 @@ impl PinnedObjects {
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
     }
 
+    /// Upper bound on the open fds this set retains: one held file per
+    /// entry. Entries sharing one `Arc` over-count, never under-count,
+    /// so the capture fd-reserve debit stays conservative.
+    pub(crate) fn retained_open_count(&self) -> usize {
+        self.by_id.len()
+    }
+
     /// The held object's `vm_file` identity ([`self_mapped_file`]):
     /// what another process's `map_files` range must equal before a maps
     /// key may stand for this object there (C1b sweep matching).
@@ -9468,6 +9475,7 @@ pub(crate) mod test_fixture {
 
     pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -9632,6 +9640,7 @@ pub(crate) mod test_fixture {
             inode: mapping.inode,
         };
         ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -11190,6 +11199,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -11306,6 +11316,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -11384,6 +11395,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -13424,6 +13436,7 @@ mod tests {
         path: &str,
     ) -> crate::discovery::scan::ScannedModule {
         crate::discovery::scan::ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -15288,6 +15301,7 @@ mod tests {
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let read = FileIdentity { dev: 37, ino: 9 };
         let module = |mapped_identity| ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity,
             double_loaded: false,

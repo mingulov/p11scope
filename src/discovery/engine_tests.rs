@@ -2944,6 +2944,7 @@ fn double_load_transition_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = |double_loaded| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         view,
@@ -2992,6 +2993,7 @@ fn same_file_load_count_change_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = |double_loaded, same_file_loads| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         view,
@@ -3040,6 +3042,7 @@ fn stable_same_file_load_count_resolves_benignly() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         view,
@@ -3085,6 +3088,7 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         view,
@@ -33119,6 +33123,7 @@ fn refresh_continues_second_view_after_first_loader_arm_error() {
 #[test]
 fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
     let module = |name_lossy, decoder_abi| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -33202,6 +33207,7 @@ fn live_union_preserves_finished_scan_without_new_static_table() {
         extension_impossible: false,
     };
     let module = |finished: bool, tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -33253,6 +33259,7 @@ fn incomplete_rescan_preserves_double_load_detection() {
     // Clearing happens only by complete-scan replacement, never by
     // union; `false`+`false` stays `false` (no invention).
     let module = |double_loaded| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded,
@@ -33300,6 +33307,7 @@ fn incomplete_rescan_unions_the_extension_proof() {
     // outright — replaces it. This needs a writable table and lasts until
     // that rescan.
     let module = |extension_impossible| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -33357,6 +33365,7 @@ fn incomplete_rescan_preserves_highest_load_count() {
     // (a newly detected third load is not lost). Clearing happens
     // only by complete-scan replacement, never by union.
     let module = |same_file_loads| ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: same_file_loads >= 2,
@@ -36479,6 +36488,7 @@ fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
 fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedModule {
     let facts: Vec<_> = paths.iter().map(|path| object_facts(path)).collect();
     ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -37604,6 +37614,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -37843,6 +37854,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         entry_objects: vec![vec![object]],
         forward_verified: vec![vec![false]],
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -37944,6 +37956,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         entry_objects: vec![vec![PinnedObjectId(200)]],
         forward_verified: vec![vec![false]],
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -38020,6 +38033,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         entry_objects: vec![vec![object]],
         forward_verified: vec![vec![false]],
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -38107,6 +38121,7 @@ fn pinned_owned_fixture() -> (Vec<ScannedModule>, PinnedObjects) {
     let key = object_facts(object).0;
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let modules = vec![ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -39132,6 +39147,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
         let file = p11scope_manifest::identity::open_object(path).unwrap();
         let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
         ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -39222,6 +39238,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -39404,6 +39421,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
     // The same bytes pinned under an identity the scan did not see must not be
     // adopted: a decoy module the matched scan never named.
     let decoy = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -40969,6 +40987,9 @@ fn fully_examined_shape_covers_same_shape_sharing() {
     }
     fn module(key: ObjectKey, path: &str) -> ScannedModule {
         ScannedModule {
+            // Proved provider (allowlisted filesystem): the twin pins
+            // that proved members still credit.
+            key_is_identity: true,
             module_hint: None,
             mapped_identity: None,
             view: ProcessViewId(0),
@@ -41011,6 +41032,181 @@ fn fully_examined_shape_covers_same_shape_sharing() {
     assert_eq!(
         reported, 1,
         "reported shape_covered={reported}; unselected PID 20 shares the fully examined shape"
+    );
+}
+
+/// View-collapse fix5 F1 (codex
+/// `reviewed_unproved_physical_file_must_not_cover_key_collision`): Btrfs
+/// renders one filesystem device for every subvolume while subvolumes
+/// number inodes independently, so two different files can share one
+/// maps key. Retained PID 10 examines non-provider A; unselected PID 20
+/// maps different file B under the same key. The scan legitimately
+/// reports negative evidence for A with `key_is_identity == false`.
+/// That evidence proves nothing about B, so the whole shape is withheld
+/// and PID 20 stays in the counted remainder.
+#[test]
+fn reviewed_unproved_physical_file_must_not_cover_key_collision() {
+    use crate::discovery::identity::{ExaminedObject, FileIdentity};
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // One maps key (one Btrfs filesystem device, one inode number), two
+    // different physical files in two subvolumes.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/subvol-a/lib.so", 1)]),
+        (20, vec![map_entry("/subvol-b/lib.so", 1)]),
+    ];
+    assert_eq!(
+        shape_key(&sweep[0].1),
+        shape_key(&sweep[1].1),
+        "the collision shares one shape key"
+    );
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    // Stable maps (no churn): the retained scan's own read agrees, the
+    // scan completes, and it examines A — but on Btrfs the key is not
+    // A's identity (the subvolume's anonymous device differs from the
+    // filesystem device maps renders).
+    let own_shape = shape_key(&sweep[0].1);
+    assert_eq!(own_shape.len(), 1);
+    let examined = vec![ExaminedObject {
+        key: ObjectKey::of(&sweep[0].1[0]),
+        identity: FileIdentity {
+            dev: 0x100_0001,
+            ino: 1,
+        },
+        key_is_identity: false,
+    }];
+    let credited = credited_scan_shape(true, &own_shape, &[], &examined);
+    assert_eq!(
+        credited, None,
+        "unproved negative evidence must withhold the whole shape"
+    );
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; PID 20 maps a different file under the same key"
+    );
+}
+
+/// View-collapse fix5 F1 healthy control: genuine same-file sharing on
+/// an allowlisted filesystem, where the scan proved the key is the
+/// examined file's identity (any range under the key is this file).
+/// The credit still flows and the unselected process is covered.
+#[test]
+fn reviewed_proved_identity_covers_same_key_sharing() {
+    use crate::discovery::identity::{ExaminedObject, FileIdentity};
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/a.so", 1)]),
+        (20, vec![map_entry("/tmp/a.so", 1)]),
+    ];
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    let own_shape = shape_key(&sweep[0].1);
+    assert_eq!(own_shape.len(), 1);
+    let examined = vec![ExaminedObject {
+        key: ObjectKey::of(&sweep[0].1[0]),
+        identity: FileIdentity {
+            dev: 0x80_0001,
+            ino: 1,
+        },
+        key_is_identity: true,
+    }];
+    let credited = credited_scan_shape(true, &own_shape, &[], &examined);
+    assert_eq!(credited, Some(own_shape));
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 1,
+        "reported shape_covered={reported}; proved same-file sharing stays covered"
+    );
+}
+
+/// View-collapse fix5 F1 provider branch: the same Btrfs key collision,
+/// but the retained scan observed a provider under the key without
+/// key-global proof (`key_is_identity == false`). The unselected
+/// process mapping a different physical file under the same key must
+/// not count as covered: its file was never examined.
+#[test]
+fn reviewed_unproved_provider_must_not_cover_key_collision() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn module(key: ObjectKey, path: &str) -> ScannedModule {
+        ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            key_is_identity: false,
+            view: ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 0,
+                inode: 0,
+            },
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            path: path.into(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: vec![],
+            tables: vec![],
+            interfaces: vec![],
+        }
+    }
+    // One maps key, two different physical files in two subvolumes.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/subvol-a/lib.so", 1)]),
+        (20, vec![map_entry("/subvol-b/lib.so", 1)]),
+    ];
+    assert_eq!(
+        shape_key(&sweep[0].1),
+        shape_key(&sweep[1].1),
+        "the collision shares one shape key"
+    );
+    let retained = vec![10];
+    let excluded = BTreeSet::new();
+    let own_shape = shape_key(&sweep[0].1);
+    assert_eq!(own_shape.len(), 1);
+    let modules = vec![module(ObjectKey::of(&sweep[0].1[0]), "/subvol-a/lib.so")];
+    let credited = credited_scan_shape(true, &own_shape, &modules, &[]);
+    assert_eq!(
+        credited, None,
+        "an unproved provider observation must withhold the whole shape"
+    );
+    let examined_shapes: BTreeSet<BTreeSet<ObjectKey>> = credited.into_iter().collect();
+    let reported = deep_scan_shape_covered(&sweep, &retained, &excluded, &examined_shapes);
+    assert_eq!(
+        reported, 0,
+        "reported shape_covered={reported}; PID 20 maps a different file under the same key"
     );
 }
 
@@ -44701,6 +44897,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         witness_fault: false,
         object: PinnedObjectId(7),
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
@@ -44795,6 +44992,7 @@ fn view_pin_revalidation_detects_replaced_files() {
     let rooted = PathBuf::from(format!("/proc/{pid}/root{}", path.display()));
     let (_, key) = open_view_object(&view, &rooted, &mut budget).unwrap();
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
@@ -46955,7 +47153,7 @@ fn e05_cross_module_admission_at_256_and_above_cap() {
     e06_write_listing(scope_dir.path(), &pids);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     // Explicit 256: this twin pins above-cap rotation arithmetic, not the
-    // production default (2048 since the 1k scan).
+    // production default (1024 since the 1k guard round).
     let args = e06_cgroup_args(scope_dir.path(), hints, Some(256));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
@@ -47097,7 +47295,7 @@ fn e06_e14_rotation_and_lifecycle_recovery_at_scale() {
     e06_write_listing(scope_dir.path(), &pids);
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     // Explicit 256: this twin pins above-cap rotation arithmetic, not the
-    // production default (2048 since the 1k scan).
+    // production default (1024 since the 1k guard round).
     let args = e06_cgroup_args(scope_dir.path(), hints, Some(256));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("the at-cap capture succeeds");
@@ -61281,6 +61479,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
         entry_objects: vec![offsets.iter().map(|_| object).collect()],
         forward_verified: vec![offsets.iter().map(|_| false).collect()],
         scanned: ScannedModule {
+            key_is_identity: false,
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,

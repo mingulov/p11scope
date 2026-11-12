@@ -177,6 +177,7 @@ fn pin_and_plan(
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        key_is_identity: false,
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,

@@ -49729,6 +49729,186 @@ fn deferring_frames_still_admit_a_late_provider_within_the_bound() {
     assert!(admitted(&fixture.engine), "the admitted provider stays");
 }
 
+/// Clean-tail starvation accounting: a live frame whose inventory tick is
+/// blocked by a parked pressure head counts toward the starvation bound
+/// even when the frame's tail record pass dispatches cleanly — a deferred
+/// leader exit — and resets the pressure flag. Without the block the frame
+/// actually suffered, every such frame resets the counter and the bound
+/// never fires, so a late provider waits unboundedly; with it, two blocked
+/// frames accrue debt and the third runs its tick to completion: the late
+/// provider is admitted while the parked head keeps its place and the
+/// refused requests keep their serials.
+#[test]
+fn blocked_tick_with_clean_tail_still_counts_toward_starvation() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let retained = fixture.children[0].pid();
+    let newcomer = fixture.children[1].pid();
+    fixture.engine.frame_work_budget_ns = u64::MAX;
+    // Room for the retained view, the pushed peers and the late provider:
+    // the fixture cap of 4 would refuse the newcomer admission outright.
+    fixture.engine.max_scan_pids = 16;
+    let exit_for = |pid: u32| {
+        let mut exit = exec_record_for(pid);
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+        exit
+    };
+    // Healthy control first: an unblocked frame runs its tick and accrues
+    // no debt.
+    let mut session = ScriptedSession::default();
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(exit_for(
+        FAKE_PID_FLOOR + 400,
+    ))))]
+    .into();
+    fixture.engine.drain_discovery_from(&mut session).unwrap();
+    assert!(
+        fixture.engine.inventory_passes >= 1,
+        "the healthy frame ran its tick"
+    );
+    assert_eq!(
+        fixture.engine.deferred_live_frames, 0,
+        "a healthy frame accrues no starvation debt"
+    );
+    assert_eq!(
+        fixture.engine.starvation_ticks, 0,
+        "a healthy frame runs no starvation tick"
+    );
+    // The late provider is listed but not yet admitted; live peers fill the
+    // refresh queue together with fake entries so every frame's head parks.
+    // The peers stay listed so the starvation tick refreshes them instead of
+    // retiring them ahead of the newcomer admission.
+    let driver = system_scope_build_driver(fixture._dir.path());
+    let mut peers = Vec::new();
+    for _ in 0..4 {
+        let child = system_scope_spawn_loaded(&driver, &fixture.providers[0]);
+        peers.push(child.pid());
+        fixture.children.push(child);
+    }
+    let mut listed = vec![retained, newcomer];
+    listed.extend(peers.iter().copied());
+    e06_write_listing(fixture.listing.path(), &listed);
+    let mut next_id = fixture.engine.next_view_id;
+    for peer in &peers {
+        fixture
+            .engine
+            .views
+            .push(ProcessView::open(ProcessViewId(next_id), *peer).unwrap());
+        next_id += 1;
+    }
+    fixture.engine.next_view_id = next_id;
+    for peer in &peers {
+        assert!(fixture.engine.request_refresh_consumed(*peer, Some(1_000)));
+    }
+    for offset in 0..(MAX_PENDING_REFRESH - peers.len()) as u32 {
+        assert!(
+            fixture
+                .engine
+                .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(
+        fixture.engine.refresh_requested.len(),
+        MAX_PENDING_REFRESH,
+        "the refresh queue is full, so the head parks every frame"
+    );
+    let serials_before = fixture.engine.refresh_requested.clone();
+    let late_provider = fixture.providers[1].display().to_string();
+    let admitted = |engine: &Engine| {
+        engine.views.iter().any(|view| view.pid() == newcomer)
+            && engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.path == late_provider)
+    };
+    let head_pid = 6_000_000u32;
+    let head_first = |engine: &Engine| {
+        engine
+            .pending_discovery_records
+            .first()
+            .is_some_and(|queued| (queued.record.pid_tgid >> 32) as u32 == head_pid)
+    };
+    let frame = |engine: &mut Engine, records: Vec<DiscoveryRecord>| {
+        let mut session = ScriptedSession::default();
+        session.refuse_preflights([true]);
+        session.dequeues = records
+            .into_iter()
+            .map(|record| Ok(Some(crate::events::DiscoveryItem::Record(record))))
+            .collect();
+        engine.drain_discovery_from(&mut session).unwrap();
+    };
+    // First blocked frame: the head parks (the tick is skipped) and the
+    // tail dispatches the deferred exit cleanly, resetting the flag.
+    frame(
+        &mut fixture.engine,
+        vec![exec_record_for(head_pid), exit_for(FAKE_PID_FLOOR + 401)],
+    );
+    assert!(
+        !admitted(&fixture.engine),
+        "a blocked first frame still skips its tick"
+    );
+    assert!(
+        !fixture.engine.frame_deferred && !fixture.engine.pressure_rotation_pending,
+        "the clean tail reset the transient flags"
+    );
+    assert!(
+        head_first(&fixture.engine),
+        "the parked head keeps its place past the clean tail"
+    );
+    assert_eq!(
+        fixture.engine.deferred_live_frames, 1,
+        "the blocked first frame counts toward starvation despite the clean tail"
+    );
+    // Second blocked frame: the re-parked head blocks the tick again.
+    frame(&mut fixture.engine, vec![exit_for(FAKE_PID_FLOOR + 402)]);
+    assert!(
+        !admitted(&fixture.engine),
+        "a blocked second frame still skips its tick"
+    );
+    assert_eq!(
+        fixture.engine.deferred_live_frames, 2,
+        "two consecutive blocked frames accrue two of debt"
+    );
+    assert!(
+        head_first(&fixture.engine),
+        "the parked head keeps its place across blocked frames"
+    );
+    for pid in fixture
+        .engine
+        .pressure_episode
+        .as_ref()
+        .map(|episode| episode.ruled_out.clone())
+        .unwrap_or_default()
+    {
+        assert_eq!(
+            fixture.engine.refresh_requested.get(&pid),
+            serials_before.get(&pid),
+            "a refused selection keeps its serial and age"
+        );
+    }
+    // Third frame: the bound fires, the tick runs to completion, and the
+    // late provider is admitted; the parked head still waits first.
+    frame(&mut fixture.engine, vec![exit_for(FAKE_PID_FLOOR + 403)]);
+    assert_eq!(
+        fixture.engine.starvation_ticks, 1,
+        "the third consecutive blocked frame runs the starvation tick"
+    );
+    assert!(
+        admitted(&fixture.engine),
+        "the starvation tick admits the late provider"
+    );
+    assert_eq!(
+        fixture.engine.deferred_live_frames, 0,
+        "the starvation tick clears the debt"
+    );
+    assert!(
+        head_first(&fixture.engine),
+        "the starvation tick leaves the parked head queued first"
+    );
+    assert_eq!(
+        fixture.engine.discovery_truncated, 0,
+        "no record was refused along the way"
+    );
+}
+
 #[test]
 fn refresh_retry_preserves_newer_serial_and_first_seen() {
     let mut engine = Engine::empty();

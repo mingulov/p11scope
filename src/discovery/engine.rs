@@ -33334,11 +33334,20 @@ impl Engine {
             )?;
         }
         if live_frame && !starved {
-            self.deferred_live_frames = if self.frame_deferred || self.pressure_rotation_pending {
-                self.deferred_live_frames.saturating_add(1)
-            } else {
-                0
-            };
+            // Count the block this frame actually suffered, not only the
+            // state the tail record pass leaves behind: that pass resets
+            // `pressure_rotation_pending` at its start, so a small batch
+            // whose first pass parked a head (blocking the tick) and
+            // whose tail pass then ran clean would otherwise reset the
+            // starvation counter every frame and the bound would never
+            // fire — under sustained churn the inventory tick then runs
+            // ~never while newcomers wait unboundedly.
+            self.deferred_live_frames =
+                if tick_blocked || self.frame_deferred || self.pressure_rotation_pending {
+                    self.deferred_live_frames.saturating_add(1)
+                } else {
+                    0
+                };
         }
         self.publish_batch_tail(changed)?;
         Ok(DiscoveryBatchOutcome {

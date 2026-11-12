@@ -385,6 +385,102 @@
       "identical": [],
       "lane": "guest-returns join-refusal accounting",
       "rationale": "The guest-returns fix on top of the transition above (6bdd02abd: the gated return arms skip the UNMATCHED bump for unstamped refusals while image coverage was never active): the Detailed object gains the native coverage-cell reader (exactly one new symbol against transition 5: .symtab +24 and .strtab +27 for its 26-char name) and the three gated arms consult the inlined join-refusal rule (.text +352 to cumulative +1256, .rel.text +16); uprobe (+184) and maps (+28) are unchanged, no section is added or removed, and BTF/debug/reloc move with the new code (.BTF +51, .BTF.ext +424, .debug_loclists +309, .debug_rnglists +278, .debug_line +222, .debug_str +208; .debug_frame, .rel.debug_frame and .rel.debug_line move for the first time). Both Inventory objects keep the transition-5 code sizes (.text +112/+176, uprobe +128, maps +28): the consult compiles only into the Detailed object, so Callers keeps exactly the transition-5 shape and plain Inventory differs by one DWARF string byte (.debug_str +1)."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "v0.7.0 guest-returns fix1 lane (measured at 4000830305b12dc76cfbbf3c439f4c8b085be568; the record commit adds only this record, which is not a BPF input; the record pins the run-independent diff shape)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF": 213,
+            ".BTF.ext": 680,
+            ".debug_abbrev": 1,
+            ".debug_addr": 160,
+            ".debug_frame": 24,
+            ".debug_info": 1845,
+            ".debug_line": 540,
+            ".debug_loclists": 1900,
+            ".debug_rnglists": 431,
+            ".debug_str": 293,
+            ".debug_str_offsets": 40,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 688,
+            ".rel.debug_addr": 320,
+            ".rel.debug_frame": 32,
+            ".rel.debug_info": 912,
+            ".rel.debug_line": 16,
+            ".rel.debug_str_offsets": 160,
+            ".rel.text": 128,
+            ".reluprobe": 32,
+            ".strtab": 36,
+            ".symtab": 48,
+            ".text": 1296,
+            "maps": 28,
+            "uprobe": 184
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 128,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1024,
+            ".debug_line": 97,
+            ".debug_loclists": 383,
+            ".debug_rnglists": 41,
+            ".debug_str": 84,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 128,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 112,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 144,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1058,
+            ".debug_line": 101,
+            ".debug_loclists": 391,
+            ".debug_rnglists": 51,
+            ".debug_str": 72,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 144,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 176,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "guest-returns retirement-failure unmatched",
+      "rationale": "The fix1 repair on top of transition 6 (400083030: the three refused arms OR the final unmatched decision with outcome == RetirementFailed, so a failed START retirement stays visible even when the never-active predicate is silent; OutputFailed still bumps ring loss only): the Detailed object gains .text +40 to cumulative +1296 for the three outcome-aware branches, with matching debug/BTF moves (.BTF.ext +16, .debug_line +16, .debug_loclists +58, .debug_rnglists +51, .rel.BTF.ext +16; .debug_addr -8, .debug_info -19, .rel.debug_addr -16); no new symbol (.symtab/.strtab unchanged), no section added or removed, uprobe (+184) and maps (+28) unchanged. Both Inventory objects keep exactly the transition-6 shape (.text +112/+176, uprobe +128, maps +28)."
     }
   ],
   "version": 1

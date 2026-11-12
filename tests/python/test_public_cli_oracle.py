@@ -889,6 +889,19 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_lone_gap_with_bool_count_fails_at_gap_gate_in_strict_mode(self):
+        # The lone count gate states the full invariant: a boolean
+        # True gap count (True == 1 in Python) fails at the gap gate
+        # instead of leaking through to the terminal uint check.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = True
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_lone_gap_passes_on_mt_system_in_strict_mode(self):
         # Fix2 twin of the system lone-gap pass: mt-system carries
         # the same exactly-one-gap ceiling with exact owned counts.

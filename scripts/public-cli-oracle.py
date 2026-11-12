@@ -634,6 +634,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and observation.get("causes") == ["pid_descendant_gaps"]
         and skip_entries == []
         and evidence.get("modules_skipped") == []
+        and type(evidence.get("pid_descendant_gaps", 0)) is int
         and evidence.get("pid_descendant_gaps", 0) == 1)
     if relaxed:
         ok_noise = (observation.get("status") == "lossy" and

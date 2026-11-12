@@ -28970,6 +28970,19 @@ int main(int argc, char **argv) {
             !inventory.contains("eprintln!"),
             "inventory/capture.rs still has a blocking stderr write"
         );
+        // v070-stderr-stall: the shadow macros themselves are the bound —
+        // every other production `eprintln!`/`eprint!` (discovery notes,
+        // knob notes, fanotify) routes through the no-wait sink, so a
+        // stalled stderr sheds instead of parking the capture thread.
+        let macros = include_str!("lib.rs");
+        assert!(
+            macros.contains("sink::try_stderr_line(&line)"),
+            "the eprintln! shadow must stay on the bounded sink"
+        );
+        assert!(
+            macros.contains("sink::try_stderr_text(&text)"),
+            "the eprint! shadow must stay on the bounded sink"
+        );
     }
 
     #[test]

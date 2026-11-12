@@ -11,12 +11,18 @@
 /// `mod`, so their textual scope shadows std's macros throughout the
 /// library; a failed diagnostic write is dropped. Test builds keep std's
 /// macros so libtest still captures test output.
+///
+/// Bounded (v070-stderr-stall): both macros route through the no-wait
+/// diagnostic sink instead of blocking writes, so a full pipe or stalled
+/// terminal sheds the line instead of parking the capture thread before
+/// its readiness line. Bytes on a healthy stderr are unchanged.
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
-        use ::std::io::Write as _;
-        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        #[allow(clippy::useless_format)]
+        let line = format!($($arg)*);
+        let _ = $crate::sink::try_stderr_line(&line);
     }};
 }
 
@@ -24,8 +30,9 @@ macro_rules! eprintln {
 #[allow(unused_macros)]
 macro_rules! eprint {
     ($($arg:tt)*) => {{
-        use ::std::io::Write as _;
-        let _ = ::std::write!(::std::io::stderr(), $($arg)*);
+        #[allow(clippy::useless_format)]
+        let text = format!($($arg)*);
+        let _ = $crate::sink::try_stderr_text(&text);
     }};
 }
 

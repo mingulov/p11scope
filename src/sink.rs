@@ -178,10 +178,26 @@ pub(crate) fn try_stderr_line(line: &str) -> io::Result<SinkDrops> {
     try_diagnostic_line_on_fd(std::io::stderr().as_raw_fd(), line)
 }
 
+/// Best-effort diagnostics without the trailing newline (the bounded
+/// `eprint!`): the same no-wait delivery as [`try_stderr_line`], bytes
+/// verbatim.
+pub(crate) fn try_stderr_text(text: &str) -> io::Result<SinkDrops> {
+    try_diagnostic_bytes_on_fd(std::io::stderr().as_raw_fd(), text.as_bytes())
+}
+
 fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
+    let mut owned = Vec::with_capacity(line.len() + 1);
+    owned.extend_from_slice(line.as_bytes());
+    owned.push(b'\n');
+    try_diagnostic_bytes_on_fd(fd, &owned)
+}
+
+/// One diagnostic's bytes on any writer fd, written at once without ever
+/// waiting: the transport takes what it takes now and the unsent tail
+/// sheds with the standard counters. Only transport errors propagate.
+fn try_diagnostic_bytes_on_fd(fd: RawFd, bytes: &[u8]) -> io::Result<SinkDrops> {
     let mut sink = stdout_sink_from(fd)?;
-    writeln!(sink, "{line}")?;
-    sink.abort_wait()?;
+    sink.write_diagnostic_bytes(bytes)?;
     Ok(sink.take_drops())
 }
 
@@ -438,6 +454,51 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
             .saturating_add(self.buf.len() as u64);
         self.buf.clear();
         self.tick_budget = Duration::ZERO;
+    }
+
+    /// One diagnostic's bytes, written at once without ever waiting:
+    /// the transport takes what it takes now, and the unsent tail sheds
+    /// with the standard counters. Bypasses the tick buffer, whose
+    /// zero-budget flush would drop an oversized line's head and deliver
+    /// its tail; here the head is delivered and the tail sheds. Called
+    /// on a fresh sink only, so the buffer stays empty. Only transport
+    /// errors propagate, as in [`abort_wait`](Self::abort_wait).
+    fn write_diagnostic_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        debug_assert!(self.buf.is_empty(), "diagnostics bypass the tick buffer");
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match self.inner.write(remaining) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "sink wrote zero bytes with a non-empty buffer",
+                    ));
+                }
+                Ok(wrote) => {
+                    remaining = &remaining[wrote..];
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // No room right now (or a stray signal): shed the
+                    // tail with counters rather than waiting for room.
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !remaining.is_empty() {
+            self.drops.timeouts = self.drops.timeouts.saturating_add(1);
+            self.drops.dropped_bytes = self
+                .drops
+                .dropped_bytes
+                .saturating_add(remaining.len() as u64);
+            self.tick_budget = Duration::ZERO;
+        }
+        Ok(())
     }
 
     /// Prompt cancel shed: no waiting at all — nonblocking writes take
@@ -1450,5 +1511,43 @@ mod tests {
             "unpreserved stdout must not deliver without the reopen: {:?}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// v070-stderr-stall: a diagnostic past the tick buffer still delivers
+    /// whole to a draining reader. The tick-buffered write would flush
+    /// mid-line with a zero budget and drop the head, delivering the tail.
+    #[test]
+    fn diagnostic_line_delivers_a_whole_oversized_line_to_a_draining_reader() {
+        let (writer, mut reader) = pair();
+        let line = "d".repeat(SINK_BUFFER_BYTES * 3 + 17);
+        let expected = format!("{line}\n");
+        let expected_len = expected.len();
+        let reader_thread = std::thread::spawn(move || {
+            reader
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut got = vec![0u8; expected_len];
+            reader.read_exact(&mut got).unwrap();
+            got
+        });
+        let drops = try_diagnostic_line_on_fd(writer.as_raw_fd(), &line).unwrap();
+        let got = reader_thread.join().unwrap();
+        assert_eq!(got, expected.as_bytes());
+        assert_eq!(drops, SinkDrops::default());
+    }
+
+    /// v070-stderr-stall: the no-newline diagnostic (the bounded `eprint!`)
+    /// writes its bytes verbatim, with no wait and no added newline.
+    #[test]
+    fn diagnostic_text_writes_bytes_verbatim_without_a_newline() {
+        let (writer, mut reader) = pair();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let drops = try_diagnostic_bytes_on_fd(writer.as_raw_fd(), b"partial").unwrap();
+        let mut received = [0; 7];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"partial");
+        assert_eq!(drops, SinkDrops::default());
     }
 }

@@ -9,11 +9,10 @@
 //! the refusal itself plus a startup notice on eligible hosts. Under a full
 //! or closed (EPIPE) stderr these diagnostics must shed instead of parking,
 //! and the exit stays the refusal's 1 on every host. (A capture that
-//! reaches discovery additionally prints discovery's own summary, whose
-//! blocking writes live in `discovery/engine.rs`, outside this change;
-//! the loop/attach/pause emissions are pinned by the
-//! `capture_diagnostics_never_use_blocking_stderr_writes` shape test to
-//! route through the same bounded helper.)
+//! reaches discovery additionally prints discovery's own summary; since
+//! v070-stderr-stall every production `eprintln!` routes through the same
+//! bounded helper, and the loop/attach/pause emissions are pinned by the
+//! `capture_diagnostics_never_use_blocking_stderr_writes` shape test.)
 
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -136,5 +135,65 @@ fn full_or_closed_stderr_preserves_capture_exit_status() {
     assert!(
         observed.iter().all(|(_, _, code)| *code == Some(1)),
         "full/closed stderr exits: {observed:?}"
+    );
+}
+
+/// v070-stderr-stall: the `--system` startup notes (thread-knob lines) fire
+/// before the host refusal; on a full stderr they must shed instead of
+/// parking the process. Pre-fix they used blocking `eprintln!` writes, so a
+/// stalled stderr held the run before its first bounded diagnostic and the
+/// refusal never arrived (the watchdog below kills the parked child).
+#[test]
+fn full_stderr_with_startup_note_preserves_fast_refusal() {
+    let out = unopenable_output();
+    let args = [
+        "inventory".to_string(),
+        "--system".to_string(),
+        "--capture".to_string(),
+        "native".to_string(),
+        "-o".to_string(),
+        out.display().to_string(),
+    ];
+    // Baseline: healthy stderr carries the knob note plus the refusal.
+    let baseline = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(&args)
+        .env("P11SCOPE_SHARD_THREADS", "8")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run baseline refusal");
+    assert_eq!(baseline.status.code(), Some(1), "inventory baseline");
+    let baseline_stderr = String::from_utf8(baseline.stderr).expect("stderr is UTF-8");
+    assert!(
+        baseline_stderr.contains("P11SCOPE_SHARD_THREADS=8"),
+        "the knob note must fire before the refusal: {baseline_stderr}"
+    );
+    // Full pipe, no reader: the note sheds and the refusal still exits 1.
+    let (reader, writer) = diagnostic_pipe(true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(&args)
+        .env("P11SCOPE_SHARD_THREADS", "8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(writer)
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(reader);
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(1),
+        "a full stderr parked the startup note instead of shedding it"
     );
 }

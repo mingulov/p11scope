@@ -617,6 +617,23 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
+    # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
+    # ruling to the system cell): quiet VNG guests disclose exactly
+    # the ambient descendant exit with no skip (60906ccca stopped
+    # filing the bogus B4 post-ready window gap, and the exit itself
+    # predates wave 1 on every leg, previously bundled into the
+    # ambient shape). The system cell accepts the disclosed lone gap
+    # with exact owned counts (checked below), zero loss (checked
+    # above) and no other class; any other cell, cause set or skip
+    # still fails. Mirrors the mt-system-only precedent of the
+    # relaxed skip family above.
+    ok_lone_gap = (
+        cell == "system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["pid_descendant_gaps"]
+        and skip_entries == []
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) != 0)
     if relaxed:
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
@@ -639,7 +656,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         require(ok_exact or ok_gap or ok_ambient,
                 "lossy or unknown observation gap class")
     elif scope in ("system", "cgroup"):
-        require(ok_exact or ok_ambient or ok_quiet, "lossy or unknown observation gap class")
+        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap,
+                "lossy or unknown observation gap class")
     else:
         require(ok_exact, "lossy or unknown observation gap class")
     kernel = evidence.get("kernel_control", {})
@@ -653,11 +671,12 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient or ok_quiet: any other cause set failed already, so the
-    # flags (not re-spelled causes) decide the qualification. Metrics
-    # evidence carries no gaps keys, which read as zero below;
-    # profile-cgroup/run cells carry them and must read 0.
-    ambient = (not relaxed and (ok_ambient or ok_quiet))
+    # ok_ambient, ok_quiet or ok_lone_gap: any other cause set failed
+    # already, so the flags (not re-spelled causes) decide the
+    # qualification. Metrics evidence carries no gaps keys, which read
+    # as zero below; profile-cgroup/run cells carry them and must
+    # read 0.
+    ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps

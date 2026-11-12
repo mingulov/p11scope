@@ -675,11 +675,47 @@ class RunnerNoiseTests(unittest.TestCase):
             d["functions"][0]["calls"] = 499
         self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True, want=1)
 
-    def test_noise_fails_in_strict_mode(self):
+    def test_lone_gap_passes_on_system_in_strict_mode(self):
+        # Wave-1 ruling 2026-11-12 (supersedes the former strict
+        # lone-gap pin test_noise_fails_in_strict_mode for the system
+        # cell): quiet VNG guests disclose exactly
+        # the ambient descendant exit with no skip (60906ccca stopped
+        # filing the bogus B4 window gap, and the exit itself predates
+        # wave 1 on every leg). Strict system scope accepts the
+        # disclosed ambient gap with exact owned counts; any other
+        # class still fails. Shape mirrors wave1-early run 43212507781
+        # (lossy [pid_descendant_gaps], gaps=1, skipped=[]).
         def mutate(d, l, r):
             d["evidence"]["pid_descendant_gaps"] = 1
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_lone_gap_with_other_class_fails_in_strict_mode(self):
+        # The wave-1 lone-gap arm stays narrow: a descendant gap
+        # bundled with any other observation class still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps", "multi_rebuild_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        self.run_case(mutate, cell="system", want=1)
+
+    def test_lone_gap_with_skip_is_not_lone_in_strict_mode(self):
+        # A descendant gap bundled with a skip is the ambient shape,
+        # not the lone shape: the ambient arm (not the lone arm)
+        # judges it, so a non-disclosable skip still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "something else"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         self.run_case(mutate, cell="system", want=1)
 

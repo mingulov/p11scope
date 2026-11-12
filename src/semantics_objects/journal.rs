@@ -1258,6 +1258,12 @@ pub(crate) struct JournalAdapter {
     /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
     taint_overflow: bool,
+    /// Shed-taints lifted by timely binding (JK-19b): images whose
+    /// pre-bind sheds stay first-observed / not attributed, eligible
+    /// for the Exec-to-attach birth fallback. Capped like the taint
+    /// set; past the cap new lifts simply never fall back (fail
+    /// closed). Only `untaint_shed_image` inserts.
+    lifted_images: BTreeSet<(u64, u64)>,
     contradictions: JournalContradictionDiagnosis,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
     /// Exact physical invocation claims, qualified by native domain,
@@ -1365,6 +1371,7 @@ impl JournalAdapter {
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
+            lifted_images: BTreeSet::new(),
             contradictions: JournalContradictionDiagnosis::default(),
             sightings: BTreeMap::new(),
             claims: BTreeMap::new(),
@@ -2156,6 +2163,33 @@ impl JournalAdapter {
         for refused in &dropped {
             self.retained_refused_dec(refused);
         }
+    }
+
+    /// Lift a shed-taint for an image that bound within grace (JK-19b):
+    /// its pre-bind sheds were sighted below any future birth cut and
+    /// stay first-observed / not attributed, while post-bind history
+    /// births normally above them. Only the finalizer calls this, and
+    /// only for images it recorded as freshly shed-tainted; taint
+    /// overflow states never lift (fail closed). A lifted image is
+    /// recorded for the Exec-to-attach birth fallback; past the cap
+    /// the taint still lifts but no fallback follows (fail closed).
+    pub(crate) fn untaint_shed_image(&mut self, image: (u64, u64)) {
+        if self.taint_overflow || !self.tainted_images.contains(&image) {
+            return;
+        }
+        self.tainted_images.remove(&image);
+        if self.lifted_images.len() < self.limits.image_sightings {
+            self.lifted_images.insert(image);
+        }
+        self.claims_prune_dirty = true;
+    }
+
+    /// Whether this image's shed-taint lifted on timely binding, so a
+    /// novelty-broken Exec birth may fall back to attach-observed
+    /// above its unattributed pre-bind sheds. Only `untaint_shed_image`
+    /// grants this; voids, absences and contradiction taints never do.
+    pub(crate) fn shed_taint_lifted(&self, image: (u64, u64)) -> bool {
+        self.lifted_images.contains(&image)
     }
 
     /// Refuse an image S1 proved to be another caller's (its calls shed

@@ -2212,8 +2212,32 @@ impl SemanticCapture {
             evidence,
         };
         let grant = crate::semantics_objects::journal::SessionBirthGrant::issue(authorization);
-        let receipt =
-            BootstrapReceipt::attest(adapter, &grant).map_err(|_| Refusal::AbsenceHistory)?;
+        let receipt = match BootstrapReceipt::attest(adapter, &grant) {
+            Ok(receipt) => receipt,
+            Err(crate::semantics_objects::journal::BirthRefusal::NoveltyBroken)
+                if birth == BirthKind::ExecMarker
+                    && adapter.shed_taint_lifted((image.task_cookie, image.exec_id)) =>
+            {
+                // Shed-then-bind (browser-bootstrap): a fresh exec whose
+                // READY marker verified above, but whose pre-bind sheds
+                // were sighted below the cut, can never exec-birth. Its
+                // shed-taint lifted on timely binding, so it births as
+                // attach-observed at the same cut instead; pre-cut
+                // history stays first-observed / not attributed. Only
+                // lifted images fall back; voids, absences and
+                // contradiction taints keep refusing.
+                let fallback =
+                    crate::semantics_objects::journal::SessionBirthGrant::issue(ValidatedH0Birth {
+                        proof: *proof,
+                        birth: BirthKind::AttachObserved,
+                        cut: candidate.cut.clone(),
+                        closure_generation: attachment.generation(),
+                        evidence,
+                    });
+                BootstrapReceipt::attest(adapter, &fallback).map_err(|_| Refusal::AbsenceHistory)?
+            }
+            Err(_) => return Err(Refusal::AbsenceHistory),
+        };
         Ok(RetainedBirthWitness {
             candidate,
             admission,

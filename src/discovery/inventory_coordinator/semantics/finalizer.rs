@@ -59,7 +59,21 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     pub(super) pre_binding: PreBindingHold,
     /// Set at the first finalize that sees a binding: holding ends there.
     pub(super) bound_once: bool,
+    /// Shed-tainted images eligible to lift their taint (JK-19b): maps
+    /// image (task cookie, exec id) to the finalize sequence of its
+    /// first shed-taint. An entry that binds/admits within grace lifts;
+    /// expired entries drop and stay refused. Bounded by distinct
+    /// images; past the cap new taints simply never lift (fail closed).
+    pub(super) taint_lift: BTreeMap<(u64, u64), u64>,
+    /// Finalize sequence for lift grace expiry. Monotonic per namespace.
+    pub(super) finalize_seq: u64,
 }
+
+/// JK-19b grace: finalizes a shed-tainted image stays eligible to lift
+/// its taint by binding. Covers slow-scan bind latency with margin (a
+/// bursting browser child binds within ~2); images that never bind
+/// keep today's permanent refusal.
+pub(super) const TAINT_LIFT_GRACE: u64 = 16;
 
 /// Unrouted calls shed before any binding existed: their distinct images,
 /// lowest position and route labels. They are disclosed and counted
@@ -164,6 +178,8 @@ impl SessionFinalizerState {
             joined_across_global: 0,
             pre_binding: PreBindingHold::new(),
             bound_once: false,
+            taint_lift: BTreeMap::new(),
+            finalize_seq: 0,
         }
     }
 

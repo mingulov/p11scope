@@ -3503,6 +3503,16 @@ fn joint_machine_refused_other_caller_binding_later_stays_s1_named() {
     let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
     fixture.published_labeled("other-caller-refused", None);
+    // JK-19b: expire the lift window before the late S1-only bind, so
+    // this twin still exercises the refused-image path (bind after
+    // grace never lifts). Background calls keep publishing; each
+    // publication advances the lift grace.
+    for i in 0..24u64 {
+        fixture
+            .scene
+            .push(std::process::id(), 0, "C_SignInit", 100 + i);
+        fixture.published_labeled(&format!("grace-{i}"), None);
+    }
     let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
     fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
     fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
@@ -3533,6 +3543,52 @@ fn joint_machine_refused_other_caller_binding_later_stays_s1_named() {
     );
 }
 
+/// JK-19b fast bind (browser-bootstrap): a foreign image that sheds
+/// before binding, then binds within grace, lifts its shed-taint and
+/// enters Joint — it does not stay S1. Its pre-bind sheds stay
+/// first-observed / not attributed via the attach fallback.
+#[test]
+fn joint_machine_shed_taint_lifts_when_image_binds_within_grace() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-sheds", None);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "shed-taints still land at once"
+    );
+    let _caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("fast-binding", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.joint_feeds(),
+        2,
+        "the fast-bound image gains a Joint feed"
+    );
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "binding within grace lifts the shed-taint"
+    );
+}
+
 /// The same late binding as above, but through the production admission
 /// path (selection, H0 refresh, consume) instead of the test-only bind:
 /// a refused process still never enters Joint. It stays S1, named, and
@@ -3546,6 +3602,16 @@ fn joint_machine_refused_image_production_binding_stays_s1_named() {
     let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
     fixture.published_labeled("other-caller-refused", None);
+    // JK-19b: expire the lift window before the late production bind, so
+    // this twin still exercises the refused-image path (bind after grace
+    // never lifts). Background calls keep publishing; each publication
+    // advances the lift grace.
+    for i in 0..24u64 {
+        fixture
+            .scene
+            .push(std::process::id(), 0, "C_SignInit", 100 + i);
+        fixture.published_labeled(&format!("grace-{i}"), None);
+    }
     let caller = super::super::sem1_feed::admit_mapped(&mut fixture.scene.real, foreign.id());
     super::super::sem1_feed::production_bind(
         &mut fixture.scene.real,

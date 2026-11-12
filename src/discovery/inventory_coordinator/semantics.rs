@@ -3724,6 +3724,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Shed-tap module resolutions cached per batch: one registry
         // scan per endpoint object, not per shed call.
         let mut init_objects: BTreeMap<PinnedObjectId, Option<ModuleId>> = BTreeMap::new();
+        // JK-19b: shed-tainted images that bound/admitted within grace
+        // lift their taint; their pre-bind sheds were sighted below any
+        // future birth cut and stay first-observed / not attributed (the
+        // Exec-to-attach fallback births above them). Expired entries
+        // drop and stay refused. Only shed-taints ever lift;
+        // contradiction taints and taint-overflow states never do.
+        if let Some(state) = self
+            .semantic_finalizer
+            .as_mut()
+            .filter(|state| state.domain == domain)
+        {
+            state.finalize_seq = state.finalize_seq.saturating_add(1);
+            let seq = state.finalize_seq;
+            let mut lift: Vec<(u64, u64)> = Vec::new();
+            state.taint_lift.retain(|image, first| {
+                let own = self.semantic_bindings.has_ticket(domain, image.0)
+                    || self
+                        .semantic_bindings
+                        .admission_images
+                        .values()
+                        .any(|history| {
+                            history.domain == domain && history.image.task_cookie == image.0
+                        });
+                let expired = seq.saturating_sub(*first) >= finalizer::TAINT_LIFT_GRACE;
+                if own && !expired {
+                    lift.push(*image);
+                    return false;
+                }
+                !expired
+            });
+            if !lift.is_empty() {
+                let adapter = self.joint_capture.adapter_mut();
+                for image in lift {
+                    adapter.untaint_shed_image(image);
+                }
+            }
+        }
         for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
@@ -3984,10 +4021,40 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // authority later (a later binding stays S1, named). An image the
         // journal already keys is left alone; its staging keeps holding
         // the seal, which the no-progress bound ends by name.
+        // JK-19b: freshly shed-tainted images additionally stay eligible
+        // to lift their taint by binding within grace. Already-refused
+        // images (contradiction taints, earlier sheds) never enter: only
+        // shed taints ever lift. Past the cap, new taints simply never
+        // lift (fail closed).
         if !refuse_images.is_empty() {
-            let adapter = self.joint_capture.adapter_mut();
-            for image in &refuse_images {
-                adapter.refuse_other_caller_image(*image);
+            let mut fresh: Vec<(u64, u64)> = Vec::new();
+            {
+                let adapter = self.joint_capture.adapter();
+                for image in &refuse_images {
+                    if !adapter.image_refused(*image) {
+                        fresh.push(*image);
+                    }
+                }
+            }
+            {
+                let adapter = self.joint_capture.adapter_mut();
+                for image in &refuse_images {
+                    adapter.refuse_other_caller_image(*image);
+                }
+            }
+            if !fresh.is_empty()
+                && let Some(state) = self
+                    .semantic_finalizer
+                    .as_mut()
+                    .filter(|state| state.domain == domain)
+            {
+                let seq = state.finalize_seq;
+                for image in fresh {
+                    if state.taint_lift.len() >= crate::discovery::instances::MAX_PENDING {
+                        break;
+                    }
+                    state.taint_lift.insert(image, seq);
+                }
             }
         }
         if shed_calls != 0 {
@@ -6155,12 +6222,12 @@ mod finalizer_history_tests {
     fn refused_other_caller_sheds_after_its_own_binding_keep_the_bound_history() {
         use crate::semantics_objects::journal::H3DispositionEvidence;
         // The live intruder shape: a foreign caller's first unrouted
-        // calls prove it another caller, so its image is refused in the
-        // journal and it can never join Joint. It then binds (S1 only,
-        // named). A later unrouted call of that same image is still
-        // provably not the bound Joint caller's: it must dispose, not
-        // barrier, even though its own binding and admission history
-        // now hold its cookie.
+        // calls prove it another caller; held past its grace without
+        // binding, its image is refused in the journal and it can never
+        // join Joint. It then binds (S1 only, named). A later unrouted
+        // call of that same image is still provably not the bound Joint
+        // caller's: it must dispose, not barrier, even though its own
+        // binding and admission history now hold its cookie.
         let (mut coordinator, mut lane, domain) = drop_test_lanes();
         let foreign = ImageIdentity {
             task_cookie: 77,
@@ -6199,12 +6266,27 @@ mod finalizer_history_tests {
             ),
             "the unbound foreign sheds dispose as before: {first:?}"
         );
+        // JK-19b: the foreign sheds dispose AND hold (no taint yet).
+        // Quiet batches past the bounded grace expire the hold, and
+        // only then is the never-bound image refused.
+        for position in 10u64..30u64 {
+            commit_outcomes(
+                &mut coordinator,
+                &mut lane,
+                domain,
+                vec![invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    position,
+                )],
+            );
+        }
         assert!(
             coordinator
                 .joint_capture
                 .adapter()
                 .image_refused((foreign.task_cookie, foreign.exec_id)),
-            "the foreign image is refused in the journal after its sheds"
+            "the foreign image is refused in the journal once its grace expires unbound"
         );
         bind_image(&mut coordinator, domain, 10, foreign);
         admit_history(&mut coordinator, domain, 10, foreign);
@@ -6221,11 +6303,13 @@ mod finalizer_history_tests {
                 unrouted_call(domain, 77, 5),
             ],
         );
+        // staged_max rode to 29 on the grace batches above; the point
+        // stands: the refused shed disposes with no barrier floor.
         assert!(
             matches!(
                 second,
                 H3DispositionEvidence::Clean {
-                    staged_max: 5,
+                    staged_max: 29,
                     pending_floor: None
                 }
             ),
@@ -6381,6 +6465,20 @@ mod finalizer_history_tests {
                 unrouted_call(domain, 77, 2),
             ],
         );
+        // JK-19b: expire the hold before the S1-only bind, so the later
+        // shed below still exercises the refused-image disposal path.
+        for position in 10u64..30u64 {
+            commit_outcomes(
+                &mut coordinator,
+                &mut lane,
+                domain,
+                vec![invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    position,
+                )],
+            );
+        }
         bind_image(&mut coordinator, domain, 10, foreign);
         let evidence = commit_outcomes(
             &mut coordinator,
@@ -6397,13 +6495,13 @@ mod finalizer_history_tests {
     }
 
     #[test]
-    fn post_binding_hold_defers_taint_until_binding() {
+    fn shed_taint_lifts_when_image_binds_within_grace() {
         use crate::semantics_objects::journal::H3DispositionEvidence;
         // JK-19b healthy twin (browser-bootstrap): background bound
         // (41); a new image (77) sheds before it binds. Its sheds
-        // dispose without barrier AND without tainting (held). It
-        // binds within grace, so it is never refused; its later shed
-        // barriers as its own loss.
+        // dispose AND taint at once (today's timing, so bound seals
+        // never wait). It binds within grace, so its shed-taint lifts
+        // and its later shed barriers as its own loss.
         let (mut coordinator, mut lane, domain) = drop_test_lanes();
         bind_image(
             &mut coordinator,
@@ -6436,14 +6534,11 @@ mod finalizer_history_tests {
                     pending_floor: None
                 }
             ),
-            "held sheds dispose without barrier: {first:?}"
+            "shed-tainted sheds dispose without barrier: {first:?}"
         );
         assert!(
-            !coordinator
-                .joint_capture
-                .adapter()
-                .image_refused((77, 3)),
-            "a never-admitted image is held, not tainted on first shed"
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "shed-taints still land at once"
         );
         bind_image(
             &mut coordinator,
@@ -6468,24 +6563,20 @@ mod finalizer_history_tests {
             ],
         );
         assert!(
-            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
-            "the bound image's own shed barriers as its loss: {second:?}"
+            !coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "binding within grace lifts the shed-taint"
         );
         assert!(
-            !coordinator
-                .joint_capture
-                .adapter()
-                .image_refused((77, 3)),
-            "binding within grace never taints"
+            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
+            "the bound image's own shed barriers as its loss: {second:?}"
         );
     }
 
     #[test]
-    fn post_binding_hold_taints_after_grace_without_binding() {
-        // JK-19b expiry twin: background bound (41); a new image (77)
-        // sheds and never binds. It is held first (no taint), then
-        // tainted once its bounded grace expires without a binding —
-        // today's eventual refusal, delayed, never removed.
+    fn shed_taint_stays_when_image_binds_after_grace() {
+        // JK-19b expiry pin: background bound (41); a new image (77)
+        // sheds (tainted at once) and never binds within grace. A late
+        // bind after expiry does NOT lift: fail closed, today's outcome.
         let (mut coordinator, mut lane, domain) = drop_test_lanes();
         bind_image(
             &mut coordinator,
@@ -6510,15 +6601,11 @@ mod finalizer_history_tests {
             ],
         );
         assert!(
-            !coordinator
-                .joint_capture
-                .adapter()
-                .image_refused((77, 3)),
-            "a never-admitted image is held, not tainted on first shed"
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "shed-taints still land at once"
         );
         let mut position = 10u64;
-        let mut tainted_at: Option<u64> = None;
-        for _ in 0..64u64 {
+        for _ in 0..32u64 {
             commit_outcomes(
                 &mut coordinator,
                 &mut lane,
@@ -6530,18 +6617,29 @@ mod finalizer_history_tests {
                 )],
             );
             position += 1;
-            if coordinator
-                .joint_capture
-                .adapter()
-                .image_refused((77, 3))
-            {
-                tainted_at = Some(position);
-                break;
-            }
         }
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 3,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(
+                domain,
+                crate::semantic_capture::InvalidationScope::CoverageFailed,
+                position,
+            )],
+        );
         assert!(
-            tainted_at.is_some(),
-            "an image that never binds is still refused after a bounded grace"
+            coordinator.joint_capture.adapter().image_refused((77, 3)),
+            "a bind after grace expiry never lifts"
         );
     }
 

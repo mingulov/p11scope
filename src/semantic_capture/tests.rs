@@ -2422,51 +2422,68 @@ fn joint_attach_birth_for_already_present_provider() {
 /// already sighted below the birth cut. Exec novelty breaks, yet the
 /// birth succeeds as attach-observed at the same cut — pre-cut history
 /// stays first-observed / not attributed — instead of refusing and
-/// leaving the feed S1Only forever.
+/// leaving the feed S1Only forever. Only lifted images fall back: the
+/// same shape without the shed-taint lift still refuses.
 #[test]
 fn joint_shed_then_bind_birth_falls_back_to_attach_observed() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
-    let mut harness = JointBirthHarness::new();
-    let image = harness.io.current_image;
-    // Quantum 1: the new image's first calls ingest (sighted) before
-    // any birth is offered — the shed-then-bind shape. No birth yet.
-    harness.push_create(1);
-    let mut first = harness.collect();
-    let (_first_report, first_admitted) = harness.route(&mut first);
-    harness.ingest(first, &first_admitted);
-    // The image binds between quanta: its next observation mints an
-    // admitted-first birth above the sighted history.
-    let (_, endpoint) = harness.fixture.endpoint_for("C_CreateObject");
-    harness
-        .capture
-        .router
-        .mark_admitted(image, endpoint.file_slot);
-    harness.push_create(2);
-    let mut second = harness.collect();
-    let (mut report, admitted) = harness.route(&mut second);
-    assert!(
-        report.observations.contains(&ObserveOutcome::AdmittedFirst),
-        "the bound image mints its admitted-first birth: {:?}",
-        report.observations
-    );
-    let (_, proof) = harness.ingest(second, &admitted);
-    let publisher = NativePublisher::build();
-    let sealed = harness.fixture.attachment().generation();
-    let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
-    let mut rows = NativeBirthRows { row, control };
-    let candidate = report
-        .take_current()
-        .pop()
-        .unwrap()
-        .into_birth_candidate()
-        .unwrap_or_else(|_| panic!("admitted-first birth candidate"));
-    harness
-        .capture
-        .validate_birth_candidate(&mut harness.io, &candidate, false)
-        .unwrap();
-    let witness = harness
-        .capture
-        .finish_birth(
+    for lifted in [true, false] {
+        let mut harness = JointBirthHarness::new();
+        let image = harness.io.current_image;
+        if lifted {
+            // Model the finalizer's shed-taint-then-lift: tainted on its
+            // pre-bind sheds (no key yet, so the refusal lands), lifted
+            // when it binds. Ingest below then sights normally.
+            harness
+                .adapter
+                .refuse_other_caller_image((image.task_cookie, image.exec_id));
+            harness
+                .adapter
+                .untaint_shed_image((image.task_cookie, image.exec_id));
+            assert!(
+                harness
+                    .adapter
+                    .shed_taint_lifted((image.task_cookie, image.exec_id)),
+                "the lift is recorded for the fallback"
+            );
+        }
+        // Quantum 1: the new image's first calls ingest (sighted) before
+        // any birth is offered — the shed-then-bind shape. No birth yet.
+        harness.push_create(1);
+        let mut first = harness.collect();
+        let (_first_report, first_admitted) = harness.route(&mut first);
+        harness.ingest(first, &first_admitted);
+        // The image binds between quanta: its next observation mints an
+        // admitted-first birth above the sighted history.
+        let (_, endpoint) = harness.fixture.endpoint_for("C_CreateObject");
+        harness
+            .capture
+            .router
+            .mark_admitted(image, endpoint.file_slot);
+        harness.push_create(2);
+        let mut second = harness.collect();
+        let (mut report, admitted) = harness.route(&mut second);
+        assert!(
+            report.observations.contains(&ObserveOutcome::AdmittedFirst),
+            "the bound image mints its admitted-first birth: {:?}",
+            report.observations
+        );
+        let (_, proof) = harness.ingest(second, &admitted);
+        let publisher = NativePublisher::build();
+        let sealed = harness.fixture.attachment().generation();
+        let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+        let mut rows = NativeBirthRows { row, control };
+        let candidate = report
+            .take_current()
+            .pop()
+            .unwrap()
+            .into_birth_candidate()
+            .unwrap_or_else(|_| panic!("admitted-first birth candidate"));
+        harness
+            .capture
+            .validate_birth_candidate(&mut harness.io, &candidate, false)
+            .unwrap();
+        let birth = harness.capture.finish_birth(
             candidate,
             None,
             &admitted,
@@ -2475,13 +2492,25 @@ fn joint_shed_then_bind_birth_falls_back_to_attach_observed() {
             &proof,
             &harness.adapter,
             &mut rows,
-        )
-        .expect("a novelty-broken fresh exec still births as attach-observed");
-    assert_eq!(
-        witness.receipt().birth(),
-        crate::semantics_objects::journal::BirthKind::AttachObserved,
-        "pre-cut sheds stay unattributed; later history tracks"
-    );
+        );
+        if lifted {
+            let witness =
+                birth.expect("a novelty-broken fresh exec still births as attach-observed");
+            assert_eq!(
+                witness.receipt().birth(),
+                crate::semantics_objects::journal::BirthKind::AttachObserved,
+                "pre-cut sheds stay unattributed; later history tracks"
+            );
+        } else {
+            assert!(
+                matches!(
+                    birth,
+                    Err(crate::attach::BirthObservationRefusal::AbsenceHistory)
+                ),
+                "without the lift the novelty break still refuses"
+            );
+        }
+    }
 }
 
 /// v0.7.0 issue 1 (observe level): a task stamped under this closure

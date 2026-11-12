@@ -16669,6 +16669,10 @@ fn loader_counts_deduplicate_replaced_context_by_stable_bound_tuple() {
     assert_eq!(aggregate.initial_set_capture.none, 1);
 }
 
+/// fix5 contract: a bind replaces its view's stale `Unbound` entry — the
+/// aggregate counts contexts, not attempts, so a view that came to own a
+/// live loader context is not also unavailable. The unkeyed disclosure
+/// (the skip) and the replacement counting below are unchanged.
 #[test]
 fn loader_counts_distinguish_unbound_and_unkeyed_contexts() {
     use p11scope_manifest::elf::SymbolFact;
@@ -16701,7 +16705,10 @@ fn loader_counts_distinguish_unbound_and_unkeyed_contexts() {
     engine.record_loader_arm(view, false);
 
     let aggregate = engine.loader_discovery();
-    assert_eq!(aggregate.strategies.unavailable, 1);
+    assert_eq!(
+        aggregate.strategies.unavailable, 0,
+        "the bind replaced the stale unbound entry"
+    );
     assert_eq!(aggregate.strategies.debug_state_every_hit, 1);
     assert_eq!(aggregate.dlopen_timing.unproven, 1);
     assert_eq!(engine.counters.object_skips.len(), 1);
@@ -16718,7 +16725,10 @@ fn loader_counts_distinguish_unbound_and_unkeyed_contexts() {
     engine.record_loader_arm(view, false);
 
     let aggregate = engine.loader_discovery();
-    assert_eq!(aggregate.strategies.unavailable, 1);
+    assert_eq!(
+        aggregate.strategies.unavailable, 0,
+        "the replacement bind keeps the stale unbound entry cleared"
+    );
     assert_eq!(aggregate.strategies.debug_state_every_hit, 2);
     assert_eq!(aggregate.dlopen_timing.unproven, 2);
     assert_eq!(engine.counters.object_skips.len(), 1);

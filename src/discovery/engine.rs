@@ -12428,6 +12428,14 @@ impl Engine {
             },
         };
         let class = LoaderContextClass { bound, initial_set };
+        if class.bound {
+            // A bind supersedes a stale Unbound entry for the same view
+            // and load kind: the earlier arm bound nothing, and the
+            // aggregate counts contexts, not attempts — keeping both
+            // would count one live context as bound and unavailable.
+            self.loader_contexts
+                .remove(&(view, LoaderAggregateKey::Unbound, initial_set));
+        }
         self.loader_contexts
             .entry((view, bound_key, initial_set))
             .and_modify(|known| known.bound = class.bound)

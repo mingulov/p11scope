@@ -13859,6 +13859,132 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn review2_localized_raw_refusal_during_shed_grace_stays_refused() {
+        // Round-2 F1: a localized raw refusal during shed grace is
+        // independent invalidation evidence. It must revoke shed-only
+        // lift eligibility even though the image is already
+        // shed-tainted, so the later timely-bind lift keeps the
+        // image refused.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        let failure = scene.adapter.refuse_disposed_raw(
+            &mut scene.model,
+            std::iter::once((COOKIE, EXEC)),
+            false,
+            JournalGap::ImageTainted,
+        );
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+        assert!(
+            !scene.adapter.invalidated,
+            "a localized refusal never voids globally"
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a localized raw refusal during shed grace makes the taint permanent"
+        );
+        assert!(!scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review2_negative_only_during_shed_grace_stays_refused() {
+        // Round-2 F2: a negative-only invocation during shed grace is
+        // independent invalidation evidence. The tainted-BEGIN
+        // shortcut must not skip it: the record still interprets as
+        // the invalidation signal and the taint turns permanent.
+        use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+
+        // Untainted control: the same record shape is the genuine
+        // valid NO_END signal.
+        let mut control = Scene::new(image_default());
+        let init = function_id("C_InitToken");
+        let invoked = begin_bytes(1, 2, init, JOURNAL_BEGIN_NO_END);
+        assert_eq!(
+            control.ingest(&invoked),
+            JournalDisposition::NegativeOnlyInvalidated
+        );
+
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        let invoked = begin_bytes(1, 2, init, JOURNAL_BEGIN_NO_END);
+        assert_eq!(
+            scene.ingest(&invoked),
+            JournalDisposition::NegativeOnlyInvalidated
+        );
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "negative-only evidence during shed grace makes the taint permanent"
+        );
+        assert!(!scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review2_shed_after_negative_only_stays_refused() {
+        // Round-2 F2 twin, other order: a negative-only invalidation
+        // taints permanently first, so a later shed must not gain
+        // lift eligibility.
+        use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+
+        let mut scene = Scene::new(image_default());
+        let init = function_id("C_InitToken");
+        let invoked = begin_bytes(1, 2, init, JOURNAL_BEGIN_NO_END);
+        assert_eq!(
+            scene.ingest(&invoked),
+            JournalDisposition::NegativeOnlyInvalidated
+        );
+        assert!(scene.adapter.image_refused((COOKIE, EXEC)));
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a shed after a negative-only invalidation must not gain lift eligibility"
+        );
+        assert!(!scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+    }
+
+    #[test]
+    fn review2_tainted_begin_modeled_call_stays_liftable() {
+        // Round-2 F2 guard pin: endpoint interpretation before the
+        // tainted-BEGIN shortcut must not promote ordinary modeled
+        // calls. Positive staging for a tainted image still refuses,
+        // and the shed-taint still lifts.
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a refused modeled BEGIN must not promote"
+        );
+        assert!(scene.adapter.shed_taint_lifted((COOKIE, EXEC)));
+        let admitted = scene.fixture.admit();
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("lifted image attests");
+    }
+
+    #[test]
     fn object_journal_bounded_uppers_keep_max_only() {
         // I5: only the maximum bounded-loss upper is retained. Two
         // bounded losses across two seals must not grow a per-loss

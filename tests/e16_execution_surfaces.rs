@@ -802,6 +802,69 @@ fn e16_synthetic_hsm_proxy_client_surface_is_admitted_like_control() {
     held.release();
 }
 
+/// A linked table with one forged entry (ruling 05:25b forged twin): the
+/// provider self-publishes its exact-standard interface record like the
+/// control, so the table links and keeps its canonical names — but ordinal
+/// 5 aims at libc instead of the provider's own text. The clause-1 core
+/// refuses the whole table: every slot stays count-only, including the
+/// foreign outlier.
+#[test]
+fn e16_linked_table_with_forged_entry_stays_count_only() {
+    let dir = scratch("linked-forged");
+    let provider = build_shared(&dir, "e16-linked-forged", "e16_linked_forged.c");
+    for factory in &REGISTRY_FACTORIES[..3] {
+        assert_dynsym(&provider, factory, true);
+    }
+    let driver = build_driver(&dir);
+    let provider_arg = provider.to_str().unwrap();
+    let mut held = HeldDriver::spawn(
+        &driver,
+        &["table", provider_arg, "C_GetFunctionList", "0", "3"],
+    );
+    let mapping = executable_mapping(held.ready.pid, held.ready.endpoint);
+    let engine = discover(held.ready.pid, &provider);
+    assert_eq!(held.go("table[0]"), 3);
+    assert_eq!(held.witness_count("forged E16_C_Initialize"), 3);
+    assert_endpoint_admitted(&engine, &mapping, held.ready.endpoint, &provider, false);
+    let name = file_name(&provider);
+    let module = engine
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with(&name))
+        .unwrap_or_else(|| panic!("{name} must be a planned module"));
+    assert_eq!(module.tables.len(), 1, "{:?}", module.tables);
+    let table = &module.tables[0];
+    assert_eq!(table.source, "scan", "{table:?}");
+    assert_eq!(table.version, (3, 2), "{table:?}");
+    assert_eq!(table.entries, 104, "{table:?}");
+    assert_eq!(table.linkage, "interface", "{table:?}");
+    assert!(
+        engine
+            .plan()
+            .surfaces
+            .iter()
+            .any(|surface| surface.source.contains("interface[0] exact_standard")),
+        "the self-published interface record is decoded: {:?}",
+        engine.plan().surfaces
+    );
+    assert_eq!(engine.plan().slots.len(), 104);
+    for slot in &engine.plan().slots {
+        assert_eq!(slot.names.len(), 1, "{slot:?}");
+        assert_ne!(slot.names, ["unknown"], "{slot:?}");
+        assert!(!slot.semantic_authorized, "{slot:?}");
+        assert_eq!(slot.descriptor_index, 0, "{slot:?}");
+    }
+    let (own, foreign): (Vec<_>, Vec<_>) = engine
+        .plan()
+        .slots
+        .iter()
+        .partition(|slot| slot.object_path.ends_with(&name));
+    assert_eq!(own.len(), 103, "one entry aims outside");
+    assert_eq!(foreign.len(), 1, "the forged outlier: {foreign:?}");
+    held.release();
+}
+
 /// A vendor-named factory publishing a standard-layout table: identity-pinned
 /// count-only admission of all 104 endpoints, with no vendor semantics
 /// invented from the factory name.

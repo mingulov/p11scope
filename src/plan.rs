@@ -9021,6 +9021,31 @@ mod tests {
     }
 
     #[test]
+    fn interface_linked_short_table_stays_count_only() {
+        // Ruling 05:25b twin (non-standard): the linkage record names
+        // the table, but 67 entries under a (2, 40) version word fail
+        // the clause-1 shape (68), so no slot carries authority. The
+        // linked names persist — only the semantic grant is refused.
+        let mut module = interface_linked_module();
+        let table = &mut module.scanned.tables[0];
+        let dropped = table.entries.pop().expect("68 entries");
+        assert_eq!(dropped.name, "C_WaitForSlotEvent");
+        module.entry_objects[0].pop();
+        assert_eq!(module.scanned.tables[0].decoded_slot_count(), 67);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_eq!(plan.slots.len(), 67);
+        assert_plan_count_only(&plan, "linked table with a short slot count");
+        assert!(
+            plan.slots.iter().all(|slot| slot.names != ["unknown"]),
+            "linkage still names the table; only authority is refused"
+        );
+        assert!(
+            plan.standard_layout_evidence().is_empty(),
+            "no layout basis is recorded for a refused table"
+        );
+    }
+
+    #[test]
     fn interface_linked_table_with_foreign_entry_stays_count_only() {
         // Ruling clause 1 on the linkage path: every retained entry
         // must point into the provider's own object. One entry
@@ -9608,6 +9633,37 @@ mod tests {
     }
 
     #[test]
+    fn interface_linked_table_with_fully_forged_entry_stays_count_only() {
+        // Ruling 05:25b twin (forged): both identity domains agree the
+        // entry is foreign — the pointer aims outside the provider and
+        // the pinned object disagrees too. Either domain alone already
+        // refuses (the foreign_entry twins); the realistic forged
+        // pointer refuses as well, keeping its linked name count-only.
+        let mut module = interface_linked_module();
+        let position = module.scanned.tables[0]
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("C_SignInit entry");
+        module.scanned.tables[0].entries[position].object = ObjectKey {
+            inode: 43,
+            ..TEST_OBJECT
+        };
+        module.scanned.tables[0].entries[position].object_path = "/opt/other.so".into();
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "linked table with a fully forged entry");
+        assert!(
+            plan.slots.iter().all(|slot| slot.names != ["unknown"]),
+            "linkage still names the table; only authority is refused"
+        );
+        assert!(
+            plan.standard_layout_evidence().is_empty(),
+            "no layout basis is recorded for a refused table"
+        );
+    }
+
+    #[test]
     fn interface_linked_table_with_null_hole_keeps_standard_authority() {
         // A NULL hole is not an unproven non-NULL target: clause 1
         // only constrains non-NULL slots, so the remaining own-text
@@ -9780,6 +9836,33 @@ mod tests {
         module.entry_objects[0][position] = PinnedObjectId(43);
         let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
         assert_plan_count_only(&plan, "getter-export table with a foreign entry");
+    }
+
+    #[test]
+    fn getter_export_table_with_partial_export_agreement_stays_count_only() {
+        // Ruling 05:25b twin (exports-disagree): the getter-export leg
+        // needs EVERY retained entry to agree per-ordinal with the
+        // provider's exports. One dropped export symbol leaves no leg —
+        // the 92-slot table refuses sole by count, nothing links it —
+        // so every slot stays count-only and unnamed.
+        let mut module = getter_export_module();
+        let exports: Vec<(String, u64)> = module
+            .exports
+            .iter()
+            .filter(|(name, _)| *name != "C_Sign")
+            .cloned()
+            .collect();
+        module.exports = std::sync::Arc::from(exports);
+        let plan = build_from_sources(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert_plan_count_only(&plan, "getter-export table with partial export agreement");
+        assert!(
+            plan.slots.iter().all(|slot| slot.names == ["unknown"]),
+            "no publication evidence names a partially agreeing table"
+        );
+        assert!(
+            plan.standard_layout_evidence().is_empty(),
+            "no layout basis is recorded for a refused table"
+        );
     }
 
     #[test]

@@ -722,14 +722,17 @@ fn instance_object_call_gate_reports_owned_tid_and_returns() -> Result<()> {
     Ok(())
 }
 
-fn object_call_evidence(session: &Session) -> Result<(u64, u64)> {
-    use p11scope_ebpf_common::{EVIDENCE_RING_LOSS, EVIDENCE_UNMATCHED_RETURNS};
+fn object_call_evidence(session: &Session) -> Result<(u64, u64, u64)> {
+    use p11scope_ebpf_common::{
+        EVIDENCE_RING_LOSS, EVIDENCE_SEMANTIC_CAPTURE_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
+    };
     let map: PerCpuArray<_, u64> =
         PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
     let total = |index| -> Result<u64> { Ok(map.get(&index, 0)?.iter().copied().sum()) };
     Ok((
         total(EVIDENCE_RING_LOSS)?,
         total(EVIDENCE_UNMATCHED_RETURNS)?,
+        total(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)?,
     ))
 }
 
@@ -838,7 +841,12 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             evidence_after.0 == evidence_before.0,
             "no ring loss in either twin"
         );
-        ensure!(evidence_after.1 - evidence_before.1 == u64::from(missing_entry));
+        // Trace-cgroup outcome split (70556a680): the missing entry
+        // retires its START (the ordinary base above is emitted) with
+        // a refused join, so the refusal counts semantic capture, not
+        // unmatched. Only a failed START retirement bumps unmatched.
+        ensure!(evidence_after.1 == evidence_before.1);
+        ensure!(evidence_after.2 - evidence_before.2 == u64::from(missing_entry));
         ensure!(
             harness.session.instance_maps().fault()? - fault_before == u64::from(missing_entry)
         );

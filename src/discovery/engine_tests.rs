@@ -11771,6 +11771,278 @@ fn refresh_inventory_with_changed(engine: &mut Engine, session: &mut ScriptedSes
         .expect("an inventory refresh over a cgroup scope")
 }
 
+/// Scan-view follow-up (public-cli metrics+system): the live tick
+/// desires user processes only, mirroring initial discovery's
+/// `user_process_pids` filter. Seventy fixture kernel threads plus the
+/// test process itself: no kthread marks as a newcomer, admits a view,
+/// defers the admission window (no `live discovery tick` tail skip) or
+/// counts a gap; the user process still admits, and its one honest
+/// admission gap is the whole count. RED before the live-tick filter:
+/// every kthread marked, the 64/tick window deferred the tail with a
+/// skip, and each live admission gaped. (Ported from 1f0c44733 onto the
+/// trunk: the filter reads the trunk `proc_root` field, so the twin
+/// points that field at the fixture.)
+#[test]
+fn live_tick_desires_user_processes_only() {
+    const KTHREADS: u32 = 70;
+    const KTHREAD_BASE: u32 = 4_290_000_000;
+    const PF_KTHREAD: u32 = 0x0020_0000;
+    let self_pid = std::process::id();
+    let proc = tempfile::tempdir().expect("a proc fixture");
+    let mut listing = vec![self_pid];
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        listing.push(pid);
+        let dir = proc.path().join(pid.to_string());
+        std::fs::create_dir(&dir).expect("a pid dir");
+        // Flags word (field 9) carries PF_KTHREAD; nothing else matters.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (kthreadd) S 0 0 0 0 -1 {PF_KTHREAD} 0 0 0 0 0 0 0 0 20 0 1 0 0 0"),
+        )
+        .expect("a kthread stat");
+    }
+    let (mut engine, _scope) = engine_over_cgroup_naming(&listing);
+    engine.max_scan_pids = 1024;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.proc_root = proc.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        assert!(
+            !engine.newcomer_first_seen.contains_key(&pid),
+            "kthread {pid} must never mark as a newcomer"
+        );
+        assert!(
+            !engine.views.iter().any(|view| view.pid() == pid),
+            "kthread {pid} must never admit a view"
+        );
+    }
+    assert!(
+        engine.views.iter().any(|view| view.pid() == self_pid),
+        "the user process still admits: {:?}",
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
+    );
+    let tails: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .chain(engine.base_counters.object_skips.iter())
+        .filter(|skip| skip.subject == "live discovery tick")
+        .collect();
+    assert!(
+        tails.is_empty(),
+        "no admission-window tail skip without real newcomers: {tails:?}"
+    );
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "only the user admission's honest gap counts"
+    );
+}
+
+/// Scan-view port (Opus B1): the live tick filters the desired set but
+/// the scope walk still proves listed kernel threads, so a later exit
+/// record for one never gaps. Seventy fixture kernel threads (flag plus
+/// empty maps: provable at the ledger) and no user process: the tick
+/// proves all seventy, marks none as a newcomer, admits no view, and
+/// defers no admission tail; their exit records then skip the gap
+/// ledger. System scope reads the live `/proc`, so the controlled
+/// listing runs on a cgroup scope (classification, filter and ledger
+/// are scope-shared) and the exit half flips to `Scope::System`. RED
+/// before the live-tick filter: every kthread entered the desired set
+/// and the 64/tick window deferred the tail with a skip.
+#[test]
+fn system_kthread_excluded_from_desired_exit_never_gaps() {
+    const KTHREADS: u32 = 70;
+    const KTHREAD_BASE: u32 = 4_290_000_000;
+    const PF_KTHREAD: u32 = 0x0020_0000;
+    let proc = tempfile::tempdir().expect("a proc fixture");
+    let mut listing = Vec::new();
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        listing.push(pid);
+        let dir = proc.path().join(pid.to_string());
+        std::fs::create_dir(&dir).expect("a pid dir");
+        // Flags word (field 9) carries PF_KTHREAD, and empty maps prove
+        // no user address space: the scope walk classifies these.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (kthreadd) S 0 0 0 0 -1 {PF_KTHREAD} 0 0 0 0 0 0 0 0 20 0 1 0 0 0"),
+        )
+        .expect("a kthread stat");
+        std::fs::write(dir.join("maps"), "").expect("empty kthread maps");
+    }
+    let (mut engine, _scope) = engine_over_cgroup_naming(&listing);
+    engine.max_scan_pids = 1024;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.proc_root = proc.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        assert!(
+            engine.known_kernel_threads.contains_key(&pid),
+            "the scope walk still proves listed kthread {pid}"
+        );
+        assert!(
+            !engine.newcomer_first_seen.contains_key(&pid),
+            "kthread {pid} must never mark as a newcomer"
+        );
+        assert!(
+            !engine.views.iter().any(|view| view.pid() == pid),
+            "kthread {pid} must never admit a view"
+        );
+    }
+    let tails: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .chain(engine.base_counters.object_skips.iter())
+        .filter(|skip| skip.subject == "live discovery tick")
+        .collect();
+    assert!(
+        tails.is_empty(),
+        "no admission-window tail skip without real newcomers: {tails:?}"
+    );
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "no user admission, no gaps"
+    );
+    // The exit half runs under system scope: the same records the trunk
+    // kworker twins pin, now for tick-proved pids.
+    engine.scope = Scope::System;
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        drain_newcomer_exit(&mut engine, pid, 1000 + u64::from(index));
+    }
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "proved kthread exits never gap"
+    );
+    for index in 0..KTHREADS {
+        let pid = KTHREAD_BASE + index;
+        assert!(
+            !engine.newcomer_first_seen.contains_key(&pid),
+            "kthread {pid} still unmarked after its exit"
+        );
+    }
+}
+
+/// Scan-view port (codex rv2 F1): a pressure-selected kernel thread must
+/// not re-enter the newcomer set. The live tick desires user processes
+/// only, so a listed PF_KTHREAD pid is never desired — and a selected
+/// transaction for that same pid resolves through the request rules
+/// without admitting the kernel thread either. The selected arm runs
+/// first: on the trunk without the filter both arms mark, and the
+/// selected arm is this twin's RED. The ordinary arm is the same bug
+/// through the ordinary path (also pinned by
+/// `live_tick_desires_user_processes_only`). No maps fixture: the pid
+/// is unprovable at the ledger, so only the desired-set filter stands
+/// between it and a mark.
+#[test]
+fn selected_listed_kthread_never_marks_as_newcomer() {
+    const KTHREAD_PID: u32 = 4_290_000_000;
+    const PF_KTHREAD: u32 = 0x0020_0000;
+    let proc = tempfile::tempdir().expect("a proc fixture");
+    let dir = proc.path().join(KTHREAD_PID.to_string());
+    std::fs::create_dir(&dir).expect("a pid dir");
+    // Flags word (field 9) carries PF_KTHREAD; nothing else matters.
+    std::fs::write(
+        dir.join("stat"),
+        format!("{KTHREAD_PID} (kthreadd) S 0 0 0 0 -1 {PF_KTHREAD} 0 0 0 0 0 0 0 0 20 0 1 0 0 0"),
+    )
+    .expect("a kthread stat");
+    // Selected arm: the queued request served as a pressure-selected
+    // transaction still admits no kernel thread.
+    let (mut selected, _selected_scope) = engine_over_cgroup_naming(&[KTHREAD_PID]);
+    selected.max_scan_pids = 1024;
+    selected.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    selected.proc_root = proc.path().to_path_buf();
+    assert!(
+        selected.request_refresh(KTHREAD_PID, None),
+        "the kthread request queues"
+    );
+    let serial = selected
+        .refresh_requested
+        .get(&KTHREAD_PID)
+        .expect("the queued request")
+        .serial;
+    selected.pressure_selected = Some(PressureSelection {
+        pid: KTHREAD_PID,
+        serial,
+    });
+    refresh_inventory_once(&mut selected);
+    assert!(
+        !selected.newcomer_first_seen.contains_key(&KTHREAD_PID),
+        "a PF_KTHREAD-listed pid must not mark as a newcomer; pressure_selected=true"
+    );
+    assert!(
+        !selected.views.iter().any(|view| view.pid() == KTHREAD_PID),
+        "a pressure-selected kthread must never admit a view"
+    );
+    // Ordinary arm: no selection; the live-tick filter already holds.
+    let (mut ordinary, _ordinary_scope) = engine_over_cgroup_naming(&[KTHREAD_PID]);
+    ordinary.max_scan_pids = 1024;
+    ordinary.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    ordinary.proc_root = proc.path().to_path_buf();
+    assert!(
+        ordinary.request_refresh(KTHREAD_PID, None),
+        "the kthread request queues"
+    );
+    refresh_inventory_once(&mut ordinary);
+    assert!(
+        !ordinary.newcomer_first_seen.contains_key(&KTHREAD_PID),
+        "ordinary tick: a PF_KTHREAD-listed pid must not mark as a newcomer"
+    );
+}
+
+/// Control twin: a pressure-selected user process still admits. The
+/// kthread exclusion must not swallow selected user service: the
+/// fixture positively identifies the test process as a user process
+/// (flags word without PF_KTHREAD), and the selected transaction
+/// serves it. Green before and after the filter.
+#[test]
+fn selected_user_process_still_admits() {
+    let self_pid = std::process::id();
+    let proc = tempfile::tempdir().expect("a proc fixture");
+    let dir = proc.path().join(self_pid.to_string());
+    std::fs::create_dir(&dir).expect("a pid dir");
+    std::fs::write(
+        dir.join("stat"),
+        format!("{self_pid} (test) S 0 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0"),
+    )
+    .expect("a user stat");
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[self_pid]);
+    engine.max_scan_pids = 1024;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.proc_root = proc.path().to_path_buf();
+    assert!(
+        engine.request_refresh(self_pid, None),
+        "the user request queues"
+    );
+    let serial = engine
+        .refresh_requested
+        .get(&self_pid)
+        .expect("the queued request")
+        .serial;
+    engine.pressure_selected = Some(PressureSelection {
+        pid: self_pid,
+        serial,
+    });
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == self_pid),
+        "a selected user process still admits: {:?}",
+        engine.views.iter().map(|view| view.pid()).collect::<Vec<_>>()
+    );
+}
+
 /// Task 9.2-fix5 item A. A `--cgroup` capture re-enumerates its members
 /// every tick, and a workload that forks one short-lived subprocess per
 /// unit of work leaves some of them gone before discovery can open or scan

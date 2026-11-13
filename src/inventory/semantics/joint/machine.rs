@@ -59,6 +59,11 @@ fn reborrow_acquisition<'a, 'b: 'a>(
 /// before it takes the named disposition path.
 pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 
+/// Running quanta one lane may abandon and re-arm past per run. Each
+/// re-arm disposes one refused quantum through the named exit abandon;
+/// past the bound the latch stands and the lane is held, named.
+pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
+
 /// Total wire rows one pre-grant quantum may attempt. This doubles as
 /// the collection's allocation limit (the quantum reserves exactly
 /// this many row slots and refuses allocator over-reservation), so a
@@ -1501,6 +1506,17 @@ impl LiveJointMachine {
     /// finished audit frame. Anything else leaves the phase
     /// untouched and yields None (the unapplied abandon needs no
     /// frame).
+    /// Re-arm a running machine latched by a transient refusal
+    /// (placeholder: no shape re-arms yet).
+    pub(crate) fn rearm_after_running_refusal(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _reason: &str,
+    ) -> Option<bool> {
+        None
+    }
+
     pub(crate) fn take_abandoned_frame(
         &mut self,
     ) -> Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum> {

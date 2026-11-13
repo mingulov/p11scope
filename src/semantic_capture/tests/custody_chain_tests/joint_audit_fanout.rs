@@ -204,6 +204,9 @@ struct MachineNativeRows {
     )>,
     fail_after_preparation: bool,
     fail_births: bool,
+    // One-shot refusal of the next scoped native read: the transient
+    // whole-quantum re-validation a busy host can hit mid-run.
+    fail_native_once: bool,
     // Unmarked births stamp exec_attach_gen 0: the task predates the
     // lane's closure (a late attach), so the attach-observed fallback
     // applies deterministically, whatever the global attachment counter.
@@ -928,6 +931,9 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         witnesses: &crate::inventory_semantics::RetainedJointBirths,
         inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
     ) -> Result<R, SemanticRefusal> {
+        if std::mem::take(&mut self.native.fail_native_once) {
+            return Err(SemanticRefusal::Unavailable);
+        }
         let mut owned = self
             .h0
             .0
@@ -1647,6 +1653,7 @@ impl MachineScene {
                 preparations: Vec::new(),
                 fail_after_preparation: false,
                 fail_births: false,
+                fail_native_once: false,
                 predating_births: false,
                 absence_reads: Vec::new(),
                 birth_outcomes: Vec::new(),
@@ -11189,6 +11196,244 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
         );
         assert_eq!(fixture.native.preparations.len(), 1);
     }
+}
+
+const QUANTUM_ABANDONED: &str = "semantic quantum abandoned; lane continues";
+
+impl MachineScene {
+    /// Re-arm the latched machine through the real lane and coordinator.
+    fn rearm(&mut self, reason: &str) -> Option<bool> {
+        let Self { scene, machine, .. } = self;
+        machine.rearm_after_running_refusal(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            reason,
+        )
+    }
+
+    /// Drive one quantum to Audited and refuse its whole-quantum native
+    /// re-validation once: the busy-host transient.
+    fn refuse_at_audited(&mut self, counter: u64) {
+        self.scene
+            .push(std::process::id(), 0, "C_CreateObject", counter);
+        self.reach_phase("Audited");
+        self.native.fail_native_once = true;
+        assert_eq!(
+            self.service(1024),
+            Err(SemanticRefusal::Unavailable),
+            "the posed native refusal latches the running machine"
+        );
+        assert_eq!(
+            self.machine.disposition_reason(),
+            Some(SemanticRefusal::Unavailable)
+        );
+    }
+
+    fn all_gap_subjects(&self) -> Vec<String> {
+        let registry = self.scene.real.scene.coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .chain(
+                registry
+                    .staged_scope_gaps_for_test()
+                    .into_iter()
+                    .map(|(subject, _)| subject),
+            )
+            .collect()
+    }
+}
+
+/// Owner rule "partial, never stop": a transient whole-quantum native
+/// refusal mid-run abandons only that quantum, with named gaps, and the
+/// lane re-arms; the next quantum publishes and records rows again.
+#[test]
+fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let reduced = fixture.reduced_for(0);
+    fixture.refuse_at_audited(2);
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the refused quantum's publication stands before the re-arm"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Audited refusal with its frame re-arms (no demand was bound)"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None, "the latch clears");
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon disposed the refused quantum's publication"
+    );
+    let subjects = fixture.all_gap_subjects();
+    for subject in [
+        "unfinished joint publication abandoned",
+        QUANTUM_ABANDONED,
+    ] {
+        assert!(
+            subjects.iter().any(|seen| seen == subject),
+            "{subject} is named: {subjects:?}"
+        );
+    }
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the re-armed lane accepts the next commit"
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 3);
+    fixture.published_labeled("after running re-arm", None);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision()
+            > revision,
+        "the next quantum publishes"
+    );
+    assert!(
+        fixture.reduced_for(0) > reduced,
+        "calls after the re-arm are recorded"
+    );
+    // Journal history ingested in the abandoned quantum never certifies
+    // later rows: the next collect voided every existing key, named.
+    let subjects = fixture.all_gap_subjects();
+    assert!(
+        subjects
+            .iter()
+            .any(|seen| seen == "Joint key operations unavailable; retained S1"),
+        "the void of the keys open across the abandoned quantum is named: {subjects:?}"
+    );
+    assert_eq!(
+        subjects
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        1,
+        "one abandoned quantum, one gap"
+    );
+}
+
+/// Healthy twin: no refusal, nothing latched, nothing to re-arm.
+#[test]
+fn joint_machine_healthy_quantum_needs_no_rearm() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.published_labeled("healthy", None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert!(
+        !fixture
+            .all_gap_subjects()
+            .iter()
+            .any(|seen| seen == QUANTUM_ABANDONED
+                || seen == "unfinished joint publication abandoned"),
+        "a healthy run names no abandoned quantum"
+    );
+}
+
+/// Permanent twin: a refusal whose phase the abandon cannot dispose in
+/// full (the attempted preparation) keeps the latch; the driver holds
+/// the lane and names the stop as before.
+#[test]
+fn joint_machine_preparation_refusal_keeps_the_latch() {
+    let mut fixture = MachineScene::new(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 1);
+    fixture.native.fail_after_preparation = true;
+    fixture.machine.begin_commit(true).unwrap();
+    let mut failed = false;
+    for _ in 0..128 {
+        if fixture.service(1).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "the attempted preparation latches");
+    assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
+    );
+    assert!(fixture.machine.begin_commit(false).is_err());
+    assert!(
+        !fixture
+            .all_gap_subjects()
+            .iter()
+            .any(|seen| seen == QUANTUM_ABANDONED),
+        "no re-arm is named"
+    );
+}
+
+/// Trip twin: the running no-progress wedge keeps its hold.
+#[test]
+fn joint_machine_running_no_progress_trip_keeps_the_latch() {
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_phase("Audited");
+    fixture.machine.pose_no_progress_poll_for_test(true);
+    assert!(fixture.service(1024).is_ok(), "the posed stall pends");
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
+    assert!(fixture.machine.audit_no_progress_trip_for_test().is_some());
+    assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+}
+
+/// Bound twin: re-arms are finite per run; past the bound the latch
+/// stands and the hold names the stop.
+#[test]
+fn joint_machine_running_rearms_are_bounded() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    for round in 0..limit {
+        fixture.refuse_at_audited(2 + round as u64);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "re-arm {round} is inside the bound"
+        );
+    }
+    fixture.refuse_at_audited(2 + limit as u64);
+    assert_eq!(fixture.rearm("semantic_unavailable"), None, "the bound holds");
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "a refused re-arm leaves the publication for the hold's own abandon"
+    );
 }
 
 #[test]

@@ -28,6 +28,8 @@ pub(crate) use machine::JointMachineIo;
 #[cfg(test)]
 pub(crate) use machine::MAX_UNPAID_VOID_YIELDS;
 #[cfg(test)]
+pub(crate) use machine::RUNNING_REARM_LIMIT;
+#[cfg(test)]
 pub(crate) use machine::StagingDetail;
 pub(crate) use machine::{
     EVENTS_STAGE_SATURATED_REASON, EVENTS_STAGE_SATURATED_SUBJECT,

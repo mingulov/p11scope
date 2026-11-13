@@ -22,7 +22,8 @@ pub(crate) use joint::{
 };
 #[cfg(test)]
 pub(crate) use joint::{
-    JointMachineIo, JointNativeIo, LiveJointMachine, MAX_UNPAID_VOID_YIELDS, StagingDetail,
+    JointMachineIo, JointNativeIo, LiveJointMachine, MAX_UNPAID_VOID_YIELDS, RUNNING_REARM_LIMIT,
+    StagingDetail,
     bind_collected_semantic_callers, with_joint_commit_io_for_births_test,
     with_joint_commit_io_for_test,
 };

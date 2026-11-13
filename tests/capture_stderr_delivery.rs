@@ -197,3 +197,97 @@ fn full_stderr_with_startup_note_preserves_fast_refusal() {
         "a full stderr parked the startup note instead of shedding it"
     );
 }
+
+/// v070-stderr-stall fix1 (codex F1): under descriptor exhaustion the
+/// startup diagnostics must still reach a writable stderr. With stdout on
+/// `/dev/null`, stderr a regular file and `RLIMIT_NOFILE=4`, startup
+/// preservation consumes the last spare fd, so the diagnostic transport
+/// can allocate nothing new; it borrows the inherited stderr for the
+/// immediate write instead of exiting silently. Pre-fix this child left
+/// zero stderr bytes.
+#[test]
+fn fd_exhaustion_with_startup_note_preserves_a_visible_refusal() {
+    use std::os::unix::process::CommandExt as _;
+    let out = unopenable_output();
+    let args = [
+        "inventory".to_string(),
+        "--system".to_string(),
+        "--capture".to_string(),
+        "native".to_string(),
+        "-o".to_string(),
+        out.display().to_string(),
+    ];
+    // Healthy control: the knob note plus the refusal, exit 1.
+    let baseline = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(&args)
+        .env("P11SCOPE_SHARD_THREADS", "8")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run baseline refusal");
+    assert_eq!(baseline.status.code(), Some(1), "inventory baseline");
+    let baseline_stderr = String::from_utf8(baseline.stderr).expect("stderr is UTF-8");
+    assert!(
+        baseline_stderr.contains("P11SCOPE_SHARD_THREADS=8"),
+        "the knob note must fire before the refusal: {baseline_stderr}"
+    );
+    // Exhausted descriptors: stdout on /dev/null, stderr a writable
+    // regular file, `RLIMIT_NOFILE=4` in the child only.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("capture-stderr-lowfd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stderr_path = dir.join("stderr.txt");
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let null_in = std::fs::File::open("/dev/null").unwrap();
+    let null_out = std::fs::File::create("/dev/null").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+    cmd.args(&args)
+        .env("P11SCOPE_SHARD_THREADS", "8")
+        .stdin(Stdio::from(null_in))
+        .stdout(Stdio::from(null_out))
+        .stderr(Stdio::from(stderr_file))
+        .die_with_parent();
+    // SAFETY: the hook runs after fork before exec; `setrlimit` is
+    // async-signal-safe, allocates nothing and touches no parent memory.
+    unsafe {
+        cmd.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(1),
+        "a low-fd startup must still exit with the refusal's 1"
+    );
+    let stderr_bytes = std::fs::read(&stderr_path).unwrap();
+    assert!(
+        !stderr_bytes.is_empty(),
+        "a low-fd startup left zero stderr bytes instead of a visible refusal"
+    );
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    assert!(
+        stderr_text.contains("p11scope:"),
+        "a low-fd startup must leave a visible refusal: {stderr_text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

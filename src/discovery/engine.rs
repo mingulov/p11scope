@@ -28627,8 +28627,26 @@ impl Engine {
         let walk_complete = skipped.is_empty();
         let enumerate_end = crate::attach::monotonic_ns();
         let max_scan_pids = self.max_scan_pids;
-        let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
-        let enumerated = pids.len();
+        // Kernel threads never call providers: the live tick desires user
+        // processes only, mirroring initial discovery (`discover_plan`). A
+        // desired kthread would mark as a newcomer, defer the admission
+        // window with a skip, and gap on admission — phantom loss on every
+        // quiet host (public-cli metrics+system). The filter feeds the
+        // desired set and the cap only: `live` below keeps the unfiltered
+        // enumeration, so the scope walk still proves listed kernel threads
+        // and their exits keep skipping the descendant-gap ledger. A named
+        // capture still serves its exact pid. A selected transaction serves
+        // its pid only while the user-process enumeration still lists it: a
+        // positively identified kernel thread is never reinserted, and its
+        // request resolves or stays queued through the serial/owner rules.
+        let named = matches!(self.scope, Scope::Pid(_));
+        let desired_pids = if named {
+            pids.clone()
+        } else {
+            user_process_pids(&pids, &self.proc_root)
+        };
+        let membership_complete = skipped.is_empty() && desired_pids.len() <= max_scan_pids;
+        let enumerated = desired_pids.len();
         let over_cap = enumerated > max_scan_pids;
         // Staleness tracks the live scope: departed pids prune every tick,
         // which is what bounds the map (a reappearing pid is PID reuse, a
@@ -28656,16 +28674,18 @@ impl Engine {
                 // cursor of its own (H1 accounting is checkpointed around it).
                 // At view capacity the selected pid still makes its own room —
                 // one guarded exploratory eviction, else a probationary probe —
-                // both scoped to the selection inside newcomer admission.
-                if pids.contains(&selected.pid) {
+                // both scoped to the selection inside newcomer admission. The
+                // selection must survive the user-process filter: a listed
+                // kernel thread stays unserved, like a selection never listed.
+                if desired_pids.contains(&selected.pid) {
                     (BTreeSet::from([selected.pid]), false)
                 } else {
                     (BTreeSet::new(), false)
                 }
             } else if max_scan_pids == 0 {
                 (BTreeSet::new(), false)
-            } else if pids.len() > max_scan_pids {
-                self.select_over_cap_desired(&pids)
+            } else if desired_pids.len() > max_scan_pids {
+                self.select_over_cap_desired(&desired_pids)
             } else {
                 // Under-cap polling round, every fourth under-cap tick: retained
                 // exploratory views carry no loader context, so without this a
@@ -28673,11 +28693,11 @@ impl Engine {
                 // cap would never re-scan. Queued here so the requests flow into
                 // `refreshed` below and are served same-tick. The zero cap
                 // short-circuits above and never polls. `scope_pids` guarantees
-                // pid order for the poll cursor.
+                // pid order for the poll cursor, and the filter preserves it.
                 if self.scheduler.begin_under_cap_tick() {
-                    self.queue_polling_rescans(&pids);
+                    self.queue_polling_rescans(&desired_pids);
                 }
-                (pids.into_iter().collect(), false)
+                (desired_pids.into_iter().collect(), false)
             };
         // Only new candidates count: known views are retained, not selected.
         // The zero-cap short-circuit keeps its exact historical skip; the

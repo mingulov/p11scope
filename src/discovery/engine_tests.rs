@@ -12039,7 +12039,11 @@ fn selected_user_process_still_admits() {
     assert!(
         engine.views.iter().any(|view| view.pid() == self_pid),
         "a selected user process still admits: {:?}",
-        engine.views.iter().map(|view| view.pid()).collect::<Vec<_>>()
+        engine
+            .views
+            .iter()
+            .map(|view| view.pid())
+            .collect::<Vec<_>>()
     );
 }
 

@@ -4916,14 +4916,35 @@ mod tests {
         assert!(!super::check_elf_provider(&file).unwrap());
     }
 
+    /// Duplicates `fd` onto the first free number at or above 1024
+    /// and closes the original: the kernel allocates the lowest free
+    /// fd, so a just-closed low number can be reused by another test
+    /// thread's open before the assert below observes it (flaked under
+    /// load: `fcntl` read back 1, a reused CLOEXEC file, instead of
+    /// `EBADF`). Test fds live below 1024, so a high probe number is
+    /// never reused and the close assert observes only this test.
+    fn dup_fd_high(fd: std::os::unix::io::RawFd) -> std::os::unix::io::RawFd {
+        // SAFETY: fcntl dup of a live fd; the floor is within limits.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 1024) };
+        assert!(
+            high >= 1024,
+            "the probe dup must clear the test fd range, got {high}"
+        );
+        // SAFETY: close of the original, now duplicated, fd.
+        unsafe {
+            libc::close(fd);
+        }
+        high
+    }
+
     /// The unread tail of an already-read buffer closes its fds: an
     /// early drain exit must not leak the event fds and pidfds the
     /// kernel installed for records past the break.
     #[test]
     fn learn_unread_tail_closes_event_and_pid_fds() {
         use std::os::unix::io::IntoRawFd;
-        let tail_fd = std::fs::File::open("/bin/sh").unwrap().into_raw_fd();
-        let tail_pidfd = std::fs::File::open("/bin/sh").unwrap().into_raw_fd();
+        let tail_fd = dup_fd_high(std::fs::File::open("/bin/sh").unwrap().into_raw_fd());
+        let tail_pidfd = dup_fd_high(std::fs::File::open("/bin/sh").unwrap().into_raw_fd());
         let mut buf = vec![0u8; 24 + 8];
         buf[0..4].copy_from_slice(&32u32.to_ne_bytes());
         buf[4] = 3;

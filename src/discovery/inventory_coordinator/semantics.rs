@@ -100,9 +100,8 @@ impl AttestedSubset {
                 return false;
             }
             self.pins
-                .pinned()
-                .find(|pin| pin.id == slot.object)
-                .zip(other.pins.pinned().find(|pin| pin.id == slot.object))
+                .summary(slot.object)
+                .zip(other.pins.summary(slot.object))
                 .is_some_and(|(ours, theirs)| {
                     !ours.sha256.is_empty()
                         && ours.key == theirs.key
@@ -137,7 +136,7 @@ impl AttestedSubset {
         if !self.required.contains_key(&object) || sha256.is_empty() {
             return false;
         }
-        let Some(pin) = self.pins.pinned().find(|pin| pin.id == object) else {
+        let Some(pin) = self.pins.summary(object) else {
             return false;
         };
         if pin.sha256 != sha256 {

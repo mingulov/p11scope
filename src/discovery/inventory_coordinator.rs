@@ -1866,8 +1866,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let summary = object.and_then(|id| {
                 prearm
                     .pins
-                    .pinned()
-                    .find(|pin| pin.id == id)
+                    .summary(id)
                     .map(|pin| (pin.key, pin.sha256.to_string()))
             });
             let (dev, ino, sha256) = match summary {
@@ -1999,8 +1998,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         object: crate::discovery::identity::PinnedObjectId,
     ) -> bool {
         let pin_sha = pins
-            .pinned()
-            .find(|pin| pin.id == object)
+            .summary(object)
             .map(|pin| pin.sha256.to_string())
             .unwrap_or_default();
         self.registry.modules().any(|module| {
@@ -2064,7 +2062,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         pins: &crate::discovery::identity::PinnedObjects,
         id: crate::discovery::identity::PinnedObjectId,
     ) -> String {
-        let summary = pins.pinned().find(|pin| pin.id == id);
+        let summary = pins.summary(id);
         let (path, major, minor, ino) =
             summary.map_or(("<unresolved pre-arm object>", 0, 0, 0), |pin| {
                 (

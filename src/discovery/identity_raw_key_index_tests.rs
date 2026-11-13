@@ -246,3 +246,43 @@ fn raw_key_queries_track_split_aliases_of_one_object() {
     let _ = pins.remove_view(ProcessViewId(21));
     assert_agrees(&pins, "scan view retired");
 }
+
+/// The keyed per-object summary equals the linear find over `pinned()`
+/// it replaces at the coordinator and subset call sites, for every id the
+/// set has minted (retired ones included) and ids it never minted.
+#[test]
+fn summary_matches_the_linear_pinned_find_for_every_id() {
+    let fields = |pin: PinnedSummary<'_>| {
+        (
+            pin.id,
+            pin.key,
+            pin.path.to_string(),
+            pin.sha256.to_string(),
+            pin.build_id.map(str::to_string),
+            pin.identity_source,
+            pin.note.map(str::to_string),
+            pin.pre_copy_up,
+        )
+    };
+    let mut pins = pin_set(&distinct_keys(5), true);
+    for minor in 1..=5 {
+        record_scan_ownership(&mut pins, ProcessViewId(minor as u32), overlay(minor), PATH);
+    }
+    assert!(pins.absorb(manifest_pin(overlay(41), SHA, 1)).is_empty());
+    let _ = pins.remove_view(ProcessViewId(2));
+    for id in query_ids(&pins) {
+        assert_eq!(
+            pins.summary(id).map(fields),
+            pins.pinned().find(|pin| pin.id == id).map(fields),
+            "summary({id:?})"
+        );
+    }
+    assert!(
+        pins.summary(PinnedObjectId(1)).is_none(),
+        "retired id has no summary"
+    );
+    assert!(
+        pins.summary(PinnedObjectId(0)).is_some(),
+        "live id has a summary"
+    );
+}

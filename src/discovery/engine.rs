@@ -36637,6 +36637,14 @@ pub(crate) mod session_fixture {
         /// before any link mutation, recording no detach failure (a program
         /// fd that cannot be resolved for a group rebuild).
         detach_slot_premutation_script: VecDeque<bool>,
+        /// One entry per upcoming `replace_targets` call; `true` fails the
+        /// replacement's cleanup detach (all targets fail, the failure is
+        /// recorded, `failed_detach` returns set). Later calls succeed.
+        replacement_detach_script: VecDeque<bool>,
+        /// One entry per upcoming `replace_targets` call; `true` fails the
+        /// whole replacement after recording a detach failure. Later calls
+        /// succeed.
+        replacement_error_script: VecDeque<bool>,
         /// One rebuild report per upcoming `detach_slots` call; later calls
         /// report no rebuild.
         detach_rebuild_script: VecDeque<DetachOutcome>,
@@ -36862,6 +36870,21 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn exhaust_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
             self.exhaust_target_slots = slots.into_iter().collect();
+        }
+
+        /// Schedules the outcome of the next replacement cleanup detaches;
+        /// `true` fails that call's cleanup (mirroring a production
+        /// `ReplacementOutcome` with `failed_detach` set). Later calls
+        /// succeed.
+        pub(crate) fn fail_replacement_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
+            self.replacement_detach_script = script.into_iter().collect();
+        }
+
+        /// Schedules whole-replacement failures for the next
+        /// `replace_targets` calls; `true` fails that call after recording
+        /// a detach failure. Later calls succeed.
+        pub(crate) fn fail_replacements(&mut self, script: impl IntoIterator<Item = bool>) {
+            self.replacement_error_script = script.into_iter().collect();
         }
 
         pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
@@ -37348,6 +37371,26 @@ pub(crate) mod session_fixture {
             self.replaced_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
+            if self.replacement_error_script.pop_front().unwrap_or(false) {
+                for slot in slots {
+                    plan.deactivate(slot.index);
+                }
+                self.detach_failures
+                    .push("scripted replacement failed after a detach failure".into());
+                bail!("scripted replacement attach failed");
+            }
+            if self.replacement_detach_script.pop_front().unwrap_or(false) {
+                for slot in slots {
+                    plan.deactivate(slot.index);
+                }
+                self.detach_failures
+                    .push("scripted replacement detach failed".into());
+                return Ok(ReplacementOutcome {
+                    completed: Vec::new(),
+                    failed_detach: true,
+                    rebuild: DetachOutcome::default(),
+                });
+            }
             if let Some(continuity) = &mut self.pid_continuity {
                 let attached = continuity.borrow_mut().attach(slots, objects);
                 let (failed, completed) = match attached {

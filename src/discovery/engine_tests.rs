@@ -10556,6 +10556,343 @@ fn sibling_loud_abort_still_records_the_loader_gap() {
     );
 }
 
+/// fix7 twin (codex fix5 F1, new-slot cleanup branch): a loader arm
+/// whose own apply closes the tick through a failed new-slot cleanup
+/// detach must record its gap, not defer silently. The first batch
+/// fails the peer attach with a working cleanup (tick stays open,
+/// the peer module publishes with its slot deactivated); the arm's
+/// retry fails the attach AND its cleanup, closing the tick loudly.
+/// Accepted + closed + loud cleanup takes the record path.
+#[test]
+fn new_slot_cleanup_detach_failure_still_records_loader_gap() {
+    let (mut sibling, mut engine, modules) = engine_with_one_accepted_provider();
+    let view_id = engine.views[0].id();
+    let batch = peer_candidate(&mut engine, &modules);
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([1]);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, batch, &mut additions, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "the failed attach still accepts");
+    assert!(
+        additions,
+        "a cleaned-up attach failure leaves the tick open"
+    );
+    assert!(!outcome.detach_failed);
+    assert!(
+        !engine.plan.is_active(1),
+        "the failed peer slot deactivates for rediscovery"
+    );
+    assert_eq!(
+        engine.modules.len(),
+        2,
+        "the failed module still publishes, so the arm rediscovers it"
+    );
+
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([2]);
+    session.fail_slot_detaches([false, true]);
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("a loud-denied arm still returns");
+
+    assert!(
+        !additions_allowed,
+        "the failed cleanup closed the tick: the denial fired"
+    );
+    assert_eq!(
+        session.attached_slots,
+        [1],
+        "the arm attempted the rediscovered slot"
+    );
+    assert_eq!(
+        session.detached_slots,
+        [0, 1],
+        "the initial detach ran, then the failed cleanup"
+    );
+    assert_eq!(
+        session.failed_cleanup_slot_indices,
+        [vec![2]],
+        "the failed cleanup targeted the rediscovered slot"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason == "a partial new-slot detach failed once and was not retried"
+        }),
+        "the failed cleanup keeps its named mark: {:?}",
+        engine.counters.object_skips
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 1,
+        "a cleanup detach failure owes its loader-gap record"
+    );
+    assert_eq!(aggregate.dlopen_timing.none, 1);
+    assert!(
+        !engine.loader_contexts.is_empty(),
+        "the record path files the unbound context"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(view_id).is_empty(),
+        "the loud denial binds nothing: the gap is the record"
+    );
+}
+
+/// fix7 twin (codex fix5 F1, replacement cleanup branch): a loader
+/// arm whose own apply closes the tick through a failed replacement
+/// cleanup detach must record its gap, not defer silently. Slot 0
+/// carries an exact descriptor (as in the U-07 replacement tests), so
+/// the arm's rebuilt candidate downgrades and replaces it; the
+/// replacement's cleanup detach fails loudly.
+#[test]
+fn replacement_detach_failure_still_records_loader_gap() {
+    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
+    let accepted = &mut engine.plan.slots[0];
+    accepted.descriptor_index = descriptor;
+    accepted.semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+    accepted.semantic_authorized = true;
+    accepted.semantic_ambiguous = false;
+    engine.plan.validate_slot_index().unwrap();
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let victim_pid = victim.id();
+    let victim_id = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(victim_id, victim_pid).unwrap());
+    engine.next_view_id = 5;
+    engine.scope = Scope::Pid(victim_pid);
+    assert!(
+        engine.views[1].still_the_same(),
+        "the victim stays a live generation"
+    );
+
+    let mut session = ScriptedSession::default();
+    session.fail_replacement_detaches([true]);
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(
+        1,
+        &mut session,
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    victim.kill().unwrap();
+    victim.wait().unwrap();
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("a loud-denied arm still returns");
+
+    assert!(
+        !additions_allowed,
+        "the failed replacement cleanup closed the tick"
+    );
+    assert_eq!(
+        session.replaced_slot_indices,
+        [vec![0]],
+        "the arm's candidate replaced the downgraded slot"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason == "a partial replacement detach failed once and additions were blocked"
+        }),
+        "the failed replacement keeps its named mark: {:?}",
+        engine.counters.object_skips
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 1,
+        "a replacement detach failure owes its loader-gap record"
+    );
+    assert_eq!(aggregate.dlopen_timing.none, 1);
+    assert!(
+        !engine.loader_contexts.is_empty(),
+        "the record path files the unbound context"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(victim_id).is_empty(),
+        "the loud denial binds nothing: the gap is the record"
+    );
+}
+
+/// fix7 twin (codex fix5 F1, replacement error branch): a loader arm
+/// whose replacement fails outright after a detach failure must
+/// record its gap, not defer silently. Same downgrade setup as the
+/// replacement-cleanup twin, but the session reports the whole
+/// replacement failed with fresh detach bookkeeping behind it.
+#[test]
+fn failed_replacement_with_detach_failure_still_records_loader_gap() {
+    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
+    let accepted = &mut engine.plan.slots[0];
+    accepted.descriptor_index = descriptor;
+    accepted.semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+    accepted.semantic_authorized = true;
+    accepted.semantic_ambiguous = false;
+    engine.plan.validate_slot_index().unwrap();
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let victim_pid = victim.id();
+    let victim_id = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(victim_id, victim_pid).unwrap());
+    engine.next_view_id = 5;
+    engine.scope = Scope::Pid(victim_pid);
+    assert!(
+        engine.views[1].still_the_same(),
+        "the victim stays a live generation"
+    );
+
+    let mut session = ScriptedSession::default();
+    session.fail_replacements([true]);
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(
+        1,
+        &mut session,
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    victim.kill().unwrap();
+    victim.wait().unwrap();
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("a loud-denied arm still returns");
+
+    assert!(!additions_allowed, "the failed replacement closed the tick");
+    assert_eq!(
+        session.replaced_slot_indices,
+        [vec![0]],
+        "the arm's candidate attempted the downgraded slot"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.reason == "one or more downgraded exact targets could not be replaced"
+        }),
+        "the failed replacement keeps its named mark: {:?}",
+        engine.counters.object_skips
+    );
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 1,
+        "a failed replacement owes its loader-gap record"
+    );
+    assert_eq!(aggregate.dlopen_timing.none, 1);
+    assert!(
+        !engine.loader_contexts.is_empty(),
+        "the record path files the unbound context"
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(victim_id).is_empty(),
+        "the loud denial binds nothing: the gap is the record"
+    );
+}
+
+/// fix7 twin (spark fix5 F1, intended second disjunct): an arm that
+/// accepts into an already-closed tick still defers without
+/// recording. A sibling batch fails its one-shot detach before any
+/// mutation (loud mark, no session failure recorded, tick closed);
+/// the victim's arm then accepts into the closed tick. Only the
+/// sibling's loud mark stands; the arm queues its re-arm and files
+/// nothing. Removing the accepted+closed disjunct must fail this
+/// twin (spark M4).
+#[test]
+fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
+    let (mut sibling, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let victim_pid = victim.id();
+    let victim_id = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(victim_id, victim_pid).unwrap());
+    engine.next_view_id = 5;
+    engine.scope = Scope::Pid(victim_pid);
+    assert!(
+        engine.views[1].still_the_same(),
+        "the victim stays a live generation"
+    );
+
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let batch = peer_candidate(&mut engine, &modules);
+    session.fail_slot_detaches_before_mutation([true]);
+    let batch_outcome = engine
+        .apply_candidate(&mut session, batch, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert!(
+        batch_outcome.accepted(),
+        "the sibling batch accepts despite its failed detach"
+    );
+    assert!(
+        batch_outcome.detach_failed,
+        "the one-shot detach failure is flagged on its own outcome"
+    );
+    assert!(
+        !additions_allowed,
+        "the sibling batch closed the tick: the cascade is armed"
+    );
+
+    let armed = engine.arm_loader_or_partial(
+        1,
+        &mut session,
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    victim.kill().unwrap();
+    victim.wait().unwrap();
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    armed.expect("an accepted-into-closed arm defers, it does not fail");
+
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "only the sibling's loud mark stands: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.counters.object_skips[0].reason,
+        "a one-shot detach failed; additions and replacements were blocked for this cycle"
+    );
+    assert!(
+        engine.loader_contexts.is_empty(),
+        "an accepted-into-closed arm records no loader context: {:?}",
+        engine.loader_contexts
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(victim_id).is_empty(),
+        "nothing bound and nothing stuck prepared: the re-arm starts clean"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&victim_pid),
+        "the deferred arm queues its rescan+re-arm: {:?}",
+        engine.refresh_requested
+    );
+    assert_eq!(
+        engine.loader_discovery(),
+        render::LoaderDiscovery::default(),
+        "the aggregate stays exactly zero"
+    );
+}
+
 #[test]
 fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
     let (fixture, view, _module, _pins) = loaded_seed_provider();
@@ -79469,5 +79806,148 @@ fn departed_kthreads_do_not_exhaust_future_exclusions() {
         engine.pid_descendant_gaps(),
         0,
         "a fresh proved kthread must still skip after 256 departures"
+    );
+}
+
+/// Fix7 pin (spark fix6 F1, relist guard): an exit inside the overlap
+/// window [relisted bound, old upper] counts even though the departed
+/// history covers it — it could be the new generation, so ambiguity
+/// counts (fail-closed). The 150 drain proves the history entry is
+/// live (guard silent, skip); the 202 drain fires the guard. System
+/// scope. Disabling the guard must fail this twin (spark noguard).
+#[test]
+fn system_relist_window_exit_counts_despite_history_overlap() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    // The pid returns as a user generation.
+    std::fs::write(pid_dir.join("stat"), stat_line(4242, "u", 0)).unwrap();
+    std::fs::write(
+        pid_dir.join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a delayed old-kthread exit still skips: the history entry is live"
+    );
+    drain_newcomer_exit(&mut engine, 4242, 202);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an in-window exit counts: the relist guard rejects the ambiguity"
+    );
+}
+
+/// Fix7 cgroup twin of the relist-window pin above.
+#[test]
+fn cgroup_relist_window_exit_counts_despite_history_overlap() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    std::fs::write(pid_dir.join("stat"), stat_line(4242, "u", 0)).unwrap();
+    std::fs::write(
+        pid_dir.join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a delayed old-kthread exit still skips: the history entry is live"
+    );
+    drain_newcomer_exit(&mut engine, 4242, 202);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an in-window exit counts: the relist guard rejects the ambiguity"
+    );
+}
+
+/// Fix7 pin (spark fix6 F1, history eviction): past the 256-entry
+/// bound the oldest departed interval evicts first — its delayed
+/// exit then counts (fail-closed) — while a retained entry still
+/// skips. 256 departures fill the history; the 257th (pid 4242)
+/// evicts pid 5000's interval. Unbounded history must fail this
+/// twin.
+#[test]
+fn evicted_departed_kthread_exit_counts_fail_closed() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for pid in 5000u32..5256u32 {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(
+            pid_dir.join("stat"),
+            stat_line(pid, "k", crate::process::PF_KTHREAD),
+        )
+        .unwrap();
+        std::fs::write(pid_dir.join("maps"), "").unwrap();
+    }
+    let fresh_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    std::fs::write(
+        fresh_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(fresh_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = (5000u32..5256u32).collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
+    let fresh: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&fresh, Some(300), Some(305));
+    engine.note_scope_walk(&BTreeSet::new(), Some(400), Some(405));
+    drain_newcomer_exit(&mut engine, 5001, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "a retained departed entry still skips its delayed exit"
+    );
+    drain_newcomer_exit(&mut engine, 5000, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "the evicted oldest entry counts its delayed exit fail-closed"
     );
 }

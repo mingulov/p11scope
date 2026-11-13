@@ -1381,10 +1381,18 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 self.callers.len() + 1,
             );
         }
-        let mut pin = self
-            .source
-            .open(pid)
-            .map_err(|error| anyhow!("cannot pin caller pid {pid}: {error}"))?;
+        // The scan discovered this pid, so the operator typed nothing:
+        // when the process is gone, say so plainly instead of relaying
+        // the named-pid diagnosis (whose "typo" advice and "cannot pin"
+        // prefix would double here). Any other pin failure keeps the
+        // source error under a non-doubling admission wrap.
+        let mut pin = self.source.open(pid).map_err(|error| {
+            if self.source.gone(pid) {
+                anyhow!("cannot pin caller pid {pid}: no live process with that pid (it exited)")
+            } else {
+                anyhow!("cannot admit caller pid {pid}: {error}")
+            }
+        })?;
         // A zombie pins successfully (its pidfd and `/proc` entries
         // survive until the parent reaps it), but admitting one mints a
         // caller for a dead generation that retires on the next pass —
@@ -7930,6 +7938,40 @@ pub(crate) mod tests {
             CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
         );
         (source, adapter)
+    }
+
+    /// O2: admitting a scan-discovered pid that exited before the pin
+    /// says so plainly — the operator typed nothing, so the named-pid
+    /// "typo" advice and the doubled "cannot pin" prefix must not appear.
+    #[test]
+    fn admit_reports_an_exited_scan_pid_without_typo_advice() {
+        let (source, mut adapter) = adapter();
+        source.spawn(200, 22);
+        source.kill(200);
+        let error = adapter
+            .admit(200, AUTHORITY, 10)
+            .expect_err("admitting an exited pid fails");
+        assert_eq!(
+            format!("{error:#}"),
+            "cannot pin caller pid 200: no live process with that pid (it exited)"
+        );
+    }
+
+    /// O2: when the pin fails while the process is still alive, the
+    /// registry names the admission failure once — the source error
+    /// keeps its own shape without a doubled "cannot pin" prefix.
+    #[test]
+    fn admit_wraps_a_live_pin_failure_without_doubling() {
+        let (source, mut adapter) = adapter();
+        source.spawn(200, 22);
+        source.poison_reopen();
+        let error = adapter
+            .admit(200, AUTHORITY, 10)
+            .expect_err("a poisoned reopen fails admission");
+        assert_eq!(
+            format!("{error:#}"),
+            "cannot admit caller pid 200: poisoned numeric-PID reopen of 200"
+        );
     }
 
     #[test]

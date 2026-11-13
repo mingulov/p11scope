@@ -234,9 +234,106 @@ fn try_diagnostic_bytes_with_reopen(
 /// and a transport that cannot be opened sheds every line to the sink.
 /// Write errors are immediate (a full pipe fails fast); callers drop
 /// them, so diagnostics never fail or stall the driver. Unlike
-/// [`SinkWriter`], this never polls and never holds bytes past the call.
+/// [`SinkWriter`], the transport never polls and never holds bytes
+/// past the call. In default verbosity the writer also drops the
+/// routine instant-completed cleanup receipt (see
+/// [`QuietCleanupWriter`], which holds at most one line to judge it
+/// whole); `-v` and `P11SCOPE_CAPTURE_DIAGNOSTICS=1` bypass the
+/// filter.
 pub(crate) fn bounded_stderr_writer() -> Box<dyn Write> {
-    bounded_writer_on_fd(std::io::stderr().as_raw_fd())
+    let writer = bounded_writer_on_fd(std::io::stderr().as_raw_fd());
+    if crate::run::capture_diagnostics_on() {
+        writer
+    } else {
+        Box::new(QuietCleanupWriter::new(writer))
+    }
+}
+
+/// Default-verbosity stderr: drops the routine all-quiet cleanup
+/// receipt — an instant `cleanup completed, N/N links released, 0 s`
+/// line says nothing the exit status does not — while every other
+/// byte passes: progress lines, slow completions, partial or
+/// uncertain receipts, other diagnostics, and unterminated tails
+/// (never a complete receipt). Lines are judged whole, however the
+/// writes split them; a tail past [`QUIET_CLEANUP_HOLD_CAP`] flushes
+/// through verbatim, so a newline-less writer can never wedge bytes
+/// here. Fail-open by construction: only the exact receipt drops.
+struct QuietCleanupWriter {
+    inner: Box<dyn Write>,
+    pending: Vec<u8>,
+}
+
+/// Longest held tail: the receipt is under a hundred bytes, so
+/// anything past this cannot be one and flushes through instead of
+/// growing the hold without limit.
+const QUIET_CLEANUP_HOLD_CAP: usize = 4096;
+
+impl QuietCleanupWriter {
+    fn new(inner: Box<dyn Write>) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Emit every complete held line except the quiet receipt, then
+    /// flush a past-cap tail through verbatim.
+    fn drain_complete_lines(&mut self) -> io::Result<()> {
+        while let Some(end) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            if !is_instant_completed_cleanup(&line) {
+                self.inner.write_all(&line)?;
+            }
+        }
+        if self.pending.len() > QUIET_CLEANUP_HOLD_CAP {
+            let tail: Vec<u8> = std::mem::take(&mut self.pending);
+            self.inner.write_all(&tail)?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for QuietCleanupWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        self.drain_complete_lines()?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain_complete_lines()?;
+        if !self.pending.is_empty() {
+            let tail: Vec<u8> = std::mem::take(&mut self.pending);
+            self.inner.write_all(&tail)?;
+        }
+        self.inner.flush()
+    }
+}
+
+/// True for the exact instant-completed cleanup receipt:
+/// `p11scope: cleanup completed, {n}/{n} links released, 0 s` with
+/// ASCII-digit counts and released equal to total, whole line
+/// consumed. Anything else — progress, slow, partial, uncertain —
+/// is a real signal and passes.
+fn is_instant_completed_cleanup(line: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"p11scope: cleanup completed, ";
+    const SUFFIX: &[u8] = b" links released, 0 s\n";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some(fraction) = rest.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    let Some(slash) = fraction.iter().position(|&byte| byte == b'/') else {
+        return false;
+    };
+    let (released, total) = fraction.split_at(slash);
+    let total = &total[1..];
+    !released.is_empty()
+        && released.iter().all(|byte| byte.is_ascii_digit())
+        && !total.is_empty()
+        && total.iter().all(|byte| byte.is_ascii_digit())
+        && released == total
 }
 
 /// [`bounded_stderr_writer`] over any writer fd (tests pass their pipe).
@@ -1908,6 +2005,55 @@ mod tests {
             got,
             b"p11scope: cleanup completed, 5/5 links released, 0 s\n"
         );
+    }
+
+    /// Default stderr drops the routine instant-completed cleanup
+    /// receipt: `cleanup completed, N/N links released, 0 s` says
+    /// nothing the exit status does not. Split writes fold the same
+    /// way as whole ones.
+    #[test]
+    fn quiet_cleanup_writer_drops_the_instant_completed_receipt() {
+        let (writer, mut reader) = pair();
+        let mut out = QuietCleanupWriter::new(bounded_writer_on_fd(writer.as_raw_fd()));
+        out.write_all(b"p11scope: cleanup completed, ").unwrap();
+        out.write_all(b"4/4 links released, 0 s\n").unwrap();
+        out.write_all(b"p11scope: cleanup completed, 5/5 links released, 0 s\n")
+            .unwrap();
+        out.flush().unwrap();
+        drop(out);
+        drop(writer);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert!(got.is_empty(), "the quiet receipt leaked: {got:?}");
+    }
+
+    /// ...while everything else passes: progress lines, slow or
+    /// incomplete or partial receipts, other diagnostics, and an
+    /// unterminated tail (never a complete receipt).
+    #[test]
+    fn quiet_cleanup_writer_keeps_progress_and_real_receipts() {
+        let (writer, mut reader) = pair();
+        let mut out = QuietCleanupWriter::new(bounded_writer_on_fd(writer.as_raw_fd()));
+        let lines = [
+            "p11scope: cleanup 4/251 links released, 0 s\n",
+            "p11scope: cleanup completed, 251/251 links released, 1 s\n",
+            "p11scope: cleanup incomplete, 1/1 links released, 1 uncertain, 0 s\n",
+            "p11scope: cleanup completed, 3/4 links released, 0 s\n",
+            "p11scope: capturing: 1466 probes attached; stop with Ctrl-C\n",
+        ];
+        for line in lines {
+            out.write_all(line.as_bytes()).unwrap();
+        }
+        out.write_all(b"p11scope: cleanup completed, 9/9 links released, 0 s")
+            .unwrap();
+        out.flush().unwrap();
+        drop(out);
+        drop(writer);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        let mut expected = lines.join("");
+        expected.push_str("p11scope: cleanup completed, 9/9 links released, 0 s");
+        assert_eq!(got, expected.as_bytes());
     }
 
     /// A fd no transport can be opened on sheds every line to the sink:

@@ -32,22 +32,28 @@ mod tests {
         }
     }
 
-    fn command(test: &str) -> Command {
+    fn command(test: &str, diagnostics: bool) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         let module = module_path!().split_once("::").unwrap().1;
         command
             .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
             .env(CHILD, "1")
             .stdout(Stdio::piped());
+        if diagnostics {
+            command.env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1");
+        }
         command
     }
 
     #[test]
     fn healthy_cleanup_diagnostics_keep_the_exact_completion_line() {
         child();
-        let output = command("healthy_cleanup_diagnostics_keep_the_exact_completion_line")
-            .output()
-            .unwrap();
+        let output = command(
+            "healthy_cleanup_diagnostics_keep_the_exact_completion_line",
+            true,
+        )
+        .output()
+        .unwrap();
         assert!(output.status.success());
         assert!(
             output
@@ -56,6 +62,31 @@ mod tests {
                 .any(|bytes| bytes == b"DIAGNOSTIC_CHILD\n")
         );
         assert_eq!(output.stderr, LINE);
+    }
+
+    /// The default-verbosity twin: the same instant-completed receipt
+    /// stays unwritten without diagnostics — routine quiet, not loss.
+    #[test]
+    fn default_cleanup_diagnostics_drop_the_instant_completed_line() {
+        child();
+        let output = command(
+            "default_cleanup_diagnostics_drop_the_instant_completed_line",
+            false,
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"DIAGNOSTIC_CHILD\n".len())
+                .any(|bytes| bytes == b"DIAGNOSTIC_CHILD\n")
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "the quiet receipt leaked: {:?}",
+            output.stderr
+        );
     }
 
     #[test]
@@ -77,7 +108,7 @@ mod tests {
         // SAFETY: retained owns the original shared pipe description.
         let flags = unsafe { libc::fcntl(retained.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0);
-        let mut process = command("full_stderr_cannot_hold_completed_cleanup_open")
+        let mut process = command("full_stderr_cannot_hold_completed_cleanup_open", true)
             .stderr(Stdio::from(writer))
             .die_with_parent()
             .spawn()

@@ -157,6 +157,25 @@ impl AssessmentContext {
             && self.seccomp.is_some()
             && (self.seccomp != Some(SeccompMode::Filter) || self.filters.is_some())
     }
+
+    /// The credential fields a post-shed re-key must hold identical, as
+    /// one comparable value with capabilities masked out. The pattern is
+    /// exhaustive (no `..`), so adding a field breaks the build instead
+    /// of silently escaping the re-key comparison.
+    fn non_capability_fields(
+        &self,
+    ) -> (u32, u32, u32, Option<u64>, Option<SeccompMode>, Option<u64>) {
+        let AssessmentContext {
+            process,
+            euid,
+            egid,
+            capabilities: _,
+            user_namespace,
+            seccomp,
+            filters,
+        } = self;
+        (*process, *euid, *egid, *user_namespace, *seccomp, *filters)
+    }
 }
 
 #[derive(Default)]
@@ -305,13 +324,7 @@ fn rekey_approval_to_post(
     if !pre_shed.reusable() {
         return;
     }
-    if pre_shed.process != post.process
-        || pre_shed.euid != post.euid
-        || pre_shed.egid != post.egid
-        || pre_shed.user_namespace != post.user_namespace
-        || pre_shed.seccomp != post.seccomp
-        || pre_shed.filters != post.filters
-    {
+    if pre_shed.non_capability_fields() != post.non_capability_fields() {
         return;
     }
     let (Some(before), Some(after)) = (pre_shed.capabilities, post.capabilities) else {

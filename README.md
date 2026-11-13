@@ -40,6 +40,7 @@ sudo p11scope doctor
 with no interim output; that is normal.)
 
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
+To check a download before installing, see [Verify a download](docs/install.md#verify-a-download).
 Container: the release publishes `ghcr.io/mingulov/p11scope:latest`
 (`:0.7.0` pins the exact version).
 Run `doctor` through it ([privileges](deploy/k8s/README.md)):

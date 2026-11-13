@@ -193,7 +193,8 @@ job, all eight contracts shards, all seven coverage partitions and the merged
 coverage report successful in that run's current attempt. Missing, skipped,
 duplicate, stale or partial gates, API errors and deduped runs refuse; there
 is no automatic search for a different run. The complete `ci` workflow remains
-the ordinary and coverage entry point.
+the ordinary and coverage entry point. Dispatch `package-preview` from the
+release tag or `main` so the file attestations name that ref, not a `tmp/ci` branch.
 
 Each selected package mode gets its own ordinary `ubuntu-26.04` runner,
 official `build-release.sh --capture-mode MODE --jobs N`, successful receipt,

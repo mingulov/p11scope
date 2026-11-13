@@ -104,6 +104,42 @@ the pushed digest, so both tags verify with one command:
 gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 -R mingulov/p11scope
 ```
 
+### Verify a download
+
+In the folder with the downloaded release assets, check the checksums
+first, then the build provenance of each file you install:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify p11scope-0.7.0-x86_64-linux-musl.tar.gz --repo mingulov/p11scope
+```
+
+`gh` must be logged in first (`gh auth login`). A passing attestation
+check is quiet: exit 0 means the file is covered. Add `--format json`
+to see the details, or pin the expected builder for a stricter check:
+
+```sh
+gh attestation verify p11scope-0.7.0-x86_64-linux-musl.tar.gz --repo mingulov/p11scope \
+  --signer-workflow mingulov/p11scope/.github/workflows/package-preview.yml
+```
+
+Verify the container image the same way, by tag or pinned by digest:
+
+```sh
+gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 --repo mingulov/p11scope
+docker buildx imagetools inspect ghcr.io/mingulov/p11scope:0.7.0 --format '{{.Manifest.Digest}}'
+gh attestation verify oci://ghcr.io/mingulov/p11scope@sha256:<digest> --repo mingulov/p11scope
+```
+
+(After a pull, `docker inspect --format '{{index .RepoDigests 0}}'
+ghcr.io/mingulov/p11scope:0.7.0` prints the same digest.)
+
+One surprise to know: the v0.7.0 file attestations name the build
+branch `refs/heads/tmp/ci/v070/rel-cand` — the release build ran on
+that branch, not on the tag — while the image attestation names
+`refs/tags/v0.7.0`. Both are expected. The recorded v0.7.0 hashes and
+digests live in the [v0.7.0 verification record](releases/v0.7.0.md#verification-record).
+
 ### Uninstall
 
 The packages install only files (no services, set-id bits or file

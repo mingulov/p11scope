@@ -945,12 +945,13 @@ impl JournalContradictionDiagnosis {
 }
 
 /// Diagnostic-only Joint void telemetry (Task 0): where stream breaks
-/// were recorded (dispose vs ingest arm), how many seal endings refused
-/// at the void-fence check, and the current per-key gauges (total,
-/// refused, tainted, pending). Counts only; no identities, paths or
-/// payloads. Disclosed on stderr when verbose text is requested, never
-/// a contract and never part of reports. Instrumentation only: it
-/// changes no Joint decision, seal, fence or gap.
+/// were recorded (dispose vs ingest arm), how many seals voided through
+/// a failed audit, how many seal endings refused at the void-fence
+/// check, and the current per-key gauges (total, refused, tainted,
+/// pending). Counts only; no identities, paths or payloads. Disclosed
+/// on stderr when verbose text is requested, never a contract and never
+/// part of reports. Instrumentation only: it changes no Joint decision,
+/// seal, fence or gap.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct JointVoidDiagnosis {
     /// Breaks recorded through dispose_without_ingest (non-contiguous
@@ -959,6 +960,13 @@ pub(crate) struct JointVoidDiagnosis {
     /// Breaks recorded through RawJointQuantum::ingest (non-contiguous
     /// stream on the ingest path).
     pub(crate) break_ingest: u64,
+    /// Seals voided through reject_audit (H3 loss, fault change,
+    /// malformed or discarded records): the fence moved and staged
+    /// custody dropped without any stream break.
+    pub(crate) void_audit: u64,
+    /// Linked-lane re-syncs that fenced a void (resolve_birth_cut): the
+    /// total the per-side break counts add up to, one per void.
+    pub(crate) void_resync: u64,
     /// Seal endings refused at the void-fence check (receipt cut below
     /// the fence is the refusing cause).
     pub(crate) seal_below_fence: u64,
@@ -1273,6 +1281,12 @@ pub(crate) struct JournalAdapter {
     /// instrumentation only, never authority.
     break_dispose: u64,
     break_ingest: u64,
+    /// Diagnostic-only audit voids (Task 0): seals voided through
+    /// reject_audit. Saturating; instrumentation only.
+    void_audit: u64,
+    /// Diagnostic-only re-sync total (Task 0): linked-lane re-syncs
+    /// that fenced a void. Saturating; instrumentation only.
+    void_resync: u64,
     /// Diagnostic-only below-fence seal endings (Task 0): seals refused
     /// at the void-fence check. Saturating; instrumentation only.
     seal_below_fence: u64,
@@ -1429,6 +1443,8 @@ impl JournalAdapter {
             stream_broken: false,
             break_dispose: 0,
             break_ingest: 0,
+            void_audit: 0,
+            void_resync: 0,
             seal_below_fence: 0,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
@@ -2247,6 +2263,46 @@ impl JournalAdapter {
         self.contradictions
     }
 
+    /// Diagnostic-only (Task 0): count a dispose-side break, but only
+    /// on a linked lane — an unlinked (S1-only) lane re-syncs without
+    /// moving any fence, so its breaks are not voids. Saturating;
+    /// instrumentation only, never authority.
+    fn note_break_dispose(&mut self) {
+        if self
+            .resource_producers
+            .as_ref()
+            .is_some_and(|producers| producers.journal_linked())
+        {
+            self.break_dispose = self.break_dispose.saturating_add(1);
+        }
+    }
+
+    /// Diagnostic-only (Task 0): count an ingest-side break, linked
+    /// lanes only (see note_break_dispose). Saturating; instrumentation
+    /// only, never authority.
+    fn note_break_ingest(&mut self) {
+        if self
+            .resource_producers
+            .as_ref()
+            .is_some_and(|producers| producers.journal_linked())
+        {
+            self.break_ingest = self.break_ingest.saturating_add(1);
+        }
+    }
+
+    /// Diagnostic-only (Task 0): adopt a retired owner's event counters
+    /// across joint-owner replacement. Global counters never reset; the
+    /// per-key gauges are not carried (they recompute from this owner's
+    /// own retained state on read). Instrumentation only, never
+    /// authority.
+    pub(crate) fn carry_joint_void_counts(&mut self, carried: &JointVoidDiagnosis) {
+        self.break_dispose = carried.break_dispose;
+        self.break_ingest = carried.break_ingest;
+        self.void_audit = carried.void_audit;
+        self.void_resync = carried.void_resync;
+        self.seal_below_fence = carried.seal_below_fence;
+    }
+
     /// Diagnostic-only Joint void telemetry (Task 0): break source
     /// counts, below-fence seal endings, and per-key gauges computed
     /// from retained state. Counts only; no identities. Readonly;
@@ -2269,6 +2325,8 @@ impl JournalAdapter {
         JointVoidDiagnosis {
             break_dispose: self.break_dispose,
             break_ingest: self.break_ingest,
+            void_audit: self.void_audit,
+            void_resync: self.void_resync,
             seal_below_fence: self.seal_below_fence,
             keys_total: self.keys.len() as u64,
             keys_refused: refused,
@@ -4113,6 +4171,9 @@ impl JournalAdapter {
             }
             if linked {
                 self.voided_through = self.voided_through.max(self.consumed_through);
+                // Diagnostic-only (Task 0): the re-sync above fenced
+                // one void. The fence is unchanged.
+                self.void_resync = self.void_resync.saturating_add(1);
             }
             self.stream_broken = false;
             self.invalidated = false;
@@ -5831,6 +5892,9 @@ impl JournalAdapter {
                     .effects
                     .extend(self.fence_void(model, self.consumed_through).effects);
                 self.void_staged();
+                // Diagnostic-only (Task 0): the audit above voided the
+                // seal. The refusal below is unchanged.
+                self.void_audit = self.void_audit.saturating_add(1);
                 // The voided consumption interval binds future keys too:
                 // births naming a cut below it refuse even when their key
                 // did not exist at the void.
@@ -12995,6 +13059,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_audit_void_counts_audit_not_breaks() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Failure twin: an H3-loss seal refusal voids through reject_audit
+        // (fence plus dropped staged custody) and counts exactly one audit
+        // void, leaving both break counters at zero. Setup mirrors
+        // object_journal_seal_below_fence_counts_ending through the void.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (after.void_audit, after.break_dispose, after.break_ingest),
+            (1, 0, 0),
+            "the audit void counts as audit, never as a break"
+        );
+    }
+
+    #[test]
+    fn object_journal_clean_seal_counts_no_audit_void() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Healthy twin: a seal that passes on a clean audit voids nothing
+        // and counts no audit void. Setup mirrors the healthy creation in
+        // object_journal_start_terminal_matrix.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("healthy seal passes");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (after.void_audit, after.break_dispose, after.break_ingest),
+            (0, 0, 0),
+            "a clean seal counts no voids of any kind"
+        );
+    }
+
+    #[test]
     fn object_journal_void_diagnosis_counts_per_key_states() {
         // Per-key gauges: a fresh adapter counts zero keys in every state;
         // after one key is attested, refused and image-tainted (never
@@ -13042,6 +13180,48 @@ pub(crate) mod tests {
             "a key of a tainted image counts as tainted"
         );
         assert_eq!(marked.keys_pending, 1, "an unsealed key still pends");
+    }
+
+    #[test]
+    fn object_journal_void_carry_adopts_all_counters() {
+        // Retirement carry: adopting a diagnosis moves all five event
+        // counters; the per-key gauges recompute from this owner's own
+        // (empty) retained state instead of being carried.
+        let mut scene = Scene::new(image_default());
+        let carried = JointVoidDiagnosis {
+            break_dispose: 3,
+            break_ingest: 5,
+            void_audit: 7,
+            void_resync: 11,
+            seal_below_fence: 13,
+            keys_total: 17,
+            keys_refused: 19,
+            keys_tainted: 23,
+            keys_pending: 29,
+        };
+        scene.adapter.carry_joint_void_counts(&carried);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (
+                after.break_dispose,
+                after.break_ingest,
+                after.void_audit,
+                after.void_resync,
+                after.seal_below_fence
+            ),
+            (3, 5, 7, 11, 13),
+            "the carry adopts every event counter"
+        );
+        assert_eq!(
+            (
+                after.keys_total,
+                after.keys_refused,
+                after.keys_tainted,
+                after.keys_pending
+            ),
+            (0, 0, 0, 0),
+            "gauges recompute from the new owner's empty state"
+        );
     }
 
     #[test]

@@ -2194,6 +2194,10 @@ impl RawJointQuantum {
         } else {
             Default::default()
         };
+        // Diagnostic-only (Task 0): snapshot the invalidation flag before
+        // the refusal below, so the break arm can tell a disposal that
+        // newly voided the stream from one that found it already void.
+        let was_invalidated = owner.adapter.invalidated;
         let failure = (unlocalized || affecting).then(|| {
             let gap = if overflow {
                 JournalGap::CutExhausted
@@ -2258,7 +2262,15 @@ impl RawJointQuantum {
         } else if !self.ordered.is_empty() || self.collection_failed() {
             owner.adapter.stream_broken = true;
             // Diagnostic-only (Task 0): the dispose side recorded a break.
-            owner.adapter.break_dispose = owner.adapter.break_dispose.saturating_add(1);
+            owner.adapter.note_break_dispose();
+        } else if owner.adapter.invalidated && !was_invalidated {
+            // Diagnostic-only (Task 0): this disposal newly invalidated
+            // the stream (an empty quantum after the fault moved, an
+            // overflow, ...) — staged custody is voided although the
+            // stream flag stays clear. Count it as a dispose-side void
+            // so the source split stays complete. Behavior unchanged:
+            // only the counter moves; stream_broken is not set here.
+            owner.adapter.note_break_dispose();
         }
         if unlocalized {
             owner.adapter.last_audit_failure = Some(owner.adapter.consumed_through);
@@ -2303,7 +2315,7 @@ impl RawJointQuantum {
         if !clean_stream {
             adapter.stream_broken = true;
             // Diagnostic-only (Task 0): the ingest side recorded a break.
-            adapter.break_ingest = adapter.break_ingest.saturating_add(1);
+            adapter.note_break_ingest();
         }
         for (item, quiet, origin) in self.classified_items() {
             let resource = match item {

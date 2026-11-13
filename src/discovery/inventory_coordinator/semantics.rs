@@ -2307,11 +2307,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         self.semantic_finalizer = None;
         self.refused_semantic_domains.insert(domain);
+        // Diagnostic-only (Task 0): the void counters are run-global
+        // and never reset, so the replacement owner adopts them.
+        let carried = self.joint_capture.adapter().joint_void_diagnosis();
         self.joint_capture =
             crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
                 crate::semantics_objects::journal::JournalLimits::policy(),
                 self.registry.semantic_storage_reserver(),
             );
+        self.joint_capture
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
         Ok(())
     }
 
@@ -7267,6 +7273,48 @@ mod promotion_lifecycle_tests {
         let state = coordinator.semantic_finalizer.as_ref().expect("kept");
         assert_eq!(state.pending_drop, Some((7, false)));
         assert!(coordinator.refused_semantic_domains.is_empty());
+    }
+
+    #[test]
+    fn retire_joint_domain_carries_void_counters() {
+        // Task 0: retiring the live domain replaces the joint owner, but
+        // the diagnostic void counters are run-global (never reset): the
+        // new owner shows the old owner's counts. The seed below uses the
+        // carry itself, but the assertion compares against literals, so
+        // a retire that dropped the counters reads zeros and fails.
+        let mut coordinator = coordinator();
+        let a = domain();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
+        let carried = crate::semantics_objects::journal::JointVoidDiagnosis {
+            break_dispose: 3,
+            break_ingest: 5,
+            void_audit: 7,
+            void_resync: 11,
+            seal_below_fence: 13,
+            keys_total: 0,
+            keys_refused: 0,
+            keys_tainted: 0,
+            keys_pending: 0,
+        };
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
+        coordinator
+            .retire_joint_domain(SessionNativeCompletion::scripted(a))
+            .expect("quiescent A retires");
+        let after = coordinator.joint_capture().adapter().joint_void_diagnosis();
+        assert_eq!(
+            (
+                after.break_dispose,
+                after.break_ingest,
+                after.void_audit,
+                after.void_resync,
+                after.seal_below_fence
+            ),
+            (3, 5, 7, 11, 13),
+            "retirement carries the void counters to the new owner"
+        );
     }
 
     #[test]

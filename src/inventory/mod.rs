@@ -2004,12 +2004,15 @@ fn run_with_terminal_budget(
     // never in reports. Counts which break side dominates and how many
     // endings refused below the fence, with per-key gauges. Emitted here
     // (not in the semantic stop disclosure) so -v always shows it, even
-    // when no semantic lane started (zeros then).
+    // when no semantic lane started (zeros then). The dashboard tail
+    // emits its own copy (it returns before this tail).
     if crate::cli::text_is_verbose() {
         let voids = coordinator.joint_void_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_voids_line(
             voids.break_dispose,
             voids.break_ingest,
+            voids.void_audit,
+            voids.void_resync,
             voids.seal_below_fence,
             voids.keys_total,
             voids.keys_refused,
@@ -8863,6 +8866,23 @@ fn run_dashboard(
     // only the stale number. Within the shared notice budget (shed past it).
     if let Some(line) = final_gap_line(&presentation) {
         display.notice(&line);
+    }
+    // Diagnostic-only Joint-void summary (Task 0), as on the classic
+    // tail: verbose text only, never in reports. The dashboard returns
+    // before the classic tail, so it emits its own copy here.
+    if crate::cli::text_is_verbose() {
+        let voids = coordinator.joint_void_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_voids_line(
+            voids.break_dispose,
+            voids.break_ingest,
+            voids.void_audit,
+            voids.void_resync,
+            voids.seal_below_fence,
+            voids.keys_total,
+            voids.keys_refused,
+            voids.keys_tainted,
+            voids.keys_pending,
+        ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);

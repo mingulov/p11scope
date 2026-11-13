@@ -843,3 +843,170 @@ fn joint_void_break_dispose_ignores_clean_empty_dispose() {
         "a clean dispose counts no breaks"
     );
 }
+
+#[test]
+fn joint_void_break_dispose_counts_unlocalized_empty_dispose() {
+    // Failure twin: disposing an EMPTY quantum after the fault counter
+    // moved since the last audit is treated as unlocalized: it sets
+    // invalidated and refuses every key (journal.rs refuse_disposed_raw)
+    // without setting the stream-broken flag. It still voided staged
+    // custody, so it counts one dispose-side void. Healthy twin:
+    // joint_void_break_dispose_ignores_clean_empty_dispose.
+    let events = EventsDomain::test_standin(0xb233);
+    let retained = producers(&events);
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let raw = collect(&mut owner, &pool, &retained, &events, []);
+    // The last audit pinned 8; this quantum opens at 7 (SteadyFault),
+    // so the fault moved.
+    owner.adapter.last_fault = Some(8);
+    let _ = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Empty)
+        .unwrap_or_else(|(_, reason)| panic!("empty disposal: {reason:?}"));
+    assert!(
+        !owner.adapter.stream_broken_for_test(),
+        "an empty disposal sets no stream-broken flag"
+    );
+    assert!(
+        owner.adapter.invalidated_for_test(),
+        "the fault move invalidated the stream"
+    );
+    let after = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (after.break_dispose, after.break_ingest),
+        (1, 0),
+        "the unlocalized empty disposal counts one dispose-side void"
+    );
+}
+
+#[test]
+fn joint_void_resync_totals_one_linked_break() {
+    // Failure twin: one dispose-side break on a linked lane, ended
+    // through void_ingest_break and re-synced, counts one resync total
+    // equal to the per-side break sum. The resync fence runs exactly
+    // once per void on a linked lane, so the total anchors the split.
+    let events = EventsDomain::test_standin(0xb234);
+    let retained = producers(&events);
+    assert!(retained.journal_linked(), "test producers link the journal");
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+    let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    let mut raw = collect(
+        &mut owner,
+        &pool,
+        &retained,
+        &events,
+        [begin.to_vec(), end.to_vec()],
+    );
+    let report = crate::semantic_capture::deliver_collected_raw_for_resource_test(
+        &mut raw,
+        retained.native_domain(),
+    );
+    assert!(!report.outcomes().is_empty());
+    assert!(raw.h0_reported && raw.ordinary.is_empty() && !raw.h0_pending);
+    let _ = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
+        .unwrap_or_else(|(_, reason)| panic!("owned disposal: {reason:?}"));
+    assert!(
+        owner.adapter.stream_broken_for_test(),
+        "the non-contiguous disposal breaks the stream"
+    );
+    assert_eq!(
+        owner.void_ingest_break(),
+        Ok(true),
+        "the joint machine ends the break through an invalidating disposal"
+    );
+    assert!(
+        owner.adapter.invalidated_for_test(),
+        "ending the break invalidated the stream"
+    );
+    let cut = EventDrain::over_domain(
+        ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+        events.clone(),
+    )
+    .consumption_cut()
+    .expect("an idle drain names its cut");
+    owner
+        .adapter_mut()
+        .resolve_birth_cut(&cut, &retained)
+        .expect("the linked lane re-syncs");
+    assert!(
+        !(owner.adapter.stream_broken_for_test() || owner.adapter.invalidated_for_test()),
+        "the re-sync cleared the stream"
+    );
+    let after = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (after.break_dispose, after.break_ingest, after.void_audit),
+        (1, 0, 0),
+        "one linked dispose break, nothing else"
+    );
+    assert_eq!(after.void_resync, 1, "the re-sync fenced one void");
+    assert_eq!(
+        after.break_dispose + after.break_ingest,
+        after.void_resync,
+        "the per-side counts sum to the resync total"
+    );
+}
+
+#[test]
+fn joint_void_unlinked_break_counts_no_void() {
+    // Healthy twin: the same dispose-side break on an UNLINKED (S1-only)
+    // lane counts no break — it re-syncs without moving any fence, so
+    // it is not a void — and its re-sync counts no resync total.
+    let events = EventsDomain::test_standin(0xb235);
+    let retained =
+        SessionDrainProducers::test_pair_unlinked(NativeDomainId::mint(), events.clone());
+    assert!(
+        !retained.journal_linked(),
+        "test producers leave the journal unlinked"
+    );
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+    let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    let mut raw = collect(
+        &mut owner,
+        &pool,
+        &retained,
+        &events,
+        [begin.to_vec(), end.to_vec()],
+    );
+    let report = crate::semantic_capture::deliver_collected_raw_for_resource_test(
+        &mut raw,
+        retained.native_domain(),
+    );
+    assert!(!report.outcomes().is_empty());
+    assert!(raw.h0_reported && raw.ordinary.is_empty() && !raw.h0_pending);
+    let _ = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
+        .unwrap_or_else(|(_, reason)| panic!("owned disposal: {reason:?}"));
+    assert!(
+        owner.adapter.stream_broken_for_test(),
+        "the non-contiguous disposal still breaks the stream"
+    );
+    let cut = EventDrain::over_domain(
+        ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+        events.clone(),
+    )
+    .consumption_cut()
+    .expect("an idle drain names its cut");
+    owner
+        .adapter_mut()
+        .resolve_birth_cut(&cut, &retained)
+        .expect("the unlinked lane re-syncs");
+    let after = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (
+            after.break_dispose,
+            after.break_ingest,
+            after.void_audit,
+            after.void_resync
+        ),
+        (0, 0, 0, 0),
+        "an unlinked break fences nothing, so it counts no void"
+    );
+}

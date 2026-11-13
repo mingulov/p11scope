@@ -1833,14 +1833,18 @@ pub(crate) fn joint_births_line(
 }
 
 /// One stderr line for the diagnostic Joint-void summary (Task 0):
-/// stream breaks by recording side (dispose vs ingest), seal endings
-/// refused at the void-fence check, and per-key gauges (total,
+/// stream breaks by recording side (dispose vs ingest), seals voided
+/// through a failed audit, the re-sync total they add up to, seal
+/// endings refused at the void-fence check, and per-key gauges (total,
 /// refused, tainted, pending). Counts only; no identities, paths or
 /// payloads. Diagnostic-only: printed beside the stop line only when
 /// verbose text is requested, never a contract and never in reports.
+#[allow(clippy::too_many_arguments)] // One line, two call sites, like joint_taints_line.
 pub(crate) fn joint_voids_line(
     break_dispose: u64,
     break_ingest: u64,
+    void_audit: u64,
+    void_resync: u64,
     seal_below_fence: u64,
     keys_total: u64,
     keys_refused: u64,
@@ -1849,7 +1853,8 @@ pub(crate) fn joint_voids_line(
 ) -> String {
     format!(
         "p11scope: joint voids: break_dispose={break_dispose} \
-         break_ingest={break_ingest} seal_below_fence={seal_below_fence} \
+         break_ingest={break_ingest} void_audit={void_audit} \
+         void_resync={void_resync} seal_below_fence={seal_below_fence} \
          keys_total={keys_total} keys_refused={keys_refused} \
          keys_tainted={keys_tainted} keys_pending={keys_pending}"
     )

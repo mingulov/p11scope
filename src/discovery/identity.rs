@@ -1226,7 +1226,7 @@ pub struct ReconciledModule {
 #[derive(Debug)]
 pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
-    raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
+    raw_to_id: RawToId,
     rejected_keys: BTreeSet<ObjectKey>,
     ambiguous_keys: BTreeSet<ObjectKey>,
     ambiguity_published: BTreeSet<ObjectKey>,
@@ -1268,6 +1268,98 @@ impl Clone for PinnedObjects {
     }
 }
 
+/// The raw-observation map with a lazily built per-object key index: the
+/// sorted, deduplicated keys of every raw filed under each object. Reads go
+/// through `Deref`; every mutable access goes through `DerefMut`, which
+/// drops the index first, so no mutation path can leave a stale index
+/// behind. The next query rebuilds it in one walk. Derived state only:
+/// `Debug` and content comparisons see the map alone.
+#[derive(Default)]
+struct RawToId {
+    map: BTreeMap<RawObjectInstance, PinnedObjectId>,
+    keys_by_id: std::cell::OnceCell<BTreeMap<PinnedObjectId, Box<[ObjectKey]>>>,
+}
+
+impl RawToId {
+    /// The sorted, deduplicated keys of every raw filed under `id`; empty
+    /// when none is.
+    fn keys_of(&self, id: PinnedObjectId) -> &[ObjectKey] {
+        self.keys_by_id
+            .get_or_init(|| {
+                #[cfg(test)]
+                raw_key_scan_count::bump();
+                let mut index: BTreeMap<PinnedObjectId, Vec<ObjectKey>> = BTreeMap::new();
+                for (raw, owner) in &self.map {
+                    index.entry(*owner).or_default().push(raw.key);
+                }
+                index
+                    .into_iter()
+                    .map(|(owner, mut keys)| {
+                        keys.sort();
+                        keys.dedup();
+                        (owner, keys.into_boxed_slice())
+                    })
+                    .collect()
+            })
+            .get(&id)
+            .map_or(&[], |keys| keys)
+    }
+}
+
+impl Clone for RawToId {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            keys_by_id: self.keys_by_id.clone(),
+        }
+    }
+}
+
+impl PartialEq for RawToId {
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+    }
+}
+
+impl std::fmt::Debug for RawToId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.map.fmt(f)
+    }
+}
+
+impl std::ops::Deref for RawToId {
+    type Target = BTreeMap<RawObjectInstance, PinnedObjectId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for RawToId {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.keys_by_id.take();
+        &mut self.map
+    }
+}
+
+impl IntoIterator for RawToId {
+    type Item = (RawObjectInstance, PinnedObjectId);
+    type IntoIter = std::collections::btree_map::IntoIter<RawObjectInstance, PinnedObjectId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RawToId {
+    type Item = (&'a RawObjectInstance, &'a PinnedObjectId);
+    type IntoIter = std::collections::btree_map::Iter<'a, RawObjectInstance, PinnedObjectId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PinCopyCacheId(std::num::NonZeroU64);
 
@@ -1295,7 +1387,7 @@ impl PinnedObjects {
     pub fn empty() -> Self {
         Self {
             by_id: BTreeMap::new(),
-            raw_to_id: BTreeMap::new(),
+            raw_to_id: RawToId::default(),
             rejected_keys: BTreeSet::new(),
             ambiguous_keys: BTreeSet::new(),
             ambiguity_published: BTreeSet::new(),
@@ -1784,19 +1876,12 @@ impl PinnedObjects {
     /// (scan aliases included), sorted and deduplicated. Task 3 Stage A
     /// selects the object's ranges in `/proc/PID/maps` by these.
     pub(crate) fn raw_keys_for(&self, id: PinnedObjectId) -> Vec<ObjectKey> {
-        #[cfg(test)]
-        raw_key_scan_count::bump();
-        let mut keys: Vec<ObjectKey> = self
-            .raw_to_id
-            .iter()
-            .filter(|(_, owner)| **owner == id)
-            .map(|(raw, _)| raw.key)
-            .collect();
-        if let Some(entry) = self.by_id.get(&id) {
-            keys.push(entry.raw.key);
+        let mut keys = self.raw_to_id.keys_of(id).to_vec();
+        if let Some(entry) = self.by_id.get(&id)
+            && let Err(at) = keys.binary_search(&entry.raw.key)
+        {
+            keys.insert(at, entry.raw.key);
         }
-        keys.sort();
-        keys.dedup();
         keys
     }
 
@@ -1820,13 +1905,13 @@ impl PinnedObjects {
         dev_minor: u64,
         ino: u64,
     ) -> bool {
-        self.raw_keys_for(object).iter().any(|key| {
+        let hit = |key: &ObjectKey| {
             key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
-        }) || self.by_id.get(&object).is_some_and(|entry| {
-            entry.probed_maps_key.is_some_and(|key| {
-                key.device.major == dev_major && key.device.minor == dev_minor && key.inode == ino
+        };
+        self.raw_to_id.keys_of(object).iter().any(hit)
+            || self.by_id.get(&object).is_some_and(|entry| {
+                hit(&entry.raw.key) || entry.probed_maps_key.as_ref().is_some_and(hit)
             })
-        })
     }
 
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {

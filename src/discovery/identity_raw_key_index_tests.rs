@@ -39,13 +39,14 @@ fn scan_matches(pins: &PinnedObjects, id: PinnedObjectId, key: ObjectKey) -> boo
             .is_some_and(|entry| entry.probed_maps_key.as_ref().is_some_and(hit))
 }
 
-/// Every id the set can answer for, plus one it has never minted.
+/// Every id the set has ever minted (retired ones included: a stale
+/// answer for a retired object is the failure this guards), every id it
+/// currently files, and ids it has never minted.
 fn query_ids(pins: &PinnedObjects) -> BTreeSet<PinnedObjectId> {
-    pins.by_id
-        .keys()
-        .copied()
+    (0..pins.next_id.saturating_add(3))
+        .map(PinnedObjectId)
+        .chain(pins.by_id.keys().copied())
         .chain(pins.raw_to_id.values().copied())
-        .chain([PinnedObjectId(pins.next_id.saturating_add(7))])
         .collect()
 }
 
@@ -55,7 +56,11 @@ fn query_keys(pins: &PinnedObjects) -> BTreeSet<ObjectKey> {
         .keys()
         .map(|raw| raw.key)
         .chain(pins.by_id.values().map(|entry| entry.raw.key))
-        .chain(pins.by_id.values().filter_map(|entry| entry.probed_maps_key))
+        .chain(
+            pins.by_id
+                .values()
+                .filter_map(|entry| entry.probed_maps_key),
+        )
         .chain([overlay(999)])
         .collect()
 }
@@ -126,12 +131,7 @@ fn raw_key_queries_rewalk_once_after_a_raw_map_mutation() {
 fn raw_key_queries_match_the_scan_after_every_mutation() {
     let mut pins = pin_set(&distinct_keys(4), true);
     for minor in 1..=4 {
-        record_scan_ownership(
-            &mut pins,
-            ProcessViewId(minor as u32),
-            overlay(minor),
-            PATH,
-        );
+        record_scan_ownership(&mut pins, ProcessViewId(minor as u32), overlay(minor), PATH);
     }
     assert_agrees(&pins, "built");
 
@@ -182,9 +182,20 @@ fn raw_key_queries_match_the_scan_after_every_mutation() {
 #[test]
 fn raw_key_queries_stay_per_copy_across_clone() {
     let mut source = pin_set(&distinct_keys(6), true);
+    for minor in 1..=6 {
+        record_scan_ownership(
+            &mut source,
+            ProcessViewId(minor as u32),
+            overlay(minor),
+            PATH,
+        );
+    }
     assert_agrees(&source, "warm source");
     let mut copy = source.clone();
     assert_agrees(&copy, "warm copy");
+    assert!(copy.remove_view(ProcessViewId(3)).is_some());
+    assert_agrees(&copy, "copy view retired");
+    assert_agrees(&source, "source after copy retirement");
     assert!(copy.absorb(manifest_pin(overlay(41), SHA, 1)).is_empty());
     assert_agrees(&copy, "copy mutated");
     assert_agrees(&source, "source after copy mutation");
@@ -208,4 +219,30 @@ fn raw_key_queries_match_the_scan_after_the_raw_map_is_drained() {
     assert_agrees(&pins, "raw map taken");
     assert!(pins.absorb(pin_set(&distinct_keys(2), true)).is_empty());
     assert_agrees(&pins, "refilled");
+}
+
+/// One object under two keys: a pre-6.8 overlay split, whose manifest
+/// alias the self-mapping probe refiles onto the scan pin, then the scan
+/// view retires while the manifest keeps the object.
+#[test]
+fn raw_key_queries_track_split_aliases_of_one_object() {
+    use super::test_fixture::{FakeSelfMappingProbe, backing_file, reback, split_scan_pin};
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let maps_key = overlay(21);
+    let fd_key = overlay(41);
+    let mut pins = split_scan_pin(maps_key, fd_key, SHA, 1);
+    reback(&mut pins, &file);
+    record_scan_ownership(&mut pins, ProcessViewId(21), maps_key, PATH);
+    assert_agrees(&pins, "scan pin");
+    let mut manifest = manifest_pin(fd_key, SHA, 1);
+    reback(&mut manifest, &file);
+    assert!(pins.absorb(manifest).is_empty());
+    assert_agrees(&pins, "manifest absorbed");
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    pins.refile_split_manifest_alias(maps_key, PATH, &mut budget, &probe);
+    assert_agrees(&pins, "manifest alias refiled");
+    let _ = pins.remove_view(ProcessViewId(21));
+    assert_agrees(&pins, "scan view retired");
 }

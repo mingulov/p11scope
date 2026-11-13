@@ -662,6 +662,15 @@ pub struct Engine {
     /// equals returned, no START row). Stable while detached: entries
     /// leave when their slot does (revived or withdrawn).
     revival_finalized: BTreeSet<u32>,
+    /// Withheld endpoints the post-attach excision could not safely
+    /// reclaim (view-collapse fix8 F1): `AttachKey` to the retired
+    /// position that retries it in place. Withholding needs clean
+    /// partial-link detach and same-key revival reuses the identical
+    /// cookie for the identical endpoint, so the clearance is sound
+    /// without the two-tick detached/finalized proof. Entries leave
+    /// when their key does (revived, withdrawn, or superseded);
+    /// bounded by the retired set, refreshed every apply.
+    withheld_revivable: BTreeMap<plan::AttachKey, usize>,
     global_retirement_frame_owed: bool,
     /// Terminal-drain quanta that stopped at the shared allowance with
     /// terminal work unfinished. Sticky evidence, like quiescence
@@ -12113,6 +12122,7 @@ impl Engine {
             pending_global_retirement: None,
             revival_observed_detached: BTreeSet::new(),
             revival_finalized: BTreeSet::new(),
+            withheld_revivable: BTreeMap::new(),
             global_retirement_frame_owed: false,
             terminal_capacity_backlog: 0,
             discovery_held_high_water: 0,
@@ -17037,9 +17047,13 @@ impl Engine {
                         // ordinary path (the withhold vehicle) — instead
                         // of recording static failures. Withholding needs
                         // clean partial-link detach (a leftover link must
-                        // never strand) and excisable tail cells; anything
-                        // else falls back to today's terminal treatment
-                        // with its own gap, never a silent skip.
+                        // never strand). Fix8 F1: excision must never
+                        // shift a linked registration — cookies, Session
+                        // links and stamps already froze the submitted
+                        // indices — so only withheld cells strictly above
+                        // the highest surviving active cell are
+                        // reclaimed; the rest stay deactivated in place
+                        // and retry there, never terminally failed.
                         let exhausted = session.attach_exhausted_slots();
                         let mut withheld = BTreeSet::new();
                         for slot in &failed_slots {
@@ -17064,9 +17078,24 @@ impl Engine {
                             for index in &withheld {
                                 candidate.plan.deactivate(*index);
                             }
+                            // Only cells whose removal cannot shift a
+                            // linked registration may go: strictly above
+                            // the highest surviving active cell. Active
+                            // here means possibly linked (completed this
+                            // attach or earlier); every inactive survivor
+                            // below was detached clean or never linked.
+                            let highest_active = (0..candidate.plan.slots.len())
+                                .rfind(|position| candidate.plan.is_active(*position as u32));
+                            let safe: BTreeSet<u32> = withheld
+                                .iter()
+                                .copied()
+                                .filter(|index| {
+                                    highest_active.is_none_or(|top| (*index as usize) > top)
+                                })
+                                .collect();
                             let old_to_new = candidate
                                 .plan
-                                .excise_unlinked_tail_cells(self.plan.slots.len(), &withheld);
+                                .excise_unlinked_tail_cells(self.plan.slots.len(), &safe);
                             for slot in candidate
                                 .delta
                                 .new
@@ -17086,11 +17115,17 @@ impl Engine {
                                     slot.index = new;
                                 }
                             }
-                            // Cells the excise could not take (not
-                            // inactive tail cells) cannot retry: terminal
-                            // treatment with their own gap. Fresh tail
-                            // cells always excise; this is the honest
-                            // fallback, not the path.
+                            // Cells the excise did not take stay
+                            // deactivated in place and retry THERE: each
+                            // is cleared for same-target revival on its
+                            // own index, so the next rebuild re-derives
+                            // the key into its own hole instead of
+                            // burning a fresh cell per attempt. Same-key
+                            // revival reuses the identical cookie for the
+                            // identical endpoint, and withholding needed
+                            // clean detach — so the clearance is sound
+                            // without the two-tick proof. No static
+                            // failure: every withheld slot pends.
                             let stuck: Vec<u32> = withheld
                                 .iter()
                                 .copied()
@@ -17100,34 +17135,27 @@ impl Engine {
                                 })
                                 .collect();
                             for index in &stuck {
-                                let new =
+                                let position =
                                     old_to_new.get(*index as usize).copied().unwrap_or(u32::MAX);
-                                if new != u32::MAX
-                                    && let Some(slot) = candidate
-                                        .plan
-                                        .slots
-                                        .iter()
-                                        .find(|slot| slot.index == new)
-                                        .cloned()
-                                {
-                                    outcome
-                                        .static_failures
-                                        .extend(slot_timing_keys(&slot, &timing_owners));
+                                if position == u32::MAX {
+                                    continue;
+                                }
+                                if let Some(slot) = candidate.plan.slots.get(position as usize) {
+                                    // Remembered by key, not stamped on the
+                                    // candidate: the post-apply revival
+                                    // refresh re-derives the clearance from
+                                    // the committed retired state plus this
+                                    // map, so it survives every refresh and
+                                    // needs no candidate-carried duplicate.
+                                    let key = plan::AttachKey::of(slot);
+                                    self.withheld_revivable.insert(key, position as usize);
                                 }
                             }
                             self.plan_rebuild_stable = false;
-                            if stuck.len() < withheld.len() {
-                                self.mark_partial(
-                                    "live discovery attach",
-                                    "fd table exhausted attaching new slots; they wait for the next tick",
-                                );
-                            }
-                            if !stuck.is_empty() {
-                                self.mark_partial(
-                                    "live discovery attach",
-                                    "fd table exhausted attaching new slots, and some could not be withheld for retry; they were deactivated",
-                                );
-                            }
+                            self.mark_partial(
+                                "live discovery attach",
+                                "fd table exhausted attaching new slots; they wait for the next tick",
+                            );
                         }
                     }
                     Err(_) => {
@@ -25249,7 +25277,37 @@ impl Engine {
                     revivable.insert(*key, *position);
                 }
             }
+            // View-collapse fix8 F1: withheld cells the post-attach
+            // excision could not safely reclaim retry in place. Re-clear
+            // each seed whose key is still retired at its remembered
+            // position with the same slot — same-key revival reuses the
+            // identical cookie for the identical endpoint after clean
+            // detach, so the clearance is sound without the two-tick
+            // proof. Anything else fails closed (and prunes below).
+            for (key, position) in &self.withheld_revivable {
+                if self.plan.retired_keys().get(key) == Some(position)
+                    && self.plan.retired_slots().contains(position)
+                    && self
+                        .plan
+                        .slots
+                        .get(*position)
+                        .is_some_and(|slot| plan::AttachKey::of(slot) == *key)
+                {
+                    revivable.insert(*key, *position);
+                }
+            }
         }
+        // Seeds that no longer name a retired cell (revived, withdrawn,
+        // or superseded) leave with it: bounded by the retired set.
+        self.withheld_revivable.retain(|key, position| {
+            self.plan.retired_keys().get(key) == Some(position)
+                && self.plan.retired_slots().contains(position)
+                && self
+                    .plan
+                    .slots
+                    .get(*position)
+                    .is_some_and(|slot| plan::AttachKey::of(slot) == *key)
+        });
         self.revival_observed_detached = detached_now;
         self.plan.set_revivable(revivable);
     }

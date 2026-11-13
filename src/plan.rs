@@ -1985,6 +1985,60 @@ impl AttachPlan {
         {
             return Ok(None);
         }
+        // View-collapse fix8 F1: a retired seed whose key cleared
+        // revivable reoccupies its old cell instead of burning a fresh
+        // one per retry — the provisional counterpart of merge revival
+        // (see `revival_target`). Same clearance, same match: Detailed
+        // policy, still retired at the remembered position, same
+        // descriptor and names, so the reused cookie names the same
+        // endpoint. Seeds are always count-only descriptor 0, for which
+        // the aggregate-ambiguity gate always passes. Every
+        // inconsistency fails closed to a fresh slot below.
+        if matches!(self.admission_policy, AdmissionPolicy::Detailed(_))
+            && !self.slot_by_key.contains_key(&key)
+            && let Some(position) = self.revivable.get(&key).copied()
+            && self.retired_keys.get(&key) == Some(&position)
+            && self.retired_slots.contains(&position)
+            && let Some(retired) = self.slots.get(position)
+            && AttachKey::of(retired) == key
+            && retired.descriptor_index == 0
+            && retired.names == ["C_GetFunctionList"]
+        {
+            // Same slot the fresh path below would build, on the old
+            // index: like merge revival, the content is the fresh
+            // evidence (seeds carry no learned names or descriptors),
+            // only the index is reused.
+            let updated = Slot {
+                index: position as u32,
+                descriptor_index: 0,
+                object: provisional.object,
+                object_path: provisional.object_path.clone(),
+                file_offset: provisional.file_offset,
+                names: vec!["C_GetFunctionList".into()],
+                aliased: false,
+                semantics: SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![provisional.module],
+            };
+            let previous_owner = self.aggregate_owners[position];
+            self.aggregate_owners[position] =
+                previous_owner.merge(AggregateOwner::from_module_ids(&updated.module_ids));
+            self.slots[position] = updated.clone();
+            self.slot_by_key.insert(key, position);
+            self.retired_slots.remove(&position);
+            self.retired_keys.remove(&key);
+            self.revivable.remove(&key);
+            self.provisional_get_function_list
+                .insert(key, provisional.object);
+            self.module_ambiguous = self
+                .aggregate_owners
+                .iter()
+                .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
+                .count();
+            return Ok(Some(updated));
+        }
         self.admission_policy
             .checked_required(self.slots.len(), 1)
             .map_err(|error| format!("provisional C_GetFunctionList: {error}"))?;
@@ -2003,6 +2057,14 @@ impl AttachPlan {
             module_ids: vec![provisional.module],
         };
         self.slot_by_key.insert(key, slot.index as usize);
+        // An active key leaves the revival memory (view-collapse fix8
+        // F1): a fresh cell over a retired key drops the stale retired
+        // position, exactly like merge-fresh allocation — otherwise the
+        // key would stay both retired and attach-indexed, which
+        // validation refuses. The old position stays retired (an
+        // anonymous hole); only the key memory moves.
+        self.retired_keys.remove(&key);
+        self.revivable.remove(&key);
         self.provisional_get_function_list
             .insert(key, provisional.object);
         self.slots.push(slot.clone());
@@ -12871,6 +12933,77 @@ mod tests {
         assert!(plan.surfaces.is_empty());
         assert_eq!(plan.entries_seen, 0);
         assert_eq!(plan.provisional_get_function_list.len(), 1);
+    }
+
+    /// View-collapse fix8 F1: a provisional seed whose retired key
+    /// cleared revivable reoccupies its old cell instead of burning a
+    /// fresh one per retry. Without clearance, at a wrong position, or
+    /// against a mismatched retired slot, the seed fails closed to a
+    /// fresh cell.
+    #[test]
+    fn provisional_seed_revives_a_cleared_retired_cell_in_place() {
+        let object = PinnedObjectId(7);
+        let mut plan = provisional_plan(object);
+        let seed = |file_offset| ProvisionalGetFunctionList {
+            module: ModuleId(0),
+            object,
+            object_path: "/opt/p11.so".into(),
+            file_offset,
+        };
+        let first = plan
+            .add_provisional_get_function_list(seed(0x10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.index, 0);
+        let key = AttachKey::of(&first);
+        plan.deactivate(0);
+        assert_eq!(plan.slot_index_for_key(key), None);
+        // No clearance: a fresh cell, fail closed.
+        let fresh = plan
+            .add_provisional_get_function_list(seed(0x10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.index, 1);
+        assert_eq!(plan.slots.len(), 2);
+        plan.deactivate(1);
+        // A clearance for a position with no retired memory fails
+        // closed at validation (the retired key sits at 1, not 99).
+        plan.set_revivable(BTreeMap::from([(key, 99)]));
+        assert!(plan.validate_slot_index().is_err());
+        // The cleared, matching cell revives in place: same index, no
+        // growth, key re-indexed, retirement cleared, still valid.
+        plan.set_revivable(BTreeMap::from([(key, 1)]));
+        let revived = plan
+            .add_provisional_get_function_list(seed(0x10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(revived.index, 1);
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.slot_index_for_key(key), Some(1));
+        assert!(!plan.retired_slots().contains(&1));
+        assert!(plan.validate_slot_index().is_ok());
+        // Active again: a repeat placement is a no-op.
+        assert!(
+            plan.add_provisional_get_function_list(seed(0x10))
+                .unwrap()
+                .is_none()
+        );
+        // A retired slot that no longer matches fails closed even with
+        // a position-matching clearance.
+        let other = plan
+            .add_provisional_get_function_list(seed(0x20))
+            .unwrap()
+            .unwrap();
+        let other_key = AttachKey::of(&other);
+        plan.deactivate(other.index);
+        plan.slots[other.index as usize].names = vec!["C_Sign".into()];
+        plan.set_revivable(BTreeMap::from([(other_key, other.index as usize)]));
+        let fresh = plan
+            .add_provisional_get_function_list(seed(0x20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.index, 3);
+        assert!(plan.validate_slot_index().is_ok());
     }
 
     #[test]

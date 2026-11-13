@@ -20198,6 +20198,91 @@ mod tests {
         }
     }
 
+    /// View-collapse fix8 F1 (codex blocking, scheduler seam): multi
+    /// groups run in path/program order, independently of plan slot
+    /// order — so exhaustion does NOT imply an index suffix. With the
+    /// path order reversed (slots 2,3 in `/a.so` attach first, slots
+    /// 0,1 in `/b.so` exhaust), the completed group keeps its higher
+    /// indices, the unfinished group waits, and every submitted cookie
+    /// still names its own slot. The engine twin below proves the plan
+    /// honors the same alignment after the withhold.
+    #[test]
+    fn review_multi_exhaustion_can_precede_completed_indices() {
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+            group_slot(3, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/b.so", ElfAbi::Lp64),
+            (1, "/b.so", ElfAbi::Lp64),
+            (2, "/a.so", ElfAbi::Lp64),
+            (3, "/a.so", ElfAbi::Lp64),
+        ]);
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(group_member_indices(&groups[0]), vec![2, 3]);
+        assert_eq!(group_member_indices(&groups[1]), vec![0, 1]);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |path, _, is_return| {
+                (path == "/b.so" && !is_return).then(|| io::Error::from_raw_os_error(libc::EMFILE))
+            }),
+        };
+        let (bundles, outcome) =
+            attach_target_groups_with(&groups, |_| Some(7), mock.leaf()).unwrap();
+        assert!(outcome.exhausted, "the /b.so entry must exhaust");
+        assert_eq!(
+            outcome
+                .completed
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [2, 3],
+            "the completed group keeps its higher indices"
+        );
+        assert_eq!(
+            outcome.exhausted_slots,
+            BTreeSet::from([0, 1]),
+            "only the unfinished group waits"
+        );
+        // Every submitted cookie names its own slot: the completed
+        // group's links route to 2 and 3, never to a shifted index.
+        for (program, is_return, sites) in mock.calls.borrow().iter() {
+            for (offset, cookie) in sites {
+                let slot = p11scope_ebpf_common::cookie_slot(*cookie);
+                let member = groups
+                    .iter()
+                    .flat_map(|group| &group.members)
+                    .find(|member| member.offset == *offset)
+                    .unwrap_or_else(|| panic!("{program} site {offset:#x} is grouped"));
+                assert_eq!(
+                    slot, member.slot.index,
+                    "{program} (return={is_return}): cookie names its own slot"
+                );
+            }
+        }
+        // The exhausted group's return side attached before its entry
+        // side failed: the caller detaches those partial links (the
+        // engine's `detach_failed_slots`), so a return bundle for the
+        // unfinished members is kept. Entry bundles belong only to
+        // completed members.
+        assert!(
+            bundles
+                .iter()
+                .any(|bundle| bundle.program == "p11_return" && bundle.slots == vec![0, 1]),
+            "the unfinished group's partial return links are kept for detach: {bundles:?}"
+        );
+        assert!(
+            bundles
+                .iter()
+                .filter(|bundle| bundle.program == "p11_entry")
+                .all(|bundle| bundle.slots.iter().all(|slot| *slot == 2 || *slot == 3)),
+            "entry bundles belong entirely to completed members: {bundles:?}"
+        );
+    }
+
     fn aya_attach_errno(errno: i32) -> aya::programs::ProgramError {
         aya::programs::ProgramError::SyscallError(aya::sys::SyscallError {
             call: "perf_event_open",

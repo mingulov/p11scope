@@ -26006,6 +26006,165 @@ fn static_seed_attach_exhaustion_withholds_slot_for_retry() {
     );
 }
 
+/// View-collapse fix8 F1 (codex blocking, integrated mixed-group
+/// regression): exhaustion is not an index suffix — a LOWER slot can
+/// wait while a HIGHER slot completes (see the attach-seam twin
+/// `review_multi_exhaustion_can_precede_completed_indices`). Withholding
+/// the lower cell must not renumber the surviving linked registration:
+/// submitted indices, Session registrations, published plan indices
+/// and the next tick's retry indices stay aligned, and the retry
+/// reuses the same cell instead of burning a fresh one per attempt.
+#[test]
+fn exhaustion_withhold_preserves_surviving_attached_slot_indices() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut candidate = engine
+        .live_candidate(pins.clone(), vec![module.clone()], Vec::new())
+        .unwrap();
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&module),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+    let seed = &collected.count_only_seeds[0];
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    // Two cells on one object: the lower waits, the higher completes.
+    let low = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    let high = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset.wrapping_add(8),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!((low.index, high.index), (0, 1));
+    let low_key = plan::AttachKey::of(&low);
+    let high_key = plan::AttachKey::of(&high);
+    candidate.delta.new.push(low.clone());
+    candidate.delta.new.push(high.clone());
+
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([low.index]);
+    session.exhaust_target_slots([low.index]);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+
+    assert!(outcome.required_complete());
+    assert_eq!(session.attached_slots, [2]);
+    assert_eq!(
+        session
+            .attached_requests
+            .iter()
+            .map(|request| request.iter().map(|(slot, _, _)| *slot).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![0, 1]],
+        "the Session was asked for the original indices"
+    );
+    // The surviving linked registration keeps its submitted index: no
+    // excision may shift an active cell down over a withheld hole.
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "both cells survive, the hole stays a hole"
+    );
+    assert_eq!(
+        engine.plan.slot_index_for_key(high_key),
+        Some(1),
+        "the completed slot still publishes its submitted index"
+    );
+    assert_eq!(
+        engine.plan.slot_index_for_key(low_key),
+        None,
+        "the withheld key leaves the index for next-tick re-derivation"
+    );
+    assert!(
+        outcome.static_failures.is_empty(),
+        "the withheld slot pends, it did not fail: {:?}",
+        outcome.static_failures
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery attach"
+                && skip.reason.contains("exhausted")
+                && skip.reason.contains("next tick")),
+        "the wait gap is filed: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Next-tick retry through the ordinary seed path: the withheld
+    // endpoint re-derives IN PLACE at index 0 — no fresh cell is
+    // consumed — and the completed slot is untouched.
+    let mut retry = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .unwrap();
+    let placement = place_count_only_seed(&mut retry, seed);
+    assert_eq!(placement, SeedPlacement::Placed);
+    assert_eq!(
+        retry
+            .delta
+            .new
+            .iter()
+            .map(|slot| slot.index)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the retry re-derives the withheld endpoint at its own index"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, retry, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert_eq!(session.attached_slots, [1]);
+    assert_eq!(
+        session
+            .attached_requests
+            .iter()
+            .map(|request| request.iter().map(|(slot, _, _)| *slot).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![0]],
+        "the retry attaches the same index the hole held"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "the retry consumed no fresh cell"
+    );
+    assert_eq!(engine.plan.slot_index_for_key(low_key), Some(0));
+    assert_eq!(engine.plan.slot_index_for_key(high_key), Some(1));
+    assert!(outcome.static_failures.is_empty());
+}
+
 #[test]
 fn static_seed_preflight_refusal_keeps_accepted_plan_and_links_unchanged() {
     let (_fixture, view, module, pins) = loaded_seed_provider();

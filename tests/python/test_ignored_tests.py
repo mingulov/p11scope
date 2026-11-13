@@ -1558,6 +1558,44 @@ class IgnoredTestsTests(unittest.TestCase):
         text = RUNNER.read_text(encoding="utf-8")
         self.assertIn("dedup_preserving_order selected_runnable", text)
 
+    def test_exact_selectors_never_run_a_prefix_sibling(self):
+        # A curated name that prefixes another (the fanotify live-drain
+        # pair) double-ran under substring selection: the short
+        # selector's shard also ran the long cell, so the coverage
+        # diff saw the sibling twice. --exact-selectors must match
+        # full paths only. Drives the runner's own selected() in both
+        # modes, plus the empty-selector and usage wiring.
+        short = "fanotify::tests::learn_live_drain_reports_opened_provider"
+        long = short + "_across_mount_ns"
+        script = (
+            f'source "{RUNNER}" --help >/dev/null 2>&1; '
+            f'SELECTORS=("{short}"); '
+            'EXACT_SELECTORS=0; '
+            f'selected "{short}" && echo "substr-self:match" || echo "substr-self:nomatch"; '
+            f'selected "{long}" && echo "substr-sib:match" || echo "substr-sib:nomatch"; '
+            'EXACT_SELECTORS=1; '
+            f'selected "{short}" && echo "exact-self:match" || echo "exact-self:nomatch"; '
+            f'selected "{long}" && echo "exact-sib:match" || echo "exact-sib:nomatch"; '
+            f'selected "{short}_renamed" && echo "exact-other:match" || echo "exact-other:nomatch"; '
+            'SELECTORS=(); '
+            f'selected "{long}" && echo "empty:match" || echo "empty:nomatch"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ["substr-self:match", "substr-sib:match",
+                          "exact-self:match", "exact-sib:nomatch",
+                          "exact-other:nomatch", "empty:match"])
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("--exact-selectors", text)
+        self.assertIn('if selector_matches "$name" "$sel"; then', text)
+        self.assertIn('if selector_matches "$candidate" "$arg"; then', text)
+        self.assertIn('"# exact_selectors: $EXACT_SELECTORS"', text)
+
     def test_run_loop_appends_the_branch_suffix_after_the_result_text(self):
         # The ` branch=` token goes after the test-result text so the
         # downstream `PASS <path> rc=0 seconds=<n> :: test result: ...`

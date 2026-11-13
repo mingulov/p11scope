@@ -4,7 +4,7 @@
 # Reproducible runner for the privileged (ignored) p11scope lib tests.
 #
 # Usage:
-#   scripts/run-privileged-lib-tests.sh LIB_TEST_BINARY OUTDIR [GROUP-FLAG...] [SELECTOR...]
+#   scripts/run-privileged-lib-tests.sh LIB_TEST_BINARY OUTDIR [GROUP-FLAG...] [--exact-selectors] [SELECTOR...]
 #   scripts/run-privileged-lib-tests.sh --list LIB_TEST_BINARY
 #   scripts/run-privileged-lib-tests.sh --list-integration TEST_BINARY_DIR
 #
@@ -996,7 +996,8 @@ tests/trace_pid_target.rs:privileged_trace_pid_names_target_on_stderr
 usage() {
     cat <<EOF
 usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [--include-btrfs]
-           [--include-overlay] [--include-expected-failures] [--full-512] [SELECTOR...]
+           [--include-overlay] [--include-expected-failures] [--full-512]
+           [--exact-selectors] [SELECTOR...]
        $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
        $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
@@ -1007,6 +1008,9 @@ usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [--include-btrfs]
 Run the curated privileged (ignored) p11scope lib tests, one at a time.
 SELECTORs are literal substrings matched against full test paths; a test
 runs when any SELECTOR matches (no SELECTOR runs the whole campaign).
+With --exact-selectors each SELECTOR must equal a full test path: a
+prefix selector never runs an unlisted sibling, so sharded runs that
+pass curated full names cannot double-run a cell.
 --include-long additionally runs the long campaign cells.
 --include-btrfs additionally runs the btrfs campaign cells (the runner
 loop-mounts a btrfs image for them).
@@ -1430,17 +1434,29 @@ list_integration_mode() {
 }
 
 # SELECTORS is the global selector list. selected() returns 0 when $1
-# matches any selector (literal substring), or when there are no selectors.
+# matches any selector (literal substring, or exact full path with
+# --exact-selectors), or when there are no selectors.
 SELECTORS=()
+EXACT_SELECTORS=0
+selector_matches() {
+    if [ "$EXACT_SELECTORS" -eq 1 ]; then
+        [ "$1" = "$2" ]
+    else
+        case $1 in
+            *"$2"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+}
 selected() {
     local name=$1 sel
     if [ "${#SELECTORS[@]}" -eq 0 ]; then
         return 0
     fi
     for sel in "${SELECTORS[@]}"; do
-        case $name in
-            *"$sel"*) return 0 ;;
-        esac
+        if selector_matches "$name" "$sel"; then
+            return 0
+        fi
     done
     return 1
 }
@@ -1499,6 +1515,7 @@ main() {
             --include-overlay) include_overlay=1 ;;
             --include-expected-failures) include_xfail=1 ;;
             --wide-detailed-2112) echo "$PROG: note: wide-detailed-2112 is the default profile since v0.7.0; the flag is ignored" >&2 ;;
+            --exact-selectors) EXACT_SELECTORS=1 ;;
             --full-512) full512=1 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
             *) SELECTORS+=("$arg") ;;
@@ -1600,13 +1617,13 @@ main() {
         local matched=0 candidate
         if [ "$wide" -eq 1 ]; then
             for candidate in "${WIDE_DETAILED_2112_TESTS[@]}"; do
-                case $candidate in *"$arg"*) matched=1; break ;; esac
+                if selector_matches "$candidate" "$arg"; then matched=1; break; fi
             done
         else
             for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" \
                 "${BTRFS_TESTS[@]}" "${OVERLAY_TESTS[@]}" \
                 "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}"; do
-                case $candidate in *"$arg"*) matched=1; break ;; esac
+                if selector_matches "$candidate" "$arg"; then matched=1; break; fi
             done
         fi
         if [ "$matched" -eq 0 ]; then
@@ -1615,42 +1632,34 @@ main() {
         fi
         if [ "$wide" -eq 0 ] && [ "$include_long" -eq 0 ]; then
             for candidate in "${LONG_TESTS[@]}"; do
-                case $candidate in
-                    *"$arg"*)
-                        echo "$PROG: note: '$arg' matches --include-long tests, skipped without the flag" >&2
-                        break
-                        ;;
-                esac
+                if selector_matches "$candidate" "$arg"; then
+                    echo "$PROG: note: '$arg' matches --include-long tests, skipped without the flag" >&2
+                    break
+                fi
             done
         fi
         if [ "$wide" -eq 0 ] && [ "$include_btrfs" -eq 0 ]; then
             for candidate in "${BTRFS_TESTS[@]}"; do
-                case $candidate in
-                    *"$arg"*)
-                        echo "$PROG: note: '$arg' matches --include-btrfs tests, skipped without the flag" >&2
-                        break
-                        ;;
-                esac
+                if selector_matches "$candidate" "$arg"; then
+                    echo "$PROG: note: '$arg' matches --include-btrfs tests, skipped without the flag" >&2
+                    break
+                fi
             done
         fi
         if [ "$wide" -eq 0 ] && [ "$include_overlay" -eq 0 ]; then
             for candidate in "${OVERLAY_TESTS[@]}"; do
-                case $candidate in
-                    *"$arg"*)
-                        echo "$PROG: note: '$arg' matches --include-overlay tests, skipped without the flag" >&2
-                        break
-                        ;;
-                esac
+                if selector_matches "$candidate" "$arg"; then
+                    echo "$PROG: note: '$arg' matches --include-overlay tests, skipped without the flag" >&2
+                    break
+                fi
             done
         fi
         if [ "$wide" -eq 0 ] && [ "$include_xfail" -eq 0 ]; then
             for candidate in "${EXPECTED_FAILURE_TESTS[@]}"; do
-                case $candidate in
-                    *"$arg"*)
-                        echo "$PROG: note: '$arg' matches --include-expected-failures tests, skipped without the flag" >&2
-                        break
-                        ;;
-                esac
+                if selector_matches "$candidate" "$arg"; then
+                    echo "$PROG: note: '$arg' matches --include-expected-failures tests, skipped without the flag" >&2
+                    break
+                fi
             done
         fi
     done
@@ -1813,6 +1822,7 @@ main() {
         echo "# include_overlay: $include_overlay"
         echo "# include_expected_failures: $include_xfail"
         echo "# wide_detailed_2112: $wide"
+        echo "# exact_selectors: $EXACT_SELECTORS"
         echo "# selectors: ${SELECTORS[*]:-<none>}"
         if [ -n "${P11SCOPE_PRIV_LIFECYCLE_LOSS:-}" ]; then
             echo "# opt-in: P11SCOPE_PRIV_LIFECYCLE_LOSS=$P11SCOPE_PRIV_LIFECYCLE_LOSS"

@@ -25,7 +25,8 @@ name: privileged-tests
 # - each privileged-shard job checks out the same commit at the same
 #   absolute path (the lib tests compile their C fixtures from the
 #   source tree), takes every SHARDS-th cell from the list and runs them
-#   through the curated runner as root;
+#   through the curated runner as root with exact selectors (a prefix
+#   cell never double-runs its longer sibling);
 # - privileged-summary proves the shards together ran every listed cell
 #   exactly once, fails on any FAIL, SKIP or missing result, enforces the
 #   floor file tests/privileged-campaign.json (listed count never drops
@@ -352,7 +353,7 @@ jobs:
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
             P11SCOPE_DISCOVER_BIN="$in/bin/p11scope-discover" \
-            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${extra[@]}" "${cells[@]}" || rc=$?
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --exact-selectors "${extra[@]}" "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           cp "$out/run/results.txt" "$RUNNER_TEMP/results-${{ matrix.shard }}.txt"
@@ -533,7 +534,7 @@ jobs:
           header=/usr/include/p11-kit-1/p11-kit
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
-            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 "${cells[@]}" || rc=$?
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -624,7 +625,7 @@ jobs:
           header=/usr/include/p11-kit-1/p11-kit
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
-            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 "${cells[@]}" || rc=$?
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --full-512 --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -698,7 +699,7 @@ jobs:
           mkdir -m 700 "$out"
           rc=0
           mapfile -t cells <"$RUNNER_TEMP/btrfs-cells.txt"
-          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs "${cells[@]}" || rc=$?
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"
@@ -801,7 +802,7 @@ jobs:
           mkdir -m 700 "$out"
           rc=0
           mapfile -t cells <"$RUNNER_TEMP/overlay-cells.txt"
-          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay "${cells[@]}" || rc=$?
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay --exact-selectors "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           echo "runner rc=$rc"

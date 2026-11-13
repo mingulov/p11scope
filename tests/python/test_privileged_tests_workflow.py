@@ -187,6 +187,22 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn('test "$rc" -eq 0', self.yml)
         self.assertIn("fail-fast: false", self.yml)
 
+    def test_shard_runners_use_exact_selectors(self):
+        # Every run-mode invocation passes curated full names as
+        # selectors; with substring matching a prefix cell (the
+        # fanotify live-drain pair) double-ran its longer sibling
+        # and the coverage diff failed. Each invocation must carry
+        # --exact-selectors so a prefix selector can never run an
+        # unlisted sibling.
+        runs = [line for line in self.yml.splitlines()
+                if 'run-privileged-lib-tests.sh "$in/lib-tests"' in line
+                and '"$out/run"' in line]
+        self.assertEqual(len(runs), 5,
+                         f"expected 5 runner invocations, got {len(runs)}")
+        for line in runs:
+            with self.subTest(line=line.strip()[:80]):
+                self.assertIn("--exact-selectors", line)
+
     def test_summary_proves_every_cell_ran_once_and_passed(self):
         summary = self.yml.split("privileged-summary:", 1)
         self.assertEqual(len(summary), 2, "no privileged-summary job")

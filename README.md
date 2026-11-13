@@ -13,7 +13,7 @@ mapped by running processes, so there is no shim to install and no restart.
 > **Status: v0.7.0** answers "which application used which key, and how", with opt-in
 > live key operations (`inventory --key-operations`), streaming inventory events
 > (`--event-log -` with `--event-interval`), and a published observer image
-> (`ghcr.io/mingulov/p11scope:0.7.0`). Read the [known
+> (`ghcr.io/mingulov/p11scope:latest`). Read the [known
 > limitations](CHANGELOG.md#known-limitations) before relying on a capture;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what this release was qualified on.
 

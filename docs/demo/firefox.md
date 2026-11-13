@@ -28,7 +28,7 @@ setup: Firefox always carries its own PKCS#11 module
 2. In a terminal, start watching that process for 60 seconds:
 
    ```sh
-   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:0.7.0 profile --pid "$FFPID" --duration 60s
+   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest profile --pid "$FFPID" --duration 60s
    ```
 
    Wait until it says `capturing:` (a busy machine can take a minute).

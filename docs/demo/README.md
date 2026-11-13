@@ -28,7 +28,9 @@ Pick one demo (each takes a few minutes):
   machine needs real host capabilities, and Docker Desktop's
   `--pid=host` sees the Desktop virtual machine, not your PC.
 - About a minute per demo. The commands below use the published
-  release image `ghcr.io/mingulov/p11scope:0.7.0`.
+  release image `ghcr.io/mingulov/p11scope:latest`. To pin this
+  exact release, use `ghcr.io/mingulov/p11scope:0.7.0` instead of
+  `:latest`.
 
 ## The shortest working command
 
@@ -36,7 +38,7 @@ This checks your machine can capture (expect about 10 seconds with no
 output; that is normal):
 
 ```sh
-docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:0.7.0 doctor
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest doctor
 ```
 
 Every demo uses the same flags: `--pid=host` lets the container see

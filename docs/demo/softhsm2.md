@@ -50,7 +50,7 @@ untouched.
 3. In the watching terminal, start the observer for 90 seconds:
 
    ```sh
-   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:0.7.0 profile --system --duration 90s
+   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest profile --system --duration 90s
    ```
 
    Wait until it says `capturing:` (a busy machine can take a

@@ -76,6 +76,10 @@ pub(super) fn render_concise(report: &DiffReport, out: &mut dyn Write) -> io::Re
             for row in report.application_changes.iter().take(SHOWN) {
                 let path = &report.comparison.application_paths[row.key.exe_path_ref.0];
                 human.line(2, path)?;
+                // Rows sharing one application path differ by module
+                // content: name it per row (its own line, so the 80-column
+                // wrap never splits the digest), like the verbose form.
+                human.line(4, &format!("content {}", row.key.sha256))?;
                 human.line(
                     4,
                     &format!("{}; {}", presence(row.presence), row.changes.join(", ")),

@@ -124,6 +124,37 @@ fn empty_application_section_omits_the_applications_header() {
     );
 }
 
+/// O10: concise rows sharing one application path but differing in
+/// module content must name the distinguishing content per row —
+/// repeated bare paths are useless.
+#[test]
+fn concise_top_changed_rows_name_the_module_content() {
+    const BEFORE_SHA: &str = "d392738570eaab6fcc9aa561001275faf4c774e2bba7f47745b15a388f17f0a2";
+    const AFTER_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let before = document();
+    let mut after = before.clone();
+    after["modules"][0]["identity"]["sha256"] = json!(AFTER_SHA);
+    let report = report(&before, &after);
+    assert_eq!(
+        report.application_changes.len(),
+        2,
+        "the flip splits one path into two content groups"
+    );
+    let output = concise(&report);
+    assert!(
+        output.contains("Top changed applications:"),
+        "rows keep their header: {output}"
+    );
+    assert!(
+        output.contains(BEFORE_SHA),
+        "the before content is named: {output}"
+    );
+    assert!(
+        output.contains(AFTER_SHA),
+        "the after content is named: {output}"
+    );
+}
+
 #[test]
 fn independent_counts_loss_and_saturation_agree_with_the_typed_report() {
     let mut before = document();

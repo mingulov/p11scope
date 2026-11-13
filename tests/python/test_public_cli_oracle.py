@@ -1041,21 +1041,30 @@ class RunnerNoiseTests(unittest.TestCase):
 
 
 def burst_census(*, ambient=0, workload_tree=(), observer_tree=(), baseline_exits=(),
-                 kthreads=(), extra_baselines=(), workload=123, observer=456, broken=None):
+                 kthreads=(), extra_baselines=(), workload=123, observer=456, broken=None,
+                 harness=None, harness_tree=(), logins=0, broken_chain=()):
     """Synthetic system-cell census: `ambient` foreign ssh-avalanche exits
     (login-bash children in their own session), plus in-window exits in
-    the workload and observer trees, pre-existing foreign exits and
-    kernel-thread exits, all joined against the same capture window.
-    `broken` corrupts the evidence one way (garbage, workload-mismatch,
-    no-markers or no-observer) for the fail-loud twins."""
+    the workload, observer and harness trees, pre-existing foreign exits,
+    kernel-thread exits and `logins` mid-capture login sessions (a session
+    leader and its shell, both born in-window), all joined against the
+    same capture window. `broken_chain` exits carry an unrecorded ppid,
+    so their ancestry is unknown, never foreign. `broken` corrupts the
+    evidence one way (garbage, workload-mismatch, no-markers or
+    no-observer) for the fail-loud twins."""
     rows = [{"type": "header", "schema": "p11scope/system-cell-census/v1",
              "workload_pid": workload, "poll_ms": 5, "census_start_mono_ns": 0}]
+    rows.append({"type": "baseline", "pid": 1, "ppid": 0, "pgrp": 1,
+                 "session": 1, "flags": 0, "starttime": 1})
     rows.append({"type": "baseline", "pid": 100, "ppid": 99, "pgrp": 100,
                  "session": 100, "flags": 0, "starttime": 10})
     rows.append({"type": "baseline", "pid": 123, "ppid": 100, "pgrp": 100,
                  "session": 100, "flags": 0, "starttime": 11})
     rows.append({"type": "baseline", "pid": 50, "ppid": 1, "pgrp": 50,
                  "session": 50, "flags": 0, "starttime": 5})
+    if harness is not None:
+        rows.append({"type": "baseline", "pid": harness, "ppid": 1, "pgrp": harness,
+                     "session": harness, "flags": 0, "starttime": 6})
     for pid, ppid in extra_baselines:
         rows.append({"type": "baseline", "pid": pid, "ppid": ppid, "pgrp": 100,
                      "session": 100, "flags": 0, "starttime": 11})
@@ -1086,11 +1095,37 @@ def burst_census(*, ambient=0, workload_tree=(), observer_tree=(), baseline_exit
         rows.append({"type": "exit", "pid": pid, "starttime": 600 + pid,
                      "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
         tick += 1
+    for pid in harness_tree:
+        assert harness is not None, "harness_tree needs the harness root pid"
+        rows.append({"type": "birth", "pid": pid, "ppid": harness, "pgrp": harness,
+                     "session": harness, "flags": 0, "starttime": 900 + pid, "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 900 + pid,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
+    for login in range(logins):
+        leader, shell = 2000 + 2 * login, 2001 + 2 * login
+        rows.append({"type": "birth", "pid": leader, "ppid": 1, "pgrp": leader,
+                     "session": leader, "flags": 0, "starttime": 950 + leader,
+                     "seen_mono_ns": tick})
+        rows.append({"type": "birth", "pid": shell, "ppid": leader, "pgrp": leader,
+                     "session": leader, "flags": 0, "starttime": 950 + shell,
+                     "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": leader, "starttime": 950 + leader,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        rows.append({"type": "exit", "pid": shell, "starttime": 950 + shell,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
     for pid in baseline_exits:
         rows.append({"type": "baseline", "pid": pid, "ppid": 50, "pgrp": 50,
                      "session": 50, "flags": 0, "starttime": 700 + pid})
         rows.append({"type": "exit", "pid": pid, "starttime": 700 + pid,
                      "birth_seen_mono_ns": None, "exit_seen_mono_ns": tick})
+        tick += 1
+    for pid in broken_chain:
+        rows.append({"type": "birth", "pid": pid, "ppid": 9999, "pgrp": pid,
+                     "session": pid, "flags": 0, "starttime": 960 + pid, "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 960 + pid,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
         tick += 1
     for pid in kthreads:
         rows.append({"type": "birth", "pid": pid, "ppid": 2, "pgrp": 0,
@@ -1101,6 +1136,8 @@ def burst_census(*, ambient=0, workload_tree=(), observer_tree=(), baseline_exit
         tick += 1
     rows.append({"type": "marker", "name": "settled", "seen_mono_ns": 2000})
     rows.append({"type": "observer", "pid": observer})
+    if harness is not None:
+        rows.append({"type": "harness", "pid": harness})
     rows.append({"type": "trailer", "census_stop_mono_ns": 2100})
     if broken == "workload-mismatch":
         rows[0]["workload_pid"] = 999
@@ -1123,51 +1160,80 @@ def burst_mutate(gaps):
     return mutate
 
 
+def phase_mutate(gaps, *, loop_start, loop_end):
+    """The lone burst shape plus the product's own capture-loop window:
+    the census join clamps to it, so exits outside never count."""
+    def mutate(d, l, r):
+        burst_mutate(gaps)(d, l, r)
+        d["evidence"]["scheduling"]["phase_mono_ns"] = {
+            "attach_mono_ns": 900, "loop_start_mono_ns": loop_start,
+            "loop_end_mono_ns": loop_end, "loop_end_reason": "expiry"}
+    return mutate
+
+
 class BurstClassificationTests(unittest.TestCase):
-    """Ambient-burst arm: census-joined foreign exits explain honest ssh
-    avalanches one for one; the unproven remainder keeps the strict
-    ceiling of one and every count stays exact."""
+    """Ambient-burst arm, evidence-only: the census join is appended to
+    the failure detail and never accepts a burst; only the lone-gap arm
+    passes, with exact owned counts."""
     run_case = OracleTests.run_case
     run_case_mt_system = RunnerNoiseTests.run_case_mt_system
 
-    def test_burst_fully_joined_passes_in_strict_mode(self):
-        # The sm1 shape (pdg=37, census-proven ssh avalanche): every gap
-        # joins a foreign-tree exit, so the remainder is zero.
-        result = self.run_case(burst_mutate(37), cell="system",
+    def test_burst_fully_joined_stays_a_failure_with_census_evidence(self):
+        # The sm1 shape (pdg=37, census-joined ssh avalanche): count
+        # cover is not proof, so the cell still fails, with the exact
+        # join accounting in the detail.
+        result = self.run_case(burst_mutate(37), cell="system", want=1,
                                census=burst_census(ambient=37))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
-        self.assertIn("pid_descendant_gaps=37", result["detail"])
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
         self.assertIn("ambient_proven=37", result["detail"])
         self.assertIn("workload_unproven=0", result["detail"])
+        self.assertIn("observer_tree_exits_observed=0", result["detail"])
 
-    def test_burst_with_one_unproven_gap_passes_in_strict_mode(self):
-        # The unproven remainder keeps the lone-gap ceiling: 37 proven
-        # ambient plus one unattributed gap still passes.
-        result = self.run_case(burst_mutate(38), cell="system",
+    def test_burst_with_one_unproven_gap_stays_a_failure_with_census_evidence(self):
+        # 37 joined ambient plus one unattributed gap: evidence, not a
+        # pass; the lone-gap ceiling no longer reaches past one gap.
+        result = self.run_case(burst_mutate(38), cell="system", want=1,
                                census=burst_census(ambient=37))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=37", result["detail"])
         self.assertIn("workload_unproven=1", result["detail"])
 
     def test_burst_with_two_unproven_gaps_fails_in_strict_mode(self):
         # Two unattributed gaps are not a lone gap, however large the
-        # proven ambient burst beside them.
+        # joined ambient burst beside them.
         result = self.run_case(burst_mutate(39), cell="system", want=1,
                                census=burst_census(ambient=37))
         self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=37", result["detail"])
+        self.assertIn("workload_unproven=2", result["detail"])
 
-    def test_burst_over_join_fails_in_strict_mode(self):
-        # Exact arithmetic: the census cannot explain more gaps than the
-        # product reported; an over-join is a contradiction, never a pass.
+    def test_burst_over_join_is_noted_never_raised(self):
+        # The census can join more exits than the product gaps (a login
+        # bash the scope walk listed is no gap): the note records the
+        # over-join and the cell fails on its gap count, never on the
+        # join arithmetic.
         result = self.run_case(burst_mutate(37), cell="system", want=1,
                                census=burst_census(ambient=38))
-        self.assertIn("census joins more ambient exits than the product gaps", result["detail"])
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("over-join", result["detail"])
+        self.assertIn("ambient_proven=38", result["detail"])
+
+    def test_over_join_with_lone_gap_reports_the_gap(self):
+        # One gap with two joined exits: the over-join never raises, so
+        # the lone-gap arm passes exactly the cell that passes today.
+        result = self.run_case(burst_mutate(1), cell="system",
+                               census=burst_census(ambient=2))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
 
     def test_workload_tree_exits_are_never_joined(self):
         # A census exit descending from the workload is not ambient: it
-        # stays in the unproven remainder, which keeps the ceiling.
-        result = self.run_case(burst_mutate(2), cell="system",
+        # never joins, and the two-gap cell fails with the workload
+        # observation in the census note.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
                                census=burst_census(ambient=1, workload_tree=(124,)))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=1", result["detail"])
         self.assertIn("workload_tree_exits_observed=1", result["detail"])
         self.assertIn("workload_unproven=1", result["detail"])
         result = self.run_case(burst_mutate(3), cell="system", want=1,
@@ -1198,36 +1264,38 @@ class BurstClassificationTests(unittest.TestCase):
 
     def test_pre_existing_foreign_exits_are_not_joined(self):
         # A foreign exit without an in-window birth was alive at the
-        # initial scope walk, so it was listed, not a gap: it cannot
-        # explain a gap and stays in the remainder.
-        result = self.run_case(burst_mutate(2), cell="system",
+        # initial scope walk, so it was listed, not a gap: it never
+        # joins, and the two-gap cell fails with one proven ambient.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
                                census=burst_census(ambient=1, baseline_exits=(777,)))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
         self.assertIn("ambient_proven=1", result["detail"])
         self.assertIn("workload_unproven=1", result["detail"])
 
     def test_burst_keeps_counts_exact(self):
-        # The burst arm never waives exact owned counts: a 499/500
-        # deficit with a fully joined burst still fails strict.
+        # The census arm never waives exact owned counts: a 499/500
+        # deficit with a fully joined lone gap still fails strict on
+        # the counts, past the gap gate.
         def mutate(d, l, r):
-            burst_mutate(37)(d, l, r)
+            burst_mutate(1)(d, l, r)
             d["functions"][0]["calls"] = 499
         result = self.run_case(mutate, cell="system", want=1,
-                               census=burst_census(ambient=37))
+                               census=burst_census(ambient=1))
         self.assertIn("owned target count differs", result["detail"])
 
     def test_burst_with_provider_linked_hint_fails(self):
-        # The provider-subject check extends to the burst arm: a hint
-        # linking a gap subject to the watched provider is not ambient.
+        # The provider-subject check still guards the lone gap the
+        # census arm annotates: a hint linking a gap subject to the
+        # watched provider is not ambient.
         def mutate(d, l, r):
-            burst_mutate(37)(d, l, r)
+            burst_mutate(1)(d, l, r)
             d["evidence"]["gap_exe_hints"] = {
                 "label": "STATIC HINT", "scope": "test",
                 "links_provider": 1, "links_pkcs11_loader": 0,
-                "no_static_link_within_scope": 0, "unknown": 36}
+                "no_static_link_within_scope": 0, "unknown": 0}
         result = self.run_case(mutate, cell="system", want=1,
-                               census=burst_census(ambient=37))
-        self.assertIn("ambient burst subject links the watched provider", result["detail"])
+                               census=burst_census(ambient=1))
+        self.assertIn("ambient gap subject links the watched provider", result["detail"])
 
     def test_burst_without_window_markers_fails(self):
         # No capture window, no join: a census that never observed the
@@ -1244,14 +1312,14 @@ class BurstClassificationTests(unittest.TestCase):
                                census=burst_census(ambient=37, broken="no-observer"))
         self.assertIn("census names no single observer pid", result["detail"])
 
-    def test_lone_gap_with_full_census_join_reports_the_burst(self):
-        # One gap fully joined by the census takes the burst
-        # qualification (with its exact accounting) over the lone arm.
+    def test_lone_gap_with_full_census_join_reports_the_gap(self):
+        # One gap fully joined by the census stays the lone ambient
+        # gap: the evidence-only arm annotates failures, never labels
+        # passes.
         result = self.run_case(burst_mutate(1), cell="system",
                                census=burst_census(ambient=1))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
-        self.assertIn("ambient_proven=1", result["detail"])
-        self.assertIn("workload_unproven=0", result["detail"])
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
 
     def test_lone_gap_with_zero_ambient_joins_reports_the_gap(self):
         # The quiet-host everyday case: one gap, nothing joined, is the
@@ -1262,31 +1330,90 @@ class BurstClassificationTests(unittest.TestCase):
         self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
         self.assertIn("pid_descendant_gaps=1", result["detail"])
 
-    def test_burst_passes_on_mt_system_in_strict_mode(self):
+    def test_burst_stays_a_failure_on_mt_system_with_census_evidence(self):
         # Mt-system twin: the ledger children are workload roots, the
-        # foreign avalanche joins the same way.
+        # foreign avalanche joins the same way, and the cell still
+        # fails with the accounting in the detail.
         mt_census = burst_census(ambient=5, extra_baselines=[(124, 123), (125, 123),
                                                              (126, 123), (127, 123)])
-        result = self.run_case_mt_system(burst_mutate(5), census=mt_census)
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        result = self.run_case_mt_system(burst_mutate(5), want=1, census=mt_census)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
         self.assertIn("ambient_proven=5", result["detail"])
+        self.assertIn("workload_unproven=0", result["detail"])
 
     def test_burst_with_two_unproven_gaps_fails_on_mt_system_in_strict_mode(self):
-        # The mt-system remainder keeps the same strict ceiling of one.
+        # The mt-system failure carries the same census accounting.
         mt_census = burst_census(ambient=5, extra_baselines=[(124, 123), (125, 123),
                                                              (126, 123), (127, 123)])
         result = self.run_case_mt_system(burst_mutate(7), want=1, census=mt_census)
         self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=5", result["detail"])
+        self.assertIn("workload_unproven=2", result["detail"])
 
     def test_kernel_thread_exits_are_never_joined(self):
         # A PF_KTHREAD exit inside the window is not a user gap the
-        # product would count, so it can never explain one: one joined
-        # ambient plus one kthread exit leaves a remainder of one.
-        result = self.run_case(burst_mutate(2), cell="system",
+        # product would count, so it never joins: one joined ambient
+        # plus one kthread exit fails with a remainder of one.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
                                census=burst_census(ambient=1, kthreads=(31,)))
-        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
         self.assertIn("ambient_proven=1", result["detail"])
         self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_harness_tree_exits_are_never_joined(self):
+        # The harness tail (terminate sleeps) forks inside the capture
+        # window: harness-tree exits are a never-joined root, so one
+        # in-window harness child plus one foreign exit fails a
+        # two-gap cell with exactly one proven ambient.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
+                               census=burst_census(ambient=1, harness=789,
+                                                   harness_tree=(790,)))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=1", result["detail"])
+        self.assertIn("harness_tree_exits_observed=1", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_mid_capture_login_avalanche_joins_as_ambient(self):
+        # A login session born mid-capture (leader plus shell, own
+        # session, complete chain to init) joins as ambient evidence:
+        # two joined exits against three gaps fail with the count.
+        result = self.run_case(burst_mutate(3), cell="system", want=1,
+                               census=burst_census(logins=1))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=2", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_broken_ancestry_chain_is_unknown_never_foreign(self):
+        # An exit whose ppid was never recorded proves nothing about
+        # its tree: it stays unknown, never joins as ambient, and the
+        # two-gap cell fails with one proven ambient beside it.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
+                               census=burst_census(ambient=1, broken_chain=(5000,)))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=1", result["detail"])
+        self.assertIn("unknown_ancestry_exits_observed=1", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_census_window_clamps_to_the_product_loop(self):
+        # The product's own loop window clamps the census markers: both
+        # foreign exits land outside the loop, so nothing joins and the
+        # two-gap cell fails with zero proven ambient.
+        result = self.run_case(phase_mutate(2, loop_start=1900, loop_end=1950),
+                               cell="system", want=1,
+                               census=burst_census(ambient=2))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=0", result["detail"])
+        self.assertIn("workload_unproven=2", result["detail"])
+
+    def test_census_window_covering_loop_joins_inside_it(self):
+        # A loop window covering the census markers changes nothing:
+        # both foreign exits sit inside both windows and join.
+        result = self.run_case(phase_mutate(2, loop_start=1000, loop_end=2000),
+                               cell="system", want=1,
+                               census=burst_census(ambient=2))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("ambient_proven=2", result["detail"])
+        self.assertIn("workload_unproven=0", result["detail"])
 
     def test_duplicate_census_exits_fail_loud(self):
         # One process exits once: a doubled exit line is corrupt
@@ -1593,7 +1720,8 @@ class ShellControls(unittest.TestCase):
     def test_system_census_lifecycle_binds_window_and_trees(self):
         # Ambient-burst lane: a healthy CONTROL system cell leaves a
         # complete census (header bound to the launched workload, both
-        # window markers, the observer line, trailer) for the oracle.
+        # window markers, the observer and harness lines, trailer) for
+        # the oracle.
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             fixture, observer, module = [tmp / p for p in ("fixture", "observer", "module")]
@@ -1605,17 +1733,19 @@ class ShellControls(unittest.TestCase):
             env = dict(os.environ, CONTROL_MODE="healthy", CONTROL_CELL="system", MODULE=str(module),
                        ITERS="500", CONTROL_REPORT=str(template), CONTROL_OUT=str(out))
             env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
-            proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
-                                   str(out), str(fixture), "system"],
-                                  env=env, text=True, capture_output=True, timeout=30)
+            proc = subprocess.Popen(["bash", str(SHELL), "--control-gated", str(observer),
+                                     str(out), str(fixture), "system"],
+                                    env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate(timeout=30)
             try:
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
                 census = [json.loads(line) for line in (out / "system.census.jsonl").read_text().splitlines()
                           if line.strip()]
                 kinds = [row["type"] for row in census]
                 self.assertEqual(kinds[0], "header")
                 self.assertIn("trailer", kinds)
-                self.assertEqual(kinds[-1], "observer")
+                self.assertEqual(kinds[-2:], ["observer", "harness"])
                 receipt = json.loads((out / "system.receipt.json").read_text())
                 self.assertEqual(census[0]["schema"], "p11scope/system-cell-census/v1")
                 self.assertEqual(census[0]["workload_pid"], receipt["launched_pid"])
@@ -1623,6 +1753,8 @@ class ShellControls(unittest.TestCase):
                 self.assertEqual(markers, ["capturing", "settled"])
                 observers = [row["pid"] for row in census if row["type"] == "observer"]
                 self.assertEqual(observers, [int((out / "observer.pid").read_text())])
+                harness = [row["pid"] for row in census if row["type"] == "harness"]
+                self.assertEqual(harness, [proc.pid])
             finally:
                 for name in ("fixture.pid", "observer.pid"):
                     path = out / name
@@ -1930,6 +2062,35 @@ class CensusTests(unittest.TestCase):
                        "os.exec", "os.posix_spawn", "popen(", "check_output"):
             self.assertNotIn(banned, text,
                              "the census poll loop must never fork inside a system capture")
+
+    def test_system_census_settled_is_written_before_the_workload_stops(self):
+        # The capture window closes when the observer settles, before
+        # the harness tail (terminate sleeps) forks: past the observer
+        # settle, every workload stop in gated() must land after the
+        # settled write, and the census must bind the harness root the
+        # oracle never joins. (Pre-capture failure exits stop the
+        # workload with no window at all and stay out of scope.)
+        text = SHELL.read_text(encoding="utf-8")
+        start = text.index("gated() {")
+        following = text.index("counter_build_supported() {", start)
+        gated = text[start:following]
+        settled_region = gated[gated.index('then terminate "$pp"; observer_rc=$LAST_EXIT; fi'):]
+        settled = '>> "$cell.census.settled"'
+        self.assertEqual(settled_region.count(settled), 1,
+                         "gated() must write the settled marker exactly once past the settle")
+        mark = settled_region.index(settled)
+        stops = []
+        for needle in ('finish "$wl"', 'terminate "$wl"'):
+            at = settled_region.find(needle)
+            while at != -1:
+                stops.append(at)
+                at = settled_region.find(needle, at + 1)
+        self.assertTrue(stops, "gated() must stop its workload")
+        for stop in stops:
+            self.assertLess(mark, stop,
+                            "the settled marker must precede every workload stop")
+        self.assertIn('"type": "harness"',
+                      gated, "gated() must bind the harness root pid for the census")
 
     def test_census_records_births_exits_and_window_markers(self):
         children = 3

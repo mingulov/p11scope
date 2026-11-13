@@ -13729,7 +13729,7 @@ pub(crate) mod tests {
 
     #[test]
     fn review_lift_past_cap_stays_refused() {
-        // JK-19b spark-F2: past the lifted cap the taint must stay (fail
+        // JK-19b F2: past the lifted cap the taint must stay (fail
         // closed), not lift without fallback eligibility.
         let mut scene = Scene::new_with_limits(
             image_default(),

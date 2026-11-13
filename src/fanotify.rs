@@ -2293,7 +2293,7 @@ mod tests {
     /// An unchanged shadowed mount stays covered after the capability
     /// shed: both passes resolve `/usr/lib` (snapshot 39) to the
     /// already-marked `/usr` (51), so the post-shed re-mark failure
-    /// files no gap. Reproduces the codex rv2 F1 probe
+    /// files no gap. Reproduces the rv2 F1 probe
     /// `review_persistent_shadow_after_capability_shed`.
     #[test]
     fn learn_unchanged_shadow_after_capability_shed_stays_covered() {

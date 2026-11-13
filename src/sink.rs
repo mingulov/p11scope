@@ -1919,7 +1919,7 @@ mod tests {
         out.flush().unwrap();
     }
 
-    /// v070-stderr-stall fix2 (codex fix1 F1): a preserved stderr pipe
+    /// v070-stderr-stall fix2 (fix1 F1): a preserved stderr pipe
     /// under clone exhaustion plus an `EACCES` reopen denial must still
     /// deliver through the borrowed preserved description — the clone's
     /// `EMFILE` must not be masked by the reopen's `EACCES`. Each

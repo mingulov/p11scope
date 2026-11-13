@@ -74,7 +74,7 @@
 //!   set exactly once — at scope end, stop, or truncation, whichever
 //!   first; no probe for that module attaches after it in this capture.
 //!   (Resolution note: the "first declared-set attach" until-trigger in the
-//!   WF text is incoherent with the conceded Codex rule that a watch must
+//!   WF text is incoherent with the conceded review rule that a watch must
 //!   not end on attachment — partial attachment remains unarmed — so this
 //!   implementation ends coverage only at scope end, stop or a terminating
 //!   failure. `ended_by: attached` is reserved for the unarmed wait the

@@ -528,7 +528,7 @@ mod tests {
         assert!(tick.breached());
     }
 
-    /// View-collapse fix5 F2 (codex
+    /// View-collapse fix5 F2 (regression probe
     /// `reviewed_fd_snapshot_must_count_retained_scan_pins`): each
     /// admission retains its view's pidfd plus its scan pins, and the
     /// once-per-tick estimate must debit both. With soft AND hard
@@ -769,7 +769,7 @@ mod tests {
         assert!(library_handle_budget_exhausted(3, 2));
     }
 
-    /// View-collapse fix7 F1 (codex blocking): pinning checks the projected
+    /// View-collapse fix7 F1 (blocking): pinning checks the projected
     /// headroom before EACH open inside one scan — the tick snapshot plus
     /// the tick's debited opens plus the scan's own opens so far, plus the
     /// open about to happen. Healthy: with room for the next open the scan
@@ -814,7 +814,7 @@ mod tests {
         assert!(!reserve_defers_next_open(None, u64::MAX));
     }
 
-    /// View-collapse fix8 F2 (codex blocking 1001-handle probe): pinning
+    /// View-collapse fix8 F2 (blocking 1001-handle probe): pinning
     /// checks the handle budget before each would-be-new open inside one
     /// scan — the tick's held handles plus the scan's own new handles so
     /// far. Healthy: with room for one more the scan continues.

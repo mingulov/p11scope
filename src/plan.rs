@@ -10018,7 +10018,7 @@ mod tests {
         // The other identity domain of the own-object conjunction:
         // the pinned entry_objects agree, but the entry's own raw
         // object key names a different file. Both domains must
-        // prove the provider's own object (spark r3 F1 twin).
+        // prove the provider's own object (r3 F1 twin).
         let mut module = interface_linked_module();
         let position = module.scanned.tables[0]
             .entries

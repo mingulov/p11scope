@@ -6011,8 +6011,9 @@ struct BoundFallbackProof {
 /// 1024 by the 2026-11-12 guard round: the raised cap stays (owner 14:35)
 /// now that the fd wall is fixed at the cause (startup rlimit raise plus a
 /// fixed reserve, so file learning stays available at 1k identity). The
-/// 512 choice is superseded; 2048 still needs a clean sm1 TTC re-measure
-/// (one 8.66 s sample over the +3 s gate on the old binary) and stays
+/// 512 choice is superseded; 2048 still needs a clean TTC re-measure
+/// on the reference host (one 8.66 s sample over the +3 s gate on the
+/// old binary) and stays
 /// behind `--max-scan-pids`. The unmatched-leader-exit event buffer
 /// shares this bound (kept at 1024 with the raise).
 pub(crate) const MAX_SCAN_PIDS: usize = 1024;

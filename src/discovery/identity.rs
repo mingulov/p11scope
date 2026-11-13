@@ -20534,7 +20534,7 @@ mod tests {
         assert!(pins.rejected_keys.is_empty());
     }
 
-    /// View-collapse fix7 F1 (codex blocking
+    /// View-collapse fix7 F1 (blocking
     /// `multi_pin_scan_must_defer_before_emfile`, production-ized): the fd
     /// guard admits whole scans while the pin debit runs after the scan
     /// opened every file — one scan with many distinct pins hits `EMFILE`
@@ -20697,7 +20697,7 @@ mod tests {
         println!("\n{COMPLETED}");
     }
 
-    /// View-collapse fix8 F2 (codex blocking reserve probe, kept as the
+    /// View-collapse fix8 F2 (blocking reserve probe, kept as the
     /// regression twin): with soft AND hard `RLIMIT_NOFILE` at 512, the
     /// table blocked to a 350 snapshot, and 300 distinct pins requested in
     /// ONE scan, the per-open projected-headroom guard (fix7) must stop
@@ -20846,7 +20846,7 @@ mod tests {
         println!("\n{COMPLETED}");
     }
 
-    /// View-collapse fix8 F2 (codex blocking 1001-handle probe, kept as
+    /// View-collapse fix8 F2 (blocking 1001-handle probe, kept as
     /// the regression twin): one scan must not hold more than 1000
     /// library handles. With the table wide open (no reserve trip, no
     /// EMFILE) and 1001 distinct files requested, the scan stops after

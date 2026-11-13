@@ -3713,7 +3713,7 @@ class JointConservationGate(unittest.TestCase):
                 self.run_joint(Path(tmp), mutate)
 
     def test_driver_rejected_demoted_loss_conserves_as_named_counted_loss(self):
-        # The kc13-sm1 shape: physical entries fall short of issued while
+        # The kc13 shape: physical entries fall short of issued while
         # driver-scoped rejected-demoted-count gaps name the exact missing
         # absolute ranges. Conservation holds as named counted loss and
         # records the unattributed total beside entries.

@@ -4634,7 +4634,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 // cause exactly when one part is active, so at least
                 // one fragment always lands. A spent budget with zero
                 // refusals stays COMPLETE and is named on the longrun
-                // line instead (spark rv-v070-identity-reuse F1).
+                // line instead (rv-v070-identity-reuse F1).
                 let control = &ev.kernel_control;
                 if control.capture_halted {
                     fragments.push(tag(if control.owner_poison.is_empty() {

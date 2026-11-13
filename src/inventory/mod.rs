@@ -2000,6 +2000,23 @@ fn run_with_terminal_budget(
     {
         inventory_diagnostic(&line);
     }
+    // Diagnostic-only Joint-void summary (Task 0): verbose text only,
+    // never in reports. Counts which break side dominates and how many
+    // endings refused below the fence, with per-key gauges. Emitted here
+    // (not in the semantic stop disclosure) so -v always shows it, even
+    // when no semantic lane started (zeros then).
+    if crate::cli::text_is_verbose() {
+        let voids = coordinator.joint_void_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_voids_line(
+            voids.break_dispose,
+            voids.break_ingest,
+            voids.seal_below_fence,
+            voids.keys_total,
+            voids.keys_refused,
+            voids.keys_tainted,
+            voids.keys_pending,
+        ));
+    }
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
@@ -3337,21 +3354,6 @@ fn disclose_semantic_stop(
             seals.deliver.f_stuck,
             seals.deliver.f_last_gap,
             seals.deliver.d_other,
-        ));
-    }
-    // Diagnostic-only Joint-void summary (Task 0): verbose text only,
-    // never in reports. Counts which break side dominates and how many
-    // endings refused below the fence, with per-key gauges.
-    if crate::cli::text_is_verbose() {
-        let voids = coordinator.joint_void_diagnosis();
-        warn.emit(&crate::inventory_semantics::joint_voids_line(
-            voids.break_dispose,
-            voids.break_ingest,
-            voids.seal_below_fence,
-            voids.keys_total,
-            voids.keys_refused,
-            voids.keys_tainted,
-            voids.keys_pending,
         ));
     }
 }

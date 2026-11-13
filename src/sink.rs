@@ -200,7 +200,18 @@ fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
 /// waiting: the transport takes what it takes now and the unsent tail
 /// sheds with the standard counters. Only transport errors propagate.
 fn try_diagnostic_bytes_on_fd(fd: RawFd, bytes: &[u8]) -> io::Result<SinkDrops> {
-    match stdout_sink_from(fd) {
+    try_diagnostic_bytes_with_reopen(fd, bytes, proc_self_fd_reopen)
+}
+
+/// [`try_diagnostic_bytes_on_fd`] with an injectable reopen (tests pass an
+/// `EACCES` denial to model the shed boundary; production reopens
+/// `/proc/self/fd/N`). The borrow dispatch is production's own.
+fn try_diagnostic_bytes_with_reopen(
+    fd: RawFd,
+    bytes: &[u8],
+    reopen: impl FnOnce(RawFd) -> io::Result<std::fs::File>,
+) -> io::Result<SinkDrops> {
+    match stdout_sink_with_reopen(fd, reopen) {
         Ok(mut sink) => {
             sink.write_diagnostic_bytes(bytes)?;
             Ok(sink.take_drops())
@@ -230,7 +241,17 @@ pub(crate) fn bounded_stderr_writer() -> Box<dyn Write> {
 
 /// [`bounded_stderr_writer`] over any writer fd (tests pass their pipe).
 pub(crate) fn bounded_writer_on_fd(fd: RawFd) -> Box<dyn Write> {
-    match stdout_transport_on_fd(fd) {
+    bounded_writer_with_reopen(fd, proc_self_fd_reopen)
+}
+
+/// [`bounded_writer_on_fd`] with an injectable reopen (tests pass an
+/// `EACCES` denial; production reopens `/proc/self/fd/N`). The borrow
+/// dispatch is production's own.
+fn bounded_writer_with_reopen(
+    fd: RawFd,
+    reopen: impl FnOnce(RawFd) -> io::Result<std::fs::File>,
+) -> Box<dyn Write> {
+    match stdout_transport_with_reopen(fd, reopen) {
         Ok(writer) => Box::new(writer),
         // Same exhausted-descriptor borrow as the one-shot diagnostic
         // path: a suitable existing transport writes immediately,
@@ -259,6 +280,27 @@ pub(crate) fn bounded_writer_on_fd(fd: RawFd) -> Box<dyn Write> {
 /// calls can still wait inside the kernel regardless of O_NONBLOCK.
 fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
     Ok(SinkWriter::without_flag_change(stdout_transport_on_fd(fd)?))
+}
+
+/// [`stdout_sink_from`] with an injectable reopen (see
+/// [`try_diagnostic_bytes_with_reopen`]).
+fn stdout_sink_with_reopen(
+    fd: RawFd,
+    reopen: impl FnOnce(RawFd) -> io::Result<std::fs::File>,
+) -> io::Result<SinkWriter<StdoutInner>> {
+    Ok(SinkWriter::without_flag_change(
+        stdout_transport_with_reopen(fd, reopen)?,
+    ))
+}
+
+/// The production `/proc/self/fd/N` reopen: a fresh description with its
+/// own flags (`O_NONBLOCK`, so a readerless FIFO fails instead of
+/// blocking; `O_CLOEXEC`, so it never reaches an owned child).
+fn proc_self_fd_reopen(fd: RawFd) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{fd}"))
 }
 
 /// A saved stdio file plus the identity of the fd it was saved from
@@ -342,32 +384,58 @@ pub(crate) fn preserve_stdio_private_descriptions() {
 /// no preserved file and the transports fall back to their reopen —
 /// the replacement is ours, so it needs no capability either.
 pub(crate) fn preserved_stdio_file(fd: RawFd) -> Option<std::fs::File> {
-    let preserved = PRESERVED_STDIO.get()?;
+    match preserved_stdio_clone(fd) {
+        PreservedClone::Cloned(file) => Some(file),
+        PreservedClone::Missing | PreservedClone::CloneFailed(_) => None,
+    }
+}
+
+/// What cloning the preserved description yields: a missing or replaced
+/// file is [`PreservedClone::Missing`] (fall back to the reopen); a
+/// failed clone keeps its error so exhaustion (`EMFILE`/`ENFILE`) is not
+/// masked by a later reopen denial (`EACCES` after the shed).
+enum PreservedClone {
+    Missing,
+    Cloned(std::fs::File),
+    CloneFailed(io::Error),
+}
+
+/// Clones the preserved private description for `fd` (1 or 2) when one
+/// exists **and the fd still names the saved file**, keeping a clone
+/// failure distinct from a missing/mismatched file. Same identity check
+/// as [`preserved_stdio_file`]; no flag change.
+fn preserved_stdio_clone(fd: RawFd) -> PreservedClone {
+    let preserved = match PRESERVED_STDIO.get() {
+        Some(preserved) => preserved,
+        None => return PreservedClone::Missing,
+    };
     let saved = match fd {
-        1 => preserved.stdout.as_ref()?,
-        2 => preserved.stderr.as_ref()?,
-        _ => return None,
+        1 => preserved.stdout.as_ref(),
+        2 => preserved.stderr.as_ref(),
+        _ => return PreservedClone::Missing,
+    };
+    let saved = match saved {
+        Some(saved) => saved,
+        None => return PreservedClone::Missing,
     };
     // SAFETY: `fstat` only reads the fd's metadata.
     let mut current: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &raw mut current) } != 0 {
-        return None;
+        return PreservedClone::Missing;
     }
     if current.st_dev as u64 != saved.dev || current.st_ino as u64 != saved.ino {
-        return None;
+        return PreservedClone::Missing;
     }
-    saved.file.try_clone().ok()
+    match saved.file.try_clone() {
+        Ok(file) => PreservedClone::Cloned(file),
+        Err(error) => PreservedClone::CloneFailed(error),
+    }
 }
 
 /// Acquires the unbuffered transport without mutating inherited status flags.
 /// A failed private reopen is an error; there is no blocking fallback.
 pub(crate) fn stdout_transport_on_fd(fd: RawFd) -> io::Result<StdoutInner> {
-    stdout_transport_with_reopen(fd, |fd| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-            .open(format!("/proc/self/fd/{fd}"))
-    })
+    stdout_transport_with_reopen(fd, proc_self_fd_reopen)
 }
 
 fn stdout_transport_with_reopen(
@@ -1841,5 +1909,140 @@ mod tests {
         let mut out = bounded_writer_on_fd(-1);
         out.write_all(b"anything").unwrap();
         out.flush().unwrap();
+    }
+
+    /// v070-stderr-stall fix2 (codex fix1 F1): a preserved stderr pipe
+    /// under clone exhaustion plus an `EACCES` reopen denial must still
+    /// deliver through the borrowed preserved description — the clone's
+    /// `EMFILE` must not be masked by the reopen's `EACCES`. Each
+    /// diagnostic API has a healthy twin (clone succeeds, `EACCES`
+    /// never reached) and an exhausted twin (clone `EMFILE`, borrow
+    /// past `EACCES`); both require the actual refusal line on the
+    /// pipe, not merely a successful write result. The child runs in a
+    /// fresh process (a new `OnceLock`, piped stderr, stdout on null so
+    /// only stderr preservation takes a fd), preserves, then — in the
+    /// exhausted modes — drops `RLIMIT_NOFILE` to 4 before the call.
+    const EXHAUST_CHILD: &str = "P11SCOPE_SINK_EXHAUST_CHILD";
+    const EXHAUST_REFUSAL: &[u8] =
+        b"p11scope: inventory --system: live capture did not start: Too many open files\n";
+
+    fn exhaust_child() {
+        let mode = std::env::var(EXHAUST_CHILD).unwrap_or_default();
+        if mode.is_empty() {
+            return;
+        }
+        // The parent piped our stderr: fd 2 must be the FIFO case.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(2, &raw mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        let eacces = || io::Error::from_raw_os_error(libc::EACCES);
+        let exhaust = || {
+            let limit = libc::rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            };
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+                0,
+                "setrlimit failed: {}",
+                io::Error::last_os_error()
+            );
+        };
+        match mode.as_str() {
+            "oneshot-healthy" => {
+                preserve_stdio_private_descriptions();
+                let drops = try_diagnostic_bytes_with_reopen(2, EXHAUST_REFUSAL, |_| Err(eacces()))
+                    .expect("healthy preserved stderr must deliver past an EACCES reopen");
+                assert_eq!(drops, SinkDrops::default());
+            }
+            "oneshot-exhausted" => {
+                preserve_stdio_private_descriptions();
+                exhaust();
+                // Production drops this result (`let _ =`); the parent
+                // requires the line itself. Pre-fix this is `EACCES`
+                // with zero bytes on the pipe.
+                let _ = try_diagnostic_bytes_with_reopen(2, EXHAUST_REFUSAL, |_| Err(eacces()));
+            }
+            "bounded-healthy" => {
+                preserve_stdio_private_descriptions();
+                let mut out = bounded_writer_with_reopen(2, |_| Err(eacces()));
+                out.write_all(EXHAUST_REFUSAL)
+                    .expect("healthy bounded writer must deliver past an EACCES reopen");
+                out.flush().expect("flush");
+            }
+            "bounded-exhausted" => {
+                preserve_stdio_private_descriptions();
+                exhaust();
+                // Pre-fix this writer is the sink: the write succeeds
+                // but no byte reaches the pipe, so the parent — not the
+                // result — decides.
+                let mut out = bounded_writer_with_reopen(2, |_| Err(eacces()));
+                let _ = out.write_all(EXHAUST_REFUSAL);
+                let _ = out.flush();
+            }
+            other => panic!("unknown exhaust child mode {other:?}"),
+        }
+        std::process::exit(0);
+    }
+
+    fn exhaust_command(test: &str, mode: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let module = module_path!().split_once("::").unwrap().1;
+        command
+            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
+            .env(EXHAUST_CHILD, mode)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    fn assert_exhaust_delivers(test: &str, mode: &str) {
+        exhaust_child();
+        let output = exhaust_command(test, mode).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode} child must exit 0: {output:?}"
+        );
+        assert!(
+            output
+                .stderr
+                .windows(EXHAUST_REFUSAL.len())
+                .any(|bytes| bytes == EXHAUST_REFUSAL),
+            "{mode} must deliver the refusal line to preserved stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn diagnostic_oneshot_healthy_preserved_stderr_bypasses_eacces_reopen() {
+        assert_exhaust_delivers(
+            "diagnostic_oneshot_healthy_preserved_stderr_bypasses_eacces_reopen",
+            "oneshot-healthy",
+        );
+    }
+
+    #[test]
+    fn diagnostic_oneshot_borrows_preserved_stderr_past_clone_exhaustion_and_eacces() {
+        assert_exhaust_delivers(
+            "diagnostic_oneshot_borrows_preserved_stderr_past_clone_exhaustion_and_eacces",
+            "oneshot-exhausted",
+        );
+    }
+
+    #[test]
+    fn bounded_writer_healthy_preserved_stderr_bypasses_eacces_reopen() {
+        assert_exhaust_delivers(
+            "bounded_writer_healthy_preserved_stderr_bypasses_eacces_reopen",
+            "bounded-healthy",
+        );
+    }
+
+    #[test]
+    fn bounded_writer_borrows_preserved_stderr_past_clone_exhaustion_and_eacces() {
+        assert_exhaust_delivers(
+            "bounded_writer_borrows_preserved_stderr_past_clone_exhaustion_and_eacces",
+            "bounded-exhausted",
+        );
     }
 }

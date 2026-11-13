@@ -2538,21 +2538,22 @@ mod tests {
             // clause names a bit the drop clears), while a silently
             // skipped shed leaves all three sets untouched: the set
             // comparison is the airtight "the shed ran" proof. The
-            // tracked context only carries CapEff, so a
-            // permitted/inheritable-only shed leaves it identical; the
-            // contexts-differ assert only proves movement when the
-            // pre/post context capabilities themselves changed (both
-            // read thread-self on this thread, unlike the main-thread
-            // /proc/self read).
+            // capget effective comparison is the independent trigger
+            // for the context check: capget reads this thread on its
+            // own, not through the tracked context, so the gate cannot
+            // be vacuous the way a context-self comparison is. The
+            // assert pins that the tracked context's CapEff followed
+            // the shed; a permitted/inheritable-only shed leaves both
+            // unchanged, so the gate simply does not fire there.
             assert!(
                 sets != post_sets,
                 "the shed must change the live capability sets when the keep differs; \
                  otherwise this twin cannot tell the re-key from a silently skipped shed"
             );
-            if pre_shed_context.capabilities != post_shed_context.capabilities {
-                assert!(
-                    pre_shed_context != post_shed_context,
-                    "a shed that changed CapEff must change the live assessment context; \
+            if sets.effective != post_sets.effective {
+                assert_ne!(
+                    pre_shed_context.capabilities, post_shed_context.capabilities,
+                    "a shed that changed CapEff must change the tracked assessment context; \
                      otherwise this twin cannot tell the re-key from a silently skipped shed"
                 );
             }
@@ -2608,19 +2609,18 @@ mod tests {
         let post_shed_context = AssessmentContext::current();
         let post_sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
         // Same movement proof as the plain twin: the set comparison is
-        // airtight for "the shed ran", and the contexts-differ assert
-        // only proves movement when the pre/post context capabilities
-        // themselves changed (both read thread-self on this thread,
-        // unlike the main-thread /proc/self read).
+        // airtight for "the shed ran", the capget effective comparison
+        // is the independent trigger, and the assert pins that the
+        // tracked context's CapEff followed the shed.
         assert!(
             sets != post_sets,
             "the shed must change the live capability sets; otherwise this twin cannot \
              tell the re-key from a silently skipped shed"
         );
-        if pre_shed_context.capabilities != post_shed_context.capabilities {
-            assert!(
-                pre_shed_context != post_shed_context,
-                "a shed that changed CapEff must change the live assessment context; \
+        if sets.effective != post_sets.effective {
+            assert_ne!(
+                pre_shed_context.capabilities, post_shed_context.capabilities,
+                "a shed that changed CapEff must change the tracked assessment context; \
                  otherwise this twin cannot tell the re-key from a silently skipped shed"
             );
         }

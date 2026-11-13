@@ -2830,6 +2830,22 @@ impl CallerRegistry {
             }
         }
     }
+
+    /// Drop the abandoned quantum's stranded Joint seals on every
+    /// retained feed (running-rearm recovery only): an applied
+    /// abandon strands sealed-but-undelivered seals whose keys the
+    /// void refused, and the recovery's fallback verification would
+    /// trip over them. Staged seals are per-quantum transient — a
+    /// finished quantum delivers all of them — so everything staged
+    /// here is the abandoned quantum's. Feed modes are untouched.
+    pub(crate) fn drop_abandoned_joint_staged(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) {
+        for record in self.instance_state.semantics.values_mut() {
+            record.feed.drop_abandoned_staged(ledger);
+        }
+    }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));
     }

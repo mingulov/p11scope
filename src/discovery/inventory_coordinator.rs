@@ -10393,6 +10393,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
     }
 
+    /// Drop the abandoned quantum's stranded Joint seals (running-rearm
+    /// recovery only; the exit hold never recovers so it never needs
+    /// this): an applied abandon strands sealed-but-undelivered seals,
+    /// and the recovery's fallback verification trips over them. A
+    /// no-op unless seals were staged.
+    pub(crate) fn drop_abandoned_joint_staged(&mut self) {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.drop_abandoned_joint_staged(ledger);
+    }
+
     /// Pose a coordinator-half pending Joint publication (no registry
     /// phase): the hold twin's wedge stand-in. Real registry-pending
     /// shapes are driven by the joint fixtures instead.

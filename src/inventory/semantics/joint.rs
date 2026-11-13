@@ -28,13 +28,11 @@ pub(crate) use machine::JointMachineIo;
 #[cfg(test)]
 pub(crate) use machine::MAX_UNPAID_VOID_YIELDS;
 #[cfg(test)]
-pub(crate) use machine::RUNNING_REARM_LIMIT;
-#[cfg(test)]
 pub(crate) use machine::StagingDetail;
 pub(crate) use machine::{
     EVENTS_STAGE_SATURATED_REASON, EVENTS_STAGE_SATURATED_SUBJECT,
     JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
-    JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine,
+    JointServiceMode, JointServiceProgress, JointWorkBudget, LiveJointMachine, RUNNING_REARM_LIMIT,
 };
 
 /// One original negative or completed witness in the SAME paid allocation.

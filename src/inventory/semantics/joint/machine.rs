@@ -1465,6 +1465,45 @@ impl LiveJointMachine {
         self.audit_no_progress_trip
     }
 
+    /// Running quanta abandoned and re-armed past (the stop gap's count).
+    #[cfg(test)]
+    pub(crate) fn running_rearms_for_test(&self) -> u32 {
+        self.running_rearms
+    }
+
+    /// Pose a begun finish on a latched machine: no production path
+    /// latches with finish state set (running service refuses early
+    /// with a finish, `begin_finish` refuses when latched), so the
+    /// finish twin poses the re-arm denial directly.
+    #[cfg(test)]
+    pub(crate) fn pose_finish_for_test(&mut self) {
+        self.finish = Some(FinishControl {
+            q: None,
+            q_storage: None,
+            discovery: FinishDiscovery::Pending,
+        });
+    }
+
+    /// Pose the latched quantum as a finish original: the realistic
+    /// finish shape at Audited. Panics outside Audited.
+    #[cfg(test)]
+    pub(crate) fn pose_finish_original_for_test(&mut self) {
+        let Some(Phase::Audited { identity, .. }) = self.phase.as_ref() else {
+            panic!("the finish-original pose needs the latched Audited phase");
+        };
+        self.finish_original = Some(*identity);
+    }
+
+    /// Pose a finish no-progress trip on a latched machine (the twin
+    /// for the finish-side wall-time bound).
+    #[cfg(test)]
+    pub(crate) fn pose_finish_no_progress_trip_for_test(&mut self) {
+        self.finish_no_progress_trip = Some(FinishNoProgressTrip {
+            polls: 1,
+            stalled: Duration::from_secs(6),
+        });
+    }
+
     /// The current transaction's Collected, across every phase that
     /// carries one (the same coverage as `h0_guard_trip_for_test`).
     #[cfg(test)]
@@ -1535,7 +1574,8 @@ impl LiveJointMachine {
     /// at Idle. The refused phase is never re-run and its frame never
     /// resumes. `None` admits no re-arm and changes nothing: the latch
     /// stands for the driver's hold (any other latched shape, a Finish,
-    /// a no-progress trip, the per-run bound, or a lane no longer live).
+    /// a no-progress trip, the per-run bound, a lane no longer live, or
+    /// a lane whose next collect cannot re-sync).
     /// A frame abandon that still leaves a publication standing also
     /// returns `None`; the hold's own abandon then finds it exactly as
     /// it would have. `Some(true)` when the abandoned publication was
@@ -1560,12 +1600,28 @@ impl LiveJointMachine {
         {
             return None;
         }
+        // A lane whose next collect cannot re-sync (a stopped adapter,
+        // or a spent frontier on a linked lane) stops at once: the
+        // void-and-fence recovery the re-arm relies on refuses there,
+        // so spending the bound on it only delays the named stop.
+        if !coordinator
+            .joint_capture()
+            .adapter()
+            .lost_quantum_can_resync(self.producers.journal_linked())
+        {
+            return None;
+        }
         self.rearm_eligible = false;
         let frame = self.take_abandoned_frame();
         coordinator.abandon_unfinished_joint_publication(lane, frame, reason.to_string());
         if coordinator.publication_pending() {
             return None;
         }
+        // An applied abandon strands sealed-but-undelivered seals whose
+        // keys the void refused; drop them (releasing their charges)
+        // so the recovery verifies against exactly its own history. An
+        // unapplied abandon staged nothing, so this is a no-op there.
+        coordinator.drop_abandoned_joint_staged();
         if self.producers.journal_linked() {
             coordinator
                 .joint_capture_mut()
@@ -4971,6 +5027,10 @@ impl AttestedSemanticLane {
 
     /// The phase this lane's latched machine holds, for the stop gap.
     pub(crate) fn joint_latched_phase(&self) -> Option<&'static str> {
+        #[cfg(test)]
+        if let Some(posed) = self.scripted_latched_phase {
+            return posed;
+        }
         self.live
             .as_deref()
             .and_then(|live| live.joint_machine.as_ref())
@@ -4979,6 +5039,10 @@ impl AttestedSemanticLane {
 
     /// Running quanta this lane's machine abandoned and re-armed past.
     pub(crate) fn joint_running_rearms(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(posed) = self.scripted_running_rearms {
+            return posed;
+        }
         self.live
             .as_deref()
             .and_then(|live| live.joint_machine.as_ref())

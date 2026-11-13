@@ -591,6 +591,28 @@ impl JointStaging {
         self.watchdog_tripped
     }
 
+    /// Drop every staged seal without delivery (running-rearm
+    /// recovery): the abandoned quantum's seals can never deliver —
+    /// the void refused their keys and fenced their history — so the
+    /// recovery verifies against exactly its own history. Releases
+    /// each head's ledger charge and advances the frontier, exactly
+    /// like consumption, but reduces, replays and counts nothing:
+    /// the abandoned calls already resolved S1-direct or
+    /// shed-counted through the batch abandon. The segment stays
+    /// open: the recovery's own seals stage and deliver normally.
+    pub(crate) fn drop_abandoned_staged(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) {
+        while let Some(head) = self.staged.pop_front() {
+            let bytes = head.charged_bytes();
+            let (position, native) = (head.position, head.resource_native);
+            drop(head);
+            self.release_or_pend(Some(&mut *ledger), position, bytes, native);
+            self.frontier = self.frontier.max(position);
+        }
+    }
+
     /// End the current Joint segment: degrade to S1Only and open
     /// the degraded window in which direct reductions count under
     /// this ending's reason until the next clean point resumes.

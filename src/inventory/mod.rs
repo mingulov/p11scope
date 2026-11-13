@@ -4873,6 +4873,28 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// The stop gap's suffix for a held Joint lane, shared by the
+    /// Poll path and the terminal not-begun step: the latched phase
+    /// and, past re-arms, how the lane got here. When the per-run
+    /// re-arm bound is spent, the suffix says plainly that the limit
+    /// stopped the lane.
+    fn joint_lane_stop_suffix(latched_at: Option<&str>, rearms: u32) -> String {
+        let mut suffix = String::new();
+        if let Some(phase) = latched_at {
+            suffix.push_str(&format!(" at {phase}"));
+        }
+        if rearms >= crate::inventory_semantics::RUNNING_REARM_LIMIT {
+            suffix.push_str(&format!(
+                "; the lane stops: it already re-armed past {rearms} abandoned quanta (the per-run limit)"
+            ));
+        } else if rearms != 0 {
+            suffix.push_str(&format!(
+                "; after {rearms} abandoned quanta the lane continued past"
+            ));
+        }
+        suffix
+    }
+
     /// Convert a semantic-lane Joint commit refusal into a held lane
     /// plus a published pass: hold the lane for exit (its stop counts
     /// disclose once), serve its post-commit summary past the handoff
@@ -4943,15 +4965,7 @@ impl ClassicDriver<'_> {
         self.joint_commit_pending = false;
         // Name the earlier re-arms when the lane stops past them (the
         // re-arm bound, or a later refusal no re-arm admits).
-        let mut rearmed = String::new();
-        if let Some(phase) = latched_at {
-            rearmed.push_str(&format!(" at {phase}"));
-        }
-        if rearms != 0 {
-            rearmed.push_str(&format!(
-                "; after {rearms} abandoned quanta the lane continued past"
-            ));
-        }
+        let rearmed = Self::joint_lane_stop_suffix(latched_at, rearms);
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
             format!(
@@ -5006,8 +5020,12 @@ impl ClassicDriver<'_> {
     /// once it publishes. A non-retryable refusal on a running
     /// commit converts like the Poll path (hold, named stop gap, no
     /// run error); only a finished lane's refusal fails the finish
-    /// through I2. The winding and final-lane retained steps share
-    /// it; callers count polls and begins.
+    /// through I2. The conversion holds without re-arm by intent:
+    /// this cursor only ever sees the final drain, and running
+    /// recovery belongs to the Poll path; its stop gap still names
+    /// the shared phase and re-arm suffix. The winding and
+    /// final-lane retained steps share it; callers count polls and
+    /// begins.
     fn step_not_begun_joint_finish(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
@@ -5097,6 +5115,16 @@ impl ClassicDriver<'_> {
                     first_error.get_or_insert(error);
                     coordinator.note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
+                    // The terminal cursor holds without re-arm: running
+                    // recovery belongs to the Poll path, and this step
+                    // only ever sees the final drain. It names the same
+                    // stop suffix, so the phase and any earlier re-arms
+                    // stay diagnosable here too.
+                    let inner = lane.as_ref().expect("a failed lane holds");
+                    let suffix = Self::joint_lane_stop_suffix(
+                        inner.joint_latched_phase(),
+                        inner.joint_running_rearms(),
+                    );
                     let live = lane.take().expect("a failed lane holds");
                     let (_, summary) = Self::hold_joint_lane_for_exit(
                         live,
@@ -5116,8 +5144,9 @@ impl ClassicDriver<'_> {
                     coordinator.note_scope_gap(
                         "semantic lane stopped".to_string(),
                         format!(
-                            "{}; broad inventory continues; semantic probes stay attached until exit",
-                            reason.code()
+                            "{}{}; broad inventory continues; semantic probes stay attached until exit",
+                            reason.code(),
+                            suffix
                         ),
                     );
                 }
@@ -18296,6 +18325,42 @@ mod tests {
     }
 
     #[test]
+    fn not_begun_running_conversion_names_phase_and_rearms_in_the_stop() {
+        // The terminal not-begun step converts a running-commit refusal
+        // like the Poll path and names the same suffix: the latched
+        // phase and the earlier re-arms (posed: substituted lanes seat
+        // no live machine).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_commit_poll_for_test(Some(Err(
+            crate::inventory_semantics::SemanticRefusal::Unavailable,
+        )));
+        lane.set_scripted_joint_latched_phase_for_test(Some("BindingKeys"));
+        lane.set_scripted_joint_rearms_for_test(3);
+        driver.semantic = Some(lane);
+        driver.joint_commit_pending = true;
+        driver.step_retained_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the conversion abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        assert_eq!(
+            stops[0].1,
+            "semantic_unavailable at BindingKeys; after 3 abandoned quanta the lane continued past; broad inventory continues; semantic probes stay attached until exit",
+            "the gap names the phase and the earlier re-arms"
+        );
+    }
+
+    #[test]
     fn dispose_retained_non_joint_blocks_resolve_through_table() {
         use std::time::{Duration, Instant};
 
@@ -20832,6 +20897,65 @@ mod tests {
             "the second refusal holds the lane"
         );
         assert_eq!(driver.commit_calls, 1, "the hold commits the pass once");
+    }
+
+    #[test]
+    fn joint_lane_stop_suffix_names_phase_rearms_and_the_spent_limit() {
+        // The stop gap's suffix, both hold sites: the latched phase,
+        // the earlier re-arms, and — when the per-run bound is spent —
+        // a plain statement that the limit stopped the lane.
+        assert_eq!(ClassicDriver::joint_lane_stop_suffix(None, 0), "");
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(Some("Audited"), 0),
+            " at Audited",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(Some("Collecting"), 3),
+            " at Collecting; after 3 abandoned quanta the lane continued past",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("Audited"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT,
+            ),
+            " at Audited; the lane stops: it already re-armed past 32 abandoned quanta (the per-run limit)",
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_spent_rearm_limit_names_the_limit_in_the_stop() {
+        // A stop past the spent re-arm bound says plainly that the
+        // limit stopped the lane, through the real driver hold.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_joint_latched_phase_for_test(Some("Audited"));
+        lane.set_scripted_joint_rearms_for_test(crate::inventory_semantics::RUNNING_REARM_LIMIT);
+        driver.semantic = Some(lane);
+        let first = driver.poll_commit(true);
+        assert!(
+            matches!(
+                first,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a refused poll publishes the pass past the held lane"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        assert_eq!(
+            stops[0].1,
+            "semantic_unavailable at Audited; the lane stops: it already re-armed past 32 abandoned quanta (the per-run limit); broad inventory continues; semantic probes stay attached until exit",
+            "the gap names the spent limit as the stop cause"
+        );
     }
 
     #[test]

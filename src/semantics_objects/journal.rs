@@ -1582,6 +1582,24 @@ impl JournalAdapter {
         self.invalidated
     }
 
+    /// Whether a lost-quantum fence can resync the next collection: the
+    /// post-flag mirror of the fail-closed arms in `resolve_birth_cut`. A
+    /// stopped adapter never resyncs; on a linked lane a spent consumption
+    /// frontier (`MAX`) leaves no frontier to fence. The running re-arm
+    /// checks this before abandoning: when no resync is possible the
+    /// recovery cannot land, so the machine keeps the latched stop
+    /// instead of spending re-arms on it.
+    pub(crate) fn lost_quantum_can_resync(&self, linked: bool) -> bool {
+        !self.stopped && (!linked || self.consumed_through != u64::MAX)
+    }
+
+    /// Stop the adapter (tests: the stopped twin poses the lane the
+    /// re-arm pre-check refuses).
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&mut self) {
+        self.stopped = true;
+    }
+
     /// Read-only allocation identity check; this never binds a new producer.
     pub(crate) fn retains_producers(
         &self,
@@ -2533,6 +2551,16 @@ impl JournalAdapter {
             SealFailureScope::AffectedDomains(domains)
         };
         let mut effects = ObjectEffects::default();
+        if unlocalized {
+            // Keyrows C1's first step (minimal): staged unbounded
+            // abandonments refuse their incarnations permanently
+            // BEFORE the void refuses every key and drops staged
+            // custody — after the loop below no key is live, so the
+            // preservation would be void (N1).
+            effects
+                .effects
+                .extend(self.preserve_abandonment_refusals(model).effects);
+        }
         let taints = &self.tainted_images;
         let overflow = self.taint_overflow;
         let sightings = &self.sightings;
@@ -17865,6 +17893,59 @@ pub(crate) mod tests {
             .expect_err("abandoned incarnation never recovers");
         assert_eq!(retry.gap, JournalGap::DomainTainted);
         assert!(scene.model.project().objects.is_empty());
+    }
+
+    #[test]
+    fn object_journal_unlocalized_void_preserves_unbounded_abandonment() {
+        // N1 twin (keyrows C1's first step): BEGIN -> collision ABANDON
+        // -> unlocalized raw disposal, the `void_ingest_break` path the
+        // running re-arm takes on every re-arm. The void must preserve
+        // the staged unbounded abandonment before refusing every key
+        // and dropping staged custody: with no key to account it, the
+        // abandoned image is tainted (unknown continuing effects), so
+        // the frame never rebirths.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let outer = begin_bytes(1, 1, create, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let failure = scene.adapter.refuse_disposed_raw(
+            &mut scene.model,
+            std::iter::empty(),
+            true,
+            JournalGap::Malformed,
+        );
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        assert!(
+            scene.adapter.image_tainted_for_test((COOKIE, EXEC)),
+            "the unaccounted abandonment taints its image"
+        );
+        // The taint survives the re-sync above the void fence, so the
+        // abandoned frame never rebirths past the loss.
+        let producers = scene.producers();
+        assert!(producers.journal_linked());
+        assert!(scene.adapter.bind_resource_producers(&producers));
+        let cut = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+            scene.retained_events.clone(),
+        )
+        .consumption_cut()
+        .expect("an idle drain names its cut");
+        let resolved = scene.adapter.resolve_birth_cut(&cut, &producers);
+        assert!(
+            resolved.is_ok(),
+            "the linked lane re-syncs: {:?}",
+            resolved.err()
+        );
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "the abandoned frame never rebirths"
+        );
     }
 
     #[test]

@@ -457,6 +457,11 @@ inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 # (the M1/M3 arms unit tests cannot build a live machine for). Prints
 # JOINT_LIVE lines.
 inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64
+# Live re-arm wrapper cell: the running re-arm wrapper takes the live
+# machine out of its lane and re-seats it (unit tests cannot build a
+# live lane). A fresh machine round-trips with no re-arm, still
+# seated, staging no re-arm gap. Prints JOINT_LIVE lines.
+inventory::privileged_tests::privileged_joint_rearm_wrapper_roundtrips_live_machine
 # R1.6 live Joint root cells: the production classic Session with Joint on
 # over the owned live-joint provider workload (needs gcc, softhsm2-util and
 # SoftHSM2; each runs its own System-scope capture, a few minutes). First

@@ -4551,6 +4551,98 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
     Ok(())
 }
 
+/// Live lane-wrapper cell: the running re-arm wrapper takes the live
+/// machine out of its lane, calls the re-arm, and re-seats it. Unit
+/// tests cannot build a live lane (no Session without attach), so this
+/// cell executes the production take/reinsert path on a real attached
+/// lane: a fresh (Runnable, unlatched) machine round-trips with `None`,
+/// stays seated, and stages no re-arm gap. The latched interior is
+/// pinned by the unprivileged machine twins; seated-ness cannot change
+/// it (the abandon's only lane touches are the shed counter and a
+/// read). Prints JOINT_LIVE lines. Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live re-arm wrapper round-trips its machine"]
+fn privileged_joint_rearm_wrapper_roundtrips_live_machine() -> Result<()> {
+    use anyhow::Context as _;
+
+    let workload = Workload::build()?;
+    let gate = workload.path("gate");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let target = workload.spawn(
+        "target",
+        &[
+            "mech",
+            "--cell",
+            "T",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--gate",
+            &gate_arg,
+            "--hold",
+        ],
+    )?;
+    let manifest = softhsm_joint_manifest(&workload)?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
+    coordinator.set_semantic_manifests(vec![manifest]);
+    let scope = Scope::Pid(target.pid());
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the SoftHSM2 subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        None,
+    )
+    .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    lane.initialize_joint(&mut coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    let (live, _gated, _finished, _ticks, phase, demand, _work, _base, _staging) =
+        lane.joint_drive_state_for_test();
+    ensure!(live, "the drive state sees the live lane");
+    ensure!(
+        phase == "Idle" && demand == "None",
+        "the fresh machine is Idle with no demand, got {phase}/{demand}"
+    );
+    // The wrapper's live take/reinsert path executes here: a fresh
+    // machine admits no re-arm and comes back seated.
+    let rearmed = lane.rearm_joint_after_running_refusal(&mut coordinator, "semantic_unavailable");
+    ensure!(
+        rearmed.is_none(),
+        "a fresh machine admits no re-arm, got {rearmed:?}"
+    );
+    ensure!(
+        lane.has_joint_machine(),
+        "the wrapper re-seated its machine"
+    );
+    let (_live, _gated, _finished, _ticks, phase, demand, _work, _base, _staging) =
+        lane.joint_drive_state_for_test();
+    ensure!(
+        phase == "Idle" && demand == "None",
+        "the round-trip changes no machine state, got {phase}/{demand}"
+    );
+    ensure!(
+        coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .iter()
+            .all(|(subject, _)| subject != "semantic quantum abandoned; lane continues"),
+        "the round-trip stages no re-arm gap"
+    );
+    eprintln!("JOINT_LIVE wrapper=roundtrip machine=seated");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // R1.6 live Joint root cells: the production classic Session with Joint on,
 // over the owned live-joint provider workload. System scope with private

@@ -370,7 +370,7 @@ gated() {
         inventory-mt-system) match_stall=20; match_overall=90 ;;
       esac
       if [ "$match_stall" != 0 ]; then
-        if python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --wl "$cell.wl" --timeout "$match_stall" --overall-timeout "$match_overall"; then
+        if python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --wl "$cell.wl" --timeout "$match_stall" --overall-timeout "$match_overall" --observer-pid "$pp"; then
           match_ok=1
         else
           match_ok=0
@@ -387,7 +387,7 @@ gated() {
               # run sequentially), then stop it with SIGINT like
               # sigint_exact. A troubled settle still proceeds to the stop:
               # the unchanged oracle judges the stop-drain counts strictly.
-              python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --settle-passes 2 --timeout "$match_stall" --overall-timeout "$match_overall" || true
+              python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --settle-passes 2 --timeout "$match_stall" --overall-timeout "$match_overall" --observer-pid "$pp" || true
               if alive "$pp"; then kill -INT "$pp" 2>/dev/null || true; fi
               ;;
           esac

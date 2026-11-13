@@ -3,7 +3,9 @@
 """Inventory MT-exact oracle controls; every assertion has a failing twin."""
 
 import copy
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -484,6 +486,120 @@ class InventoryMtGateTests(unittest.TestCase):
             None, script, 0.8, ["--settle-passes", "2"])
         self.assertEqual(code, 1)
         self.assertIn("stalled:", err)
+
+    def test_settle_overall_exhausted_fails(self):
+        # Settle mode with no further pass ever arriving: like the
+        # release twin, only the overall backstop fails this wait.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            log = tmp / "log"
+            log.write_text(json.dumps(gate_started()) + "\n")
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log),
+                                   "--settle-passes", "2",
+                                   "--timeout", "0.4",
+                                   "--overall-timeout", "1.0"],
+                                  capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("overall budget exhausted", proc.stderr)
+
+    def test_settle_ended_early_fails_fast(self):
+        # The stream ended before the further passes arrived: no pass
+        # can follow, so settle fails at once instead of idling.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            log = tmp / "log"
+            events = [gate_started(), gate_pass(11), gate_ended(12)]
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            start = time.monotonic()
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log),
+                                   "--settle-passes", "2",
+                                   "--timeout", "3"],
+                                  capture_output=True, text=True, timeout=15)
+            elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ended after", proc.stderr)
+        self.assertLess(elapsed, 2.0)
+
+    def dead_pid(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        pid = child.pid
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        self.fail("reaped child pid %d unexpectedly alive" % pid)
+
+    def test_dead_observer_fails_fast(self):
+        # The observer crashed without writing `ended`: with its pid
+        # passed in, the gate must fail at once with a named reason
+        # instead of idling out the long overall backstop.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl_single()) + "\n")
+            log = tmp / "log"
+            log.write_text(json.dumps(gate_started()) + "\n")
+            start = time.monotonic()
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "3",
+                                   "--overall-timeout", "30",
+                                   "--observer-pid", str(self.dead_pid())],
+                                  capture_output=True, text=True, timeout=15)
+            elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("observer exited", proc.stderr)
+        self.assertIn("unmatched workload edges for pids [123]", proc.stderr)
+        self.assertLess(elapsed, 5.0)
+
+    def test_live_observer_pid_still_releases(self):
+        # A live observer pid must not trip the liveness fail-fast:
+        # the qualifying edges still release the gate.
+        events = [gate_event(123, "counted")]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl_single()) + "\n")
+            log = tmp / "log"
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "2",
+                                   "--observer-pid", str(os.getpid())],
+                                  capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 0)
+
+
+def load_gate_module():
+    spec = importlib.util.spec_from_file_location("inventory_mt_gate", GATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class InventoryMtEventTailTests(unittest.TestCase):
+    def test_torn_record_across_polls_is_buffered(self):
+        # A record split across two polls (half-written line at the
+        # first read) must be buffered until its newline arrives,
+        # not dropped as two malformed lines.
+        gate = load_gate_module()
+        with tempfile.TemporaryDirectory() as raw:
+            log = Path(raw) / "log"
+            line = json.dumps(gate_pass(1)) + "\n"
+            head, tail = line[:len(line) // 2], line[len(line) // 2:]
+            log.write_text(head)
+            tail_reader = gate.EventTail(str(log))
+            self.assertEqual(tail_reader.poll(), [])
+            self.assertEqual(tail_reader.passes, 0)
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(tail)
+            records = tail_reader.poll()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["kind"], "pass_committed")
+            self.assertEqual(tail_reader.passes, 1)
 
 
 if __name__ == "__main__":

@@ -24,13 +24,18 @@ idles past a decided outcome.
 collected after it, since pass collections run sequentially). It needs no
 workload transcript and takes the same stall/overall/ended rules.
 
-Exit 0 when the condition holds, 1 on stall/overall/ended, 2 on bad
-arguments.
+`--observer-pid PID` fails fast when the observer process is gone before
+the condition holds (a crashed observer writes no `ended` and no further
+passes, so waiting out the backstop would only idle).
+
+Exit 0 when the condition holds, 1 on stall/overall/ended/observer-exit,
+2 on bad arguments.
 """
 
 import argparse
 import json
 import math
+import os
 import sys
 import time
 
@@ -40,12 +45,15 @@ class EventTail:
 
     Tracks how many `pass_committed` records arrived and whether the
     stream ended. Missing file reads as no new records (the observer
-    may not have created it yet); malformed lines are skipped.
+    may not have created it yet); malformed lines are skipped. A
+    trailing partial line (no newline yet) is buffered until the rest
+    arrives, so a record torn across two polls is never dropped.
     """
 
     def __init__(self, path):
         self._path = path
         self._offset = 0
+        self._pending = ""
         self.passes = 0
         self.ended = False
 
@@ -54,11 +62,19 @@ class EventTail:
             with open(self._path, encoding="utf-8") as handle:
                 handle.seek(self._offset)
                 chunk = handle.read()
-                self._offset = handle.tell()
-        except FileNotFoundError:
+        except (FileNotFoundError, UnicodeDecodeError):
             return []
+        data = self._pending + chunk
+        cut = data.rfind("\n")
+        if cut == -1:
+            self._pending = data
+            self._offset += len(chunk.encode("utf-8"))
+            return []
+        complete = data[:cut]
+        self._pending = data[cut + 1:]
+        self._offset += len((complete + "\n").encode("utf-8"))
         records = []
-        for line in chunk.splitlines():
+        for line in complete.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -79,7 +95,24 @@ def unmatched_line(missing):
     return "unmatched workload edges for pids %r" % (missing,)
 
 
-def release(tail, want, dev, ino, stall, overall):
+def observer_dead(pid):
+    """True when the observed observer pid is known gone.
+
+    A pid we may not signal still counts as alive; only a missing pid
+    fails the gate fast (a crashed observer writes no further passes).
+    """
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def release(tail, want, dev, ino, stall, overall, observer_pid=None):
     matched = set()
     start = time.monotonic()
     last_pass = None
@@ -113,6 +146,11 @@ def release(tail, want, dev, ino, stall, overall):
                   % unmatched_line(sorted(set(want) - matched)),
                   file=sys.stderr)
             return 1
+        if observer_dead(observer_pid):
+            print("inventory-mt-gate: observer exited without match; %s"
+                  % unmatched_line(sorted(set(want) - matched)),
+                  file=sys.stderr)
+            return 1
         now = time.monotonic()
         if tail.passes > seen_passes:
             seen_passes = tail.passes
@@ -134,7 +172,7 @@ def release(tail, want, dev, ino, stall, overall):
         time.sleep(0.1)
 
 
-def settle(tail, need, stall, overall):
+def settle(tail, need, stall, overall, observer_pid=None):
     start = time.monotonic()
     last_pass = None
     tail.poll()
@@ -151,6 +189,12 @@ def settle(tail, need, stall, overall):
         if tail.ended:
             print("inventory-mt-gate: event stream ended after %d of %d "
                       "further passes" % (tail.passes - baseline, need),
+                  file=sys.stderr)
+            return 1
+        if observer_dead(observer_pid):
+            print("inventory-mt-gate: observer exited during settle after "
+                      "%d of %d further passes"
+                  % (tail.passes - baseline, need),
                   file=sys.stderr)
             return 1
         now = time.monotonic()
@@ -187,6 +231,9 @@ def main(argv=None):
     parser.add_argument("--settle-passes", type=int, default=0,
                         help="settle mode: wait for this many further "
                              "passes instead of matching edges")
+    parser.add_argument("--observer-pid", type=int, default=None,
+                        help="fail fast when this observer pid is gone "
+                             "before the condition holds")
     args = parser.parse_args(argv)
     if any(math.isnan(value) for value in (args.timeout, args.overall_timeout)):
         print("inventory-mt-gate: timeouts must be numbers, not NaN",
@@ -196,10 +243,14 @@ def main(argv=None):
         print("inventory-mt-gate: --settle-passes must not be negative",
               file=sys.stderr)
         return 2
+    if args.observer_pid is not None and args.observer_pid <= 0:
+        print("inventory-mt-gate: --observer-pid must be a positive pid",
+              file=sys.stderr)
+        return 2
     tail = EventTail(args.event_log)
     if args.settle_passes > 0:
         return settle(tail, args.settle_passes, args.timeout,
-                      args.overall_timeout)
+                      args.overall_timeout, args.observer_pid)
     if args.wl is None:
         print("inventory-mt-gate: --wl is required to release the workload "
               "gate", file=sys.stderr)
@@ -222,7 +273,8 @@ def main(argv=None):
         print("inventory-mt-gate: need READY pids and one provider identity", file=sys.stderr)
         return 2
     (dev, ino) = dev_ino.pop()
-    return release(tail, want, dev, ino, args.timeout, args.overall_timeout)
+    return release(tail, want, dev, ino, args.timeout, args.overall_timeout,
+                   args.observer_pid)
 
 
 if __name__ == "__main__":

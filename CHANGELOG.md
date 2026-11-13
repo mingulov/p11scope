@@ -639,8 +639,7 @@ SHA behind each check the release rounds re-measured):
 
 The following scoped checks qualify the release candidate. Each row
 names the source SHA it was measured on; SHAs differ because each
-round measured on its own tip. The last row is the controller's
-final-candidate gate:
+round measured on its own tip. The last row is the final-candidate gate:
 
 | Check | Measured result |
 | --- | --- |
@@ -1346,7 +1345,7 @@ Re-run from the repo root (release binaries for `<RC>` staged as
 
 ```sh
 export CARGO_BUILD_JOBS=4 TMPDIR=/var/tmp/p11scope-ws-tmp
-scripts/qualify-release-matrix.sh --rev <RC> --bin-dir /home/user/.cache/p11scope-vng/rc-qualify-bins-<RC>
+scripts/qualify-release-matrix.sh --rev <RC> --bin-dir ~/.cache/p11scope-vng/rc-qualify-bins-<RC>
 ```
 
 The short measurement tier: M0 PASS (29 of 29 units valid, and 43 of 43

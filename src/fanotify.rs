@@ -1984,6 +1984,72 @@ fn drain_final_tail_with(
     true
 }
 
+/// One periodic re-mark pass: runs `mark` on a bounded helper unless
+/// a previous pass is still running — a hung mount must not stack a
+/// thread and a duplicate fd every period. `pending` carries the
+/// in-flight pass's receiver across ticks. Returns the coverage to
+/// adopt: `Some` when a pass finished (just now or on an earlier tick)
+/// or when no pass could run (keeping the previous set with one
+/// uncovered), `None` when the previous pass is still running and this
+/// tick is skipped.
+fn run_remark_pass(
+    group: &OwnedFd,
+    previous: &BTreeSet<MountIdentity>,
+    pending: &mut Option<Receiver<(BTreeSet<MountIdentity>, usize)>>,
+    bound: std::time::Duration,
+    mark: impl FnOnce(&OwnedFd, &BTreeSet<MountIdentity>) -> (BTreeSet<MountIdentity>, usize)
+    + Send
+    + 'static,
+) -> Option<(BTreeSet<MountIdentity>, usize)> {
+    if let Some(rx) = pending.as_ref() {
+        match rx.try_recv() {
+            Ok(result) => {
+                *pending = None;
+                return Some(result);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *pending = None;
+                return Some((previous.clone(), 1));
+            }
+        }
+    }
+    let dup = match group.try_clone() {
+        Ok(dup) => dup,
+        Err(_) => return Some((previous.clone(), 1)),
+    };
+    let prev = previous.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let helper = std::thread::Builder::new()
+        .name("p11scope-learn-remark".to_string())
+        .spawn(move || {
+            let _ = tx.send(mark(&dup, &prev));
+        });
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(_) => return Some((previous.clone(), 1)),
+    };
+    match rx.recv_timeout(bound) {
+        Ok(result) => {
+            let _ = helper.join();
+            Some(result)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = helper.join();
+            Some((previous.clone(), 1))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Dropping the handle detaches the helper; forgetting it
+            // would leave the thread joinable (leaked) instead. Its
+            // receiver stays pending so later ticks adopt its result
+            // instead of stacking another pass.
+            drop(helper);
+            *pending = Some(rx);
+            Some((previous.clone(), 1))
+        }
+    }
+}
+
 /// The drain: poll/read the group, decide each opened file at most once
 /// per generation, hold provider fds, and forward candidates, load
 /// tallies and overflow. Never blocks the engine; the engine never
@@ -2018,6 +2084,7 @@ fn drain_loop(
     let mut last_remark = std::time::Instant::now();
     let mut last_backlog_check = std::time::Instant::now();
     let mut unavailable_sent = false;
+    let mut pending_remark: Option<Receiver<(BTreeSet<MountIdentity>, usize)>> = None;
     // The startup pass already left a visible filesystem uncovered:
     // name that partial coverage now, once (data-always), instead of
     // letting traffic on the covered filesystems stand in for it.
@@ -2069,22 +2136,28 @@ fn drain_loop(
             // group: a hung mount must never stall the drain, because
             // the unlimited queue would grow behind it. A pass that
             // does not finish (or cannot start) leaves coverage
-            // unproven, which files the unavailable-learning gap.
+            // unproven, which files the unavailable-learning gap; a
+            // pass still running from the previous period skips this
+            // tick instead of stacking another thread and duplicate.
             let previous = covered.clone();
-            let remark = group.try_clone().ok().and_then(|dup| {
-                run_with_bound("p11scope-learn-remark", LEARN_WORKER_BOUND, move || {
+            if let Some((next_covered, uncovered)) = run_remark_pass(
+                &group,
+                &previous,
+                &mut pending_remark,
+                LEARN_WORKER_BOUND,
+                |dup, prev| {
                     // The periodic pass is never cancelled: it runs to
                     // completion or the bound detaches it whole.
                     let never = std::sync::atomic::AtomicBool::new(false);
-                    mark_visible_filesystems(&dup, &previous, &never)
-                })
-            });
-            let (next_covered, uncovered) = remark.unwrap_or_else(|| (covered.clone(), 1));
-            covered = next_covered;
-            if uncovered > 0 && !unavailable_sent {
-                unavailable_sent = true;
-                if !send_learn(&tx, &state, LearnMsg::Unavailable) {
-                    break 'drain;
+                    mark_visible_filesystems(dup, prev, &never)
+                },
+            ) {
+                covered = next_covered;
+                if uncovered > 0 && !unavailable_sent {
+                    unavailable_sent = true;
+                    if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+                        break 'drain;
+                    }
                 }
             }
             if crate::run::capture_diagnostics_on() {
@@ -3615,6 +3688,79 @@ mod tests {
             ctx.marked_this_period.is_empty(),
             "a successful flush clears the set"
         );
+    }
+
+    /// A re-mark pass still running from the previous period is never
+    /// stacked: the tick skips starting another thread while one is in
+    /// flight, and adopts its result when it lands. (Unprivileged: the
+    /// mark is injected and the group is a dummy fd.)
+    #[test]
+    fn learn_remark_skips_while_a_pass_is_still_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut pending = None;
+        let prev = std::collections::BTreeSet::new();
+        let bound = std::time::Duration::from_millis(100);
+        // The first pass sleeps past the bound: it times out, files its
+        // gap, and stays pending.
+        let first = std::sync::Arc::clone(&calls);
+        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
+            first.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            (std::collections::BTreeSet::new(), 7)
+        });
+        assert_eq!(
+            out,
+            Some((std::collections::BTreeSet::new(), 1)),
+            "a timed-out pass keeps coverage with a gap"
+        );
+        assert!(pending.is_some(), "the pass stays in flight");
+        // An immediate second tick starts nothing while it runs.
+        let second = std::sync::Arc::clone(&calls);
+        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
+            second.fetch_add(1, Ordering::SeqCst);
+            (std::collections::BTreeSet::new(), 0)
+        });
+        assert_eq!(out, None, "a tick while a pass runs is skipped");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no second thread starts while one runs"
+        );
+        // Once the pass lands, its result is adopted without spawning.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let third = std::sync::Arc::clone(&calls);
+        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
+            third.fetch_add(1, Ordering::SeqCst);
+            (std::collections::BTreeSet::new(), 0)
+        });
+        assert_eq!(
+            out,
+            Some((std::collections::BTreeSet::new(), 7)),
+            "the landed pass result is adopted"
+        );
+        assert!(pending.is_none(), "no pass in flight afterwards");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "adopting starts no new thread"
+        );
+        // The next tick starts fresh again.
+        let fourth = std::sync::Arc::clone(&calls);
+        let out = super::run_remark_pass(
+            &group,
+            &prev,
+            &mut pending,
+            std::time::Duration::from_secs(5),
+            move |_, _| {
+                fourth.fetch_add(1, Ordering::SeqCst);
+                (std::collections::BTreeSet::new(), 0)
+            },
+        );
+        assert_eq!(out, Some((std::collections::BTreeSet::new(), 0)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// The tally pid falls back to the metadata capture when the

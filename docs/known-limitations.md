@@ -444,6 +444,20 @@ offline helper (`p11scope-discover --module <path> -o manifest.json`)
 and pass `--manifest manifest.json`, or capture the process by
 `--pid`.
 
+### Key operations can stop recording partway through a long system-wide capture
+
+A long `inventory --system --key-operations` capture on a busy host
+can stop recording key operations partway through (measured: about
+5 minutes into a 20-minute capture): later operations never get
+per-key rows, the report reads PARTIAL with the stop named as a gap,
+and a stderr note says coverage is partial. This is a known bug in
+v0.7.0, not a host problem: whether it stops depends on host
+activity, and an earlier run on the same host kept key operations
+for the full window. The broad inventory keeps running to the end of
+the window with exact counts and no lost calls. Workaround: rerun
+the capture, or narrow the scope (`--pid`). A fix is planned for
+0.8.0.
+
 ### Calls through the p11-kit proxy can publish no mechanism names
 
 Since v0.7.0, ELF interposition under p11-kit-proxy no longer

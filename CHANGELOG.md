@@ -338,6 +338,11 @@ The v0.7.0 limits live in
   with stdout redirected and stderr a pipe, and a very slow stderr
   reader (some lines dropped without a count). Capture data and the
   report file are unaffected; fixes are planned for 0.8.0.
+- On a busy host, a long `inventory --system --key-operations`
+  capture can stop recording key operations partway through; the
+  report stays PARTIAL with exact counts and no lost calls. Rerun
+  the capture or narrow the scope (`--pid`); a fix is planned
+  for 0.8.0.
 
 ## [0.6.0] - 2026-11-06
 

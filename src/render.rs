@@ -14,7 +14,7 @@ use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
 use crate::semantic_capture::InstanceReloadNotExcluded;
 use crate::semantics::MechStat;
-use p11scope_ebpf_common::{CounterMode, IMAGE_IDENTITY_TICKET_LIMIT};
+use p11scope_ebpf_common::{ARG_NONE, CounterMode, IMAGE_IDENTITY_TICKET_LIMIT};
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -3200,14 +3200,52 @@ fn has_unattested_provider(ev: &Evidence) -> bool {
             .any(|module| !module.sources.contains(&"manifest"))
 }
 
+/// Whether this row's names leave open a mechanism argument the
+/// observer could decode with a layout proof: an unnamed slot
+/// (nothing rules a mechanism argument out) or a named
+/// mechanism-carrying function (`C_*Init` and the direct operations,
+/// per the shared [`kinds::descriptor`] table).
+fn report_may_carry_mechanism(report: &SlotReport) -> bool {
+    report.names.is_empty()
+        || report.names.iter().any(|name| {
+            name == crate::plan::UNKNOWN_FUNCTION_NAME
+                || crate::kinds::descriptor(name)
+                    .is_some_and(|semantics| semantics.mechanism_arg != ARG_NONE)
+        })
+}
+
+/// Observed activity (completed or in-flight calls) on slots whose
+/// layout the scan never proved, where a mechanism argument is still
+/// possible: the only case where `--manifest` could attribute this
+/// window's mechanisms. Named non-carrying calls on unproven slots
+/// are excluded: a manifest could not decode a mechanism they never
+/// carried.
+fn unproven_mechanism_activity(reports: &[SlotReport]) -> bool {
+    reports.iter().any(|report| {
+        (report.calls > 0 || report.in_flight > 0)
+            && !report.semantic_authorized
+            && report_may_carry_mechanism(report)
+    })
+}
+
+/// Observed activity where a mechanism argument is possible on any
+/// slot, proven or not: separates "carrying calls were seen but
+/// nothing was attributed" from "no carrying call was seen at all".
+fn mechanism_activity(reports: &[SlotReport]) -> bool {
+    reports.iter().any(|report| {
+        (report.calls > 0 || report.in_flight > 0) && report_may_carry_mechanism(report)
+    })
+}
+
 /// Plain-words companion to the `semantic_unverified_slots` verdict
 /// fragment: how many mapped providers have no manifest at all, by path.
 /// Prints only when unverified slots remain and at least one mapped
 /// provider lacks any manifest source; partial manifest coverage keeps
 /// the machine fragment alone. Human text only; the JSON is unchanged.
 /// Concise states the fact; the `--manifest` remedy lives once in the
-/// coverage line, with verbose repeating it here.
-fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
+/// coverage line, with verbose repeating it here only when the
+/// observed calls could use one.
+fn unattributed_provider_line(ev: &Evidence, verbose: bool, reports: &[SlotReport]) -> String {
     if ev.semantic_unverified_slots == 0 || !has_unattested_provider(ev) {
         return String::new();
     }
@@ -3249,7 +3287,7 @@ fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
     } else {
         shown.join(", ")
     };
-    let remedy = if verbose {
+    let remedy = if verbose && unproven_mechanism_activity(reports) {
         " - rerun with --manifest for provider files with unverified tables (see Coverage) to confirm their layouts for mechanism decoding"
     } else {
         ""
@@ -3421,7 +3459,7 @@ pub fn scope_summary_with_verbosity(
     text.push_str(&coverage_line(ev, verbose));
     text.push('\n');
     if verbosity != TextVerbosity::Quiet {
-        text.push_str(&unattributed_provider_line(ev, verbose));
+        text.push_str(&unattributed_provider_line(ev, verbose, reports));
         if let Some(hint) = forwarding_suggestion(reports, &ev.discovery.modules, &forwarding) {
             text.push_str(&hint);
             text.push('\n');
@@ -4013,11 +4051,15 @@ pub fn live_scoped_with_verbosity_and_sessions(
         }
     } else if reports.iter().any(|r| r.calls > 0 || r.in_flight > 0) {
         // No attributed mechanisms despite observed calls: name the gap in
-        // one plain line instead of omitting the section. Count-only slots
-        // never carry mechanism attribution; anything else simply records
-        // none for the observed calls. The manifest remedy prints only
-        // while a mapped provider actually lacks one.
-        if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
+        // one plain line instead of omitting the section. The manifest
+        // remedy fires only when the observed calls could use one:
+        // mechanism-carrying (or unnamed) calls on layout-unproven
+        // slots of unattested providers. Proven layouts, and windows
+        // whose calls carry no mechanism, say so plainly instead.
+        if ev.semantic_unverified_slots > 0
+            && has_unattested_provider(ev)
+            && unproven_mechanism_activity(reports)
+        {
             // Concise points at Coverage for the one remedy; verbose
             // repeats the remedy here beside the fact.
             let remedy = if verbosity == crate::cli::TextVerbosity::Verbose {
@@ -4035,8 +4077,10 @@ pub fn live_scoped_with_verbosity_and_sessions(
                     "s"
                 },
             ));
-        } else {
+        } else if mechanism_activity(reports) {
             s.push_str("Mechanisms: none recorded for the observed calls.\n");
+        } else {
+            s.push_str("Mechanisms: no calls that carry a mechanism were seen.\n");
         }
         if ev.unregistered_standard_layout_mechanisms > 0 {
             s.push_str(&format!(
@@ -6013,6 +6057,14 @@ pub(crate) mod tests {
             escape_controls("/opt/p11-ключ-é.so"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A report on a layout-unproven slot: the scan never proved the
+    /// table behind it, so mechanism arguments stay unread there.
+    fn unverified_report(name: &str, calls: u64) -> SlotReport {
+        let mut out = report(name, calls, 0, false);
+        out.semantic_authorized = false;
+        out
     }
 
     fn report(name: &str, calls: u64, in_flight: u64, aliased: bool) -> SlotReport {
@@ -10851,7 +10903,8 @@ pub(crate) mod tests {
     /// The terminal summary explains withheld attribution in plain words:
     /// how many mapped providers have no manifest at all, naming them, so
     /// PARTIAL coverage reads as a cause rather than an alarm. Verbose
-    /// repeats the remedy; concise keeps it once in Coverage.
+    /// repeats the remedy when the observed calls could use one;
+    /// concise keeps it once in Coverage.
     #[test]
     fn scope_summary_names_providers_without_manifests() {
         let mut softhsm = discovered_fixture();
@@ -10868,7 +10921,7 @@ pub(crate) mod tests {
         ev.verdict();
         let text = scope_summary_with_verbosity(
             "pid",
-            &reports_fixture(),
+            &[unverified_report("C_SignInit", 1)],
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
@@ -10878,6 +10931,57 @@ pub(crate) mod tests {
                  counts are exact, names are unconfirmed"
             ),
             "{text}"
+        );
+        assert!(
+            text.contains("rerun with --manifest for provider files with unverified tables"),
+            "{text}"
+        );
+    }
+
+    /// Verbose repeats the remedy only when the observed calls could
+    /// gain from a manifest: proven non-carrying calls keep the
+    /// factual line but drop "rerun with --manifest".
+    #[test]
+    fn scope_summary_without_manifest_relevant_calls_omits_the_remedy() {
+        let mut nss = discovered_fixture();
+        nss.path = "/opt/firefox/libsoftokn3.so".into();
+        nss.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![nss];
+        ev.semantic_unverified_slots = 136;
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &[report("C_CloseSession", 6, 0, false)],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            text.contains(
+                "Attribution: 1 of 1 mapped provider file has no manifest (/opt/firefox/libsoftokn3.so); \
+                 counts are exact, names are unconfirmed"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("rerun with --manifest"), "{text}");
+    }
+
+    /// Twin: mechanism-carrying calls on layout-unproven slots keep
+    /// the verbose remedy: a manifest could attribute exactly them.
+    #[test]
+    fn scope_summary_with_unverified_carrying_calls_keeps_the_remedy() {
+        let mut nss = discovered_fixture();
+        nss.path = "/opt/firefox/libsoftokn3.so".into();
+        nss.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![nss];
+        ev.semantic_unverified_slots = 136;
+        ev.verdict();
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &[unverified_report("C_SignInit", 2)],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(
             text.contains("rerun with --manifest for provider files with unverified tables"),
@@ -13454,10 +13558,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// Demo journey 2, empty side: with observed calls but no attributed
-    /// mechanisms, the human view says so in one plain line naming the
-    /// count-only gap and how to get mechanisms, instead of omitting the
-    /// section. The line sits under the function table, above Evidence.
+    /// Demo journey 2, empty side: with observed mechanism-carrying
+    /// calls on layout-unproven slots but no attributed mechanisms, the
+    /// human view says so in one plain line naming the count-only gap
+    /// and how to get mechanisms, instead of omitting the section. The
+    /// line sits under the function table, above Evidence.
     #[test]
     fn live_view_without_mechanisms_names_the_attribution_gap() {
         let mut ev = evidence();
@@ -13465,7 +13570,7 @@ pub(crate) mod tests {
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
         let out = live_scoped_with_verbosity(
-            &[report("C_SignInit", 2, 0, false)],
+            &[unverified_report("C_SignInit", 2)],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
@@ -13494,7 +13599,9 @@ pub(crate) mod tests {
     }
 
     /// Concise keeps one manifest remedy (coverage); verbose keeps every
-    /// hint. Three identical nags in one concise report bury the result.
+    /// hint the observed calls could use. Three identical nags in one
+    /// concise report bury the result, and nags for calls a manifest
+    /// could not attribute bury it in verbose too.
     #[test]
     fn concise_frame_mentions_manifest_once() {
         let mut unattested = discovered_fixture();
@@ -13521,8 +13628,10 @@ pub(crate) mod tests {
             1,
             "concise keeps one manifest hint: {concise}"
         );
+        // Verbose repeats every hint only for calls a manifest could
+        // attribute: mechanism-carrying calls on unproven slots.
         let verbose = live_scoped_with_verbosity(
-            &[row],
+            &[unverified_report("C_SignInit", 2)],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
@@ -13551,7 +13660,7 @@ pub(crate) mod tests {
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
         let out = live_scoped(
-            &[report("C_GenerateRandom", 6, 0, false)],
+            &[report("C_SignInit", 6, 0, false)],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
@@ -13573,16 +13682,16 @@ pub(crate) mod tests {
         assert!(!note.contains("--manifest"), "{out}");
     }
 
-    /// Empty mechanisms with fully attested slots: none of the observed
-    /// calls carried an attributed mechanism, so the note says exactly
-    /// that and offers no manifest remedy.
+    /// Empty mechanisms with fully attested slots: the observed
+    /// mechanism-carrying calls produced no attributed mechanism, so
+    /// the note says exactly that and offers no manifest remedy.
     #[test]
     fn live_view_without_mechanisms_on_verified_slots_says_none_recorded() {
         let mut ev = evidence();
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
         let out = live_scoped(
-            &[report("C_GetInfo", 1, 0, false)],
+            &[report("C_SignInit", 1, 0, false)],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
@@ -13596,6 +13705,235 @@ pub(crate) mod tests {
             "{out}"
         );
         assert!(!out.contains("--manifest"), "{out}");
+    }
+
+    /// Owner window (2026-11-13): every observed call is on a proven
+    /// slot and none carries a mechanism, while unrelated idle modules
+    /// stay unverified. The note says plainly that no
+    /// mechanism-carrying call was seen instead of blaming the layout
+    /// and prescribing --manifest. Concise and verbose agree.
+    #[test]
+    fn live_view_without_mechanism_carrying_calls_says_so_plainly() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 136;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let reports = [
+            "C_DestroyObject",
+            "C_GenerateRandom",
+            "C_CloseSession",
+            "C_DecryptMessage",
+            "C_EncryptMessage",
+        ]
+        .map(|name| report(name, 6, 0, false));
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = live_scoped_with_verbosity(
+                &reports,
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &mechanisms,
+                verbosity,
+            );
+            let note = out
+                .lines()
+                .find(|line| line.starts_with("Mechanisms:"))
+                .expect("mechanisms note: {out}");
+            assert_eq!(
+                note, "Mechanisms: no calls that carry a mechanism were seen.",
+                "{out}"
+            );
+        }
+    }
+
+    /// Same plain note with nothing unverified at all: a fully proven
+    /// capture whose calls carry no mechanism explains itself the
+    /// same way.
+    #[test]
+    fn live_view_without_mechanism_carrying_calls_says_so_when_verified() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_GetInfo", 1, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert_eq!(
+            note, "Mechanisms: no calls that carry a mechanism were seen.",
+            "{out}"
+        );
+    }
+
+    /// Mechanism-carrying calls on proven slots but nothing attributed
+    /// (every value outside the registry, for example): the note
+    /// records the bare fact. Idle unverified modules elsewhere must
+    /// not pull a --manifest remedy into this window's note.
+    #[test]
+    fn live_view_with_carrying_calls_on_verified_slots_says_none_recorded() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped_with_verbosity(
+            &[report("C_SignInit", 2, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert_eq!(
+            note, "Mechanisms: none recorded for the observed calls.",
+            "{out}"
+        );
+    }
+
+    /// Named but layout-unproven slots (an exports-only proof) whose
+    /// observed calls carry no mechanism: --manifest could not
+    /// attribute anything for this window, so the note stays plain.
+    #[test]
+    fn live_view_with_noncarrying_calls_on_unverified_slots_says_so_plainly() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped_with_verbosity(
+            &[unverified_report("C_CloseSession", 3)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert_eq!(
+            note, "Mechanisms: no calls that carry a mechanism were seen.",
+            "{out}"
+        );
+    }
+
+    /// Failure twin: mechanism-carrying calls on layout-unproven slots
+    /// keep the --manifest remedy (verbose) and the Coverage pointer
+    /// (concise): a manifest could attribute exactly these calls.
+    #[test]
+    fn live_view_with_carrying_calls_on_unverified_slots_keeps_manifest_remedy() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let verbose = live_scoped_with_verbosity(
+            &[unverified_report("C_SignInit", 2)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let note = verbose
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {verbose}");
+        assert!(
+            note.contains("Mechanisms: none attributed - 68 functions"),
+            "{verbose}"
+        );
+        assert!(note.contains("add --manifest"), "{verbose}");
+        let concise = live_scoped_with_verbosity(
+            &[unverified_report("C_SignInit", 2)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        let note = concise
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {concise}");
+        assert!(
+            note.contains("Mechanisms: none attributed - 68 functions"),
+            "{concise}"
+        );
+        assert!(note.contains("(see Coverage)"), "{concise}");
+        assert!(!note.contains("add --manifest"), "{concise}");
+    }
+
+    /// Failure twin: calls on unnamed layout-unproven slots keep the
+    /// remedy too: nothing rules out a mechanism argument there, and a
+    /// manifest would name the slots as well as decode them.
+    #[test]
+    fn live_view_with_unknown_calls_on_unverified_slots_keeps_manifest_remedy() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped_with_verbosity(
+            &[unverified_report("unknown", 4)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert!(note.contains("Mechanisms: none attributed"), "{out}");
+        assert!(note.contains("add --manifest"), "{out}");
     }
 
     /// No completed or in-flight calls: the scope summary already says no

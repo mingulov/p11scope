@@ -555,7 +555,13 @@ def census_burst_accounting(census_text, *, launched_pid, workload_children):
     never join. Raises EvidenceError on malformed census evidence, so a
     corrupt census fails closed instead of weakening the gate. Pid
     allocation is sequential and the window is seconds, so a pid names
-    one generation here and chains resolve on latest ancestry.
+    one generation here and chains resolve on latest ancestry. A chain
+    that leaves recorded census ancestry reads as foreign, which assumes
+    every workload descendant's parent was recorded: the cell workloads
+    hold it (gated never forks; mt_fork forks one level from the
+    launched pid, children never fork, all ledger-listed). An orphaned
+    workload descendant would misjoin as ambient, bounded by the
+    remainder ceiling and the over-join cap.
     """
     rows = []
     for lineno, line in enumerate(census_text.splitlines(), 1):

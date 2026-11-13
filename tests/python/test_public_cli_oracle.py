@@ -1245,6 +1245,15 @@ class BurstClassificationTests(unittest.TestCase):
         self.assertIn("ambient_proven=1", result["detail"])
         self.assertIn("workload_unproven=0", result["detail"])
 
+    def test_lone_gap_with_zero_ambient_joins_reports_the_gap(self):
+        # The quiet-host everyday case: one gap, nothing joined, is the
+        # lone ambient gap, not a burst (nothing burst and nothing was
+        # proven ambient).
+        result = self.run_case(burst_mutate(1), cell="system",
+                               census=burst_census(ambient=0))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
+
     def test_burst_passes_on_mt_system_in_strict_mode(self):
         # Mt-system twin: the ledger children are workload roots, the
         # foreign avalanche joins the same way.

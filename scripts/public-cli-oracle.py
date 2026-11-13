@@ -830,7 +830,12 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # as zero below; profile-cgroup/run cells carry them and must
     # read 0.
     ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap))
-    burst = (not relaxed and not gap66 and ok_burst)
+    # The gate above already accepted the shape; the burst label
+    # additionally needs a proven join, or a quiet host's lone gap
+    # (remainder 1, ambient 0) would misreport as a burst. Short-circuit
+    # order matters: burst_accounting exists exactly when the census arm
+    # ran, which ok_burst implies.
+    burst = (not relaxed and not gap66 and ok_burst and burst_accounting[0] > 0)
     if (relaxed or ambient or burst) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps

@@ -50,11 +50,22 @@ untouched.
 3. In the watching terminal, start the observer for 90 seconds:
 
    ```sh
-   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest profile --system --duration 90s
+   docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest profile --system --duration 90s
    ```
 
    Wait until it says `capturing:` (a busy machine can take a
    minute). Only what happens after that line is counted.
+
+   Alternative: `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
+   DAC_READ_SEARCH` in place of the five `--cap-*` flags.
+   `CAP_SYS_ADMIN` grants very broad power — close to full root
+   (mounts, namespaces, many kernel admin operations) — so use it
+   only when needed. What it adds for p11scope is file learning
+   (fanotify): it catches a short-lived process's first load of a new
+   provider file; without it that case is a named gap in the report.
+   On Docker older than 24, whose default seccomp allows `bpf()` only
+   with `CAP_SYS_ADMIN`, it is also the way to run without the
+   [seccomp file](../../deploy/seccomp-p11scope.json).
 
 4. In the working terminal, run the three tool commands:
 

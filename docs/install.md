@@ -104,6 +104,29 @@ the pushed digest, so both tags verify with one command:
 gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 -R mingulov/p11scope
 ```
 
+Run `doctor` through it with the narrow five-capability set (Docker
+24+ needs no seccomp flag; older engines use the vendored [seccomp
+profile](../deploy/seccomp-p11scope.json)):
+
+```sh
+docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:latest doctor
+```
+
+On AppArmor hosts add `--security-opt apparmor=unconfined` (or load
+the `p11scope-observer` profile; see the [deployment
+notes](../deploy/README.md)). The [demos](demo/README.md) have the
+full copy-paste commands and the measured numbers.
+
+Alternative: `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
+DAC_READ_SEARCH` in place of the five `--cap-*` flags above.
+`CAP_SYS_ADMIN` grants very broad power — close to full root (mounts,
+namespaces, many kernel admin operations) — so use it only when
+needed. What it adds for p11scope is file learning (fanotify): it
+catches a short-lived process's first load of a new provider file;
+without it that case is a named gap in the report. On Docker older
+than 24, whose default seccomp allows `bpf()` only with
+`CAP_SYS_ADMIN`, it is also the way to run without the seccomp file.
+
 ### Verify a download
 
 In the folder with the downloaded release assets, check the checksums

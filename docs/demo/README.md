@@ -38,22 +38,34 @@ This checks your machine can capture (expect about 10 seconds with no
 output; that is normal):
 
 ```sh
-docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest doctor
+docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined ghcr.io/mingulov/p11scope:latest doctor
 ```
 
 Every demo uses the same flags: `--pid=host` lets the container see
-your machine's processes, the three `--cap-add` grants let it watch
-them, and the read-only cgroup mount names container workloads. On
-Ubuntu and other AppArmor systems the `--security-opt
-apparmor=unconfined` flag is what lets the container read other
-processes at all — without it a capture sees almost nothing (2
-processes scanned, 0 providers found). On machines without AppArmor,
-leave that flag out. If you prefer to keep confinement, load the
-shipped profile once with `sudo apparmor_parser -r
+your machine's processes, the five `--cap-*` grants (after `--cap-drop
+ALL`) let it watch them, and the read-only cgroup mount names
+container workloads. On Ubuntu and other AppArmor systems the
+`--security-opt apparmor=unconfined` flag is what lets the container
+read other processes at all — without it a capture sees almost
+nothing (2 processes scanned, 0 providers found). On machines without
+AppArmor, leave that flag out. If you prefer to keep confinement, load
+the shipped profile once with `sudo apparmor_parser -r
 deploy/apparmor-p11scope` from the p11scope source tree and use
 `--security-opt apparmor=p11scope-observer` instead of `unconfined`.
 To confirm AppArmor is the cause: `sudo dmesg |
-grep 'apparmor="DENIED"' | grep docker-default`.
+grep 'apparmor="DENIED"' | grep docker-default`. Docker 24+ needs no
+seccomp flag; older engines use the vendored [seccomp
+profile](../../deploy/seccomp-p11scope.json).
+
+Alternative: `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
+DAC_READ_SEARCH` in place of the five `--cap-*` flags above.
+`CAP_SYS_ADMIN` grants very broad power — close to full root (mounts,
+namespaces, many kernel admin operations) — so use it only when
+needed. What it adds for p11scope is file learning (fanotify): it
+catches a short-lived process's first load of a new provider file;
+without it that case is a named gap in the report. On Docker older
+than 24, whose default seccomp allows `bpf()` only with
+`CAP_SYS_ADMIN`, it is also the way to run without the seccomp file.
 
 Prefer a system package over Docker? Install v0.7.0 and use `sudo
 p11scope` in place of the `docker run ...` lines (each demo shows the
@@ -68,6 +80,22 @@ sudo apt install ./p11scope_0.7.0_amd64.deb
 
 On Fedora/RHEL, download `p11scope-0.7.0-1.x86_64.rpm` instead and
 install it with `sudo dnf install ./p11scope-0.7.0-1.x86_64.rpm`.
+
+## Saving a report
+
+`-o` writes inside the container, and `--rm` discards it with the
+container, so mount a folder for the report. Today the output
+directory must be root-owned: a user-owned mount is refused
+(`output directory ancestor /out is untrusted: owned by uid 1000`).
+Make a root-owned directory once, then add `-v ~/p11out:/out` to the
+`docker run` line and `-o /out/report.json` to the p11scope command:
+
+```sh
+sudo install -d -m 0755 -o root -g root ~/p11out
+```
+
+The file lands root-owned (`0600`; read it with `sudo`). Easier
+output ownership is planned for 0.8.0.
 
 ## Learn more
 

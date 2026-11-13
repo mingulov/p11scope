@@ -7,7 +7,7 @@ Pins two honesties: the DaemonSet default is runnable from the checkout
 (the local dev image, or the published tag of the version in Cargo.toml,
 which stays unpublished until the release step 7.4 push makes it live),
 and deploy/README.md shows the proven minimal `docker run` recipes (the
-shipped set and the measured least-privilege five-capability set) and
+primary five-capability set first, then the SYS_ADMIN alternative) and
 claims only the refusals the container-image cell actually proves.
 """
 
@@ -35,7 +35,7 @@ def minimal_recipe_blocks():
     blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
     matches = [block for block in blocks if "docker run" in block and "doctor" in block]
     assert len(matches) == 2, \
-        "deploy/README.md must show the shipped and five-cap docker run recipes"
+        "deploy/README.md must show the primary five-cap and alternative SYS_ADMIN recipes"
     return matches
 
 
@@ -51,10 +51,13 @@ class DeployDefaultsTests(unittest.TestCase):
 
     def test_minimal_recipe_mounts_the_node_cgroup_hierarchy(self):
         recipes = minimal_recipe_blocks()
-        shipped = [block for block in recipes if "--cap-add SYS_ADMIN" in block]
-        five_cap = [block for block in recipes if "--cap-drop ALL" in block]
-        self.assertEqual(len(shipped), 1, "the shipped recipe keeps SYS_ADMIN")
-        self.assertEqual(len(five_cap), 1, "the least-privilege recipe drops to five caps")
+        primary = [block for block in recipes if "--cap-drop ALL" in block]
+        alternative = [block for block in recipes if "--cap-add SYS_ADMIN" in block]
+        self.assertEqual(len(primary), 1, "the primary recipe drops to five caps")
+        self.assertEqual(len(alternative), 1, "the alternative recipe keeps SYS_ADMIN")
+        text = DEPLOY_README.read_text()
+        self.assertLess(text.index("--cap-drop ALL"), text.index("--cap-add SYS_ADMIN"),
+                        "the five-cap recipe stays primary, ahead of the SYS_ADMIN alternative")
         for block in recipes:
             self.assertIn("-v /sys/fs/cgroup:/sys/fs/cgroup:ro", block,
                           "the proven minimal runs mount cgroupfs read-only")
@@ -64,16 +67,29 @@ class DeployDefaultsTests(unittest.TestCase):
         self.assertNotIn("dropping any of them refuses", text,
                          "the cell proves two removals, not every flag")
         self.assertIn("or `SYS_PTRACE` refuses", text)
-        self.assertIn("Least privilege (measured 2026-11-11", text,
+        self.assertIn("Primary recipe (measured 2026-11-11", text,
                       "the run is the measured set, not a claimed minimum")
         self.assertIn("five-cap-exact", text,
                       "the container-image cell covering the recipe is named")
-        self.assertIn("stands in for", text,
-                      "SYS_ADMIN is the narrow-capability stand-in")
+        self.assertIn("Alternative: the `SYS_ADMIN` set", text,
+                      "the SYS_ADMIN run is the alternative, not the default")
+        self.assertIn("close to full root", text,
+                      "the alternative states the breadth of CAP_SYS_ADMIN")
+        self.assertIn("file learning (fanotify)", text,
+                      "the alternative names what SYS_ADMIN adds")
+        self.assertIn("named gap", text,
+                      "the alternative names the without-it gap")
         self.assertNotIn("minimal container run", text,
                          "the old minimal wording contradicts the product term")
         self.assertNotIn("Privileges and why", text,
                          "the kind-table citation no longer applies")
+
+    def test_output_mount_names_the_root_owned_rule(self):
+        text = DEPLOY_README.read_text()
+        self.assertIn("is untrusted: owned by uid", text,
+                      "the -o note quotes the user-owned-mount refusal")
+        self.assertIn("planned for 0.8.0", text,
+                      "the -o note names the easier-ownership plan")
 
     def test_rebuild_recipe_keeps_full_features(self):
         self.assertNotIn("--no-default-features", DEPLOY_README.read_text(),

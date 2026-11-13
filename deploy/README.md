@@ -32,36 +32,20 @@
 
 The observer image is published on releases as
 `ghcr.io/mingulov/p11scope:<version>` (see `RELEASING.md`); the holder image
-stays test-only. The shipped recipe keeps `--pid=host` plus
-`SYS_ADMIN`, `SYS_PTRACE` and `DAC_READ_SEARCH`, with the node cgroup
-hierarchy mounted read-only. `SYS_ADMIN` stands in for `CAP_BPF` +
-`CAP_PERFMON` + `CAP_CHECKPOINT_RESTORE` (BPF load and perf-event attach
-where the narrow grant is absent, plus `map_files` for caller attribution).
-Dropping `--pid=host` or `SYS_PTRACE` refuses, as
-`scripts/matrix/verify-container-image.sh` proves:
+stays test-only. The primary recipe keeps `--pid=host` plus the narrow
+five-capability set (`BPF`, `PERFMON`, `CHECKPOINT_RESTORE`,
+`SYS_PTRACE`, `DAC_READ_SEARCH`) with `--cap-drop ALL`, and the node
+cgroup hierarchy mounted read-only. Dropping `--pid=host`
+or `SYS_PTRACE` refuses, as `scripts/matrix/verify-container-image.sh`
+proves.
 
-```sh
-docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
-  --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-  ghcr.io/mingulov/p11scope:latest doctor
-```
-
-(On AppArmor hosts load [`apparmor-p11scope`](apparmor-p11scope) and
-add `--security-opt apparmor=p11scope-observer` (`apparmor=unconfined`
-also works but drops the confinement); on SELinux-enforcing hosts no
-extra flag is needed (measured 2026-11-11, below). The example tag is
-published with the 0.7.0 release; before that, substitute a locally built
-image tag from the recipe below.)
-
-Least privilege (measured 2026-11-11; no `--privileged`, no
-`CAP_SYS_ADMIN`): the narrow five-capability set (`BPF`, `PERFMON`,
-`CHECKPOINT_RESTORE`, `SYS_PTRACE`, `DAC_READ_SEARCH`) with `--cap-drop
-ALL` under the Docker default seccomp profile captures exactly like the
-shipped set. `doctor` exits 0 with `capture available`, and `profile
---pid`, `--cgroup` and `--system` count a ledgered SoftHSM workload
-exactly. Docker 24 and later already allow `bpf()` with `CAP_BPF` and
-`perf_event_open()` with `CAP_PERFMON` under the default profile, so no
-`--security-opt seccomp` flag is needed there.
+Primary recipe (measured 2026-11-11; no `--privileged`, no
+`CAP_SYS_ADMIN`): the five-capability set under the Docker default
+seccomp profile. `doctor` exits 0 with `capture available`, and
+`profile --pid`, `--cgroup` and `--system` count a ledgered SoftHSM
+workload exactly. Docker 24 and later already allow `bpf()` with
+`CAP_BPF` and `perf_event_open()` with `CAP_PERFMON` under the default
+profile, so no `--security-opt seccomp` flag is needed there.
 
 ```sh
 docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
@@ -70,9 +54,14 @@ docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
   ghcr.io/mingulov/p11scope:latest doctor
 ```
 
-(Same AppArmor and SELinux notes as above. It still needs host PID and
-named capabilities, so rootless Docker, Podman and Docker Desktop's VM
-boundary stay unsupported, as in [the demos](../docs/demo/README.md).)
+(On AppArmor hosts load [`apparmor-p11scope`](apparmor-p11scope) and
+add `--security-opt apparmor=p11scope-observer` (`apparmor=unconfined`
+also works but drops the confinement); on SELinux-enforcing hosts no
+extra flag is needed (measured 2026-11-11, below). The example tag is
+published with the 0.7.0 release.)
+It still needs host PID and named capabilities, so rootless Docker,
+Podman and Docker Desktop's VM boundary stay unsupported, as in [the
+demos](../docs/demo/README.md).
 Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 `Privileged=false`, `CapDrop=[ALL]`,
 `CapAdd=[BPF CHECKPOINT_RESTORE DAC_READ_SEARCH PERFMON SYS_PTRACE]`,
@@ -81,7 +70,28 @@ Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 default filter active). `scripts/matrix/verify-container-image.sh`
 covers the recipe as `five-cap-exact`.
 
-Where the engine default cannot be used — Docker 20.10 and older
+Alternative: the `SYS_ADMIN` set. Replacing the five `--cap-*` flags
+above with `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
+DAC_READ_SEARCH` also captures:
+
+```sh
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+  --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  ghcr.io/mingulov/p11scope:latest doctor
+```
+
+`CAP_SYS_ADMIN` grants very broad power — close to full root (mounts,
+namespaces, many kernel admin operations) — so use it only when
+needed. What it adds for p11scope is file learning (fanotify): it
+catches a short-lived process's first load of a new provider file,
+naming the loader and the file (the first use itself stays a
+[missed window](../docs/known-limitations.md#one-shot-tools-under---system-first-use-missed-later-runs-caught));
+without it that case is a named gap in the report. On Docker older
+than 24, whose default seccomp allows `bpf()` only with
+`CAP_SYS_ADMIN`, it is also the way to run without the vendored
+seccomp file below.
+
+Where the engine default cannot be used — Docker older than 24
 (whose default allows `bpf()` only with `CAP_SYS_ADMIN`), a daemon
 with a custom default, or a Kubernetes `Localhost` seccomp profile —
 use [`seccomp-p11scope.json`](seccomp-p11scope.json) via
@@ -100,6 +110,26 @@ legs there miss
 only at full-multiset level amid another lane's container workload
 (host-module rows exact), so `--system` full-multiset exactness
 needs a quiet host.
+
+Saving a report: `-o` writes inside the container, and `--rm`
+discards it with the container, so mount a folder for the report.
+Today the output directory must be root-owned: a user-owned mount is
+refused (`output directory ancestor /out is untrusted: owned by uid
+1000`). Make a root-owned directory once, then mount it:
+
+```sh
+sudo install -d -m 0755 -o root -g root ~/p11out
+docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
+  --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE \
+  --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  -v ~/p11out:/out ghcr.io/mingulov/p11scope:latest inventory --system \
+  -o /out/report.json
+```
+
+The file lands root-owned (`0600`; read it with `sudo`). Measured on
+Docker 29.8.1 with the five-cap set: `inventory --system -o` into a
+root-owned mount exits 0 with the file written. Easier output
+ownership is planned for 0.8.0.
 
 Mandatory access control and kernel knobs (measured 2026-11-11):
 

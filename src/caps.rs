@@ -186,10 +186,27 @@ pub(crate) fn lacking_line(missing: &[&KnownCap], binary: &str) -> String {
     )
 }
 
+/// The stderr note for `missing`, or `None` when no grant can help: in
+/// a proven child user namespace (`Some(false)`) cross-userns reads need
+/// capabilities in the *target's* userns, so a setcap recipe misleads and
+/// the userns refusal already names the remedy. Pure over the proven
+/// cause, so twins stay off the live namespace.
+pub(crate) fn lacking_note(
+    missing: &[&KnownCap],
+    binary: &str,
+    init_user_ns: Option<bool>,
+) -> Option<String> {
+    if init_user_ns == Some(false) {
+        return None;
+    }
+    Some(lacking_line(missing, binary))
+}
+
 /// Name the missing ones of `bits` on stderr, once per process per
 /// capability: a missing capability gets its line exactly where its
 /// operation fails, without repeating for every object in a scan. A
-/// closed stderr drops the line instead of panicking.
+/// closed stderr drops the line instead of panicking. Silent in a proven
+/// child user namespace: no in-namespace grant can fix the read there.
 pub(crate) fn note_lacking(bits: &[u32]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NOTED: AtomicU64 = AtomicU64::new(0);
@@ -203,11 +220,11 @@ pub(crate) fn note_lacking(bits: &[u32]) {
             newly.push(cap);
         }
     }
-    if !newly.is_empty() {
-        let _ = crate::try_stderr_line(&format!(
-            "p11scope: {}",
-            lacking_line(&newly, &current_binary())
-        ));
+    if !newly.is_empty()
+        && let Some(note) =
+            lacking_note(&newly, &current_binary(), crate::userns::in_init_user_ns())
+    {
+        let _ = crate::try_stderr_line(&format!("p11scope: {note}"));
     }
 }
 
@@ -678,6 +695,31 @@ mod tests {
              /usr/bin/p11scope"
         );
         assert_eq!(line.lines().count(), 1);
+    }
+
+    /// Twins for the grant-advice note: a proven child user namespace
+    /// suppresses it (no in-namespace grant can fix cross-userns reads —
+    /// the userns refusal already names the remedy), while initial and
+    /// unknown namespaces keep the old clause byte for byte.
+    #[test]
+    fn lacking_note_suppressed_only_in_a_proven_child_userns() {
+        let binary = "/usr/bin/p11scope";
+        let missing = missing_in(0, &TARGET_READ_BITS);
+        assert_eq!(
+            lacking_note(&missing, binary, Some(false)),
+            None,
+            "a proven child userns must not print grant advice"
+        );
+        let old = lacking_line(&missing, binary);
+        assert!(old.contains("Grant the minimal set"), "{old}");
+        assert!(old.contains("sudo"), "{old}");
+        for init_user_ns in [Some(true), None] {
+            assert_eq!(
+                lacking_note(&missing, binary, init_user_ns),
+                Some(old.clone()),
+                "{init_user_ns:?} keeps the old clause"
+            );
+        }
     }
 
     /// Post-setup least privilege: multi with linked dynamics sheds the

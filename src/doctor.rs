@@ -2108,12 +2108,17 @@ fn render_concise_with_host(
         // and every other FAIL row stays beneath it. Warnings follow
         // flat, as without the cause. Full detail lives under -v.
         let _ = writeln!(out, "cause: {}", crate::userns::CAUSE_LINE);
-        out.push_str("failing checks:\n");
-        for check in checks
+        let others: Vec<&Check> = checks
             .iter()
             .filter(|check| !is_userns_row(&check.name) && matches!(check.status, Status::Fail(_)))
-        {
-            render_row(&mut out, check);
+            .collect();
+        // No dangling header: a nested namespace with working BPF shows
+        // the cause with no empty group beneath it.
+        if !others.is_empty() {
+            out.push_str("failing checks:\n");
+            for check in others {
+                render_row(&mut out, check);
+            }
         }
         for check in checks
             .iter()
@@ -5343,21 +5348,50 @@ mod tests {
         assert!(verbose.contains(USER_NAMESPACE_ROW), "{verbose}");
         assert!(verbose.contains(crate::userns::CAUSE_LINE), "{verbose}");
         // The not-detected twin: initial and unknown namespaces render
-        // the old shape, with the failing row's own Next.
-        for numbering in [
-            ObserverUserNs::Initial,
-            ObserverUserNs::Unknown("probe withheld".to_string()),
+        // the old shape, with the failing row's own Next. The Unknown
+        // warning renders (the Initial Ok stays verbose-only): a
+        // regression downgrading Unknown to Ok must fail here.
+        for (numbering, shows_row) in [
+            (ObserverUserNs::Initial, false),
+            (ObserverUserNs::Unknown("probe withheld".to_string()), true),
         ] {
             let mut checks = concise_checks();
             checks.push(user_namespace_check(&numbering));
             let text = render_concise(&checks);
             assert!(!text.contains("cause: "), "{numbering:?}: {text}");
             assert!(!text.contains("failing checks:"), "{numbering:?}: {text}");
+            assert_eq!(
+                text.contains("user namespace"),
+                shows_row,
+                "{numbering:?}: {text}"
+            );
             assert!(
                 text.contains("Next: review BPF map create in the checks below"),
                 "{numbering:?}: {text}"
             );
         }
+    }
+
+    /// No dangling group header: a proven userns cause with zero other
+    /// FAIL rows prints `cause:` without an empty `failing checks:`
+    /// group — a nested namespace with working BPF must not show a
+    /// header with no rows beneath it.
+    #[test]
+    fn userns_cause_with_no_other_failures_omits_empty_group_header() {
+        use crate::userns::ObserverUserNs;
+        let checks = vec![user_namespace_check(&ObserverUserNs::Nested)];
+        let text = render_concise(&checks);
+        assert!(
+            text.contains(&format!("cause: {}", crate::userns::CAUSE_LINE)),
+            "{text}"
+        );
+        assert!(!text.contains("failing checks:"), "{text}");
+        let next = text
+            .lines()
+            .find(|line| line.starts_with("Next: "))
+            .unwrap();
+        assert!(next.contains(crate::userns::NEXT_STEP), "{text}");
+        assert_eq!(verdict(&checks), 1);
     }
 
     #[test]

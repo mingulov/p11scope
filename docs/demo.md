@@ -98,8 +98,8 @@ sudo p11scope inventory --system --key-operations --duration 90s
 sudo p11scope profile --pid <browser-pid> --duration 45s
 ```
 
-The samples below were measured 2026-11-12 on the dev host lu26
-(Ubuntu 26.04.1, kernel 7.0.0-38-generic), p11scope 346d2c875
+The samples below were measured 2026-11-13 on the dev host lu26
+(Ubuntu 26.04.1, kernel 7.0.0-38-generic), p11scope 26884cce8
 release, against an already-running headless browser (fresh
 profile, own NSS database seeded with a throwaway client
 credential) doing real TLS client-certificate handshakes against
@@ -111,24 +111,28 @@ when it does cryptography: https sites, Security Devices, saved
 passwords.
 
 `inventory --system --key-operations` (trimmed; the Chromium run,
-4 presented handshakes in the window):
+3 presented handshakes in the window):
 
 ```
-inventory system (14 passes, 255 callers, 16 provider files, 52 edges)
-coverage: partial - 385 gaps
-key operations: 6 keys on 1 provider; rev 14 populated; 6 sessions
-  /usr/lib/x86_64-linux-gnu/libsoftokn3.so: sign 3 completed, 0 returned errors, 0 active operations
-  unknown keys: digest 169 completed, 0 returned errors, 0 active operations
-  type unknown (not established while observed) (3 key rows)
-/usr/lib/x86_64-linux-gnu/libsoftokn3.so: mapped by 1 application (chrome (from node)); 2609 entries observed
+inventory system (17 passes, 468 callers, 9 provider files, 52 edges)
+coverage: partial - 58 gaps
+key operations: 7 keys on 1 provider; rev 17 partial; 6 sessions
+  per-key tracking lost some calls; exact rows continue
+  /usr/lib/x86_64-linux-gnu/libsoftokn3.so: sign 2 completed, 0 returned errors, 0 active operations
+  unknown keys: digest 182 completed, 0 returned errors, 0 active operations
+  type unknown (not established while observed) (2 key rows)
+/usr/lib/x86_64-linux-gnu/libsoftokn3.so: mapped by 2 applications (chrome (from dash), chrome (from node)); 4236 entries observed
 /snap/firefox/9057/usr/lib/firefox/libsoftokn3.so: mapped by 5 applications (firefox (from firefox), firefox (from xfce4-panel)); no use in the covered interval; 5 of 5 mappings predate the watch, earlier calls are not counted
 run with -v for details
 ```
 
-The 3 signs are 3 of the 4 presented handshakes (no event loss:
-the fourth carried no new PKCS#11 signature). Each name carries
-its named parent in parentheses (`chrome (from node)` runs under
-Playwright's driver process). The desktop snap Firefox maps its
+The 2 signs are 2 of the 3 presented handshakes; per-key
+tracking names its own loss on the `per-key tracking lost some
+calls` line, so the third signature stays out of the key rows.
+Each name carries its named parent in parentheses (`chrome (from
+node)` runs under Playwright's driver process; the second
+`chrome (from dash)` is another Chromium on the busy host
+mapping the same module). The desktop snap Firefox maps its
 own softokn but stayed quiet, so its earlier calls sit in the
 named "mappings predate the watch" gap. Key types stay unknown
 here: the browser logged in before the observer attached, so no
@@ -141,12 +145,12 @@ in the first demo.
 ```
 p11scope - PID scope - up 00:00:45 - mode profile - /usr/lib/x86_64-linux-gnu/libnssckbi.so (+1 more)
 caller: /home/user/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome
-8210 completed calls; 539 returned errors; 0 entries without an observed return.
+8147 completed calls; 539 returned errors; 0 entries without an observed return.
 coverage: partial - calls may be missing (1 provider file not watched, 1 discovery step unavailable, 3 provider tables incompletely read, function list not fully identified); names unconfirmed (function names follow the standard PKCS#11 table but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding))
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_FindObjectsInit            libsoftokn3.so        742      0    16.4us    65.5us   131.1us         0
-C_Sign                       libsoftokn3.so          3      0     2.1ms     4.2ms     4.2ms         0
-C_SignInit                   libsoftokn3.so          3      0   524.3us     1.0ms     1.0ms         0
+C_FindObjectsInit            libsoftokn3.so        728      0    16.4us    65.5us   131.1us         0
+C_Sign                       libsoftokn3.so          3      0     1.0ms     1.0ms     1.0ms         0
+C_SignInit                   libsoftokn3.so          3      0   262.1us   524.3us   524.3us         0
 [13 more rows]
 MECHANISM                       CALLS    ERR
 CKM_SHA_1                         362      0
@@ -169,48 +173,109 @@ TLS handshake in NSS, 2 presented handshakes in the window):
 ```
 p11scope - PID scope - up 00:00:45 - mode profile - /home/user/.cache/ms-playwright/firefox-1555/firefox/libsoftokn3.so
 caller: /home/user/.cache/ms-playwright/firefox-1555/firefox/firefox
-1548 completed calls; 0 returned errors; 0 entries without an observed return.
-coverage: partial - calls may be missing (function list not fully identified); names unconfirmed (9 unregistered mechanisms); call details degraded (28 session-tracking gaps)
+1975 completed calls; 0 returned errors; 0 entries without an observed return.
+coverage: partial - calls may be missing (function list not fully identified); names unconfirmed (function names follow the standard PKCS#11 table but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding), 10 unregistered mechanisms); call details degraded (28 session-tracking gaps)
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_DeriveKey                  libsoftokn3.so         79      0    16.4us    65.5us   262.1us         0
-C_SignInit                   libsoftokn3.so         15      0     8.2us   524.3us   524.3us         0
-C_SignFinal                  libsoftokn3.so         15      0     4.1us     2.1ms     2.1ms         0
-C_EncryptMessage             libsoftokn3.so         10      0    16.4us    65.5us    65.5us         0
-C_DecapsulateKey             libsoftokn3.so          3      0     1.0ms     1.0ms     1.0ms         0
-[32 more rows]
+C_DeriveKey                  libsoftokn3.so         82      0     8.2us    32.8us    65.5us         0
+C_SignInit                   libsoftokn3.so         17      0     8.2us   262.1us   262.1us         0
+C_SignFinal                  libsoftokn3.so         17      0     4.1us     1.0ms     1.0ms         0
+C_EncryptMessage             libsoftokn3.so         13      0     8.2us    32.8us    32.8us         0
+C_DecapsulateKey             libsoftokn3.so          3      0   524.3us     1.0ms     1.0ms         0
+[35 more rows]
 MECHANISM                       CALLS    ERR
 CKM_HKDF_DERIVE                    58      0
-CKM_AES_GCM                        44      0
+CKM_AES_GCM                        53      0
 CKM_SHA256_RSA_PKCS_PSS            22      0
-CKM_ECDH1_DERIVE                    3      0
+CKM_ECDH1_DERIVE                    4      0
 CKM_ML_KEM                          3      0
-[13 more rows]
+[18 more rows]
 mechanism names from the standard table (layout evidence: interface linkage)
-sessions: 102 opened, peak 6 at once, 2 still open
+sessions: 128 opened, peak 4 at once, 2 still open
 run with -v for details
 ```
 
 The mechanism table is the handshake: ECDH and ML-KEM key
 exchange, HKDF key schedule, AES-GCM records, RSA-PSS
-signatures. Nine vendor mechanisms outside the registry stay
-count-only. Against Firefox, per-key rows are withheld in this
-shape (session tracking degrades across its hundred sessions),
-so inventory keeps exact aggregates instead:
+signatures. Ten vendor mechanisms outside the registry stay
+count-only. Against Firefox, per-key rows held in this run
+(116 sessions tracked), so the same `inventory --system
+--key-operations` names the operation mix per provider:
 
 ```
-key operations: 0 keys on 0 providers; rev 26 partial; 0 sessions
-  per-key tracking lost some calls; exact rows continue
-  unknown keys: sign 14 completed, 0 returned errors, 0 active operations
-  unknown keys: derive 92 completed, 0 returned errors, 0 active operations
-  unknown keys: decapsulate 4 completed, 0 returned errors, 0 active operations
-  unknown keys: digest 49 completed, 0 returned errors, 0 active operations
-  [4 more categories]
+key operations: 316 keys on 1 provider; rev 16 populated; 116 sessions
+  /home/user/.cache/ms-playwrigh...: decapsulate 3 completed, 0 returned errors, 0 active operations
+  /home/user/.cache/ms-playwright/fi...: derive 79 completed, 0 returned errors, 0 active operations
+  /home/user/.cache/ms-playwright/fire...: sign 15 completed, 0 returned errors, 0 active operations
+  unknown keys: digest 35 completed, 0 returned errors, 0 active operations
+  unknown keys: generate_key_pair 9 completed, 0 returned errors, 0 active operations
+  type unknown (not established while observed) (120 key rows)
 ```
 
+Decapsulations, derivations and signatures carry per-provider
+counts here; every key row still reads `type unknown`, because
+no key size was observed for these keys, instead of guessing.
 Per-key rows cover operations that start after the attach:
 against an already-running browser, earlier operations are
 counted in named gaps
 ([limits](known-limitations.md#known-limitations-in-060)).
+Per-key tracking needs `--capture auto` or `native`; on a
+multi-provider desktop the run may instead report the named
+`needs --manifest` gap — narrow with `--module` or rerun with
+`--manifest`. Above about 6,000 key operations/s rows can lag
+or show count-only ranges
+([limits](known-limitations.md#key-operations-at-sustained-6000-callss-arrive-late-and-can-show-count-only-rows)).
+
+### Post-quantum key exchange
+
+Firefox answers one more question through the same tables: did
+a site negotiate post-quantum key exchange? Two loopback TLS
+servers stood in for the sites: server A offers the hybrid
+group X25519MLKEM768 plus X25519, server B offers classical
+X25519 only (`openssl s_server` with `-groups
+X25519MLKEM768:X25519` and `-groups X25519`). Firefox visited
+one server at a time while `profile --pid` watched; each case
+ran 3 times (measured 2026-11-13 on lu26, p11scope 26884cce8),
+and the server log confirmed the negotiated group on every
+connection.
+
+Against the hybrid server (trimmed to the key-exchange tail of
+the mechanism table; both connections negotiated the hybrid
+group):
+
+```
+MECHANISM                       CALLS    ERR
+CKM_ML_KEM                          2      0
+CKM_GENERIC_SECRET_KEY_GEN          2      0
+CKM_CONCATENATE_BASE_AND_KEY        2      0
+CKM_ECDH1_DERIVE                    2      0
+CKM_NSS_ML_KEM_KEY_PAIR_GEN         2      0
+CKM_DES3_KEY_GEN                    1      0
+```
+
+The function table holds the matching `C_DecapsulateKey` row
+(2 calls in every hybrid run, none in any classical run).
+Against the classical server (same trim; the connection
+negotiated X25519):
+
+```
+MECHANISM                       CALLS    ERR
+CKM_GENERIC_SECRET_KEY_GEN          2      0
+CKM_ECDH1_DERIVE                    2      0
+CKM_NSS_ML_KEM_KEY_PAIR_GEN         2      0
+CKM_DES3_KEY_GEN                    1      0
+```
+
+No decapsulation row, no `CKM_ML_KEM`: with classical-only
+negotiation there is nothing to decapsulate. The ML-KEM
+keypair-generation row still appears, because Firefox prepares
+its hybrid offer either way — only the decapsulation rows mark
+a negotiated hybrid handshake. Classical ECDH appears in both
+tables; the mechanism names show the key family behind each
+count. p11scope never sees site names or traffic, so you load
+one site at a time and read the mechanisms. Chromium does TLS
+outside PKCS#11, so this works for Firefox and other
+NSS-based programs only. Per-key types stay `type unknown`
+here too, for the same reason as above.
 
 ## With the container image
 
@@ -245,11 +310,10 @@ label and the fix) and print a one-line hint plus a `process access`
 gap in `inventory` and `profile`.
 
 The simplest fix is one flag, `--security-opt apparmor=unconfined`,
-as in the script above. Measured 2026-11-12 on lu26 (Ubuntu
-26.04.1, local image built from p11scope 346d2c875; the published
-tags appear at release): 16 provider files including snap
-Firefox's libsoftokn3 (7 are transient test fixtures from other
-work on the busy host), 190 callers, 20,099 functions watched.
+as in the script above. Measured 2026-11-13 on lu26 (Ubuntu
+26.04.1, local image built from p11scope 26884cce8; the published
+tags appear at release): 9 provider files including snap
+Firefox's libsoftokn3, 490 callers, 20,099 functions watched.
 The trade-off is one sentence: this container runs without extra
 AppArmor confinement, while the granted capabilities and the
 default seccomp profile still apply.
@@ -265,7 +329,7 @@ shipped profile once with `sudo apparmor_parser -r
 deploy/apparmor-p11scope` (the load is lost on reboot unless the file
 is copied to `/etc/apparmor.d/`), then use `--security-opt
 apparmor=p11scope-observer` instead of `unconfined`. Measured
-2026-11-12 on the same host (local image): 4 provider files, 165
+2026-11-13 on the same host (local image): 4 provider files, 440
 callers, 6,907 functions watched. Against non-snap targets
 the shipped profile captures the same demo exactly (measured: 142
 callers, 5 providers, ledgered `profile --pid` multiset-exact);
@@ -273,7 +337,7 @@ snap-confined apps such as snap Firefox stay unreadable under it
 (their per-process `unreadable` gaps name them) — for those, use the
 unconfined flag or run natively.
 
-Least privilege (measured 2026-11-12 on lu26 with the local
+Least privilege (measured 2026-11-13 on lu26 with the local
 image; no `--privileged`, no `CAP_SYS_ADMIN`) captures the same
 demo exactly with the narrow
 five-capability set under the Docker default seccomp profile — no
@@ -287,10 +351,10 @@ apparmor=...` flag alongside it:
 FLAGS="--pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro --security-opt apparmor=unconfined"
 ```
 
-Measured 2026-11-12 on lu26 (Ubuntu 26.04.1, rootful Docker
-29.8.1, AppArmor enforcing, local image from p11scope 346d2c875):
-the least-privilege set scans 198 callers with the opt and 2
-without; the shipped-capability set scans 190 callers with the
+Measured 2026-11-13 on lu26 (Ubuntu 26.04.1, rootful Docker
+29.8.1, AppArmor enforcing, local image from p11scope 26884cce8):
+the least-privilege set scans 475 callers with the opt and 2
+without; the shipped-capability set scans 490 callers with the
 opt and 2 without (20,099 functions watched with the opt under
 both sets).
 
@@ -321,7 +385,7 @@ Docker — as a `docker`-group user, or with sudo. The host needs Linux
 the Desktop VM, not your laptop.
 
 `doctor` (trimmed real output, Ubuntu 26.04, local image,
-measured 2026-11-12 on lu26, p11scope 346d2c875):
+measured 2026-11-13 on lu26, p11scope 26884cce8):
 
 ```
 Doctor: requested-lane checks passed.
@@ -336,25 +400,25 @@ run with -v for details
 ```
 
 `inventory --system --duration 15s` (trimmed; the desktop Firefox maps
-its NSS softokn; measured 2026-11-12 on lu26, local image):
+its NSS softokn; measured 2026-11-13 on lu26, local image):
 
 ```
-inventory system (2 passes, 190 callers, 16 provider files, 56 edges)
-coverage: partial - 161 gaps
+inventory system (2 passes, 490 callers, 9 provider files, 48 edges)
+coverage: partial - 33 gaps
 /snap/firefox/9057/usr/lib/firefox/libsoftokn3.so: mapped by 5 applications (firefox (from firefox), firefox (from xfce4-panel)); no use in the covered interval; 5 of 5 mappings predate the watch, earlier calls are not counted
 run with -v for details
 ```
 
 `profile --system --duration 30s` (trimmed; a quiet window — nothing
 touched a provider, so the report is an honest empty with every gap
-named; measured 2026-11-12 on lu26, local image):
+named; measured 2026-11-13 on lu26, local image):
 
 ```
-p11scope - system scope - up 00:00:39 - mode profile - /usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so (+4 more)
+p11scope - system scope - up 00:00:32 - mode profile - /usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so (+4 more)
 Aggregate across the selected scope; counts are not per application.
 No completed calls observed; coverage incomplete.
 0 completed calls; 0 returned errors; 0 entries without an observed return.
-coverage: partial - calls may be missing (3 provider files not watched, 47 discovery steps unavailable, capture process-view capacity was exhausted; remaining generations were not scanned: 1, file-learning events were lost; some provider files may not have been learned: 1, file learning was unavailable; short-lived first loads of new provider files were not learned: 1, file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned: 1, 9 provider tables incompletely read, library-load tracking missed loads it should have seen, function list not fully identified, 380 short-lived process gaps); names unconfirmed (function names follow the standard PKCS#11 table but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding))
+coverage: partial - calls may be missing (3 provider files not watched, 19 discovery steps unavailable, file learning was unavailable; short-lived first loads of new provider files were not learned: 1, a provider file was replaced or deleted before staging; it was not learned: 1, file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned: 1, 9 provider tables incompletely read, library-load tracking missed loads it should have seen, function list not fully identified, 679 short-lived process gaps); names unconfirmed (function names follow the standard PKCS#11 table but their layout was not verified from scan (add --manifest to confirm positions for mechanism decoding))
 Attribution: 5 of 5 mapped provider files have no manifest (/snap/firefox/9057/usr/lib/firefox/libsoftokn3.so, /usr/lib/x86_64-linux-gnu/libnssckbi.so, /usr/lib/x86_64-linux-gnu/libsoftokn3.so, and 2 more); counts are exact, names are unconfirmed.
 [Module gaps section trimmed]
 run with -v for details
@@ -364,7 +428,7 @@ run with -v for details
 
 Firefox's own NSS module, libsoftokn3, is a PKCS#11 provider, so a
 desktop Firefox shows up in the demo without any setup, as in the
-inventory output above (measured 2026-11-12 on lu26: 5 Firefox
+inventory output above (measured 2026-11-13 on lu26: 5 Firefox
 mappings, quiet in the window). Activity appears when Firefox
 does cryptography: opening https sites, opening Settings >
 Privacy & Security > Security Devices, or viewing saved

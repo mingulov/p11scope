@@ -20359,7 +20359,9 @@ impl Engine {
     /// capability shed has run on the calling thread: capabilities are
     /// per-thread, and a pre-shed spawn would keep parsing arbitrary
     /// opened files with the transient `CAP_SYS_ADMIN`. Events between
-    /// marking and this call wait in the finite kernel queue. A spawn
+    /// marking and this call wait in the unlimited kernel queue
+    /// (finite on the fallback path), shed past the drain's user-space
+    /// cap. A spawn
     /// failure files the unavailable gap, never a silent dead learner.
     pub(crate) fn begin_file_learning_drain(&mut self) {
         let Some(learner) = self.file_learner.as_mut() else {

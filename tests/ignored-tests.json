@@ -972,6 +972,30 @@
       "cell": "privileged"
     },
     {
+      "file": "src/fanotify.rs",
+      "path": "fanotify::tests::learn_live_stop_under_open_churn_drains_without_loss",
+      "reason": "privileged: stopping the fanotify drain under child open churn decides the queued tail without learned loss (root, CAP_SYS_ADMIN)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/fanotify.rs",
+      "path": "fanotify::tests::learn_live_stop_under_rewrite_churn_decides_queued_tail",
+      "reason": "privileged: stopping the fanotify drain under rewrite churn decides the queued tail and still learns a provider opened just before (root, CAP_SYS_ADMIN, gcc)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/fanotify.rs",
+      "path": "fanotify::tests::learn_live_backlog_past_cap_is_shed_as_named_overflow",
+      "reason": "privileged: the unlimited fanotify queue absorbs an undrained flood, and a backlog past the user-space cap is shed as the named overflow (root, CAP_SYS_ADMIN, gcc)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/fanotify.rs",
+      "path": "fanotify::tests::learn_live_ignore_mark_filters_until_flush",
+      "reason": "privileged: a fanotify inode ignore mark filters a negative file's opens until the periodic flush (root, CAP_SYS_ADMIN)",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/unbound_exe.rs",
       "path": "discovery::unbound_exe::tests::privileged_btrfs_subvolume_collision_resolves_ambiguous",
       "reason": "privileged: btrfs subvolume twins resolve ambiguous (root, btrfs TMPDIR)",

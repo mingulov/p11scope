@@ -801,7 +801,8 @@ fn pidfd_exited(pidfd: &OwnedFd) -> bool {
 /// comes from the pidfd's fdinfo, the exe link is read only while the
 /// pinned task provably still lives, and both are re-checked after
 /// the read, so an exited-and-recycled pid can never be named. The
-/// read happens at event receipt, before the ELF proof. A loader
+/// read happens mid-proof: after the cheap byte tests admit the file,
+/// before the full export parse. A loader
 /// that already exited — or exec'd a different program between the
 /// open and this read, which no pidfd can exclude — resolves to the
 /// finite unknown or the current image; callers and docs state the
@@ -1525,11 +1526,32 @@ fn ignore_negative_inode(group: std::os::unix::io::RawFd, file: &std::fs::File) 
     rc == 0
 }
 
+/// Removes every inode ignore mark of the group (the filesystem marks
+/// stay): `FAN_MARK_FLUSH` of inode marks needs no capability, so it
+/// works after the post-setup shed. Best effort.
+fn flush_ignore_marks(group: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: libc call on the live group; flush takes no path.
+    let rc = unsafe {
+        libc::fanotify_mark(
+            group,
+            libc::FAN_MARK_FLUSH,
+            0,
+            libc::AT_FDCWD,
+            std::ptr::null(),
+        )
+    };
+    rc == 0
+}
+
 impl DrainCtx<'_> {
     /// Records a certain negative: cached in user space, and filtered
     /// in the kernel while the ignore-mark budget lasts.
     fn note_negative(&mut self, generation: FileGeneration, file: &std::fs::File) {
         self.cache.note_decided(generation, false);
+        self.mark_ignored(file);
+    }
+
+    fn mark_ignored(&mut self, file: &std::fs::File) {
         if self.ignore_marks < LEARN_IGNORE_MARK_CAP && ignore_negative_inode(self.group, file) {
             self.ignore_marks += 1;
         }
@@ -1599,6 +1621,9 @@ impl DrainCtx<'_> {
         };
         if !self.cache.needs_check(generation) {
             if self.cache.decided_provider(generation) != Some(true) {
+                // A known negative that still reports opens (its mark was
+                // flushed, refused or evicted): mark it again.
+                self.mark_ignored(&file);
                 return true;
             }
             // A later open of a sent file: tally the load. The pid
@@ -1698,14 +1723,15 @@ fn shed_backlog_past_cap(
     raw: std::os::unix::io::RawFd,
     ctx: &mut DrainCtx<'_>,
     buf: &mut [u8],
+    cap_bytes: usize,
 ) -> bool {
     let Some(queued) = queued_event_bytes(raw) else {
         return true;
     };
-    if queued <= LEARN_BACKLOG_CAP_BYTES {
+    if queued <= cap_bytes {
         return true;
     }
-    let mut owed = queued - LEARN_BACKLOG_CAP_BYTES / 2;
+    let mut owed = queued - cap_bytes / 2;
     while owed > 0 {
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -1826,6 +1852,14 @@ fn drain_loop(
         }
         if last_remark.elapsed() >= std::time::Duration::from_secs(30) {
             last_remark = std::time::Instant::now();
+            // Ignore marks live one re-mark period at most: a change the
+            // kernel never reports as a modification (a write through a
+            // shared writable mapping) still moves the file's ctime, so
+            // after the flush its next open is a new generation and is
+            // re-proved. The flush costs one re-queued open per marked
+            // file, then the marks come back.
+            flush_ignore_marks(raw);
+            ctx.ignore_marks = 0;
             // Coverage is the retained-mark set, never event traffic:
             // a failed re-mark of a retained filesystem is harmless
             // (its startup mark still delivers), but a visible
@@ -1871,7 +1905,7 @@ fn drain_loop(
         }
         if last_backlog_check.elapsed() >= std::time::Duration::from_secs(1) {
             last_backlog_check = std::time::Instant::now();
-            if !shed_backlog_past_cap(raw, &mut ctx, &mut buf) {
+            if !shed_backlog_past_cap(raw, &mut ctx, &mut buf, LEARN_BACKLOG_CAP_BYTES) {
                 break 'drain;
             }
         }
@@ -3395,6 +3429,217 @@ mod tests {
                 "round {round}: the provider opened before the stop is learned"
             );
         }
+    }
+
+    /// Reads a group's queued events for `window`, closing every fd,
+    /// and reports whether one of them opened `target` (`st_dev`,
+    /// `st_ino`) and whether a kernel overflow record appeared.
+    fn read_events_for(
+        raw: std::os::unix::io::RawFd,
+        target: (u64, u64),
+        window: std::time::Duration,
+    ) -> (bool, bool) {
+        use std::os::unix::io::FromRawFd;
+        let deadline = std::time::Instant::now() + window;
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut seen, mut overflow) = (false, false);
+        while std::time::Instant::now() < deadline {
+            // SAFETY: libc read into a live buffer; the group is non-blocking.
+            let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if read <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            let mut offset = 0usize;
+            while offset < read as usize {
+                let event = super::parse_fanotify_event(&buf[offset..read as usize]).unwrap();
+                offset += event.total_len;
+                overflow |= event.overflow;
+                if let Some(pidfd) = event.pidfd.filter(|fd| *fd >= 0) {
+                    // SAFETY: the kernel handed this pidfd to us.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd) });
+                }
+                if event.fd >= 0 {
+                    // SAFETY: the kernel handed this event fd to us.
+                    let file = unsafe { std::fs::File::from_raw_fd(event.fd) };
+                    seen |= super::file_identity(&file).ok() == Some(target);
+                }
+            }
+        }
+        (seen, overflow)
+    }
+
+    /// Live shed proof (privileged): the unlimited queue absorbs a flood
+    /// past the default 16384-event limit without a kernel overflow while
+    /// nothing drains it, a backlog under the user-space cap is left
+    /// alone (healthy twin), a backlog past it is shed down to half the
+    /// cap and filed as the named overflow (failure twin), and the drain
+    /// still proves a provider opened afterwards.
+    /// Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_backlog_past_cap_is_shed_as_named_overflow() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{index}")), b"not elf").unwrap();
+        }
+        let c = dir.path().join("shed.c");
+        let so = dir.path().join("libshed.so");
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        // Never begin the drain: this thread reads the group itself.
+        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let raw = group.as_raw_fd();
+        // 20000 opens with nobody reading: past the default queue limit.
+        // One process per pass, so the kernel cannot merge the repeats.
+        assert!(
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "for pass in 1 2 3 4 5 6 7 8 9 10; do cat \"$1\"/f* > /dev/null; done",
+                    "sh",
+                ])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let queued = super::queued_event_bytes(raw).expect("FIONREAD");
+        assert!(
+            queued >= 20_000 * super::FANOTIFY_META_LEN,
+            "the unlimited queue holds the whole flood: {queued} bytes"
+        );
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: raw,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        // Healthy twin: a backlog under the cap is never shed.
+        assert!(super::shed_backlog_past_cap(
+            raw,
+            &mut ctx,
+            &mut buf,
+            queued * 4
+        ));
+        assert_eq!(ctx.stats.overflows, 0);
+        assert!(rx.try_recv().is_err(), "no overflow under the cap");
+        // Failure twin: past the cap the backlog is shed and named.
+        let cap = 64 * 1024;
+        assert!(super::shed_backlog_past_cap(raw, &mut ctx, &mut buf, cap));
+        assert_eq!(ctx.stats.overflows, 1);
+        assert!(
+            matches!(rx.try_recv(), Ok(super::LearnMsg::QueueOverflow)),
+            "the shed files the named overflow"
+        );
+        let after = super::queued_event_bytes(raw).expect("FIONREAD");
+        assert!(
+            after < queued / 2,
+            "the backlog was shed: {queued} -> {after} bytes"
+        );
+        // The drain still serves: a provider opened now is proved.
+        assert!(
+            std::process::Command::new("cat")
+                .arg(&so)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut learned = false;
+        while !learned && std::time::Instant::now() < deadline {
+            // SAFETY: libc read into a live buffer; the group is non-blocking.
+            let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if read > 0 {
+                let chunk = buf[..read as usize].to_vec();
+                assert!(ctx.process_read(&chunk, super::SendWindow::Live));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    super::LearnMsg::Candidate(candidate) => {
+                        learned |= candidate.display_path.ends_with("libshed.so");
+                    }
+                    super::LearnMsg::QueueOverflow => {
+                        panic!("the unlimited queue never overflows in the kernel")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(learned, "a provider opened after the shed is still learned");
+    }
+
+    /// Live ignore-mark proof (privileged): a file proved negative stops
+    /// reporting opens once ignore-marked, and the periodic flush makes
+    /// its next open report again — the bound that re-proves a file
+    /// changed without a modification event (a shared writable mapping).
+    /// Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_ignore_mark_filters_until_flush() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("negative.dat");
+        std::fs::write(&path, b"not elf").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let target = super::file_identity(&file).unwrap();
+        let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        let (group, _tx, _, _) = learner.pending.take().expect("armed learner");
+        let raw = group.as_raw_fd();
+        let open_by_child = || {
+            assert!(
+                std::process::Command::new("cat")
+                    .arg(&path)
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let window = std::time::Duration::from_millis(300);
+        // Healthy twin: unmarked, the child's open is reported.
+        open_by_child();
+        assert!(
+            read_events_for(raw, target, window).0,
+            "an unmarked open is reported"
+        );
+        assert!(
+            super::ignore_negative_inode(raw, &file),
+            "ignore mark accepted"
+        );
+        open_by_child();
+        assert!(
+            !read_events_for(raw, target, window).0,
+            "an ignored open is filtered"
+        );
+        assert!(super::flush_ignore_marks(raw), "flush accepted");
+        open_by_child();
+        assert!(
+            read_events_for(raw, target, window).0,
+            "after the flush the open reports again"
+        );
     }
 
     /// Live drain proof across mount namespaces (privileged): a child in

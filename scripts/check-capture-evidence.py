@@ -1308,6 +1308,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "unmatched_forwarding" in evidence:
         wanted.add("unmatched_forwarding")
         exact_unmatched_forwarding(evidence["unmatched_forwarding"])
+    if not historical and not terminal and "unmatched_modules" in evidence:
+        wanted.add("unmatched_modules")
+        exact_unmatched_modules(evidence["unmatched_modules"])
     if not historical and not terminal and "legacy_collection" in evidence:
         wanted.add("legacy_collection")
         exact_legacy_collection(evidence["legacy_collection"])
@@ -1435,6 +1438,13 @@ def exact_unmatched_forwarding(value):
     matched no mapped file, in operator order."""
     require(isinstance(value, list) and all(isinstance(item, str) for item in value),
             f"unmatched_forwarding must be a string array: {value!r}")
+
+
+def exact_unmatched_modules(value):
+    """The additive --module miss list: operator inputs that matched
+    no mapped file, in operator order."""
+    require(isinstance(value, list) and all(isinstance(item, str) for item in value),
+            f"unmatched_modules must be a string array: {value!r}")
 
 
 def slot_stats_cost_bytes(slots, possible_cpus):

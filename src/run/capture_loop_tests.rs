@@ -2869,6 +2869,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         excluded_modules: Vec::new(),
         unmatched_excludes: Vec::new(),
         unmatched_forwarding: Vec::new(),
+        unmatched_modules: Vec::new(),
         object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
             1,
             "bootstrap_unavailable",

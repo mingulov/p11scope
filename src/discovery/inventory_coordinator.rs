@@ -2727,6 +2727,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.forwarding_inputs()
     }
 
+    /// The capture's `--module` inputs for evidence-time matching
+    /// against mapped files.
+    pub(crate) fn module_inputs(&self) -> &[std::path::PathBuf] {
+        self.engine.module_inputs()
+    }
+
     /// Fold an inventory-native pass's `--exclude-module` records into
     /// the engine budget, where `excluded_snapshot` reports them. The
     /// collector budgets that record these are per-pass copies; the

@@ -687,7 +687,11 @@ it only for runs that must not delay the child.
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
 normal manifest-free path does not execute provider code. `--module` is also
-optional and only narrows the memory scan to named providers.
+optional and only narrows the memory scan to named providers. A `--module`
+input that matched no mapped file is named in the report (text and JSON) as
+an unmatched `--module` input; the capture still exits 0, like `inspect`'s
+named skip — a path the observer cannot open may still match inside a
+container target, so a missing path is disclosure, not a usage error.
 `p11scope-discover --module` must be an absolute path — a relative path is
 refused rather than resolved against a surprising directory. Its `-o` file is
 published the way a profile report is: a private (0600) temporary file beside

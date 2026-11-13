@@ -997,6 +997,10 @@ and never proves an app identity. See the app identity rows of
   `--forwarding-module` is passed and at least one input matched no
   mapped file. Lists those inputs in operator order. A declared
   operator choice, never a gap or a loss.
+- `unmatched_modules` (additive within v1): present only when
+  `--module` is passed and at least one input matched no mapped file.
+  Lists those inputs in operator order. A declared operator choice,
+  never a gap or a loss.
 
 ## Semantic instances (additive within v1)
 

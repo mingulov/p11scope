@@ -225,6 +225,24 @@ fn snapshot_and_json_list_excluded_modules_and_unmatched_inputs() {
     assert_eq!(out["unmatched_excludes"][0], "nope.so");
 }
 
+/// O-Module: a `--module` input that matched nothing is named in the
+/// snapshot and JSON, like an unmatched exclusion — never a silent
+/// empty capture.
+#[test]
+fn snapshot_and_json_name_module_inputs_that_matched_nothing() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let mut presentation = capture_for(&harness, &document);
+    presentation.unmatched_modules = vec!["/nonexistent/pkcs11.so".into()];
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains("Unmatched --module inputs (1): /nonexistent/pkcs11.so"),
+        "{snapshot}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(out["unmatched_modules"][0], "/nonexistent/pkcs11.so");
+}
+
 /// The snapshot names a refused module with its admission reason in plain
 /// words, on the module's own detail line.
 #[test]

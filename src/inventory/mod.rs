@@ -9991,6 +9991,12 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         document["unmatched_forwarding"] =
             serde_json::to_value(&presentation.unmatched_forwarding).unwrap_or_default();
     }
+    // Additive: `--module` inputs that matched no mapped file, in
+    // operator order. Omitted when empty.
+    if !presentation.unmatched_modules.is_empty() {
+        document["unmatched_modules"] =
+            serde_json::to_value(&presentation.unmatched_modules).unwrap_or_default();
+    }
     // Additive (B17 leg 2): the staged reload disclosure, absent without
     // a producer. One call site; the helper owns the shape.
     crate::inventory_present::reload_disclosure::insert_reload_disclosure_json(

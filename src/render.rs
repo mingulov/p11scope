@@ -708,6 +708,12 @@ pub struct DiscoveryEvidence {
     /// nothing must never silently do nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_forwarding: Vec<String>,
+    /// `--module` inputs that matched no mapped file, in operator
+    /// order. Omitted when empty. Like `unmatched_forwarding`: a
+    /// narrowing input that matched nothing must never print as a
+    /// silent empty capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_modules: Vec<String>,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
     /// mode armed. Serde-skipped carrier: the profile lane and the
     /// terminal trace `EVIDENCE` hoist it to the top-level
@@ -884,6 +890,39 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
     (ordered, unmatched)
 }
 
+/// Match `--module` inputs against discovered modules at evidence
+/// assembly, mirroring the scan-time narrowing: a verbatim target-view
+/// path match counts even when the observer cannot open the input (the
+/// container case — `--module`, unlike `--forwarding-module`, takes no
+/// startup existence check), and an observer-inode match covers aliases
+/// (versioned `.so` links resolve to the same file). Either leg alone
+/// suffices, exactly as the narrowing admits by path or inode; a rotated
+/// same-spelling file still matched (rotation is an identity concern,
+/// not a match concern). Returns the inputs that matched nothing, in
+/// operator order. Modules share [`match_forwarding_inputs`]'s key
+/// shape `(id, path, dev, ino)`; ids and devices are never compared.
+pub(crate) fn match_module_inputs<Id>(
+    hints: &[std::path::PathBuf],
+    modules: &[(Id, String, (u64, u64), u64)],
+) -> Vec<String> {
+    let mut unmatched: Vec<String> = Vec::new();
+    for input in hints {
+        let input_string = input.display().to_string();
+        let inode = std::fs::metadata(input).ok().map(|meta| {
+            use std::os::unix::fs::MetadataExt as _;
+            meta.ino()
+        });
+        let hit = modules.iter().any(|(_, path, _, ino)| {
+            crate::discovery::identity::target_paths_equal(&input_string, path)
+                || inode.is_some_and(|file_ino| *ino == file_ino)
+        });
+        if !hit {
+            unmatched.push(input_string);
+        }
+    }
+    unmatched
+}
+
 impl Default for DiscoveryEvidence {
     fn default() -> Self {
         Self {
@@ -901,6 +940,7 @@ impl Default for DiscoveryEvidence {
             unmatched_excludes: Vec::new(),
             forwarding_declared: Vec::new(),
             unmatched_forwarding: Vec::new(),
+            unmatched_modules: Vec::new(),
             gap_exit_mappings: None,
             slot_sizing: None,
             deep_scan_selection: None,
@@ -3148,6 +3188,26 @@ fn unmatched_forwarding_lines(ev: &Evidence) -> String {
     )
 }
 
+/// Narrowing inputs that matched no mapped file, echoed whenever
+/// present: a `--module` input that matched nothing must never print
+/// as a silent empty capture. The JSON twin is the `unmatched_modules`
+/// key; never a coverage gap, so it never forces `PARTIAL`.
+fn unmatched_module_lines(ev: &Evidence) -> String {
+    if ev.discovery.unmatched_modules.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Unmatched --module inputs ({}): {}\n",
+        ev.discovery.unmatched_modules.len(),
+        ev.discovery
+            .unmatched_modules
+            .iter()
+            .map(|input| escape_controls(input))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Ownership-gap rows behind the headline: logical rows only, since
 /// the gap lines explain headline attribution. Forwarding rows are
 /// stated in the forwarding line, never summed here.
@@ -3472,6 +3532,7 @@ pub fn scope_summary_with_verbosity(
     }
     text.push_str(&excluded_lines(ev));
     text.push_str(&unmatched_forwarding_lines(ev));
+    text.push_str(&unmatched_module_lines(ev));
     if verbose {
         for ((has_owner_gap, total), description) in [
             (
@@ -12665,6 +12726,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// A `--module` input that matched no mapped file is named in text —
+    /// a typo'd provider path must never print as a silent empty capture.
+    #[test]
+    fn unmatched_module_inputs_are_named() {
+        let mut ev = evidence();
+        ev.discovery.modules = Vec::new();
+        ev.discovery.unmatched_modules = vec!["/nonexistent/pkcs11.so".into()];
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(
+            text.contains("/nonexistent/pkcs11.so") && text.contains("Unmatched --module inputs"),
+            "unmatched --module inputs are named: {text}"
+        );
+    }
+
+    /// The JSON twin of the unmatched-modules text line: an input that
+    /// matched nothing is machine-readable, omitted when empty.
+    #[test]
+    fn unmatched_module_inputs_are_serialized() {
+        let mut ev = evidence();
+        ev.discovery.unmatched_modules = vec!["/nonexistent/pkcs11.so".into()];
+        ev.verdict();
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["unmatched_modules"][0], "/nonexistent/pkcs11.so");
+        let mut empty = evidence();
+        empty.verdict();
+        let empty_json = serde_json::to_value(&empty).unwrap();
+        assert!(
+            empty_json.get("unmatched_modules").is_none(),
+            "empty unmatched_modules is omitted"
+        );
+    }
+
     /// Ownership-gap lines explain headline attribution gaps, so they
     /// count logical rows only: unattributed forwarding rows are already
     /// stated in the forwarding line, never summed here.
@@ -13091,6 +13185,106 @@ pub(crate) mod tests {
         let modules = vec![(ModuleId(3), "/opt/liba.so".into(), (8, 1), 100)];
         let (matched, unmatched) = match_forwarding_inputs(&[], &modules);
         assert!(matched.is_empty());
+        assert!(unmatched.is_empty());
+    }
+
+    /// The O-Module case: a typo'd `--module` path matches no mapped file
+    /// and is reported back verbatim, in operator order.
+    #[test]
+    fn module_match_typo_reports_the_input() {
+        use std::path::PathBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("libunrelated.so.1");
+        std::fs::write(&unrelated, b"fake-other").unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let other_ino = std::fs::metadata(&unrelated).unwrap().ino();
+        let modules = vec![(
+            7u32,
+            "/opt/libreal.so".to_string(),
+            (8, 1),
+            other_ino.wrapping_add(1),
+        )];
+        let unmatched = match_module_inputs(
+            &[
+                PathBuf::from("/nonexistent/pkcs11.so"),
+                PathBuf::from("/opt/libreal.so"),
+                unrelated.clone(),
+            ],
+            &modules,
+        );
+        assert_eq!(
+            unmatched,
+            vec![
+                "/nonexistent/pkcs11.so".to_string(),
+                unrelated.display().to_string()
+            ]
+        );
+    }
+
+    /// Unlike forwarding declarations, `--module` hints stay usable for
+    /// container targets the observer cannot open: a verbatim target-view
+    /// path match counts even when the input resolves to nothing here.
+    #[test]
+    fn module_match_verbatim_path_matches_without_observer_open() {
+        use std::path::PathBuf;
+        let spelling = "/proc/123/root/usr/lib/libcontainer-only.so".to_string();
+        assert!(
+            std::fs::metadata(&spelling).is_err(),
+            "the fixture spelling must stay unopenable"
+        );
+        let modules = vec![(7u32, spelling.clone(), (8, 1), 100u64)];
+        let unmatched = match_module_inputs(&[PathBuf::from(&spelling)], &modules);
+        assert!(
+            unmatched.is_empty(),
+            "verbatim path match counts: {unmatched:?}"
+        );
+    }
+
+    /// A `--module` input naming the discovered file through another
+    /// spelling (versioned `.so` link) matches by inode, like the scan's
+    /// narrowing.
+    #[test]
+    fn module_match_inode_alias_matches() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libalias.so.1");
+        std::fs::write(&target, b"fake-provider").unwrap();
+        let link = dir.path().join("libalias.so");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        let modules = vec![(7u32, target.display().to_string(), (8, 1), ino)];
+        let unmatched = match_module_inputs(std::slice::from_ref(&link), &modules);
+        assert!(unmatched.is_empty(), "inode alias matches: {unmatched:?}");
+    }
+
+    /// Verbatim spelling wins over a rotated inode: scan-time narrowing
+    /// admits by target-view path equality, so an input that named the
+    /// discovered path matched even when the observer's current inode
+    /// differs (rotation is an identity concern, not a match concern).
+    #[test]
+    fn module_match_same_spelling_matches_despite_rotation() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("librotated.so.1");
+        std::fs::write(&target, b"fake-new-bytes").unwrap();
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        let modules = vec![(
+            7u32,
+            target.display().to_string(),
+            (8, 1),
+            ino.wrapping_add(1),
+        )];
+        let unmatched = match_module_inputs(std::slice::from_ref(&target), &modules);
+        assert!(
+            unmatched.is_empty(),
+            "verbatim path match counts: {unmatched:?}"
+        );
+    }
+
+    #[test]
+    fn module_match_nothing_declared_matches_nothing() {
+        let modules = vec![(7u32, "/opt/liba.so".to_string(), (8, 1), 100u64)];
+        let unmatched = match_module_inputs(&[], &modules);
         assert!(unmatched.is_empty());
     }
 

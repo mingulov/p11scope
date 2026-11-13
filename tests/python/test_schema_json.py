@@ -1024,8 +1024,9 @@ class SchemaOracleAgreement(unittest.TestCase):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
         the optional additive envelopes (counter, selection, excludes,
-        forwarding, legacy, short-lived splits, deep-scan selection) and
-        the two additive annotations (refused pause, snapshot failure)."""
+        forwarding, module misses, legacy, short-lived splits, deep-scan
+        selection) and the two additive annotations (refused pause,
+        snapshot failure)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
@@ -1033,7 +1034,8 @@ class SchemaOracleAgreement(unittest.TestCase):
                "counter_collection", "selected_detail",
                "excluded_modules", "unmatched_excludes", "legacy_collection",
                "gap_exe_hints", "target_exec_hints", "gap_exit_mappings",
-               "unmatched_forwarding", "pause_refused", "snapshot_failure",
+               "unmatched_forwarding", "unmatched_modules",
+               "pause_refused", "snapshot_failure",
                "deep_scan_selection"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
@@ -1102,6 +1104,19 @@ class SchemaOracleAgreement(unittest.TestCase):
             with self.subTest(unmatched=unmatched):
                 invalid = copy.deepcopy(document)
                 invalid["evidence"]["unmatched_forwarding"] = unmatched
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
+    def test_unmatched_modules_shape_twins(self):
+        document = self.metrics_document()
+        valid = copy.deepcopy(document)
+        valid["evidence"]["unmatched_modules"] = ["/nonexistent/pkcs11.so"]
+        CHECKER["exact_metrics_schema"](valid)
+        for unmatched in (["/nonexistent/pkcs11.so", 42], "/nonexistent/pkcs11.so",
+                          [None]):
+            with self.subTest(unmatched=unmatched):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["unmatched_modules"] = unmatched
                 with self.assertRaises(AssertionError):
                     CHECKER["exact_metrics_schema"](invalid)
 

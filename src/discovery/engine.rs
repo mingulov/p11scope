@@ -16621,6 +16621,17 @@ impl Engine {
         self.discovery =
             self.capture_facts
                 .discovery(&self.plan, &excluded_records, &excludes, &forwarding);
+        // The capture facts own no `--module` inputs, so the unmatched
+        // narrowing disclosure matches here, against the projected
+        // modules, rather than inside `discovery()`.
+        let module_keys: Vec<(plan::ModuleId, String, (u64, u64), u64)> = self
+            .discovery
+            .modules
+            .iter()
+            .map(|module| (module.id, module.path.clone(), module.dev, module.ino))
+            .collect();
+        self.discovery.unmatched_modules =
+            render::match_module_inputs(&self.module_hints, &module_keys);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "project_facts",
@@ -35514,6 +35525,12 @@ impl Engine {
         self.budget.forwarding()
     }
 
+    /// The capture's `--module` inputs for evidence-time matching
+    /// against mapped files.
+    pub(crate) fn module_inputs(&self) -> &[std::path::PathBuf] {
+        &self.module_hints
+    }
+
     /// Cancels every pre-arm watch at scope end (packet 6.13, R2-D1-7):
     /// each open watch closes with `until_ns` and `ended_by: scope_end`,
     /// exactly once. A natural close preserves an earned `armed_idle`
@@ -38992,6 +39009,37 @@ mod missing_named_process_tests {
                 "process with PID {} could not be scanned; its modules are unknown, not absent",
                 std::process::id()
             )
+        );
+    }
+}
+
+/// O-Module wiring: projection stamps the `--module` inputs that
+/// matched nothing onto discovery evidence. Lives here — not in
+/// `engine_tests.rs`, which a sibling lane owns — beside the other
+/// inline projection tests.
+#[cfg(test)]
+mod unmatched_module_projection_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn project_capture_facts_names_module_hints_that_matched_nothing() {
+        let mut engine = Engine::empty();
+        engine.module_hints = vec![PathBuf::from("/nonexistent/pkcs11.so")];
+        engine.project_capture_facts();
+        assert_eq!(
+            engine.discovery.unmatched_modules,
+            vec!["/nonexistent/pkcs11.so".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_capture_facts_omits_unmatched_modules_without_hints() {
+        let mut engine = Engine::empty();
+        engine.project_capture_facts();
+        assert!(
+            engine.discovery.unmatched_modules.is_empty(),
+            "no hints, no disclosure"
         );
     }
 }

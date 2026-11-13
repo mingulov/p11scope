@@ -626,6 +626,10 @@ pub(crate) struct Presentation {
     /// `unmatched_excludes`: a declaration that matched nothing must
     /// never silently do nothing.
     pub unmatched_forwarding: Vec<String>,
+    /// `--module` inputs that matched no mapped file. Like
+    /// `unmatched_forwarding`: a narrowing input that matched nothing
+    /// must never print as a silent empty capture.
+    pub unmatched_modules: Vec<String>,
     pub budgets: BudgetView,
     /// The sanitized Detailed-lane summary (`observation.
     /// semantic_capture`): counts only, set by the run loop from the
@@ -971,6 +975,8 @@ impl Presentation {
             .collect();
         let (forwarding_declared, unmatched_forwarding) =
             crate::render::match_forwarding_inputs(coordinator.forwarding_inputs(), &module_keys);
+        let unmatched_modules =
+            crate::render::match_module_inputs(coordinator.module_inputs(), &module_keys);
         let declared: std::collections::BTreeSet<ModuleId> =
             forwarding_declared.into_iter().collect();
         for module in &mut modules {
@@ -1003,6 +1009,7 @@ impl Presentation {
             excluded_modules,
             unmatched_excludes,
             unmatched_forwarding,
+            unmatched_modules,
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
             // No Joint evidence reaches the live registry today
             // (live-loop carry): the projection is honestly
@@ -4351,6 +4358,7 @@ fn render_snapshot_inner(
         &presentation.excluded_modules,
         &presentation.unmatched_excludes,
         &presentation.unmatched_forwarding,
+        &presentation.unmatched_modules,
     );
     if summary_only {
         return out;
@@ -4694,6 +4702,7 @@ fn render_excluded_lines(
     excluded_modules: &[crate::render::ExcludedOut],
     unmatched_excludes: &[String],
     unmatched_forwarding: &[String],
+    unmatched_modules: &[String],
 ) {
     use std::fmt::Write as _;
     if !excluded_modules.is_empty() {
@@ -4727,6 +4736,18 @@ fn render_excluded_lines(
             "Unmatched forwarding declarations ({}): {}",
             unmatched_forwarding.len(),
             unmatched_forwarding
+                .iter()
+                .map(|input| escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !unmatched_modules.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched --module inputs ({}): {}",
+            unmatched_modules.len(),
+            unmatched_modules
                 .iter()
                 .map(|input| escape_controls(input))
                 .collect::<Vec<_>>()

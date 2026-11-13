@@ -21099,9 +21099,13 @@ impl Engine {
                     }
                 }
                 crate::fanotify::LearnMsg::Unavailable => {
+                    // A live drain sent this: startup marks are active
+                    // (the drain runs), so learning is partly —
+                    // never totally — unavailable. Only the
+                    // never-started shapes file the unavailable row.
                     self.mark_partial(
                         crate::render::LEARNED_SKIP_SUBJECT,
-                        crate::render::LEARNED_UNAVAILABLE_REASON,
+                        crate::render::LEARNED_UNMARKED_REASON,
                     );
                 }
                 crate::fanotify::LearnMsg::QueueOverflow => {

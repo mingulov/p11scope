@@ -55,8 +55,8 @@ PRODUCER_CONSTANTS = (
     "RUN_TREE_DEGRADED",
     "RUN_TREE_MEMBERSHIP_UNKNOWN",
     # Learned-file gaps: first-run, overflow, cap, unavailable,
-    # replaced/deleted, operator-disabled and mount-namespace reasons
-    # under their own subject.
+    # replaced/deleted, operator-disabled, mount-namespace and
+    # unmarked-filesystem reasons under their own subject.
     "LEARNED_FIRST_RUN_REASON",
     "LEARNED_OVERFLOW_REASON",
     "LEARNED_CAP_REASON",
@@ -64,6 +64,7 @@ PRODUCER_CONSTANTS = (
     "LEARNED_REPLACED_DELETED_REASON",
     "LEARNED_DISABLED_REASON",
     "LEARNED_MOUNT_NAMESPACE_REASON",
+    "LEARNED_UNMARKED_REASON",
 )
 
 
@@ -86,7 +87,7 @@ def producer_reasons():
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
     fifteen discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
-    of its seven reasons under its own subject. The split mirrors
+    of its eight reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
     source, never from a copy pasted into this test.
     """
@@ -124,12 +125,13 @@ def producer_reasons():
         const["LEARNED_REPLACED_DELETED_REASON"],
         const["LEARNED_DISABLED_REASON"],
         const["LEARNED_MOUNT_NAMESPACE_REASON"],
+        const["LEARNED_UNMARKED_REASON"],
     }
     assert (
         len(entry) == 2
         and len(discovery) == 15
         and len(run_tree) == 3
-        and len(learned) == 7
+        and len(learned) == 8
     ), const
     return entry, discovery, run_tree, learned
 

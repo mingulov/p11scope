@@ -703,6 +703,10 @@ LEARNED_MOUNT_NAMESPACE_REASON = (
     "file learning cannot see filesystems outside the observer's mount "
     "namespace; provider files opened only there were not learned"
 )
+LEARNED_UNMARKED_REASON = (
+    "some filesystems were not marked for file learning; short-lived "
+    "first loads of new provider files opened only there were not learned"
+)
 LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,
     LEARNED_OVERFLOW_REASON,
@@ -711,6 +715,7 @@ LEARNED_SKIP_REASONS = {
     LEARNED_REPLACED_DELETED_REASON,
     LEARNED_DISABLED_REASON,
     LEARNED_MOUNT_NAMESPACE_REASON,
+    LEARNED_UNMARKED_REASON,
 }
 # Owned-handoff (v0.7.0): a run whose startup step failed after probes
 # attached seals a partial report naming the failed step, with every

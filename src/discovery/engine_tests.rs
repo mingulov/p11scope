@@ -80521,9 +80521,10 @@ fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
     );
 }
 
-/// An unavailable-learning signal from the drain files the finite
-/// unavailable row once: membership-style failures are counted named
-/// gaps, never silently dropped.
+/// An unavailable-learning signal from a live drain files the finite
+/// unmarked-filesystems row once: the drain runs with active marks, so
+/// learning is partly — never totally — unavailable. Membership-style
+/// failures are counted named gaps, never silently dropped.
 #[test]
 fn learned_unavailable_files_a_named_gap() {
     let (tx, rx) = std::sync::mpsc::sync_channel(8);
@@ -80541,12 +80542,16 @@ fn learned_unavailable_files_a_named_gap() {
         .collect();
     assert!(
         public.iter().any(|skip| {
-            skip.name == "learned provider file"
-                && skip.reason
-                    == "file learning was unavailable; short-lived first loads \
-                         of new provider files were not learned"
+            skip.name == "learned provider file" && skip.reason == render::LEARNED_UNMARKED_REASON
         }),
-        "unavailable learning files its named gap: {public:?}"
+        "partial learning files its named gap: {public:?}"
+    );
+    assert!(
+        public.iter().all(|skip| {
+            skip.name != "learned provider file"
+                || skip.reason != render::LEARNED_UNAVAILABLE_REASON
+        }),
+        "a live drain never claims total unavailability: {public:?}"
     );
     // Other scopes never arm the drain.
     let mut pid_engine = Engine::empty();

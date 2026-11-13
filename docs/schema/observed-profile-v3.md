@@ -1089,12 +1089,18 @@ Learned-file gaps file under their own subject. Each record is
   files were not learned`: later candidates were refused loudly. The
   refused count rides in `evidence.learned_cap_skipped`.
 - `file learning was unavailable; short-lived first loads of new
-  provider files were not learned`: fanotify could not start or mark
-  any filesystem, or a visible filesystem could never be marked —
-  including one mounted, remounted or replaced at an already covered
-  path after startup, whose earlier mark died with the old mount —
-  so first loads from unmarked filesystems were not learned.
-  Ordinary discovery still ran; this names only the learning loss.
+  provider files were not learned`: fanotify could not start, the
+  drain thread could not spawn, or no filesystem could be marked —
+  learning never ran. Ordinary discovery still ran; this names only
+  the learning loss.
+- `some filesystems were not marked for file learning; short-lived
+  first loads of new provider files opened only there were not
+  learned`: the drain runs with active marks, but a visible
+  filesystem could never be marked — including one mounted,
+  remounted or replaced at an already covered path after startup,
+  whose earlier mark died with the old mount — so first loads from
+  unmarked filesystems were not learned. Ordinary discovery still
+  ran; this names only the learning loss.
 - `a provider file was replaced or deleted before staging; it was not
   learned`: the drain proved a provider on held bytes, but the held
   file was unlinked (deleted, or replaced by a rename over its path)

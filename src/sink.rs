@@ -457,8 +457,16 @@ fn stdout_transport_with_reopen(
             // reopen of an invoker-owned pipe or terminal fails
             // EACCES, so prefer the description preserved before the
             // shed (a clone of our own file needs no capability).
-            if let Some(file) = preserved_stdio_file(fd) {
-                return Ok(StdoutInner::File(file));
+            match preserved_stdio_clone(fd) {
+                PreservedClone::Cloned(file) => return Ok(StdoutInner::File(file)),
+                // Clone exhaustion is the transport's own failure:
+                // retain it instead of letting a shed reopen's EACCES
+                // mask it and bypass the diagnostic borrow. Other clone
+                // errors fall back to the reopen as before.
+                PreservedClone::CloneFailed(error) if is_fd_exhaustion(&error) => {
+                    return Err(error);
+                }
+                PreservedClone::Missing | PreservedClone::CloneFailed(_) => {}
             }
             Ok(StdoutInner::File(reopen(fd)?))
         }

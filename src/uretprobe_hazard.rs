@@ -2395,4 +2395,58 @@ mod tests {
     fn the_probe_point_is_a_real_call_that_returns() {
         assert_eq!(probe_point(41), 42);
     }
+
+    /// After the post-setup shed changes this thread's capability sets, the
+    /// stored return-probe approval must be re-keyed to the post-shed
+    /// context: otherwise the next attach's `ensure_admission` sees a stale
+    /// context, re-runs the uretprobe self-probe, and forks a short-lived
+    /// child whose exit the live ring records but no scope walk ever lists
+    /// (one `pid_descendant_gaps` per capture on sm1). The shed itself is
+    /// driven for real (no fork, no BPF: the approval is seeded and the
+    /// re-probe is observed through the injected assess closure), so the
+    /// twin is non-vacuous as root and vacuous-but-green unprivileged (no
+    /// shed, no mismatch), like the `post_setup_shed` twins in attach.rs.
+    #[test]
+    fn post_setup_shed_rekeys_the_retained_approval_so_the_next_attach_skips_the_self_probe() {
+        let sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
+        let keep = crate::caps::post_setup_keep(true, true, false, sets.effective);
+        let needed = crate::caps::post_setup_shed_needed(keep, sets);
+        // Seed a pre-shed approval for the live context without forking.
+        let mut retained: Option<ReturnProbeAdmission> = None;
+        ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
+            Ok(ReturnProbeAdmission {
+                context: AssessmentContext::current(),
+                override_reason: None,
+            })
+        })
+        .expect("seeding the retained approval succeeds");
+        crate::attach::drop_post_setup_capabilities_for(
+            crate::attach::AttachBackend::Multi,
+            true,
+            false,
+            None,
+        )
+        .expect("the shed succeeds");
+        // The next attach's ensure must reuse the retained approval.
+        let mut probed = false;
+        ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
+            probed = true;
+            Ok(ReturnProbeAdmission {
+                context: AssessmentContext::current(),
+                override_reason: None,
+            })
+        })
+        .expect("the post-shed ensure succeeds");
+        if needed {
+            assert!(
+                !probed,
+                "a shed capture must not re-run the self-probe on the next attach"
+            );
+        } else {
+            assert!(
+                !probed,
+                "an unshed capture reuses its approval (vacuous unprivileged leg)"
+            );
+        }
+    }
 }

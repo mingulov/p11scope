@@ -33,7 +33,7 @@ versioned separately and are opaque, exact dispatch keys.
 - Callers show their launcher chain: one hop (`from backup.sh`) by
   default, up to four in `-v` and JSON (`launched_by`).
   <!-- lane: parent-chain -->
-- Linux 7.4-rc1 joins the tested kernel matrix. <!-- lane: k74 -->
+- Linux 7.4-rc2 joins the tested kernel matrix. <!-- lane: k74 -->
 - A forwarding layer's whole table set is watched when the probe
   budget allows, so calls through pre-attach tables count and the
   layer's own calls separate from application calls.

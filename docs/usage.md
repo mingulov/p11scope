@@ -2408,7 +2408,7 @@ five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `inventory --system` named the SoftHSM module with a caller edge, and
 `run` counted completed calls (`scripts/ci/minimal-setcap.sh`; it has
 26 rows when the saved paranoid value is 3 or 4 and 33 otherwise, and
-runs on the CI host and the v6.6, v6.12, v6.18, 7.3 and 7.4-rc1 guest
+runs on the CI host and the v6.6, v6.12, v6.18, 7.3 and 7.4-rc2 guest
 kernels; all 33 rows passed in a local v6.6 guest on 2026-11-07). Measured the
 same day on Fedora defaults (`perf_event_paranoid=2`,
 `kernel.yama.ptrace_scope=0`, `kernel.kptr_restrict=0`, kernels 7.2.9

@@ -706,7 +706,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         kernels = [kernel.strip() for kernel in match.group(1).split(",")]
         self.assertEqual(kernels,
                          ["host", "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
-                          "v7.4-rc1"])
+                          "v7.4-rc2"])
         sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
         for kernel in kernels[1:]:
             self.assertTrue((sums / f"{kernel}.sums").is_file(),

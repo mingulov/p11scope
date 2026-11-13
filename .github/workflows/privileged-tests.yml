@@ -1063,9 +1063,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Newest mainline first-class: add each new release (7.4-rc1 now;
+        # Newest mainline first-class: add each new release (7.4-rc2 now;
         # re-point at the 7.4 final when it ships).
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1538,7 +1538,7 @@ jobs:
       fail-fast: false
       matrix:
         # Newest mainline first-class, like public-cli above.
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

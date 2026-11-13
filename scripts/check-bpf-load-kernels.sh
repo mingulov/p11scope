@@ -10,7 +10,7 @@
 # probe built by `measure-verifier-headroom.py build`, OUTDIR a directory
 # under /home/user/.cache/p11scope-vng/<tag>/ shared with the guests.
 # Default kernels: v6.6.157 v6.12.111 v6.18.58 v7.3.1.
-# v7.3.1 stays the default newest-stable; CI runs v7.4-rc1 as an extra
+# v7.3.1 stays the default newest-stable; CI runs v7.4-rc2 as an extra
 # matrix cell, and an -rc joins the defaults only when its final ships.
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json
 # when that file exists, so a budgeted program with no probe row FAILs

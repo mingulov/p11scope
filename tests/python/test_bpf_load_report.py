@@ -29,16 +29,16 @@ COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
-# plus the 7.0 guest and the 7.4-rc1 newest-mainline cell the budgets
+# plus the 7.0 guest and the 7.4-rc2 newest-mainline cell the budgets
 # also cover. Variant-group members split this set instead of carrying
 # it whole (see below). Each budget-key namespace (prefix before "/")
 # pins its own kernel set; all five namespaces currently cover the
 # same measured 6-kernel set.
 EXPECTED_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc2",
 })
 EXPECTED_GATE1_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc2",
 })
 EXPECTED_BUDGET_KERNELS_BY_NAMESPACE = {
     "detailed": EXPECTED_BUDGET_KERNELS,
@@ -76,7 +76,7 @@ EXCLUSIVE_VARIANT_GROUPS = [
 # modes. Every loaded counter program has a cell for each 6.6+ kernel
 # and nothing else.
 EXPECTED_COUNTER_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc2",
 })
 _COUNTER_MODES = ("counts", "timestamps", "latency")
 _COUNTER_ROOTS = (
@@ -799,7 +799,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("counter-<mode>-probe-", text)
 
     def test_driver_comment_records_the_rc_default_decision(self):
-        # v7.4-rc1 stays out of the local-qualification defaults by
+        # v7.4-rc2 stays out of the local-qualification defaults by
         # decision (an -rc joins only when its final ships), while CI
         # runs it as an extra matrix cell. The 7.3.1 precedent extended
         # the defaults, so the deviation must say so next to them.

@@ -4430,9 +4430,12 @@ struct ApplyOutcome {
     /// Inventory newcomers (`extra_views`) this apply left unpublished: none
     /// of their pins, modules or links were committed (U-07).
     unpublished_views: BTreeSet<ProcessViewId>,
-    /// The one-shot detach of the retired and replaced targets failed —
-    /// before or after any link mutation — and the apply blocked additions
-    /// for the cycle (PD-T3-1).
+    /// A detach failed and the apply blocked additions for the cycle
+    /// (PD-T3-1): the one-shot retire/replace detach, a partial new-slot
+    /// cleanup detach, or a replacement detach — before or after any link
+    /// mutation. Loader arming reads this to keep loud cleanup failures
+    /// on the record path instead of misreading an accepted close as a
+    /// silent sibling denial.
     detach_failed: bool,
     /// The apply refused via the proven-exit silent abort (stale only by
     /// dead views, empty delta): nothing mutated, nothing marked. A loader
@@ -17281,6 +17284,7 @@ impl Engine {
                             ),
                             Err(_) => {
                                 *additions_allowed = false;
+                                outcome.detach_failed = true;
                                 self.mark_partial(
                                     "live discovery detach",
                                     "a partial new-slot detach failed once and was not retried",
@@ -17492,6 +17496,7 @@ impl Engine {
                         );
                         if failed_detach {
                             *additions_allowed = false;
+                            outcome.detach_failed = true;
                             self.mark_partial(
                                 "live discovery replacement",
                                 "a partial replacement detach failed once and additions were blocked",
@@ -17515,6 +17520,7 @@ impl Engine {
                         );
                         if session.detach_failures().len() > detach_failures {
                             *additions_allowed = false;
+                            outcome.detach_failed = true;
                         }
                         self.mark_partial(
                             "live discovery replacement",

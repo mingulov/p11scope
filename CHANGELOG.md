@@ -289,6 +289,8 @@ versioned separately and are opaque, exact dispatch keys.
 - A stale manifest grants no semantic authority: replacement tables
   lend names only, never semantics, and non-standard, disagreeing or
   forged replacements stay count-only.
+- System-wide runs no longer count p11scope's own short-lived
+  self-check helper as a pending process.
 
 ### Corrections
 

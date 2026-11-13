@@ -332,6 +332,43 @@ class RefuseTests(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("overlay published extra gap", out)
 
+    def test_retained_refresh_without_deadline_still_fails(self):
+        # N3: the facts-retained refresh refusal only comes with a
+        # run-deadline straddle, so the deadline gap must be present
+        # in the same run; the retained row alone stays loud.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("retained refresh without a run deadline", out)
+
+    def test_duplicate_retained_refresh_per_caller_still_fails(self):
+        # N3: one row per owning caller — a second retained row for
+        # the same caller stays loud even with the deadline present.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 2})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("duplicate retained refresh for one caller", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -829,6 +829,13 @@ if degraded:
     # below instead of hiding.
     known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
     assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
+    # The facts-retained refresh refusal only comes with a
+    # run-deadline straddle: the deadline gap must be present in the
+    # same run, and at most one retained row per owning caller.
+    retained=[g for g in rest if g.get('reason')=='the final-sample permit was not granted; prior owner facts retained']
+    if retained:
+        assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
+        assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
     assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY

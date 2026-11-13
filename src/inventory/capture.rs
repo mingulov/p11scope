@@ -48,9 +48,10 @@
 //! discloses the mechanism and any fallback reason.
 
 use crate::attach::capture::{
-    CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary, CookieQuery,
-    DiscoveryBatch, ExtendReceipt, ExtendWindow, InventoryCapture, NativeDomainId, ReadWindow,
-    RetiredCapture, RetiringCapture, ScopeCustody, WitnessBatch, default_caller_budget,
+    AttachedEndpoint, CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary,
+    CookieQuery, DiscoveryBatch, EndpointFailure, ExtendReceipt, ExtendWindow, InventoryCapture,
+    MapperEstimate, NativeDomainId, ReadWindow, RetiredCapture, RetiringCapture, ScopeCustody,
+    WitnessBatch, default_caller_budget,
 };
 use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
@@ -58,13 +59,15 @@ use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
 };
-use crate::discovery::inventory_attach_set::{AttachEndpoint, TargetDelta};
+use crate::discovery::identity::RetainedInventoryTarget;
+use crate::discovery::inventory_attach_set::{AttachEndpoint, AttachObjectId, TargetDelta};
 use crate::discovery::native_binding::{BoundImage, NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
 use crate::inspect_system::inventory_cgroup::CgroupCollection;
 use crate::process::PidPin;
 use crate::scope::inventory_cgroup::CollectionControl;
 use anyhow::{Result, anyhow};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// The per-pass and per-tick windows (ruling D9: provisional until the M1
@@ -75,11 +78,22 @@ pub(crate) struct LaneWindows {
     /// Singles backend (old kernels: this quantum is unchanged).
     pub extend_entries: usize,
     pub extend_budget: Duration,
-    /// The same quantum on the Multi backend: one pass carries a whole
-    /// provider's endpoints (p11-kit admits 6734) instead of 512 of them,
-    /// so the most-mapped provider attaches within a 30 s system run.
+    /// The same quantum on the Multi backend: the endpoint ceiling, so the
+    /// 4 s wall budget binds instead of the entry count (v0.8.0 attach
+    /// cadence: measured 19-45 us/site at 1-5 mappers, ~1.8 s for the
+    /// 20167-endpoint desktop demand, well inside the wall; OD29 raise).
     pub multi_extend_entries: usize,
     pub multi_extend_budget: Duration,
+    /// Attach attempts per inter-pass/collection tick, and the tick's
+    /// attach budget, on Singles: ticks drain the deferred backlog in
+    /// small bounded quanta without regressing loop tick time (10 ms,
+    /// one SERVICE_TICK; entry bound is a safety cap, the wall binds).
+    pub tick_extend_entries: usize,
+    pub tick_extend_budget: Duration,
+    /// The same tick quantum on Multi (1024 entries / 10 ms: wall binds
+    /// at 19-227 us/site across 1-33 mappers; ~90-1050 sites per tick).
+    pub multi_tick_extend_entries: usize,
+    pub multi_tick_extend_budget: Duration,
     /// CALLER_USE rows per witness read, and its budget.
     pub witness_rows: usize,
     pub witness_budget: Duration,
@@ -143,8 +157,12 @@ impl LaneWindows {
     pub(crate) const PROVISIONAL: Self = Self {
         extend_entries: 512,
         extend_budget: Duration::from_millis(250),
-        multi_extend_entries: 8192,
+        multi_extend_entries: 32768,
         multi_extend_budget: Duration::from_secs(4),
+        tick_extend_entries: 64,
+        tick_extend_budget: Duration::from_millis(10),
+        multi_tick_extend_entries: 1024,
+        multi_tick_extend_budget: Duration::from_millis(10),
         witness_rows: 8192,
         witness_budget: Duration::from_millis(100),
         discovery_records: 256,
@@ -192,9 +210,10 @@ impl LaneWindows {
     }
 
     /// One pass's attach window on `backend`: the Singles quantum is
-    /// the provisional 512 entries / 250 ms; the Multi quantum carries a
-    /// whole provider per pass (8192 entries / 4 s), so a busy desktop's
-    /// most-mapped provider attaches inside a 30 s run.
+    /// the provisional 512 entries / 250 ms; the Multi quantum is the
+    /// endpoint ceiling / 4 s, so the wall budget binds instead of the
+    /// entry count (a busy desktop's 20167-endpoint demand attaches in
+    /// ~1.8 s measured, well inside the wall).
     fn extend_for(&self, backend: AttachBackend) -> ExtendWindow {
         let (entries, budget) = match backend {
             AttachBackend::Multi => (self.multi_extend_entries, self.multi_extend_budget),
@@ -202,6 +221,23 @@ impl LaneWindows {
         };
         ExtendWindow::new(entries, Instant::now() + budget)
             .expect("the provisional extend window is positive")
+    }
+
+    /// One tick's attach window on `backend` (v0.8.0 cadence): a small
+    /// bounded quantum (Singles 64 / 10 ms, Multi 1024 / 10 ms) so
+    /// inter-pass and collection ticks drain the deferred backlog
+    /// without regressing loop tick time. The wall binds at measured
+    /// 19-227 us/site; the entry bound is a safety cap.
+    fn extend_for_tick(&self, backend: AttachBackend) -> ExtendWindow {
+        let (entries, budget) = match backend {
+            AttachBackend::Multi => (
+                self.multi_tick_extend_entries,
+                self.multi_tick_extend_budget,
+            ),
+            AttachBackend::Singles => (self.tick_extend_entries, self.tick_extend_budget),
+        };
+        ExtendWindow::new(entries, Instant::now() + budget)
+            .expect("the provisional tick extend window is positive")
     }
 
     fn witness(&self) -> ReadWindow {
@@ -692,6 +728,33 @@ pub(crate) struct Stopped<L> {
     pub capture: L,
 }
 
+/// One backlog object's shared pin plus its mapper estimate, cloned from
+/// the host when the backlog forms (after passes), so collection ticks can
+/// extend host-free.
+struct CachedTickTarget {
+    target: RetainedInventoryTarget,
+    mappers: MapperEstimate,
+}
+
+/// The collection ticks' host-free [`CaptureTargets`]: shared pins cloned
+/// at the last pass, never a host borrow while the catalog is collected.
+struct TickTargets<'a> {
+    cached: &'a BTreeMap<AttachObjectId, CachedTickTarget>,
+}
+
+impl CaptureTargets for TickTargets<'_> {
+    fn target(&self, object: AttachObjectId) -> Option<&RetainedInventoryTarget> {
+        self.cached.get(&object).map(|cached| &cached.target)
+    }
+
+    fn mappers(&self, object: AttachObjectId) -> MapperEstimate {
+        self.cached
+            .get(&object)
+            .map(|cached| cached.mappers)
+            .unwrap_or(MapperEstimate::Unknown)
+    }
+}
+
 /// The lane: the capture plus the state the loop keeps between passes.
 pub(crate) struct NativeLane<L> {
     capture: L,
@@ -716,6 +779,17 @@ pub(crate) struct NativeLane<L> {
     loss_seen: bool,
     /// The pass that just ran was itself a recovery rescan.
     rescanning: bool,
+    /// Shared pins for backlog objects (v0.8.0 cadence): cloned from the
+    /// host when the backlog forms, so collection ticks extend host-free.
+    /// A superset is harmless (extends look up only their delta).
+    tick_targets: BTreeMap<AttachObjectId, CachedTickTarget>,
+    /// Tick attach progress buffered for the next pass to forward as one
+    /// ordered receipt (attached/failed in tick order; deferred stays in
+    /// `backlog` and is reported by the pass receipt if still deferred).
+    pending_tick_attached: Vec<AttachedEndpoint>,
+    pending_tick_failed: Vec<EndpointFailure>,
+    pending_tick_custody: Option<ScopeCustody>,
+    pending_tick_refused: Option<String>,
 }
 
 impl<L> NativeLane<L> {
@@ -768,7 +842,7 @@ impl<L> NativeLane<L> {
                 .map_or(0, |coverage| coverage.start_ns());
             host.note_capture_custody(&ScopeCustody::PidUnproven { at_ns, reason });
         }
-        Ok(Self {
+        let mut lane = Self {
             capture,
             windows,
             backlog: receipt.deferred,
@@ -783,7 +857,14 @@ impl<L> NativeLane<L> {
             lifecycle_high_water_bytes: None,
             loss_seen: false,
             rescanning: false,
-        })
+            tick_targets: BTreeMap::new(),
+            pending_tick_attached: Vec::new(),
+            pending_tick_failed: Vec::new(),
+            pending_tick_custody: None,
+            pending_tick_refused: None,
+        };
+        lane.cache_backlog_targets(host);
+        Ok(lane)
     }
 
     /// The capture as the scan pass's native identity.
@@ -796,12 +877,16 @@ impl<L> NativeLane<L> {
 
     /// The pass's native half (invariant 2.3–2.5), after its scan and
     /// before its commit. Returns every native event since the last pass.
+    /// Tick attach progress buffered since the last pass forwards first,
+    /// as one ordered receipt, so the pass's own extend sees the drained
+    /// backlog.
     pub(crate) fn after_pass<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
         self.passes += 1;
+        self.flush_tick_progress(host);
         self.extend_targets(host);
         self.stage_pass_evidence(host)
     }
@@ -809,24 +894,30 @@ impl<L> NativeLane<L> {
     /// The pass's native half when a stop landed during its apply (F9):
     /// the already-applied owned drain still stages, but no NEW target
     /// extension starts after the stop. The host is already latched, so
-    /// the staged evidence drains while successor mint refuses.
+    /// the staged evidence drains while successor mint refuses. Tick
+    /// attach progress buffered before the stop still forwards (evidence
+    /// of links already held, not new work).
     pub(crate) fn after_pass_stopped<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
         self.passes += 1;
+        self.flush_tick_progress(host);
         self.stage_pass_evidence(host)
     }
 
     /// Scoped admission needs the held lifecycle and witness transitions
     /// before its final sample; this phase takes no new target delta.
+    /// Tick attach progress buffered during the collection forwards here,
+    /// so the commit samples it.
     pub(crate) fn before_cgroup_commit<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
         self.passes += 1;
+        self.flush_tick_progress(host);
         self.stage_pass_evidence(host)
     }
 
@@ -837,6 +928,7 @@ impl<L> NativeLane<L> {
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
+        self.flush_tick_progress(host);
         self.extend_targets(host);
         self.stage_pass_evidence(host)
     }
@@ -870,6 +962,207 @@ impl<L> NativeLane<L> {
             );
         }
         self.backlog = receipt.deferred;
+        self.cache_backlog_targets(host);
+    }
+
+    /// Clones shared pins for backlog objects the cache lacks, so
+    /// collection ticks extend host-free. Called when the backlog forms
+    /// (startup, passes); ticks only shrink the backlog, never add new
+    /// objects, so the cache stays a valid superset between passes.
+    fn cache_backlog_targets<Pin, H>(&mut self, host: &H)
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        let sources = host.capture_targets();
+        for endpoint in &self.backlog.endpoints {
+            if self.tick_targets.contains_key(&endpoint.object) {
+                continue;
+            }
+            let mappers = sources.mappers(endpoint.object);
+            let Some(shared) = sources
+                .target(endpoint.object)
+                .map(RetainedInventoryTarget::share)
+            else {
+                continue;
+            };
+            self.tick_targets.insert(
+                endpoint.object,
+                CachedTickTarget {
+                    target: shared,
+                    mappers,
+                },
+            );
+        }
+    }
+
+    /// Forwards tick attach progress buffered since the last pass as one
+    /// ordered receipt (attached/failed in tick order). Deferred stays in
+    /// `backlog` and is reported by the pass receipt if still deferred, so
+    /// ticks never flood gaps. Custody-only ticks (no attaches, fails or
+    /// refusal) forward nothing; the pass receipt carries custody anyway.
+    fn flush_tick_progress<Pin, H>(&mut self, host: &mut H)
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        if self.pending_tick_attached.is_empty()
+            && self.pending_tick_failed.is_empty()
+            && self.pending_tick_refused.is_none()
+        {
+            self.pending_tick_custody = None;
+            return;
+        }
+        let receipt = ExtendReceipt {
+            attached: std::mem::take(&mut self.pending_tick_attached),
+            failed: std::mem::take(&mut self.pending_tick_failed),
+            refused: self.pending_tick_refused.take(),
+            custody: self.pending_tick_custody.take(),
+            ..ExtendReceipt::default()
+        };
+        host.note_extend_receipt(&receipt);
+        self.attached += receipt.attached.len();
+        self.failed += receipt.failed.len();
+        if let Some(reason) = &receipt.refused
+            && !self.refusal_reported
+        {
+            self.refusal_reported = true;
+            host.note_scope_gap(
+                "native capture refused an extend".into(),
+                format!(
+                    "{reason}; providers admitted from now on are not attached and their usage \
+                     is not covered"
+                ),
+            );
+        }
+    }
+
+    /// Extends the backlog prefix within one tick window against `targets`,
+    /// buffering attached/failed/custody/refusal for the next pass to
+    /// forward. Skips when the backlog is empty or an extend already
+    /// refused (no progress possible). The backlog keeps drain order: the
+    /// receipt's deferred (the prefix tail) plus the untouched suffix.
+    /// `targets` must not borrow this lane (host targets); cached ticks
+    /// use [`Self::tick_extend_cached`].
+    fn tick_extend_backlog<Pin>(&mut self, targets: &dyn CaptureTargets)
+    where
+        L: CaptureLane<Pin>,
+    {
+        Self::tick_extend_inner(
+            &mut self.capture,
+            &mut self.backlog,
+            &mut self.pending_tick_attached,
+            &mut self.pending_tick_failed,
+            &mut self.pending_tick_custody,
+            &mut self.pending_tick_refused,
+            &self.windows,
+            self.refusal_reported,
+            targets,
+        );
+    }
+
+    /// The collection ticks' host-free extend: the backlog prefix against
+    /// shared pins cloned at the last pass. No host method runs.
+    fn tick_extend_cached<Pin>(&mut self)
+    where
+        L: CaptureLane<Pin>,
+    {
+        let cached = TickTargets {
+            cached: &self.tick_targets,
+        };
+        // Disjoint field borrows: the targets borrow `tick_targets`
+        // shared while the extend mutates the capture and buffers.
+        let (
+            capture,
+            backlog,
+            pending_attached,
+            pending_failed,
+            pending_custody,
+            pending_refused,
+            windows,
+            refusal_reported,
+        ) = (
+            &mut self.capture,
+            &mut self.backlog,
+            &mut self.pending_tick_attached,
+            &mut self.pending_tick_failed,
+            &mut self.pending_tick_custody,
+            &mut self.pending_tick_refused,
+            &self.windows,
+            self.refusal_reported,
+        );
+        Self::tick_extend_inner(
+            capture,
+            backlog,
+            pending_attached,
+            pending_failed,
+            pending_custody,
+            pending_refused,
+            windows,
+            refusal_reported,
+            &cached,
+        );
+    }
+
+    /// One tick extend against `targets`, shared by host and cached ticks.
+    #[allow(clippy::too_many_arguments)]
+    fn tick_extend_inner<Pin, C>(
+        capture: &mut C,
+        backlog: &mut TargetDelta,
+        pending_attached: &mut Vec<AttachedEndpoint>,
+        pending_failed: &mut Vec<EndpointFailure>,
+        pending_custody: &mut Option<ScopeCustody>,
+        pending_refused: &mut Option<String>,
+        windows: &LaneWindows,
+        refusal_reported: bool,
+        targets: &dyn CaptureTargets,
+    ) where
+        C: CaptureLane<Pin>,
+    {
+        if backlog.endpoints.is_empty() || refusal_reported || pending_refused.is_some() {
+            return;
+        }
+        let backend = capture.backend().backend;
+        let window = windows.extend_for_tick(backend);
+        // The entry bound caps the prefix; the wall binds inside extend.
+        let max_entries = match backend {
+            AttachBackend::Multi => windows.multi_tick_extend_entries,
+            AttachBackend::Singles => windows.tick_extend_entries,
+        };
+        let take = backlog.endpoints.len().min(max_entries);
+        if take == 0 {
+            return;
+        }
+        let mut endpoints = Vec::with_capacity(take);
+        let mut objects = Vec::new();
+        for endpoint in backlog.endpoints.iter().take(take) {
+            endpoints.push(*endpoint);
+            if !objects.contains(&endpoint.object) {
+                objects.push(endpoint.object);
+            }
+        }
+        let prefix = TargetDelta { endpoints, objects };
+        let receipt = capture.extend(prefix, targets, window);
+        if let Some(custody) = receipt.custody.clone() {
+            *pending_custody = Some(custody);
+        }
+        if pending_refused.is_none() {
+            *pending_refused = receipt.refused.clone();
+        }
+        pending_attached.extend(receipt.attached);
+        pending_failed.extend(receipt.failed);
+        let mut rest = backlog.endpoints.split_off(take);
+        let mut endpoints = receipt.deferred.endpoints;
+        endpoints.append(&mut rest);
+        // Deduplicate objects via a set: the backlog can hold tens of
+        // thousands of endpoints, so a quadratic scan would blow the tick.
+        let mut seen: std::collections::BTreeSet<AttachObjectId> =
+            receipt.deferred.objects.into_iter().collect();
+        for endpoint in &endpoints {
+            seen.insert(endpoint.object);
+        }
+        let objects: Vec<AttachObjectId> = seen.into_iter().collect();
+        *backlog = TargetDelta { endpoints, objects };
     }
 
     fn stage_pass_evidence<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
@@ -895,24 +1188,36 @@ impl<L> NativeLane<L> {
         events
     }
 
-    /// One service tick between passes (invariant 3).
+    /// One service tick between passes (invariant 3): first one bounded
+    /// backlog extend (buffered for the next pass to forward, so ticks
+    /// never flood gaps), then one discovery quantum staged at once.
+    /// Skips the extend when the backlog is empty or refused.
     pub(crate) fn tick<Pin, H>(&mut self, host: &mut H)
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
+        self.tick_extend_backlog(host.capture_targets());
         let events = self.service(host, 1);
         self.pending_events.extend(events);
     }
 
     /// One service tick while the pass's collection runs on its worker
     /// (C5.7): drain up to `pass_quanta` quanta and hold them, in drain
-    /// order, for `after_pass`. Nothing reaches the host while the catalog
-    /// is collected, so the coordinator sees every call in the order it
-    /// saw when the ring was serviced only between passes; only the ring
-    /// empties sooner. At `held_records` records or `held_batches`
-    /// batches the tick drains nothing more (the batch bound covers
-    /// empty quanta, which charge zero records but still cost a shell).
+    /// order, for `after_pass`, then one bounded backlog extend (buffered
+    /// for `after_pass` to forward). Nothing reaches the host while the
+    /// catalog is collected: the drain holds (no staging), and the extend
+    /// uses only lane-owned backlog plus shared pins cloned at the last
+    /// pass — no host method runs, no receipt is noted, nothing is
+    /// staged — so the coordinator sees every call in the order it saw
+    /// when the ring was serviced only between passes; only the ring
+    /// empties sooner and the backlog drains sooner. At `held_records`
+    /// records or `held_batches` batches the tick drains nothing more
+    /// (the batch bound covers empty quanta, which charge zero records
+    /// but still cost a shell); the backlog extend still runs (it is
+    /// bounded by its own tick window, not the held bounds). Ordering
+    /// stays `sort_drain_order`: the backlog keeps the last pass's sorted
+    /// order, ticks take its prefix, no re-sort.
     pub(crate) fn collecting_tick<Pin>(&mut self)
     where
         L: CaptureLane<Pin>,
@@ -920,16 +1225,17 @@ impl<L> NativeLane<L> {
         for _ in 0..self.windows.pass_quanta {
             let room = self.windows.held_records.saturating_sub(self.held_records);
             if room == 0 || self.held.len() >= self.windows.held_batches {
-                return;
+                break;
             }
             let batch = self.drain_within(self.windows.discovery_at_most(room));
             let more = batch.record_bound_reached || batch.deadline_reached;
             self.held_records += batch.records.len();
             self.held.push(batch);
             if !more {
-                return;
+                break;
             }
         }
+        self.tick_extend_cached();
     }
 
     /// Stages the held quanta in drain order, never rebuilt.
@@ -1136,6 +1442,9 @@ impl<L> NativeLane<L> {
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
+        // Tick attach progress buffered before the stop forwards first
+        // (evidence of links already held, not new work after the latch).
+        self.flush_tick_progress(host);
         let mut events = std::mem::take(&mut self.pending_events);
         // Nothing is held after a pass; staged first all the same.
         events.extend(self.stage_held(host));
@@ -1447,6 +1756,10 @@ impl<L> NativeStop<L> {
             return NativeStopProgress::Pending(self);
         }
         self.not_before = None;
+        // Tick attach progress buffered before the stop forwards on the
+        // first action (evidence of links already held; later actions
+        // no-op once flushed).
+        self.lane.flush_tick_progress(host);
         match self.phase {
             NativeStopPhase::Held => match self.held.next() {
                 Some(batch) => {

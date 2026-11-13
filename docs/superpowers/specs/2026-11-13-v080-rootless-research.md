@@ -7,7 +7,10 @@ capture works, but host-process visibility stays unavailable, so the
 v0.8.0 scope is attach-by-path capture of known provider files, not
 host discovery.** Measured 2026-11-13 on Ubuntu 26.04, kernel
 7.0.0-43-generic, Docker 29.8.1, runc 1.5.1, release image
-`ghcr.io/mingulov/p11scope:0.7.0`.
+`ghcr.io/mingulov/p11scope:0.7.0`. **Round 2 (same day, same kernel):
+confirmed** — kryprobe's `EOPNOTSUPP` is the init-userns refusal, and
+the correct split flow passes 5000/5000 probe hits from outer-nobody
+at `unprivileged_bpf_disabled=2` (details below).
 
 ## What works today (rootless, no setup): nothing captures
 
@@ -60,13 +63,35 @@ rootless container at same uid: `/proc/<pid>/maps`, `/mem`,
 - `/proc/<pid>/mem` needs `PTRACE_MODE_ATTACH`, further gated by
   Yama: at scope 1 (Ubuntu default) non-descendant same-user attach
   fails (`security/yama/yama_lsm.c`), independent of namespaces.
-- `--pid=host` is allowed rootless (runc proven here; rootless
-  Podman likewise per Red Hat/Docker docs — Podman itself was not
-  installed here, so Docker/Podman-daemon specifics are cited, not
-  executed). Without it, host PIDs are invisible and only
+- `--pid=host` is allowed rootless (runc proven locally, rootless
+  Podman proven on fedora-sm1 in round 2 — host PIDs visible, maps
+  still `EACCES`). Without it, host PIDs are invisible and only
   in-container targets exist.
 - Cgroup paths of host processes are hidden by the container's
   cgroupns; `--cgroup` scope cannot address host cgroups rootless.
+
+### Round 2: rootless engines on Fedora (executed on fedora-sm1)
+
+fedora-sm1 (Fedora 44, kernel 7.2.15-200, podman 5.8.9, docker
+29.9.2, `unprivileged_bpf_disabled=2`, SELinux) — one short
+unprivileged session after the capture windows, fully cleaned
+(6.5G free, no images/containers/daemons left):
+
+- Rootless Podman `--pid=host` works: host PID 1 (`systemd`)
+  visible via `cmdline`; container userns `0→1000` +
+  `1→524288/65536`; `/proc/1/maps` → `EACCES`, confirming the
+  cross-userns boundary on a real engine.
+- `--cap-add BPF --cap-add PERFMON` works rootless: `CapEff`
+  gains bits 38+39. Setup step 1 (container userns holding both
+  caps) runs on Podman today; the only remaining gap is the
+  privileged per-container bpffs delegation.
+- Rootless Docker does **not** start there: `overlay is not
+  supported for Rootless with SELinux` (overlay2; pasta present,
+  slirp4netns absent). Host-specific, not fundamental —
+  non-SELinux hosts don't hit it.
+- Kernel 7.2 carries the same token UAPI (`BPF_TOKEN_CREATE`,
+  vmlinux BTF present); no privileged token test was run there
+  (out of scope on the shared host).
 
 ## BPF token: the working path (proven end to end)
 
@@ -122,12 +147,56 @@ Loader gap: p11scope uses **aya 0.14.0** (pinned + patched;
 [aya-rs/aya#1515](https://github.com/aya-rs/aya/pull/1515) is still
 open). libbpf ≥ 1.5 already supports tokens
 (`bpf_object_open_opts.bpf_token_path`,
-`LIBBPF_BPF_TOKEN_PATH`). No OCI runtime wires delegation natively
+`LIBBPF_BPF_TOKEN_PATH`). Token-aware loaders must also set
+`expected_attach_type` at `PROG_LOAD`, not only at link time (round 2:
+with attach 0 the kernel drops the token at load,
+`syscall.c:2934-2938`, and the load fails `EPERM` even though
+link-create would succeed). No OCI runtime wires delegation natively
 (runc/crun/rootlesskit: none found); only LXD
 (`security.delegate_bpf`) does. Ubuntu 23.10+ additionally confines
 raw `unshare` to the `unprivileged_userns` AppArmor profile (own
 uid_map write fails `EPERM`); runc/rootlesskit/Podman ship
 `flags=(unconfined)` profiles and are unaffected.
+
+### Round 2: kryprobe's `EOPNOTSUPP`, reconciled (exact 7.0 source)
+
+kryprobe's `pins.md` note (2026-09-17, T12 era) — `BPF_TOKEN_CREATE`
+→ errno 95 on every bpffs instance, sysctl 2 and 0 — predates its
+own T17 child-userns split flow (`token/userns.rs`, which is the
+correct setup). Against Ubuntu `linux-source-7.0.0-43.43`
+(`kernel/bpf/token.c:bpf_token_create`):
+
+- The **sole** `EOPNOTSUPP` site is `token.c:149-151`:
+  `current_user_ns() == &init_user_ns`. Two `EPERM` gates precede
+  it (minter userns == bpffs `s_user_ns`, `token.c:144-145`;
+  `CAP_BPF` in it, `:146-147`), so root in the init ns passes
+  both and always lands on 95 — on every instance, as observed.
+  The sysctl is never consulted by token-create, so the 2-vs-0
+  variation was immaterial; and token *use* explicitly bypasses
+  the sysctl (`syscall.c:1460` map, `:2957` prog), so tokens work
+  at this host's `unprivileged_bpf_disabled=2`.
+- No-delegation is a different errno: `ENOENT` (`token.c:154-158`),
+  reachable only when userns+caps already match (a non-init minter
+  on the system bpffs gets `EPERM`, not `ENOENT`). There is no
+  token kconfig gate (part of `CONFIG_BPF_SYSCALL`), and the LSM
+  hook (`security_bpf_token_create`, `token.c:188`) is
+  default-allow — zero BPF-LSM programs here, AppArmor mediates no
+  token hook.
+- Privileged steps confirmed at exact lines: non-empty
+  `delegate_*` needs init-ns `CAP_SYS_ADMIN` (`inode.c:924-925`),
+  as does `CREATE` of an fs-context opened in a non-init userns
+  (`inode.c:1014-1015`, via `bpf_fill_super`).
+
+Re-run 2026-11-13 (throwaway C, since removed; privileged half under
+the local lock): negative control as root in the init ns
+(userns 4026531837) on `/sys/fs/bpf` → `EOPNOTSUPP`, reproducing
+kryprobe; positive split flow (child userns, `uid_map 0 65534 1`,
+host-root `fsconfig`+`CREATE`, in-userns token create) →
+token/map/prog/link all `OK` from outer-nobody and **5000/5000
+probe hits** on a same-file target (offset cross-checked via
+tracefs). Tokens can work on this kernel; the required setup is
+exactly the four-step host procedure below, with the minter outside
+the init userns.
 
 ## Scan-only without BPF
 
@@ -182,8 +251,9 @@ maps/mem/map_files/caller proof stay `unknown` with named gaps.
   session + ELF offset resolution + gap taxonomy 15–20; host
   setup helper + docs 8–12; cells below 10–15. Total ≈ 55–75.
 - Not in scope: singles backend, `--system` discovery,
-  map_files identity, Docker Desktop, daemonless Podman E2E
-  (revisit when a Podman host is available).
+  map_files identity, Docker Desktop, full p11scope-in-Podman E2E
+  (Podman engine mechanics executed on sm1 in round 2; E2E waits
+  for the token-aware build).
 - Test plan cells: (1) `rootless-token-attach`: scratch
   container + helper asserts token load/attach + N>0 hits on a
   ledgered workload; (2) `rootless-refusals`: no-token run

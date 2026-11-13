@@ -2,16 +2,16 @@
 # v0.7.0 GitHub release body — DRAFT (owner edits before posting)
 
 > Draft for the GitHub release page. Concise by owner rule; every claim
-> below is merged on the draft base (`346d2c875`) and sourced in
+> below is merged on the draft base (`26884cce8`) and sourced in
 > `CHANGELOG.md`, `docs/` or the tree. Unmerged lane claims from
 > `task/v070-relnotes` (launcher chain, 10k key-ops rate, threaded exact
 > totals, whole-table forwarding watch, sudo stdio keeps, drain-order
 > system fix, perf numbers) are deliberately absent; add them only if
 > they land before the cut. Body shape follows `RELEASING.md` step 7.3.
-> Quickstart verified 2026-11-12 on a `346d2c875` release build (dev
-> host lu26, kernel 7.0.0-38-generic): `doctor` exit 0 in 11.62 s
+> Quickstart verified 2026-11-13 on a `26884cce8` release build (dev
+> host lu26, kernel 7.0.0-38-generic): `doctor` exit 0 in 4.88 s
 > ("capture available"); `inventory --system --duration 15s` exit 0
-> (honest PARTIAL on the loaded host: 191 callers, 159 gaps);
+> (honest PARTIAL on the loaded host: 494 callers, 32 gaps);
 > `profile --pid 1 --duration 30s` exit 0 (honest empty result,
 > JSON written).
 
@@ -42,7 +42,7 @@ What is new vs 0.6.0:
   pkcs11-spy?", a tested provider/application list, and a concise front page.
 
 Known issues: [CHANGELOG entry](https://github.com/mingulov/p11scope/blob/v0.7.0/CHANGELOG.md)
-(currently the v0.6.0 list; the v0.7.0 list lands at the cut).
+(the v0.7.0 list).
 
 Install (bundles, DEB/RPM, helpers and source export under this tag):
 

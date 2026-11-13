@@ -2,7 +2,7 @@
 # r/PKI first-post text for p11scope v0.7.0 — DRAFT (owner edits before posting)
 
 > Draft for the first public r/PKI post. Plain and non-hype by brief;
-> every claim is merged on the draft base (`346d2c875`) and sourced in
+> every claim is merged on the draft base (`26884cce8`) and sourced in
 > `CHANGELOG.md`, `docs/` or the tree. Link targets are placeholders the
 > owner fills at publish. The example output below is real, captured on
 > the dev host per the run note; it was checked to contain no secrets
@@ -53,16 +53,16 @@ $ sudo --preserve-env=SOFTHSM2_CONF p11scope run --pause auto -- \
 p11scope: starting: loading probes and scanning processes (a busy machine can take a minute or more); stop with Ctrl-C
 p11scope: capturing: waiting for the command to load a provider; stop with Ctrl-C
 Available slots:
-Slot 0 (0x4846024f): SoftHSM slot ID 0x4846024f
+Slot 0 (0x77d08576): SoftHSM slot ID 0x77d08576
   token label        : demo
   token manufacturer : SoftHSM project
   token model        : SoftHSM v2
   token flags        : login required, rng, token initialized, PIN initialized, other flags=0x20
   hardware version   : 2.6
   firmware version   : 2.6
-  serial num         : eeb871f04846024f
+  serial num         : cf747f9ff7d08576
   pin min/max        : 4/255
-  uri                : pkcs11:model=SoftHSM%20v2;manufacturer=SoftHSM%20project;serial=eeb871f04846024f;token=demo
+  uri                : pkcs11:model=SoftHSM%20v2;manufacturer=SoftHSM%20project;serial=cf747f9ff7d08576;token=demo
 Slot 1 (0x1): SoftHSM slot ID 0x1
   token state:   uninitialized
 p11scope - cgroup scope - up 00:00:00 - mode profile - /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
@@ -73,10 +73,10 @@ Attribution: 1 of 1 mapped provider file has no manifest (/usr/lib/x86_64-linux-
 CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.
 Latency units: ns/us/ms/s (microseconds shown as us); ~ = log2-bucket approximation, lower bound.
 FUNCTION                     PROVIDER            CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
-C_GetSlotInfo                libsofthsm2.so          2      0    16.4us    65.5us    65.5us         0
-C_GetSlotList                libsofthsm2.so          2      0     8.2us    16.4us    16.4us         0
-C_GetTokenInfo               libsofthsm2.so          2      0     8.2us   131.1us   131.1us         0
-C_Finalize                   libsofthsm2.so          1      0    32.8us    32.8us    32.8us         0
+C_GetSlotInfo                libsofthsm2.so          2      0     8.2us    16.4us    16.4us         0
+C_GetSlotList                libsofthsm2.so          2      0     4.1us    16.4us    16.4us         0
+C_GetTokenInfo               libsofthsm2.so          2      0     8.2us    65.5us    65.5us         0
+C_Finalize                   libsofthsm2.so          1      0    16.4us    16.4us    16.4us         0
 C_GetFunctionList            libsofthsm2.so          1      0   262.1us   262.1us   262.1us         0
 C_Initialize [init: ok]      libsofthsm2.so          1      0    16.8ms    16.8ms    16.8ms         0
 Mechanisms: none attributed - 1 function named from the standard table, unconfirmed (see Coverage).
@@ -107,7 +107,7 @@ welcome, especially on providers and kernels outside the tested list.
 
 ## Run note (not part of the post)
 
-- Host: dev host lu26, kernel 7.0.0-38-generic, 2026-11-12 ~23:20 EET.
+- Host: dev host lu26, kernel 7.0.0-38-generic, 2026-11-13 ~12:40 EET.
   Privileged commands ran via `sudo -n` under
   `flock /var/tmp/p11scope-ws-tmp/privileged.lock`, umask 022,
   `TMPDIR=/var/tmp/p11scope-ws-tmp`.
@@ -129,13 +129,13 @@ welcome, especially on providers and kernels outside the tested list.
     pkcs11-tool --module "$MODULE" -L
   ```
 
-- `p11scope` binary: `p11scope 0.7.0` release, built from `346d2c875`
+- `p11scope` binary: `p11scope 0.7.0` release, built from `26884cce8`
   via `p11-lock mise exec -- ./scripts/cargo.sh +1.99.1 build
   --locked --release --bin p11scope` (exit 0, 166 s on the um790
   build host).
-- Quickstart verification (same binary): `doctor` exit 0, 11.62 s,
+- Quickstart verification (same binary): `doctor` exit 0, 4.88 s,
   verdict "capture available"; `inventory --system --duration 15s`
-  exit 0 (honest PARTIAL on the loaded host: 191 callers, 159
+  exit 0 (honest PARTIAL on the loaded host: 494 callers, 32
   gaps); `profile --pid 1 --duration 30s` exit 0 (honest empty
   result, JSON report written).
 - Secret check: `grep -c 1234` over the run stdout/stderr and the

@@ -539,6 +539,6 @@ mod tests {
         unconfined_first(&stderr_line(&block), "stderr line");
         unconfined_first(&gap_reason(&block, None), "gap");
         unconfined_first(&gap_reason(&block, Some(164)), "gap with count");
-        unconfined_first(include_str!("../docs/demo.md"), "docs/demo.md");
+        unconfined_first(include_str!("../docs/demo/README.md"), "docs/demo/README.md");
     }
 }

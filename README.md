@@ -51,9 +51,9 @@ docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DA
 On Ubuntu and other AppArmor hosts, add `--security-opt
 apparmor=unconfined`: Docker confines every container with
 `docker-default`, which blocks reading other processes, so without the
-flag the run sees almost nothing. The [container
-demo](docs/demo.md#with-the-container-image) has the full copy-paste
-script, the hardened profile alternative, and the measured numbers.
+flag the run sees almost nothing. The [demo
+pages](docs/demo/README.md) have the full copy-paste
+commands, the hardened profile alternative, and the measured numbers.
 
 ## First commands
 

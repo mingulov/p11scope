@@ -2264,7 +2264,7 @@ target. The measured matrices and command-specific limitations follow below.
 On Ubuntu and other AppArmor hosts, a container observer needs one
 more flag: Docker confines every container with `docker-default`,
 which blocks reading other processes, so without the flag the run
-sees almost nothing. The [container demo](demo.md#with-the-container-image)
+sees almost nothing. The [demos front page](demo/README.md)
 shows the one-flag fix, the hardened profile alternative, and how to
 confirm the denials.
 

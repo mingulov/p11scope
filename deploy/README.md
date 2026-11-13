@@ -72,7 +72,7 @@ docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
 
 (Same AppArmor and SELinux notes as above. It still needs host PID and
 named capabilities, so rootless Docker, Podman and Docker Desktop's VM
-boundary stay unsupported, as in [the demo](../docs/demo.md).)
+boundary stay unsupported, as in [the demos](../docs/demo/README.md).)
 Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 `Privileged=false`, `CapDrop=[ALL]`,
 `CapAdd=[BPF CHECKPOINT_RESTORE DAC_READ_SEARCH PERFMON SYS_PTRACE]`,

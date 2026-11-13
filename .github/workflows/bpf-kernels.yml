@@ -96,15 +96,23 @@ jobs:
           nproc
           free -g
           df -h
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Enable KVM for the runner user
         shell: bash
         run: |
+          set -euo pipefail
           test -c /dev/kvm
+          # The qemu install above re-applies its udev rule/service state,
+          # which resets /dev/kvm to 0660 root:kvm - so KVM is enabled only
+          # after it, with a udev rule that survives udev reprocessing.
+          sudo udevadm settle || true
+          printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-p11scope-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo chmod 0666 /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
           ls -l /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          python3 -c 'import os; fd = os.open("/dev/kvm", os.O_RDWR); os.close(fd)' \
+            || { echo "KVM_UNUSABLE_FOR_RUNNER_USER: the runner user cannot open /dev/kvm O_RDWR" >&2; exit 1; }
       - name: Install pinned virtme-ng
         shell: bash
         run: |
@@ -337,14 +345,23 @@ jobs:
         with:
           # Scripts only (driver + report); no custody test runs here.
           fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Enable KVM for the runner user
         shell: bash
         run: |
+          set -euo pipefail
           test -c /dev/kvm
+          # The qemu install above re-applies its udev rule/service state,
+          # which resets /dev/kvm to 0660 root:kvm - so KVM is enabled only
+          # after it, with a udev rule that survives udev reprocessing.
+          sudo udevadm settle || true
+          printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-p11scope-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo chmod 0666 /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          ls -l /dev/kvm
+          python3 -c 'import os; fd = os.open("/dev/kvm", os.O_RDWR); os.close(fd)' \
+            || { echo "KVM_UNUSABLE_FOR_RUNNER_USER: the runner user cannot open /dev/kvm O_RDWR" >&2; exit 1; }
       - name: Install pinned virtme-ng
         shell: bash
         run: |
@@ -635,14 +652,23 @@ jobs:
         with:
           # Scripts only (driver + report); no custody test runs here.
           fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Enable KVM for the runner user
         shell: bash
         run: |
+          set -euo pipefail
           test -c /dev/kvm
+          # The qemu install above re-applies its udev rule/service state,
+          # which resets /dev/kvm to 0660 root:kvm - so KVM is enabled only
+          # after it, with a udev rule that survives udev reprocessing.
+          sudo udevadm settle || true
+          printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-p11scope-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo chmod 0666 /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          ls -l /dev/kvm
+          python3 -c 'import os; fd = os.open("/dev/kvm", os.O_RDWR); os.close(fd)' \
+            || { echo "KVM_UNUSABLE_FOR_RUNNER_USER: the runner user cannot open /dev/kvm O_RDWR" >&2; exit 1; }
       - name: Install pinned virtme-ng
         shell: bash
         run: |
@@ -770,14 +796,23 @@ jobs:
         with:
           # Scripts only (the guest driver); no test runs here.
           fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc libp11-kit-dev softhsm2 qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Enable KVM for the runner user
         shell: bash
         run: |
+          set -euo pipefail
           test -c /dev/kvm
+          # The qemu install above re-applies its udev rule/service state,
+          # which resets /dev/kvm to 0660 root:kvm - so KVM is enabled only
+          # after it, with a udev rule that survives udev reprocessing.
+          sudo udevadm settle || true
+          printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-p11scope-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo chmod 0666 /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc libp11-kit-dev softhsm2 qemu-system-x86 qemu-utils seabios ipxe-qemu
+          ls -l /dev/kvm
+          python3 -c 'import os; fd = os.open("/dev/kvm", os.O_RDWR); os.close(fd)' \
+            || { echo "KVM_UNUSABLE_FOR_RUNNER_USER: the runner user cannot open /dev/kvm O_RDWR" >&2; exit 1; }
       - name: Install pinned virtme-ng
         shell: bash
         run: |

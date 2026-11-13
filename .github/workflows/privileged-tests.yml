@@ -1124,8 +1124,10 @@ jobs:
           if [ "${{ matrix.kernel }}" = host ]; then
             uname -a
             # Ruling CI-GAP-1: the hosted host system cell discloses shared-
-            # runner descendant exits as runner noise. VNG guests keep the
-            # strict no-gap mode (no flag on the guest leg below).
+            # runner descendant exits as runner noise. VNG guests accept the
+            # single disclosed gap on the system and mt-system cells
+            # (scripts/public-cli-oracle.py lone-gap arm; no flag on the
+            # guest leg below).
             # Template proof: the host leg runs through run-cell-script.sh,
             # which validates with check-cell-results.py (smoke allow-listed).
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \

@@ -250,6 +250,22 @@ fn ensure_admission_with(
     Ok(())
 }
 
+/// Re-key a stored return-probe approval to the live credential context
+/// after the post-setup capability shed. The kernel verdict the approval
+/// carries (the uretprobe trampoline's syscall is exempt) is a property
+/// of the kernel, proven by the pre-shed self-probe on this same
+/// process; shedding our own capabilities cannot change it, so the
+/// approval stays valid under the new context and the next attach's
+/// `ensure_admission` reuses it instead of re-running the self-probe
+/// (whose forked child would exit unlisted and count a descendant gap).
+/// A missing approval stays missing: the next ensure admits fresh, as
+/// before. The override reason, when present, is preserved.
+pub(crate) fn rekey_approval_to_current(retained: &mut Option<ReturnProbeAdmission>) {
+    if let Some(admission) = retained {
+        admission.context = AssessmentContext::current();
+    }
+}
+
 pub(crate) fn refusal_error(action: Action) -> anyhow::Error {
     match action {
         Action::Refuse(reason) => anyhow!(
@@ -2425,6 +2441,7 @@ mod tests {
             true,
             false,
             None,
+            &mut retained,
         )
         .expect("the shed succeeds");
         // The next attach's ensure must reuse the retained approval.

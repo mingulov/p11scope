@@ -11464,13 +11464,17 @@ impl Session {
     /// [`drop_post_setup_capabilities_for`]. Callers invoke this after
     /// their session starts, before the capture loop. `owned` is true
     /// for `run` (the observer owns the child): owned sessions never
-    /// shed (controller ruling 2026-11-08, F1).
-    pub(crate) fn drop_post_setup_capabilities(&self, owned: bool) -> std::io::Result<()> {
+    /// shed (controller ruling 2026-11-08, F1). A shed session's stored
+    /// return-probe approval is re-keyed to the post-shed context with
+    /// it, so the next attach reuses the approval without forking a
+    /// second self-probe.
+    pub(crate) fn drop_post_setup_capabilities(&mut self, owned: bool) -> std::io::Result<()> {
         drop_post_setup_capabilities_for(
             self.backend,
             self.dynamic_multi,
             owned,
             self.cleanup_worker.as_ref(),
+            &mut self.return_probe_admission,
         )
     }
 }
@@ -11482,21 +11486,22 @@ impl Session {
 /// session, or a multi session whose dynamics stay on perf (an unproven
 /// pid filter), keeps it for dynamic perf re-attach. An owned `run`
 /// session (`owned`) never sheds when it holds `CAP_SYS_ADMIN`; a
-/// setcap `run` needs none (bisected to be50cad25: after the shed the
-/// first attach reruns the return-probe safety check's uretprobe
-/// self-probe, keyed on the thread's effective capabilities; controller
-/// ruling 2026-11-08, F1; re-keying the stored approval to the
-/// post-shed context is a 0.7.x follow-up). The sets come from
-/// `capget`, never `/proc` (a broken `/proc` must not zero the shed).
+/// setcap `run` needs none (bisected to be50cad25; controller ruling
+/// 2026-11-08, F1). The stored return-probe approval is re-keyed to the
+/// post-shed context, so the next attach's admission check reuses it
+/// instead of re-running the self-probe (whose forked child would exit
+/// unlisted and count a descendant gap). The sets come from `capget`,
+/// never `/proc` (a broken `/proc` must not zero the shed).
 /// The shed is per-thread, so the pre-spawned cleanup worker sheds to
 /// the same keep. Sets already at keep skip the drop entirely (no
-/// `capset`, no worker shed), so a post-shed hook fires only for a
-/// capture that actually shed. Fail-closed like the startup drop.
+/// `capset`, no worker shed, no re-key), so a post-shed hook fires only
+/// for a capture that actually shed. Fail-closed like the startup drop.
 pub(crate) fn drop_post_setup_capabilities_for(
     backend: AttachBackend,
     dynamic_multi: bool,
     owned: bool,
     worker: Option<&CleanupWorker>,
+    retained: &mut Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
 ) -> std::io::Result<()> {
     if owned {
         return Ok(());
@@ -11514,6 +11519,7 @@ pub(crate) fn drop_post_setup_capabilities_for(
     if let Some(worker) = worker {
         worker.shed_to(keep)?;
     }
+    crate::uretprobe_hazard::rekey_approval_to_current(retained);
     Ok(())
 }
 
@@ -11543,8 +11549,15 @@ mod post_setup_shed_tests {
             seen_clone.lock().unwrap().push(keep);
             Ok(())
         }));
-        drop_post_setup_capabilities_for(AttachBackend::Multi, true, false, Some(&worker))
-            .expect("the shed succeeds");
+        let mut retained = None;
+        drop_post_setup_capabilities_for(
+            AttachBackend::Multi,
+            true,
+            false,
+            Some(&worker),
+            &mut retained,
+        )
+        .expect("the shed succeeds");
         let seen = seen.lock().unwrap().clone();
         if needed {
             assert_eq!(
@@ -11575,8 +11588,15 @@ mod post_setup_shed_tests {
             seen_clone.lock().unwrap().push(keep);
             Ok(())
         }));
-        drop_post_setup_capabilities_for(AttachBackend::Multi, true, true, Some(&worker))
-            .expect("an owned no-op shed succeeds");
+        let mut retained = None;
+        drop_post_setup_capabilities_for(
+            AttachBackend::Multi,
+            true,
+            true,
+            Some(&worker),
+            &mut retained,
+        )
+        .expect("an owned no-op shed succeeds");
         assert!(
             seen.lock().unwrap().is_empty(),
             "the worker drop must not run for an owned session (F1)"

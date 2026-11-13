@@ -37590,6 +37590,429 @@ fn named_generation_change_during_attach_drops_before_event_consumption() {
     assert!(!log.borrow().contains(&"consume"));
 }
 
+/// View-collapse fix8 F3 (codex blocking): an initial named-process pin
+/// wait must pend the original generation for a retry tick — never
+/// terminate startup. Named discovery under a zero-headroom table keeps
+/// the original view (same id, same pidfd generation, no reopen),
+/// files the counted pending gap, binds the refresh to the retained
+/// view, owes a handles-first retry, and the real startup guard starts
+/// the session; after capacity frees, the refresh rescans the SAME
+/// retained view and the plan gains the provider. Runs in an isolated
+/// child: lowering the hard limit is process-global and irreversible.
+#[test]
+fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
+    const CHILD: &str = "P11SCOPE_NAMED_WAIT_CHILD";
+    const COMPLETED: &str = "P11SCOPE_NAMED_WAIT_COMPLETED";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::engine::tests::named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "named-wait child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == COMPLETED),
+            "named-wait child did not complete its assertions:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    const SOFT: u64 = 256;
+    // The fixture provider is built and loaded before the limit drops,
+    // and the named view is retained from scope resolution before the
+    // table fills — exactly like the production startup order.
+    let provider = E07Provider::dlopen();
+    let live_pid = std::process::id();
+    let named_view = ProcessView::open(ProcessViewId(0), live_pid).expect("the named view opens");
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one initialized writable rlimit.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+        0
+    );
+    assert!(
+        current.rlim_max >= SOFT,
+        "the box must allow a 256 hard fd limit for the named-wait child"
+    );
+    let lowered = libc::rlimit {
+        rlim_cur: SOFT,
+        rlim_max: SOFT,
+    };
+    // SAFETY: lowering both limits in the isolated child; the child
+    // exits after its assertions, so the irreversible hard-limit drop
+    // never escapes to siblings.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    // Blockers hold the table to zero projected pin-opens above the
+    // reserve (the intra-scan-stop twin's arithmetic): the loop-top
+    // still admits, the view pin consumes one more, and the first pin
+    // would breach — so the pin wait fires deterministically. Real
+    // room stays ample, so only the projection can stop this scan.
+    let target_open = SOFT - crate::fd_budget::FD_RESERVE - 1;
+    let mut blockers = Vec::new();
+    loop {
+        let open = crate::fd_budget::open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+            .expect("a readable count while holding blockers") as u64;
+        assert!(
+            open <= target_open,
+            "ambient fds already past the {target_open} target: {open}"
+        );
+        if open == target_open {
+            break;
+        }
+        blockers
+            .push(std::fs::File::open("/dev/null").expect("a blocker must open below the target"));
+    }
+    let args = crate::cli::CaptureArgs {
+        track_short_lived: false,
+        verbose: false,
+        quiet: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![provider.path.clone()],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        forwarding_modules: Vec::new(),
+        hooks: crate::discovery::hooks::HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Pid(live_pid),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        out_is_stdout: false,
+        max_events: None,
+        max_scan_pids: None,
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: crate::attach::BackendSelection::default(),
+    };
+    let scope = Scope::Pid(live_pid);
+    let mut engine =
+        Engine::discover(&args, &scope, Some(named_view)).expect("named discovery pends");
+    // The original generation stays retained — same id, same pid, same
+    // pidfd custody — with its scan pending, not dropped.
+    assert_eq!(
+        engine.views.len(),
+        1,
+        "the pin wait pends the view, it never drops it"
+    );
+    assert_eq!(engine.views[0].pid(), live_pid);
+    assert!(
+        engine.views[0].still_the_same(),
+        "the retained view is the original generation"
+    );
+    let view_id = engine.views[0].id();
+    assert!(
+        !engine.scan_inputs.contains_key(&view_id),
+        "nothing scanned yet: the scan pends for the retry tick"
+    );
+    assert!(
+        engine.plan.modules.is_empty(),
+        "the pending plan is honestly empty"
+    );
+    // The retry is owed through the ordinary vehicles: a refresh bound
+    // to the retained view (never a pid reopen) plus the handles-first
+    // mark, under the counted pending gap.
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&live_pid)
+            .and_then(|request| request.owner),
+        Some(view_id),
+        "the retry binds the original retained view: {:?}",
+        engine.refresh_requested.get(&live_pid)
+    );
+    assert!(
+        engine.handles_deferred.contains_key(&live_pid),
+        "the deferral marks the pid for a handles-first retry"
+    );
+    let skips = engine.counters.object_skips.clone();
+    assert!(
+        skips.iter().any(|skip| skip.subject == "library file open"),
+        "the pin wait is counted: {skips:?}"
+    );
+    assert!(
+        skips.iter().any(|skip| skip.reason.contains("next tick")),
+        "the pending gap names the retry: {skips:?}"
+    );
+    // The REAL startup guard starts the session over the pending view:
+    // no terminal startup error, the native-start closure runs once.
+    let starts = Cell::new(0);
+    let session = start_retained_with(&mut engine, true, crate::process::stale_view_ids, |_, _| {
+        starts.set(starts.get() + 1);
+        Ok(FakeSession(Default::default()))
+    })
+    .expect("startup reaches a session over the pending view");
+    assert_eq!(starts.get(), 1, "the session starts exactly once");
+    drop(session);
+    // After capacity frees, the refresh rescans the SAME retained view
+    // — no reopen, no replacement pid — and the provider publishes.
+    drop(blockers);
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    let tick_start = 1_000_000u64;
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let (refreshed_scans, failed_pids, deferred_pids, refresh_skips) =
+        engine.scan_inventory_views(&BTreeSet::from([view_id]), "test refresh", &mut tick_now);
+    assert!(
+        failed_pids.is_empty() && deferred_pids.is_empty(),
+        "the retry rescan runs: {failed_pids:?} {deferred_pids:?} {refresh_skips:?}"
+    );
+    assert_eq!(refreshed_scans.len(), 1);
+    assert_eq!(refreshed_scans[0].0, view_id);
+    assert!(
+        !refreshed_scans[0].1.is_empty(),
+        "the retry finds the provider modules"
+    );
+    let serviced = engine.refresh_request_snapshot();
+    engine.complete_refresh_requests(&serviced, &BTreeSet::new());
+    assert!(
+        !engine.refresh_requested.contains_key(&live_pid),
+        "the serviced retry completes its refresh request"
+    );
+    let candidate = engine
+        .inventory_candidate(
+            &BTreeSet::new(),
+            &refreshed_scans,
+            &[],
+            Vec::new(),
+            &BTreeSet::new(),
+        )
+        .expect("the retry builds a candidate");
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the retry applies");
+    assert!(
+        !engine.plan.modules.is_empty(),
+        "the retry publishes the provider"
+    );
+    assert_eq!(engine.views.len(), 1);
+    assert_eq!(engine.views[0].id(), view_id);
+    assert_eq!(engine.views[0].pid(), live_pid);
+    assert!(
+        engine.views[0].still_the_same(),
+        "the retried view is still the original generation"
+    );
+    println!("\n{COMPLETED}");
+}
+
+/// View-collapse fix8 F3 at the loop-top (same defect shape as the
+/// pin-wait path): a named capture whose initial pass defers at the
+/// reserve gate — before any scan opens — pends its original
+/// generation the same way: retained view, bound refresh,
+/// handles-first mark, counted gap, session start, and a successful
+/// retry on the same view. Runs in an isolated child.
+#[test]
+fn named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup() {
+    const CHILD: &str = "P11SCOPE_NAMED_RESERVE_CHILD";
+    const COMPLETED: &str = "P11SCOPE_NAMED_RESERVE_COMPLETED";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::engine::tests::named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "named-reserve child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == COMPLETED),
+            "named-reserve child did not complete its assertions:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    const SOFT: u64 = 256;
+    let provider = E07Provider::dlopen();
+    let live_pid = std::process::id();
+    let named_view = ProcessView::open(ProcessViewId(0), live_pid).expect("the named view opens");
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one initialized writable rlimit.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+        0
+    );
+    assert!(
+        current.rlim_max >= SOFT,
+        "the box must allow a 256 hard fd limit for the named-reserve child"
+    );
+    let lowered = libc::rlimit {
+        rlim_cur: SOFT,
+        rlim_max: SOFT,
+    };
+    // SAFETY: lowering both limits in the isolated child; the child
+    // exits after its assertions, so the irreversible hard-limit drop
+    // never escapes to siblings.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    // Blockers hold the table past the reserve before the pass starts,
+    // so the loop-top gate defers before any scan opens.
+    let target_open = SOFT - crate::fd_budget::FD_RESERVE + 1;
+    let mut blockers = Vec::new();
+    loop {
+        let open = crate::fd_budget::open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+            .expect("a readable count while holding blockers") as u64;
+        assert!(
+            open <= target_open,
+            "ambient fds already past the {target_open} target: {open}"
+        );
+        if open == target_open {
+            break;
+        }
+        blockers
+            .push(std::fs::File::open("/dev/null").expect("a blocker must open below the target"));
+    }
+    let args = crate::cli::CaptureArgs {
+        track_short_lived: false,
+        verbose: false,
+        quiet: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![provider.path.clone()],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        forwarding_modules: Vec::new(),
+        hooks: crate::discovery::hooks::HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Pid(live_pid),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        out_is_stdout: false,
+        max_events: None,
+        max_scan_pids: None,
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: crate::attach::BackendSelection::default(),
+    };
+    let scope = Scope::Pid(live_pid);
+    let mut engine =
+        Engine::discover(&args, &scope, Some(named_view)).expect("named discovery pends");
+    assert_eq!(
+        engine.views.len(),
+        1,
+        "the loop-top deferral pends the view, it never drops it"
+    );
+    assert_eq!(engine.views[0].pid(), live_pid);
+    assert!(
+        engine.views[0].still_the_same(),
+        "the retained view is the original generation"
+    );
+    let view_id = engine.views[0].id();
+    assert!(
+        !engine.scan_inputs.contains_key(&view_id),
+        "nothing scanned yet: the scan pends for the retry tick"
+    );
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&live_pid)
+            .and_then(|request| request.owner),
+        Some(view_id),
+        "the retry binds the original retained view: {:?}",
+        engine.refresh_requested.get(&live_pid)
+    );
+    assert!(
+        engine.handles_deferred.contains_key(&live_pid),
+        "the deferral marks the pid for a handles-first retry"
+    );
+    let skips = engine.counters.object_skips.clone();
+    assert!(
+        skips.iter().any(|skip| skip
+            .reason
+            .contains("capture file-descriptor reserve exhausted")),
+        "the reserve tail is filed: {skips:?}"
+    );
+    let starts = Cell::new(0);
+    let session = start_retained_with(&mut engine, true, crate::process::stale_view_ids, |_, _| {
+        starts.set(starts.get() + 1);
+        Ok(FakeSession(Default::default()))
+    })
+    .expect("startup reaches a session over the pending view");
+    assert_eq!(starts.get(), 1, "the session starts exactly once");
+    drop(session);
+    // After capacity frees, the refresh rescans the SAME retained view
+    // and the provider publishes.
+    drop(blockers);
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    let tick_start = 1_000_000u64;
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let (refreshed_scans, failed_pids, deferred_pids, refresh_skips) =
+        engine.scan_inventory_views(&BTreeSet::from([view_id]), "test refresh", &mut tick_now);
+    assert!(
+        failed_pids.is_empty() && deferred_pids.is_empty(),
+        "the retry rescan runs: {failed_pids:?} {deferred_pids:?} {refresh_skips:?}"
+    );
+    assert_eq!(refreshed_scans.len(), 1);
+    assert!(
+        !refreshed_scans[0].1.is_empty(),
+        "the retry finds the provider modules"
+    );
+    let candidate = engine
+        .inventory_candidate(
+            &BTreeSet::new(),
+            &refreshed_scans,
+            &[],
+            Vec::new(),
+            &BTreeSet::new(),
+        )
+        .expect("the retry builds a candidate");
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the retry applies");
+    assert!(
+        !engine.plan.modules.is_empty(),
+        "the retry publishes the provider"
+    );
+    assert_eq!(engine.views[0].id(), view_id);
+    assert!(
+        engine.views[0].still_the_same(),
+        "the retried view is still the original generation"
+    );
+    println!("\n{COMPLETED}");
+}
+
 /// Mutation caught: retrying without subtracting an originally accepted stale
 /// view can spin forever under cgroup churn. Before any session exists, each
 /// accepted view that went stale is removed with one plan rebuild, and the

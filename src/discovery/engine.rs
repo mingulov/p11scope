@@ -7669,6 +7669,35 @@ fn broad_admit_from_env() -> bool {
     std::env::var_os("P11SCOPE_BROAD_ADMIT").is_some_and(|value| value == "1")
 }
 
+/// Retains a named capture's scope-resolution view with its scan
+/// pending (view-collapse fix8 F3): an initial deferral (reserve,
+/// handle budget, or pin wait) must pend the original generation for
+/// a retry tick instead of terminating startup at the named-view
+/// guard. The retained view keeps its pidfd custody — the retry tick
+/// rescans the same generation through its bound refresh, never a
+/// pid reopen — and the session starts over the pending view. No-op
+/// without a held named view (non-named scopes, or an already-taken
+/// view): their pids re-enumerate without a custody promise.
+fn retain_named_view_pending(discovered: &mut Engine, named_view: &mut Option<ProcessView>) {
+    let Some(view) = named_view.take() else {
+        return;
+    };
+    // The ID pool is empty at initial discovery, so this retains;
+    // a failure keeps today's terminal shape (plus the filed gap)
+    // rather than installing an unowned view.
+    if discovered.retain_view_id(view.id()).is_err() {
+        return;
+    }
+    // Pushed before the refresh binds: the request owner is the
+    // retained view, so the retry can only serve the original
+    // generation. The queue is empty at initial discovery, so the
+    // request is accepted; the handles-first mark is filed by the
+    // deferring break beside this call.
+    let pid = view.pid();
+    discovered.views.push(view);
+    discovered.request_refresh(pid, crate::attach::monotonic_ns());
+}
+
 fn discover_plan(
     a: &CaptureArgs,
     scope: &Scope,
@@ -7865,6 +7894,9 @@ fn discover_plan(
             };
             attribution::note(&skipped);
             discovered.base_counters.object_skips.push(skipped);
+            // Fix8 F3: a named capture's original generation pends for
+            // a retry tick instead of terminating startup.
+            retain_named_view_pending(&mut discovered, &mut named_view);
             break;
         }
         // Past the handle cap the rest wait for the next tick with their
@@ -7882,6 +7914,9 @@ fn discover_plan(
             };
             attribution::note(&skipped);
             discovered.base_counters.object_skips.push(skipped);
+            // Fix8 F3: a named capture's original generation pends for
+            // a retry tick instead of terminating startup.
+            retain_named_view_pending(&mut discovered, &mut named_view);
             break;
         }
         let opened = if named {
@@ -8016,8 +8051,18 @@ fn discover_plan(
                 // the wait gaps) merged like a failed scan's. The fd
                 // table just proved itself full, so the rest of the pass
                 // waits behind the same break as the reserve path.
+                // Fix8 F3: a named capture's view never drops here —
+                // the original generation stays retained with its scan
+                // pending (its ID too), so startup reaches a session
+                // and the retry tick rescans the same generation.
                 if scan_pins_waited(&counters.object_skips) {
-                    discovered.release_view_id(view.id());
+                    if named {
+                        let pid = view.pid();
+                        discovered.views.push(view);
+                        discovered.request_refresh(pid, crate::attach::monotonic_ns());
+                    } else {
+                        discovered.release_view_id(view.id());
+                    }
                     // Fix7 F1: a scan that stopped BEFORE the reserve
                     // tripped files the reserve tail — nothing filled, the
                     // guard tripped first. Fix8 F2: a scan that stopped

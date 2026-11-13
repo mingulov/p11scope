@@ -1764,6 +1764,160 @@ fn singles_lane_keeps_the_512_entry_pass_quantum() {
     );
 }
 
+/// Owner run 2026-11-13: 20167 demand, 2 passes, 8192 per pass, 3783
+/// deferred at stop (pass0 11975 = 20167-8192; stop 3783 = 20167-2*8192).
+/// The fix raises the Multi per-pass bound to the 32768 endpoint ceiling
+/// (wall binds, measured ~1.8 s for 20167) and drains any remainder on
+/// ticks. This test uses 40000 demand (past the raised bound) so one pass
+/// still defers (32768 attached, 7232 deferred, entry-bound with wall
+/// remaining — scripted time never advances, so the deadline never binds)
+/// and ticks must drain the rest to zero at stop.
+#[test]
+fn multi_lane_tick_cadence_drains_backlog_within_wall_budget() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    assert_eq!(
+        windows().multi_extend_budget,
+        Duration::from_secs(4),
+        "the wall budget binds, not the test clock"
+    );
+    assert_eq!(
+        windows().multi_extend_entries,
+        32768,
+        "the raised per-pass bound is the endpoint ceiling"
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts[1],
+        (32768, 7232),
+        "one Multi pass attaches 32768 and defers the rest (entry-bound, wall remains)"
+    );
+    for _ in 0..200 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    lane.after_pass(&mut host);
+    let (attached, deferred) = host.receipts.last().copied().unwrap();
+    assert_eq!(
+        deferred, 0,
+        "ticks drain the backlog so the run ends with zero deferred (last receipt attached {attached})"
+    );
+    let total_attached: usize = host.receipts.iter().map(|(attached, _)| *attached).sum();
+    assert_eq!(
+        total_attached, 40000,
+        "all demand attaches across passes plus ticks: {:?}",
+        host.receipts
+    );
+}
+
+/// The owner demand (20167) now attaches in one pass under the raised
+/// 32768 bound (wall binds, ~1.8 s measured); ticks are unneeded but
+/// harmless.
+#[test]
+fn multi_lane_raised_bound_carries_owner_demand_in_one_pass() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(20167));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts[1],
+        (20167, 0),
+        "one Multi pass carries the full 20167-endpoint owner demand"
+    );
+    for _ in 0..10 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts.last().copied().unwrap(), (0, 0));
+}
+
+/// Healthy twin: demand within one pass stays attached; ticks with an
+/// empty backlog start no new extends.
+#[test]
+fn multi_lane_ticks_keep_a_whole_provider_attached() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(6734));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (6734, 0));
+    let receipts_before = host.receipts.len();
+    for _ in 0..10 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    assert_eq!(
+        host.receipts.len(),
+        receipts_before,
+        "ticks with an empty backlog start no new extends: {:?}",
+        host.receipts
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts.last().copied().unwrap(), (0, 0));
+}
+
+/// Failure twin: demand past any per-pass entry bound still defers
+/// honestly (attached plus deferred sums to demand, nothing lost or
+/// hidden), with or without ticks.
+#[test]
+fn multi_lane_over_ceiling_demand_still_defers_honestly() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    let (attached, deferred) = host.receipts[1];
+    assert!(
+        deferred > 0,
+        "over-ceiling demand defers past one pass: {attached} attached, {deferred} deferred"
+    );
+    assert_eq!(
+        attached + deferred,
+        40000,
+        "every endpoint lands in exactly one bucket: {:?}",
+        host.receipts
+    );
+}
+
+/// Stop-path twin: the tick cadence plus the bounded stop ends with zero
+/// deferred when demand is past one pass but within tick reach (40000:
+/// one pass defers 7232, ticks drain it).
+#[test]
+fn multi_lane_stop_after_tick_cadence_reports_zero_deferred() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    for _ in 0..200 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    lane.after_pass(&mut host);
+    let stopped = lane.stop(&mut host);
+    assert_eq!(
+        stopped.summary.attached, 40000,
+        "ticks plus passes attach all demand before stop: {:?}",
+        host.receipts
+    );
+    assert_eq!(stopped.summary.failed, 0);
+    assert_eq!(
+        host.receipts.last().copied().unwrap().1,
+        0,
+        "zero deferred at stop: {:?}",
+        host.receipts
+    );
+}
+
 /// first scan with its receipt forwarded at once, then per pass scan →
 /// delta → extend → receipt → lifecycle → witness → commit → publish, then
 /// the terminal read before the coverage ends, retirement under service, one

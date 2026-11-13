@@ -799,6 +799,16 @@ degraded=modfs=='overlayfs' or no_witness
 owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
 assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
 unproven=[]
+# The facts-retained refresh refusal only comes with a
+# run-deadline straddle on every substrate: the deadline gap must
+# be present in the same run, and at most one retained row per
+# owning caller. This runs outside the degraded branch so a
+# witness-available report cannot smuggle a lone or duplicated
+# retained row past the qualifier.
+retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample permit was not granted; prior owner facts retained']
+if retained:
+    assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
+    assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
@@ -829,13 +839,6 @@ if degraded:
     # below instead of hiding.
     known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
     assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
-    # The facts-retained refresh refusal only comes with a
-    # run-deadline straddle: the deadline gap must be present in the
-    # same run, and at most one retained row per owning caller.
-    retained=[g for g in rest if g.get('reason')=='the final-sample permit was not granted; prior owner facts retained']
-    if retained:
-        assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
-        assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
     assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY

@@ -17,6 +17,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -238,7 +239,7 @@ def replace_successful_totals(report, ledger, totals):
 
 class OracleTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell="profile-pid", want=0,
-                 allow_pid_descendant_gaps=False):
+                 allow_pid_descendant_gaps=False, census=None):
         report, ledger, receipt = inputs(metrics=cell == "metrics-pid", system=cell == "system")
         receipt["cell"] = cell
         if mutate:
@@ -259,6 +260,10 @@ class OracleTests(unittest.TestCase):
                                          for key, path in paths.items()), [])]
             if allow_pid_descendant_gaps:
                 args.append("--allow-pid-descendant-gaps")
+            if census is not None:
+                census_path = tmp / "census"
+                census_path.write_text(census)
+                args += ["--census", str(census_path)]
             proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
@@ -729,7 +734,7 @@ class RunnerNoiseTests(unittest.TestCase):
     """Ruling CI-GAP-1: hosted host system cell discloses runner noise."""
     run_case = OracleTests.run_case
 
-    def run_case_mt_system(self, mutate=None, *, want=0):
+    def run_case_mt_system(self, mutate=None, *, want=0, census=None):
         report, ledger, receipt = inputs_mt_system()
         if mutate:
             mutate(report, ledger, receipt)
@@ -744,6 +749,10 @@ class RunnerNoiseTests(unittest.TestCase):
             args = [sys.executable, "-I", str(ORACLE),
                     "--cell", "mt-system", *sum((["--" + key, str(path)]
                                          for key, path in paths.items()), [])]
+            if census is not None:
+                census_path = tmp / "census"
+                census_path.write_text(census)
+                args += ["--census", str(census_path)]
             proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
@@ -1029,6 +1038,247 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
         self.assertIn("pid_descendant_gaps=41", result["detail"])
         self.assertIn("discovery_skips=1", result["detail"])
+
+
+def burst_census(*, ambient=0, workload_tree=(), observer_tree=(), baseline_exits=(),
+                 kthreads=(), extra_baselines=(), workload=123, observer=456, broken=None):
+    """Synthetic system-cell census: `ambient` foreign ssh-avalanche exits
+    (login-bash children in their own session), plus in-window exits in
+    the workload and observer trees, pre-existing foreign exits and
+    kernel-thread exits, all joined against the same capture window.
+    `broken` corrupts the evidence one way (garbage, workload-mismatch,
+    no-markers or no-observer) for the fail-loud twins."""
+    rows = [{"type": "header", "schema": "p11scope/system-cell-census/v1",
+             "workload_pid": workload, "poll_ms": 5, "census_start_mono_ns": 0}]
+    rows.append({"type": "baseline", "pid": 100, "ppid": 99, "pgrp": 100,
+                 "session": 100, "flags": 0, "starttime": 10})
+    rows.append({"type": "baseline", "pid": 123, "ppid": 100, "pgrp": 100,
+                 "session": 100, "flags": 0, "starttime": 11})
+    rows.append({"type": "baseline", "pid": 50, "ppid": 1, "pgrp": 50,
+                 "session": 50, "flags": 0, "starttime": 5})
+    for pid, ppid in extra_baselines:
+        rows.append({"type": "baseline", "pid": pid, "ppid": ppid, "pgrp": 100,
+                     "session": 100, "flags": 0, "starttime": 11})
+    rows.append({"type": "birth", "pid": 456, "ppid": 100, "pgrp": 100,
+                 "session": 100, "flags": 0, "starttime": 12, "seen_mono_ns": 100})
+    rows.append({"type": "birth", "pid": 501, "ppid": 50, "pgrp": 501,
+                 "session": 501, "flags": 0, "starttime": 13, "seen_mono_ns": 200})
+    rows.append({"type": "birth", "pid": 502, "ppid": 501, "pgrp": 501,
+                 "session": 501, "flags": 0, "starttime": 14, "seen_mono_ns": 300})
+    rows.append({"type": "marker", "name": "capturing", "seen_mono_ns": 1000})
+    tick = 1100
+    for i in range(ambient):
+        pid = 1000 + i
+        rows.append({"type": "birth", "pid": pid, "ppid": 502, "pgrp": 501,
+                     "session": 501, "flags": 0, "starttime": 100 + i, "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 100 + i,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
+    for pid in workload_tree:
+        rows.append({"type": "birth", "pid": pid, "ppid": 123, "pgrp": 100,
+                     "session": 100, "flags": 0, "starttime": 500 + pid, "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 500 + pid,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
+    for pid in observer_tree:
+        rows.append({"type": "birth", "pid": pid, "ppid": 456, "pgrp": 100,
+                     "session": 100, "flags": 0, "starttime": 600 + pid, "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 600 + pid,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
+    for pid in baseline_exits:
+        rows.append({"type": "baseline", "pid": pid, "ppid": 50, "pgrp": 50,
+                     "session": 50, "flags": 0, "starttime": 700 + pid})
+        rows.append({"type": "exit", "pid": pid, "starttime": 700 + pid,
+                     "birth_seen_mono_ns": None, "exit_seen_mono_ns": tick})
+        tick += 1
+    for pid in kthreads:
+        rows.append({"type": "birth", "pid": pid, "ppid": 2, "pgrp": 0,
+                     "session": 0, "flags": 0x00200000, "starttime": 800 + pid,
+                     "seen_mono_ns": tick})
+        rows.append({"type": "exit", "pid": pid, "starttime": 800 + pid,
+                     "birth_seen_mono_ns": tick, "exit_seen_mono_ns": tick + 50})
+        tick += 1
+    rows.append({"type": "marker", "name": "settled", "seen_mono_ns": 2000})
+    rows.append({"type": "observer", "pid": observer})
+    rows.append({"type": "trailer", "census_stop_mono_ns": 2100})
+    if broken == "workload-mismatch":
+        rows[0]["workload_pid"] = 999
+    if broken == "no-markers":
+        rows = [row for row in rows if row.get("type") != "marker"]
+    if broken == "no-observer":
+        rows = [row for row in rows if row.get("type") != "observer"]
+    text = "\n".join(json.dumps(row) for row in rows) + "\n"
+    if broken == "garbage":
+        text += "not json\n"
+    return text
+
+
+def burst_mutate(gaps):
+    def mutate(d, l, r):
+        d["evidence"]["pid_descendant_gaps"] = gaps
+        d["evidence"]["gap_classes"]["observation"] = {
+            "status": "lossy", "causes": ["pid_descendant_gaps"]}
+        d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+    return mutate
+
+
+class BurstClassificationTests(unittest.TestCase):
+    """Ambient-burst arm: census-joined foreign exits explain honest ssh
+    avalanches one for one; the unproven remainder keeps the strict
+    ceiling of one and every count stays exact."""
+    run_case = OracleTests.run_case
+    run_case_mt_system = RunnerNoiseTests.run_case_mt_system
+
+    def test_burst_fully_joined_passes_in_strict_mode(self):
+        # The sm1 shape (pdg=37, census-proven ssh avalanche): every gap
+        # joins a foreign-tree exit, so the remainder is zero.
+        result = self.run_case(burst_mutate(37), cell="system",
+                               census=burst_census(ambient=37))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("pid_descendant_gaps=37", result["detail"])
+        self.assertIn("ambient_proven=37", result["detail"])
+        self.assertIn("workload_unproven=0", result["detail"])
+
+    def test_burst_with_one_unproven_gap_passes_in_strict_mode(self):
+        # The unproven remainder keeps the lone-gap ceiling: 37 proven
+        # ambient plus one unattributed gap still passes.
+        result = self.run_case(burst_mutate(38), cell="system",
+                               census=burst_census(ambient=37))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_burst_with_two_unproven_gaps_fails_in_strict_mode(self):
+        # Two unattributed gaps are not a lone gap, however large the
+        # proven ambient burst beside them.
+        result = self.run_case(burst_mutate(39), cell="system", want=1,
+                               census=burst_census(ambient=37))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_burst_over_join_fails_in_strict_mode(self):
+        # Exact arithmetic: the census cannot explain more gaps than the
+        # product reported; an over-join is a contradiction, never a pass.
+        result = self.run_case(burst_mutate(37), cell="system", want=1,
+                               census=burst_census(ambient=38))
+        self.assertIn("census joins more ambient exits than the product gaps", result["detail"])
+
+    def test_workload_tree_exits_are_never_joined(self):
+        # A census exit descending from the workload is not ambient: it
+        # stays in the unproven remainder, which keeps the ceiling.
+        result = self.run_case(burst_mutate(2), cell="system",
+                               census=burst_census(ambient=1, workload_tree=(124,)))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("workload_tree_exits_observed=1", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+        result = self.run_case(burst_mutate(3), cell="system", want=1,
+                               census=burst_census(ambient=1, workload_tree=(124,)))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_observer_tree_exits_are_never_joined(self):
+        # Observer children (a regressed self-probe fork) are not ambient
+        # either: two of them with no foreign burst still fail strict.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
+                               census=burst_census(observer_tree=(457, 458)))
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+        self.assertIn("observer_tree_exits_observed=2", result["detail"])
+
+    def test_malformed_census_fails_loud_instead_of_lone_pass(self):
+        # Corrupt census evidence fails closed: one gap with a garbage
+        # census must not silently fall back to the lone-gap pass.
+        result = self.run_case(burst_mutate(1), cell="system", want=1,
+                               census=burst_census(ambient=1, broken="garbage"))
+        self.assertIn("census", result["detail"])
+        self.assertNotIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_census_bound_to_launched_pid(self):
+        # A census for another workload proves nothing about this cell.
+        result = self.run_case(burst_mutate(37), cell="system", want=1,
+                               census=burst_census(ambient=37, broken="workload-mismatch"))
+        self.assertIn("census workload", result["detail"])
+
+    def test_pre_existing_foreign_exits_are_not_joined(self):
+        # A foreign exit without an in-window birth was alive at the
+        # initial scope walk, so it was listed, not a gap: it cannot
+        # explain a gap and stays in the remainder.
+        result = self.run_case(burst_mutate(2), cell="system",
+                               census=burst_census(ambient=1, baseline_exits=(777,)))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("ambient_proven=1", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_burst_keeps_counts_exact(self):
+        # The burst arm never waives exact owned counts: a 499/500
+        # deficit with a fully joined burst still fails strict.
+        def mutate(d, l, r):
+            burst_mutate(37)(d, l, r)
+            d["functions"][0]["calls"] = 499
+        result = self.run_case(mutate, cell="system", want=1,
+                               census=burst_census(ambient=37))
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_burst_with_provider_linked_hint_fails(self):
+        # The provider-subject check extends to the burst arm: a hint
+        # linking a gap subject to the watched provider is not ambient.
+        def mutate(d, l, r):
+            burst_mutate(37)(d, l, r)
+            d["evidence"]["gap_exe_hints"] = {
+                "label": "STATIC HINT", "scope": "test",
+                "links_provider": 1, "links_pkcs11_loader": 0,
+                "no_static_link_within_scope": 0, "unknown": 36}
+        result = self.run_case(mutate, cell="system", want=1,
+                               census=burst_census(ambient=37))
+        self.assertIn("ambient burst subject links the watched provider", result["detail"])
+
+    def test_burst_without_window_markers_fails(self):
+        # No capture window, no join: a census that never observed the
+        # capturing/settled markers cannot place any exit in-window.
+        result = self.run_case(burst_mutate(2), cell="system", want=1,
+                               census=burst_census(ambient=2, broken="no-markers"))
+        self.assertIn("census capture window", result["detail"])
+
+    def test_lone_gap_with_full_census_join_reports_the_burst(self):
+        # One gap fully joined by the census takes the burst
+        # qualification (with its exact accounting) over the lone arm.
+        result = self.run_case(burst_mutate(1), cell="system",
+                               census=burst_census(ambient=1))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("ambient_proven=1", result["detail"])
+        self.assertIn("workload_unproven=0", result["detail"])
+
+    def test_burst_passes_on_mt_system_in_strict_mode(self):
+        # Mt-system twin: the ledger children are workload roots, the
+        # foreign avalanche joins the same way.
+        mt_census = burst_census(ambient=5, extra_baselines=[(124, 123), (125, 123),
+                                                             (126, 123), (127, 123)])
+        result = self.run_case_mt_system(burst_mutate(5), census=mt_census)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("ambient_proven=5", result["detail"])
+
+    def test_burst_with_two_unproven_gaps_fails_on_mt_system_in_strict_mode(self):
+        # The mt-system remainder keeps the same strict ceiling of one.
+        mt_census = burst_census(ambient=5, extra_baselines=[(124, 123), (125, 123),
+                                                             (126, 123), (127, 123)])
+        result = self.run_case_mt_system(burst_mutate(7), want=1, census=mt_census)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_kernel_thread_exits_are_never_joined(self):
+        # A PF_KTHREAD exit inside the window is not a user gap the
+        # product would count, so it can never explain one: one joined
+        # ambient plus one kthread exit leaves a remainder of one.
+        result = self.run_case(burst_mutate(2), cell="system",
+                               census=burst_census(ambient=1, kthreads=(31,)))
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-burst")
+        self.assertIn("ambient_proven=1", result["detail"])
+        self.assertIn("workload_unproven=1", result["detail"])
+
+    def test_duplicate_census_exits_fail_loud(self):
+        # One process exits once: a doubled exit line is corrupt
+        # evidence, and double-joining it would mask a workload gap.
+        census = burst_census(ambient=1)
+        doubled = census + [line for line in census.splitlines()
+                            if '"exit"' in line][0] + "\n"
+        result = self.run_case(burst_mutate(2), cell="system", want=1, census=doubled)
+        self.assertIn("census exit is recorded twice", result["detail"])
 
 
 # Test-only independent mapping code runs in both separate lifecycle children.
@@ -1323,6 +1573,46 @@ class ShellControls(unittest.TestCase):
             calls = [line for line in window if line.startswith("CALL ")]
             self.assertEqual(calls, [], "runner spawned subprocesses during the system capture")
 
+    def test_system_census_lifecycle_binds_window_and_trees(self):
+        # Ambient-burst lane: a healthy CONTROL system cell leaves a
+        # complete census (header bound to the launched workload, both
+        # window markers, the observer line, trailer) for the oracle.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            fixture, observer, module = [tmp / p for p in ("fixture", "observer", "module")]
+            fixture.write_text(FAKE_FIXTURE); observer.write_text(FAKE_OBSERVER)
+            fixture.chmod(0o700); observer.chmod(0o700); module.write_text("independent provider")
+            out = tmp / "out"; out.mkdir()
+            template = tmp / "report-template.json"
+            template.write_text(json.dumps(inputs(system=True)[0]))
+            env = dict(os.environ, CONTROL_MODE="healthy", CONTROL_CELL="system", MODULE=str(module),
+                       ITERS="500", CONTROL_REPORT=str(template), CONTROL_OUT=str(out))
+            env.pop("P11SCOPE_LOCAL_OUTPUT_ROOT", None)
+            proc = subprocess.run(["bash", str(SHELL), "--control-gated", str(observer),
+                                   str(out), str(fixture), "system"],
+                                  env=env, text=True, capture_output=True, timeout=30)
+            try:
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                census = [json.loads(line) for line in (out / "system.census.jsonl").read_text().splitlines()
+                          if line.strip()]
+                kinds = [row["type"] for row in census]
+                self.assertEqual(kinds[0], "header")
+                self.assertIn("trailer", kinds)
+                self.assertEqual(kinds[-1], "observer")
+                receipt = json.loads((out / "system.receipt.json").read_text())
+                self.assertEqual(census[0]["schema"], "p11scope/system-cell-census/v1")
+                self.assertEqual(census[0]["workload_pid"], receipt["launched_pid"])
+                markers = [row["name"] for row in census if row["type"] == "marker"]
+                self.assertEqual(markers, ["capturing", "settled"])
+                observers = [row["pid"] for row in census if row["type"] == "observer"]
+                self.assertEqual(observers, [int((out / "observer.pid").read_text())])
+            finally:
+                for name in ("fixture.pid", "observer.pid"):
+                    path = out / name
+                    if path.exists():
+                        try: os.kill(int(path.read_text()), 9)
+                        except ProcessLookupError: pass
+
     def test_system_never_ready_fails_without_release(self):
         self.control("never-ready", 1, "system")
 
@@ -1609,6 +1899,124 @@ class NativeFixtureTests(unittest.TestCase):
         ledger = self.check_ledger(proc, [NAMES[0]], identity_gate=False)
         self.assertGreater(ledger["functions"][0]["successful"], 0)
         self.assertEqual(ledger["functions"][0]["attempts"], ledger["functions"][0]["successful"])
+
+
+CENSUS = ROOT / "scripts/system-cell-census.py"
+
+
+class CensusTests(unittest.TestCase):
+    """The system-cell census records fork-free /proc ancestry for the burst arm."""
+
+    def test_census_is_fork_free_by_construction(self):
+        text = CENSUS.read_text(encoding="utf-8")
+        for banned in ("subprocess", "os.system", "os.spawn", "os.fork",
+                       "os.exec", "os.posix_spawn", "popen(", "check_output"):
+            self.assertNotIn(banned, text,
+                             "the census poll loop must never fork inside a system capture")
+
+    def test_census_records_births_exits_and_window_markers(self):
+        children = 3
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            out, stop = tmp / "census.jsonl", tmp / "stop"
+            capturing, settled, ready = tmp / "capturing", tmp / "settled", tmp / "ready"
+            proc = subprocess.Popen(
+                [sys.executable, "-I", str(CENSUS), "--out", str(out),
+                 "--stop", str(stop), "--workload", str(os.getpid()),
+                 "--capturing", str(capturing), "--settled", str(settled),
+                 "--ready", str(ready),
+                 "--poll-ms", "5"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline and not ready.exists():
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "the census never finished its baseline: " +
+                                (proc.stderr.read() if proc.poll() is not None else "still running"))
+                capturing.touch()
+                kids = [subprocess.Popen(
+                    [sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for _ in range(children)]
+                try:
+                    deadline = time.time() + 10
+                    mine = []
+                    while time.time() < deadline and len(mine) < children:
+                        time.sleep(0.02)
+                        try:
+                            text = out.read_text(encoding="utf-8")
+                        except OSError:
+                            continue
+                        mine = [json.loads(line) for line in text.splitlines()
+                                if line.strip() and json.loads(line).get("type") == "birth"
+                                and json.loads(line).get("ppid") == os.getpid()]
+                    self.assertEqual(
+                        len(mine), children,
+                        "every spawned child is birth-recorded with its ppid "
+                        "(census alive=%s, kids alive=%s)" % (
+                            proc.poll() is None,
+                            [kid.poll() is None for kid in kids]))
+                    for kid in kids:
+                        kid.terminate()
+                    for kid in kids:
+                        kid.wait(timeout=10)
+                finally:
+                    for kid in kids:
+                        if kid.poll() is None:
+                            kid.kill()
+                            kid.wait(timeout=5)
+                settled.touch()
+                stop.touch()
+                _, stderr = proc.communicate(timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            self.assertEqual(proc.returncode, 0, stderr)
+            rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        kinds = [row["type"] for row in rows]
+        self.assertEqual(kinds[0], "header")
+        self.assertEqual(kinds[-1], "trailer")
+        header = rows[0]
+        self.assertEqual(header["schema"], "p11scope/system-cell-census/v1")
+        self.assertEqual(header["workload_pid"], os.getpid())
+        self.assertEqual(header["poll_ms"], 5)
+        self.assertIs(type(header["census_start_mono_ns"]), int)
+        baselines = [row for row in rows if row["type"] == "baseline"]
+        self.assertTrue(any(row["pid"] == os.getpid() for row in baselines),
+                        "the census baselines its live workload")
+        births = [row for row in rows if row["type"] == "birth"]
+        exits = [row for row in rows if row["type"] == "exit"]
+        mine = [row for row in births if row["ppid"] == os.getpid()]
+        self.assertGreaterEqual(len(mine), children,
+                                "every spawned child is birth-recorded with its ppid")
+        for row in mine:
+            for key in ("pid", "ppid", "pgrp", "session", "flags", "starttime", "seen_mono_ns"):
+                self.assertIs(type(row[key]), int, key)
+            self.assertEqual(row["session"], os.getsid(os.getpid()))
+            match = [exit for exit in exits
+                     if exit["pid"] == row["pid"] and exit["starttime"] == row["starttime"]]
+            self.assertEqual(len(match), 1, "each birth has exactly one matched exit")
+            self.assertGreaterEqual(match[0]["exit_seen_mono_ns"], row["seen_mono_ns"])
+        markers = [row for row in rows if row["type"] == "marker"]
+        self.assertEqual([row["name"] for row in markers], ["capturing", "settled"])
+        self.assertLessEqual(markers[0]["seen_mono_ns"], markers[1]["seen_mono_ns"])
+        self.assertLessEqual(header["census_start_mono_ns"], markers[0]["seen_mono_ns"])
+        self.assertLessEqual(markers[1]["seen_mono_ns"], rows[-1]["census_stop_mono_ns"])
+        self.assertNotIn("comm", json.dumps(rows), "the census records ancestry, never names")
+        self.assertNotIn("cmd", json.dumps(rows), "the census records ancestry, never command lines")
+
+    def test_census_refuses_a_non_pid_workload(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            proc = subprocess.run(
+                [sys.executable, "-I", str(CENSUS), "--out", str(tmp / "o"),
+                 "--stop", str(tmp / "s"), "--workload", "0",
+                 "--capturing", str(tmp / "c"), "--settled", str(tmp / "e"),
+                 "--ready", str(tmp / "r")],
+                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

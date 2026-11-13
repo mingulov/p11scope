@@ -300,6 +300,12 @@ judge() {
   if [ "${4:-}" = select-endpoint-system ] && [[ $(uname -r) =~ ^6\.6\. ]]; then
     extra+=(--allow-66-discovery-gap)
   fi
+  # Ambient-burst lane: the harness census of out-of-tree exits lets the
+  # oracle join honest ambient bursts on the system count cells; without
+  # it the cells stay strict (a missing census never weakens the gate).
+  if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ -s "$4.census.jsonl" ]; then
+    extra+=(--census "$4.census.jsonl")
+  fi
   local out rc
   case "${4:-}" in
     inventory-mt-*)
@@ -315,7 +321,8 @@ gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   local gate=$OUT/$cell.gate ext=json
   case "$cell" in trace-*|mt-trace) ext=txt;; esac
-  rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl"
+  rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl" \
+    "$cell.census.jsonl" "$cell.census.stop" "$cell.census.capturing" "$cell.census.settled" "$cell.census.ready" "$cell.census.stderr"
   local output; output=$(product_output "$cell.$ext")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
@@ -336,8 +343,26 @@ gated() {
     *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
   esac
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
+  local census_pid=''
+  case "$cell" in system|mt-system) census_pid=pending;; esac
   if waitfor "$cell.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
     ready=1; readygen=$(generation "$wl")
+    # Ambient-burst lane: start the fork-free /proc census before the
+    # observer exists and wait for its baseline, so every process born
+    # inside the capture window gets ancestry. A census that never
+    # becomes ready fails the cell loud: system cells require ambient
+    # evidence, and a silent fallback would misjudge bursts as strict.
+    if [ "$census_pid" = pending ]; then
+      python3 -I "$HERE/system-cell-census.py" --out "$cell.census.jsonl" --stop "$cell.census.stop" \
+        --workload "$wl" --capturing "$cell.census.capturing" --settled "$cell.census.settled" \
+        --ready "$cell.census.ready" --poll-ms 5 >"$cell.census.stderr" 2>&1 & census_pid=$!
+      register "$census_pid" || true
+      if ! waitfor "$cell.census.ready" "^ready$" "$census_pid" "$READY_TICKS"; then
+        terminate "$census_pid" || true; census_pid=''
+        terminate "$wl" || true
+        result "$cell" 0 'census never became ready' failed; return 1
+      fi
+    fi
     local args=("${@//@PID@/$wl}")
     local evlog
     evlog=$(product_output "$cell.eventlog.jsonl")
@@ -355,6 +380,9 @@ gated() {
     case "$cell" in inventory-mt-*) ready_needle='native usage lane active';; esac
     if "$poll" "$cell.stderr" "$ready_needle" "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
+      # Capture window opens here (shell builtin only: every fork during
+      # a system capture is a descendant gap).
+      if [ -n "$census_pid" ] && [ "$census_pid" != pending ]; then : >> "$cell.census.capturing"; fi
       # Inventory counts only calls made after an edge is native-matched, so
       # the inventory-mt cells hold the workload gate until every workload
       # edge is matched in the event stream. The wait follows the product's
@@ -410,6 +438,16 @@ gated() {
     *)
       terminate "$wl"; workload_rc=$LAST_EXIT ;;
   esac
+  # The observer is settled above, so the capture window is closed: mark
+  # it, stop the census, and bind the observer pid for tree roots. All
+  # post-capture; a census that died mid-cell leaves its stderr behind
+  # and the oracle fails the burst arm closed on the incomplete window.
+  if [ -n "$census_pid" ] && [ "$census_pid" != pending ]; then
+    : >> "$cell.census.settled"
+    : >> "$cell.census.stop"
+    finish "$census_pid" "$READY_TICKS" || true
+    if [ -n "$pp" ]; then printf '{"type": "observer", "pid": %d}\n' "$pp" >> "$cell.census.jsonl"; fi
+  fi
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }

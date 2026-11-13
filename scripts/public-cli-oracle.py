@@ -77,6 +77,12 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # this generic redacted pair; any other skip (entry loss, another
 # discovery reason) is a different family and still fails.
 DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
+# Ambient-burst lane: the harness census schema consumed by the burst arm.
+CENSUS_SCHEMA = "p11scope/system-cell-census/v1"
+# PF_KTHREAD, from linux/sched.h: census exits carrying it are kernel
+# threads, which the product skips from the gap ledger once proven, so
+# they can never join a gap as ambient.
+PF_KTHREAD = 0x00200000
 # Keep verdict policy in the existing canonical reader; it recomputes classes
 # from published counters rather than trusting a report's claimed statuses.
 VERDICT = runpy.run_path(str(Path(__file__).with_name("check-capture-evidence.py")))
@@ -539,6 +545,107 @@ def select_judge(evidence, cell, expected):
                 "unresolved selection carries unexpected keys")
 
 
+def census_burst_accounting(census_text, *, launched_pid, workload_children):
+    """(ambient_joined, workload_observed, observer_observed) from a census.
+
+    Joins census exits born and exited inside the capture window whose
+    ppid chain touches neither the workload tree (the launched pid plus
+    ledger children and their census descendants) nor the observer tree.
+    Kernel-thread, pre-existing, out-of-window and birth-unmatched exits
+    never join. Raises EvidenceError on malformed census evidence, so a
+    corrupt census fails closed instead of weakening the gate. Pid
+    allocation is sequential and the window is seconds, so a pid names
+    one generation here and chains resolve on latest ancestry.
+    """
+    rows = []
+    for lineno, line in enumerate(census_text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = parse(line)
+        except ValueError as error:
+            raise EvidenceError("census line %d is not JSON: %s" % (lineno, error))
+        require(isinstance(row, dict), "census line %d is not an object" % lineno)
+        rows.append(row)
+    require(rows and rows[0].get("type") == "header", "census has no header")
+    header = rows[0]
+    require(header.get("schema") == CENSUS_SCHEMA, "census schema mismatch")
+    require(header.get("workload_pid") == launched_pid,
+            "census workload %r does not match launched pid %r"
+            % (header.get("workload_pid"), launched_pid))
+    observers = [row["pid"] for row in rows if row.get("type") == "observer"]
+    require(len(observers) == 1 and integer(observers[0]) and observers[0] > 0,
+            "census names no single observer pid")
+    observer_pid = observers[0]
+    markers = {}
+    for row in rows:
+        if row.get("type") == "marker" and row.get("name") in ("capturing", "settled"):
+            markers.setdefault(row["name"], row.get("seen_mono_ns"))
+    require(integer(markers.get("capturing")) and integer(markers.get("settled"))
+            and markers["capturing"] <= markers["settled"],
+            "census capture window is missing or unordered")
+    start, end = markers["capturing"], markers["settled"]
+    ancestry = {}
+    births = {}
+    for row in rows:
+        kind = row.get("type")
+        if kind not in ("baseline", "birth"):
+            continue
+        pid = row.get("pid")
+        require(integer(pid) and pid > 0, "census ancestry pid is malformed")
+        require(type(row.get("ppid")) is int and row["ppid"] >= 0,
+                "census ancestry ppid is malformed")
+        require(integer(row.get("starttime")), "census ancestry starttime is malformed")
+        require(integer(row.get("flags")), "census ancestry flags are malformed")
+        ancestry[pid] = row["ppid"]
+        if kind == "birth":
+            require(integer(row.get("seen_mono_ns")), "census birth has no seen time")
+            births[(pid, row["starttime"])] = (row["seen_mono_ns"], row["flags"])
+    workload_roots = set([launched_pid] + list(workload_children))
+
+    def tree_of(pid):
+        seen = set()
+        while pid not in seen:
+            seen.add(pid)
+            if pid in workload_roots:
+                return "workload"
+            if pid == observer_pid:
+                return "observer"
+            if pid not in ancestry:
+                return "foreign"
+            pid = ancestry[pid]
+        return None
+
+    ambient = workload_observed = observer_observed = 0
+    counted = set()
+    for row in rows:
+        if row.get("type") != "exit":
+            continue
+        pid = row.get("pid")
+        born, exited = row.get("birth_seen_mono_ns"), row.get("exit_seen_mono_ns")
+        require(integer(pid) and pid > 0 and integer(exited), "census exit is malformed")
+        key = (pid, row.get("starttime"))
+        require(key not in counted, "census exit is recorded twice")
+        counted.add(key)
+        if born is None or not integer(born):
+            continue
+        if not (start <= born <= end and start <= exited <= end):
+            continue
+        birth = births.get((pid, row.get("starttime")))
+        if birth is None or birth[0] != born:
+            continue
+        if birth[1] & PF_KTHREAD:
+            continue
+        tree = tree_of(pid)
+        if tree == "workload":
+            workload_observed += 1
+        elif tree == "observer":
+            observer_observed += 1
+        elif tree == "foreign":
+            ambient += 1
+    return ambient, workload_observed, observer_observed
+
+
 def run_judge(evidence):
     require(evidence.get("pause") == "sigstop", "run pause is not confirmed sigstop")
     attempts, confirmed, partial = (evidence.get("pause_attempts"), evidence.get("pause_confirmed"),
@@ -550,7 +657,7 @@ def run_judge(evidence):
 
 
 def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=False,
-          allow_66_discovery_gap=False):
+          allow_66_discovery_gap=False, census_text=None):
     require(cell in COUNT_CELLS | SMOKE_CELLS, "undeclared cell")
     # Ruling CI-GAP-1: only the hosted-runner host system cells may disclose
     # short-lived descendant exits as runner noise, via an explicit flag.
@@ -636,6 +743,47 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("modules_skipped") == []
         and type(evidence.get("pid_descendant_gaps", 0)) is int
         and evidence.get("pid_descendant_gaps", 0) == 1)
+    # Ambient-burst lane: a busy host (logins, timers) honestly reports
+    # dozens of descendant gaps, which the lone-gap ceiling cannot judge.
+    # The harness census joins each gap-scale exit outside the workload
+    # and observer trees as proven ambient; the unproven remainder keeps
+    # the strict ceiling of one and the arithmetic stays exact. Only the
+    # lone shape (single cause, no skips) classifies; exact cells never
+    # parse the census, relaxed mode never needs it, and a corrupt
+    # census fails closed. Residual: a walk-listed foreign exit inflates
+    # the join, so on a busy host a simultaneous workload regression
+    # could hide behind ambient; the quiet CI legs stay exact.
+    ok_burst = False
+    burst_note = None
+    burst_accounting = None
+    if (census_text is not None and not relaxed
+            and cell in ("system", "mt-system")
+            and observation.get("status") == "lossy"
+            and observation.get("causes") == ["pid_descendant_gaps"]):
+        children = []
+        for line in ledger_text.splitlines():
+            match = re.fullmatch(r"CHILD pid=([0-9]+)", line)
+            if match is not None:
+                children.append(int(match[1]))
+        ambient_joined, w_obs, o_obs = census_burst_accounting(
+            census_text, launched_pid=receipt.get("launched_pid"),
+            workload_children=children)
+        gaps = evidence.get("pid_descendant_gaps", 0)
+        burst_note = ("census: pid_descendant_gaps=%s ambient_proven=%d "
+                      "workload_unproven=%s workload_tree_exits_observed=%d "
+                      "observer_tree_exits_observed=%d"
+                      % (gaps, ambient_joined,
+                         gaps - ambient_joined if type(gaps) is int else "?",
+                         w_obs, o_obs))
+        if type(gaps) is int and ambient_joined > gaps:
+            raise EvidenceError(
+                "census joins more ambient exits than the product gaps: " + burst_note)
+        burst_accounting = (ambient_joined, w_obs, o_obs)
+        ok_burst = (
+            skip_entries == []
+            and evidence.get("modules_skipped") == []
+            and type(gaps) is int
+            and gaps - ambient_joined <= 1)
     if relaxed:
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
@@ -658,8 +806,11 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         require(ok_exact or ok_gap or ok_ambient,
                 "lossy or unknown observation gap class")
     elif scope in ("system", "cgroup"):
-        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap,
-                "lossy or unknown observation gap class")
+        gap_detail = "lossy or unknown observation gap class"
+        if burst_note is not None:
+            gap_detail += "; " + burst_note
+        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap or ok_burst,
+                gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
     kernel = evidence.get("kernel_control", {})
@@ -673,13 +824,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient, ok_quiet or ok_lone_gap: any other cause set failed
-    # already, so the flags (not re-spelled causes) decide the
+    # ok_ambient, ok_quiet, ok_lone_gap or ok_burst: any other cause set
+    # failed already, so the flags (not re-spelled causes) decide the
     # qualification. Metrics evidence carries no gaps keys, which read
     # as zero below; profile-cgroup/run cells carry them and must
     # read 0.
     ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap))
-    if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
+    burst = (not relaxed and not gap66 and ok_burst)
+    if (relaxed or ambient or burst) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps
         # or other loss would have failed above, and PARTIAL/concrete_gap
@@ -693,7 +845,10 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         # check: a provider-linked subject is not ambient noise.
         hints = evidence.get("gap_exe_hints")
         if hints is not None:
-            subject = "ambient gap subject" if ambient else "runner noise subject"
+            if burst:
+                subject = "ambient burst subject"
+            else:
+                subject = "ambient gap subject" if ambient else "runner noise subject"
             require(hints.get("links_provider", 0) == 0,
                     subject + " links the watched provider")
     if cell in RUN_CELLS:
@@ -796,6 +951,15 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             "owned physical-provider counts match independent successful ledger; "
             "disclosed 6.6 discovery gap: discovery subject/discovery unavailable; "
             "per-caller attribution is not established")
+    if burst:
+        gaps = evidence.get("pid_descendant_gaps", 0)
+        ambient_joined, w_obs, o_obs = burst_accounting
+        return "owned-provider-counts-with-ambient-burst", (
+            "owned physical-provider counts match independent successful ledger; "
+            f"disclosed ambient burst: pid_descendant_gaps={gaps} "
+            f"(ambient_proven={ambient_joined}, workload_unproven={gaps - ambient_joined}, "
+            f"workload_tree_exits_observed={w_obs}, observer_tree_exits_observed={o_obs}); "
+            "per-caller attribution is not established")
     if ambient:
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
@@ -823,13 +987,19 @@ def main(argv=None):
     parser.add_argument("--allow-66-discovery-gap", action="store_true",
                         help="flake-66: on select-endpoint-system only, disclose exactly one "
                              "redacted discovery skip as a 6.6 transient instead of failing")
+    parser.add_argument("--census", default=None,
+                        help="ambient-burst lane: on the system cells (`system`, `mt-system`) "
+                             "only, join the harness census of out-of-tree exits as proven "
+                             "ambient; the unproven remainder keeps the strict ceiling of one")
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}
     try:
+        census_text = read(Path(args.census)) if args.census is not None else None
         qualification, detail = judge(read(Path(args.report)), read(Path(args.ledger)),
                                       parse(read(Path(args.receipt))), args.cell,
                                       allow_pid_descendant_gaps=args.allow_pid_descendant_gaps,
-                                      allow_66_discovery_gap=args.allow_66_discovery_gap)
+                                      allow_66_discovery_gap=args.allow_66_discovery_gap,
+                                      census_text=census_text)
         result.update({"pass": True, "qualification": qualification, "detail": detail})
         code = 0
     except Nonqualifying as error:

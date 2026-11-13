@@ -66,6 +66,12 @@ class CheckCellResultsTests(unittest.TestCase):
                                   "counts match; disclosed 6.6 discovery gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_ambient_burst_qualification_accepted(self):
+        result = run_checker([row("system", True,
+                                  "owned-provider-counts-with-ambient-burst",
+                                  "counts match; disclosed ambient burst")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_qualified_failure_fails(self):
         result = run_checker([row("a", True), row("b", False, "command-contract")])
         self.assertNotEqual(result.returncode, 0)

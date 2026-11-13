@@ -8,8 +8,7 @@ qualification and detail. Qualification is a closed set: qualified,
 command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
-owned-provider-counts-with-ambient-gap,
-owned-provider-counts-with-ambient-burst, prearm-exactness,
+owned-provider-counts-with-ambient-gap, prearm-exactness,
 verdict-consistency, semantic-names and failed are qualified and every
 qualified row must pass; nonqualifying smoke may pass or fail but every
 nonqualifying row must be allow-listed and the allow-list must equal
@@ -34,8 +33,7 @@ def fail(message):
 QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
              "owned-provider-counts-with-runner-noise",
              "owned-provider-counts-with-66-discovery-gap",
-             "owned-provider-counts-with-ambient-gap",
-             "owned-provider-counts-with-ambient-burst", "prearm-exactness",
+             "owned-provider-counts-with-ambient-gap", "prearm-exactness",
              "verdict-consistency", "semantic-names", "failed"}
 VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
 

@@ -14,9 +14,10 @@
 # cells/summary.txt, one cells/<test>.log per cell, run.log, uname.txt,
 # vng-console.log, vng-boot-diag.log and the staged kernel-config. The
 # vng invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is
-# proven before the boot, and a guest that prints nothing and writes no
-# uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT
-# with diagnostics instead of riding the blind 1200s timeout.
+# probed (advisory: a denied open only selects TCG) before the boot,
+# and a guest that prints nothing and writes no uname.txt within
+# VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT with
+# diagnostics instead of riding the blind 1200s timeout.
 #
 # The pre-arm witness needs the running kernel's LTO status from
 # /boot/config-{release}, but the shared rootfs only carries the host's

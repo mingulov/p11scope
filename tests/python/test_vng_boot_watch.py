@@ -95,25 +95,67 @@ class BootWatchTests(unittest.TestCase):
                 self.assertIn(pin, body)
         self.assertLess(elapsed, 25, f"watchdog did not trip fast: {elapsed:.1f}s")
 
-    def test_missing_kvm_node_fails_without_starting_the_child(self):
+    def test_missing_kvm_node_warns_and_still_runs_the_child(self):
+        # A missing node means TCG, not a refusal: vng boots without
+        # /dev/kvm (virtme can_use_kvm falls back), so the watch must
+        # record the failure and run the child.
         env = {"VNG_BOOT_WATCH_TEST": "0",
                "VNG_KVM_NODE": str(self.work / "no-such-kvm")}
-        result, _, _, console, diag = self.run_helper("echo", "no", extra_env=env)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("VNG_KVM_UNUSABLE", result.stderr)
-        self.assertIn("reason=node-missing-or-not-char", result.stderr)
-        self.assertFalse(console.exists(), "the child must not start without KVM")
+        result, _, _, console, diag = self.run_helper(
+            "sh", "-c", "echo guest-bytes; exit 0", extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(console.read_text(encoding="utf-8"), "guest-bytes\n")
+        self.assertNotIn("VNG_KVM_UNUSABLE", result.stderr)
         body = diag.read_text(encoding="utf-8")
-        self.assertIn("result=VNG_KVM_UNUSABLE", body)
+        self.assertIn("reason=node-missing-or-not-char", body)
+        self.assertIn("kvm_expected_accel=tcg-fallback", body)
+        self.assertIn("result=passthrough rc=0 booted=1", body)
 
-    def test_wrong_kvm_node_fails_on_the_ioctl(self):
-        # /dev/null opens but is not KVM: the API ioctl must refuse it.
+    def test_wrong_kvm_node_warns_and_still_runs_the_child(self):
+        # /dev/null opens but is not KVM: the API ioctl fails, which
+        # selects TCG instead of refusing the boot.
         env = {"VNG_BOOT_WATCH_TEST": "0", "VNG_KVM_NODE": "/dev/null"}
-        result, _, _, console, _ = self.run_helper("echo", "no", extra_env=env)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("VNG_KVM_UNUSABLE", result.stderr)
-        self.assertIn("reason=api:", result.stderr)
-        self.assertFalse(console.exists(), "the child must not start without KVM")
+        result, _, _, console, diag = self.run_helper(
+            "sh", "-c", "echo guest-bytes; exit 0", extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(console.read_text(encoding="utf-8"), "guest-bytes\n")
+        self.assertNotIn("VNG_KVM_UNUSABLE", result.stderr)
+        body = diag.read_text(encoding="utf-8")
+        self.assertIn("reason=api:", body)
+        self.assertIn("kvm_expected_accel=tcg-fallback", body)
+        self.assertIn("result=passthrough rc=0 booted=1", body)
+
+    def test_permission_denied_kvm_node_still_boots_with_tcg_fallback(self):
+        # CI run 43460470603: the qemu install re-applied udev perms
+        # (0660 root:kvm) after the workflow's chmod 0666, so the
+        # probe's open got EACCES while vng boots anyway (virtme
+        # can_use_kvm treats a denied open as "use TCG"). /dev/mem is
+        # a char node that denies non-root O_RDWR and whose ioctls can
+        # never satisfy KVM: the probe must record the failure and
+        # still start the child.
+        try:
+            fd = os.open("/dev/mem", os.O_RDWR)
+        except PermissionError:
+            denied = True
+        except OSError:
+            denied = False  # missing node or other error: still unusable KVM
+        else:
+            os.close(fd)
+            denied = False  # root: the open works, the KVM ioctl refuses
+        marker = self.work / "marker"
+        result, _, _, console, diag = self.run_helper(
+            "sh", "-c", f"echo guest-bytes; echo 6.6.157 > {marker}; exit 0",
+            extra_env={"VNG_BOOT_WATCH_TEST": "0",
+                       "VNG_KVM_NODE": "/dev/mem"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(console.read_text(encoding="utf-8"), "guest-bytes\n")
+        self.assertNotIn("VNG_KVM_UNUSABLE", result.stderr)
+        body = diag.read_text(encoding="utf-8")
+        self.assertIn("kvm_probe=fail", body)
+        if denied:
+            self.assertIn("reason=open:", body)
+        self.assertIn("kvm_expected_accel=tcg-fallback", body)
+        self.assertIn("result=passthrough rc=0 booted=1", body)
 
     def test_test_mode_skips_the_probe(self):
         env = {"VNG_KVM_NODE": str(self.work / "no-such-kvm")}

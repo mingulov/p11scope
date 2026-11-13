@@ -35,8 +35,9 @@
 # instance hooks load the way they do on ordinary hosts. Per-cell evidence
 # and logs are copied back to OUTDIR/<kernel>/; OUTDIR/results.jsonl carries
 # one row per cell: {"cell", "pass", "qualification", "detail"}. Each vng
-# invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is proven
-# before the boot, and a guest that prints nothing and writes no uname.txt
+# invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is probed
+# (advisory: a denied open only selects TCG) before the boot, and a guest
+# that prints nothing and writes no uname.txt
 # within VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT with
 # diagnostics (OUTDIR/<kernel>/vng-boot-diag.log) instead of riding the
 # blind 1200s timeout.

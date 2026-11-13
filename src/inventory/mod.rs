@@ -5840,15 +5840,26 @@ fn commit_semantic_finish(
 /// before the display opens, so the classic sink is correct on both
 /// paths. A promotion seals its new lane silently (its install and
 /// end already disclose through gaps); only the run's first seal
-/// readies users and scripts. Key operations record only on the
-/// opted-in lane, so the line says so plainly.
+/// readies users and scripts. The key-operations parenthetical follows
+/// the sealed lane: a journal lane records them, an ordinary lane
+/// records them only with the flag, and a refused request says
+/// unavailable (the refusal reason printed just above).
 const SEMANTIC_SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
+const SEMANTIC_SEAL_LINE_KEY_OPERATIONS: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)";
+const SEMANTIC_SEAL_LINE_KEY_OPERATIONS_REFUSED: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: unavailable)";
 
 /// Note the lane seal once, through the classic stderr sink.
-fn note_semantic_lane_sealed() {
-    inventory_diagnostic(SEMANTIC_SEAL_LINE);
+fn note_semantic_lane_sealed(recording_key_operations: bool, key_operations_requested: bool) {
+    let line = if recording_key_operations {
+        SEMANTIC_SEAL_LINE_KEY_OPERATIONS
+    } else if key_operations_requested {
+        SEMANTIC_SEAL_LINE_KEY_OPERATIONS_REFUSED
+    } else {
+        SEMANTIC_SEAL_LINE
+    };
+    inventory_diagnostic(line);
     #[cfg(test)]
-    record_sealed_for_test(SEMANTIC_SEAL_LINE);
+    record_sealed_for_test(line);
 }
 
 /// Run `start` (the semantic lane's seconds-long BPF load) while a worker
@@ -5998,7 +6009,7 @@ fn start_semantic_lane(
             run_control,
         ) {
             Ok(lane) => {
-                note_semantic_lane_sealed();
+                note_semantic_lane_sealed(true, key_operations);
                 coordinator.note_semantic_sealed();
                 return Some(lane);
             }
@@ -6045,7 +6056,7 @@ fn start_semantic_lane(
         run_control,
     ) {
         Ok(lane) => {
-            note_semantic_lane_sealed();
+            note_semantic_lane_sealed(false, key_operations);
             coordinator.note_semantic_sealed();
             Some(lane)
         }
@@ -29365,7 +29376,7 @@ mod seal_readiness_tests {
     //! line when the semantic lane seals, so users and scripts know
     //! from when newly started programs are covered. The scripted
     //! startups drive the real match arms without manifests or BPF.
-    use super::promotion_driver_tests::{WindDownIo, joint_lane};
+    use super::promotion_driver_tests::{WindDownIo, joint_lane, wind_down_lane};
     use super::*;
     use crate::discovery::engine::inventory_coordinator::semantics::{
         AttestedSubset, SubsetPreparation,
@@ -29375,6 +29386,11 @@ mod seal_readiness_tests {
     /// The exact seal line, pinned as a literal: the wording is the
     /// contract with users and scripts, independent of the builder.
     const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
+    /// The sealed-journal-lane variant: key operations are recorded.
+    const SEAL_LINE_KEY_OPERATIONS: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)";
+    /// The refused-request variant: the flag was passed but the journal
+    /// start refused, so the sealed ordinary lane records no key ops.
+    const SEAL_LINE_KEY_OPERATIONS_REFUSED: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: unavailable)";
 
     /// Scripts for one deferred scan-seal attempt whose live starts
     /// all refuse: the journal start and the ordinary retry each mint
@@ -29429,7 +29445,7 @@ mod seal_readiness_tests {
         assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
         assert_eq!(
             take_sealed_for_test(),
-            vec![SEAL_LINE.to_string()],
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
             "the retry notes the seal line once"
         );
         assert_eq!(
@@ -29484,7 +29500,7 @@ mod seal_readiness_tests {
         assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
         assert_eq!(
             take_sealed_for_test(),
-            vec![SEAL_LINE.to_string()],
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
             "the seating notes the seal line once"
         );
         assert_eq!(
@@ -29739,7 +29755,10 @@ mod seal_readiness_tests {
         );
         assert!(driver.semantic.is_some(), "the pending attempt seals");
         assert!(!driver.scan_seal_pending);
-        assert_eq!(take_sealed_for_test(), vec![SEAL_LINE.to_string()]);
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()]
+        );
     }
 
     /// The `--system` short-run shape (v0.7.0 item 4): a stable set
@@ -29903,7 +29922,7 @@ mod seal_readiness_tests {
         assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
         assert_eq!(
             take_sealed_for_test(),
-            vec![SEAL_LINE.to_string()],
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
             "the seating notes the seal line once"
         );
         assert_eq!(
@@ -30680,6 +30699,46 @@ mod seal_readiness_tests {
             take_sealed_for_test(),
             vec![SEAL_LINE.to_string()],
             "exactly one seal line with the exact wording"
+        );
+    }
+
+    /// O1: a refused journal start falls through to an ordinary lane
+    /// whose seal line says key operations are unavailable — never the
+    /// recorded-only-with-the-flag hint when the flag was passed.
+    #[test]
+    fn seal_line_says_unavailable_when_the_journal_refused() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Ok(wind_down_lane(WindDownIo::completing())),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                )
+            },
+        );
+        assert!(lane.is_some(), "the ordinary retry seats a lane");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS_REFUSED.to_string()],
+            "the refused request says unavailable, not flag-missing"
         );
     }
 

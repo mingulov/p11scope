@@ -344,6 +344,16 @@ The v0.7.0 limits live in
   the capture or narrow the scope (`--pid`); a fix is planned
   for 0.8.0.
 
+### Qualification of this release
+
+The full qualification facts live in the [verification
+record](docs/releases/v0.7.0.md#verification-record). The
+final-candidate gate:
+
+| Check | Measured result |
+| --- | --- |
+| Final candidate (source `00147d894`) | `ci.yml` ([43462011892](https://github.com/mingulov/p11scope/actions/runs/43462011892)), `privileged-tests.yml` ([43462011701](https://github.com/mingulov/p11scope/actions/runs/43462011701)) and `bpf-kernels.yml` ([43462011694](https://github.com/mingulov/p11scope/actions/runs/43462011694)) green on the exact candidate source (privileged needed a second attempt for one guest cell after a runner KVM-permission setup failure); `package-preview.yml` ([43472492183](https://github.com/mingulov/p11scope/actions/runs/43472492183), capture_mode=both) green including install-test and attest; `container-publish.yml` ([43477455945](https://github.com/mingulov/p11scope/actions/runs/43477455945)) green. Result: QUALIFIED. |
+
 ## [0.6.0] - 2026-11-06
 
 v0.6.0 answers "which application used which key, and how": inventory

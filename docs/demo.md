@@ -208,6 +208,7 @@ key operations: 316 keys on 1 provider; rev 16 populated; 116 sessions
   /home/user/.cache/ms-playwright/fire...: sign 15 completed, 0 returned errors, 0 active operations
   unknown keys: digest 35 completed, 0 returned errors, 0 active operations
   unknown keys: generate_key_pair 9 completed, 0 returned errors, 0 active operations
+  [6 more categories]
   type unknown (not established while observed) (120 key rows)
 ```
 
@@ -236,7 +237,7 @@ X25519MLKEM768:X25519` and `-groups X25519`). Firefox visited
 one server at a time while `profile --pid` watched; each case
 ran 3 times (measured 2026-11-13 on lu26, p11scope 26884cce8),
 and the server log confirmed the negotiated group on every
-connection.
+completed handshake.
 
 Against the hybrid server (trimmed to the key-exchange tail of
 the mechanism table; both connections negotiated the hybrid
@@ -274,8 +275,7 @@ tables; the mechanism names show the key family behind each
 count. p11scope never sees site names or traffic, so you load
 one site at a time and read the mechanisms. Chromium does TLS
 outside PKCS#11, so this works for Firefox and other
-NSS-based programs only. Per-key types stay `type unknown`
-here too, for the same reason as above.
+NSS-based programs only.
 
 ## With the container image
 

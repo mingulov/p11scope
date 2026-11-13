@@ -202,6 +202,7 @@ fn probe_with_host(
         capabilities_check(),
         setcap_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
+        user_namespace_check(crate::userns::observer()),
         object_capture_check(),
         process_access_check(),
     ];
@@ -508,6 +509,47 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
 
 fn is_pid_namespace_row(name: &str) -> bool {
     name == PID_NAMESPACE_ROW
+}
+
+/// Name of the observer's user namespace row.
+const USER_NAMESPACE_ROW: &str = "user namespace";
+
+/// Whether BPF judges this process's capabilities here (the initial user
+/// namespace) or ignores them (a child namespace: a rootless container or
+/// any userns without host capabilities). A proven child namespace fails:
+/// every capture lane is unavailable there, and the row carries the one
+/// plain cause line the concise render groups the other failures under.
+/// Unknown warns without naming the cause: an unreadable link proves
+/// nothing, so the capture rows below stand on their own.
+fn user_namespace_check(numbering: &crate::userns::ObserverUserNs) -> Check {
+    use crate::userns::ObserverUserNs;
+    let status = match numbering {
+        ObserverUserNs::Initial => {
+            Status::Ok("initial - capabilities held here count for BPF and uprobes".to_string())
+        }
+        ObserverUserNs::Nested => Status::Fail(crate::userns::CAUSE_LINE.to_string()),
+        ObserverUserNs::Unknown(reason) => Status::Warn(format!(
+            "unknown ({reason}) - cannot prove which user namespace this is; \
+             capture rows below stand on their own"
+        )),
+    };
+    Check {
+        name: USER_NAMESPACE_ROW.into(),
+        status,
+    }
+}
+
+fn is_userns_row(name: &str) -> bool {
+    name == USER_NAMESPACE_ROW
+}
+
+/// Whether the checks prove the userns cause: a failed user-namespace
+/// row. Pure over the rows, so render and Next stay testable without
+/// reading the live namespace.
+fn userns_cause_proven(checks: &[Check]) -> bool {
+    checks
+        .iter()
+        .any(|check| is_userns_row(&check.name) && matches!(check.status, Status::Fail(_)))
 }
 
 fn not_applicable(name: &str, reason: &str) -> Check {
@@ -1765,6 +1807,7 @@ fn is_requested_lane(name: &str) -> bool {
         || is_cgroup_row(name)
         || is_run_capture_row(name)
         || is_pid_namespace_row(name)
+        || is_userns_row(name)
         || is_process_access_row(name)
 }
 
@@ -1873,7 +1916,13 @@ fn next_line(
         is_pid_namespace_row(&check.name)
             && matches!(check.status, Status::Warn(_) | Status::Fail(_))
     });
-    let next = match problem {
+    // A proven userns cause wins over every per-row step, in both modes:
+    // no grant, sudo, or kernel upgrade inside that namespace can fix
+    // the failures below, so naming any of them would mislead.
+    let next = if userns_cause_proven(checks) {
+        crate::userns::NEXT_STEP.to_string()
+    } else {
+        match problem {
         Some(check) if matches!(check.status, Status::Fail(_)) || extra_strict => {
             next_step_with_host(check, host, privileged, caps_lacking)
         }
@@ -1885,6 +1934,7 @@ fn next_line(
         None if scope == "unassessed" =>
             "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
         None => "choose a capture mode with p11scope profile --help; these checks do not prove provider activity".into(),
+        }
     };
     format!("Next: {}.\n", crate::render::escape_controls(&next))
 }
@@ -2039,7 +2089,9 @@ fn render_row(out: &mut String, check: &Check) {
 
 /// The concise default: the verdict, the failing and warning rows, the
 /// next step, and the `-v` hint. Passing and not-applicable rows stay in
-/// the verbose render. Pure like [`render`].
+/// the verbose render. While the userns cause is proven, the one plain
+/// cause line heads the output and the other FAIL rows group beneath it.
+/// Pure like [`render`].
 pub fn render_concise(checks: &[Check]) -> String {
     render_concise_with_host(checks, None)
 }
@@ -2050,11 +2102,32 @@ fn render_concise_with_host(
 ) -> String {
     let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, false));
     let _ = writeln!(out, "{}", verdict_line(checks));
-    for check in checks
-        .iter()
-        .filter(|check| matches!(check.status, Status::Fail(_) | Status::Warn(_)))
-    {
-        render_row(&mut out, check);
+    if userns_cause_proven(checks) {
+        // The proven userns cause, stated once: the user-namespace row
+        // itself is promoted to this header (it carries the same line),
+        // and every other FAIL row stays beneath it. Warnings follow
+        // flat, as without the cause. Full detail lives under -v.
+        let _ = writeln!(out, "cause: {}", crate::userns::CAUSE_LINE);
+        out.push_str("failing checks:\n");
+        for check in checks
+            .iter()
+            .filter(|check| !is_userns_row(&check.name) && matches!(check.status, Status::Fail(_)))
+        {
+            render_row(&mut out, check);
+        }
+        for check in checks
+            .iter()
+            .filter(|check| matches!(check.status, Status::Warn(_)))
+        {
+            render_row(&mut out, check);
+        }
+    } else {
+        for check in checks
+            .iter()
+            .filter(|check| matches!(check.status, Status::Fail(_) | Status::Warn(_)))
+        {
+            render_row(&mut out, check);
+        }
     }
     out.push_str(&next_line(checks, false, host));
     out.push_str(crate::cli::VERBOSE_HINT);
@@ -2081,6 +2154,7 @@ pub fn verdict(checks: &[Check]) -> i32 {
             || is_cgroup_row(&c.name)
             || is_run_capture_row(&c.name)
             || is_pid_namespace_row(&c.name)
+            || is_userns_row(&c.name)
             || is_process_access_row(&c.name))
             && matches!(c.status, Status::Fail(_))
     });
@@ -2684,13 +2758,14 @@ mod tests {
         let scan = "use 'p11scope inventory --capture scan' or 'p11scope inspect --pid N' \
             for a scan without capture.";
         match cause {
-            // The denied wording reads the runner's own mask, exactly
-            // like the producer's `Display` it mirrors.
+            // The denied wording reads the runner's own mask and user
+            // namespace, exactly like the producer's `Display` it mirrors.
             "denied" => crate::attach::denied_line(
                 operation,
                 &reason,
                 crate::caps::read_effective().unwrap_or(0),
                 &crate::caps::current_binary(),
+                crate::userns::in_init_user_ns(),
             ),
             "unavailable" => format!(
                 "live capture unavailable: {doing} is not supported on this host{reason}; \
@@ -3744,9 +3819,10 @@ mod tests {
         // 13 host/target rows, eight §10.1 rows, five finite preflight rows
         // (host, inventory, journal pair, lifecycle, scope), the cgroup
         // version row, the uprobe-multi self-link row, the PID namespace
-        // row, the minimal-setcap recipe row, the object-attribute
-        // capture build row, and the process-access confinement row.
-        assert_eq!(checks.len(), 32, "{checks:?}");
+        // row, the user namespace row, the minimal-setcap recipe row, the
+        // object-attribute capture build row, and the process-access
+        // confinement row.
+        assert_eq!(checks.len(), 33, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),
@@ -5219,6 +5295,69 @@ mod tests {
             render_quiet(&checks),
             "Doctor: requested lane unavailable.\n"
         );
+    }
+
+    /// Twins for the userns cause in the concise default. Detected: the
+    /// one plain cause line heads the output, every other FAIL row stays
+    /// grouped beneath it, the user-namespace row itself is promoted to
+    /// the header (never repeated), and Next names the host remedy, never
+    /// a grant or sudo. Not detected: the render is exactly the old
+    /// shape — no cause line, no group header, the failing row's own
+    /// Next — and the verbose render carries the row with its detail.
+    #[test]
+    fn concise_groups_failures_under_the_proven_userns_cause() {
+        use crate::userns::ObserverUserNs;
+        let mut detected = concise_checks();
+        detected.push(user_namespace_check(&ObserverUserNs::Nested));
+        let text = render_concise(&detected);
+        let cause = format!("cause: {}", crate::userns::CAUSE_LINE);
+        assert!(text.contains(&cause), "{text}");
+        assert!(text.contains("failing checks:\n"), "{text}");
+        assert!(text.contains("BPF map create"), "{text}");
+        assert!(text.contains("FAIL"), "{text}");
+        assert!(
+            !text.contains("user namespace ."),
+            "the cause row is the header, never repeated as a dotted row: {text}"
+        );
+        assert!(
+            text.contains("kernel.yama.ptrace_scope"),
+            "warnings stay: {text}"
+        );
+        let next = text
+            .lines()
+            .find(|line| line.starts_with("Next: "))
+            .unwrap();
+        assert!(
+            next.contains(crate::userns::NEXT_STEP),
+            "Next names the host remedy: {text}"
+        );
+        assert!(!next.contains("sudo"), "{text}");
+        assert!(!next.contains("setcap"), "{text}");
+        assert!(
+            text.ends_with(&format!("{}\n", crate::cli::VERBOSE_HINT)),
+            "{text}"
+        );
+        assert_eq!(verdict(&detected), 1);
+        // The verbose render keeps the row with its full detail.
+        let verbose = render(&detected);
+        assert!(verbose.contains(USER_NAMESPACE_ROW), "{verbose}");
+        assert!(verbose.contains(crate::userns::CAUSE_LINE), "{verbose}");
+        // The not-detected twin: initial and unknown namespaces render
+        // the old shape, with the failing row's own Next.
+        for numbering in [
+            ObserverUserNs::Initial,
+            ObserverUserNs::Unknown("probe withheld".to_string()),
+        ] {
+            let mut checks = concise_checks();
+            checks.push(user_namespace_check(&numbering));
+            let text = render_concise(&checks);
+            assert!(!text.contains("cause: "), "{numbering:?}: {text}");
+            assert!(!text.contains("failing checks:"), "{numbering:?}: {text}");
+            assert!(
+                text.contains("Next: review BPF map create in the checks below"),
+                "{numbering:?}: {text}"
+            );
+        }
     }
 
     #[test]

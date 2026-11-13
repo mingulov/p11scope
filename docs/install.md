@@ -128,6 +128,21 @@ without it that case is a named gap in the report. On Docker older
 than 24, whose default seccomp allows `bpf()` only with
 `CAP_SYS_ADMIN`, it is also the way to run without the seccomp file.
 
+### Rootless containers
+
+A rootless container (rootless Docker/Podman, or any container in a
+non-initial user namespace) runs p11scope but captures nothing: BPF
+and uprobes need capabilities in the host user namespace, and no
+grant inside the container's namespace counts. `doctor` reports the
+cause in one line (per-check FAIL rows grouped beneath it, full
+detail with `-v`), and `profile`, `trace`, `inventory` and `run`
+refuse with the same cause. Only `inventory` and `inspect` scans of
+same-namespace processes work, partial with named gaps. Run p11scope
+on the host or with the five-capability rootful command above
+instead; see [Rootless
+containers](../deploy/README.md#rootless-containers) for what works,
+what to do instead, and the planned BPF-token capture.
+
 ### Verify a download
 
 In the folder with the downloaded release assets, check the checksums

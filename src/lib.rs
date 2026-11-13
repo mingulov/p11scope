@@ -116,6 +116,7 @@ pub mod timing;
 pub mod trace;
 pub(crate) mod trace_identity;
 pub(crate) mod uretprobe_hazard;
+pub mod userns;
 pub mod vendor_mechanisms;
 
 /// Best-effort frontend diagnostic through the existing bounded stderr sink.

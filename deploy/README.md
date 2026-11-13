@@ -60,7 +60,8 @@ also works but drops the confinement); on SELinux-enforcing hosts no
 extra flag is needed (measured 2026-11-11, below). The example tag is
 published with the 0.7.0 release.)
 It still needs host PID and named capabilities, so rootless Docker,
-Podman and Docker Desktop's VM boundary stay unsupported, as in [the
+Podman and Docker Desktop's VM boundary stay unsupported (see
+[Rootless containers](#rootless-containers)), as in [the
 demos](../docs/demo/README.md).
 Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 `Privileged=false`, `CapDrop=[ALL]`,
@@ -130,6 +131,30 @@ The file lands root-owned (`0600`; read it with `sudo`). Measured on
 Docker 29.8.1 with the five-cap set: `inventory --system -o` into a
 root-owned mount exits 0 with the file written. Easier output
 ownership is planned for 0.8.0.
+
+## Rootless containers
+
+A rootless container (rootless Docker/Podman, or any container in a
+non-initial user namespace) runs p11scope but captures nothing. BPF
+program loads and uprobe attaches need capabilities in the host user
+namespace, and no grant inside the container's namespace counts: the
+kernel's `capable()` from a non-initial userns is always false, so a
+`--cap-add BPF --cap-add PERFMON` container still loads nothing.
+Cross-namespace process reads are refused too, so host discovery and
+caller attribution are impossible from inside any container userns.
+
+`doctor` says so plainly: one `cause:` line names the missing host
+namespace, the per-check FAIL rows group beneath it, and `-v` shows
+the full detail. `profile`, `trace`, `inventory` and `run` refuse
+with the same cause instead of a bare `Operation not permitted`.
+What still works: `inventory` and `inspect` scans of same-namespace
+processes, partial with named gaps (host targets stay unknown).
+
+What to do instead: run p11scope on the host, or with the
+five-capability rootful command above. Delegated BPF-token capture
+(one privileged host setup per container, operator-named provider
+files only, no host discovery) is planned for later; host-process
+visibility from a container userns stays impossible.
 
 Mandatory access control and kernel knobs (measured 2026-11-11):
 

@@ -7443,6 +7443,28 @@ mod native_preparation_test {
     }
 }
 
+/// The auto-PID scan-fallback gap reason, pure over typed facts. The
+/// grant advice rides only when a `Denied` refusal meets capabilities
+/// actually missing outside a proven child user namespace: in one, no
+/// grant inside it counts for BPF, and the summary already names the
+/// host remedy (the refusal line embeds the stable userns code, so the
+/// JSON `reason` carries it).
+fn pid_fallback_gap_reason(
+    denied: bool,
+    lacking: bool,
+    init_user_ns: Option<bool>,
+    summary: &str,
+) -> String {
+    if denied && lacking && init_user_ns != Some(false) {
+        format!(
+            "live capture refused ({summary}); grant the minimal capability set for \
+             full capture (see 'p11scope doctor')"
+        )
+    } else {
+        format!("live capture refused ({summary})")
+    }
+}
+
 /// The preparation boundary permits testing its actual arguments and startup
 /// refusal without loading BPF. An active lane's later refusals stay native.
 fn open_native_lane_with(
@@ -7516,26 +7538,26 @@ fn open_native_lane_with(
             // process maps, and the gap names the missing live capture.
             if mode == CaptureMode::Auto && pid_scope {
                 let summary = crate::attach::summarize_native_preparation_error(&error);
-                // The grant advice is gated on the typed cause and the
-                // live mask: only a `Denied` refusal with capabilities
-                // actually missing can the setcap grant fix. An old
-                // kernel, a verifier-shaped refusal, or a denial with
-                // the set complete (lockdown/LSM) points at doctor
-                // through the summary itself.
+                // The grant advice is gated on the typed cause, the live
+                // mask, and the live user namespace (below): only a
+                // `Denied` refusal with capabilities actually missing can
+                // the setcap grant fix. An old kernel, a verifier-shaped
+                // refusal, a denial with the set complete (lockdown/LSM),
+                // or any refusal in a proven child user namespace (no
+                // grant inside it counts for BPF) points at doctor — or
+                // the host remedy — through the summary itself.
                 let denied = error
                     .downcast_ref::<crate::attach::MultiHostRefusal>()
                     .is_some_and(crate::attach::MultiHostRefusal::needs_privilege_hint);
                 let lacking =
                     !crate::caps::missing_for_live(crate::caps::read_effective().unwrap_or(0))
                         .is_empty();
-                let reason = if denied && lacking {
-                    format!(
-                        "live capture refused ({summary}); grant the minimal capability set for \
-                         full capture (see 'p11scope doctor')"
-                    )
-                } else {
-                    format!("live capture refused ({summary})")
-                };
+                let reason = pid_fallback_gap_reason(
+                    denied,
+                    lacking,
+                    crate::userns::in_init_user_ns(),
+                    &summary,
+                );
                 return unavailable(coordinator, reason);
             }
             return Err(error);
@@ -11119,6 +11141,53 @@ mod tests {
                 Some(&refusal),
                 "{error:#}"
             );
+        }
+    }
+
+    /// Twins for the userns cause in the auto-PID fallback gap: detected
+    /// drops the grant advice (no grant inside that namespace counts for
+    /// BPF) while the summary carries the stable userns code into the
+    /// JSON `reason`; not detected keeps the grant advice when a
+    /// `Denied` refusal meets missing capabilities.
+    #[test]
+    fn pid_fallback_gap_names_the_userns_cause_without_grant_advice() {
+        let summary = crate::attach::denied_line(
+            "load p11scope's BPF programs",
+            " (Operation not permitted)",
+            0,
+            "/usr/bin/p11scope",
+            Some(false),
+        );
+        let reason = pid_fallback_gap_reason(true, true, Some(false), &summary);
+        assert!(
+            reason.contains(crate::userns::CAUSE_CODE),
+            "the JSON reason carries the stable code: {reason}"
+        );
+        assert!(
+            !reason.contains("grant the minimal capability set"),
+            "no grant advice in a child userns: {reason}"
+        );
+        assert!(!reason.contains("sudo"), "{reason}");
+        // The not-detected twin: initial and unreadable namespaces keep
+        // the grant advice for a denied refusal with missing caps, and
+        // keep the plain refusal otherwise.
+        for init_user_ns in [Some(true), None] {
+            let reason = pid_fallback_gap_reason(true, true, init_user_ns, "denied summary");
+            assert!(
+                reason.contains("grant the minimal capability set"),
+                "{init_user_ns:?}: {reason}"
+            );
+            for (denied, lacking) in [(false, true), (true, false), (false, false)] {
+                let reason = pid_fallback_gap_reason(denied, lacking, init_user_ns, "summary");
+                assert!(
+                    !reason.contains("grant the minimal capability set"),
+                    "{init_user_ns:?} x {denied}/{lacking}: {reason}"
+                );
+                assert!(
+                    reason.contains("live capture refused (summary)"),
+                    "{reason}"
+                );
+            }
         }
     }
 

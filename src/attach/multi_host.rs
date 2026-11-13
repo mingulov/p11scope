@@ -153,11 +153,23 @@ fn errno_name(errno: i32) -> String {
 /// missing load capability with what it enables, plus the one-line
 /// recipe; when the load set is complete — or `CAP_SYS_ADMIN` is held,
 /// which suffices for BPF load — the refusal is other enforcement
-/// (lockdown, LSM, seccomp), never more privilege. Child-userns holders
-/// (the bit set but ignored by the kernel for BPF) also read lockdown
-/// here: this line has no userns input (the self-probe path names userns
-/// separately).
-pub(crate) fn denied_line(operation: &str, reason: &str, effective: u64, binary: &str) -> String {
+/// (lockdown, LSM, seccomp), never more privilege. Checked first: a
+/// proven child user namespace (a rootless container) refuses with the
+/// same plain cause doctor names, never the kernel-refusal text — no
+/// grant inside that namespace can fix it, so no privilege is named.
+pub(crate) fn denied_line(
+    operation: &str,
+    reason: &str,
+    effective: u64,
+    binary: &str,
+    init_user_ns: Option<bool>,
+) -> String {
+    if init_user_ns == Some(false) {
+        return format!(
+            "live capture refused: {}; or use 'p11scope inspect --pid N' for a scan without capture.",
+            crate::userns::CAUSE_LINE
+        );
+    }
     let missing = crate::caps::missing_in(effective, &crate::caps::LOAD_BITS);
     if missing.is_empty() {
         format!(
@@ -208,7 +220,8 @@ impl std::fmt::Display for MultiHostRefusal {
                         operation,
                         &reason,
                         effective,
-                        &crate::caps::current_binary()
+                        &crate::caps::current_binary(),
+                        crate::userns::in_init_user_ns()
                     )
                 )
             }
@@ -447,6 +460,7 @@ mod tests {
                 " (Operation not permitted)",
                 0,
                 "/usr/bin/p11scope",
+                Some(true),
             ),
             "live capture needs CAP_BPF (load BPF programs and attach probes); needs CAP_PERFMON \
              (load BPF programs alongside CAP_BPF): the kernel refused to load p11scope's BPF programs \
@@ -515,6 +529,7 @@ mod tests {
                 " (Operation not permitted)",
                 full & !(1u64 << bit),
                 binary,
+                Some(true),
             );
             assert!(line.contains(needs), "{line}");
             assert!(line.contains(&recipe), "{line}");
@@ -534,6 +549,7 @@ mod tests {
             " (Operation not permitted)",
             u64::MAX,
             binary,
+            Some(true),
         );
         assert!(
             line.contains("the kernel refused to attach p11scope's probes"),
@@ -565,6 +581,7 @@ mod tests {
                 " (Operation not permitted)",
                 effective,
                 binary,
+                Some(true),
             );
             assert!(
                 line.contains("the kernel refused to load p11scope's BPF programs"),
@@ -578,6 +595,50 @@ mod tests {
             assert!(line.contains("p11scope inspect --pid N"), "{line}");
             assert_eq!(line.lines().count(), 1);
             assert!(line.len() < 1_024, "{line}");
+        }
+    }
+
+    /// Twins for the userns cause: a proven child user namespace refuses
+    /// with the same plain cause doctor names (never the kernel-refusal
+    /// text, never a grant no userns member can use); an initial or
+    /// unreadable namespace keeps the old wording byte for byte.
+    #[test]
+    fn denied_line_userns_cause_replaces_kernel_refusal_when_proven() {
+        let operation = "load p11scope's BPF programs";
+        let reason = " (Operation not permitted)";
+        let binary = "/usr/bin/p11scope";
+        let line = super::denied_line(operation, reason, 0, binary, Some(false));
+        assert!(line.starts_with("live capture refused: "), "{line}");
+        assert!(line.contains(crate::userns::CAUSE_LINE), "{line}");
+        assert!(
+            line.contains(crate::userns::CAUSE_CODE),
+            "JSON gap reasons embed this line, so the stable code rides along: {line}"
+        );
+        assert!(
+            !line.contains("the kernel refused to load"),
+            "the proven cause replaces the kernel-refusal text: {line}"
+        );
+        assert!(!line.contains("needs CAP_"), "{line}");
+        assert!(!line.contains("Grant the minimal set"), "{line}");
+        assert!(!line.contains("sudo"), "{line}");
+        assert!(line.contains("p11scope inspect --pid N"), "{line}");
+        assert!(line.contains("deploy/README.md"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.len() < 1_024, "{line}");
+        // The not-detected twin: initial and unreadable namespaces keep
+        // the old text, whatever the mask.
+        for init_user_ns in [Some(true), None] {
+            for effective in [0u64, u64::MAX] {
+                let line = super::denied_line(operation, reason, effective, binary, init_user_ns);
+                assert!(
+                    line.contains("the kernel refused to load p11scope's BPF programs"),
+                    "{init_user_ns:?} x {effective:#x}: {line}"
+                );
+                assert!(
+                    !line.contains(crate::userns::CAUSE_CODE),
+                    "{init_user_ns:?} x {effective:#x}: {line}"
+                );
+            }
         }
     }
 

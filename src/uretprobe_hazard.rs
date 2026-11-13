@@ -141,7 +141,7 @@ impl AssessmentContext {
             capabilities: status.as_deref().and_then(parse_cap_eff),
             user_namespace: std::fs::read_link("/proc/thread-self/ns/user")
                 .ok()
-                .and_then(|path| parse_user_ns_link(&path.to_string_lossy())),
+                .and_then(|path| crate::userns::parse_user_ns_link(&path.to_string_lossy())),
             seccomp: status.as_deref().and_then(parse_seccomp_mode),
             filters: status.as_deref().and_then(|status| {
                 status
@@ -559,11 +559,10 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
     }
 }
 
-/// `PROC_USER_INIT_INO`: the nsfs inode of the initial user namespace
-/// (`include/linux/proc_ns.h`), as `PROC_PID_INIT_INO` is for PIDs.
-const INIT_USER_NS_INODE: u64 = 0xEFFF_FFFD;
-
 /// The privilege facts a not-permitted refusal is explained from.
+/// User-namespace identity itself lives in [`crate::userns`]: one inode
+/// constant and one link parser for every consumer, so the two cannot
+/// drift (F-09).
 ///
 /// `CapEff` lists capabilities in the task's **own** user namespace, while
 /// BPF and perf check them in the initial one, so a uid 0 with a full
@@ -610,10 +609,7 @@ impl PrivilegeFacts {
             euid_root: euid == 0,
             cap_eff,
             sys_admin: cap_eff.map(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
-            init_user_ns: user_ns
-                .ok()
-                .and_then(|link| parse_user_ns_link(&link))
-                .map(|inode| inode == INIT_USER_NS_INODE),
+            init_user_ns: crate::userns::classify(user_ns).as_bool(),
             perf_event_paranoid: paranoid
                 .ok()
                 .and_then(|value| value.trim().parse::<i64>().ok()),
@@ -625,15 +621,6 @@ impl PrivilegeFacts {
     fn sys_admin_counts(&self) -> bool {
         self.sys_admin == Some(true) && self.init_user_ns != Some(false)
     }
-}
-
-/// `user:[4026531837]` → `4026531837`; any other shape → `None`.
-fn parse_user_ns_link(link: &str) -> Option<u64> {
-    let digits = link.strip_prefix("user:[")?.strip_suffix(']')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
 }
 
 fn parse_cap_eff(status: &str) -> Option<u64> {
@@ -1853,12 +1840,15 @@ mod tests {
         assert!(!message.contains("without CAP_SYS_ADMIN"), "{message}");
         assert!(!message.contains("lockdown"), "{message}");
         assert_eq!(
-            parse_user_ns_link("user:[4026531837]"),
-            Some(INIT_USER_NS_INODE)
+            crate::userns::parse_user_ns_link("user:[4026531837]"),
+            Some(crate::userns::INIT_USER_NS_INODE)
         );
-        assert_eq!(parse_user_ns_link("user:[4026532001]"), Some(4_026_532_001));
-        assert_eq!(parse_user_ns_link("pid:[4026531837]"), None);
-        assert_eq!(parse_user_ns_link(""), None);
+        assert_eq!(
+            crate::userns::parse_user_ns_link("user:[4026532001]"),
+            Some(4_026_532_001)
+        );
+        assert_eq!(crate::userns::parse_user_ns_link("pid:[4026531837]"), None);
+        assert_eq!(crate::userns::parse_user_ns_link(""), None);
     }
 
     #[test]

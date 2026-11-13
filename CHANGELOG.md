@@ -119,6 +119,10 @@ versioned separately and are opaque, exact dispatch keys.
   file binds, so providers under an overlay or a bind-mounted file are
   learned; automount triggers and device binds are skipped, and the
   mark pass is bounded so a hung mount cannot stall the capture.
+- Discovery runs faster at scale: a lazily built raw-key index and
+  by-ID pin lookup join more calls (scale cell: 14 of 16 passes vs
+  12 of 14, 31% more joined calls), and cheaper bind (about 4x) and
+  projection (about 2x) steps cut per-call cost.
 
 ### Changed
 

@@ -7,11 +7,6 @@
 # `nobody` user with exactly the minimal setcap set, no sudo, no CAP_SYS_ADMIN).
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp, so the binary and
 # OUTDIR must live under /home. Take the VM lane lock around this script.
-# The vng invocation runs under scripts/ci/vng-boot-watch.sh (console to
-# OUTDIR/vng-console.log, diagnostics to OUTDIR/vng-boot-diag.log): host
-# KVM is proven before the boot, and a guest that prints nothing and
-# writes no uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips
-# VNG_BOOT_TIMEOUT instead of hanging to the job timeout.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
 # Exit codes: the guest's qualify exit (0 qualifies, 1 fails, 2 is the
 # documented nonqualifying smoke); 1 when vng itself fails, when the results
@@ -21,8 +16,6 @@
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-WATCH="$REPO/scripts/ci/vng-boot-watch.sh"
-[ -x "$WATCH" ] || { echo "qualify-public-cli-vng.sh: boot watch missing: $WATCH" >&2; exit 1; }
 case "$BIN:$OUT" in /tmp/*|/var/tmp/*|*:/tmp/*|*:/var/tmp/*) echo "binary and OUTDIR must be under /home" >&2; exit 64;; esac
 # p11scope refuses -o directories writable by group/other; keep the tree owner-only.
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e "$OUT")
@@ -41,8 +34,7 @@ echo "minimal_exit=\$?" >> $OUT/minimal.log
 cp -r /tmp/qual/minimal-cells $OUT/minimal-cells
 INNER
 s=$(date +%s)
-"$WATCH" --marker "$OUT/uname.txt" --console "$OUT/vng-console.log" --diag "$OUT/vng-boot-diag.log" -- \
-    vng --run "$K" --user root --cpus 4 --memory 4G --rwdir "$OUT" --exec "sh $OUT/inner.sh"
+vng --run "$K" --user root --cpus 4 --memory 4G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1
 vng_exit=$?
 echo "vng_exit=$vng_exit wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(cat "$OUT/cells/summary.txt" 2>/dev/null)"
 [ "$vng_exit" -eq 0 ] || exit 1

@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -44,7 +43,6 @@ EXPECTED_CELLS = [
 # A canned guest: parses --run/--rwdir from the script's vng invocation and
 # writes the artifacts a real guest would, per FAKE_VNG_MODE. Never boots.
 FAKE_VNG = r'''#!/bin/sh
-case "$1" in --version) echo "virtme-ng 1.41-stub"; exit 0;; esac
 kernel=""; out=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,7 +53,6 @@ while [ $# -gt 0 ]; do
 done
 mode="${FAKE_VNG_MODE:-all-pass}"
 if [ "$mode" = "rc1" ]; then echo "vng: cannot boot"; exit 1; fi
-if [ "$mode" = "hang-no-output" ]; then sleep 30; exit 0; fi
 release="${kernel#v}"
 [ "$mode" = "wrong-kernel" ] && release="9.9.9"
 echo "$release" > "$out/uname.txt"
@@ -111,17 +108,10 @@ class LibCellsVngTests(unittest.TestCase):
         libtest.chmod(0o700)
         self.libtest = libtest
 
-    def run_script(self, *args, mode="all-pass", path=None, extra_env=None):
-        # VNG_BOOT_WATCH_TEST skips the helper's live KVM probe: these
-        # tests pin exit plumbing with a stubbed vng, and KVM is not
-        # openable on CI script lanes. The probe itself is covered by
-        # tests/python/test_vng_boot_watch.py.
+    def run_script(self, *args, mode="all-pass", path=None):
         env = dict(os.environ, FAKE_VNG_MODE=mode,
                    FAKE_CELLS_FILE=str(self.cells_file),
-                   LIB_CELLS_VNG_TEST="1",
-                   VNG_BOOT_WATCH_TEST="1")
-        if extra_env:
-            env.update(extra_env)
+                   LIB_CELLS_VNG_TEST="1")
         env["PATH"] = (str(self.bin) if path is None else path) + os.pathsep + env["PATH"]
         out = self.work / "out"
         command = [str(SCRIPT), str(self.libtest), str(out), *args]
@@ -196,21 +186,6 @@ class LibCellsVngTests(unittest.TestCase):
     def test_vng_failure_is_a_harness_error(self):
         result, _ = self.run_script("v6.6.157", mode="rc1")
         self.assertEqual(result.returncode, 2, result.stderr)
-
-    def test_silent_hang_trips_the_boot_watchdog(self):
-        # The zero-byte signature (a vng that prints nothing and writes
-        # no marker) must trip VNG_BOOT_TIMEOUT fast with diagnostics,
-        # instead of riding the blind 1200s timeout.
-        extra = {"VNG_BOOT_TIMEOUT_S": "3"}
-        start = time.monotonic()
-        result, out = self.run_script("v6.6.157", mode="hang-no-output",
-                                      extra_env=extra)
-        elapsed = time.monotonic() - start
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("VNG_BOOT_TIMEOUT", result.stderr)
-        diag = out / "v6.6.157" / "vng-boot-diag.log"
-        self.assertTrue(diag.is_file(), f"diag missing; stderr: {result.stderr}")
-        self.assertLess(elapsed, 25, f"watchdog did not trip fast: {elapsed:.1f}s")
 
     def test_missing_vng_exits_77(self):
         # Only realpath is reachable: the script needs it before the vng

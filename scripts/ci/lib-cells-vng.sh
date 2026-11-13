@@ -34,12 +34,7 @@
 # the virtme-ng cache (the check-bpf-load-kernels.sh pattern), so the
 # instance hooks load the way they do on ordinary hosts. Per-cell evidence
 # and logs are copied back to OUTDIR/<kernel>/; OUTDIR/results.jsonl carries
-# one row per cell: {"cell", "pass", "qualification", "detail"}. Each vng
-# invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is proven
-# before the boot, and a guest that prints nothing and writes no uname.txt
-# within VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT with
-# diagnostics (OUTDIR/<kernel>/vng-boot-diag.log) instead of riding the
-# blind 1200s timeout.
+# one row per cell: {"cell", "pass", "qualification", "detail"}.
 #
 # Exit codes: 0 every cell passed; 1 a cell failed; 2 harness error
 # (bad usage, vng failure, wrong guest kernel, missing logs);
@@ -69,9 +64,6 @@ if [ "${LIB_CELLS_VNG_TEST:-0}" != 1 ]; then
     esac
 fi
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e -- "$OUT") || exit 2
-HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
-WATCH="$HERE/vng-boot-watch.sh"
-[ -x "$WATCH" ] || { echo "lib-cells-vng.sh: boot watch missing: $WATCH" >&2; exit 2; }
 
 # Single-quote a path for the guest shell.
 q() {
@@ -105,7 +97,7 @@ for KERNEL in "$@"; do
     esac
     KOUT="$OUT/$KERNEL"
     mkdir -p "$KOUT" && chmod 755 "$KOUT" || exit 2
-    rm -f "$KOUT"/cell-*.log "$KOUT"/status.txt "$KOUT"/uname.txt "$KOUT"/vng-console.log "$KOUT"/vng-boot-diag.log
+    rm -f "$KOUT"/cell-*.log "$KOUT"/status.txt "$KOUT"/uname.txt "$KOUT"/vng-console.log
     {
         printf '#!/bin/sh\nset -u\n'
         printf 'KOUT=%s\nLIBTEST=%s\nVNG_CACHE=%s\n' "$(q "$KOUT")" "$(q "$LIBTEST")" "$(q "$VNG_CACHE")"
@@ -135,9 +127,8 @@ INNER_EOF
         printf 'echo "cells-done count=%d"\n' "${#CELLS[@]}"
     } > "$KOUT/inner.sh"
     s=$(date +%s)
-    if ! "$WATCH" --marker "$KOUT/uname.txt" --console "$KOUT/vng-console.log" --diag "$KOUT/vng-boot-diag.log" -- \
-        timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
-        --rwdir "$KOUT" --exec "sh $KOUT/inner.sh" < /dev/null; then
+    if ! timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+        --rwdir "$KOUT" --exec "sh $KOUT/inner.sh" < /dev/null >"$KOUT/vng-console.log" 2>&1; then
         echo "lib-cells-vng.sh: vng run failed or timed out on $KERNEL (see $KOUT/vng-console.log)" >&2
         HARNESS_FAILED=1
         continue

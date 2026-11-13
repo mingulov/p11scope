@@ -11,11 +11,7 @@
 # run with TMPDIR on a guest-local tmpfs: the shared 9p tree slows
 # capture cells and remaps ownership. OUTDIR receives cells/results.jsonl,
 # cells/summary.txt, one cells/<test>.log per cell, run.log, uname.txt,
-# vng-console.log, vng-boot-diag.log and the staged kernel-config. The
-# vng invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is
-# proven before the boot, and a guest that prints nothing and writes no
-# uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT
-# with diagnostics instead of riding the blind 1200s timeout.
+# vng-console.log and the staged kernel-config.
 #
 # The pre-arm witness needs the running kernel's LTO status from
 # /boot/config-{release}, but the shared rootfs only carries the host's
@@ -56,8 +52,6 @@ fi
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 RUNNER="$HERE/run-run-tree.sh"
 [ -x "$RUNNER" ] || { echo "run-tree-vng.sh: cell runner missing: $RUNNER" >&2; exit 2; }
-WATCH="$HERE/vng-boot-watch.sh"
-[ -x "$WATCH" ] || { echo "run-tree-vng.sh: boot watch missing: $WATCH" >&2; exit 2; }
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e -- "$OUT") || exit 2
 # Stage the booted kernel's config for the guest LTO gate: the vng cache
 # holds exactly one config per kernel tag.
@@ -123,9 +117,8 @@ INNER_EOF
 } > "$OUT/inner.sh"
 
 s=$(date +%s)
-if ! "$WATCH" --marker "$OUT/uname.txt" --console "$OUT/vng-console.log" --diag "$OUT/vng-boot-diag.log" -- \
-    timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
-    --rwdir "$OUT" --exec "sh $OUT/inner.sh" < /dev/null; then
+if ! timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+    --rwdir "$OUT" --exec "sh $OUT/inner.sh" < /dev/null >"$OUT/vng-console.log" 2>&1; then
     echo "run-tree-vng.sh: vng run failed or timed out on $KERNEL (see $OUT/vng-console.log)" >&2
     exit 2
 fi

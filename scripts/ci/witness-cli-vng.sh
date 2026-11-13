@@ -12,11 +12,7 @@
 # run with TMPDIR on a guest-local tmpfs: the shared 9p tree slows
 # capture cells and remaps ownership. OUTDIR receives cells/results.jsonl,
 # cells/summary.txt, one cells/<test>.log per cell, run.log, uname.txt,
-# vng-console.log, vng-boot-diag.log and the staged kernel-config. The
-# vng invocation runs under scripts/ci/vng-boot-watch.sh: host KVM is
-# proven before the boot, and a guest that prints nothing and writes no
-# uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips VNG_BOOT_TIMEOUT
-# with diagnostics instead of riding the blind 1200s timeout.
+# vng-console.log and the staged kernel-config.
 #
 # The pre-arm witness needs the running kernel's LTO status from
 # /boot/config-{release}, but the shared rootfs only carries the host's
@@ -58,8 +54,6 @@ fi
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 RUNNER="$HERE/run-witness-cli.sh"
 [ -x "$RUNNER" ] || { echo "witness-cli-vng.sh: cell runner missing: $RUNNER" >&2; exit 2; }
-WATCH="$HERE/vng-boot-watch.sh"
-[ -x "$WATCH" ] || { echo "witness-cli-vng.sh: boot watch missing: $WATCH" >&2; exit 2; }
 # Guest release match, shared with the BPF load drivers.
 [ -f "$HERE/../bpf-guest-release.sh" ] || { echo "release match not found: $HERE/../bpf-guest-release.sh" >&2; exit 2; }
 . "$HERE/../bpf-guest-release.sh"
@@ -107,9 +101,8 @@ INNER_EOF
 } > "$OUT/inner.sh"
 
 s=$(date +%s)
-if ! "$WATCH" --marker "$OUT/uname.txt" --console "$OUT/vng-console.log" --diag "$OUT/vng-boot-diag.log" -- \
-    timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
-    --rwdir "$OUT" --exec "sh $OUT/inner.sh" < /dev/null; then
+if ! timeout -k 30 1200 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+    --rwdir "$OUT" --exec "sh $OUT/inner.sh" < /dev/null >"$OUT/vng-console.log" 2>&1; then
     echo "witness-cli-vng.sh: vng run failed or timed out on $KERNEL (see $OUT/vng-console.log)" >&2
     exit 2
 fi

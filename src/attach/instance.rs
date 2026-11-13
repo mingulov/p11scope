@@ -402,9 +402,10 @@ fn modules_build_matches_release(
 
 /// Ordered LTO verdict for one release over explicit paths (the test seam;
 /// production passes the RUNNING release's real paths). First verifiable
-/// source in order decides: `/boot/config-{release}`, `/proc/config.gz`,
-/// then the modules `.config` only with a release proof. Nothing
-/// verifiable refuses with every attempt named; LTO-off is never assumed.
+/// source in order decides: the running kernel's own `/proc/config.gz`,
+/// then `/boot/config-{release}`, then the modules `.config` only with a
+/// release proof. Nothing verifiable refuses with every attempt named;
+/// LTO-off is never assumed.
 fn lto_refusal_for_release(
     release: &str,
     boot_path: &Path,
@@ -414,18 +415,6 @@ fn lto_refusal_for_release(
     utsrelease_path: &Path,
 ) -> Option<String> {
     let mut failures = Vec::new();
-    match std::fs::read_to_string(boot_path) {
-        Ok(config) => {
-            if lto_enabled_in_config(&config) {
-                return Some(format!(
-                    "instance continuity hooks refused: LTO kernel ({} enables CONFIG_LTO_*; inlined hook-target copies escape fentry)",
-                    boot_path.display()
-                ));
-            }
-            return None;
-        }
-        Err(error) => failures.push(format!("{}: {error}", boot_path.display())),
-    }
     match std::fs::read(proc_gz_path) {
         Ok(bytes) => match decode_proc_config_gz(&bytes) {
             Ok(config) => {
@@ -440,6 +429,18 @@ fn lto_refusal_for_release(
             Err(error) => failures.push(format!("{}: {error}", proc_gz_path.display())),
         },
         Err(error) => failures.push(format!("{}: {error}", proc_gz_path.display())),
+    }
+    match std::fs::read_to_string(boot_path) {
+        Ok(config) => {
+            if lto_enabled_in_config(&config) {
+                return Some(format!(
+                    "instance continuity hooks refused: LTO kernel ({} enables CONFIG_LTO_*; inlined hook-target copies escape fentry)",
+                    boot_path.display()
+                ));
+            }
+            return None;
+        }
+        Err(error) => failures.push(format!("{}: {error}", boot_path.display())),
     }
     if !modules_build_matches_release(release, kernel_release_path, utsrelease_path) {
         failures.push(format!(
@@ -471,11 +472,12 @@ fn lto_refusal_for_release(
 /// Kernel LTO preflight (B2): refuses the hooks on LTO kernels, and on
 /// kernels whose LTO status is unverifiable, with a named reason each.
 /// Reads the RUNNING release's config from the first verifiable source in
-/// order: the distro `/boot/config-{release}` (absent on Arch/NixOS), the
-/// kernel's own `/proc/config.gz` (IKCONFIG_PROC; gzip via flate2's
-/// pure-Rust backend), then `/lib/modules/{release}/build/.config` only
-/// when the build tree provably names the running release. Nothing
-/// verifiable refuses; LTO-off is never assumed. A kallsyms ThinLTO
+/// order: the running kernel's own `/proc/config.gz` (IKCONFIG_PROC;
+/// gzip via flate2's pure-Rust backend), then the distro
+/// `/boot/config-{release}` (absent on Arch/NixOS), then
+/// `/lib/modules/{release}/build/.config` only when the build tree
+/// provably names the running release. Nothing verifiable refuses;
+/// LTO-off is never assumed. A kallsyms ThinLTO
 /// (`.llvm.`) signal is deliberately unused: presence implies LTO but
 /// absence does not imply non-LTO (full LTO, restricted kallsyms), so it
 /// is unsound in the allow direction. Stage 5 per-cell preflight
@@ -3992,6 +3994,50 @@ mod tests {
     }
 
     #[test]
+    fn lto_proc_config_gz_decides_before_boot() {
+        // N4: the running kernel's own config wins over the distro
+        // file: inside a container a mismatched `/boot` file must not
+        // decide. Both directions disagree, so order alone explains
+        // the verdict.
+        let directory = tempfile::tempdir().unwrap();
+        let boot = directory.path().join("config-9.9.9-test");
+        let gz = directory.path().join("config.gz");
+        let modules = directory.path().join("dotconfig");
+        let kernel_release = directory.path().join("kernel.release");
+        let utsrelease = directory.path().join("utsrelease.h");
+        std::fs::write(&boot, "CONFIG_LTO_CLANG_THIN=y\n").unwrap();
+        std::fs::write(&gz, gzip_bytes("CONFIG_LTO_NONE=y\n")).unwrap();
+        assert_eq!(
+            super::lto_refusal_for_release(
+                "9.9.9-test",
+                &boot,
+                &gz,
+                &modules,
+                &kernel_release,
+                &utsrelease,
+            ),
+            None,
+            "the kernel's own LTO-off gz must overrule a mismatched LTO /boot file",
+        );
+        std::fs::write(&boot, "CONFIG_LTO_NONE=y\n").unwrap();
+        std::fs::write(&gz, gzip_bytes("CONFIG_LTO_CLANG_FULL=y\n")).unwrap();
+        let refusal = super::lto_refusal_for_release(
+            "9.9.9-test",
+            &boot,
+            &gz,
+            &modules,
+            &kernel_release,
+            &utsrelease,
+        )
+        .expect("the kernel's own LTO gz must overrule a mismatched LTO-off /boot file");
+        assert!(refusal.contains("LTO kernel"), "{refusal}");
+        assert!(
+            refusal.contains(gz.display().to_string().as_str()),
+            "the gz source must name its own path: {refusal}"
+        );
+    }
+
+    #[test]
     fn lto_missing_all_sources_refuses_unverifiable() {
         let directory = tempfile::tempdir().unwrap();
         let boot = directory.path().join("config-9.9.9-test");
@@ -4074,7 +4120,9 @@ mod tests {
     }
 
     #[test]
-    fn lto_boot_config_decides_first() {
+    fn lto_boot_config_decides_without_proc_config_gz() {
+        // The distro file is the second source now: it decides when the
+        // kernel's own gz is absent, and when the gz is corrupt.
         let directory = tempfile::tempdir().unwrap();
         let boot = directory.path().join("config-9.9.9-test");
         let gz = directory.path().join("config.gz");
@@ -4104,6 +4152,20 @@ mod tests {
         )
         .expect("LTO boot config must refuse");
         assert!(refusal.contains("LTO kernel"), "{refusal}");
+        std::fs::write(&gz, b"not a gzip stream".as_slice()).unwrap();
+        std::fs::write(&boot, "CONFIG_LTO_NONE=y\n").unwrap();
+        assert_eq!(
+            super::lto_refusal_for_release(
+                "9.9.9-test",
+                &boot,
+                &gz,
+                &modules,
+                &kernel_release,
+                &utsrelease,
+            ),
+            None,
+            "a corrupt gz must fall through to the boot verdict",
+        );
     }
 
     #[test]

@@ -23905,6 +23905,7 @@ int main(int argc, char **argv) {
         &mut engine.budget,
         engine.broad_admit,
         &mut engine.stage_timings,
+        None,
     );
     let (modules, _, _) = metadata.unwrap();
     assert_eq!(
@@ -38709,6 +38710,7 @@ fn p2_refuse_then_exit(
             Ok(outcome)
         },
         None,
+        None,
     );
     assert!(
         result
@@ -43318,6 +43320,7 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
         false,
         &mut engine.stage_timings,
         None,
+        None,
     );
     let (found, _, complete) = scan_result.expect("the view still scans");
     assert!(complete, "an unchanged full scan is complete");
@@ -43995,6 +43998,7 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
         false,
         &mut engine.stage_timings,
         None,
+        None,
     );
     let (found, fresh_pins, _) = scan_result.expect("the view still scans");
     assert!(
@@ -44073,6 +44077,7 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        None,
         None,
     );
     let (found, fresh_pins, _) = scan_result.expect("the view still scans");
@@ -44584,6 +44589,7 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        None,
     );
     let (found, _, complete) = scan_result.expect("the metadata snapshot scans");
     assert!(complete, "the metadata snapshot is complete");
@@ -44624,6 +44630,7 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        None,
         None,
     );
     let (found, _, complete) = scan_result.expect("the memory snapshot scans");
@@ -45410,6 +45417,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut crate::timing::StageTimings::default(),
         clean,
         None,
+        None,
     )
     .unwrap();
     assert!(complete);
@@ -45435,6 +45443,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
                 scan_ms: 0,
             })
         },
+        None,
         None,
     )
     .unwrap();
@@ -45462,6 +45471,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
             })
         },
         None,
+        None,
     )
     .unwrap();
     assert!(!complete, "a truncating skip is incomplete");
@@ -45485,6 +45495,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
             })
         },
         None,
+        None,
     )
     .unwrap();
     assert!(!complete, "an unavailable scan is incomplete");
@@ -45502,6 +45513,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         false,
         &mut crate::timing::StageTimings::default(),
         clean,
+        None,
         None,
     )
     .unwrap();
@@ -45529,6 +45541,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
                 scan_ms: 0,
             })
         },
+        None,
         None,
     )
     .unwrap();
@@ -48072,6 +48085,52 @@ fn scan_pins_waited_only_for_reserve_names_the_preemptive_stop() {
     assert!(!scan_pins_waited_only_for_reserve(&[]));
 }
 
+/// View-collapse fix8 F2 (budget tail): the matcher fires only when
+/// every wait gap carries the not-attempted budget detail — a real
+/// open-exhaustion wait beside it keeps the fd-table-exhausted tail,
+/// and ordinary per-path skips never matter.
+#[test]
+fn scan_pins_waited_only_for_budget_names_the_preemptive_stop() {
+    let stop = Skipped {
+        subject: "library file open".into(),
+        reason: format!(
+            "/lib/a.so: {}; the pin waits for the next tick",
+            crate::discovery::identity::PIN_BUDGET_STOP_DETAIL
+        ),
+    };
+    let reserve = Skipped {
+        subject: "library file open".into(),
+        reason: format!(
+            "/lib/b.so: {}; the pin waits for the next tick",
+            crate::discovery::identity::PIN_RESERVE_STOP_DETAIL
+        ),
+    };
+    let exhausted = Skipped {
+        subject: "library file open".into(),
+        reason: "/lib/c.so: opening object within retained target root: Too many open files (os error 24); the pin waits for the next tick".into(),
+    };
+    let ordinary = Skipped {
+        subject: "/lib/d.so".into(),
+        reason: "identity_mismatch: the mapping changed under the scan".into(),
+    };
+    assert!(scan_pins_waited_only_for_budget(&[
+        ordinary.clone(),
+        stop.clone()
+    ]));
+    assert!(!scan_pins_waited_only_for_budget(&[
+        stop.clone(),
+        exhausted.clone()
+    ]));
+    assert!(!scan_pins_waited_only_for_budget(&[
+        stop.clone(),
+        reserve.clone()
+    ]));
+    assert!(!scan_pins_waited_only_for_budget(&[exhausted]));
+    assert!(!scan_pins_waited_only_for_budget(&[reserve]));
+    assert!(!scan_pins_waited_only_for_budget(&[ordinary]));
+    assert!(!scan_pins_waited_only_for_budget(&[]));
+}
+
 /// View-collapse fix7 F1 at the admission seam (codex blocking): a live
 /// admission whose scan wants more pins than the reserve covers stops
 /// mid-scan — the view defers whole under the RESERVE tail (not the
@@ -48256,6 +48315,146 @@ fn intra_scan_reserve_stop_defers_whole_view_for_retry() {
         "the retry measures its defer-to-retry delay"
     );
     println!("\n{COMPLETED}");
+}
+
+/// View-collapse fix8 F2 at the admission seam (codex blocking
+/// 1001-handle probe): a live admission whose scan wants more NEW pins
+/// than the handle budget covers stops mid-scan — the view defers
+/// whole under the BUDGET tail (not the fd-table-exhausted tail:
+/// nothing over the cap was retained, the guard tripped first), the
+/// pid owes a handles-first retry, and the retry stages once the
+/// budget frees. No rlimit games: a scripted cap of 2 with one held
+/// lender and two dlopened fixture providers trips the stop
+/// deterministically on the second new pin.
+#[test]
+fn intra_scan_budget_stop_defers_whole_view_for_retry() {
+    let first = E07Provider::dlopen();
+    let second = E07Provider::dlopen();
+    let live_pid = std::process::id();
+    let hints = vec![first.path.clone(), second.path.clone()];
+    // The fixture proves itself first: the hinted self-scan must yield
+    // at least two pins, or the stop below would have nothing to trip.
+    {
+        let view = ProcessView::open(ProcessViewId(999), live_pid).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let mut timings = crate::timing::StageTimings::new();
+        let (scan, _) = Engine::scan_retained_view(
+            &view,
+            &hints,
+            &HookRegistry::builtin(),
+            &mut budget,
+            false,
+            &mut timings,
+            None,
+            None,
+        );
+        let (_, pins, _) = scan.expect("the fixture scan runs");
+        assert!(
+            pins.pinned().count() >= 2,
+            "two providers pin at least two files: {}",
+            pins.pinned().count()
+        );
+    }
+    let mut engine = Engine::empty();
+    engine.module_hints = hints;
+    // One held lender (distinct from the scan's files), cap 2: the
+    // loop-top admits, the first new pin fits, the second trips.
+    let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+        std::path::Path::new("/dev/null"),
+        None,
+        0,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    engine.scan_inputs.insert(
+        ProcessViewId(1001),
+        ScanInput {
+            modules: Vec::new(),
+            pins,
+            counters: DiscoveryCounters::default(),
+        },
+    );
+    engine.library_handle_cap_for_test = Some(2);
+    let tick_start = 1_000_000u64;
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, failed, skipped) = engine.admit_inventory_new_views(
+        vec![live_pid],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut tick_now,
+    );
+    assert!(
+        failed.contains(&live_pid),
+        "the stopped scan defers whole: {failed:?} {skipped:?}"
+    );
+    assert!(
+        !new_views.iter().any(|(view, _, _)| view.pid() == live_pid),
+        "the stopped scan stages no view"
+    );
+    let waited: Vec<_> = skipped
+        .iter()
+        .filter(|skip| skip.subject == "library file open")
+        .collect();
+    assert!(
+        !waited.is_empty(),
+        "the stop files pre-emptive waits: {skipped:?}"
+    );
+    assert!(
+        waited.iter().all(|skip| skip
+            .reason
+            .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL)),
+        "the waits name the pre-emptive budget stop: {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.subject == "live discovery tick"
+                && skip.reason.contains("library-handle budget")),
+        "the stop files the budget tail: {skipped:?}"
+    );
+    assert!(
+        !skipped.iter().any(|skip| skip
+            .reason
+            .contains("fd table exhausted while opening a library")),
+        "nothing over the cap was retained: no fd-table-exhausted tail: {skipped:?}"
+    );
+    assert!(
+        engine.handles_deferred.contains_key(&live_pid),
+        "the deferral marks the pid for a handles-first retry"
+    );
+    // Next-tick preservation: after the budget frees, the same pid
+    // stages on retry and the mark is spent.
+    engine.library_handle_cap_for_test = Some(1000);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let (new_views, failed, skipped) = engine.admit_inventory_new_views(
+        vec![live_pid],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut tick_now,
+    );
+    assert!(
+        new_views.iter().any(|(view, _, _)| view.pid() == live_pid),
+        "the retry stages once the budget frees: {failed:?} {skipped:?}"
+    );
+    assert!(
+        !skipped
+            .iter()
+            .any(|skip| skip.subject == "library file open"),
+        "the retry waits for nothing: {skipped:?}"
+    );
+    assert!(
+        !engine.handles_deferred.contains_key(&live_pid),
+        "the retry spends the handles-first mark"
+    );
 }
 
 /// View-collapse fix7 21:10 addendum (deferred-first + measured retry):

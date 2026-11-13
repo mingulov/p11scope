@@ -34,6 +34,22 @@ pub(crate) fn library_handle_budget_exhausted(held: usize, cap: usize) -> bool {
     held >= cap
 }
 
+/// True when one more genuinely-new library handle would breach the
+/// concurrent `cap` (view-collapse fix8 F2): `held` handles retained
+/// at the tick plus `scan_new` new handles this scan already holds, so
+/// the handle about to be taken is the one that would exceed. Pinning
+/// checks this before each would-be-new open; only pins the post-scan
+/// share cannot absorb count (a scan whose files all duplicate
+/// retained lenders proceeds even at the cap). Saturating: absurd
+/// counts defer, never wrap into admission.
+pub(crate) fn library_handle_budget_defers_next_new(
+    held: usize,
+    scan_new: usize,
+    cap: usize,
+) -> bool {
+    held.saturating_add(scan_new) >= cap
+}
+
 /// The fixed subject of the over-budget deferral gap: admissions held
 /// back by the concurrent library-handle cap.
 pub(crate) const LIBRARY_HANDLE_BUDGET_SUBJECT: &str = "library handles";
@@ -796,5 +812,70 @@ mod tests {
         assert!(reserve_defers_next_open(Some(&tick), 0));
         assert!(!reserve_defers_next_open(None, 0));
         assert!(!reserve_defers_next_open(None, u64::MAX));
+    }
+
+    /// View-collapse fix8 F2 (codex blocking 1001-handle probe): pinning
+    /// checks the handle budget before each would-be-new open inside one
+    /// scan — the tick's held handles plus the scan's own new handles so
+    /// far. Healthy: with room for one more the scan continues.
+    #[test]
+    fn handle_budget_defers_next_new_admits_with_headroom() {
+        assert!(!library_handle_budget_defers_next_new(
+            0,
+            0,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        // 999 + 0: the thousandth handle still fits.
+        assert!(!library_handle_budget_defers_next_new(
+            999,
+            0,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        // A small test cap exercises the same boundary.
+        assert!(!library_handle_budget_defers_next_new(0, 0, 2));
+        assert!(!library_handle_budget_defers_next_new(1, 0, 2));
+        assert!(!library_handle_budget_defers_next_new(0, 1, 2));
+    }
+
+    /// Failure pair: once one more new handle would breach the cap the
+    /// scan must stop with the rest pending — never retain past it.
+    #[test]
+    fn handle_budget_defers_next_new_stops_at_the_cap() {
+        // 999 + 1: the thousandth handle is held, the next would breach.
+        assert!(library_handle_budget_defers_next_new(
+            999,
+            1,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_defers_next_new(
+            1000,
+            0,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_defers_next_new(1, 1, 2));
+        assert!(library_handle_budget_defers_next_new(0, 2, 2));
+        // A zero cap holds nothing: even the first new handle defers.
+        assert!(library_handle_budget_defers_next_new(0, 0, 0));
+    }
+
+    /// Failure pair: absurd counts saturate into deferral, never wrap
+    /// into admission.
+    #[test]
+    fn handle_budget_defers_next_new_saturates() {
+        assert!(library_handle_budget_defers_next_new(
+            usize::MAX,
+            0,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_defers_next_new(
+            0,
+            usize::MAX,
+            MAX_CONCURRENT_LIBRARY_HANDLES
+        ));
+        assert!(library_handle_budget_defers_next_new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX
+        ));
     }
 }

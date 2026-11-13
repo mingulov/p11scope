@@ -8522,15 +8522,14 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
 /// behave exactly as with per-view opens. Release is through the shared
 /// `Arc`: a view's drop releases its share, and the fd closes with the
 /// last share.
-pub(crate) fn share_scan_pins_with_retained<'a>(
-    pins: &mut PinnedObjects,
+/// Lender candidates by maps key (integer compares only, no
+/// syscalls): only a retained entry under an incoming entry's own key
+/// can lend to it, so only those pay for the held-fd proof below. A
+/// full retained scan per admission would cost an fstat per entry and
+/// tip wall-time-sensitive scale ticks.
+fn share_candidates<'a>(
     retained: impl IntoIterator<Item = &'a PinnedObjects>,
-) -> u64 {
-    // Lender candidates by maps key (integer compares only, no
-    // syscalls): only a retained entry under an incoming entry's own
-    // key can lend to it, so only those pay for the held-fd proof
-    // below. A full retained scan per admission would cost an fstat
-    // per entry and tip wall-time-sensitive scale ticks.
+) -> BTreeMap<ObjectKey, Vec<&'a Entry>> {
     let mut candidates: BTreeMap<ObjectKey, Vec<&Entry>> = BTreeMap::new();
     for set in retained {
         for entry in set.by_id.values() {
@@ -8539,6 +8538,38 @@ pub(crate) fn share_scan_pins_with_retained<'a>(
             }
         }
     }
+    candidates
+}
+
+/// The retained loan for one incoming pin entry, if a proven lender
+/// covers it: the borrower's own exclusions plus the first lender
+/// under its maps key whose held-fd proof is fresh and whose identity
+/// proves the key. Shared by the post-scan share and the pin loop's
+/// handle-budget projection (view-collapse fix8 F2), so the two can
+/// never disagree about what counts as a new handle.
+fn share_loan(
+    entry: &Entry,
+    candidates: &BTreeMap<ObjectKey, Vec<&Entry>>,
+) -> Option<(Arc<std::fs::File>, MappedFile)> {
+    if entry.pre_copy_up || entry.collapsed {
+        return None;
+    }
+    let key = entry.raw.key;
+    candidates.get(&key).and_then(|offers| {
+        offers.iter().find_map(|lender| {
+            let mapped = lender.reusable_mapped_file()?;
+            mapped
+                .key_is_identity(key)
+                .then(|| (Arc::clone(&lender.file), mapped))
+        })
+    })
+}
+
+pub(crate) fn share_scan_pins_with_retained<'a>(
+    pins: &mut PinnedObjects,
+    retained: impl IntoIterator<Item = &'a PinnedObjects>,
+) -> u64 {
+    let candidates = share_candidates(retained);
     if candidates.is_empty() {
         return pins.by_id.len() as u64;
     }
@@ -8546,20 +8577,7 @@ pub(crate) fn share_scan_pins_with_retained<'a>(
     // the kept count is exactly the admission's new fds.
     let mut kept = 0u64;
     for entry in pins.by_id.values_mut() {
-        let key = entry.raw.key;
-        let loan = if entry.pre_copy_up || entry.collapsed {
-            None
-        } else {
-            candidates.get(&key).and_then(|offers| {
-                offers.iter().find_map(|lender| {
-                    let mapped = lender.reusable_mapped_file()?;
-                    mapped
-                        .key_is_identity(key)
-                        .then(|| (Arc::clone(&lender.file), mapped))
-                })
-            })
-        };
-        if let Some((file, mapped)) = loan {
+        if let Some((file, mapped)) = share_loan(entry, &candidates) {
             entry.file = file;
             if entry.mapped.is_none() {
                 entry.mapped = Some(mapped);
@@ -8591,7 +8609,7 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, None)
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, None, None)
 }
 
 /// [`pin_scanned_view_objects`] with the tick's fd-reserve snapshot
@@ -8600,13 +8618,46 @@ pub fn pin_scanned_view_objects(
 /// unprocessed objects pending under the named reserve gap instead of
 /// opening into `EMFILE`. `None` keeps today's behavior (plus the fix6
 /// A3 open-exhaustion waits): non-admission pin sites pass `None`.
+/// Test-only since fix8 F2: production admission scans budget the
+/// handle cap beside the reserve through
+/// [`pin_scanned_view_objects_with_budgets`].
+#[cfg(test)]
 pub(crate) fn pin_scanned_view_objects_with_reserve(
     view: &ProcessView,
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve)
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, None)
+}
+
+/// The capture's library-handle budget as seen by one pin scan
+/// (view-collapse fix8 F2): `held` distinct handles the capture already
+/// retains, `cap` the strict concurrent ceiling, and the retained lender
+/// sets the post-scan share will borrow from. The pin loop stops before
+/// a pin that would push retained handles past `cap`, counting only
+/// pins the share cannot absorb — a scan whose files all duplicate
+/// retained lenders proceeds even at the cap, so budget enforcement
+/// never starves a no-new-handle scan.
+pub(crate) struct PinHandleBudget<'a> {
+    pub(crate) held: usize,
+    pub(crate) cap: usize,
+    pub(crate) lenders: Vec<&'a PinnedObjects>,
+}
+
+/// [`pin_scanned_view_objects_with_reserve`] plus the library-handle
+/// budget inside the pin loop (view-collapse fix8 F2): `handles`
+/// carries the tick's held count, cap and lender sets (see
+/// [`PinHandleBudget`]). `None` keeps the reserve-only behavior:
+/// non-admission pin sites pass `None`.
+pub(crate) fn pin_scanned_view_objects_with_budgets(
+    view: &ProcessView,
+    modules: &[ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    reserve: Option<&crate::fd_budget::FdReserveTick>,
+    handles: Option<&PinHandleBudget<'_>>,
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, handles)
 }
 
 /// Reads a pinned fd's `vm_file` identity ([`self_mapped_file`]).
@@ -8615,13 +8666,16 @@ type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, S
 /// [`pin_scanned_view_objects`] with the pinned fd's `vm_file` identity
 /// read through `pinned_identity` (a seam: following `map_files` needs
 /// privilege, so tests script it). `reserve` is the tick's fd-reserve
-/// snapshot (fix7 F1, see the bridge above); `None` pins unbounded.
+/// snapshot (fix7 F1, see the bridge above); `handles` is the tick's
+/// library-handle budget (fix8 F2, see [`PinHandleBudget`]); `None` pins
+/// unbounded on that axis.
 fn pin_scanned_view_objects_with(
     view: &ProcessView,
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
     pinned_identity: ReadPinnedIdentity<'_>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
+    handles: Option<&PinHandleBudget<'_>>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     // Both the table-owning modules and every object a table entry points into: an
     // entry may land in a dependency the module itself only forwards to.
@@ -8681,6 +8735,21 @@ fn pin_scanned_view_objects_with(
     // opened — so the projection below tracks exactly what the
     // post-scan debit will charge.
     let mut scan_opens: u64 = 0;
+    // Genuinely-new handles this scan holds so far (fix8 F2): only
+    // pins the post-scan share cannot absorb count against the
+    // library-handle cap. The candidates below are the same lender
+    // sets the post-scan share borrows from, and the same
+    // [`share_loan`] predicate decides — so the projection agrees
+    // with the debit exactly, and a scan whose files all duplicate
+    // retained lenders proceeds even at the cap.
+    let handle_state = handles.map(|budget| {
+        (
+            budget.held,
+            budget.cap,
+            share_candidates(budget.lenders.iter().copied()),
+        )
+    });
+    let mut scan_new: usize = 0;
     let mut wanted = wanted.into_iter();
     for raw in wanted.by_ref() {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
@@ -8695,13 +8764,33 @@ fn pin_scanned_view_objects_with(
         // full scan. `None` (or an unreadable snapshot inside) never
         // stops: fail open, exactly like the admission-level guard.
         if crate::fd_budget::reserve_defers_next_open(reserve, scan_opens) {
-            let stop = || PinFailure::Wait {
-                reason: PIN_RESERVE_STOP_DETAIL.into(),
-            };
-            record_scanned_candidate(&mut pinned, view.id(), raw, Err(stop()), &mut skipped);
-            for raw in wanted.by_ref() {
-                record_scanned_candidate(&mut pinned, view.id(), raw, Err(stop()), &mut skipped);
-            }
+            record_pin_stop(
+                &mut pinned,
+                view.id(),
+                raw,
+                wanted.by_ref(),
+                &mut skipped,
+                PIN_RESERVE_STOP_DETAIL,
+            );
+            break;
+        }
+        // Fix8 F2, pre-open: a definitely-new pin (no lender under its
+        // maps key, so the share cannot absorb it) that would breach
+        // the cap stops the scan before paying for the open. Entries
+        // with a lender may still share; they open for validation and
+        // verify below.
+        if let Some((held, cap, candidates)) = handle_state.as_ref()
+            && !candidates.contains_key(&raw.key)
+            && crate::fd_budget::library_handle_budget_defers_next_new(*held, scan_new, *cap)
+        {
+            record_pin_stop(
+                &mut pinned,
+                view.id(),
+                raw,
+                wanted.by_ref(),
+                &mut skipped,
+                PIN_BUDGET_STOP_DETAIL,
+            );
             break;
         }
         let scanned = scanned_files.get(&raw).copied();
@@ -8715,9 +8804,37 @@ fn pin_scanned_view_objects_with(
             &mut mounts,
             budget,
         );
-        if candidate.is_ok() {
-            scan_opens = scan_opens.saturating_add(1);
-        }
+        // Fix8 F2, post-open verification: the entry's own exclusions
+        // are known only now. A pin the share cannot absorb is
+        // genuinely new — charge it, or close it back out (never
+        // retained, never counted) when the charge would breach the
+        // cap, with this and every remaining object pending.
+        let candidate = match candidate {
+            Ok(entry) => {
+                if let Some((held, cap, candidates)) = handle_state.as_ref()
+                    && share_loan(&entry, candidates).is_none()
+                {
+                    if crate::fd_budget::library_handle_budget_defers_next_new(
+                        *held, scan_new, *cap,
+                    ) {
+                        drop(entry);
+                        record_pin_stop(
+                            &mut pinned,
+                            view.id(),
+                            raw,
+                            wanted.by_ref(),
+                            &mut skipped,
+                            PIN_BUDGET_STOP_DETAIL,
+                        );
+                        break;
+                    }
+                    scan_new = scan_new.saturating_add(1);
+                }
+                scan_opens = scan_opens.saturating_add(1);
+                Ok(entry)
+            }
+            refused => refused,
+        };
         record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
@@ -8742,6 +8859,17 @@ pub(crate) const PIN_WAIT_SUBJECT: &str = "library file open";
 /// reserve tail instead of the fd-table-exhausted tail.
 pub(crate) const PIN_RESERVE_STOP_DETAIL: &str =
     "capture file-descriptor reserve exhausted; the pin was not attempted";
+
+/// The fixed detail when pinning stops BEFORE a pin the library-handle
+/// budget cannot cover (view-collapse fix8 F2): like
+/// [`PIN_RESERVE_STOP_DETAIL`], the pin was never attempted, so nothing
+/// about the file is claimed — it waits for the next tick with the
+/// whole view. Recorded under [`PIN_WAIT_SUBJECT`] through the same
+/// [`PinFailure::Wait`] arm (no key rejection); the admission loops
+/// match this detail to file the budget tail instead of the
+/// fd-table-exhausted tail.
+pub(crate) const PIN_BUDGET_STOP_DETAIL: &str =
+    "capture library-handle budget exhausted; the pin was not attempted";
 
 /// How one scan pin failed (fix6 A3, owner 20:25): an ordinary refusal —
 /// recorded with today's reason and key rejection — or handle
@@ -8796,6 +8924,27 @@ impl From<OpenObjectError> for PinFailure {
         } else {
             Self::Refused(error.reason)
         }
+    }
+}
+
+/// Files one pre-emptive pin-loop stop (fix7 F1's reserve stop,
+/// fix8 F2's budget stop): this object plus every remaining one waits
+/// under the named `detail` gap — never attempted (or closed back out
+/// before retention), never rejected.
+fn record_pin_stop(
+    pinned: &mut PinnedObjects,
+    view: ProcessViewId,
+    raw: RawObjectInstance,
+    remaining: impl Iterator<Item = RawObjectInstance>,
+    skipped: &mut Vec<Skipped>,
+    detail: &str,
+) {
+    let stop = || PinFailure::Wait {
+        reason: detail.into(),
+    };
+    record_scanned_candidate(pinned, view, raw, Err(stop()), skipped);
+    for raw in remaining {
+        record_scanned_candidate(pinned, view, raw, Err(stop()), skipped);
     }
 }
 
@@ -15488,6 +15637,7 @@ mod tests {
             &mut CaptureWorkBudget::default(),
             &|_| Ok(calibrated),
             None,
+            None,
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -15507,6 +15657,7 @@ mod tests {
             &mut budget,
             &probe,
             None,
+            None,
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -15520,7 +15671,8 @@ mod tests {
         }
         module.mapped_identity = Some(FileIdentity { dev: 47, ino: 9 });
         let (refused, skipped) =
-            pin_scanned_view_objects_with(&view, &[module], &mut budget, &probe, None).unwrap();
+            pin_scanned_view_objects_with(&view, &[module], &mut budget, &probe, None, None)
+                .unwrap();
         assert_eq!(probes.get(), 2 * usize::from(!reusable));
         assert_eq!(refused.pinned().count(), 0);
         assert!(
@@ -15574,6 +15726,7 @@ mod tests {
                         fs_magic: None,
                     })
                 },
+                None,
                 None,
             )
             .unwrap();
@@ -20408,5 +20561,324 @@ mod tests {
         );
         assert_eq!(retry_pins.entry_count_for_test(), PINS);
         println!("\n{COMPLETED}");
+    }
+
+    /// View-collapse fix8 F2 (codex blocking reserve probe, kept as the
+    /// regression twin): with soft AND hard `RLIMIT_NOFILE` at 512, the
+    /// table blocked to a 350 snapshot, and 300 distinct pins requested in
+    /// ONE scan, the per-open projected-headroom guard (fix7) must stop
+    /// the scan before any open fails — waits under the named reserve
+    /// gap, never rejected, never attempted, no `EMFILE` text anywhere.
+    /// Runs in an isolated child: lowering the hard limit is
+    /// process-global and irreversible.
+    #[test]
+    fn review_many_distinct_pins_in_one_scan_respects_reserve() {
+        const CHILD: &str = "P11SCOPE_F2_RESERVE_CHILD";
+        const COMPLETED: &str = "P11SCOPE_F2_RESERVE_COMPLETED";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "discovery::identity::tests::review_many_distinct_pins_in_one_scan_respects_reserve",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "f2-reserve child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "f2-reserve child did not complete its assertions:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        const PINS: usize = 300;
+        const SOFT: u64 = 512;
+        const SNAPSHOT: u64 = 350;
+        // The 300 distinct modules are built before the limit drops: the
+        // fixture's transient opens need room while the limit is high.
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+            0
+        );
+        assert!(
+            current.rlim_max >= SOFT,
+            "the box must allow a 512 hard fd limit for the f2-reserve child"
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: SOFT,
+            rlim_max: SOFT,
+        };
+        // SAFETY: lowering both limits in the isolated child; the child
+        // exits after its assertions, so the irreversible hard-limit drop
+        // never escapes to siblings.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        // Blockers hold the table at exactly the review's 350 snapshot;
+        // real room stays ample (~162 free), so only the projection can
+        // stop this scan — never a real `EMFILE`.
+        let mut blockers = Vec::new();
+        loop {
+            let open = crate::fd_budget::open_fd_count_in(std::path::Path::new("/proc/self/fd"))
+                .expect("a readable count while holding blockers") as u64;
+            assert!(
+                open <= SNAPSHOT,
+                "ambient fds already past the {SNAPSHOT} target: {open}"
+            );
+            if open == SNAPSHOT {
+                break;
+            }
+            blockers.push(
+                std::fs::File::open("/dev/null").expect("a blocker must open below the target"),
+            );
+        }
+        let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        assert!(
+            !crate::fd_budget::reserve_defers(Some(&tick)),
+            "the blocked table still admits the scan"
+        );
+        let (pins, skipped) =
+            pin_scanned_view_objects_with_reserve(&view, &modules, &mut budget, Some(&tick))
+                .unwrap();
+        // 350 + 0 + 34 + 1 = 385: the 35th open would leave 127 free,
+        // below the 128 reserve — so exactly 34 land and 266 wait.
+        assert_eq!(
+            pins.entry_count_for_test(),
+            34,
+            "the scan stops after exactly the projected headroom: {skipped:?}"
+        );
+        let waited: Vec<_> = skipped
+            .iter()
+            .filter(|skip| skip.subject == "library file open")
+            .collect();
+        assert_eq!(
+            waited.len(),
+            PINS - 34,
+            "every unprocessed pin waits: {skipped:?}"
+        );
+        assert_eq!(
+            waited.len(),
+            skipped.len(),
+            "nothing else is skipped: {skipped:?}"
+        );
+        assert!(
+            waited
+                .iter()
+                .all(|skip| skip.reason.contains(PIN_RESERVE_STOP_DETAIL)),
+            "the waits name the pre-emptive reserve stop: {skipped:?}"
+        );
+        assert!(
+            !skipped
+                .iter()
+                .any(|skip| skip.reason.contains("Too many open files")),
+            "no EMFILE: the stop came first: {skipped:?}"
+        );
+        assert!(
+            pins.rejected_keys.is_empty(),
+            "waited keys are never rejected: {:?}",
+            pins.rejected_keys
+        );
+        // Retry after capacity frees: the whole 300-pin scan pins cleanly
+        // with no skip at all, proving the stop left nothing sticky.
+        drop(blockers);
+        let mut budget = CaptureWorkBudget::default();
+        let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+        let (retry_pins, retry_skipped) =
+            pin_scanned_view_objects_with_reserve(&view, &modules, &mut budget, Some(&tick))
+                .unwrap();
+        assert!(
+            retry_skipped.is_empty(),
+            "the retry pins cleanly: {retry_skipped:?}"
+        );
+        assert_eq!(retry_pins.entry_count_for_test(), PINS);
+        println!("\n{COMPLETED}");
+    }
+
+    /// View-collapse fix8 F2 (codex blocking 1001-handle probe, kept as
+    /// the regression twin): one scan must not hold more than 1000
+    /// library handles. With the table wide open (no reserve trip, no
+    /// EMFILE) and 1001 distinct files requested, the scan stops after
+    /// exactly 1000: the rest wait under the named budget gap, never
+    /// rejected, and the post-open share/debit charges at most the cap.
+    /// Raises the soft `RLIMIT_NOFILE` to the hard limit in-process and
+    /// restores it afterwards (raising soft toward hard is reversible).
+    #[test]
+    fn review_one_scan_must_not_hold_more_than_a_thousand_libraries() {
+        const PINS: usize = 1001;
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
+        let mut saved = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0
+        );
+        assert!(
+            saved.rlim_max >= 2048,
+            "the box must allow a wide soft fd limit for the 1001-handle twin"
+        );
+        let raised = libc::rlimit {
+            rlim_cur: saved.rlim_max,
+            rlim_max: saved.rlim_max,
+        };
+        // Restores the saved limits on drop, even when an assertion
+        // below panics: raising soft toward hard is process-global.
+        struct RestoreRlimit(libc::rlimit);
+        impl Drop for RestoreRlimit {
+            fn drop(&mut self) {
+                // SAFETY: restoring the exact saved limits.
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
+                }
+            }
+        }
+        // SAFETY: raising the soft limit toward the hard limit in this
+        // test only; the guard above restores it. The twin runs alone
+        // (`--test-threads=1` in the focused gate).
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) }, 0);
+        let _restore = RestoreRlimit(saved);
+        {
+            let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
+            assert!(
+                !crate::fd_budget::reserve_defers(Some(&tick)),
+                "the wide-open table admits the scan"
+            );
+            let handle_budget = PinHandleBudget {
+                held: 0,
+                cap: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+                lenders: Vec::new(),
+            };
+            let (mut pins, skipped) = pin_scanned_view_objects_with_budgets(
+                &view,
+                &modules,
+                &mut budget,
+                Some(&tick),
+                Some(&handle_budget),
+            )
+            .unwrap();
+            assert_eq!(
+                pins.entry_count_for_test(),
+                crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+                "the scan stops at exactly the handle cap: {skipped:?}"
+            );
+            let waited: Vec<_> = skipped
+                .iter()
+                .filter(|skip| skip.subject == "library file open")
+                .collect();
+            assert_eq!(
+                waited.len(),
+                PINS - crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+                "every over-cap pin waits: {skipped:?}"
+            );
+            assert_eq!(
+                waited.len(),
+                skipped.len(),
+                "nothing else is skipped: {skipped:?}"
+            );
+            assert!(
+                waited
+                    .iter()
+                    .all(|skip| skip.reason.contains(PIN_BUDGET_STOP_DETAIL)),
+                "the waits name the pre-emptive budget stop: {skipped:?}"
+            );
+            assert!(
+                pins.rejected_keys.is_empty(),
+                "waited keys are never rejected: {:?}",
+                pins.rejected_keys
+            );
+            let kept = share_scan_pins_with_retained(&mut pins, Vec::new());
+            assert_eq!(
+                kept,
+                crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES as u64,
+                "the share/debit charges exactly the cap, never 1001"
+            );
+        }
+    }
+
+    /// View-collapse fix8 F2 (budget-guard liveness): the per-pin budget
+    /// counts only pins the post-scan share cannot absorb. A scan whose
+    /// files all duplicate proven retained lenders proceeds even AT the
+    /// cap — a sharing-blind guard would stop before the first pin and
+    /// the whole-view deferral would starve the view forever.
+    #[test]
+    fn budget_stop_never_starves_a_fully_shared_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), 2, &mut budget);
+        // Lenders prove both files under their own scanned keys (ext4
+        // identity), so the post-scan share absorbs the whole scan.
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut lenders = Vec::new();
+        for module in &modules {
+            let mut lender = test_fixture::real_scan_pin(
+                std::path::Path::new(&module.path),
+                Some(module.key),
+                0,
+                sha,
+            );
+            if let Some(entry) = lender.by_id.values_mut().next() {
+                let (Ok(major), Ok(minor)) = (
+                    u32::try_from(module.key.device.major),
+                    u32::try_from(module.key.device.minor),
+                ) else {
+                    panic!("fixture device does not fit: {:?}", module.key.device);
+                };
+                entry.mapped = Some(MappedFile {
+                    identity: FileIdentity {
+                        dev: libc::makedev(major, minor),
+                        ino: module.key.inode,
+                    },
+                    fs_magic: Some(0xef53),
+                });
+            }
+            lenders.push(lender);
+        }
+        let lender_refs: Vec<&PinnedObjects> = lenders.iter().collect();
+        let handle_budget = PinHandleBudget {
+            held: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+            cap: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+            lenders: lender_refs,
+        };
+        let (mut pins, skipped) = pin_scanned_view_objects_with_budgets(
+            &view,
+            &modules,
+            &mut budget,
+            None,
+            Some(&handle_budget),
+        )
+        .unwrap();
+        assert!(
+            skipped.is_empty(),
+            "a fully shared scan proceeds at the cap: {skipped:?}"
+        );
+        assert_eq!(pins.entry_count_for_test(), 2);
+        let kept = share_scan_pins_with_retained(&mut pins, lenders.iter());
+        assert_eq!(kept, 0, "the share absorbs the whole scan");
     }
 }

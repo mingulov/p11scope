@@ -22,14 +22,14 @@ use crate::discovery::elf_needed;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
-    InstalledPinsBacking, KernelSelfMappingProbe, ManifestStaleReason, Pin,
+    InstalledPinsBacking, KernelSelfMappingProbe, ManifestStaleReason, Pin, PinHandleBudget,
     PinnedConservativeCursor, PinnedObjectId, PinnedObjects, PinnedTimingKey, PrearmPinnedInput,
     ReconciledModule, RetainedScannedInputs, RetiredFileHandoff, ScannedInputMeasure,
     ScannedRebindCursor, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
     canonicalize_scanned_overlays, open_view_executable_cached, open_view_rooted_object_cached,
     opened_file_matches_maps, pin_manifest_objects_deferred_in_views_with_budget, pin_of,
     pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects,
-    pin_scanned_view_objects_with_reserve, preexec_object_key, retained_object_key_cached,
+    pin_scanned_view_objects_with_budgets, preexec_object_key, retained_object_key_cached,
     self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
@@ -6474,6 +6474,7 @@ fn scan_and_pin(
         stage,
         scan_process_view,
         None,
+        None,
     )
     .map(|(modules, pins, _)| (modules, pins))
 }
@@ -6499,6 +6500,7 @@ fn scan_and_pin_with(
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
+    handles: Option<&PinHandleBudget<'_>>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     scan_and_pin_with_proof(
         view,
@@ -6512,6 +6514,7 @@ fn scan_and_pin_with(
             scan(request, view, budget).map(|outcome| (outcome, Vec::new(), BTreeSet::new()))
         },
         reserve,
+        handles,
     )
     .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
 }
@@ -6549,6 +6552,7 @@ fn scan_and_pin_with_proof(
         String,
     >,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
+    handles: Option<&PinHandleBudget<'_>>,
 ) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
@@ -6599,9 +6603,11 @@ fn scan_and_pin_with_proof(
     let pin_start = crate::attach::monotonic_ns();
     // Fix7 F1: the tick's reserve budgets the pin loop itself, so a scan
     // that wants more pins than the headroom covers stops with the rest
-    // pending instead of opening into `EMFILE`. Admission scans pass
-    // `Some`; every other scan site passes `None` (today's behavior).
-    let pinned = pin_scanned_view_objects_with_reserve(view, &modules, budget, reserve);
+    // pending instead of opening into `EMFILE`. Fix8 F2: the tick's
+    // library-handle budget does the same per acquisition, so one scan
+    // can no longer retain past the cap. Admission scans pass `Some`;
+    // every other scan site passes `None` (today's behavior).
+    let pinned = pin_scanned_view_objects_with_budgets(view, &modules, budget, reserve, handles);
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",
@@ -7140,6 +7146,30 @@ fn scan_pins_waited_only_for_reserve(skips: &[Skipped]) -> bool {
         if !skip
             .reason
             .contains(crate::discovery::identity::PIN_RESERVE_STOP_DETAIL)
+        {
+            return false;
+        }
+        waited = true;
+    }
+    waited
+}
+
+/// True when a scan's pins waited ONLY for the pre-emptive
+/// library-handle budget stop (view-collapse fix8 F2): every wait gap
+/// carries the not-attempted budget detail, so the cap tripped first
+/// and no open ever failed for it. The admission loops file the
+/// budget tail then; any real open-exhaustion wait (fix6 A3) keeps
+/// the fd-table-exhausted tail. Ordinary per-path skips are ignored,
+/// like in [`scan_pins_waited`].
+fn scan_pins_waited_only_for_budget(skips: &[Skipped]) -> bool {
+    let mut waited = false;
+    for skip in skips {
+        if skip.subject != crate::discovery::identity::PIN_WAIT_SUBJECT {
+            continue;
+        }
+        if !skip
+            .reason
+            .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL)
         {
             return false;
         }
@@ -7934,6 +7964,20 @@ fn discover_plan(
         // never from a caller-side maps pre-read outside the scan's
         // validation bracket. Same scan work as `scan_process_view`;
         // only already-computed values are surfaced.
+        // Fix8 F2: the pass's handle budget (held count, cap, and the
+        // same lender sets the post-scan share borrows from) budgets
+        // the pin loop per acquisition, so one scan can no longer
+        // retain past the cap.
+        let pin_lenders: Vec<&PinnedObjects> = discovered
+            .scan_inputs
+            .values()
+            .map(|input| &input.pins)
+            .collect();
+        let pin_handles = PinHandleBudget {
+            held: held_handles,
+            cap: library_cap,
+            lenders: pin_lenders,
+        };
         let scan_result = scan_and_pin_with_proof(
             &view,
             &a.modules,
@@ -7948,6 +7992,7 @@ fn discover_plan(
             },
             // Fix7 F1: the pass's reserve budgets the pin loop itself.
             reserve_tick.as_ref(),
+            Some(&pin_handles),
         );
         // 6.14 Option B: the scan observed this generation alive; learn
         // its executable path whether or not the scan completed.
@@ -7966,9 +8011,12 @@ fn discover_plan(
                     discovered.release_view_id(view.id());
                     // Fix7 F1: a scan that stopped BEFORE the reserve
                     // tripped files the reserve tail — nothing filled, the
-                    // guard tripped first. Any real open-exhaustion wait
-                    // keeps the fd-table-exhausted tail.
+                    // guard tripped first. Fix8 F2: a scan that stopped
+                    // BEFORE the handle cap files the budget tail. Any
+                    // real open-exhaustion wait keeps the
+                    // fd-table-exhausted tail.
                     let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
+                    let budget_stop = scan_pins_waited_only_for_budget(&counters.object_skips);
                     // Fix7 (owner 21:10): this pid's view deferred whole,
                     // and the break defers the unprocessed rest: all owe a
                     // handles-first retry in the next round.
@@ -7990,6 +8038,8 @@ fn discover_plan(
                     discovered.base_counters.noise.merge(&counters.noise);
                     let reason = if reserve_stop {
                         "capture file-descriptor reserve exhausted; remaining processes deferred to the next tick"
+                    } else if budget_stop {
+                        crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_INITIAL
                     } else {
                         "fd table exhausted while opening a library; remaining processes deferred to the next tick"
                     };
@@ -14984,6 +15034,7 @@ impl Engine {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_retained_view(
         view: &ProcessView,
         module_hints: &[PathBuf],
@@ -14992,6 +15043,7 @@ impl Engine {
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
         reserve: Option<&crate::fd_budget::FdReserveTick>,
+        handles: Option<&PinHandleBudget<'_>>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -15007,6 +15059,7 @@ impl Engine {
                 stage,
                 scan_process_view,
                 reserve,
+                handles,
             )
         })
     }
@@ -15018,6 +15071,7 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
+        handles: Option<&PinHandleBudget<'_>>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -15033,6 +15087,7 @@ impl Engine {
                 stage,
                 scan_process_view_without_memory,
                 None,
+                handles,
             )
         })
     }
@@ -19256,6 +19311,7 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
+                None,
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
@@ -19264,6 +19320,7 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                None,
             ),
         };
         // 6.14 Option B: learn the scanned generation's executable path.
@@ -26166,6 +26223,7 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
+                None,
             );
             // 6.14 Option B: learn the refreshed generation's executable.
             elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
@@ -27304,6 +27362,7 @@ impl Engine {
             broad_admit,
             &mut self.stage_timings,
             None,
+            None,
         );
         // 6.14 Option B: learn the probationary generation's executable.
         elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -27725,6 +27784,17 @@ impl Engine {
             // a departed pid prunes every tick).
             self.note_handles_retry(pid);
             let broad_admit = self.broad_admit;
+            // Fix8 F2: the tick's handle budget (held count, cap, and
+            // the same lender sets the post-scan share borrows from)
+            // budgets the pin loop per acquisition, so one scan can no
+            // longer retain past the cap.
+            let pin_lenders: Vec<&PinnedObjects> =
+                self.scan_inputs.values().map(|input| &input.pins).collect();
+            let pin_handles = PinHandleBudget {
+                held: held_handles,
+                cap: library_cap,
+                lenders: pin_lenders,
+            };
             let (scan_result, counters) = Self::scan_retained_view(
                 &view,
                 &self.module_hints,
@@ -27734,6 +27804,7 @@ impl Engine {
                 &mut self.stage_timings,
                 // Fix7 F1: the tick's reserve budgets the pin loop itself.
                 reserve_tick.as_ref(),
+                Some(&pin_handles),
             );
             // 6.14 Option B: learn the newcomer's executable path.
             elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -27743,6 +27814,7 @@ impl Engine {
             // snapshots the pre-emptive-stop kind beside it for the tail.
             let pins_waited = scan_pins_waited(&counters.object_skips);
             let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
+            let budget_stop = scan_pins_waited_only_for_budget(&counters.object_skips);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // Completeness is otherwise unused here: a new view has
@@ -27772,11 +27844,14 @@ impl Engine {
                         }
                         // Fix7 F1: a scan that stopped BEFORE the reserve
                         // tripped files the reserve tail — nothing filled,
-                        // the guard tripped first. Any real
-                        // open-exhaustion wait keeps the
+                        // the guard tripped first. Fix8 F2: a scan that
+                        // stopped BEFORE the handle cap files the budget
+                        // tail. Any real open-exhaustion wait keeps the
                         // fd-table-exhausted tail.
                         let reason = if reserve_stop {
                             "capture file-descriptor reserve exhausted; remaining new processes deferred to the next tick"
+                        } else if budget_stop {
+                            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE
                         } else {
                             "fd table exhausted while opening a library; remaining new processes deferred to the next tick"
                         };

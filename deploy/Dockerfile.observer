@@ -47,6 +47,9 @@
 FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS busybox
 FROM scratch
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The image marker `p11scope doctor` reads (with a `/.dockerenv`
+# fallback) to name `docker run` capability flags instead of `setcap`.
+ENV P11SCOPE_IMAGE=1
 COPY --from=busybox /bin/busybox /bin/busybox
 COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry

@@ -201,6 +201,7 @@ fn probe_with_host(
         ),
         capabilities_check(),
         setcap_check(),
+        file_learning_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
         user_namespace_check(crate::userns::observer()),
         object_capture_check(),
@@ -932,9 +933,50 @@ fn object_capture_check() -> Check {
 
 fn capabilities_check() -> Check {
     Check {
-        name: "effective capabilities".to_string(),
-        status: capabilities_status(read_cap_eff()),
+        name: EFFECTIVE_CAPS_ROW.to_string(),
+        status: capabilities_status(read_cap_eff(), crate::userns::in_init_user_ns()),
     }
+}
+
+/// The capabilities row's name, shared by the probe and the verdict
+/// line's file-learning fragment below.
+const EFFECTIVE_CAPS_ROW: &str = "effective capabilities";
+
+/// The live mask with the kernel's `CAP_SYS_ADMIN` equivalences
+/// applied: the kernel accepts `CAP_SYS_ADMIN` for BPF load and attach
+/// (`bpf_capable`), perf (`perfmon_capable`) and
+/// `/proc/<pid>/map_files` reads (`checkpoint_restore_ns_capable`),
+/// so an effective `CAP_SYS_ADMIN` covers `CAP_BPF`, `CAP_PERFMON`
+/// and `CAP_CHECKPOINT_RESTORE`, and doctor must not list them as
+/// missing. (`src/caps.rs` is lane-owned; the cover lives here,
+/// beside its only consumers.)
+///
+/// The cover applies only where held capabilities count for BPF: in
+/// a proven child user namespace (`Some(false)`) the kernel ignores
+/// them (`security/commoncap.c`), so the mask passes through
+/// uncovered and no row may read "sufficient" next to the failed
+/// user-namespace row. Pure over the proven cause, like
+/// [`crate::caps::lacking_note`], so twins stay off the live namespace.
+fn live_mask_with_admin_cover(mask: u64, init_user_ns: Option<bool>) -> u64 {
+    use crate::caps::{CAP_BPF_BIT, CAP_CHECKPOINT_RESTORE_BIT, CAP_PERFMON_BIT};
+    if init_user_ns == Some(false) || mask & (1u64 << CAP_SYS_ADMIN_BIT) == 0 {
+        return mask;
+    }
+    mask | (1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | (1u64 << CAP_CHECKPOINT_RESTORE_BIT)
+}
+
+/// Whether `CAP_SYS_ADMIN` covers anything in `mask`: held, with at
+/// least one of the three covered capabilities absent. A set holding
+/// all three explicitly needs no sufficiency note. Never in a proven
+/// child user namespace: nothing held there covers a live capability
+/// (see [`live_mask_with_admin_cover`]).
+fn admin_covers_live_caps(mask: u64, init_user_ns: Option<bool>) -> bool {
+    use crate::caps::{CAP_BPF_BIT, CAP_CHECKPOINT_RESTORE_BIT, CAP_PERFMON_BIT};
+    init_user_ns != Some(false)
+        && mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0
+        && [CAP_BPF_BIT, CAP_PERFMON_BIT, CAP_CHECKPOINT_RESTORE_BIT]
+            .iter()
+            .any(|bit| mask & (1u64 << bit) == 0)
 }
 
 /// The confinement row: a Fail names the AppArmor label blocking process
@@ -950,12 +992,15 @@ const MINIMAL_SETCAP_ROW: &str = "minimal setcap";
 /// The recipe row for one mask read: the exact one-line `setcap`
 /// command, warning with the missing names while the minimal live set
 /// is incomplete. A read failure reports the failure, like the
-/// capabilities row.
-fn setcap_status(read: Result<u64, String>, binary: &str) -> Status {
+/// capabilities row. The `CAP_SYS_ADMIN` cover follows
+/// [`live_mask_with_admin_cover`]: it applies only in the initial
+/// user namespace.
+fn setcap_status(read: Result<u64, String>, binary: &str, init_user_ns: Option<bool>) -> Status {
     match read {
         Ok(mask) => {
             let recipe = crate::caps::setcap_command(binary);
-            let missing = crate::caps::missing_for_live(mask);
+            let missing =
+                crate::caps::missing_for_live(live_mask_with_admin_cover(mask, init_user_ns));
             if missing.is_empty() {
                 Status::Ok(recipe)
             } else {
@@ -968,9 +1013,113 @@ fn setcap_status(read: Result<u64, String>, binary: &str) -> Status {
 }
 
 fn setcap_check() -> Check {
+    let read = read_cap_eff();
+    let init_user_ns = crate::userns::in_init_user_ns();
+    let status = if running_in_container() {
+        container_flags_status(read, init_user_ns)
+    } else {
+        setcap_status(read, &crate::caps::current_binary(), init_user_ns)
+    };
     Check {
         name: MINIMAL_SETCAP_ROW.to_string(),
-        status: setcap_status(read_cap_eff(), &crate::caps::current_binary()),
+        status,
+    }
+}
+
+/// Whether the observer runs inside a container: `P11SCOPE_IMAGE=1`
+/// in the image environment (set by both observer Dockerfiles), with
+/// `/.dockerenv` as the fallback for hand-rolled containers. Pure
+/// over the two signals for tests; the probe reads the live values.
+fn in_container(image_env: Option<&str>, dockerenv_present: bool) -> bool {
+    image_env == Some("1") || dockerenv_present
+}
+
+fn running_in_container() -> bool {
+    in_container(
+        std::env::var("P11SCOPE_IMAGE").ok().as_deref(),
+        std::path::Path::new("/.dockerenv").exists(),
+    )
+}
+
+/// The container grant recipe: the exact `docker run` flags granting
+/// the minimal live set (see `deploy/README.md`). A container has no
+/// setcap-able host binary, so doctor never suggests `setcap` here —
+/// it names these flags instead.
+const CONTAINER_FLAGS: &str = "--cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH";
+
+/// The recipe row inside a container: the same missing-set shape as
+/// [`setcap_status`], with the docker flags as the remedy. The
+/// `CAP_SYS_ADMIN` cover applies here too, in the initial user
+/// namespace only. In a proven child user namespace no container
+/// grant can fix capture (re-running the image keeps the child
+/// namespace), so the row stays out of the way with the true remedy
+/// instead of naming flags — the grant-advice suppression of
+/// [`crate::caps::lacking_note`], as a row rather than silence.
+fn container_flags_status(read: Result<u64, String>, init_user_ns: Option<bool>) -> Status {
+    match read {
+        Ok(mask) => {
+            if init_user_ns == Some(false) {
+                return Status::NotApplicable(format!(
+                    "no container grant helps in a child user namespace; {}",
+                    crate::userns::NEXT_STEP
+                ));
+            }
+            let missing =
+                crate::caps::missing_for_live(live_mask_with_admin_cover(mask, init_user_ns));
+            if missing.is_empty() {
+                Status::Ok(format!(
+                    "the container flags grant the minimal set ({CONTAINER_FLAGS})"
+                ))
+            } else {
+                let names: Vec<&str> = missing.iter().map(|cap| cap.name).collect();
+                Status::Warn(format!(
+                    "missing {}: run the image with {CONTAINER_FLAGS}",
+                    names.join(", ")
+                ))
+            }
+        }
+        Err(e) => Status::Warn(e),
+    }
+}
+
+/// The file-learning row: fanotify marks need `CAP_SYS_ADMIN`, which
+/// the narrower five-capability set deliberately omits — so a
+/// sufficient five-cap grant still leaves file learning unavailable.
+/// Info, never a warning: with a sufficient set the verdict line
+/// names it once (see [`verdict_line_with`]).
+const FILE_LEARNING_ROW: &str = "file learning";
+
+/// The file-learning row's detail without `CAP_SYS_ADMIN`, shared by
+/// the probe and the verdict line's fragment below.
+const FILE_LEARNING_NEEDS_ADMIN: &str = "needs CAP_SYS_ADMIN";
+
+fn file_learning_check() -> Check {
+    Check {
+        name: FILE_LEARNING_ROW.to_string(),
+        status: file_learning_status(read_cap_eff(), crate::userns::in_init_user_ns()),
+    }
+}
+
+/// The file-learning row for one mask read: held `CAP_SYS_ADMIN`
+/// reads available, otherwise not applicable with the reason — info,
+/// never a warning. "Available" applies only in the initial user
+/// namespace: an admin bit held in a proven child namespace enables
+/// no fanotify mark, so it must not read available next to the failed
+/// user-namespace row. A read failure stays distinct like the
+/// capabilities row's.
+fn file_learning_status(read: Result<u64, String>, init_user_ns: Option<bool>) -> Status {
+    match read {
+        Ok(mask) if mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0 => {
+            if init_user_ns == Some(false) {
+                Status::NotApplicable("unavailable in a child user namespace".into())
+            } else {
+                Status::Ok("available".into())
+            }
+        }
+        Ok(_) => Status::NotApplicable(FILE_LEARNING_NEEDS_ADMIN.into()),
+        // The capabilities row already warns with the failure; this
+        // row stays out of the way instead of warning twice.
+        Err(e) => Status::NotApplicable(e),
     }
 }
 
@@ -978,14 +1127,27 @@ fn setcap_check() -> Check {
 /// reported, never coerced into "none" — an unmeasured mask must not read
 /// the same as a genuinely empty one. Any mask missing minimal-live
 /// capabilities warns with each one and what it enables; only the
-/// complete set reads Ok.
-fn capabilities_status(read: Result<u64, String>) -> Status {
+/// complete set reads Ok. An effective `CAP_SYS_ADMIN` covers the BPF,
+/// perf and checkpoint/restore members (see
+/// [`live_mask_with_admin_cover`]), so a covered set reads sufficient
+/// with the narrower-set note instead of warning. In a proven child
+/// user namespace the cover is off: the row lists what is held
+/// without claiming sufficiency.
+fn capabilities_status(read: Result<u64, String>, init_user_ns: Option<bool>) -> Status {
     match read {
         Ok(mask) => {
             let names = decode_caps(mask);
-            let missing = crate::caps::missing_for_live(mask);
+            let missing =
+                crate::caps::missing_for_live(live_mask_with_admin_cover(mask, init_user_ns));
             if missing.is_empty() {
-                Status::Ok(names.join(" "))
+                let mut detail = names.join(" ");
+                if admin_covers_live_caps(mask, init_user_ns) {
+                    detail.push_str(
+                        " (sufficient: CAP_SYS_ADMIN covers BPF, perf and checkpoint/restore; \
+                         the narrower five-capability set also works)",
+                    );
+                }
+                Status::Ok(detail)
             } else {
                 let have = if names.is_empty() {
                     "none".to_string()
@@ -1159,21 +1321,16 @@ fn uprobe_multi_check(host: crate::attach::MultiHostVerdict) -> Check {
 /// Every failure collapses to the negative classification. Nothing about
 /// *which* loader this is may reach the row (design §9.3, §10.1), so this
 /// deliberately returns three booleans and never an error string.
-fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
+fn loader_facts(pid: u32) -> (bool, bool, bool) {
     loader_facts_from(&loader_sample_exes(pid))
 }
 
-/// The executables plain `doctor` samples for the loader rows, in order.
-/// With no `--pid` the honest subject is this host as the observer sees
-/// it: its own executable first, then init's as the host representative
-/// when the observer's own offers no loader to assess (a statically
-/// linked observer, or an execute-only install its own open cannot read).
-/// An explicit `--pid` assesses exactly that target, static or not.
-fn loader_sample_exes(pid: Option<u32>) -> Vec<String> {
-    match pid {
-        Some(pid) => vec![format!("/proc/{pid}/exe")],
-        None => vec!["/proc/self/exe".to_string(), "/proc/1/exe".to_string()],
-    }
+/// The executable a `--pid` target offers for the loader rows. The rows
+/// are per-target checks: without `--pid` there is no target to assess
+/// and they read not applicable (see [`live_discovery_checks`]), never
+/// a warning about the observer's own (possibly static) binary.
+fn loader_sample_exes(pid: u32) -> Vec<String> {
+    vec![format!("/proc/{pid}/exe")]
 }
 
 /// The loader facts behind a sample list: the first sample that offers
@@ -1227,9 +1384,11 @@ fn loader_sample_at(exe: &str) -> Option<(bool, bool, bool)> {
 
 /// The eight finite live-discovery classifications of design §10.1. Each
 /// detail is exactly one word from its frozen vocabulary, never the identity
-/// or the proof behind it.
+/// or the proof behind it. The three loader rows are per-target checks:
+/// without `--pid` they read not applicable (like the other target rows),
+/// never a warning.
 fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
-    let (bound, hook, state) = loader_facts(pid);
+    let target = pid.map(loader_facts);
     let finite = |ok: bool, yes: &str, no: &str| {
         if ok {
             Status::Ok(yes.to_string())
@@ -1239,6 +1398,12 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
             Status::Warn(no.to_string())
         }
     };
+    let per_target = |yes: &str, no: &str, ok: bool| match target {
+        Some(_) if ok => Status::Ok(yes.to_string()),
+        Some(_) => Status::Warn(no.to_string()),
+        None => Status::NotApplicable("no --pid".to_string()),
+    };
+    let (bound, hook, state) = target.unwrap_or((false, false, false));
     // The compiled-in timing catalog is exactly empty (D3 amendment §3),
     // so no context can reach `qualified_pre_constructor`/
     // `known_pre_relocation`: both timing rows read as build limits.
@@ -1246,11 +1411,11 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
     vec![
         Check {
             name: "target loader build".into(),
-            status: finite(bound, "bound", "unbound"),
+            status: per_target("bound", "unbound", bound),
         },
         Check {
             name: "debug-state hook".into(),
-            status: finite(hook, "available", "unavailable"),
+            status: per_target("available", "unavailable", hook),
         },
         Check {
             name: "loader timing (initial_set)".into(),
@@ -1262,7 +1427,7 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
         },
         Check {
             name: "loader-state live read".into(),
-            status: finite(state, "available", "unavailable"),
+            status: per_target("available", "unavailable", state),
         },
         Check {
             // Bounded `bpf_probe_read_user` in the current task: it needs the
@@ -1720,6 +1885,18 @@ fn verdict_inventory_reason(detail: &str) -> String {
 }
 
 fn verdict_line(checks: &[Check]) -> String {
+    verdict_line_with(checks, false)
+}
+
+/// The concise verdict: [`verdict_line`] without the run-startup-capture
+/// build-limit note — a user of the image is not alarmed by `not in
+/// this build` on the default line; `-v` keeps it. Real run failures
+/// and warnings still show.
+fn verdict_line_concise(checks: &[Check]) -> String {
+    verdict_line_with(checks, true)
+}
+
+fn verdict_line_with(checks: &[Check], concise: bool) -> String {
     // The inventory lane gets its own part below: an inventory-only
     // failure must not read as "capture unavailable" when the Detailed
     // lanes work. Exit gating is unchanged (`verdict` still counts the
@@ -1785,9 +1962,11 @@ fn verdict_line(checks: &[Check]) -> String {
             // Plain words, lowercase partial like the coverage lines; the
             // -v row keeps the technical check name.
             Status::NotApplicable(detail) if detail == BUILD_LIMIT_NOT_IN_BUILD => {
-                parts.push(format!(
-                    "run startup capture {detail} (run reports stay partial; run itself works)"
-                ));
+                if !concise {
+                    parts.push(format!(
+                        "run startup capture {detail} (run reports stay partial; run itself works)"
+                    ));
+                }
             }
             Status::NotApplicable(_) => {}
             Status::Fail(detail) => parts.push(format!("run capture unavailable ({detail})")),
@@ -1797,7 +1976,30 @@ fn verdict_line(checks: &[Check]) -> String {
             Status::Ok(_) => parts.push("run capture available".to_string()),
         }
     }
+    if file_learning_unavailable_on_sufficient_set(checks) {
+        parts.push(format!(
+            "file learning unavailable ({FILE_LEARNING_NEEDS_ADMIN})"
+        ));
+    }
     format!("verdict: {}", parts.join("; "))
+}
+
+/// Whether the verdict names file learning once: the capabilities row
+/// reads sufficient while the file-learning row needs `CAP_SYS_ADMIN`
+/// (the five-capability set). Admin-held and caps-lacking shapes stay
+/// silent — the former can mark, the latter already warns. While the
+/// userns cause is proven the verdict belongs to it: a secondary
+/// unavailability fragment would read as grant advice where no grant
+/// helps.
+fn file_learning_unavailable_on_sufficient_set(checks: &[Check]) -> bool {
+    let caps_sufficient = checks
+        .iter()
+        .any(|check| check.name == EFFECTIVE_CAPS_ROW && matches!(check.status, Status::Ok(_)));
+    let learning_needs_admin = checks.iter().any(|check| {
+        check.name == FILE_LEARNING_ROW
+            && matches!(&check.status, Status::NotApplicable(detail) if detail == FILE_LEARNING_NEEDS_ADMIN)
+    });
+    caps_sufficient && learning_needs_admin && !userns_cause_proven(checks)
 }
 
 fn is_requested_lane(name: &str) -> bool {
@@ -2101,7 +2303,7 @@ fn render_concise_with_host(
     host: Option<crate::attach::MultiHostVerdict>,
 ) -> String {
     let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, false));
-    let _ = writeln!(out, "{}", verdict_line(checks));
+    let _ = writeln!(out, "{}", verdict_line_concise(checks));
     if userns_cause_proven(checks) {
         // The proven userns cause, stated once: the user-namespace row
         // itself is promoted to this header (it carries the same line),
@@ -3824,10 +4026,11 @@ mod tests {
         // 13 host/target rows, eight §10.1 rows, five finite preflight rows
         // (host, inventory, journal pair, lifecycle, scope), the cgroup
         // version row, the uprobe-multi self-link row, the PID namespace
-        // row, the user namespace row, the minimal-setcap recipe row, the
-        // object-attribute capture build row, and the process-access
+        // row, the user namespace row, the minimal-setcap recipe row,
+        // the file-learning info row, the object-attribute capture build
+        // row, and the process-access
         // confinement row.
-        assert_eq!(checks.len(), 33, "{checks:?}");
+        assert_eq!(checks.len(), 34, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),
@@ -4171,7 +4374,18 @@ mod tests {
 
     #[test]
     fn doctor_classifies_every_live_discovery_row_finitely() {
-        let checks = probe(None, None);
+        use crate::fixture_guard::DieWithParent as _;
+
+        // The finite vocabulary pins the assessed (--pid) path: probe a
+        // small owned child, like the extra-strict host test below.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .expect("a dynamic control process");
+        let checks = probe(Some(child.id()), None);
+        child.kill().expect("the control process dies");
+        child.wait().expect("the control process is reaped");
         for (name, allowed) in FROZEN_ROWS {
             let check = checks
                 .iter()
@@ -4181,6 +4395,24 @@ mod tests {
             assert!(
                 allowed.contains(&detail),
                 "{name} classified itself as {detail:?}, outside {allowed:?}"
+            );
+        }
+        // Without `--pid` the per-target loader rows read not
+        // applicable — never a warning, never a classification.
+        let plain = probe(None, None);
+        for name in [
+            "target loader build",
+            "debug-state hook",
+            "loader-state live read",
+        ] {
+            let check = plain
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} row is missing: {plain:?}"));
+            assert_eq!(
+                check.status,
+                Status::NotApplicable("no --pid".into()),
+                "{name}"
             );
         }
         // Build limits read n/a in this build, never warn: no host can
@@ -4213,7 +4445,7 @@ mod tests {
             "the pause row must say whether an explicit policy can arm: {detail:?}"
         );
         // The memory scan lane keeps its existing row and its existing rules.
-        assert!(checks.iter().any(|c| c.name == "/proc/<pid>/mem"));
+        assert!(plain.iter().any(|c| c.name == "/proc/<pid>/mem"));
     }
 
     #[test]
@@ -4314,6 +4546,96 @@ mod tests {
         );
         assert!(!line.contains("initial-set"), "{line}");
         assert!(!line.contains("PARTIAL"), "{line}");
+    }
+
+    /// The concise verdict leaves the run-startup-capture build note to
+    /// `-v`: a user of the image is not alarmed by `not in this build`
+    /// on the default line. The verbose verdict keeps it, and real run
+    /// failures and warnings still show on the concise line.
+    #[test]
+    fn concise_verdict_moves_the_run_startup_build_note_to_verbose() {
+        let limited = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::NotApplicable("not in this build".into()),
+        }];
+        let concise = verdict_line_concise(&limited);
+        assert!(!concise.contains("run startup capture"), "{concise}");
+        assert!(concise.contains("capture available"), "{concise}");
+        assert!(
+            verdict_line(&limited).contains("run startup capture not in this build"),
+            "the verbose verdict keeps the build note"
+        );
+        let failed = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::Fail("refused".into()),
+        }];
+        assert!(
+            verdict_line_concise(&failed).contains("run capture unavailable (refused)"),
+            "a real run failure still shows on the concise line"
+        );
+        let ineligible = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::Warn("none".into()),
+        }];
+        assert!(
+            verdict_line_concise(&ineligible).contains("run startup capture none"),
+            "a real run warning still shows on the concise line"
+        );
+    }
+
+    /// With the five-capability set (sufficient, no `CAP_SYS_ADMIN`),
+    /// the verdict names file learning as unavailable in one info
+    /// line — never a warning row. Both renders carry it: the default
+    /// line is where a five-cap operator looks.
+    #[test]
+    fn verdict_names_file_learning_unavailable_on_a_sufficient_set_without_admin() {
+        let without_admin = vec![
+            Check {
+                name: "effective capabilities".into(),
+                status: Status::Ok("CAP_BPF held".into()),
+            },
+            Check {
+                name: "file learning".into(),
+                status: Status::NotApplicable("needs CAP_SYS_ADMIN".into()),
+            },
+        ];
+        for line in [
+            verdict_line(&without_admin),
+            verdict_line_concise(&without_admin),
+        ] {
+            assert!(
+                line.contains("file learning unavailable (needs CAP_SYS_ADMIN)"),
+                "{line}"
+            );
+        }
+        // Admin held: learning can mark, so the verdict stays silent.
+        let held = vec![
+            Check {
+                name: "effective capabilities".into(),
+                status: Status::Ok("CAP_SYS_ADMIN held".into()),
+            },
+            Check {
+                name: "file learning".into(),
+                status: Status::Ok("available".into()),
+            },
+        ];
+        assert!(!verdict_line(&held).contains("file learning"), "{held:?}");
+        // Capabilities lacking: the capabilities warning covers it, so
+        // the file-learning fragment stays out of the way.
+        let lacking = vec![
+            Check {
+                name: "effective capabilities".into(),
+                status: Status::Warn("missing CAP_BPF".into()),
+            },
+            Check {
+                name: "file learning".into(),
+                status: Status::NotApplicable("needs CAP_SYS_ADMIN".into()),
+            },
+        ];
+        assert!(
+            !verdict_line(&lacking).contains("file learning"),
+            "{lacking:?}"
+        );
     }
 
     /// A degraded timing value is a warning: it makes complete timing
@@ -4541,20 +4863,60 @@ mod tests {
         assert_eq!(loader_sample_at("/nonexistent-doctor-sample"), None);
     }
 
-    /// Plain `doctor` samples its own executable first, then init's: a
-    /// static observer still reports the host's loader facts instead of
-    /// warning about its own missing interpreter. An explicit `--pid`
-    /// assesses exactly that target.
+    /// The loader rows are per-target checks: without `--pid` there
+    /// is no target to assess, so they read not applicable — never a
+    /// warning about the observer's own (possibly static) binary.
     #[test]
-    fn plain_doctor_samples_self_then_init_while_pid_stays_exact() {
-        assert_eq!(
-            loader_sample_exes(None),
-            vec!["/proc/self/exe".to_string(), "/proc/1/exe".to_string()]
-        );
-        assert_eq!(
-            loader_sample_exes(Some(42)),
-            vec!["/proc/42/exe".to_string()]
-        );
+    fn live_discovery_checks_without_pid_names_loader_rows_not_applicable() {
+        let checks = live_discovery_checks(None, true);
+        for name in [
+            "target loader build",
+            "debug-state hook",
+            "loader-state live read",
+        ] {
+            let check = checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} row is missing: {checks:?}"));
+            assert_eq!(
+                check.status,
+                Status::NotApplicable("no --pid".into()),
+                "{name}"
+            );
+        }
+    }
+
+    /// The healthy twin: with `--pid` the same rows assess exactly
+    /// that target's loader — a dynamic target reads bound/available.
+    #[test]
+    fn live_discovery_checks_with_pid_assesses_the_target_loader() {
+        use crate::fixture_guard::DieWithParent as _;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .expect("a dynamic control process");
+        let checks = live_discovery_checks(Some(child.id()), true);
+        child.kill().expect("the control process dies");
+        child.wait().expect("the control process is reaped");
+        for (name, detail) in [
+            ("target loader build", "bound"),
+            ("debug-state hook", "available"),
+            ("loader-state live read", "available"),
+        ] {
+            let check = checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} row is missing: {checks:?}"));
+            assert_eq!(check.status, Status::Ok(detail.into()), "{name}");
+        }
+    }
+
+    /// An explicit `--pid` assesses exactly that target's loader.
+    #[test]
+    fn pid_loader_sample_stays_exact() {
+        assert_eq!(loader_sample_exes(42), vec!["/proc/42/exe".to_string()]);
     }
 
     /// The sample list resolves to the first sample that offers loader
@@ -5398,7 +5760,7 @@ mod tests {
     fn empty_capabilities_warn_while_a_read_failure_stays_distinct() {
         // Empty: every minimal capability named with what it enables,
         // never "needs root".
-        let Status::Warn(detail) = capabilities_status(Ok(0)) else {
+        let Status::Warn(detail) = capabilities_status(Ok(0), Some(true)) else {
             panic!("empty capabilities must warn");
         };
         for cap in &crate::caps::MINIMAL_LIVE {
@@ -5406,14 +5768,62 @@ mod tests {
         }
         assert!(!detail.contains("needs root"), "{detail}");
         assert_eq!(
-            capabilities_status(Err("cannot read".into())),
+            capabilities_status(Err("cannot read".into()), Some(true)),
             Status::Warn("cannot read".into())
         );
         // Partial: the missing capabilities warn, even with some held.
         assert!(matches!(
-            capabilities_status(Ok((1u64 << 2) | (1u64 << 19) | (1u64 << 39))),
+            capabilities_status(Ok((1u64 << 2) | (1u64 << 19) | (1u64 << 39)), Some(true)),
             Status::Warn(_)
         ));
+    }
+
+    /// The kernel accepts `CAP_SYS_ADMIN` for BPF, perf and
+    /// checkpoint/restore, so a set it covers reads sufficient: the
+    /// three covered names are never listed as missing, and the row
+    /// says the set is sufficient plus the narrower five-capability
+    /// note, in one line.
+    #[test]
+    fn admin_effective_covers_bpf_perf_and_checkpoint_restore() {
+        use crate::caps;
+        let mask = (1u64 << caps::CAP_SYS_ADMIN_BIT)
+            | (1u64 << caps::CAP_DAC_READ_SEARCH_BIT)
+            | (1u64 << caps::CAP_SYS_PTRACE_BIT);
+        let Status::Ok(detail) = capabilities_status(Ok(mask), Some(true)) else {
+            panic!("an admin-covered set must read sufficient");
+        };
+        assert!(detail.contains("sufficient"), "{detail}");
+        assert!(detail.contains("five-capability"), "{detail}");
+        assert!(!detail.contains("missing"), "{detail}");
+        assert_eq!(detail.lines().count(), 1, "{detail}");
+    }
+
+    /// The cover is exact: `CAP_SYS_ADMIN` alone still warns, naming
+    /// only the two capabilities it does not cover.
+    #[test]
+    fn admin_alone_still_warns_for_dac_and_ptrace_only() {
+        use crate::caps;
+        let needs = |bit: u32| {
+            let cap = caps::MINIMAL_LIVE
+                .iter()
+                .find(|cap| cap.bit == bit)
+                .unwrap();
+            caps::needs_line(cap)
+        };
+        let Status::Warn(detail) = capabilities_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), Some(true)) else {
+            panic!("admin alone must warn");
+        };
+        assert!(
+            detail.contains(&needs(caps::CAP_DAC_READ_SEARCH_BIT)),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&needs(caps::CAP_SYS_PTRACE_BIT)),
+            "{detail}"
+        );
+        for covered in ["CAP_BPF", "CAP_PERFMON", "CAP_CHECKPOINT_RESTORE"] {
+            assert!(!detail.contains(&format!("needs {covered}")), "{detail}");
+        }
     }
 
     /// Per-capability twins: each missing capability warns with its
@@ -5422,10 +5832,15 @@ mod tests {
     fn partial_capabilities_warn_with_each_missing_capability() {
         use crate::caps;
         let full = caps::minimal_live_mask();
-        assert!(matches!(capabilities_status(Ok(full)), Status::Ok(_)));
-        assert!(matches!(capabilities_status(Ok(u64::MAX)), Status::Ok(_)));
+        assert!(matches!(capabilities_status(Ok(full), Some(true)), Status::Ok(_)));
+        assert!(matches!(
+            capabilities_status(Ok(u64::MAX), Some(true)),
+            Status::Ok(_)
+        ));
         for cap in &caps::MINIMAL_LIVE {
-            let Status::Warn(detail) = capabilities_status(Ok(full & !(1u64 << cap.bit))) else {
+            let Status::Warn(detail) =
+                capabilities_status(Ok(full & !(1u64 << cap.bit)), Some(true))
+            else {
                 panic!("{} missing must warn", cap.name);
             };
             assert!(detail.contains(&caps::needs_line(cap)), "{detail}");
@@ -5445,14 +5860,14 @@ mod tests {
         let binary = "/usr/bin/p11scope";
         let recipe = caps::setcap_command(binary);
         assert_eq!(
-            setcap_status(Ok(caps::minimal_live_mask()), binary),
+            setcap_status(Ok(caps::minimal_live_mask()), binary, Some(true)),
             Status::Ok(recipe.clone())
         );
         assert_eq!(
-            setcap_status(Ok(u64::MAX), binary),
+            setcap_status(Ok(u64::MAX), binary, Some(true)),
             Status::Ok(recipe.clone())
         );
-        let Status::Warn(detail) = setcap_status(Ok(0), binary) else {
+        let Status::Warn(detail) = setcap_status(Ok(0), binary, Some(true)) else {
             panic!("empty capabilities must warn the recipe");
         };
         for cap in &caps::MINIMAL_LIVE {
@@ -5460,9 +5875,212 @@ mod tests {
         }
         assert!(detail.contains(&recipe), "{detail}");
         assert_eq!(
-            setcap_status(Err("cannot read".into()), binary),
+            setcap_status(Err("cannot read".into()), binary, Some(true)),
             Status::Warn("cannot read".into())
         );
+    }
+
+    /// The recipe row agrees with the capabilities row: an
+    /// admin-covered set reads Ok, never Warn — while an admin-only
+    /// mask warns with exactly the uncovered names.
+    #[test]
+    fn setcap_row_ok_when_admin_covers_the_live_set() {
+        use crate::caps;
+        let binary = "/usr/bin/p11scope";
+        let mask = (1u64 << caps::CAP_SYS_ADMIN_BIT)
+            | (1u64 << caps::CAP_DAC_READ_SEARCH_BIT)
+            | (1u64 << caps::CAP_SYS_PTRACE_BIT);
+        assert_eq!(
+            setcap_status(Ok(mask), binary, Some(true)),
+            Status::Ok(caps::setcap_command(binary))
+        );
+        let Status::Warn(detail) =
+            setcap_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), binary, Some(true))
+        else {
+            panic!("admin alone must warn the recipe");
+        };
+        assert!(
+            detail.contains("CAP_DAC_READ_SEARCH, CAP_SYS_PTRACE"),
+            "{detail}"
+        );
+        assert!(!detail.contains("CAP_BPF"), "{detail}");
+        assert!(!detail.contains("CAP_PERFMON"), "{detail}");
+        assert!(!detail.contains("CAP_CHECKPOINT_RESTORE"), "{detail}");
+    }
+
+    /// Inside a container the recipe row names the `docker run`
+    /// flags, never `sudo setcap`: a container has no setcap-able host
+    /// binary. The missing names still list exactly the uncovered
+    /// capabilities, and a complete set reads Ok.
+    #[test]
+    fn container_recipe_names_docker_flags_never_setcap() {
+        let Status::Warn(detail) = container_flags_status(Ok(0), Some(true)) else {
+            panic!("empty capabilities must warn the flags");
+        };
+        assert!(detail.contains("missing CAP_BPF"), "{detail}");
+        assert!(detail.contains("--cap-drop ALL --cap-add BPF"), "{detail}");
+        assert!(detail.contains("--cap-add DAC_READ_SEARCH"), "{detail}");
+        assert!(!detail.contains("setcap"), "{detail}");
+        assert!(!detail.contains("sudo"), "{detail}");
+        let Status::Ok(detail) =
+            container_flags_status(Ok(crate::caps::minimal_live_mask()), Some(true))
+        else {
+            panic!("a complete set must read Ok");
+        };
+        assert!(detail.contains("--cap-drop ALL"), "{detail}");
+        assert!(!detail.contains("setcap"), "{detail}");
+        // An admin-covered set reads Ok here too, like the setcap row.
+        let admin = (1u64 << crate::caps::CAP_SYS_ADMIN_BIT)
+            | (1u64 << crate::caps::CAP_DAC_READ_SEARCH_BIT)
+            | (1u64 << crate::caps::CAP_SYS_PTRACE_BIT);
+        assert!(matches!(
+            container_flags_status(Ok(admin), Some(true)),
+            Status::Ok(_)
+        ));
+    }
+
+    /// Container detection: the image environment wins, `/.dockerenv`
+    /// is the fallback for hand-rolled containers, anything else runs
+    /// the host path.
+    #[test]
+    fn container_detection_prefers_the_image_env_with_dockerenv_fallback() {
+        assert!(in_container(Some("1"), false));
+        assert!(in_container(Some("1"), true));
+        assert!(in_container(None, true));
+        assert!(!in_container(None, false));
+        assert!(!in_container(Some("0"), false));
+        assert!(!in_container(Some("yes"), false));
+        assert!(!in_container(Some(""), false));
+    }
+
+    /// The file-learning row follows the `CAP_SYS_ADMIN` bit: held it
+    /// reads Ok, otherwise not applicable with the reason — info,
+    /// never a warning. A read failure stays distinct like the
+    /// capabilities row's.
+    #[test]
+    fn file_learning_row_follows_the_admin_bit() {
+        use crate::caps;
+        assert!(matches!(
+            file_learning_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), Some(true)),
+            Status::Ok(_)
+        ));
+        assert_eq!(
+            file_learning_status(Ok(caps::minimal_live_mask()), Some(true)),
+            Status::NotApplicable("needs CAP_SYS_ADMIN".into())
+        );
+        assert_eq!(
+            file_learning_status(Err("cannot read".into()), Some(true)),
+            Status::NotApplicable("cannot read".into())
+        );
+    }
+
+    /// The admin cover applies only in the initial user namespace: in
+    /// a proven child namespace an admin-covered set warns with the
+    /// uncovered live names (never "sufficient"), while a complete
+    /// set reads Ok without the sufficiency note. Unknown keeps the
+    /// initial-namespace behavior.
+    #[test]
+    fn admin_cover_applies_only_in_the_initial_user_namespace() {
+        use crate::caps;
+        let covered = (1u64 << caps::CAP_SYS_ADMIN_BIT)
+            | (1u64 << caps::CAP_DAC_READ_SEARCH_BIT)
+            | (1u64 << caps::CAP_SYS_PTRACE_BIT);
+        let Status::Warn(detail) = capabilities_status(Ok(covered), Some(false)) else {
+            panic!("a covered set in a child userns must warn, not read sufficient");
+        };
+        assert!(detail.contains("CAP_BPF"), "{detail}");
+        assert!(!detail.contains("sufficient"), "{detail}");
+        let Status::Ok(detail) = capabilities_status(Ok(u64::MAX), Some(false)) else {
+            panic!("a complete set in a child userns must read Ok");
+        };
+        assert!(!detail.contains("sufficient"), "{detail}");
+        // The recipe row agrees: no Ok via the cover in a child userns.
+        let binary = "/usr/bin/p11scope";
+        assert!(matches!(
+            setcap_status(Ok(covered), binary, Some(false)),
+            Status::Warn(_)
+        ));
+        // Unknown keeps the initial-namespace behavior.
+        assert!(matches!(
+            capabilities_status(Ok(covered), None),
+            Status::Ok(_)
+        ));
+        assert!(matches!(
+            setcap_status(Ok(covered), binary, None),
+            Status::Ok(_)
+        ));
+    }
+
+    /// In a proven child user namespace the container recipe row
+    /// names no flags: no container grant fixes capture there, so the
+    /// row stays out of the way with the true remedy — complete and
+    /// incomplete sets alike.
+    #[test]
+    fn container_recipe_defers_to_the_userns_cause_in_a_child_namespace() {
+        for mask in [0, crate::caps::minimal_live_mask(), u64::MAX] {
+            let Status::NotApplicable(detail) = container_flags_status(Ok(mask), Some(false))
+            else {
+                panic!("mask {mask:#x} in a child userns must stay out of the way");
+            };
+            assert!(detail.contains("no container grant helps"), "{detail}");
+            assert!(detail.contains(crate::userns::NEXT_STEP), "{detail}");
+            assert!(!detail.contains("--cap-add"), "{detail}");
+            assert!(!detail.contains("setcap"), "{detail}");
+        }
+        // A read failure still reports the failure, like the setcap row.
+        assert_eq!(
+            container_flags_status(Err("cannot read".into()), Some(false)),
+            Status::Warn("cannot read".into())
+        );
+    }
+
+    /// "Available" applies only in the initial user namespace: an
+    /// admin bit held in a proven child namespace reads not
+    /// applicable, never available. Unknown keeps the old behavior.
+    #[test]
+    fn file_learning_row_never_reads_available_in_a_child_user_namespace() {
+        use crate::caps;
+        assert_eq!(
+            file_learning_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), Some(false)),
+            Status::NotApplicable("unavailable in a child user namespace".into())
+        );
+        assert_eq!(
+            file_learning_status(Ok(caps::minimal_live_mask()), Some(false)),
+            Status::NotApplicable("needs CAP_SYS_ADMIN".into())
+        );
+        assert!(matches!(
+            file_learning_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), None),
+            Status::Ok(_)
+        ));
+    }
+
+    /// While the userns cause is proven the verdict belongs to it: a
+    /// sufficient set without admin stays silent about file learning
+    /// instead of appending grant-flavored advice.
+    #[test]
+    fn verdict_fragment_silent_while_the_userns_cause_is_proven() {
+        let sufficient = vec![
+            Check {
+                name: "effective capabilities".into(),
+                status: Status::Ok("CAP_BPF held".into()),
+            },
+            Check {
+                name: "file learning".into(),
+                status: Status::NotApplicable("needs CAP_SYS_ADMIN".into()),
+            },
+        ];
+        assert!(
+            verdict_line(&sufficient).contains("file learning unavailable"),
+            "the fragment fires without the userns cause"
+        );
+        let mut nested = sufficient;
+        nested.push(Check {
+            name: "user namespace".into(),
+            status: Status::Fail(crate::userns::CAUSE_LINE.to_string()),
+        });
+        for line in [verdict_line(&nested), verdict_line_concise(&nested)] {
+            assert!(!line.contains("file learning"), "{line}");
+        }
     }
 
     /// While any minimal-live capability is missing, Next points at

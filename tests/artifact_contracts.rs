@@ -11735,6 +11735,9 @@ fn observer_image_runs_p11scope_by_default() {
         "/usr/local/bin/k8s-profile-entry --self-test",
         "test -f /usr/share/licenses/p11scope/LICENSE",
         "only effective for uid 0",
+        // The image marker `doctor` reads to name `docker run` flags
+        // instead of `setcap` (with a `/.dockerenv` fallback).
+        "ENV P11SCOPE_IMAGE=1",
     ] {
         require_contract_marker(&dockerfile, marker, "observer image")
             .expect("observer image contract");
@@ -11767,6 +11770,9 @@ fn observer_image_runs_p11scope_by_default() {
         "RELEASE.json",
         "org.opencontainers.image.source",
         "only effective for uid 0",
+        // The image marker `doctor` reads to name `docker run` flags
+        // instead of `setcap` (with a `/.dockerenv` fallback).
+        "ENV P11SCOPE_IMAGE=1",
     ] {
         require_contract_marker(&release, marker, "observer release image")
             .expect("observer release image contract");

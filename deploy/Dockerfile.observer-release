@@ -74,6 +74,9 @@ RUN set -eu; \
 FROM scratch
 LABEL org.opencontainers.image.source=https://github.com/mingulov/p11scope
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The image marker `p11scope doctor` reads (with a `/.dockerenv`
+# fallback) to name `docker run` capability flags instead of `setcap`.
+ENV P11SCOPE_IMAGE=1
 COPY --from=src /tmp/stage/bin/p11scope /usr/local/bin/p11scope
 COPY --from=src /tmp/stage/licenses/ /usr/share/licenses/p11scope/
 COPY --from=src /bin/busybox /bin/busybox

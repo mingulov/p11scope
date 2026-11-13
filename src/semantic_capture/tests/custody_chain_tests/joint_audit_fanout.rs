@@ -28891,12 +28891,14 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     // `detected_ns`, +32) and the pre-arm raw-source marker (+8;
     // `changed` packs into the bool tail). +8 (F12 fs-identity): the
     // entry carries the held fd's own `st_dev` (`fd_dev`) so snapshot
-    // twins on one mount separate. Re-audited: the worst-case
-    // 1,024-partition transaction below still binds within the 160 MiB
-    // pool at this size, so the reservation holds.
+    // twins on one mount separate. +8 (handle table): the entry's
+    // filed handle carries its table row id (`TableHandle`).
+    // Re-audited: the worst-case 1,024-partition transaction below
+    // still binds within the 160 MiB pool at this size, so the
+    // reservation holds.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        568
+        576
     );
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);

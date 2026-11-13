@@ -70,6 +70,7 @@ fn cold_group_deep_scan_keeps_sparse_provider_targets_useful() {
             &mut timings,
             None,
             None,
+            crate::discovery::handle_table::Filing::Untracked,
         );
 
         let (modules, pins, _) =

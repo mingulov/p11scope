@@ -9621,7 +9621,7 @@ pub(crate) mod tests {
             let pins = pinning.pins;
             let operator = dir.path().join("operator-input.json");
             std::fs::write(&operator, serde_json::to_vec(&manifest).unwrap()).unwrap();
-            let engine =
+            let mut engine =
                 crate::discovery::engine::inventory_coordinator::semantics::engine_for_test(
                     Vec::new(),
                     Vec::new(),
@@ -9629,7 +9629,7 @@ pub(crate) mod tests {
                 );
             let prepared =
                 crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
-                    &engine,
+                    &mut engine,
                     std::slice::from_ref(&operator),
                 );
             let subset = prepared.subset.expect("nonempty validated operator subset");
@@ -9712,7 +9712,7 @@ pub(crate) mod tests {
             let attachment = crate::attach::seal_test_attachment(subset, domain, &pins);
             let prepared =
                 crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
-                    &engine,
+                    &mut engine,
                     &[operator],
                 );
             let subset = prepared.subset.expect("re-attested working subset");

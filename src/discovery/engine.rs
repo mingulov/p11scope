@@ -19,18 +19,21 @@ use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::elf_needed;
+use crate::discovery::handle_table::{Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
-    InstalledPinsBacking, KernelSelfMappingProbe, ManifestStaleReason, Pin, PinHandleBudget,
-    PinnedConservativeCursor, PinnedObjectId, PinnedObjects, PinnedTimingKey, PrearmPinnedInput,
-    ReconciledModule, RetainedScannedInputs, RetiredFileHandoff, ScannedInputMeasure,
-    ScannedRebindCursor, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
-    canonicalize_scanned_overlays, open_view_executable_cached, open_view_rooted_object_cached,
-    opened_file_matches_maps, pin_manifest_objects_deferred_in_views_with_budget, pin_of,
-    pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects,
-    pin_scanned_view_objects_with_budgets, preexec_object_key, retained_object_key_cached,
-    self_mapped_fallback_key, target_paths_equal,
+    InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError, ManifestPinning,
+    ManifestStaleReason, Pin, PinHandleBudget, PinnedConservativeCursor, PinnedObjectId,
+    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
+    RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
+    open_view_executable_cached, open_view_rooted_object_cached, opened_file_matches_maps,
+    pin_manifest_objects_deferred_in_views_with_budget_and_filing,
+    pin_manifest_objects_deferred_in_views_with_prior_and_filing, pin_of,
+    pin_prearm_objects_in_views_with_budget_and_filing,
+    pin_scanned_view_objects_with_budgets_and_filing, preexec_object_key,
+    retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -440,6 +443,10 @@ pub struct Engine {
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
     prearm_input: Option<PrearmInput>,
+    /// The capture-owned library-handle table: every retained library
+    /// fd files here, so the concurrent-handle cap holds by
+    /// construction. Engine-thread only: all mutation takes `&mut`.
+    handle_table: HandleTable,
     /// Kernel file-open learning: the fanotify drain handle, armed for
     /// system scope only. `None` before arming, when the scope is not
     /// system, or when fanotify is unavailable (then the capture keeps
@@ -7008,6 +7015,7 @@ fn scan_and_pin(
         scan_process_view,
         None,
         None,
+        Filing::Untracked,
     )
     .map(|(modules, pins, _)| (modules, pins))
 }
@@ -7034,6 +7042,7 @@ fn scan_and_pin_with(
     ) -> std::result::Result<ScanOutcome, String>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     handles: Option<&PinHandleBudget<'_>>,
+    filing: Filing<'_>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     scan_and_pin_with_proof(
         view,
@@ -7048,6 +7057,7 @@ fn scan_and_pin_with(
         },
         reserve,
         handles,
+        filing,
     )
     .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
 }
@@ -7086,6 +7096,7 @@ fn scan_and_pin_with_proof(
     >,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     handles: Option<&PinHandleBudget<'_>>,
+    filing: Filing<'_>,
 ) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
@@ -7139,8 +7150,11 @@ fn scan_and_pin_with_proof(
     // pending instead of opening into `EMFILE`. Fix8 F2: the tick's
     // library-handle budget does the same per acquisition, so one scan
     // can no longer retain past the cap. Admission scans pass `Some`;
-    // every other scan site passes `None` (today's behavior).
-    let pinned = pin_scanned_view_objects_with_budgets(view, &modules, budget, reserve, handles);
+    // every other scan site passes `None` (today's behavior). Every
+    // retaining site files `Adopt` into its lane's table (Phase 0).
+    let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+        view, &modules, budget, reserve, handles, filing,
+    );
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",
@@ -8781,6 +8795,7 @@ fn discover_plan(
             // Fix7 F1: the pass's reserve budgets the pin loop itself.
             reserve_tick.as_ref(),
             Some(&pin_handles),
+            Filing::Adopt(&mut discovered.handle_table),
         );
         // 6.14 Option B: the scan observed this generation alive; learn
         // its executable path whether or not the scan completed.
@@ -8874,6 +8889,7 @@ fn discover_plan(
                 );
                 held_handles =
                     held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
+                discovered.debug_assert_table_coherent();
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
@@ -8951,10 +8967,11 @@ fn discover_plan(
         let manifest =
             read_manifest_file(path).inspect_err(|_| discovered.base_counters.report_notes())?;
         let pin_start = crate::attach::monotonic_ns();
-        let pinning_result = pin_manifest_objects_deferred_in_views_with_budget(
+        let pinning_result = pin_manifest_objects_deferred_in_views_with_budget_and_filing(
             &manifest,
             &discovered.views,
             &mut discovered.budget,
+            Filing::Adopt(&mut discovered.handle_table),
         );
         discovered.stage_timings.span(
             crate::timing::StageKind::Pin,
@@ -9013,13 +9030,14 @@ fn discover_plan(
             .iter()
             .map(|input| input.pins.pinned_object_bytes())
             .fold(0u64, |total, bytes| total.saturating_add(bytes));
-        let pinning = pin_prearm_objects_in_views_with_budget(
+        let pinning = pin_prearm_objects_in_views_with_budget_and_filing(
             &a.prearm_modules,
             &discovered.views,
             named_pid,
             prior_objects,
             prior_bytes,
             &mut discovered.budget,
+            Filing::Adopt(&mut discovered.handle_table),
         )
         .map_err(|error| {
             for problem in error.problems() {
@@ -12860,6 +12878,7 @@ impl Engine {
             scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
             prearm_input: None,
+            handle_table: HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
             file_learner: None,
             learned_rx: None,
             learned_notes: BTreeMap::new(),
@@ -15954,6 +15973,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn scan_retained_view(
         view: &ProcessView,
         module_hints: &[PathBuf],
@@ -15963,6 +15983,7 @@ impl Engine {
         stage: &mut crate::timing::StageTimings,
         reserve: Option<&crate::fd_budget::FdReserveTick>,
         handles: Option<&PinHandleBudget<'_>>,
+        filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -15979,10 +16000,12 @@ impl Engine {
                 scan_process_view,
                 reserve,
                 handles,
+                filing,
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_retained_view_without_memory(
         view: &ProcessView,
         module_hints: &[PathBuf],
@@ -15991,6 +16014,7 @@ impl Engine {
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
         handles: Option<&PinHandleBudget<'_>>,
+        filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -16007,6 +16031,7 @@ impl Engine {
                 scan_process_view_without_memory,
                 None,
                 handles,
+                filing,
             )
         })
     }
@@ -17560,6 +17585,9 @@ impl Engine {
         // clearance the next merge reads is always fresh — including
         // after a failed application, whose links may still have moved.
         self.refresh_revivable(session);
+        // Phase-0 shadow assert after every commit (covers every
+        // refresh, loader and live-tail commit path at once).
+        self.debug_assert_table_coherent();
         outcome
     }
 
@@ -19925,8 +19953,14 @@ impl Engine {
         let (pins, pin_skips) = {
             let view = &self.views[position];
             let pin_start = crate::attach::monotonic_ns();
-            let pinned =
-                pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget);
+            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+                view,
+                std::slice::from_ref(&lowered),
+                &mut self.budget,
+                None,
+                None,
+                Filing::Adopt(&mut self.handle_table),
+            );
             self.stage_timings.span(
                 crate::timing::StageKind::Pin,
                 "pin_lowered_module",
@@ -20393,6 +20427,7 @@ impl Engine {
                 &mut self.stage_timings,
                 None,
                 None,
+                Filing::Adopt(&mut self.handle_table),
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
@@ -20402,6 +20437,7 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
+                Filing::Adopt(&mut self.handle_table),
             ),
         };
         // 6.14 Option B: learn the scanned generation's executable path.
@@ -20658,8 +20694,14 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned =
-                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget);
+            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+                &self.views[position],
+                &new_modules,
+                &mut self.budget,
+                None,
+                None,
+                Filing::Adopt(&mut self.handle_table),
+            );
             self.stage_timings.span(
                 crate::timing::StageKind::Pin,
                 "pin_new_modules",
@@ -20739,8 +20781,14 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned =
-                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget);
+            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+                &self.views[position],
+                &new_modules,
+                &mut self.budget,
+                None,
+                None,
+                Filing::Adopt(&mut self.handle_table),
+            );
             self.stage_timings.span(
                 crate::timing::StageKind::Pin,
                 "pin_new_modules",
@@ -21457,6 +21505,7 @@ impl Engine {
             prior_objects,
             prior_bytes,
             &mut self.budget,
+            Filing::Adopt(&mut self.handle_table),
         ) {
             Ok(pinning) => pinning,
             Err(error) => {
@@ -23370,10 +23419,13 @@ impl Engine {
             &loader_path,
         );
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects(
+        let pinned = pin_scanned_view_objects_with_budgets_and_filing(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
+            None,
+            None,
+            Filing::Adopt(&mut self.handle_table),
         );
         self.stage_timings.span(
             crate::timing::StageKind::Pin,
@@ -23713,10 +23765,13 @@ impl Engine {
             interfaces: Vec::new(),
         };
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects(
+        let pinned = pin_scanned_view_objects_with_budgets_and_filing(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
+            None,
+            None,
+            Filing::Adopt(&mut self.handle_table),
         );
         self.stage_timings.span(
             crate::timing::StageKind::Pin,
@@ -27463,6 +27518,7 @@ impl Engine {
                 &mut self.stage_timings,
                 None,
                 None,
+                Filing::Adopt(&mut self.handle_table),
             );
             // 6.14 Option B: learn the refreshed generation's executable.
             elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
@@ -28593,6 +28649,7 @@ impl Engine {
             return (false, Vec::new());
         }
         let broad_admit = self.broad_admit;
+        // The probationary probe discards its pins: no rows until Task 4.
         let (scan_result, counters) = Self::scan_retained_view(
             &view,
             &self.module_hints,
@@ -28602,6 +28659,7 @@ impl Engine {
             &mut self.stage_timings,
             None,
             None,
+            Filing::Untracked,
         );
         // 6.14 Option B: learn the probationary generation's executable.
         elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -28757,6 +28815,69 @@ impl Engine {
         }
         self.pinned.held_library_fds(&mut fds);
         fds.len()
+    }
+
+    /// The capture-owned handle table, mutably: the coordinator lane
+    /// files its trusted pins through here. Same-module callers use
+    /// the field directly so their borrows can split.
+    pub(crate) fn handle_table_mut(&mut self) -> &mut HandleTable {
+        &mut self.handle_table
+    }
+
+    /// Pin one manifest for the semantic retained inputs (C3), filing
+    /// into this lane's table. Splits `views`/`handle_table` here so
+    /// the coordinator call sites keep their own borrows.
+    pub(crate) fn pin_retained_manifest(
+        &mut self,
+        manifest: &Manifest,
+        budget: &mut CaptureWorkBudget,
+        prior_objects: usize,
+        prior_bytes: u64,
+    ) -> Result<ManifestPinning, ManifestPinError> {
+        pin_manifest_objects_deferred_in_views_with_prior_and_filing(
+            manifest,
+            &self.views,
+            budget,
+            prior_objects,
+            prior_bytes,
+            Filing::Adopt(&mut self.handle_table),
+        )
+    }
+
+    /// Phase-0 shadow assert (debug-only): after pruning to
+    /// quiescence, the tabled recount over the four retained sets
+    /// stays within the table, and the distinct rows reachable from
+    /// the tabled handles equal the tabled recount. Untableable
+    /// handles (fixtures, untracked pins) stay out of both sides. The
+    /// old recount stays the enforcement until Task 6.
+    fn debug_assert_table_coherent(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            while self.handle_table.prune(1024).pending > 0 {}
+            let mut fds = BTreeSet::new();
+            let mut rows = BTreeSet::new();
+            for input in self.scan_inputs.values() {
+                input.pins.tabled_held_library_fds(&mut fds, &mut rows);
+            }
+            for input in &self.manifest_inputs {
+                input.pins.tabled_held_library_fds(&mut fds, &mut rows);
+            }
+            if let Some(prearm) = &self.prearm_input {
+                prearm.pins.tabled_held_library_fds(&mut fds, &mut rows);
+            }
+            self.pinned.tabled_held_library_fds(&mut fds, &mut rows);
+            debug_assert!(
+                fds.len() <= self.handle_table.len(),
+                "tabled recount {} exceeds table len {}",
+                fds.len(),
+                self.handle_table.len()
+            );
+            debug_assert_eq!(
+                rows.len(),
+                fds.len(),
+                "distinct tabled rows must equal the tabled recount"
+            );
+        }
     }
 
     fn admit_inventory_new_views(
@@ -29044,6 +29165,7 @@ impl Engine {
                 // Fix7 F1: the tick's reserve budgets the pin loop itself.
                 reserve_tick.as_ref(),
                 Some(&pin_handles),
+                Filing::Adopt(&mut self.handle_table),
             );
             // 6.14 Option B: learn the newcomer's executable path.
             elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -29117,6 +29239,7 @@ impl Engine {
                     );
                     held_handles =
                         held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
+                    self.debug_assert_table_coherent();
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot
                     // when a pending waiter follows in this window — the

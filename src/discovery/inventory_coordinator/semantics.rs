@@ -3,7 +3,6 @@
 //! Sole subset minter over the coordinator's retained, accepted sources.
 
 use super::*;
-use crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_prior;
 
 #[path = "semantics/finalizer.rs"]
 mod finalizer;
@@ -260,7 +259,7 @@ impl SemanticInputs {
         self.prearm_prior
     }
 
-    pub(crate) fn prepare(&mut self, engine: &Engine) -> SubsetPreparation {
+    pub(crate) fn prepare(&mut self, engine: &mut Engine) -> SubsetPreparation {
         let retained = self.retained_or_load(engine);
         prepare_retained_subset(engine, retained)
     }
@@ -275,7 +274,7 @@ impl SemanticInputs {
     /// to the engine's own scan snapshot.
     pub(crate) fn prepare_scan(
         &mut self,
-        engine: &Engine,
+        engine: &mut Engine,
         scan_sources: Option<(Vec<ReconciledModule>, PinnedObjects)>,
     ) -> SubsetPreparation {
         let retained = self.retained_or_load(engine);
@@ -290,7 +289,7 @@ impl SemanticInputs {
     /// The memoized retained inputs, loaded once from the operator
     /// paths. Shared by the full mint and the selected restriction so
     /// both read the same retained files.
-    fn retained_or_load(&mut self, engine: &Engine) -> &RetainedInputs {
+    fn retained_or_load(&mut self, engine: &mut Engine) -> &RetainedInputs {
         let (prior_objects, prior_bytes) = self.prearm_prior;
         self.retained.get_or_insert_with(|| {
             let mut inputs = Vec::new();
@@ -299,14 +298,9 @@ impl SemanticInputs {
             for path in &self.paths {
                 let accepted = (|| -> Result<(ManifestInput, bool)> {
                     let manifest = read_manifest_file(path)?;
-                    let pinning = pin_manifest_objects_deferred_in_views_with_prior(
-                        &manifest,
-                        &engine.views,
-                        &mut budget,
-                        prior_objects,
-                        prior_bytes,
-                    )
-                    .map_err(|_| anyhow!("manifest pinning refused"))?;
+                    let pinning = engine
+                        .pin_retained_manifest(&manifest, &mut budget, prior_objects, prior_bytes)
+                        .map_err(|_| anyhow!("manifest pinning refused"))?;
                     let skipped = !pinning.skipped.is_empty();
                     Ok((
                         ManifestInput {
@@ -341,7 +335,7 @@ impl SemanticInputs {
 /// Read explicit inputs against the Inventory owner's retained sources. The
 /// physical plan and its source ownership are never rebuilt or modified.
 #[cfg(test)]
-pub(crate) fn prepare_attested_subset(engine: &Engine, paths: &[PathBuf]) -> SubsetPreparation {
+pub(crate) fn prepare_attested_subset(engine: &mut Engine, paths: &[PathBuf]) -> SubsetPreparation {
     SemanticInputs::new(paths.to_vec()).prepare(engine)
 }
 
@@ -357,7 +351,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
 /// Test seam for the no-manifest scan mint, mirroring
 /// [`prepare_attested_subset`] with no operator inputs.
 #[cfg(test)]
-pub(crate) fn prepare_scan_attested_subset(engine: &Engine) -> SubsetPreparation {
+pub(crate) fn prepare_scan_attested_subset(engine: &mut Engine) -> SubsetPreparation {
     SemanticInputs::new(Vec::new()).prepare_scan(engine, None)
 }
 
@@ -2130,12 +2124,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(PromotionRefusal::ProviderUnloaded);
         };
         let key = module.key.clone();
-        let accepted = accept_retained_inputs(
-            &self.engine,
-            self.semantic_inputs.retained_or_load(&self.engine),
-            false,
-            None,
-        );
+        let retained = self.semantic_inputs.retained_or_load(&mut self.engine);
+        let accepted = accept_retained_inputs(&self.engine, retained, false, None);
         let object = provider_object_for_key(&accepted.pins, &key)
             .ok_or(PromotionRefusal::ManifestUnavailable)?;
         let restrict = BTreeSet::from([object]);
@@ -4850,8 +4840,8 @@ mod finalizer_history_tests {
         fn subset(&self) -> AttestedSubset {
             let path = self.dir.path().join("operator-input.json");
             std::fs::write(&path, serde_json::to_vec(&self.manifest).unwrap()).unwrap();
-            let engine = engine_for_test(Vec::new(), Vec::new(), self.pins.clone());
-            let prepared = prepare_attested_subset(&engine, &[path]);
+            let mut engine = engine_for_test(Vec::new(), Vec::new(), self.pins.clone());
+            let prepared = prepare_attested_subset(&mut engine, &[path]);
             let subset = prepared.subset.expect("nonempty validated operator subset");
             assert_eq!(subset.plan().slots.len(), 2);
             subset
@@ -4953,10 +4943,10 @@ mod finalizer_history_tests {
             ..manifest.clone()
         })
         .expect("the first wide object pins alone");
-        let engine = engine_for_test(Vec::new(), Vec::new(), first.pins);
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), first.pins);
         let mut charged = SemanticInputs::new(vec![input]);
         charged.set_prearm_prior(prior_objects, prior_bytes);
-        let refused = charged.prepare(&engine);
+        let refused = charged.prepare(&mut engine);
         assert_eq!(
             refused.refusals,
             vec![SemanticRefusal::ManifestInput],
@@ -4967,10 +4957,10 @@ mod finalizer_history_tests {
         let small = HistoryFixture::new();
         let small_input = small.dir.path().join("operator-input.json");
         std::fs::write(&small_input, serde_json::to_vec(&small.manifest).unwrap()).unwrap();
-        let small_engine = engine_for_test(Vec::new(), Vec::new(), small.pins.clone());
+        let mut small_engine = engine_for_test(Vec::new(), Vec::new(), small.pins.clone());
         let mut charged_small = SemanticInputs::new(vec![small_input]);
         charged_small.set_prearm_prior(prior_objects, prior_bytes);
-        let accepted = charged_small.prepare(&small_engine);
+        let accepted = charged_small.prepare(&mut small_engine);
         assert!(
             !accepted.refusals.contains(&SemanticRefusal::ManifestInput),
             "a small manifest with retained usage still pins"
@@ -5005,8 +4995,10 @@ mod finalizer_history_tests {
         let path = fixture.dir.path().join("operator-input.json");
         let independent =
             crate::discovery::identity::pin_manifest_objects_deferred(&fixture.manifest).unwrap();
-        let engine = engine_for_test(Vec::new(), Vec::new(), independent.pins);
-        let independent = prepare_attested_subset(&engine, &[path]).subset.unwrap();
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), independent.pins);
+        let independent = prepare_attested_subset(&mut engine, &[path])
+            .subset
+            .unwrap();
         assert_eq!(
             attached.plan, independent.plan,
             "same physical file and exact plan are insufficient alone"

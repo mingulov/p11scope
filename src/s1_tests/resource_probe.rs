@@ -815,9 +815,12 @@ fn native_semantic_resource_final_types_pinned() {
     // machine reservation: the worst-case transaction still binds (the
     // N/N+1 population and the 1,024-partition full-spread transaction
     // pass at 568 bytes on this candidate).
+    // +8 (handle table): the entry's filed handle carries its table
+    // row id (`TableHandle`), so the watched target grows one u64.
+    // The N/N+1 populations still bind (their tests pass at 576).
     pin!(
         crate::semantic_capture::CurrentPartitionReceipt,
-        504 + size_of::<RetainedBirth>()
+        512 + size_of::<RetainedBirth>()
     );
     pin!(crate::semantic_capture::Invalidation, 72);
     pin!(crate::semantic_capture::InvalidationScope, 48);

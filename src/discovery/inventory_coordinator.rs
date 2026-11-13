@@ -1328,6 +1328,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         pinning: crate::discovery::identity::PrearmPinning,
     ) {
+        // Phase 0: the pins were proven before any table existed, so
+        // their already-held handles file here, without reopening.
+        let mut pinning = pinning;
+        pinning
+            .pins
+            .adopt_handles_into(self.engine.handle_table_mut());
         let usage = (
             pinning.pins.pinned().count(),
             pinning.pins.pinned_object_bytes(),
@@ -2175,7 +2181,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
-        self.semantic_inputs.prepare(&self.engine)
+        self.semantic_inputs.prepare(&mut self.engine)
     }
 
     /// Mark that this run will attempt the no-manifest scan seal,
@@ -2194,7 +2200,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // start retries on a later pass whose absorb refills the
         // stash with fresher tables anyway.
         let sources = self.scan_mint_sources.clone();
-        self.semantic_inputs.prepare_scan(&self.engine, sources)
+        self.semantic_inputs.prepare_scan(&mut self.engine, sources)
     }
 
     pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {

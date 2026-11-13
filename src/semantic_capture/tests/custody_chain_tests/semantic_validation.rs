@@ -219,9 +219,9 @@ impl HeldProviders {
             std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
             paths.push(input);
         }
-        let engine = engine_for_test(Vec::new(), Vec::new(), PinnedObjects::empty());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), PinnedObjects::empty());
         let mut inputs = SemanticInputs::new(paths);
-        let prepared = inputs.prepare(&engine);
+        let prepared = inputs.prepare(&mut engine);
         assert!(prepared.refusals.is_empty(), "{:?}", prepared.refusals);
         let subset = prepared
             .subset
@@ -229,7 +229,7 @@ impl HeldProviders {
         assert_eq!(subset.required().len(), count);
         assert_eq!(subset.plan().slots.len(), count * resolved.len());
         let attachment = attach.then(|| {
-            let prepared = inputs.prepare(&engine);
+            let prepared = inputs.prepare(&mut engine);
             assert!(prepared.refusals.is_empty());
             let attachment = prepared.subset.unwrap();
             assert!(

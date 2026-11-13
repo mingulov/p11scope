@@ -177,8 +177,8 @@ impl ProviderFixture {
 
     fn subset(&self) -> AttestedSubset {
         let path = self.write_manifest();
-        let engine = engine_for_test(Vec::new(), Vec::new(), self.pins.clone());
-        let prepared = prepare_attested_subset(&engine, &[path]);
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), self.pins.clone());
+        let prepared = prepare_attested_subset(&mut engine, &[path]);
         let subset = prepared.subset.expect("nonempty validated operator subset");
         assert_eq!(subset.plan().slots.len(), 2);
         assert!(
@@ -433,7 +433,7 @@ fn native_semantic_manifest_repeatable_and_mixed_refusal_preserves_counts() {
         panic!("repeatable manifests: {parsed:?}");
     };
     assert_eq!(args.manifests, vec![valid.clone(), invalid.clone()]);
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         vec![fixture.source(["C_SignInit", "C_Sign"])],
         fixture.pins.clone(),
@@ -444,9 +444,9 @@ fn native_semantic_manifest_repeatable_and_mixed_refusal_preserves_counts() {
         2,
         "broad physical endpoints are nonempty"
     );
-    let without_input = prepare_attested_subset(&engine, &[]);
-    let refused_input = prepare_attested_subset(&engine, std::slice::from_ref(&invalid));
-    let prepared = prepare_attested_subset(&engine, &[valid, invalid]);
+    let without_input = prepare_attested_subset(&mut engine, &[]);
+    let refused_input = prepare_attested_subset(&mut engine, std::slice::from_ref(&invalid));
+    let prepared = prepare_attested_subset(&mut engine, &[valid, invalid]);
     assert!(
         prepared.subset.is_some(),
         "valid provider survives another input's refusal"
@@ -471,7 +471,7 @@ fn native_semantic_manifest_repeatable_and_mixed_refusal_preserves_counts() {
 fn native_semantic_manifest_input_retains_original_after_replacement() {
     let fixture = ProviderFixture::new();
     let path = fixture.write_manifest();
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         vec![fixture.source(["C_SignInit", "C_Sign"])],
         fixture.pins.clone(),
@@ -479,14 +479,14 @@ fn native_semantic_manifest_input_retains_original_after_replacement() {
     let before = engine.plan().clone();
     let mut inputs = SemanticInputs::new(vec![path.clone()]);
     let original = inputs
-        .prepare(&engine)
+        .prepare(&mut engine)
         .subset
         .expect("actual explicit input produces a nonempty subset");
     assert_eq!(original.plan().slots.len(), 2);
     let removed = fixture.dir.path().join("original-input.json");
     std::fs::rename(&path, &removed).unwrap();
     std::fs::write(&path, b"{\"schema\":\"replacement-is-not-attestation\"}").unwrap();
-    let replaced = inputs.prepare(&engine);
+    let replaced = inputs.prepare(&mut engine);
     assert!(
         replaced.subset.is_some(),
         "pathname replacement cannot replace the retained explicit source"
@@ -494,7 +494,7 @@ fn native_semantic_manifest_input_retains_original_after_replacement() {
     assert_eq!(replaced.subset.unwrap().plan(), original.plan());
     std::fs::remove_file(&removed).unwrap();
     std::fs::remove_file(&path).unwrap();
-    let unlinked = inputs.prepare(&engine);
+    let unlinked = inputs.prepare(&mut engine);
     assert!(
         unlinked.subset.is_some(),
         "unlink does not erase accepted immutable input and held provider pins"
@@ -529,14 +529,14 @@ fn native_semantic_unreadable_acquired_surface_refuses_whole_provider() {
     };
     fixture.manifest.interface_list = Acquisition::Ok;
     fixture.manifest.surfaces.push(interface);
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         vec![fixture.source(["C_SignInit", "C_Sign"])],
         fixture.pins.clone(),
     );
     let before = engine.plan().clone();
     assert!(crate::manifest_input::validate_structure(&fixture.manifest).is_empty());
-    let positive = prepare_attested_subset(&engine, &[fixture.write_manifest()]);
+    let positive = prepare_attested_subset(&mut engine, &[fixture.write_manifest()]);
     assert_eq!(positive.subset.unwrap().plan().slots.len(), 2);
     let mut admitted = Vec::new();
     for (label, walk, version) in [
@@ -565,7 +565,7 @@ fn native_semantic_unreadable_acquired_surface_refuses_whole_provider() {
             crate::manifest_input::validate_structure(&fixture.manifest).is_empty(),
             "{label} is a valid retained input, not a parser rejection"
         );
-        let prepared = prepare_attested_subset(&engine, &[fixture.write_manifest()]);
+        let prepared = prepare_attested_subset(&mut engine, &[fixture.write_manifest()]);
         if prepared.subset.is_some() {
             admitted.push(label);
         } else {
@@ -656,13 +656,13 @@ fn selection_only_evidence(name: &str, offset: u64) -> SelectionEvidence {
 #[test]
 fn native_semantic_reachable_selection_preserves_demand_and_rivals() {
     let mut fixture = ProviderFixture::new();
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         vec![fixture.source(["C_SignInit", "C_Sign"])],
         fixture.pins.clone(),
     );
     let before = engine.plan().clone();
-    let positive = prepare_attested_subset(&engine, &[fixture.write_manifest()]);
+    let positive = prepare_attested_subset(&mut engine, &[fixture.write_manifest()]);
     assert_eq!(positive.subset.unwrap().plan().slots.len(), 2);
     let mut omitted = Vec::new();
     for (label, offset) in [
@@ -674,7 +674,7 @@ fn native_semantic_reachable_selection_preserves_demand_and_rivals() {
             crate::manifest_input::validate_structure(&fixture.manifest).is_empty(),
             "reachable selection-only table uses the accepted full canonical layout"
         );
-        let prepared = prepare_attested_subset(&engine, &[fixture.write_manifest()]);
+        let prepared = prepare_attested_subset(&mut engine, &[fixture.write_manifest()]);
         if let Some(subset) = prepared.subset {
             if !subset.plan().slots.iter().any(|slot| {
                 slot.file_offset == offset
@@ -704,8 +704,8 @@ fn native_semantic_scan_subset_mints_without_manifest() {
     use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
     let fixture = ProviderFixture::new();
     let scan = fixture.source(["C_SignInit", "C_Sign"]);
-    let engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     let subset = prepared
         .subset
         .expect("name-authorized scan tables mint a subset without a manifest");
@@ -720,7 +720,7 @@ fn native_semantic_scan_subset_mints_without_manifest() {
         "scan-derived slots carry semantics, never count-only"
     );
     // The manifest preparation over the same engine is unchanged.
-    let manifest_prepared = prepare_attested_subset(&engine, &[]);
+    let manifest_prepared = prepare_attested_subset(&mut engine, &[]);
     assert!(manifest_prepared.subset.is_none());
     assert_eq!(
         manifest_prepared.refusals,
@@ -730,8 +730,8 @@ fn native_semantic_scan_subset_mints_without_manifest() {
     // nothing mints.
     let mut bare = fixture.source(["C_SignInit", "C_Sign"]);
     bare.scanned.tables[0].live_return = false;
-    let engine = engine_for_test(Vec::new(), vec![bare], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![bare], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared.subset.is_none(),
         "bare decode without publication evidence cannot attest names"
@@ -753,7 +753,7 @@ fn native_semantic_scan_subset_mints_beside_incomplete_provider() {
     bad.scanned.tables[0].walk = "known_prefix";
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![good.scanned, bad.scanned]);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared
             .refusals
@@ -834,7 +834,7 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
     grow(&mut good, complete.offsets[0], 2, 80);
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared
             .refusals
@@ -886,7 +886,7 @@ fn native_semantic_scan_subset_skips_cross_object_provider() {
     }
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared
             .refusals
@@ -1021,8 +1021,8 @@ fn native_semantic_scan_subset_sole_complete_mints_via_real_seam() {
     use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
     let fixture = ProviderFixture::new();
     let sole = sole_complete_source(&fixture);
-    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     let subset = prepared
         .subset
         .expect("a finished sole complete table mints through the real seam");
@@ -1045,8 +1045,8 @@ fn native_semantic_scan_subset_sole_complete_unfinished_refuses_via_real_seam() 
     let fixture = ProviderFixture::new();
     let mut sole = sole_complete_source(&fixture);
     sole.scanned.tables_scan_finished = false;
-    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared.subset.is_none(),
         "an unfinished sole table refuses through the real seam"
@@ -1069,8 +1069,8 @@ fn native_semantic_scan_subset_sole_complete_exports_only_second_table_refuses()
         .push(vec![sole.object; sole.scanned.tables[0].entries.len()]);
     sole.forward_verified
         .push(vec![false; sole.scanned.tables[0].entries.len()]);
-    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared.subset.is_none(),
         "an exports-only second table refuses the sole grant"
@@ -1098,9 +1098,9 @@ fn native_semantic_scan_subset_sole_complete_one_vs_two_views_refuse_both_orders
         ("one-first", vec![one.clone(), two.clone()]),
         ("two-first", vec![two.clone(), one.clone()]),
     ] {
-        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
         let prepared = SemanticInputs::new(Vec::new())
-            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+            .prepare_scan(&mut engine, Some((modules, fixture.pins.clone())));
         assert!(
             prepared.subset.is_none(),
             "{label}: 1-vs-2 views of one object refuse the sole grant"
@@ -1133,8 +1133,8 @@ fn native_semantic_scan_subset_sole_complete_variant_mints_alone() {
     use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
     let fixture = ProviderFixture::new();
     let variant = sole_variant_source(&fixture);
-    let engine = engine_for_test(Vec::new(), vec![variant], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![variant], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     let subset = prepared
         .subset
         .expect("a sole-valid variant table mints alone");
@@ -1154,9 +1154,9 @@ fn native_semantic_scan_subset_sole_complete_content_disagree_refuses_both_order
         ("table-first", vec![table.clone(), variant.clone()]),
         ("variant-first", vec![variant.clone(), table.clone()]),
     ] {
-        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
         let prepared = SemanticInputs::new(Vec::new())
-            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+            .prepare_scan(&mut engine, Some((modules, fixture.pins.clone())));
         assert!(
             prepared.subset.is_none(),
             "{label}: same-count different-content views refuse the sole grant"
@@ -1187,9 +1187,9 @@ fn native_semantic_scan_subset_sole_complete_disagreement_is_sticky_all_rotation
             vec![table.clone(), table.clone(), variant.clone()],
         ),
     ] {
-        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
         let prepared = SemanticInputs::new(Vec::new())
-            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+            .prepare_scan(&mut engine, Some((modules, fixture.pins.clone())));
         assert!(
             prepared.subset.is_none(),
             "{label}: a disagreeing view refuses in every rotation"
@@ -1221,9 +1221,9 @@ fn native_semantic_scan_subset_sole_complete_empty_view_disagreement_is_sticky()
         ("empty-then-table", vec![empty.clone(), table.clone()]),
         ("table-then-empty", vec![table.clone(), empty.clone()]),
     ] {
-        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
         let prepared = SemanticInputs::new(Vec::new())
-            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+            .prepare_scan(&mut engine, Some((modules, fixture.pins.clone())));
         assert!(
             prepared.subset.is_none(),
             "{label}: an empty view refuses beside a single-table view"
@@ -1248,9 +1248,9 @@ fn native_semantic_scan_subset_sole_complete_finished_and_unfinished_views_mint(
             vec![unfinished.clone(), finished.clone()],
         ),
     ] {
-        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
         let prepared = SemanticInputs::new(Vec::new())
-            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+            .prepare_scan(&mut engine, Some((modules, fixture.pins.clone())));
         let subset = prepared.subset.unwrap_or_else(|| {
             panic!("{label}: agreeing finished/unfinished views mint the sole grant")
         });
@@ -1273,15 +1273,15 @@ fn native_semantic_scan_subset_refuses_exports_only_tables_via_real_seam() {
         .map(|entry| (entry.name.to_string(), entry.file_offset))
         .collect();
     exports_only.exports = std::sync::Arc::from(symbols);
-    let engine = engine_for_test(Vec::new(), vec![exports_only], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![exports_only], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared.subset.is_none(),
         "an exports-only table mints nothing through the real seam"
     );
     let live = fixture.source(["C_SignInit", "C_Sign"]);
-    let engine = engine_for_test(Vec::new(), vec![live], fixture.pins.clone());
-    let prepared = prepare_scan_attested_subset(&engine);
+    let mut engine = engine_for_test(Vec::new(), vec![live], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&mut engine);
     let subset = prepared
         .subset
         .expect("the live-return twin mints through the real seam");
@@ -1352,7 +1352,7 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
     grow(&mut good, good_key, None, complete.offsets[0], 2, 80);
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared
             .refusals
@@ -1390,7 +1390,7 @@ fn native_semantic_scan_subset_mints_from_current_scan_inputs() {
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
     engine.seed_scan_input_for_test(vec![scan.scanned.clone()], scan_pins);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     let subset = prepared
         .subset
         .expect("current scan inputs mint the subset live captures need");
@@ -1411,7 +1411,7 @@ fn native_semantic_scan_subset_keeps_best_view_per_object() {
     partial.scanned.tables[0].walk = "partial";
     let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![full.scanned.clone(), partial.scanned.clone()]);
-    let prepared = prepare_scan_attested_subset(&engine);
+    let prepared = prepare_scan_attested_subset(&mut engine);
     assert!(
         prepared.subset.is_some(),
         "a full view of the provider mints despite a partial sibling view: {:?}",
@@ -1425,9 +1425,9 @@ fn native_semantic_names_never_attest() {
     let positive = fixture.subset();
     assert_eq!(positive.required().len(), 1);
     let scan = fixture.source(["C_SignInit", "C_Sign"]);
-    let engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
+    let mut engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
     assert_eq!(engine.plan().slots.len(), 2);
-    let prepared = prepare_attested_subset(&engine, &[]);
+    let prepared = prepare_attested_subset(&mut engine, &[]);
     assert!(
         prepared.subset.is_none(),
         "published scan names are count authority only"
@@ -1660,8 +1660,8 @@ fn aliased_subset(fixture: &ProviderFixture) -> AttestedSubset {
     }
     let path = fixture.dir.path().join("operator-alias-input.json");
     std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
-    let prepared = prepare_attested_subset(&engine, &[path]);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    let prepared = prepare_attested_subset(&mut engine, &[path]);
     assert!(
         prepared.subset.is_some(),
         "aliased subset refused: {:?}",
@@ -1937,7 +1937,7 @@ fn native_semantic_partial_affecting_set_refuses() {
         )
         .is_ok()
     );
-    let (engine, path, count_only) = fixture.over_capacity_inputs();
+    let (mut engine, path, count_only) = fixture.over_capacity_inputs();
     let before = engine.plan().clone();
     assert!(
         before.slots.len() > p11scope_ebpf_common::MAX_SLOTS as usize,
@@ -1950,12 +1950,12 @@ fn native_semantic_partial_affecting_set_refuses() {
             .any(|slot| slot.file_offset == count_only && slot.descriptor_index == 0),
         "the pre-admission population contains the required count-only affecting endpoint"
     );
-    let too_large_manifest = prepare_attested_subset(&engine, &[path]);
+    let too_large_manifest = prepare_attested_subset(&mut engine, &[path]);
     assert!(
         too_large_manifest.subset.is_none(),
         "existing planner already refuses an operator manifest that itself exceeds capacity whole"
     );
-    let prepared = prepare_attested_subset(&engine, &[fixture.write_manifest()]);
+    let prepared = prepare_attested_subset(&mut engine, &[fixture.write_manifest()]);
     if let Some(subset) = &prepared.subset {
         assert!(
             !subset.plan().slots.is_empty(),
@@ -2027,10 +2027,10 @@ fn native_semantic_partial_affecting_set_refuses() {
                 });
         }
         assert!(crate::manifest_input::validate_structure(&unresolved.manifest).is_empty());
-        let engine = engine_for_test(Vec::new(), vec![source], unresolved.pins.clone());
+        let mut engine = engine_for_test(Vec::new(), vec![source], unresolved.pins.clone());
         let before = engine.plan().clone();
         assert_eq!(before.slots.len(), 2, "known endpoints remain nonempty");
-        let prepared = prepare_attested_subset(&engine, &[unresolved.write_manifest()]);
+        let prepared = prepare_attested_subset(&mut engine, &[unresolved.write_manifest()]);
         assert!(
             prepared.subset.is_none(),
             "a non-null affecting manifest/scan entry without a retained target cannot silently disappear"
@@ -2064,13 +2064,13 @@ fn native_semantic_unattested_overlap_stays_count_only() {
         entry.object_path = fixture.manifest.module_path.clone();
     }
     let path = fixture.write_manifest();
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         vec![fixture.source(["C_SignInit", "C_Sign"]), rival],
         pins,
     );
     let before = engine.plan().clone();
-    let prepared = prepare_attested_subset(&engine, &[path]);
+    let prepared = prepare_attested_subset(&mut engine, &[path]);
     assert!(
         prepared.subset.is_none(),
         "attested selection cannot erase a rival or claim a complete affecting set"
@@ -6029,12 +6029,12 @@ fn native_semantic_one_cursor_and_independent_producers() {
     let pid = std::process::id();
     let caller = scene.admit(pid, 50);
     scene.map(caller, pid, 60);
-    let engine = engine_for_test(
+    let mut engine = engine_for_test(
         Vec::new(),
         Vec::new(),
         crate::discovery::identity::PinnedObjects::empty(),
     );
-    let preparation = prepare_attested_subset(&engine, &[]);
+    let preparation = prepare_attested_subset(&mut engine, &[]);
     assert!(preparation.subset.is_none());
     assert!(
         preparation.refusals.contains(&SemanticRefusal::Unattested),
@@ -6127,8 +6127,8 @@ fn native_semantic_one_cursor_and_independent_producers() {
     bad.module_path = "/nonexistent/provider.so".to_string();
     let bad_path = fixture.dir.path().join("bad-input.json");
     std::fs::write(&bad_path, serde_json::to_vec(&bad).unwrap()).unwrap();
-    let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
-    let preparation = prepare_attested_subset(&engine, &[bad_path]);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    let preparation = prepare_attested_subset(&mut engine, &[bad_path]);
     assert!(preparation.subset.is_none());
     assert!(
         preparation
@@ -6600,9 +6600,11 @@ fn dual_provider_subset() -> (ProviderFixture, ProviderFixture, AttestedSubset) 
         pins.absorb(second.pins.clone()).is_empty(),
         "distinct provider files pin without collisions"
     );
-    let engine = engine_for_test(Vec::new(), Vec::new(), pins);
-    let prepared =
-        prepare_attested_subset(&engine, &[first.write_manifest(), second.write_manifest()]);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), pins);
+    let prepared = prepare_attested_subset(
+        &mut engine,
+        &[first.write_manifest(), second.write_manifest()],
+    );
     let subset = prepared
         .subset
         .expect("two complete providers attest together");

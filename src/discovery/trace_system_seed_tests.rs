@@ -861,6 +861,7 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
                     &mut capture.engine.stage_timings,
                     None,
                     None,
+                    crate::discovery::handle_table::Filing::Untracked,
                 );
                 let (modules, _pins, _) = scan.unwrap();
                 assert!(!modules.is_empty());

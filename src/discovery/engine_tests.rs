@@ -23,7 +23,8 @@ use crate::discovery::identity::test_fixture::{
 };
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object, pin_manifest_objects,
-    pin_manifest_objects_deferred, pin_scanned_objects, reconcile_scanned_modules,
+    pin_manifest_objects_deferred, pin_scanned_objects, pin_scanned_view_objects,
+    reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
@@ -25740,6 +25741,7 @@ int main(int argc, char **argv) {
         engine.broad_admit,
         &mut engine.stage_timings,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (modules, _, _) = metadata.unwrap();
     assert_eq!(
@@ -41231,6 +41233,7 @@ fn p2_refuse_then_exit(
         },
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     assert!(
         result
@@ -46225,6 +46228,7 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
         &mut engine.stage_timings,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the view still scans");
     assert!(complete, "an unchanged full scan is complete");
@@ -46903,6 +46907,7 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
         &mut engine.stage_timings,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, fresh_pins, _) = scan_result.expect("the view still scans");
     assert!(
@@ -46983,6 +46988,7 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
         &mut engine.stage_timings,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, fresh_pins, _) = scan_result.expect("the view still scans");
     assert!(
@@ -47494,6 +47500,7 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         false,
         &mut engine.stage_timings,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the metadata snapshot scans");
     assert!(complete, "the metadata snapshot is complete");
@@ -47536,6 +47543,7 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.stage_timings,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the memory snapshot scans");
     assert!(complete, "the memory snapshot is complete");
@@ -48322,6 +48330,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         clean,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(complete);
@@ -48349,6 +48358,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         },
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(complete, "verified absence is complete");
@@ -48376,6 +48386,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         },
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(!complete, "a truncating skip is incomplete");
@@ -48400,6 +48411,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         },
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(!complete, "an unavailable scan is incomplete");
@@ -48419,6 +48431,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         clean,
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(!complete, "a stopped scan is incomplete");
@@ -48447,6 +48460,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         },
         None,
         None,
+        crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
     assert!(!complete, "a refused candidate is incomplete");
@@ -51252,6 +51266,7 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
             &mut timings,
             None,
             None,
+            crate::discovery::handle_table::Filing::Untracked,
         );
         let (_, pins, _) = scan.expect("the fixture scan runs");
         assert!(

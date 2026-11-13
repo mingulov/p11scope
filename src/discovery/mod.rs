@@ -7,6 +7,7 @@ pub(crate) mod caller_registry;
 pub(crate) mod confirm_shards;
 pub(crate) mod elf_needed;
 pub mod engine;
+pub(crate) mod handle_table;
 pub mod hooks;
 pub mod identity;
 // Task 3 Stage A router: consumed by the Task 6 native seam (DR-T3A-1) and

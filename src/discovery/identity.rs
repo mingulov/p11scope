@@ -29,6 +29,7 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
+use super::handle_table::{Filing, HandleTable, Held, RowId, TableHandle};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
     read_maps_or_refuse, read_mountinfo, standard_function_names,
@@ -156,9 +157,9 @@ pub(crate) fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
 pub struct PinnedObjectId(pub u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RawObjectInstance {
+pub(crate) struct RawObjectInstance {
     mount_namespace: Option<MountNamespaceId>,
-    key: ObjectKey,
+    pub(crate) key: ObjectKey,
     path: String,
     /// A `--prearm-module` operator alias (packet 6.13). Pre-arm aliases are
     /// operator inputs like manifest aliases (same lifetime: they survive
@@ -246,7 +247,7 @@ struct Entry {
     /// this is the subvolume's anonymous device: snapshot twins share the
     /// mapping, pin and digest but never this.
     fd_dev: u64,
-    file: Arc<std::fs::File>,
+    file: TableHandle,
     pin: Pin,
     /// Last `CLOCK_MONOTONIC` instant a held-fd check proved this object
     /// unchanged, starting at the pin-time bracket verification. Feeds the
@@ -307,6 +308,177 @@ struct Entry {
     probed_maps_key: Option<ObjectKey>,
 }
 
+/// Every [`Entry`] field except the filed handle, plus the prove-time
+/// stamps filing routes on. The pin worker proves these, the handle
+/// table files the handle, and [`Entry::from_held`] joins them.
+pub(crate) struct EntryMeta {
+    pub(crate) raw: RawObjectInstance,
+    pub(crate) mapping: MappingFileKey,
+    pub(crate) fd_dev: u64,
+    pub(crate) pin: Pin,
+    pub(crate) mapped: Option<MappedFile>,
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+    pub(crate) build_id: Option<String>,
+    pub(crate) abi: ElfAbi,
+    pub(crate) exports: Arc<[(String, u64)]>,
+    pub(crate) getter_present: bool,
+    pub(crate) witness_fault: bool,
+    pub(crate) overlay: bool,
+    pub(crate) pre_copy_up: bool,
+    pub(crate) collapsed: bool,
+    pub(crate) probed_maps_unproven: bool,
+    pub(crate) probed_maps_key: Option<ObjectKey>,
+    pub(crate) verified_ns: Option<u64>,
+    /// `file_inodes_are_unique` at prove time.
+    pub(crate) unique: bool,
+}
+
+impl EntryMeta {
+    /// Snapshot the meta of an already-built entry (C4 re-file): every
+    /// field straight across, `unique` derived from the live handle.
+    fn from_entry(entry: &Entry, unique: bool) -> Self {
+        Self {
+            raw: entry.raw.clone(),
+            mapping: entry.mapping,
+            fd_dev: entry.fd_dev,
+            pin: entry.pin,
+            mapped: entry.mapped,
+            path: entry.path.clone(),
+            sha256: entry.sha256.clone(),
+            build_id: entry.build_id.clone(),
+            abi: entry.abi,
+            exports: entry.exports.clone(),
+            getter_present: entry.getter_present,
+            witness_fault: entry.witness_fault,
+            overlay: entry.overlay,
+            pre_copy_up: entry.pre_copy_up,
+            collapsed: entry.collapsed,
+            probed_maps_unproven: entry.probed_maps_unproven,
+            probed_maps_key: entry.probed_maps_key,
+            verified_ns: entry.last_ok_ns.get(),
+            unique,
+        }
+    }
+}
+
+/// The pin worker's output: an owned proven file plus its proof meta,
+/// never an [`Entry`]. Filing turns it into a [`Held`] (table row or
+/// untracked) and [`Entry::from_held`] builds the entry.
+pub(crate) struct ProvedEntry {
+    pub(crate) file: std::fs::File,
+    pub(crate) meta: EntryMeta,
+}
+
+impl ProvedEntry {
+    /// Prove one opened file: the old `Entry::new` body, minus the
+    /// handle wrap. Identity proof unchanged: fstat device, overlay
+    /// witness, digest and exports from the inspected bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn prove(
+        file: std::fs::File,
+        pin: Pin,
+        path: String,
+        inspected: &InspectedObject,
+        raw: RawObjectInstance,
+        mapping: MappingFileKey,
+        mapped: Option<MappedFile>,
+        verified_ns: Option<u64>,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        provider_metadata_read_test::metadata_read();
+        let fd_dev = file
+            .metadata()
+            .map_err(|error| format!("fstat failed: {error}"))?
+            .dev();
+        let unique = file_inodes_are_unique(&file);
+        let overlay = on_overlayfs(file.as_raw_fd())?;
+        Ok(Self {
+            file,
+            meta: EntryMeta {
+                overlay,
+                pre_copy_up: raw.pre_copy_up,
+                collapsed: false,
+                probed_maps_unproven: false,
+                probed_maps_key: None,
+                raw,
+                mapping,
+                fd_dev,
+                pin,
+                mapped,
+                path,
+                // `inspect_file` always records a whole-file digest.
+                sha256: inspected.identity.sha256.clone().unwrap_or_default(),
+                build_id: match inspected.identity.kind {
+                    IdentityKind::GnuBuildId => inspected.identity.value.clone(),
+                    _ => None,
+                },
+                abi: inspected.abi,
+                exports: inspected.exports.clone().into(),
+                getter_present: inspected.getter_present,
+                witness_fault: inspected.witness_fault,
+                verified_ns,
+                unique,
+            },
+        })
+    }
+
+    /// A proven pin over `file` for table unit tests: the real pin and
+    /// device, scripted maps key/digest/mapped proof, unique inodes.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        file: std::fs::File,
+        maps: ObjectKey,
+        sha256: &str,
+        mapped: Option<MappedFile>,
+    ) -> Self {
+        let metadata = file.metadata().unwrap();
+        let raw = RawObjectInstance {
+            mount_namespace: None,
+            key: maps,
+            path: format!("/test/{}", metadata.ino()),
+            prearm: false,
+            pre_copy_up: false,
+        };
+        Self {
+            meta: EntryMeta {
+                raw,
+                mapping: MappingFileKey {
+                    mount_id: 0,
+                    device_major: u64::from(libc::major(metadata.dev())),
+                    device_minor: u64::from(libc::minor(metadata.dev())),
+                    inode: metadata.ino(),
+                },
+                fd_dev: metadata.dev(),
+                pin: pin_of(&file).unwrap(),
+                mapped,
+                path: format!("/test/{}", metadata.ino()),
+                sha256: sha256.into(),
+                build_id: None,
+                abi: ElfAbi::Lp64,
+                exports: Arc::from(Vec::new()),
+                getter_present: false,
+                witness_fault: false,
+                overlay: false,
+                pre_copy_up: false,
+                collapsed: false,
+                probed_maps_unproven: false,
+                probed_maps_key: None,
+                verified_ns: None,
+                unique: true,
+            },
+            file,
+        }
+    }
+
+    /// Script non-unique inodes (the nonce path).
+    #[cfg(test)]
+    pub(crate) fn with_unique(mut self, unique: bool) -> Self {
+        self.meta.unique = unique;
+        self
+    }
+}
+
 /// The exact, bounded pin subset retained by private Inventory activation.
 /// Cloning one entry preserves its complete canonical identity and opened file;
 /// it does not clone discovery ownership graphs or reopen a pathname.
@@ -326,7 +498,7 @@ pub(crate) struct RetainedMappedIdentities {
 
 #[derive(Debug)]
 struct RetainedMappedIdentity {
-    file: Arc<std::fs::File>,
+    file: TableHandle,
     pin: Pin,
     mapped: MappedFile,
 }
@@ -351,7 +523,7 @@ impl RetainedMappedIdentities {
                 .files
                 .entry(FileIdentity::of(&metadata))
                 .or_insert_with(|| RetainedMappedIdentity {
-                    file: Arc::clone(&entry.file),
+                    file: entry.file.clone(),
                     pin: entry.pin,
                     mapped,
                 });
@@ -394,7 +566,7 @@ impl RetainedInventoryTarget {
     pub(crate) fn retirement_lease(&self) -> Arc<std::fs::File> {
         // The retirement worker needs only custody of the already-open file.
         // Identity and sticky mutation checks stay with the main target owner.
-        self.entry.file.clone()
+        self.entry.file.arc().clone()
     }
 
     pub(crate) fn abi(&self) -> ElfAbi {
@@ -421,7 +593,7 @@ impl RetainedInventoryTarget {
     /// Borrow the original opened file and canonical digest without copying
     /// identity or opening another descriptor. Callers retain ABI/pin checks.
     pub(crate) fn borrowed_file_and_digest(&self) -> (&std::fs::File, &str) {
-        (&self.entry.file, &self.entry.sha256)
+        (self.entry.file.as_ref(), &self.entry.sha256)
     }
 
     /// The raw mapping key this object was first retained under.
@@ -725,7 +897,7 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn of(metadata: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -808,7 +980,7 @@ impl MappedFile {
     /// device; it still requires every target range's map_files proof below.
     /// Overlay backing switches, wrapping tmpfs inode numbers and unknown
     /// filesystems keep the ordinary fresh self-mapping probe.
-    fn may_retain(&self) -> bool {
+    pub(crate) fn may_retain(&self) -> bool {
         self.fs_magic.is_some_and(|magic| {
             magic == 0x9123_683e
                 || KEY_IS_IDENTITY_FILESYSTEMS
@@ -1088,50 +1260,33 @@ impl Entry {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        file: std::fs::File,
-        pin: Pin,
-        path: String,
-        inspected: &InspectedObject,
-        raw: RawObjectInstance,
-        mapping: MappingFileKey,
-        mapped: Option<MappedFile>,
-        verified_ns: Option<u64>,
-    ) -> Result<Self, String> {
-        #[cfg(test)]
-        provider_metadata_read_test::metadata_read();
-        let fd_dev = file
-            .metadata()
-            .map_err(|error| format!("fstat failed: {error}"))?
-            .dev();
-        Ok(Self {
-            overlay: on_overlayfs(file.as_raw_fd())?,
-            pre_copy_up: raw.pre_copy_up,
-            collapsed: false,
-            probed_maps_unproven: false,
-            probed_maps_key: None,
-            raw,
-            mapping,
-            fd_dev,
-            file: Arc::new(file),
-            pin,
-            last_ok_ns: std::cell::Cell::new(verified_ns),
+    /// The only production constructor: join worker-proven meta with
+    /// its filed handle. The entry takes the filed mapped proof (its
+    /// own, or the resident's when it had none).
+    pub(crate) fn from_held(meta: EntryMeta, held: Held) -> Self {
+        Self {
+            raw: meta.raw,
+            mapping: meta.mapping,
+            fd_dev: meta.fd_dev,
+            file: held.handle,
+            pin: meta.pin,
+            last_ok_ns: std::cell::Cell::new(meta.verified_ns),
             changed: std::cell::Cell::new(false),
             detected_ns: std::cell::Cell::new(None),
-            mapped,
-            path,
-            // `inspect_file` always records a whole-file digest.
-            sha256: inspected.identity.sha256.clone().unwrap_or_default(),
-            build_id: match inspected.identity.kind {
-                IdentityKind::GnuBuildId => inspected.identity.value.clone(),
-                _ => None,
-            },
-            abi: inspected.abi,
-            exports: inspected.exports.clone().into(),
-            getter_present: inspected.getter_present,
-            witness_fault: inspected.witness_fault,
-        })
+            mapped: held.mapped,
+            path: meta.path,
+            sha256: meta.sha256,
+            build_id: meta.build_id,
+            abi: meta.abi,
+            exports: meta.exports,
+            getter_present: meta.getter_present,
+            witness_fault: meta.witness_fault,
+            overlay: meta.overlay,
+            pre_copy_up: meta.pre_copy_up,
+            collapsed: meta.collapsed,
+            probed_maps_unproven: meta.probed_maps_unproven,
+            probed_maps_key: meta.probed_maps_key,
+        }
     }
 }
 
@@ -1754,7 +1909,7 @@ impl PinnedObjects {
             let Some(new) = candidate.by_id.get(id) else {
                 return false;
             };
-            if !Arc::ptr_eq(&old.file, &new.file)
+            if !old.file.ptr_eq(&new.file)
                 || old.raw != new.raw
                 || old.mapping != new.mapping
                 || old.pin != new.pin
@@ -2260,6 +2415,46 @@ impl PinnedObjects {
         use std::os::unix::io::AsRawFd as _;
         for entry in self.by_id.values() {
             fds.insert(entry.file.as_raw_fd());
+        }
+    }
+
+    /// File every entry's already-held handle into `table` (C4 re-file):
+    /// proven-key routing over the live `Arc`, never a reopen. Entries
+    /// sharing one file converge on one row; unshared entries file
+    /// their own. Adopt never refuses, so pins only gain shares here.
+    pub(crate) fn adopt_handles_into(&mut self, table: &mut HandleTable) {
+        for entry in self.by_id.values_mut() {
+            // Idempotent: an already-tabled handle keeps its row instead
+            // of filing a second row for one fd.
+            if entry.file.id() != RowId::MAX {
+                continue;
+            }
+            let unique = file_inodes_are_unique(&entry.file);
+            let meta = EntryMeta::from_entry(entry, unique);
+            let held = table.adopt_shared(entry.file.arc().clone(), &meta);
+            entry.file = held.handle;
+            if entry.mapped.is_none() {
+                entry.mapped = held.mapped;
+            }
+        }
+    }
+
+    /// The tabled subset of [`PinnedObjects::held_library_fds`] for the
+    /// Phase-0 shadow assert: distinct live fds plus their distinct
+    /// rows, skipping untabled handles (fixtures and untracked pins
+    /// file no rows). Debug-only callers.
+    pub(crate) fn tabled_held_library_fds(
+        &self,
+        fds: &mut BTreeSet<std::os::unix::io::RawFd>,
+        rows: &mut BTreeSet<RowId>,
+    ) {
+        use std::os::unix::io::AsRawFd as _;
+        for entry in self.by_id.values() {
+            if entry.file.id() == RowId::MAX {
+                continue;
+            }
+            fds.insert(entry.file.as_raw_fd());
+            rows.insert(entry.file.id());
         }
     }
 
@@ -3492,7 +3687,7 @@ mod conservative_copy {
         path: String,
         digest: String,
         build: Option<String>,
-        file: Option<Arc<std::fs::File>>,
+        file: Option<TableHandle>,
         exports: Option<Arc<[(String, u64)]>>,
         field: u8,
         drained: usize,
@@ -3523,7 +3718,7 @@ mod conservative_copy {
                     let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
                     if !source
                         .and_then(|pins| pins.by_id.get(&self.id))
-                        .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+                        .is_some_and(|held| held.file.ptr_eq(file))
                     {
                         // Pure reclamation cannot close the last descriptor.
                         // An inode, independently opened FD, or reference count
@@ -3609,12 +3804,12 @@ mod conservative_copy {
             let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
             if source
                 .and_then(|pins| pins.by_id.get(&self.id))
-                .is_some_and(|held| Arc::ptr_eq(&held.file, file))
+                .is_some_and(|held| held.file.ptr_eq(file))
             {
                 drop(self.file.take());
             } else {
                 let file = self.file.as_ref().ok_or(GraphRefusal::Identity)?;
-                handoff.push(file).map_err(|()| {
+                handoff.push(file.arc()).map_err(|()| {
                     reserve
                         .reserve(usize::MAX)
                         .err()
@@ -7037,7 +7232,8 @@ mod conservative_copy {
             let reopened = std::fs::File::open(&original.path).unwrap();
             assert_ne!(reopened.as_raw_fd(), actual_fd);
             assert_eq!(pin_of(&reopened).unwrap(), original.pin);
-            independent.by_id.get_mut(&id).unwrap().file = Arc::new(reopened);
+            independent.by_id.get_mut(&id).unwrap().file =
+                TableHandle::for_test(Arc::new(reopened));
             let mut wrong = source.clone();
             let different = source
                 .by_id
@@ -7697,6 +7893,28 @@ fn identity_of_manifest(
 /// opened object's remaining checks are fatal except an exact recorded-identity
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
+/// File one worker-proven pin from a manifest/prearm chain: adopt
+/// into the table, or hold untracked. `Scratch` is scan-path-only and
+/// files `Untracked` here (a programming error, caught in debug).
+fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Entry {
+    let ProvedEntry { file, meta } = proved;
+    match filing {
+        Filing::Adopt(table) => {
+            let held = table.adopt(file, &meta);
+            Entry::from_held(meta, held)
+        }
+        Filing::Untracked => {
+            let held = Held::untracked(Arc::new(file), meta.mapped);
+            Entry::from_held(meta, held)
+        }
+        Filing::Scratch => {
+            debug_assert!(false, "Filing::Scratch is scan-path-only");
+            let held = Held::untracked(Arc::new(file), meta.mapped);
+            Entry::from_held(meta, held)
+        }
+    }
+}
+
 pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, ManifestPinError> {
     let mut budget = CaptureWorkBudget::default();
     pin_manifest_objects_deferred_in_views_with_budget(m, &[], &mut budget)
@@ -7747,6 +7965,32 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         false,
         prior_objects,
         prior_bytes,
+        Filing::Untracked,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_probe`] with the filing
+/// destination for each proven pin (Phase 0): trusted-input sites file
+/// `Adopt` into their lane's table; `Scratch` is scan-path-only and
+/// files `Untracked` here.
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe_and_filing(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+    prior_objects: usize,
+    prior_bytes: u64,
+    filing: Filing<'_>,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        probe,
+        false,
+        prior_objects,
+        prior_bytes,
+        filing,
     )
 }
 
@@ -7756,6 +8000,9 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
 /// manifest side charges that usage against the shared 512-object/512-MiB
 /// manifest+pre-arm budget (R2-D1-3). Mirrors the run path, where pre-arm
 /// pinning charges already-pinned manifest usage instead.
+/// Test-only since Phase 0: production files through the `_and_filing`
+/// variant into its lane's table.
+#[cfg(test)]
 pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior(
     m: &Manifest,
     views: &[ProcessView],
@@ -7770,6 +8017,46 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior(
         &KernelSelfMappingProbe,
         prior_objects,
         prior_bytes,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_budget`] with the filing
+/// destination for each proven pin (C1 trusted inputs, Phase 0).
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_budget_and_filing(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    filing: Filing<'_>,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe_and_filing(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        0,
+        0,
+        filing,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_prior`] with the filing
+/// destination for each proven pin (C3 retained inputs, Phase 0).
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior_and_filing(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+    filing: Filing<'_>,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe_and_filing(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        prior_objects,
+        prior_bytes,
+        filing,
     )
 }
 
@@ -7793,6 +8080,7 @@ pub(crate) fn pin_count_manifest_objects_in_views_with_prior(
         true,
         prior_objects,
         prior_bytes,
+        Filing::Untracked,
     )
 }
 
@@ -7871,6 +8159,7 @@ fn inspect_count_manifest_file(
     Ok(inspected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pin_manifest_objects_with_read_policy(
     m: &Manifest,
     views: &[ProcessView],
@@ -7879,6 +8168,7 @@ fn pin_manifest_objects_with_read_policy(
     meter_identity: bool,
     prior_objects: usize,
     prior_bytes: u64,
+    mut filing: Filing<'_>,
 ) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
@@ -8117,7 +8407,7 @@ fn pin_manifest_objects_with_read_policy(
         let held = meter_identity
             .then(|| budget.retained_mapped_identity(&file))
             .flatten();
-        let mut entry = match Entry::new(
+        let mut entry = match ProvedEntry::prove(
             file,
             pin,
             object.path.clone(),
@@ -8127,7 +8417,7 @@ fn pin_manifest_objects_with_read_policy(
             held,
             verified_ns,
         ) {
-            Ok(entry) => entry,
+            Ok(proved) => file_proved_pin(proved, &mut filing),
             Err(error) => {
                 skipped.push(Skipped {
                     subject: object.path.clone(),
@@ -8316,6 +8606,31 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         prior_objects,
         prior_bytes,
         budget,
+        Filing::Untracked,
+    )
+}
+
+/// [`pin_prearm_objects_in_views_with_budget`] with the filing
+/// destination for each proven pin (C2 trusted inputs, Phase 0).
+pub(crate) fn pin_prearm_objects_in_views_with_budget_and_filing(
+    paths: &[PathBuf],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+    filing: Filing<'_>,
+) -> Result<PrearmPinning, PrearmPinError> {
+    let requests: Vec<PrearmPinRequest> =
+        paths.iter().cloned().map(PrearmPinRequest::path).collect();
+    pin_prearm_requests_in_views_with_budget(
+        &requests,
+        views,
+        named_pid,
+        prior_objects,
+        prior_bytes,
+        budget,
+        filing,
     )
 }
 
@@ -8329,6 +8644,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
     prior_objects: usize,
     prior_bytes: u64,
     budget: &mut CaptureWorkBudget,
+    mut filing: Filing<'_>,
 ) -> Result<PrearmPinning, PrearmPinError> {
     let mut skipped: Vec<Skipped> = Vec::new();
     if prior_objects.saturating_add(requests.len()) > MAX_OBJECTS {
@@ -8531,7 +8847,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             continue;
         };
         let input_path = raw.path.clone();
-        let mut entry = match Entry::new(
+        let mut entry = match ProvedEntry::prove(
             file,
             pin,
             spelling.clone(),
@@ -8541,7 +8857,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             None,
             verified_ns,
         ) {
-            Ok(entry) => entry,
+            Ok(proved) => file_proved_pin(proved, &mut filing),
             Err(error) => {
                 skipped.push(Skipped {
                     subject: spelling.clone(),
@@ -8655,17 +8971,34 @@ fn share_candidates<'a>(
 fn share_loan(
     entry: &Entry,
     candidates: &BTreeMap<ObjectKey, Vec<&Entry>>,
-) -> Option<(Arc<std::fs::File>, MappedFile)> {
-    if entry.pre_copy_up || entry.collapsed {
+) -> Option<(TableHandle, MappedFile)> {
+    share_loan_for(
+        entry.pre_copy_up,
+        entry.collapsed,
+        entry.raw.key,
+        candidates,
+    )
+}
+
+/// [`share_loan`] for a borrower known only by its proven meta (the pin
+/// loop files [`ProvedEntry`] before any [`Entry`] exists): the borrower
+/// contributes only its exclusions and maps key; the lender predicates
+/// are unchanged. Deleted with the budget projection in Task 1.
+fn share_loan_for(
+    pre_copy_up: bool,
+    collapsed: bool,
+    key: ObjectKey,
+    candidates: &BTreeMap<ObjectKey, Vec<&Entry>>,
+) -> Option<(TableHandle, MappedFile)> {
+    if pre_copy_up || collapsed {
         return None;
     }
-    let key = entry.raw.key;
     candidates.get(&key).and_then(|offers| {
         offers.iter().find_map(|lender| {
             let mapped = lender.reusable_mapped_file()?;
             mapped
                 .key_is_identity(key)
-                .then(|| (Arc::clone(&lender.file), mapped))
+                .then(|| (lender.file.clone(), mapped))
         })
     })
 }
@@ -8714,7 +9047,15 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, None, None)
+    pin_scanned_view_objects_with(
+        view,
+        modules,
+        budget,
+        &self_mapped_file,
+        None,
+        None,
+        Filing::Untracked,
+    )
 }
 
 /// [`pin_scanned_view_objects`] with the tick's fd-reserve snapshot
@@ -8733,7 +9074,15 @@ pub(crate) fn pin_scanned_view_objects_with_reserve(
     budget: &mut CaptureWorkBudget,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, None)
+    pin_scanned_view_objects_with(
+        view,
+        modules,
+        budget,
+        &self_mapped_file,
+        reserve,
+        None,
+        Filing::Untracked,
+    )
 }
 
 /// The capture's library-handle budget as seen by one pin scan
@@ -8755,6 +9104,9 @@ pub(crate) struct PinHandleBudget<'a> {
 /// carries the tick's held count, cap and lender sets (see
 /// [`PinHandleBudget`]). `None` keeps the reserve-only behavior:
 /// non-admission pin sites pass `None`.
+/// Test-only since Phase 0: production files through the
+/// `_and_filing` variant. Deleted in Task 1 with the projection.
+#[cfg(test)]
 pub(crate) fn pin_scanned_view_objects_with_budgets(
     view: &ProcessView,
     modules: &[ScannedModule],
@@ -8762,7 +9114,39 @@ pub(crate) fn pin_scanned_view_objects_with_budgets(
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     handles: Option<&PinHandleBudget<'_>>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, handles)
+    pin_scanned_view_objects_with(
+        view,
+        modules,
+        budget,
+        &self_mapped_file,
+        reserve,
+        handles,
+        Filing::Untracked,
+    )
+}
+
+/// [`pin_scanned_view_objects_with_budgets`] with the filing destination
+/// for each proven pin (Phase 0): production scan sites file
+/// `Adopt` into their lane's table; the probationary probe files
+/// `Untracked` until Task 4. Replaced by the `_with_table` variant in
+/// Task 1, when the budget projection below is deleted.
+pub(crate) fn pin_scanned_view_objects_with_budgets_and_filing(
+    view: &ProcessView,
+    modules: &[ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    reserve: Option<&crate::fd_budget::FdReserveTick>,
+    handles: Option<&PinHandleBudget<'_>>,
+    filing: Filing<'_>,
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    pin_scanned_view_objects_with(
+        view,
+        modules,
+        budget,
+        &self_mapped_file,
+        reserve,
+        handles,
+        filing,
+    )
 }
 
 /// Reads a pinned fd's `vm_file` identity ([`self_mapped_file`]).
@@ -8773,7 +9157,8 @@ type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, S
 /// privilege, so tests script it). `reserve` is the tick's fd-reserve
 /// snapshot (fix7 F1, see the bridge above); `handles` is the tick's
 /// library-handle budget (fix8 F2, see [`PinHandleBudget`]); `None` pins
-/// unbounded on that axis.
+/// unbounded on that axis. `filing` is where each proven pin files:
+/// a table row, no row, or a probe-local scratch dropped at return.
 fn pin_scanned_view_objects_with(
     view: &ProcessView,
     modules: &[ScannedModule],
@@ -8781,6 +9166,7 @@ fn pin_scanned_view_objects_with(
     pinned_identity: ReadPinnedIdentity<'_>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
     handles: Option<&PinHandleBudget<'_>>,
+    mut filing: Filing<'_>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     // Both the table-owning modules and every object a table entry points into: an
     // entry may land in a dependency the module itself only forwards to.
@@ -8855,6 +9241,9 @@ fn pin_scanned_view_objects_with(
         )
     });
     let mut scan_new: usize = 0;
+    // Probe-local scratch (`Filing::Scratch` only): proven pins that
+    // build no entries and file no rows, dropped at return.
+    let mut scratch = Vec::new();
     let mut wanted = wanted.into_iter();
     for raw in wanted.by_ref() {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
@@ -8909,20 +9298,26 @@ fn pin_scanned_view_objects_with(
             &mut mounts,
             budget,
         );
-        // Fix8 F2, post-open verification: the entry's own exclusions
+        // Fix8 F2, post-open verification: the pin's own exclusions
         // are known only now. A pin the share cannot absorb is
         // genuinely new — charge it, or close it back out (never
         // retained, never counted) when the charge would breach the
         // cap, with this and every remaining object pending.
         let candidate = match candidate {
-            Ok(entry) => {
+            Ok(proved) => {
                 if let Some((held, cap, candidates)) = handle_state.as_ref()
-                    && share_loan(&entry, candidates).is_none()
+                    && share_loan_for(
+                        proved.meta.pre_copy_up,
+                        proved.meta.collapsed,
+                        proved.meta.raw.key,
+                        candidates,
+                    )
+                    .is_none()
                 {
                     if crate::fd_budget::library_handle_budget_defers_next_new(
                         *held, scan_new, *cap,
                     ) {
-                        drop(entry);
+                        drop(proved);
                         record_pin_stop(
                             &mut pinned,
                             view.id(),
@@ -8936,9 +9331,24 @@ fn pin_scanned_view_objects_with(
                     scan_new = scan_new.saturating_add(1);
                 }
                 scan_opens = scan_opens.saturating_add(1);
-                Ok(entry)
+                match &mut filing {
+                    Filing::Adopt(table) => {
+                        let ProvedEntry { file, meta } = proved;
+                        let held = table.adopt(file, &meta);
+                        Ok(Entry::from_held(meta, held))
+                    }
+                    Filing::Untracked => {
+                        let ProvedEntry { file, meta } = proved;
+                        let held = Held::untracked(Arc::new(file), meta.mapped);
+                        Ok(Entry::from_held(meta, held))
+                    }
+                    Filing::Scratch => {
+                        scratch.push(proved);
+                        continue;
+                    }
+                }
             }
-            refused => refused,
+            Err(failure) => Err(failure),
         };
         record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
     }
@@ -9753,7 +10163,7 @@ fn pin_scanned_object(
     pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
-) -> Result<Entry, PinFailure> {
+) -> Result<ProvedEntry, PinFailure> {
     // A pre-copy-up raw reopens its proven mount-table candidate, not the
     // merged path: the candidate list is recomputed from the same target
     // table the scan proved against, and the scanned check below binds
@@ -9893,7 +10303,7 @@ fn pin_scanned_object(
         // The clock read precedes the verification it timestamps.
         let verified_ns = crate::attach::monotonic_ns();
         if pin_of(&file)? == before {
-            return Entry::new(
+            return ProvedEntry::prove(
                 file,
                 before,
                 raw.path.clone(),
@@ -9936,7 +10346,7 @@ fn pin_scanned_object(
     if cacheable {
         budget.note_inspected_file(cache_key, inspected.clone());
     }
-    Entry::new(
+    ProvedEntry::prove(
         file,
         before,
         raw.path.clone(),
@@ -10079,7 +10489,7 @@ pub(crate) mod test_fixture {
             raw,
             fd_dev,
             pin: pin_of(&file).unwrap(),
-            file: Arc::new(file),
+            file: TableHandle::for_test(Arc::new(file)),
             mapped: None,
             path: path.into(),
             sha256: sha256.into(),
@@ -10190,7 +10600,7 @@ pub(crate) mod test_fixture {
         overlay: bool,
     ) -> PinnedObjects {
         let raw = RawObjectInstance::scanned(module, module.key, &module.path).unwrap();
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = TableHandle::for_test(Arc::new(std::fs::File::open("/dev/null").unwrap()));
         let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
@@ -10246,7 +10656,7 @@ pub(crate) mod test_fixture {
     pub(crate) fn reback(pins: &mut PinnedObjects, file: &Arc<std::fs::File>) {
         let fd_dev = file.metadata().unwrap().dev();
         for entry in pins.by_id.values_mut() {
-            entry.file = Arc::clone(file);
+            entry.file = TableHandle::for_test(Arc::clone(file));
             entry.fd_dev = fd_dev;
         }
     }
@@ -10417,7 +10827,7 @@ pub(crate) mod test_fixture {
     ) -> PinnedObjects {
         let modelled = module(maps_key);
         let raw = RawObjectInstance::scanned(&modelled, modelled.key, &modelled.path).unwrap();
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = TableHandle::for_test(Arc::new(std::fs::File::open("/dev/null").unwrap()));
         let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
@@ -10460,7 +10870,7 @@ pub(crate) mod test_fixture {
     /// fd's key, with the same mapping, pin and digest as its scan pin.
     pub(crate) fn manifest_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
         let raw = RawObjectInstance::manifest(fd_key, PATH.to_string()).unwrap();
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = TableHandle::for_test(Arc::new(std::fs::File::open("/dev/null").unwrap()));
         let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
@@ -10504,7 +10914,7 @@ pub(crate) mod test_fixture {
     /// pin's inode is the key's, as a real pin's always is.
     pub(crate) fn prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
         let raw = RawObjectInstance::prearm(fd_key, PATH.to_string()).unwrap();
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = TableHandle::for_test(Arc::new(std::fs::File::open("/dev/null").unwrap()));
         let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
@@ -11219,7 +11629,7 @@ mod tests {
                 "both independently cloned path fields are included"
             );
             assert!(charge >= actual);
-            assert!(Arc::ptr_eq(&target.entry.file, &copy.entry.file));
+            assert!(target.entry.file.ptr_eq(&copy.entry.file));
             assert!(Arc::ptr_eq(&target.entry.exports, &copy.entry.exports));
         }
     }
@@ -15749,7 +16159,7 @@ mod tests {
             fs_magic: Some(0x9123_683e),
         };
         entry.mapped = Some(calibrated);
-        let original = Arc::downgrade(&entry.file);
+        let original = Arc::downgrade(entry.file.arc());
         let id = pins.by_id.keys().next().copied().unwrap();
         let target = pins.retain_inventory_target(id).unwrap();
         let snapshot = RetainedMappedIdentities::from_targets([&target, &target]);
@@ -15848,6 +16258,7 @@ mod tests {
             &|_| Ok(calibrated),
             None,
             None,
+            Filing::Untracked,
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -15868,6 +16279,7 @@ mod tests {
             &probe,
             None,
             None,
+            Filing::Untracked,
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -15880,9 +16292,16 @@ mod tests {
             );
         }
         module.mapped_identity = Some(FileIdentity { dev: 47, ino: 9 });
-        let (refused, skipped) =
-            pin_scanned_view_objects_with(&view, &[module], &mut budget, &probe, None, None)
-                .unwrap();
+        let (refused, skipped) = pin_scanned_view_objects_with(
+            &view,
+            &[module],
+            &mut budget,
+            &probe,
+            None,
+            None,
+            Filing::Untracked,
+        )
+        .unwrap();
         assert_eq!(probes.get(), 2 * usize::from(!reusable));
         assert_eq!(refused.pinned().count(), 0);
         assert!(
@@ -15938,6 +16357,7 @@ mod tests {
                 },
                 None,
                 None,
+                Filing::Untracked,
             )
             .unwrap();
             (objects.pinned().count(), skipped)
@@ -16809,7 +17229,7 @@ mod tests {
             assert_eq!(new.overlay, old.overlay);
             assert_eq!(new.collapsed, old.collapsed);
             assert!(
-                Arc::ptr_eq(&new.file, &old.file),
+                new.file.ptr_eq(&old.file),
                 "the SAME opened File is retained"
             );
             assert!(Arc::ptr_eq(&new.exports, &old.exports));
@@ -16863,13 +17283,13 @@ mod tests {
             for _ in 0..4096 {
                 let mut before = [0usize; 3];
                 for (count, entry) in before.iter_mut().zip(source.by_id.values()) {
-                    *count = Arc::strong_count(&entry.file);
+                    *count = Arc::strong_count(entry.file.arc());
                 }
                 let step = source
                     .poll_conservative_copy(&mut cursor, &selection, &reserve, 1)
                     .unwrap();
                 for (old, entry) in before.into_iter().zip(source.by_id.values()) {
-                    assert!(Arc::strong_count(&entry.file).saturating_sub(old) <= 1);
+                    assert!(Arc::strong_count(entry.file.arc()).saturating_sub(old) <= 1);
                 }
                 if step == GraphStep::Ready {
                     break;
@@ -17045,7 +17465,7 @@ mod tests {
         let counts: Vec<_> = source
             .by_id
             .values()
-            .map(|entry| Arc::strong_count(&entry.file))
+            .map(|entry| Arc::strong_count(entry.file.arc()))
             .collect();
         let mut refused = false;
         for _ in 0..4096 {
@@ -17065,7 +17485,7 @@ mod tests {
             source
                 .by_id
                 .values()
-                .map(|entry| Arc::strong_count(&entry.file))
+                .map(|entry| Arc::strong_count(entry.file.arc()))
                 .collect::<Vec<_>>()
         );
         pool.reference_set_limit(baseline.checked_add(required).unwrap());
@@ -18725,9 +19145,9 @@ mod tests {
                     .chain(claims.targets.iter().map(|(id, _)| *id))
             })
             .collect();
-        let weak_a = Arc::downgrade(&source.by_id.get(&id_a).unwrap().file);
-        let weak_r1 = Arc::downgrade(&source.by_id.get(&id_r1).unwrap().file);
-        let weak_r2 = Arc::downgrade(&source.by_id.get(&id_r2).unwrap().file);
+        let weak_a = Arc::downgrade(source.by_id.get(&id_a).unwrap().file.arc());
+        let weak_r1 = Arc::downgrade(source.by_id.get(&id_r1).unwrap().file.arc());
+        let weak_r2 = Arc::downgrade(source.by_id.get(&id_r2).unwrap().file.arc());
         let fd_a = source.by_id.get(&id_a).unwrap().file.as_raw_fd();
         let fd_r1 = source.by_id.get(&id_r1).unwrap().file.as_raw_fd();
         let fd_r2 = source.by_id.get(&id_r2).unwrap().file.as_raw_fd();
@@ -19284,10 +19704,7 @@ mod tests {
         let id = *canonical.by_id.keys().next().unwrap();
         let fd = canonical.by_id.get(&id).unwrap().file.as_raw_fd();
         let stranger = canonical.by_id.values().nth(1).unwrap().file.clone();
-        assert!(!Arc::ptr_eq(
-            &canonical.by_id.get(&id).unwrap().file,
-            &stranger
-        ));
+        assert!(!canonical.by_id.get(&id).unwrap().file.ptr_eq(&stranger));
         canonical.by_id.get_mut(&id).unwrap().file = stranger;
         assert!(matches!(
             drive_pins_installed_reclaim(
@@ -20226,6 +20643,7 @@ mod tests {
             0,
             0,
             &mut budget,
+            Filing::Untracked,
         )
         .expect("the held fd pins");
         assert!(pinning.skipped.is_empty(), "{:?}", pinning.skipped);
@@ -20372,7 +20790,7 @@ mod tests {
         let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
         assert_eq!(new_fds, 0);
         let held = incoming.by_id[&incoming_id].file.clone();
-        let weak = std::sync::Arc::downgrade(&held);
+        let weak = std::sync::Arc::downgrade(held.arc());
         drop(held);
         drop(incoming);
         assert!(
@@ -20430,6 +20848,38 @@ mod tests {
         retained.held_library_fds(&mut fds);
         shared.held_library_fds(&mut fds);
         assert_eq!(fds.len(), 1, "two views over one file hold one handle");
+    }
+
+    /// The C4 re-file twin: already-held pins file into the table
+    /// without reopening. Pins sharing one file converge on one row;
+    /// every filed handle carries its row id.
+    #[test]
+    fn adopt_handles_into_files_held_pins_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::write(&first, b"first-bytes").unwrap();
+        std::fs::write(&second, b"second-bytes").unwrap();
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut pins = test_fixture::real_scan_pin(&first, None, 0, sha);
+        let more = test_fixture::real_scan_pin(&second, None, 1, sha);
+        let _skipped = pins.absorb(more);
+        let mut table = HandleTable::new(1000);
+        pins.adopt_handles_into(&mut table);
+        assert_eq!(table.len(), 2, "two files file two rows");
+        for entry in pins.by_id.values() {
+            assert_ne!(
+                entry.file.id(),
+                RowId::MAX,
+                "every re-filed handle carries its row"
+            );
+        }
+        let mut again = test_fixture::real_scan_pin(&first, None, 0, sha);
+        again.adopt_handles_into(&mut table);
+        // Unmapped fixture pins never lend (no mapped proof), so the
+        // second pin of the first file files its own row — exactly the
+        // post-scan share's verdict for the same pair.
+        assert_eq!(table.len(), 3);
     }
 
     /// Copies of `/bin/true` as pinnable scan modules for the pin-wait

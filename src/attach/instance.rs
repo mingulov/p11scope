@@ -4107,6 +4107,82 @@ mod tests {
     }
 
     #[test]
+    fn lto_corrupt_proc_config_gz_falls_through() {
+        let directory = tempfile::tempdir().unwrap();
+        let boot = directory.path().join("config-9.9.9-test");
+        let gz = directory.path().join("config.gz");
+        let modules = directory.path().join("dotconfig");
+        let kernel_release = directory.path().join("kernel.release");
+        let utsrelease = directory.path().join("utsrelease.h");
+        let valid = gzip_bytes("CONFIG_LTO_NONE=y\n");
+        let truncated = valid[..valid.len() / 2].to_vec();
+        assert!(
+            truncated.len() >= 2,
+            "truncated fixture must keep gzip magic"
+        );
+        let oversize = gzip_bytes(&"A".repeat(8 * 1024 * 1024 + 1));
+        let corrupt: [(&str, Vec<u8>); 3] = [
+            ("bad magic", b"not a gzip stream".to_vec()),
+            ("truncated stream", truncated),
+            ("oversize output", oversize),
+        ];
+        let gz_name = gz.display().to_string();
+        for (name, payload) in &corrupt {
+            std::fs::write(&gz, payload).unwrap();
+            let refusal = super::lto_refusal_for_release(
+                "9.9.9-test",
+                &boot,
+                &gz,
+                &modules,
+                &kernel_release,
+                &utsrelease,
+            )
+            .unwrap_or_else(|| panic!("corrupt gz ({name}) must refuse, never assume LTO-off"));
+            assert!(
+                refusal.contains("unverifiable"),
+                "corrupt gz ({name}) must be unverifiable: {refusal}"
+            );
+            assert!(
+                refusal.contains(gz_name.as_str()),
+                "corrupt gz ({name}) must name the gz path: {refusal}"
+            );
+        }
+        std::fs::write(&kernel_release, "9.9.9-test\n").unwrap();
+        for (name, payload) in &corrupt {
+            std::fs::write(&gz, payload).unwrap();
+            std::fs::write(&modules, "CONFIG_LTO_NONE=y\n").unwrap();
+            assert_eq!(
+                super::lto_refusal_for_release(
+                    "9.9.9-test",
+                    &boot,
+                    &gz,
+                    &modules,
+                    &kernel_release,
+                    &utsrelease,
+                ),
+                None,
+                "corrupt gz ({name}) must fall through to proven LTO-off modules allow",
+            );
+            std::fs::write(&modules, "CONFIG_LTO_CLANG_THIN=y\n").unwrap();
+            let refusal = super::lto_refusal_for_release(
+                "9.9.9-test",
+                &boot,
+                &gz,
+                &modules,
+                &kernel_release,
+                &utsrelease,
+            )
+            .unwrap_or_else(|| {
+                panic!("corrupt gz ({name}) must fall through to proven LTO modules refusal")
+            });
+            assert!(
+                refusal.contains("LTO kernel"),
+                "corrupt gz ({name}) must surface the modules LTO verdict: {refusal}"
+            );
+        }
+    }
+
+    #[test]
     fn pre_68_overlay_maps_select_through_the_calibration_key() {
         use p11scope_ebpf_common::InstanceFileKey;
         use p11scope_manifest::maps::{Device, ObjectKey};

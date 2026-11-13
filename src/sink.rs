@@ -200,9 +200,21 @@ fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
 /// waiting: the transport takes what it takes now and the unsent tail
 /// sheds with the standard counters. Only transport errors propagate.
 fn try_diagnostic_bytes_on_fd(fd: RawFd, bytes: &[u8]) -> io::Result<SinkDrops> {
-    let mut sink = stdout_sink_from(fd)?;
-    sink.write_diagnostic_bytes(bytes)?;
-    Ok(sink.take_drops())
+    match stdout_sink_from(fd) {
+        Ok(mut sink) => {
+            sink.write_diagnostic_bytes(bytes)?;
+            Ok(sink.take_drops())
+        }
+        // No fresh descriptor (EMFILE/ENFILE): borrow a suitable
+        // existing transport for the immediate write instead of losing
+        // the diagnostic. Unsuitable types (a blocking pipe with no
+        // preserved channel) keep the original error, which callers drop.
+        Err(error) if is_fd_exhaustion(&error) => match borrowed_diagnostic_transport(fd) {
+            Some(borrowed) => write_borrowed_diagnostic(borrowed, bytes),
+            None => Err(error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 /// A no-wait stderr `Write` for drivers that own their own text (detach
@@ -220,6 +232,20 @@ pub(crate) fn bounded_stderr_writer() -> Box<dyn Write> {
 pub(crate) fn bounded_writer_on_fd(fd: RawFd) -> Box<dyn Write> {
     match stdout_transport_on_fd(fd) {
         Ok(writer) => Box::new(writer),
+        // Same exhausted-descriptor borrow as the one-shot diagnostic
+        // path: a suitable existing transport writes immediately,
+        // unsuitable types shed to the sink as before.
+        Err(error) if is_fd_exhaustion(&error) => match borrowed_diagnostic_transport(fd) {
+            Some(BorrowedDiagnostic::File(raw)) => Box::new(BorrowedDiagnosticWriter {
+                fd: raw,
+                socket: false,
+            }),
+            Some(BorrowedDiagnostic::Socket(raw)) => Box::new(BorrowedDiagnosticWriter {
+                fd: raw,
+                socket: true,
+            }),
+            None => Box::new(std::io::sink()),
+        },
         Err(_) => Box::new(std::io::sink()),
     }
 }
@@ -404,6 +430,200 @@ fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: `fcntl` returned a fresh owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(duped) })
+}
+
+/// True when the transport failed only because no fresh descriptor could
+/// be allocated. Other errors (unsupported type, EACCES, ENXIO, EPIPE at
+/// open) keep their existing shed/propagate policy.
+fn is_fd_exhaustion(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EMFILE || code == libc::ENFILE
+    )
+}
+
+/// A diagnostic channel borrowed without allocating a descriptor: the raw
+/// fd to write, either the caller's own fd or a preserved private stdio
+/// description. The fd is never closed here; stdio fds and the preserved
+/// files live for the process's life, and test callers hold their pipe
+/// while the borrowed writer is alive.
+#[derive(Debug, Clone, Copy)]
+enum BorrowedDiagnostic {
+    File(RawFd),
+    Socket(RawFd),
+}
+
+/// Selects the borrowed channel for `fd` when no new descriptor can be
+/// allocated. Regular files and block devices write through the page
+/// cache, so the inherited fd is already non-waiting; sockets send with
+/// per-call `MSG_DONTWAIT`, so no flag change is needed. Pipes and
+/// terminals borrow the preserved `O_NONBLOCK` description when its
+/// identity still matches, else the inherited fd when it is already
+/// nonblocking; a blocking pipe with no preserved channel has no safe
+/// borrow (writing would park, toggling `O_NONBLOCK` would touch the
+/// shared description), so it stays `None` and the diagnostic sheds.
+fn borrowed_diagnostic_transport(fd: RawFd) -> Option<BorrowedDiagnostic> {
+    // SAFETY: `fstat` only reads the fd's metadata.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
+        return None;
+    }
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG | libc::S_IFBLK => Some(BorrowedDiagnostic::File(fd)),
+        libc::S_IFSOCK => Some(BorrowedDiagnostic::Socket(fd)),
+        libc::S_IFIFO | libc::S_IFCHR => {
+            if let Some(raw) = preserved_stdio_borrowed_fd(fd) {
+                return Some(BorrowedDiagnostic::File(raw));
+            }
+            if fd_is_nonblocking(fd) {
+                return Some(BorrowedDiagnostic::File(fd));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The preserved private description's own fd, without the clone that
+/// [`preserved_stdio_file`] needs a fresh descriptor for. Same identity
+/// check: only while the fd still names the saved file.
+fn preserved_stdio_borrowed_fd(fd: RawFd) -> Option<RawFd> {
+    let preserved = PRESERVED_STDIO.get()?;
+    let saved = match fd {
+        1 => preserved.stdout.as_ref()?,
+        2 => preserved.stderr.as_ref()?,
+        _ => return None,
+    };
+    // SAFETY: `fstat` only reads the fd's metadata.
+    let mut current: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut current) } != 0 {
+        return None;
+    }
+    if current.st_dev as u64 != saved.dev || current.st_ino as u64 != saved.ino {
+        return None;
+    }
+    Some(saved.file.as_raw_fd())
+}
+
+/// Whether `fd` already carries `O_NONBLOCK`, read without changing it.
+fn fd_is_nonblocking(fd: RawFd) -> bool {
+    // SAFETY: `F_GETFL` only reads the fd's flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+}
+
+/// Writes one diagnostic through a borrowed channel, with the same
+/// immediate head/tail policy as [`SinkWriter::write_diagnostic_bytes`]:
+/// the transport takes what it takes now, the unsent tail sheds with
+/// the standard counters. Never waits, never touches status flags.
+fn write_borrowed_diagnostic(transport: BorrowedDiagnostic, bytes: &[u8]) -> io::Result<SinkDrops> {
+    let mut drops = SinkDrops::default();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let wrote = match transport {
+            BorrowedDiagnostic::File(raw) => {
+                // SAFETY: `write` reads `remaining` only; the borrowed fd
+                // is open for the whole diagnostic call.
+                let wrote = unsafe { libc::write(raw, remaining.as_ptr().cast(), remaining.len()) };
+                if wrote < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(wrote as usize)
+                }
+            }
+            BorrowedDiagnostic::Socket(raw) => {
+                // SAFETY: `send` reads `remaining` only; the borrowed fd
+                // is open for the whole diagnostic call.
+                let sent = unsafe {
+                    libc::send(
+                        raw,
+                        remaining.as_ptr().cast(),
+                        remaining.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(sent as usize)
+                }
+            }
+        };
+        match wrote {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "sink wrote zero bytes with a non-empty buffer",
+                ));
+            }
+            Ok(wrote) => {
+                remaining = &remaining[wrote..];
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                // No room right now (or a stray signal): shed the tail
+                // with counters rather than waiting for room.
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !remaining.is_empty() {
+        drops.timeouts = drops.timeouts.saturating_add(1);
+        drops.dropped_bytes = drops.dropped_bytes.saturating_add(remaining.len() as u64);
+    }
+    Ok(drops)
+}
+
+/// A [`bounded_writer_on_fd`] fallback that writes through a borrowed
+/// channel without owning a descriptor. Single immediate attempts, like
+/// the owned transport: a full pipe fails fast for the caller to drop.
+/// Never closes the borrowed fd.
+struct BorrowedDiagnosticWriter {
+    fd: RawFd,
+    socket: bool,
+}
+
+impl Write for BorrowedDiagnosticWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.socket {
+            // SAFETY: `send` reads `bytes` only; the borrowed fd is open
+            // while this short-lived writer is alive.
+            let sent = unsafe {
+                libc::send(
+                    self.fd,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
+            }
+        } else {
+            // SAFETY: `write` reads `bytes` only; the borrowed fd is open
+            // while this short-lived writer is alive.
+            let wrote = unsafe { libc::write(self.fd, bytes.as_ptr().cast(), bytes.len()) };
+            if wrote < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(wrote as usize)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<W: Write + AsRawFd> SinkWriter<W> {

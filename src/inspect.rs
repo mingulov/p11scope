@@ -192,7 +192,11 @@ fn render_text_with_application(
         render_folded_skips(&mut out, &skips);
     }
     if !excluded.is_empty() {
-        let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        if excluded.len() == 1 {
+            let _ = writeln!(out, "Excluded by you (1 file):");
+        } else {
+            let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        }
         for item in excluded {
             let processes = if item.processes == 1 {
                 "1 process mapped it".to_string()
@@ -1355,7 +1359,7 @@ mod tests {
             &unmatched,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(out.contains("Excluded by you (1 files):"), "{out}");
+        assert!(out.contains("Excluded by you (1 file):"), "{out}");
         assert!(
             out.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 2 processes mapped it)"),
             "{out}"

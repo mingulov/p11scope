@@ -4142,7 +4142,11 @@ fn render_excluded(out: &mut String, catalog: &Catalog) {
     let (excluded, unmatched) =
         crate::render::aggregate_excluded(&catalog.excluded, &catalog.exclude_inputs);
     if !excluded.is_empty() {
-        let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        if excluded.len() == 1 {
+            let _ = writeln!(out, "Excluded by you (1 file):");
+        } else {
+            let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        }
         for item in &excluded {
             let processes = if item.processes == 1 {
                 "1 process mapped it".to_string()
@@ -7572,7 +7576,7 @@ mod tests {
             PathBuf::from("libnothing.so"),
         ];
         let text = render_text(&catalog);
-        assert!(text.contains("Excluded by you (1 files):"), "{text}");
+        assert!(text.contains("Excluded by you (1 file):"), "{text}");
         assert!(
             text.contains(
                 "/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 1 process mapped it)"

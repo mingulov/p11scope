@@ -2900,7 +2900,11 @@ fn excluded_lines(ev: &Evidence) -> String {
     let mut out = String::new();
     let total = ev.discovery.excluded_modules.len();
     if total > 0 {
-        out.push_str(&format!("Excluded by you ({total} files):\n"));
+        if total == 1 {
+            out.push_str("Excluded by you (1 file):\n");
+        } else {
+            out.push_str(&format!("Excluded by you ({total} files):\n"));
+        }
         for excluded in &ev.discovery.excluded_modules {
             let processes = if excluded.processes == 1 {
                 "1 process mapped it".to_string()
@@ -13004,7 +13008,7 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("Excluded by you (1 files):"), "{text}");
+        assert!(text.contains("Excluded by you (1 file):"), "{text}");
         assert!(
             text.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 3 processes mapped it)"),
             "{text}"

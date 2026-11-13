@@ -4715,15 +4715,23 @@ fn render_excluded_lines(
 ) {
     use std::fmt::Write as _;
     if !excluded_modules.is_empty() {
-        let _ = writeln!(out, "Excluded by you ({} files):", excluded_modules.len());
+        if excluded_modules.len() == 1 {
+            let _ = writeln!(out, "Excluded by you (1 file):");
+        } else {
+            let _ = writeln!(out, "Excluded by you ({} files):", excluded_modules.len());
+        }
         for excluded in excluded_modules {
+            let processes = if excluded.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", excluded.processes)
+            };
             let _ = writeln!(
                 out,
-                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed",
                 escape_controls(&excluded.path),
                 excluded.dev,
                 excluded.ino,
-                excluded.processes
             );
         }
     }

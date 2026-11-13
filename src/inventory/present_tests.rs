@@ -204,10 +204,7 @@ fn snapshot_and_json_list_excluded_modules_and_unmatched_inputs() {
     }];
     presentation.unmatched_excludes = vec!["nope.so".into()];
     let snapshot = render_snapshot(&presentation);
-    assert!(
-        snapshot.contains("Excluded by you (1 files):"),
-        "{snapshot}"
-    );
+    assert!(snapshot.contains("Excluded by you (1 file):"), "{snapshot}");
     assert!(
         snapshot.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 3 processes mapped it)"),
         "{snapshot}"
@@ -223,6 +220,28 @@ fn snapshot_and_json_list_excluded_modules_and_unmatched_inputs() {
     );
     assert_eq!(out["excluded_modules"][0]["processes"], 3);
     assert_eq!(out["unmatched_excludes"][0], "nope.so");
+}
+
+/// O9b: the inventory exclusion row pluralizes its mapping count —
+/// "1 process mapped it", never "1 processes mapped it".
+#[test]
+fn snapshot_exclusion_row_uses_singular_process_for_one_mapping() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let mut presentation = capture_for(&harness, &document);
+    presentation.excluded_modules = vec![crate::render::ExcludedOut {
+        path: "/opt/libp11-kit.so.0.4.8".into(),
+        dev: 42,
+        ino: 1001,
+        processes: 1,
+    }];
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains(
+            "/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 1 process mapped it)"
+        ),
+        "{snapshot}"
+    );
 }
 
 /// O-Module: a `--module` input that matched nothing is named in the

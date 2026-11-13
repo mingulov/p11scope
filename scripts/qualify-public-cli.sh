@@ -345,21 +345,32 @@ gated() {
       [ "${args[$i]}" != -o ] || args[$((i+1))]=$output
       [ "${args[$i]}" != --event-log ] || args[$((i+1))]=$evlog
     done
-    "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+    # The inventory-mt stop below arrives by SIGINT (sigint_exact
+    # precedent): reset an inherited SIGINT ignore so the observer's own
+    # stop handler deterministically installs.
+    local sigint_env=()
+    case "$cell" in inventory-mt-*) sigint_env=(env --default-signal=INT);; esac
+    "${sigint_env[@]}" "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     local ready_needle='p11scope: capturing:'
     case "$cell" in inventory-mt-*) ready_needle='native usage lane active';; esac
     if "$poll" "$cell.stderr" "$ready_needle" "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
       # Inventory counts only calls made after an edge is native-matched, so
       # the inventory-mt cells hold the workload gate until every workload
-      # edge is matched in the event stream (fail loud on timeout).
-      local match_ok=1 match_timeout=0
+      # edge is matched in the event stream. The wait follows the product's
+      # own progress (pass heartbeats), not a wall budget on the match: the
+      # stall budget fails a wedged observer, the overall backstop bounds a
+      # product that progresses but never matches. Budgets sized at ~4x over
+      # measured loaded upper bounds (pid started-based match <= 14.5s with
+      # steady pass gaps <= 3.8s; system <= 22.5s with gaps <= 4.8s; the
+      # gate window from lane-active is strictly inside those spans).
+      local match_ok=1 match_stall=0 match_overall=0
       case "$cell" in
-        inventory-mt-pid) match_timeout=10 ;;
-        inventory-mt-system) match_timeout=20 ;;
+        inventory-mt-pid) match_stall=10; match_overall=60 ;;
+        inventory-mt-system) match_stall=20; match_overall=90 ;;
       esac
-      if [ "$match_timeout" != 0 ]; then
-        if python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --wl "$cell.wl" --timeout "$match_timeout"; then
+      if [ "$match_stall" != 0 ]; then
+        if python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --wl "$cell.wl" --timeout "$match_stall" --overall-timeout "$match_overall"; then
           match_ok=1
         else
           match_ok=0
@@ -368,6 +379,18 @@ gated() {
       if [ "$match_ok" = 1 ] && "$release" "$gate"; then
         released=1
         if "$poll" "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
+          case "$cell" in
+            inventory-mt-*)
+              # The workload is done (LEDGER holds its exact totals); let
+              # the product count on its own cadence (two further passes
+              # surely collected after the ledger, since pass collections
+              # run sequentially), then stop it with SIGINT like
+              # sigint_exact. A troubled settle still proceeds to the stop:
+              # the unchanged oracle judges the stop-drain counts strictly.
+              python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --settle-passes 2 --timeout "$match_stall" --overall-timeout "$match_overall" || true
+              if alive "$pp"; then kill -INT "$pp" 2>/dev/null || true; fi
+              ;;
+          esac
           if "$settle" "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
         fi
       fi
@@ -1134,8 +1157,8 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       mt-trace) gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt" ;;
       counter-latency-mt) counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
       mt-system) gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json" ;;
-      inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 12 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
-      inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 25 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
+      inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 120 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
+      inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 120 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
     esac
   done
   summary "$@"; exit $?
@@ -1194,8 +1217,10 @@ counter_cell counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode
 gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json"
 # Inventory MT-exact cells: the held workload keeps its process alive across
 # inventory passes; per-edge usage and the event-log stream are judged exact.
-MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 12 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json"
-MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 25 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json"
+# The observer runs until the harness stops it after the ledger settles
+# (sigint_exact shape); --duration is only the backstop behind that stop.
+MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 120 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json"
+MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 120 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json"
 # SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
 # SIGINT arrives after the ledger is complete; require exact counts, a proven
 # drain and exact observation via the oracle.

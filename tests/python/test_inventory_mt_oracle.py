@@ -7,6 +7,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -235,6 +237,54 @@ def gate_event(pid, state, dev=(8, 1), ino=71):
                       "entries": {"coverage": {"state": state}}}}
 
 
+def gate_pass(seq):
+    return {"seq": seq, "kind": "pass_committed", "at_ns": seq * 1_000_000_000,
+            "event": {"pass": seq - 1}}
+
+
+def gate_started():
+    return {"seq": 0, "kind": "started", "at_ns": 0, "event": {}}
+
+
+def gate_ended(seq):
+    return {"seq": seq, "kind": "ended", "at_ns": seq * 1_000_000_000,
+            "event": {}}
+
+
+class ScriptedEventLog:
+    """Append event-log records on a scripted timeline (writer thread).
+
+    script: [(delay_after_previous_seconds, [record, ...]), ...].
+    stop() halts the timeline early; join() waits for the thread.
+    """
+
+    def __init__(self, path, script):
+        self._path = path
+        self._script = script
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        with open(self._path, "a", encoding="utf-8") as handle:
+            for delay, records in self._script:
+                if self._stop.wait(delay):
+                    break
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+                handle.flush()
+
+    def stop(self):
+        self._stop.set()
+
+    def join(self, timeout=30):
+        self._thread.join(timeout)
+
+
 class InventoryMtGateTests(unittest.TestCase):
     def run_gate(self, wl_lines, events, timeout=2):
         with tempfile.TemporaryDirectory() as raw:
@@ -259,12 +309,36 @@ class InventoryMtGateTests(unittest.TestCase):
         self.assertEqual(self.run_gate(self.wl(), events), 0)
 
     def test_missing_pid_times_out(self):
+        # Static log, no passes: the overall backstop (not the stall,
+        # which clocks from the first pass) fails the unmatchable wait.
         events = [gate_event(123, "counted")]
-        self.assertEqual(self.run_gate(self.wl(), events, timeout=0.2), 1)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl()) + "\n")
+            log = tmp / "log"
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "0.2",
+                                   "--overall-timeout", "0.3"],
+                                  capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
 
     def test_wrong_module_ignored(self):
         events = [gate_event(123, "counted", ino=72), gate_event(124, "counted", ino=72)]
-        self.assertEqual(self.run_gate(self.wl(), events, timeout=0.2), 1)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl()) + "\n")
+            log = tmp / "log"
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "0.2",
+                                   "--overall-timeout", "0.3"],
+                                  capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
 
     def test_malformed_lines_skipped(self):
         events = [gate_event(123, "counted"), gate_event(124, "counted")]
@@ -289,6 +363,127 @@ class InventoryMtGateTests(unittest.TestCase):
                                    "--timeout", "0.2"],
                                   capture_output=True, text=True, timeout=15)
         self.assertEqual(proc.returncode, 2)
+
+    def wl_single(self):
+        return ["TARGET " + json.dumps({"name": "C_GenerateRandom",
+                                        "dev": [8, 1], "ino": 71}),
+                "READY pid=123"]
+
+    def run_gate_scripted(self, wl_lines, script, timeout, extra=()):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            args = [sys.executable, "-I", str(GATE),
+                    "--event-log", str(tmp / "log"), "--timeout", str(timeout)]
+            if wl_lines is not None:
+                wl = tmp / "wl"
+                wl.write_text("\n".join(wl_lines) + "\n")
+                args += ["--wl", str(wl)]
+            args += list(extra)
+            writer = ScriptedEventLog(tmp / "log", script).start()
+            try:
+                start = time.monotonic()
+                proc = subprocess.run(args, capture_output=True, text=True,
+                                      timeout=30)
+                elapsed = time.monotonic() - start
+            finally:
+                writer.stop()
+                writer.join()
+        return proc.returncode, proc.stderr, elapsed
+
+    def test_slow_but_progressing_match_passes(self):
+        # The loaded-runner shape: passes arrive steadily but the
+        # qualifying edge lands after the old wall budget. The gate must
+        # wait while the product progresses, not fail on wall time.
+        script = [(0.0, [gate_started(), gate_pass(1),
+                         gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(2), gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(3), gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(4), gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(5), gate_event(123, "watched_no_use")])]
+        code, err, _ = self.run_gate_scripted(self.wl_single(), script, 1.5)
+        self.assertEqual(code, 0)
+        self.assertIn("released: all", err)
+
+    def test_progress_then_stall_fails_with_stall_message(self):
+        # Passes arrive, then stop without a match: a wedged product
+        # must fail on the stall, measured from the last pass.
+        script = [(0.0, [gate_started(), gate_pass(1),
+                         gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(2), gate_event(123, "unknown")]),
+                  (0.4, [gate_pass(3), gate_event(123, "unknown")])]
+        code, err, _ = self.run_gate_scripted(self.wl_single(), script, 1.0)
+        self.assertEqual(code, 1)
+        self.assertIn("stalled:", err)
+        self.assertIn("unmatched workload edges for pids [123]", err)
+
+    def test_no_passes_waits_for_overall(self):
+        # No pass ever arrives (wedged before the first one): the stall
+        # clocks from the first pass, so only the overall backstop fails
+        # this wait, and it names the overall budget.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl_single()) + "\n")
+            log = tmp / "log"
+            log.write_text(json.dumps(gate_started()) + "\n")
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "0.4",
+                                   "--overall-timeout", "1.0"],
+                                  capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("overall budget exhausted", proc.stderr)
+
+    def test_overall_backstop_bounds_endless_progress(self):
+        # Passes flow forever but no edge ever qualifies: the overall
+        # backstop bounds the wait even while progressing.
+        script = [(0.0, [gate_started(), gate_pass(1),
+                         gate_event(123, "unknown")])]
+        script += [(0.2, [gate_pass(seq), gate_event(123, "unknown")])
+                   for seq in range(2, 22)]
+        code, err, _ = self.run_gate_scripted(
+            self.wl_single(), script, 2, ["--overall-timeout", "1.0"])
+        self.assertEqual(code, 1)
+        self.assertIn("overall budget exhausted", err)
+        self.assertIn("unmatched workload edges for pids [123]", err)
+
+    def test_ended_without_match_fails_fast(self):
+        # The stream ended with no qualifying edge: no further pass can
+        # arrive, so the gate fails at once instead of idling to stall.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl_single()) + "\n")
+            log = tmp / "log"
+            events = [gate_started(), gate_pass(1),
+                      gate_event(123, "unknown"), gate_ended(2)]
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            start = time.monotonic()
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "3"],
+                                  capture_output=True, text=True, timeout=15)
+            elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ended without match", proc.stderr)
+        self.assertLess(elapsed, 2.0)
+
+    def test_settle_waits_for_further_passes(self):
+        # Settle mode waits for N more passes past the gate start, so a
+        # post-LEDGER stop lets the product count on its own cadence.
+        script = [(0.3, [gate_pass(11)]), (0.3, [gate_pass(12)])]
+        code, err, _ = self.run_gate_scripted(
+            None, script, 2, ["--settle-passes", "2"])
+        self.assertEqual(code, 0)
+        self.assertIn("settled:", err)
+
+    def test_settle_stall_fails(self):
+        # Settle mode fails when the further passes stop arriving.
+        script = [(0.2, [gate_pass(11)])]
+        code, err, _ = self.run_gate_scripted(
+            None, script, 0.8, ["--settle-passes", "2"])
+        self.assertEqual(code, 1)
+        self.assertIn("stalled:", err)
 
 
 if __name__ == "__main__":

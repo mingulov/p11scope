@@ -9,7 +9,7 @@
 //! path lists. Event fds, pidfds and readlink strings of files that fail
 //! the provider test never leave this module.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1564,6 +1564,10 @@ struct DrainCtx<'a> {
     /// Inode ignore marks placed so far (bounded by
     /// `LEARN_IGNORE_MARK_CAP`).
     ignore_marks: usize,
+    /// Generations already ignore-marked since the last flush: each is
+    /// marked at most once per flush period, so the counter above
+    /// counts live marks, not mark calls.
+    marked_this_period: HashSet<FileGeneration>,
 }
 
 /// Bound on the kernel-side ignore marks the drain places on files it
@@ -1601,6 +1605,37 @@ fn ignore_negative_inode(group: std::os::unix::io::RawFd, file: &std::fs::File) 
     rc == 0
 }
 
+/// Removes one file's inode ignore mark again: the undo for a mark
+/// that raced a writer between the proof reads and the mark syscall.
+/// Best effort: a refused removal still leaves the periodic flush to
+/// clear it within one re-mark period.
+fn remove_ignore_mark(group: std::os::unix::io::RawFd, file: &std::fs::File) -> bool {
+    // SAFETY: libc call; the group and the held event fd are valid,
+    // and a NULL pathname addresses the held fd's inode.
+    let rc = unsafe {
+        libc::fanotify_mark(
+            group,
+            libc::FAN_MARK_REMOVE | libc::FAN_MARK_IGNORED_MASK,
+            libc::FAN_OPEN,
+            file.as_raw_fd(),
+            std::ptr::null(),
+        )
+    };
+    rc == 0
+}
+
+/// What placing one ignore mark did: `Marked` means a mark is newly in
+/// place for an unchanged file, `Refused` that the kernel took none
+/// (mark limit, permission, or the cap — the user-space cache still
+/// decides), and `Changed` that the file moved under the proof so its
+/// mark was removed again and nothing may be cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreMarkOutcome {
+    Marked,
+    Refused,
+    Changed,
+}
+
 /// Removes every filesystem mark of the group (inode ignore marks
 /// stay): flushing filesystem marks needs `CAP_SYS_ADMIN`, so it runs
 /// only where the startup grant is still held — the arming-timeout
@@ -1617,6 +1652,17 @@ fn flush_filesystem_marks(group: std::os::unix::io::RawFd) -> bool {
         )
     };
     rc == 0
+}
+
+/// Clears the period ignore-mark state after the periodic flush —
+/// but only when the flush succeeded. A failed flush leaves the marks
+/// installed, so the counter and the per-period set stay: the cap
+/// keeps bounding new marks instead of undercounting past it.
+fn reset_marks_after_flush(ctx: &mut DrainCtx<'_>, flushed: bool) {
+    if flushed {
+        ctx.ignore_marks = 0;
+        ctx.marked_this_period.clear();
+    }
 }
 
 /// Removes every inode ignore mark of the group (the filesystem marks
@@ -1638,16 +1684,52 @@ fn flush_ignore_marks(group: std::os::unix::io::RawFd) -> bool {
 
 impl DrainCtx<'_> {
     /// Records a certain negative: cached in user space, and filtered
-    /// in the kernel while the ignore-mark budget lasts.
+    /// in the kernel while the ignore-mark budget lasts. A file that
+    /// moved under its proof is neither cached nor left marked: its
+    /// next open re-proves the new content.
     fn note_negative(&mut self, generation: FileGeneration, file: &std::fs::File) {
-        self.cache.note_decided(generation, false);
-        self.mark_ignored(file);
+        match self.mark_ignored_for(generation, file) {
+            IgnoreMarkOutcome::Marked | IgnoreMarkOutcome::Refused => {
+                self.cache.note_decided(generation, false);
+            }
+            IgnoreMarkOutcome::Changed => {}
+        }
     }
 
-    fn mark_ignored(&mut self, file: &std::fs::File) {
-        if self.ignore_marks < LEARN_IGNORE_MARK_CAP && ignore_negative_inode(self.group, file) {
-            self.ignore_marks += 1;
+    /// Places the kernel ignore mark for one proved-negative
+    /// generation, at most once per flush period. After marking, the
+    /// file's size and ctime are re-checked: a writer between the
+    /// proof reads and the mark would otherwise leave the new content
+    /// suppressed, so a changed file has its mark removed again and
+    /// reports `Changed` (the caller must not cache it).
+    fn mark_ignored_for(
+        &mut self,
+        generation: FileGeneration,
+        file: &std::fs::File,
+    ) -> IgnoreMarkOutcome {
+        if self.ignore_marks >= LEARN_IGNORE_MARK_CAP {
+            return IgnoreMarkOutcome::Refused;
         }
+        if !self.marked_this_period.insert(generation) {
+            return IgnoreMarkOutcome::Refused;
+        }
+        if !ignore_negative_inode(self.group, file) {
+            self.marked_this_period.remove(&generation);
+            return IgnoreMarkOutcome::Refused;
+        }
+        let unchanged = match file_generation(file) {
+            Ok(fresh) => {
+                fresh.2 == generation.2 && fresh.3 == generation.3 && fresh.4 == generation.4
+            }
+            Err(_) => false,
+        };
+        if !unchanged {
+            remove_ignore_mark(self.group, file);
+            self.marked_this_period.remove(&generation);
+            return IgnoreMarkOutcome::Changed;
+        }
+        self.ignore_marks += 1;
+        IgnoreMarkOutcome::Marked
     }
 
     /// Decides every event in one read buffer. Returns false when the
@@ -1715,8 +1797,9 @@ impl DrainCtx<'_> {
         if !self.cache.needs_check(generation) {
             if self.cache.decided_provider(generation) != Some(true) {
                 // A known negative that still reports opens (its mark was
-                // flushed, refused or evicted): mark it again.
-                self.mark_ignored(&file);
+                // flushed, refused or evicted): mark it again, at most
+                // once per flush period.
+                let _ = self.mark_ignored_for(generation, &file);
                 return true;
             }
             // A later open of a sent file: tally the load. The pid
@@ -1929,6 +2012,7 @@ fn drain_loop(
         cache: LearnCache::new(),
         stats: DrainStats::default(),
         ignore_marks: 0,
+        marked_this_period: std::collections::HashSet::new(),
     };
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_remark = std::time::Instant::now();
@@ -1972,8 +2056,8 @@ fn drain_loop(
             // after the flush its next open is a new generation and is
             // re-proved. The flush costs one re-queued open per marked
             // file, then the marks come back.
-            flush_ignore_marks(raw);
-            ctx.ignore_marks = 0;
+            let flushed = flush_ignore_marks(raw);
+            reset_marks_after_flush(&mut ctx, flushed);
             // Coverage is the retained-mark set, never event traffic:
             // a failed re-mark of a retained filesystem is harmless
             // (its startup mark still delivers), but a visible
@@ -3437,6 +3521,7 @@ mod tests {
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
         };
         let mut buf = vec![0u8; 64 * 1024];
         assert!(
@@ -3480,6 +3565,7 @@ mod tests {
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
         };
         let mut buf = vec![0u8; 64 * 1024];
         let mut calls = 0;
@@ -3496,6 +3582,38 @@ mod tests {
         assert!(
             !state.lost_tail.load(Ordering::Acquire),
             "a continued error is not a lost tail"
+        );
+    }
+
+    /// The period mark state clears only after a successful flush: a
+    /// failed flush keeps the counter and the per-period set, so the
+    /// cap keeps bounding new marks instead of undercounting past it.
+    #[test]
+    fn learn_mark_period_resets_only_after_a_successful_flush() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: -1,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 5,
+            marked_this_period: std::collections::HashSet::from([(1u64, 2u64, 3u64, 4i64, 5i64)]),
+        };
+        super::reset_marks_after_flush(&mut ctx, false);
+        assert_eq!(ctx.ignore_marks, 5, "a failed flush keeps the counter");
+        assert_eq!(
+            ctx.marked_this_period.len(),
+            1,
+            "a failed flush keeps the set"
+        );
+        super::reset_marks_after_flush(&mut ctx, true);
+        assert_eq!(ctx.ignore_marks, 0, "a successful flush resets the counter");
+        assert!(
+            ctx.marked_this_period.is_empty(),
+            "a successful flush clears the set"
         );
     }
 
@@ -3847,6 +3965,7 @@ mod tests {
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
         };
         let mut buf = vec![0u8; 64 * 1024];
         // Healthy twin: a backlog under the cap is never shed.
@@ -3968,6 +4087,7 @@ mod tests {
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
         };
         let mut buf = vec![0u8; 64 * 1024];
         assert!(
@@ -4049,6 +4169,80 @@ mod tests {
         assert!(
             read_events_for(raw, target, window).0,
             "after the flush the open reports again"
+        );
+    }
+
+    /// Live ignore-mark proof (privileged): each proved-negative
+    /// generation is marked at most once per flush period (re-marking
+    /// the same file does not recount), and a file that moves between
+    /// its proof and its mark has the mark removed again and is never
+    /// cached as negative — its next open re-proves the new content.
+    /// Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_ignore_mark_counts_once_and_rechecks_the_race() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("negative.dat");
+        std::fs::write(&path, b"not elf").unwrap();
+        let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let raw = group.as_raw_fd();
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: raw,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        // Healthy twin: a fresh negative is marked once and cached.
+        let file = std::fs::File::open(&path).unwrap();
+        let generation = super::file_generation(&file).unwrap();
+        ctx.note_negative(generation, &file);
+        assert_eq!(ctx.ignore_marks, 1, "the first mark counts once");
+        assert!(
+            !ctx.cache.needs_check(generation),
+            "a marked negative is cached"
+        );
+        // Re-marking the same generation within the period recounts
+        // nothing.
+        let outcome = ctx.mark_ignored_for(generation, &file);
+        assert_eq!(
+            outcome,
+            super::IgnoreMarkOutcome::Refused,
+            "already marked this period"
+        );
+        assert_eq!(
+            ctx.ignore_marks, 1,
+            "a re-mark within the period does not recount"
+        );
+        // A file that moves under its proof is neither cached nor left
+        // marked: the generation is captured, the file is rewritten to
+        // a new size, and only then is the stale proof recorded.
+        let path2 = dir.path().join("raced.dat");
+        std::fs::write(&path2, b"not elf either").unwrap();
+        let file2 = std::fs::File::open(&path2).unwrap();
+        let stale = super::file_generation(&file2).unwrap();
+        std::fs::write(&path2, b"not elf either, but longer now").unwrap();
+        ctx.note_negative(stale, &file2);
+        assert!(
+            ctx.cache.needs_check(stale),
+            "a raced file is never cached negative"
+        );
+        assert_eq!(ctx.ignore_marks, 1, "a raced mark is removed, not counted");
+        let fresh = super::file_generation(&file2).unwrap();
+        assert_ne!(
+            (fresh.2, fresh.3, fresh.4),
+            (stale.2, stale.3, stale.4),
+            "the race moved size+ctime"
+        );
+        assert!(
+            ctx.cache.needs_check(fresh),
+            "the new generation still needs its proof"
         );
     }
 

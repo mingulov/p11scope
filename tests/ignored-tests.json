@@ -1008,6 +1008,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/fanotify.rs",
+      "path": "fanotify::tests::learn_live_ignore_mark_counts_once_and_rechecks_the_race",
+      "reason": "privileged: each negative generation is ignore-marked once per period, and a file that moves under its proof keeps no mark and no cache entry (root, CAP_SYS_ADMIN)",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/unbound_exe.rs",
       "path": "discovery::unbound_exe::tests::privileged_btrfs_subvolume_collision_resolves_ambiguous",
       "reason": "privileged: btrfs subvolume twins resolve ambiguous (root, btrfs TMPDIR)",

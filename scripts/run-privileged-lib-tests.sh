@@ -382,7 +382,8 @@ discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executab
 # backlog past the user-space cap is shed as the named overflow; ignore
 # marks filter negatives until the periodic flush; the stop tail decides
 # a queued snapshot with the provider last; a stalled arming pass times
-# out with no marks left (root, CAP_SYS_ADMIN; seconds).
+# out with no marks left; marks count once per period with a race
+# re-check (root, CAP_SYS_ADMIN; seconds).
 fanotify::tests::learn_live_drain_reports_opened_provider
 fanotify::tests::learn_live_drain_reports_opened_provider_across_mount_ns
 fanotify::tests::learn_live_stop_under_open_churn_drains_without_loss
@@ -391,6 +392,7 @@ fanotify::tests::learn_live_backlog_past_cap_is_shed_as_named_overflow
 fanotify::tests::learn_live_ignore_mark_filters_until_flush
 fanotify::tests::learn_live_final_tail_decides_queued_snapshot
 fanotify::tests::learn_live_arming_timeout_flushes_marks_and_closes_dup
+fanotify::tests::learn_live_ignore_mark_counts_once_and_rechecks_the_race
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up no-re-edge positive runs in the

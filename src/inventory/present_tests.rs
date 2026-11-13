@@ -6374,7 +6374,7 @@ fn concise_gap_summary_folds_kernel_thread_notes_with_summed_total() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "  5 x kernel threads - 583 processes examined are kernel threads with no user memory to scan"
+            "  5 x kernel threads - 583 process examinations found kernel threads with no user memory to scan"
         ),
         "one folded line carries the summed total:\n{concise}"
     );
@@ -6436,9 +6436,36 @@ fn concise_kernel_thread_fold_sums_repeats_and_singular_template() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         concise.contains(
-            "  2 x kernel threads - 217 processes examined are kernel threads with no user memory to scan"
+            "  2 x kernel threads - 217 process examinations found kernel threads with no user memory to scan"
         ),
         "two rows fold with repeats multiplied (108x2 + 1):\n{concise}"
+    );
+}
+
+/// O8: a lone kernel-thread note covers one window, so it keeps the
+/// producer's per-window wording — only multi-window sums count
+/// repeat examinations.
+#[test]
+fn concise_kernel_thread_fold_keeps_single_window_wording() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "kernel threads".into(),
+        reason: "117 processes examined are kernel threads with no user memory to scan".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains(
+            "  1 x kernel threads - 117 processes examined are kernel threads with no user memory to scan"
+        ),
+        "one window keeps per-window wording:\n{concise}"
     );
 }
 

@@ -2774,13 +2774,21 @@ fn kernel_thread_absence_count(reason: &str) -> Option<u64> {
 }
 
 /// One folded kernel-thread absence reason carrying the summed
-/// examination total across the folded rows, in the producer's own
-/// singular/plural wording.
-fn kernel_thread_fold_reason(total: u64) -> String {
+/// examination total across the folded rows. A single window keeps
+/// the producer's own per-window wording (those processes were
+/// examined once); a multi-window sum counts repeat examinations
+/// across passes, never distinct processes.
+fn kernel_thread_fold_reason(total: u64, single_window: bool) -> String {
+    if single_window {
+        if total == 1 {
+            return format!("1 {KTHREAD_ABSENCE_SINGULAR_TAIL}");
+        }
+        return format!("{total} {KTHREAD_ABSENCE_PLURAL_TAIL}");
+    }
     if total == 1 {
-        format!("1 {KTHREAD_ABSENCE_SINGULAR_TAIL}")
+        "1 process examination found a kernel thread with no user memory to scan".to_string()
     } else {
-        format!("{total} {KTHREAD_ABSENCE_PLURAL_TAIL}")
+        format!("{total} process examinations found kernel threads with no user memory to scan")
     }
 }
 
@@ -2973,8 +2981,9 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
                 total = total.saturating_add(count.saturating_mul(gap.repeats));
             }
         }
+        let single_window = kthreads.len() == 1 && kthreads[0].repeats == 1;
         let subject = escape_controls("kernel threads").into_owned();
-        let reason = escape_controls(&kernel_thread_fold_reason(total)).into_owned();
+        let reason = escape_controls(&kernel_thread_fold_reason(total, single_window)).into_owned();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
         entry.0 += kthreads.len();
     }

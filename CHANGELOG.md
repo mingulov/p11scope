@@ -123,6 +123,17 @@ versioned separately and are opaque, exact dispatch keys.
   by-ID pin lookup join more calls (scale cell: 14 of 16 passes vs
   12 of 14, 31% more joined calls), and cheaper bind (about 4x) and
   projection (about 2x) steps cut per-call cost.
+- System-wide captures examine up to 1,024 user processes in detail
+  (was 256), sharing one examination per exact library set, with a
+  counted gap naming what was not examined; kernel threads never
+  consume slots.
+- Captures no longer hit the file-descriptor wall: the soft limit is
+  raised at startup with a fixed reserve held back, and the reserve is
+  sampled once per tick, failing open.
+- Library-handle pressure waits and retries instead of dropping work
+  (one scan pin per physical file, deferred handles retried first),
+  and the live tick tracks user processes only so kernel threads
+  never become newcomers or gaps.
 
 ### Changed
 

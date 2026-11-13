@@ -2097,7 +2097,7 @@ mod tests {
         let all = !remaining.iter().any(|pid| *pid <= originals);
         let ordered = served_order.windows(2).all(|w| w[0] < w[1]);
         eprintln!(
-            "OPUS-P1 k={k} originals={originals} all_served={all} last_tick={last} oldest_first={ordered}"
+            "SCHED-P1 k={k} originals={originals} all_served={all} last_tick={last} oldest_first={ordered}"
         );
         (last, all && ordered)
     }
@@ -2119,7 +2119,7 @@ mod tests {
         assert!(t8 <= 200 / 4 + 1, "k=8 bound {t8}");
     }
 
-    /// OPUS r4 S1: on a scarce window no rotation candidate precedes a
+    /// r4 S1: on a scarce window no rotation candidate precedes a
     /// pending newcomer (ruling order: pending newcomers, pending backlog,
     /// rotation).
     #[test]
@@ -2133,7 +2133,7 @@ mod tests {
             MAX_NEW_VIEWS_PER_TICK,
             MAX_NEWCOMER_ADMISSIONS_PER_TICK,
         );
-        eprintln!("OPUS-S1 head={:?}", &admitted[..8]);
+        eprintln!("SCHED-S1 head={:?}", &admitted[..8]);
         let last_pending = admitted.iter().rposition(|p| *p >= 1000).unwrap();
         let first_rotation = admitted.iter().position(|p| *p < 1000).unwrap();
         assert!(
@@ -2143,7 +2143,7 @@ mod tests {
         );
     }
 
-    /// OPUS r4 S2: a 40-pid fresh pending burst with rotation present and
+    /// r4 S2: a 40-pid fresh pending burst with rotation present and
     /// no pending backlog keeps every pending pid ahead of rotation.
     #[test]
     fn opus_r4_scarce_burst_over_share_all_pending_first() {
@@ -2154,13 +2154,13 @@ mod tests {
             s.scarce_window_pending_newcomers_first(&fresh, &[], &rotation, 64, 32);
         let fresh_admitted = admitted.iter().filter(|p| **p >= 1000).count();
         eprintln!(
-            "OPUS-S2 fresh_admitted={fresh_admitted} deferred_fresh={}",
+            "SCHED-S2 fresh_admitted={fresh_admitted} deferred_fresh={}",
             deferred.iter().filter(|p| **p >= 1000).count()
         );
         assert_eq!(fresh_admitted, 40);
     }
 
-    /// OPUS r4 S3: rotation-only backlog class must not take the owed lead
+    /// r4 S3: rotation-only backlog class must not take the owed lead
     /// ahead of a pending newcomer.
     #[test]
     fn opus_r4_scarce_owed_lead_with_only_rotation() {
@@ -2169,14 +2169,14 @@ mod tests {
         let (a1, _) = s.scarce_window_pending_newcomers_first(&[1000], &[], &rotation, 64, 32);
         s.note_newcomer_attempt(a1[0]);
         let (a2, _) = s.scarce_window_pending_newcomers_first(&[1001], &[], &rotation, 64, 32);
-        eprintln!("OPUS-S3 tick1={:?} tick2={:?}", &a1[..3], &a2[..3]);
+        eprintln!("SCHED-S3 tick1={:?} tick2={:?}", &a1[..3], &a2[..3]);
         assert_eq!(
             a2[0], 1001,
             "a rotation candidate took the owed lead ahead of a pending newcomer"
         );
     }
 
-    /// OPUS r4 S4: the failed-newcomer sink survives a zero-attempt window.
+    /// r4 S4: the failed-newcomer sink survives a zero-attempt window.
     /// A tick that attempts nothing (an expired quantum before the first
     /// scan) must not rotate the newcomer-attempt sets and lose the sink.
     #[test]
@@ -2189,7 +2189,7 @@ mod tests {
         assert_eq!(a, vec![9]);
         // Nothing attempted (quantum expired before the first scan).
         let (a, _) = s.new_view_window_newcomers_first(&[7, 9], &BTreeSet::new(), 1, 32);
-        eprintln!("OPUS-S4 after_zero_attempt_window={a:?}");
+        eprintln!("SCHED-S4 after_zero_attempt_window={a:?}");
         assert_eq!(
             a,
             vec![9],

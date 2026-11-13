@@ -739,7 +739,7 @@ mod tests {
         assert!(!claim_unreadable_report(&slot));
     }
 
-    /// View-collapse fix6 A2 (owner 20:20): the handle limit is
+    /// View-collapse fix6 A2: the handle limit is
     /// concurrent — at most 1000 library handles held at once, while the
     /// lifetime number of distinct libraries stays unlimited.
     #[test]

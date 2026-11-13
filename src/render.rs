@@ -15214,7 +15214,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pid_capture_json_keeps_the_attach_time_exe_after_an_exec() {
-        // Opus B6: a wrapper (A) that makes calls and then execs another
+        // B6: a wrapper (A) that makes calls and then execs another
         // tool (B), which makes calls too. JSON must not relabel A's
         // calls as B's: `exe` keeps the attach-time program and the
         // post-exec program rides a separate field, in both lanes.

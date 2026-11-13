@@ -10428,7 +10428,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut scoped_scan_callers = 0;
         let mut cgroup_proof_complete = false;
         if let Some((collection, now_ns)) = &mut publishing_cgroup {
-            // Data-always scan-only (owner 2026-11-09): an operator stop
+            // Data-always scan-only: an operator stop
             // during the first pass publishes the members it actually
             // scanned, without end-sample permits or native attach. Later
             // passes keep the trailing discard (results already exist).
@@ -19496,7 +19496,7 @@ exit 0
 
     #[test]
     fn cgroup_stop_after_apply_publishes_scan_only_without_complete_receipt() {
-        // Data-always (owner 2026-11-09, F1): a stop after apply still
+        // Data-always (F1): a stop after apply still
         // publishes the scanned member scan-only with the partial-scan
         // gap; only the complete-scope receipt stays withheld (no
         // end-sample proof, no attach, original custody released).

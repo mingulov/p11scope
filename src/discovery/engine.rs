@@ -6008,7 +6008,7 @@ struct BoundFallbackProof {
 /// ponytail: the capture byte budget already bounds work; this flat cap also bounds
 /// `/proc` inventory overhead for cgroups containing thousands of processes.
 /// Shared with `inspect --system` as the default `--max-scan-pids`.
-/// 1024 by the 2026-11-12 guard round: the raised cap stays (owner 14:35)
+/// 1024 by the 2026-11-12 guard round: the raised cap stays
 /// now that the fd wall is fixed at the cause (startup rlimit raise plus a
 /// fixed reserve, so file learning stays available at 1k identity). The
 /// 512 choice is superseded; 2048 still needs a clean TTC re-measure
@@ -7229,7 +7229,7 @@ pub(crate) fn credited_scan_shape(
 /// after a successful scan, before the pins are stored: without it a
 /// small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
 ///
-/// Fix6 A1 (owner 20:02 + 20:15): the incoming pins first share one
+/// Fix6 A1: the incoming pins first share one
 /// retained pin per physical file across all views (see
 /// [`share_scan_pins_with_retained`]), and only the fds the admission
 /// newly holds are debited — the reserve stays a safety net over what
@@ -8038,7 +8038,7 @@ fn discover_plan(
         // within the pass: drops are not subtracted; the fresh snapshot
         // bounds the drift every pass).
         if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
-            // Fix7 (owner 21:10): this pid and the unprocessed rest owe
+            // Fix7: this pid and the unprocessed rest owe
             // a handles-first retry in the next round.
             for deferred_pid in &selected[index..] {
                 discovered.note_handles_deferred(*deferred_pid);
@@ -8059,7 +8059,7 @@ fn discover_plan(
         // counted named gap, never dropped; a later pass with freed
         // handles serves them instead of losing the work.
         if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
-            // Fix7 (owner 21:10): this pid and the unprocessed rest owe
+            // Fix7: this pid and the unprocessed rest owe
             // a handles-first retry in the next round.
             for deferred_pid in &selected[index..] {
                 discovered.note_handles_deferred(*deferred_pid);
@@ -8200,7 +8200,7 @@ fn discover_plan(
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
             Ok((found, mut pins, complete, scan_examined, scan_shape)) => {
-                // Fix6 A3 (owner 20:25): handle exhaustion waits, never
+                // Fix6 A3: handle exhaustion waits, never
                 // skips. A scan with waited pins defers whole — the view
                 // drops, its ID returns to the pool, and the next tick
                 // retries the scan — with this scan's evidence (including
@@ -8227,7 +8227,7 @@ fn discover_plan(
                     // fd-table-exhausted tail.
                     let reserve_stop = scan_pins_waited_only_for_reserve(&counters.object_skips);
                     let budget_stop = scan_pins_waited_only_for_budget(&counters.object_skips);
-                    // Fix7 (owner 21:10): this pid's view deferred whole,
+                    // Fix7: this pid's view deferred whole,
                     // and the break defers the unprocessed rest: all owe a
                     // handles-first retry in the next round.
                     for deferred_pid in &selected[index..] {
@@ -17407,7 +17407,7 @@ impl Engine {
                                 );
                             }
                         }
-                        // Fix6 A3 (owner 20:25): fd exhaustion waits, real
+                        // Fix6 A3: fd exhaustion waits, real
                         // failures die. Exhaustion-unfinished slots are
                         // withheld for a next-tick retry — deactivated,
                         // then excised so their keys leave the index and
@@ -28006,7 +28006,7 @@ impl Engine {
         // counted at staging like any admission, subtracted if the yield
         // completes and drops the staged pins at the next loop-top.
         let mut staged_new_fds: u64 = 0;
-        // Fix7 (owner 21:10): handles-deferred members attempt first in
+        // Fix7: handles-deferred members attempt first in
         // this round, ahead of window order (stable otherwise).
         let admitted = Self::order_handles_deferred_first(admitted, &self.handles_deferred);
         let mut unprocessed = admitted.into_iter();
@@ -28090,7 +28090,7 @@ impl Engine {
             if crate::fd_budget::reserve_defers(reserve_tick.as_ref()) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
-                    // Fix7 (owner 21:10): the rest owe a handles-first
+                    // Fix7: the rest owe a handles-first
                     // retry in the next round.
                     self.note_handles_deferred(deferred_pid);
                     failed_refresh_pids.insert(deferred_pid);
@@ -28109,7 +28109,7 @@ impl Engine {
             if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
-                    // Fix7 (owner 21:10): the rest owe a handles-first
+                    // Fix7: the rest owe a handles-first
                     // retry in the next round.
                     self.note_handles_deferred(deferred_pid);
                     failed_refresh_pids.insert(deferred_pid);
@@ -28243,7 +28243,7 @@ impl Engine {
             if let Some(tick) = reserve_tick.as_mut() {
                 tick.note_opened();
             }
-            // Fix7 (owner 21:10): a handles-deferred pid re-attempted —
+            // Fix7: a handles-deferred pid re-attempted —
             // spend its first-in-round mark and measure the delay. An
             // open failure above keeps the mark (the pid retries later;
             // a departed pid prunes every tick).
@@ -28286,7 +28286,7 @@ impl Engine {
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, mut pins, complete)) => {
-                    // Fix6 A3 (owner 20:25): handle exhaustion waits,
+                    // Fix6 A3: handle exhaustion waits,
                     // never skips. A scan with waited pins defers whole
                     // with its request retained — the view drops and the
                     // next tick retries the scan — exactly like the
@@ -28297,7 +28297,7 @@ impl Engine {
                     if pins_waited {
                         self.release_view_id(view.id());
                         self.mark_unattempted_fresh(pid, ledger);
-                        // Fix7 (owner 21:10): this pid's view deferred
+                        // Fix7: this pid's view deferred
                         // whole, and the break defers the unprocessed
                         // rest: all owe a handles-first retry.
                         self.note_handles_deferred(pid);
@@ -28453,7 +28453,7 @@ impl Engine {
         });
         let mut new_views = Vec::new();
         self.inventory_passes = self.inventory_passes.saturating_add(1);
-        // Fix7 (owner 21:10): the handle baseline for the end-of-tick
+        // Fix7: the handle baseline for the end-of-tick
         // release observation — only while a handles-deferred retry
         // pends, so idle ticks pay one `is_empty` for the whole round.
         let handle_baseline = if self.handles_deferred.is_empty() {
@@ -28474,7 +28474,7 @@ impl Engine {
         );
         self.in_refresh_tick = false;
         self.release_unadmitted_views(new_views);
-        // Fix7 (owner 21:10): a release observed while a retry pends owes
+        // Fix7: a release observed while a retry pends owes
         // the next round immediately — after the unadmitted drops, so
         // their freed pins count as the release they are.
         if let Some((held_before, views_before)) = handle_baseline {
@@ -28654,7 +28654,7 @@ impl Engine {
         // new generation, correctly fresh).
         let live: BTreeSet<u32> = pids.iter().copied().collect();
         self.scheduler.prune_stale_to_enumerated(&live);
-        // Fix7 (owner 21:10): departed handles-deferred pids owe no
+        // Fix7: departed handles-deferred pids owe no
         // retry — prune beside the scheduler's own stale set, so the
         // map never outgrows the live scope.
         self.handles_deferred.retain(|pid, _| live.contains(pid));

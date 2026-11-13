@@ -20191,7 +20191,7 @@ mod tests {
         (retained, retained_id, incoming, incoming_id)
     }
 
-    /// View-collapse fix6 A1 (owner 20:02 + 20:15): one scan pin per
+    /// View-collapse fix6 A1: one scan pin per
     /// physical file shared across all views. A second view pins the same
     /// file the first view proved; the admission shares the retained fd
     /// instead of holding its own, so the reserve debit counts zero new
@@ -20284,7 +20284,7 @@ mod tests {
         assert_eq!(new_fds, 1, "a distinct file keeps its own fd");
     }
 
-    /// Release twin (owner 20:02): a shared pin's fd outlives each single
+    /// Release twin: a shared pin's fd outlives each single
     /// view but closes with the last one — release on view drop, through
     /// the shared `Arc`, with no explicit close path.
     #[test]
@@ -20324,7 +20324,7 @@ mod tests {
         assert_eq!(new_fds, 1, "a pre-copy-up pin keeps its own fd");
     }
 
-    /// View-collapse fix6 A2 (owner 20:20): the concurrent library-handle
+    /// View-collapse fix6 A2: the concurrent library-handle
     /// budget counts distinct held files, so views sharing one pin count
     /// once. The sharing here is a manual `Arc` clone (no dependence on
     /// the A1 share path): the counter must see through any aliasing.
@@ -20402,7 +20402,7 @@ mod tests {
         assert!(pins.rejected_keys.is_empty());
     }
 
-    /// View-collapse fix6 A3 (owner 20:25): EMFILE/ENFILE while opening a
+    /// View-collapse fix6 A3: EMFILE/ENFILE while opening a
     /// library waits for the next tick — a counted named gap, never a
     /// permanent skip. With soft AND hard `RLIMIT_NOFILE` at 64, pinning
     /// 96 libraries exhausts the table mid-pass: every failure must file

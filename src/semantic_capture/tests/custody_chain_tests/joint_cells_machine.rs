@@ -3417,7 +3417,7 @@ fn joint_pregrant_real_timeout_closes_and_taints() {
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
 
-/// Close-reason counter (Opus F4): it names each pre-grant linked
+/// Close-reason counter (F4): it names each pre-grant linked
 /// close. The timeout flow closes twice: the empty first quantum by
 /// request, the held quantum by timeout; nothing else counts, and
 /// the counts change no decision.

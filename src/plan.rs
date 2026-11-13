@@ -8914,7 +8914,7 @@ mod tests {
 
     #[test]
     fn standard_layout_scan_table_mints_main_plan_semantics_without_manifest() {
-        // No-manifest mechanism attribution (owner 2026-11-11: no manifest
+        // No-manifest mechanism attribution (no manifest
         // needed for standard providers): a SoftHSM-shaped standard table —
         // single 2.x function list, full walk, every entry in own code and
         // agreeing with the provider's exports, finished scan — carries
@@ -10861,7 +10861,7 @@ mod tests {
 
     #[test]
     fn sole_complete_unverified_retained_forward_refuses() {
-        // B5 (Opus 2026-11-12): a retained cross-object getter entry
+        // B5 (2026-11-12): a retained cross-object getter entry
         // the binder did NOT verify — a `ReconciledModule` produced on
         // a path that bypassed bind verification — must not take the
         // verified-forward exemption. Only a binder-verified forward

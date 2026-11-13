@@ -1461,7 +1461,7 @@ impl ModelState {
             );
             return;
         }
-        // P4 Initialize era rule (owner 2026-10-29). Qualification here
+        // P4 Initialize era rule. Qualification here
         // is journal/seal qualification — a matched BEGIN/END pair with
         // owned cuts settled through a consistent prefix — not model
         // bootstrap qualification, which by construction cannot precede
@@ -1503,7 +1503,7 @@ impl ModelState {
         self.flush_deferred_releases(ledger);
     }
 
-    /// P4 Initialize era rule (owner 2026-10-29, merged P4-M1…M6).
+    /// P4 Initialize era rule (merged P4-M1…M6).
     /// Exactly one qualified `CKR_OK` mints one never-reused
     /// initialization era; everything else mints nothing. The entry
     /// session word is never read as a session (P4-M2, ARG_NONE), so

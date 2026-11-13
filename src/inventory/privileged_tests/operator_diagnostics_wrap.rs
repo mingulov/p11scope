@@ -46,7 +46,7 @@ const PILOT_SCHEDULE: WrapSchedule = WrapSchedule {
 /// margin. Longer counted runs (C=286: 1056 margin) exceeded the former
 /// 900 s system bound live (enabled leg reached 249/286); 10% margin needs
 /// C~=330 at 32/round, infeasible on available hosts. The per-leg bound is
-/// 1200 s (owner 2026-11-09; hang guard only, proof unchanged).
+/// 1200 s (hang guard only, proof unchanged).
 const WRAP_COUNTED: u64 = 260;
 const WRAP_SHARED: u64 = 4;
 const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {

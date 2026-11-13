@@ -3467,7 +3467,7 @@ where
                         );
                     }
                 }
-                // Data-always scan-only (owner 2026-11-09): an operator
+                // Data-always scan-only: an operator
                 // stop during pass-0's collection still publishes the
                 // members scanned so far. The commit below takes the
                 // scan-only path (no permits, no attach); a live lane

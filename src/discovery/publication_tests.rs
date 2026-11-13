@@ -1270,8 +1270,8 @@ fn assert_costing(engine: &Engine, wall: std::time::Duration, label: &str) {
 
 /// Count-only treatment: pure live/heuristic publication evidence never
 /// authorizes semantics on its own in the main plan. Fresh-manifest
-/// corroboration, exact interface linkage and sole-complete tables do
-/// (owner 2026-11-11); a stale manifest's fallback proof lends names
+/// corroboration, exact interface linkage and sole-complete tables do;
+/// a stale manifest's fallback proof lends names
 /// only (controller 2026-11-12 05:25). Tests with those use their own
 /// assertions.
 fn assert_count_only(engine: &Engine) {

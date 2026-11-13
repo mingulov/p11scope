@@ -11578,7 +11578,7 @@ pub(crate) mod tests {
             );
         }
         // (ordinal, name, class) for every non-modeled function.
-        // P4 (owner 2026-10-29): ordinal 0 (C_Initialize) left this
+        // P4: ordinal 0 (C_Initialize) left this
         // table for the modeled set as lifecycle::CRYPTOKI_INITIALIZE.
         // KEM (92/93) left this table when packet 6.07c modeled it.
         let pinned: [(u32, &str, EndpointClass); 25] = [

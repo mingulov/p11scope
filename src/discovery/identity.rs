@@ -2719,6 +2719,14 @@ impl PinnedObjects {
             .is_some_and(|(left, right)| ordinary_identity_equal(left, right))
     }
 
+    /// Whether `owned_timing_key(id)` would answer `Some`, without building
+    /// (and allocating) the key.
+    pub(crate) fn has_owned_timing_key(&self, id: PinnedObjectId) -> bool {
+        self.by_id
+            .get(&id)
+            .is_some_and(|entry| !entry.sha256.is_empty())
+    }
+
     pub(crate) fn owned_timing_key(&self, id: PinnedObjectId) -> Option<PinnedTimingKey> {
         let entry = self.by_id.get(&id)?;
         (!entry.sha256.is_empty()).then(|| PinnedTimingKey {
@@ -9217,12 +9225,26 @@ pub fn bind_scanned_modules(
         let mut scanned = module.clone();
         let mut entry_objects = Vec::with_capacity(scanned.tables.len());
         let mut forward_verified = Vec::with_capacity(scanned.tables.len());
-        for table in &mut scanned.tables {
+        // Entries of one module name few distinct (object, path) pairs, and
+        // the lookup reads only this module and the raw map, which nothing
+        // in this loop changes: resolve each pair once (the lookup
+        // normalizes and allocates the path on every call).
+        let mut resolved: BTreeMap<(ObjectKey, &str), Option<PinnedObjectId>> = BTreeMap::new();
+        for (table, original) in scanned.tables.iter_mut().zip(&module.tables) {
             let mut ids = Vec::with_capacity(table.entries.len());
             let mut verified = Vec::with_capacity(table.entries.len());
             let mut kept = Vec::with_capacity(table.entries.len());
-            for entry in std::mem::take(&mut table.entries) {
-                match pinned.id_for_scanned(module, entry.object, &entry.object_path) {
+            debug_assert_eq!(table.entries, original.entries);
+            for (entry, original) in std::mem::take(&mut table.entries)
+                .into_iter()
+                .zip(&original.entries)
+            {
+                let target = *resolved
+                    .entry((original.object, original.object_path.as_str()))
+                    .or_insert_with(|| {
+                        pinned.id_for_scanned(module, original.object, &original.object_path)
+                    });
+                match target {
                     Some(id)
                         if matches!(
                             (pinned.abi_for(id), pinned.abi_for(object)),

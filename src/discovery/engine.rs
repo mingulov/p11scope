@@ -1362,10 +1362,15 @@ enum DecodedOccurrence {
     /// One exact decoded target occurrence, in the one keyspace every source
     /// shares: a manifest corroborating a scanned entry names the same
     /// occurrence and is counted once, as the schema requires.
+    ///
+    /// `name` borrows the scanner's static function name (a manifest name
+    /// is owned) and `object` is shared per opened object, so re-inserting
+    /// an already-known occurrence allocates nothing. Both compare by
+    /// content, exactly as the owned `String`/`PinnedTimingKey` did.
     Target {
         module: plan::ModuleId,
-        name: String,
-        object: PinnedTimingKey,
+        name: std::borrow::Cow<'static, str>,
+        object: Arc<PinnedTimingKey>,
         file_offset: u64,
         occurrence: usize,
     },
@@ -1390,6 +1395,76 @@ enum DecodedOccurrence {
         name: &'static str,
         object: Option<(PinnedTimingKey, u64)>,
     },
+}
+
+/// `DecodedOccurrence::Target` keeps the owned key's equality and order:
+/// a borrowed and an owned name, and two separately built shared identities
+/// for one object, are one occurrence; the set orders like the owned tuple.
+#[cfg(test)]
+mod decoded_occurrence_key_tests {
+    use super::*;
+    use crate::discovery::identity::test_fixture::{SHA, overlay, pin_set};
+    use std::borrow::Cow;
+
+    #[test]
+    fn target_occurrences_compare_like_the_owned_key() {
+        let pins = pin_set(&[(overlay(1), SHA, 1), (overlay(2), SHA, 1)], true);
+        let keys: Vec<PinnedTimingKey> = pins
+            .pinned()
+            .map(|pin| pins.owned_timing_key(pin.id).unwrap())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        let target = |module: u32, name: Cow<'static, str>, key: usize, offset: u64| {
+            DecodedOccurrence::Target {
+                module: plan::ModuleId(module),
+                name,
+                object: Arc::new(keys[key].clone()),
+                file_offset: offset,
+                occurrence: 0,
+            }
+        };
+        assert_eq!(
+            target(0, Cow::Borrowed("C_Sign"), 0, 8),
+            target(0, Cow::Owned("C_Sign".to_string()), 0, 8)
+        );
+        let mut set = BTreeSet::new();
+        assert!(set.insert(target(0, Cow::Borrowed("C_Sign"), 0, 8)));
+        assert!(!set.insert(target(0, Cow::Owned("C_Sign".into()), 0, 8)));
+        let shapes: [(u32, &'static str, usize, u64); 6] = [
+            (1, "C_Init", 0, 1),
+            (0, "C_Sign", 1, 8),
+            (0, "C_Sign", 0, 9),
+            (0, "C_Final", 1, 2),
+            (0, "C_Sign", 0, 8),
+            (0, "C_SignInit", 0, 0),
+        ];
+        for (module, name, key, offset) in shapes {
+            set.insert(target(module, Cow::Owned(name.to_string()), key, offset));
+        }
+        let mut owned: Vec<_> = shapes
+            .iter()
+            .map(|(module, name, key, offset)| {
+                (*module, name.to_string(), keys[*key].clone(), *offset)
+            })
+            .collect();
+        owned.sort();
+        owned.dedup();
+        let ordered: Vec<_> = set
+            .iter()
+            .map(|occurrence| match occurrence {
+                DecodedOccurrence::Target {
+                    module,
+                    name,
+                    object,
+                    file_offset,
+                    ..
+                } => (module.0, name.to_string(), (**object).clone(), *file_offset),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ordered, owned);
+    }
 }
 
 impl DecodedOccurrence {
@@ -2543,9 +2618,9 @@ impl CaptureFacts {
                     bail!("reconciled provider table target identities are incomplete");
                 }
                 for object in objects {
-                    pinned.owned_timing_key(*object).ok_or_else(|| {
-                        anyhow!("decoded target object has no exact opened identity")
-                    })?;
+                    if !pinned.has_owned_timing_key(*object) {
+                        bail!("decoded target object has no exact opened identity");
+                    }
                 }
             }
         }
@@ -2664,7 +2739,11 @@ impl CaptureFacts {
                     StandardExportFact::Absent
                 },
             );
-            let mut targets = BTreeMap::new();
+            let mut targets: BTreeMap<(&'static str, Arc<PinnedTimingKey>, u64), usize> =
+                BTreeMap::new();
+            // One exact opened identity per target object, built once per
+            // module instead of once per decoded entry.
+            let mut timing_keys: BTreeMap<PinnedObjectId, Arc<PinnedTimingKey>> = BTreeMap::new();
             let mut skips = BTreeMap::new();
             let mut surfaces = BTreeMap::new();
             let mut tables = BTreeMap::new();
@@ -2822,16 +2901,25 @@ impl CaptureFacts {
                     bail!("reconciled provider table target identities are incomplete");
                 }
                 for (entry, object) in table.entries.iter().zip(objects) {
-                    let object = pinned.owned_timing_key(*object).ok_or_else(|| {
-                        anyhow!("decoded target object has no exact opened identity")
-                    })?;
-                    let fact = (entry.name.to_string(), object, entry.file_offset);
-                    let occurrence = targets.entry(fact.clone()).or_insert(0usize);
+                    let object = match timing_keys.get(object) {
+                        Some(key) => key.clone(),
+                        None => {
+                            let key =
+                                Arc::new(pinned.owned_timing_key(*object).ok_or_else(|| {
+                                    anyhow!("decoded target object has no exact opened identity")
+                                })?);
+                            timing_keys.insert(*object, key.clone());
+                            key
+                        }
+                    };
+                    let occurrence = targets
+                        .entry((entry.name, object.clone(), entry.file_offset))
+                        .or_insert(0usize);
                     history.decoded.insert(DecodedOccurrence::Target {
                         module: owner,
-                        name: fact.0,
-                        object: fact.1,
-                        file_offset: fact.2,
+                        name: std::borrow::Cow::Borrowed(entry.name),
+                        object,
+                        file_offset: entry.file_offset,
                         occurrence: *occurrence,
                     });
                     *occurrence += 1;
@@ -2952,8 +3040,8 @@ impl CaptureFacts {
                             let occurrence = manifest_targets.entry(fact.clone()).or_insert(0usize);
                             history.decoded.insert(DecodedOccurrence::Target {
                                 module: owner,
-                                name: fact.0,
-                                object: fact.1,
+                                name: std::borrow::Cow::Owned(fact.0),
+                                object: Arc::new(fact.1),
                                 file_offset: fact.2,
                                 occurrence: *occurrence,
                             });

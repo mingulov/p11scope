@@ -1919,6 +1919,9 @@ fn run_with_terminal_budget(
                 }) {
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
+                // A0 periodic line: every loop pass publishes through
+                // this arm, so the 60 s check lives here.
+                driver.coordinator.maybe_emit_memory_line();
             }
             Publish::Retiring {
                 attached,
@@ -7062,9 +7065,6 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             let engine_scope = self.seal_scope.clone();
             self.attempt_deferred_scan_seal(engine_scope);
         }
-        // A0 periodic line: one `-v` stderr line every 60 s, checked
-        // once per pass after publication.
-        self.coordinator.maybe_emit_memory_line();
         Ok(())
     }
 
@@ -8958,6 +8958,9 @@ fn run_dashboard(
                     }
                     display.offer(display_view);
                 }
+                // A0 periodic line: every loop pass publishes through
+                // this arm, so the 60 s check lives here.
+                driver.coordinator.maybe_emit_memory_line();
             }
             Publish::Retiring {
                 attached,

@@ -11488,9 +11488,10 @@ impl Session {
 /// session (`owned`) never sheds when it holds `CAP_SYS_ADMIN`; a
 /// setcap `run` needs none (bisected to be50cad25; controller ruling
 /// 2026-11-08, F1). The stored return-probe approval is re-keyed to the
-/// post-shed context, so the next attach's admission check reuses it
-/// instead of re-running the self-probe (whose forked child would exit
-/// unlisted and count a descendant gap). The sets come from `capget`,
+/// post-shed context when the shed provably changed only capabilities,
+/// so the next attach's admission check reuses it instead of re-running
+/// the self-probe (whose forked child would exit unlisted and count a
+/// descendant gap). The sets come from `capget`,
 /// never `/proc` (a broken `/proc` must not zero the shed).
 /// The shed is per-thread, so the pre-spawned cleanup worker sheds to
 /// the same keep. Sets already at keep skip the drop entirely (no

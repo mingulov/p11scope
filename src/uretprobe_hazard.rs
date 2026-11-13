@@ -273,8 +273,10 @@ pub(crate) fn pre_shed_snapshot() -> PreShedSnapshot {
 /// approval stays valid under the new context and the next attach's
 /// `ensure_admission` reuses it instead of re-running the self-probe
 /// (whose forked child would exit unlisted and count a descendant gap).
-/// A missing approval stays missing: the next ensure admits fresh, as
-/// before. The override reason, when present, is preserved.
+/// The move is conditional: when the shed provably changed anything but
+/// capabilities the approval stays on the old context and the next check
+/// re-probes. A missing approval stays missing: the next ensure admits
+/// fresh, as before. The override reason, when present, is preserved.
 pub(crate) fn rekey_approval_to_current(
     retained: &mut Option<ReturnProbeAdmission>,
     pre_shed: &PreShedSnapshot,
@@ -282,20 +284,43 @@ pub(crate) fn rekey_approval_to_current(
     rekey_approval_to_post(retained, &pre_shed.0, &AssessmentContext::current())
 }
 
-/// Policy point for the conditional re-key (Opus I1): the stored
-/// approval may move to `post` only when it matches the pre-shed
-/// snapshot, the snapshot is reusable, and `post` differs from it only
-/// in capabilities and only as a subset. Any refusal leaves `retained`
-/// untouched so the next check re-probes. The checks land with the
-/// hardening fix; until then this relabels like the original.
+/// Move a stored return-probe approval to the post-shed context, but
+/// only when the shed provably changed nothing but capabilities: the
+/// stored approval must match the pre-shed snapshot, the snapshot must
+/// be reusable, every non-capability field must be identical, and the
+/// post-shed capabilities must be a subset of the snapshot's. Any
+/// refusal leaves `retained` untouched so the next check re-probes
+/// instead of reusing stale authority.
 fn rekey_approval_to_post(
     retained: &mut Option<ReturnProbeAdmission>,
-    _pre_shed: &AssessmentContext,
+    pre_shed: &AssessmentContext,
     post: &AssessmentContext,
 ) {
-    if let Some(admission) = retained {
-        admission.context = post.clone();
+    let Some(admission) = retained else {
+        return;
+    };
+    if admission.context != *pre_shed {
+        return;
     }
+    if !pre_shed.reusable() {
+        return;
+    }
+    if pre_shed.process != post.process
+        || pre_shed.euid != post.euid
+        || pre_shed.egid != post.egid
+        || pre_shed.user_namespace != post.user_namespace
+        || pre_shed.seccomp != post.seccomp
+        || pre_shed.filters != post.filters
+    {
+        return;
+    }
+    let (Some(before), Some(after)) = (pre_shed.capabilities, post.capabilities) else {
+        return;
+    };
+    if after & !before != 0 {
+        return;
+    }
+    admission.context = post.clone();
 }
 
 pub(crate) fn refusal_error(action: Action) -> anyhow::Error {

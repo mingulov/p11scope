@@ -29,7 +29,9 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
-use super::handle_table::{Filing, HandleTable, Held, RowId, TableHandle};
+#[cfg(test)]
+use super::handle_table::DeferredReason;
+use super::handle_table::{AcquireOutcome, Filing, HandleTable, Held, RowId, TableHandle};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
     read_maps_or_refuse, read_mountinfo, standard_function_names,
@@ -2398,9 +2400,8 @@ impl PinnedObjects {
     }
 
     /// Entries this set retains: before cross-view sharing each entry
-    /// holds its own fd, so this was the fd-reserve debit; sharing (see
-    /// [`share_scan_pins_with_retained`]) now debits only the fds an
-    /// admission newly holds instead.
+    /// holds its own fd, so this was the fd-reserve debit; sharing now
+    /// debits only the rows an admission newly files instead.
     #[cfg(test)]
     fn entry_count_for_test(&self) -> usize {
         self.by_id.len()
@@ -2436,6 +2437,17 @@ impl PinnedObjects {
             if entry.mapped.is_none() {
                 entry.mapped = held.mapped;
             }
+        }
+    }
+
+    /// File every entry's handle into `table` by open file (engine
+    /// test helper): one row per distinct `Arc`, whatever the entries'
+    /// scripted meta claims. Fixture pins that alias one fd converge
+    /// on one row, so the test cap binds on fds like production.
+    #[cfg(test)]
+    pub(crate) fn adopt_existing_handles_into(&mut self, table: &mut HandleTable) {
+        for entry in self.by_id.values_mut() {
+            entry.file = table.adopt_existing(&entry.file).handle;
         }
     }
 
@@ -7903,6 +7915,13 @@ fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Entry {
             let held = table.adopt(file, &meta);
             Entry::from_held(meta, held)
         }
+        // Trusted/learned sites acquire from Tasks 3-4 with their own
+        // gap handling; until then no caller files `Acquire` here.
+        Filing::Acquire(_, _) => {
+            debug_assert!(false, "trusted/learned sites adopt until Tasks 3-4");
+            let held = Held::untracked(Arc::new(file), meta.mapped);
+            Entry::from_held(meta, held)
+        }
         Filing::Untracked => {
             let held = Held::untracked(Arc::new(file), meta.mapped);
             Entry::from_held(meta, held)
@@ -8911,122 +8930,6 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
     })
 }
 
-/// Opens, identity-checks, hashes once and pins every object the scan named. Objects
-/// that cannot be pinned are returned as `Skipped`, never as errors: one unusable
-/// dependency must not lose the whole capture (spec §4.10). `Err` is reserved for the
-/// case that makes the whole result meaningless — the target exiting, after which a
-/// report could be claiming objects pinned from a recycled pid.
-///
-/// `limits` are the scan's own byte caps and bind here too: hashing reads each object
-/// whole, and the object set comes from the target's mappings, so an unbounded pin
-/// would let a target turn a bounded memory scan into unbounded reads on the observer.
-/// Lends one retained scan pin per physical file to a newly scanned
-/// view (view-collapse fix6 A1, owner 20:02 + 20:15): for every entry
-/// whose maps key a retained pin proves is that file's identity, the
-/// entry's own freshly opened fd is dropped and the retained `Arc` is
-/// shared instead, so all views hold one fd per physical file. The proof
-/// is the retained entry's own reusable `MappedFile` through
-/// [`MappedFile::key_is_identity`] — the
-/// [`KEY_IS_IDENTITY_FILESYSTEMS`] allowlist, never a new list.
-/// Collapsed entries (which stand for more than one file) and
-/// pre-copy-up observations (whose key names the merged mapping, not the
-/// pinned lower file) never lend or borrow. A borrower that carries no
-/// `mapped` proof inherits the lender's, so a third view can share
-/// transitively. Returns the entries that kept their own fd: the reserve
-/// debit for this admission.
-///
-/// Soundness: `key_is_identity` proves a range rendered under the key in
-/// ANY process is the retained file, so the incoming entry — pinned for
-/// a range under that same key — names the same file its own validation
-/// opened. Only the `file` handle is swapped; every entry keeps its own
-/// validated metadata, so `check_unchanged`, digests and attach paths
-/// behave exactly as with per-view opens. Release is through the shared
-/// `Arc`: a view's drop releases its share, and the fd closes with the
-/// last share.
-/// Lender candidates by maps key (integer compares only, no
-/// syscalls): only a retained entry under an incoming entry's own key
-/// can lend to it, so only those pay for the held-fd proof below. A
-/// full retained scan per admission would cost an fstat per entry and
-/// tip wall-time-sensitive scale ticks.
-fn share_candidates<'a>(
-    retained: impl IntoIterator<Item = &'a PinnedObjects>,
-) -> BTreeMap<ObjectKey, Vec<&'a Entry>> {
-    let mut candidates: BTreeMap<ObjectKey, Vec<&Entry>> = BTreeMap::new();
-    for set in retained {
-        for entry in set.by_id.values() {
-            if !entry.pre_copy_up && !entry.collapsed {
-                candidates.entry(entry.raw.key).or_default().push(entry);
-            }
-        }
-    }
-    candidates
-}
-
-/// The retained loan for one incoming pin entry, if a proven lender
-/// covers it: the borrower's own exclusions plus the first lender
-/// under its maps key whose held-fd proof is fresh and whose identity
-/// proves the key. Shared by the post-scan share and the pin loop's
-/// handle-budget projection (view-collapse fix8 F2), so the two can
-/// never disagree about what counts as a new handle.
-fn share_loan(
-    entry: &Entry,
-    candidates: &BTreeMap<ObjectKey, Vec<&Entry>>,
-) -> Option<(TableHandle, MappedFile)> {
-    share_loan_for(
-        entry.pre_copy_up,
-        entry.collapsed,
-        entry.raw.key,
-        candidates,
-    )
-}
-
-/// [`share_loan`] for a borrower known only by its proven meta (the pin
-/// loop files [`ProvedEntry`] before any [`Entry`] exists): the borrower
-/// contributes only its exclusions and maps key; the lender predicates
-/// are unchanged. Deleted with the budget projection in Task 1.
-fn share_loan_for(
-    pre_copy_up: bool,
-    collapsed: bool,
-    key: ObjectKey,
-    candidates: &BTreeMap<ObjectKey, Vec<&Entry>>,
-) -> Option<(TableHandle, MappedFile)> {
-    if pre_copy_up || collapsed {
-        return None;
-    }
-    candidates.get(&key).and_then(|offers| {
-        offers.iter().find_map(|lender| {
-            let mapped = lender.reusable_mapped_file()?;
-            mapped
-                .key_is_identity(key)
-                .then(|| (lender.file.clone(), mapped))
-        })
-    })
-}
-
-pub(crate) fn share_scan_pins_with_retained<'a>(
-    pins: &mut PinnedObjects,
-    retained: impl IntoIterator<Item = &'a PinnedObjects>,
-) -> u64 {
-    let candidates = share_candidates(retained);
-    if candidates.is_empty() {
-        return pins.by_id.len() as u64;
-    }
-    // The share applies once per entry (first proof wins per key), so
-    // the kept count is exactly the admission's new fds.
-    let mut kept = 0u64;
-    for entry in pins.by_id.values_mut() {
-        if let Some((file, mapped)) = share_loan(entry, &candidates) {
-            entry.file = file;
-            if entry.mapped.is_none() {
-                entry.mapped = Some(mapped);
-            }
-        } else {
-            kept = kept.saturating_add(1);
-        }
-    }
-    kept
-}
-
 pub fn pin_scanned_objects(
     pid: u32,
     modules: &[ScannedModule],
@@ -9053,7 +8956,6 @@ pub fn pin_scanned_view_objects(
         budget,
         &self_mapped_file,
         None,
-        None,
         Filing::Untracked,
     )
 }
@@ -9064,9 +8966,8 @@ pub fn pin_scanned_view_objects(
 /// unprocessed objects pending under the named reserve gap instead of
 /// opening into `EMFILE`. `None` keeps today's behavior (plus the fix6
 /// A3 open-exhaustion waits): non-admission pin sites pass `None`.
-/// Test-only since fix8 F2: production admission scans budget the
-/// handle cap beside the reserve through
-/// [`pin_scanned_view_objects_with_budgets`].
+/// Test-only: production admission scans file through
+/// [`pin_scanned_view_objects_with_table`].
 #[cfg(test)]
 pub(crate) fn pin_scanned_view_objects_with_reserve(
     view: &ProcessView,
@@ -9080,72 +8981,46 @@ pub(crate) fn pin_scanned_view_objects_with_reserve(
         budget,
         &self_mapped_file,
         reserve,
-        None,
         Filing::Untracked,
     )
 }
 
-/// The capture's library-handle budget as seen by one pin scan
-/// (view-collapse fix8 F2): `held` distinct handles the capture already
-/// retains, `cap` the strict concurrent ceiling, and the retained lender
-/// sets the post-scan share will borrow from. The pin loop stops before
-/// a pin that would push retained handles past `cap`, counting only
-/// pins the share cannot absorb — a scan whose files all duplicate
-/// retained lenders proceeds even at the cap, so budget enforcement
-/// never starves a no-new-handle scan.
-pub(crate) struct PinHandleBudget<'a> {
-    pub(crate) held: usize,
-    pub(crate) cap: usize,
-    pub(crate) lenders: Vec<&'a PinnedObjects>,
-}
-
-/// [`pin_scanned_view_objects_with_reserve`] plus the library-handle
-/// budget inside the pin loop (view-collapse fix8 F2): `handles`
-/// carries the tick's held count, cap and lender sets (see
-/// [`PinHandleBudget`]). `None` keeps the reserve-only behavior:
-/// non-admission pin sites pass `None`.
-/// Test-only since Phase 0: production files through the
-/// `_and_filing` variant. Deleted in Task 1 with the projection.
-#[cfg(test)]
-pub(crate) fn pin_scanned_view_objects_with_budgets(
+/// [`pin_scanned_view_objects`] with the filing destination for each
+/// proven pin: converted sites file `Acquire` (refusing) into their
+/// lane's table, the rest file `Adopt` (count-only) until their task.
+pub(crate) fn pin_scanned_view_objects_with_filing(
     view: &ProcessView,
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
-    handles: Option<&PinHandleBudget<'_>>,
-) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(
-        view,
-        modules,
-        budget,
-        &self_mapped_file,
-        reserve,
-        handles,
-        Filing::Untracked,
-    )
-}
-
-/// [`pin_scanned_view_objects_with_budgets`] with the filing destination
-/// for each proven pin (Phase 0): production scan sites file
-/// `Adopt` into their lane's table; the probationary probe files
-/// `Untracked` until Task 4. Replaced by the `_with_table` variant in
-/// Task 1, when the budget projection below is deleted.
-pub(crate) fn pin_scanned_view_objects_with_budgets_and_filing(
-    view: &ProcessView,
-    modules: &[ScannedModule],
-    budget: &mut CaptureWorkBudget,
-    reserve: Option<&crate::fd_budget::FdReserveTick>,
-    handles: Option<&PinHandleBudget<'_>>,
     filing: Filing<'_>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, filing)
+}
+
+/// [`pin_scanned_view_objects_with_filing`] for admission scans: every
+/// proven pin goes through the single `acquire()` with the caller's
+/// refusal reason. A refusal stops the scan with this and every
+/// remaining object waiting under the named budget gap — never
+/// attempted past the cap, never rejected. Twin-facing: production
+/// admission scans reach the same core arm through the funnel's
+/// `Filing::Acquire`.
+#[cfg(test)]
+pub(crate) fn pin_scanned_view_objects_with_table(
+    view: &ProcessView,
+    modules: &[ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    reserve: Option<&crate::fd_budget::FdReserveTick>,
+    table: &mut HandleTable,
+    reason: DeferredReason,
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     pin_scanned_view_objects_with(
         view,
         modules,
         budget,
         &self_mapped_file,
         reserve,
-        handles,
-        filing,
+        Filing::Acquire(table, reason),
     )
 }
 
@@ -9155,17 +9030,16 @@ type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, S
 /// [`pin_scanned_view_objects`] with the pinned fd's `vm_file` identity
 /// read through `pinned_identity` (a seam: following `map_files` needs
 /// privilege, so tests script it). `reserve` is the tick's fd-reserve
-/// snapshot (fix7 F1, see the bridge above); `handles` is the tick's
-/// library-handle budget (fix8 F2, see [`PinHandleBudget`]); `None` pins
-/// unbounded on that axis. `filing` is where each proven pin files:
-/// a table row, no row, or a probe-local scratch dropped at return.
+/// snapshot (fix7 F1, see the bridge above); `None` pins unbounded on
+/// that axis. `filing` is where each proven pin files: a table row
+/// (refusing for converted sites, count-only for the rest), no row,
+/// or a probe-local scratch dropped at return.
 fn pin_scanned_view_objects_with(
     view: &ProcessView,
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
     pinned_identity: ReadPinnedIdentity<'_>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
-    handles: Option<&PinHandleBudget<'_>>,
     mut filing: Filing<'_>,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     // Both the table-owning modules and every object a table entry points into: an
@@ -9224,23 +9098,8 @@ fn pin_scanned_view_objects_with(
     // Persistent fds this scan holds so far (fix7 F1): one per
     // successful pin — refused pins hold nothing, waited pins never
     // opened — so the projection below tracks exactly what the
-    // post-scan debit will charge.
+    // admission debit will charge.
     let mut scan_opens: u64 = 0;
-    // Genuinely-new handles this scan holds so far (fix8 F2): only
-    // pins the post-scan share cannot absorb count against the
-    // library-handle cap. The candidates below are the same lender
-    // sets the post-scan share borrows from, and the same
-    // [`share_loan`] predicate decides — so the projection agrees
-    // with the debit exactly, and a scan whose files all duplicate
-    // retained lenders proceeds even at the cap.
-    let handle_state = handles.map(|budget| {
-        (
-            budget.held,
-            budget.cap,
-            share_candidates(budget.lenders.iter().copied()),
-        )
-    });
-    let mut scan_new: usize = 0;
     // Probe-local scratch (`Filing::Scratch` only): proven pins that
     // build no entries and file no rows, dropped at return.
     let mut scratch = Vec::new();
@@ -9268,14 +9127,12 @@ fn pin_scanned_view_objects_with(
             );
             break;
         }
-        // Fix8 F2, pre-open: a definitely-new pin (no lender under its
-        // maps key, so the share cannot absorb it) that would breach
-        // the cap stops the scan before paying for the open. Entries
-        // with a lender may still share; they open for validation and
-        // verify below.
-        if let Some((held, cap, candidates)) = handle_state.as_ref()
-            && !candidates.contains_key(&raw.key)
-            && crate::fd_budget::library_handle_budget_defers_next_new(*held, scan_new, *cap)
+        // Pre-open fast path (converted sites only): when the table
+        // is full with no row under this maps key, the pin cannot
+        // share, so it stops the scan before paying for the open. A
+        // routed key may still share; only the acquire below decides.
+        if let Filing::Acquire(table, _) = &filing
+            && table.preopen_defers(&raw.key)
         {
             record_pin_stop(
                 &mut pinned,
@@ -9298,40 +9155,30 @@ fn pin_scanned_view_objects_with(
             &mut mounts,
             budget,
         );
-        // Fix8 F2, post-open verification: the pin's own exclusions
-        // are known only now. A pin the share cannot absorb is
-        // genuinely new — charge it, or close it back out (never
-        // retained, never counted) when the charge would breach the
-        // cap, with this and every remaining object pending.
+        // Filing: converted sites acquire (a refusal stops the scan
+        // with this and every remaining object pending under the named
+        // budget gap); the rest adopt count-only until their task.
         let candidate = match candidate {
             Ok(proved) => {
-                if let Some((held, cap, candidates)) = handle_state.as_ref()
-                    && share_loan_for(
-                        proved.meta.pre_copy_up,
-                        proved.meta.collapsed,
-                        proved.meta.raw.key,
-                        candidates,
-                    )
-                    .is_none()
-                {
-                    if crate::fd_budget::library_handle_budget_defers_next_new(
-                        *held, scan_new, *cap,
-                    ) {
-                        drop(proved);
-                        record_pin_stop(
-                            &mut pinned,
-                            view.id(),
-                            raw,
-                            wanted.by_ref(),
-                            &mut skipped,
-                            PIN_BUDGET_STOP_DETAIL,
-                        );
-                        break;
-                    }
-                    scan_new = scan_new.saturating_add(1);
-                }
                 scan_opens = scan_opens.saturating_add(1);
                 match &mut filing {
+                    Filing::Acquire(table, reason) => {
+                        let ProvedEntry { file, meta } = proved;
+                        match table.acquire(file, &meta, *reason) {
+                            AcquireOutcome::Held(held) => Ok(Entry::from_held(meta, held)),
+                            AcquireOutcome::Deferred(_) => {
+                                record_pin_stop(
+                                    &mut pinned,
+                                    view.id(),
+                                    raw,
+                                    wanted.by_ref(),
+                                    &mut skipped,
+                                    PIN_BUDGET_STOP_DETAIL,
+                                );
+                                break;
+                            }
+                        }
+                    }
                     Filing::Adopt(table) => {
                         let ProvedEntry { file, meta } = proved;
                         let held = table.adopt(file, &meta);
@@ -16257,7 +16104,6 @@ mod tests {
             &mut CaptureWorkBudget::default(),
             &|_| Ok(calibrated),
             None,
-            None,
             Filing::Untracked,
         )
         .unwrap();
@@ -16278,7 +16124,6 @@ mod tests {
             &mut budget,
             &probe,
             None,
-            None,
             Filing::Untracked,
         )
         .unwrap();
@@ -16297,7 +16142,6 @@ mod tests {
             &[module],
             &mut budget,
             &probe,
-            None,
             None,
             Filing::Untracked,
         )
@@ -16355,7 +16199,6 @@ mod tests {
                         fs_magic: None,
                     })
                 },
-                None,
                 None,
                 Filing::Untracked,
             )
@@ -20685,28 +20528,82 @@ mod tests {
         (retained, retained_id, incoming, incoming_id)
     }
 
-    /// View-collapse fix6 A1: one scan pin per
-    /// physical file shared across all views. A second view pins the same
-    /// file the first view proved; the admission shares the retained fd
-    /// instead of holding its own, so the reserve debit counts zero new
-    /// fds for it. The share rides the retained pin's own
-    /// `key_is_identity` proof (ext4: on `KEY_IS_IDENTITY_FILESYSTEMS`),
-    /// never a new list.
+    /// Re-prove a fixture entry as a second view's pin: a fresh open of
+    /// the same file (what another view's pin worker would hold) with
+    /// scripted unique inodes — the filesystem seam, like
+    /// `share_pair_for`'s scripted mapped magic. Every other proof bit
+    /// comes straight from the fixture entry.
+    fn reprove_for_test(entry: &Entry) -> ProvedEntry {
+        ProvedEntry {
+            file: entry.file.try_clone().expect("fixture fd dups"),
+            meta: EntryMeta::from_entry(entry, true),
+        }
+    }
+
+    /// Acquire one re-proven pin through the table, or fail with the
+    /// named expectation. The live reason is immaterial while the
+    /// table holds room: every twin below asserts `Held`.
+    fn acquire_held_for_test(table: &mut HandleTable, proved: ProvedEntry, message: &str) -> Held {
+        let ProvedEntry { file, meta } = proved;
+        match table.acquire(file, &meta, DeferredReason::Live) {
+            AcquireOutcome::Held(held) => held,
+            AcquireOutcome::Deferred(reason) => {
+                panic!("{message}: deferred with {reason:?}")
+            }
+        }
+    }
+
+    /// A scripted ext4 mapped proof under `key` (what a privileged
+    /// `map_files` read would prove): same shape as `share_pair_for`'s
+    /// injected proof, for table-level twins that file directly.
+    fn mapped_proof_for_test(key: ObjectKey) -> MappedFile {
+        let (Ok(major), Ok(minor)) = (
+            u32::try_from(key.device.major),
+            u32::try_from(key.device.minor),
+        ) else {
+            panic!("fixture device does not fit: {:?}", key.device);
+        };
+        MappedFile {
+            identity: FileIdentity {
+                dev: libc::makedev(major, minor),
+                ino: key.inode,
+            },
+            fs_magic: Some(0xef53),
+        }
+    }
+
+    /// Handle-table twin of `reviewed_one_scan_pin_per_physical_file`:
+    /// one filed handle per physical file, shared across views. A second
+    /// view's proven pin over the same file shares the resident fd
+    /// instead of filing a new row, so the reserve debit counts zero new
+    /// fds for it. Same fixtures, same ext4 `key_is_identity` proof.
     #[test]
-    fn reviewed_one_scan_pin_per_physical_file() {
+    fn handle_table_share_lends_one_fd_per_physical_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.so");
         std::fs::write(&path, b"shared-bytes").unwrap();
-        let (retained, retained_id, mut incoming, incoming_id) =
-            share_pair_for(&path, Some(0xef53));
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 0, "a fully shared admission holds no new fd");
+        let (retained, retained_id, incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        assert!(lender.inserted);
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the same file shares",
+        );
+        assert!(!borrower.inserted, "a share files no new row");
+        assert_eq!(table.len(), 1);
         assert!(
-            std::ptr::eq(
-                retained.file_for(retained_id).unwrap(),
-                incoming.file_for(incoming_id).unwrap(),
-            ),
+            std::sync::Arc::ptr_eq(lender.handle.arc(), borrower.handle.arc()),
             "the second view shares the retained pin's fd",
+        );
+        assert_eq!(
+            borrower.mapped, lender.mapped,
+            "the borrower inherits the resident proof",
         );
     }
 
@@ -20730,92 +20627,159 @@ mod tests {
         );
     }
 
-    /// The share twin's filesystem boundary: btrfs is retained by
-    /// `may_retain` but is NOT on `KEY_IS_IDENTITY_FILESYSTEMS` (one maps
-    /// device for every subvolume), so the same key there never shares.
+    /// Handle-table twin of
+    /// `reviewed_shared_scan_pin_refuses_unproven_filesystem`: btrfs is
+    /// retained by `may_retain` but is NOT on
+    /// `KEY_IS_IDENTITY_FILESYSTEMS` (one maps device for every
+    /// subvolume), so the same key there never shares. Same fixtures,
+    /// same `0x9123683e` magic.
     #[test]
-    fn reviewed_shared_scan_pin_refuses_unproven_filesystem() {
+    fn handle_table_share_refuses_unproven_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.so");
         std::fs::write(&path, b"shared-bytes").unwrap();
-        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0x9123_683e));
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 1, "btrfs keys never share a pin");
-        let retained_id = *retained.by_id.keys().next().unwrap();
+        let (retained, retained_id, incoming, incoming_id) =
+            share_pair_for(&path, Some(0x9123_683e));
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        assert!(lender.inserted);
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the borrower admits beside it",
+        );
+        assert!(borrower.inserted, "btrfs keys never share a pin");
+        assert_eq!(table.len(), 2);
         assert!(
-            !std::ptr::eq(
-                retained.file_for(retained_id).unwrap(),
-                incoming.file_for(incoming_id).unwrap(),
-            ),
+            !std::sync::Arc::ptr_eq(lender.handle.arc(), borrower.handle.arc()),
             "the unproven filesystem keeps its own fd",
         );
     }
 
-    /// Fail-closed twin: a retained pin without a `mapped` proof shares
-    /// nothing, even for the same file and key.
+    /// Handle-table twin of `reviewed_shared_scan_pin_refuses_without_proof`:
+    /// a resident without a `mapped` proof lends nothing, even for the
+    /// same file and key. Same fixtures.
     #[test]
-    fn reviewed_shared_scan_pin_refuses_without_proof() {
+    fn handle_table_share_refuses_without_proof() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.so");
         std::fs::write(&path, b"shared-bytes").unwrap();
-        let (retained, _, mut incoming, _) = share_pair_for(&path, None);
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 1, "an unproven pin never lends its fd");
+        let (retained, retained_id, incoming, incoming_id) = share_pair_for(&path, None);
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        assert!(lender.inserted);
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the borrower admits beside it",
+        );
+        assert!(borrower.inserted, "an unproven pin never lends its fd");
+        assert_eq!(table.len(), 2);
     }
 
-    /// Healthy twin: distinct files never share, however proven both pins
-    /// are. The incoming admission keeps its own fd and debits it.
+    /// Handle-table twin of
+    /// `reviewed_shared_scan_pin_keeps_distinct_files_apart`: distinct
+    /// files never share, however proven both pins are. Same fixtures,
+    /// same distinct ext4 files.
     #[test]
-    fn reviewed_shared_scan_pin_keeps_distinct_files_apart() {
+    fn handle_table_share_keeps_distinct_files_apart() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.so");
         let second = dir.path().join("second.so");
         std::fs::write(&first, b"first-bytes").unwrap();
         std::fs::write(&second, b"second-bytes").unwrap();
-        let (retained, _, _, _) = share_pair_for(&first, Some(0xef53));
-        let (_, _, mut incoming, _) = share_pair_for(&second, Some(0xef53));
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 1, "a distinct file keeps its own fd");
+        let (retained, retained_id, _, _) = share_pair_for(&first, Some(0xef53));
+        let (_, _, incoming, incoming_id) = share_pair_for(&second, Some(0xef53));
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        assert!(lender.inserted);
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the borrower admits beside it",
+        );
+        assert!(borrower.inserted, "a distinct file keeps its own fd");
+        assert_eq!(table.len(), 2);
     }
 
-    /// Release twin: a shared pin's fd outlives each single
-    /// view but closes with the last one — release on view drop, through
-    /// the shared `Arc`, with no explicit close path.
+    /// Handle-table twin of `reviewed_shared_scan_pin_releases_with_last_view`:
+    /// a shared fd outlives each single share but closes with the last
+    /// one — release on drop, through the shared `Arc`, with no
+    /// explicit close path. Rows hold only `Weak`s, so the table never
+    /// keeps a dead fd open. Same fixtures.
     #[test]
-    fn reviewed_shared_scan_pin_releases_with_last_view() {
+    fn handle_table_share_releases_with_last_view() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.so");
         std::fs::write(&path, b"shared-bytes").unwrap();
-        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 0);
-        let held = incoming.by_id[&incoming_id].file.clone();
-        let weak = std::sync::Arc::downgrade(held.arc());
-        drop(held);
-        drop(incoming);
+        let (retained, retained_id, incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the same file shares",
+        );
+        assert!(!borrower.inserted);
+        let weak = std::sync::Arc::downgrade(borrower.handle.arc());
+        drop(borrower);
         assert!(
             weak.upgrade().is_some(),
-            "one dropped view leaves the shared fd open",
+            "one dropped share leaves the shared fd open",
         );
-        drop(retained);
+        drop(lender);
         assert!(
             weak.upgrade().is_none(),
-            "the last dropped view closes the shared fd",
+            "the last dropped share closes the shared fd",
         );
+        let stats = table.prune(usize::MAX);
+        assert_eq!((stats.reaped, stats.pending), (1, 0));
+        assert_eq!(table.len(), 0);
     }
 
-    /// A witness-proven pre-copy-up observation pins the lower file behind
-    /// the merged mapping: its key names another file, so it never shares
-    /// (and is never lent to) a plain pin under the same key.
+    /// Handle-table twin of `reviewed_shared_scan_pin_refuses_pre_copy_up`:
+    /// a witness-proven pre-copy-up observation pins the lower file
+    /// behind the merged mapping: its key names another file, so it
+    /// never shares (and is never lent to) a plain pin under the same
+    /// key. Same fixtures.
     #[test]
-    fn reviewed_shared_scan_pin_refuses_pre_copy_up() {
+    fn handle_table_share_refuses_pre_copy_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.so");
         std::fs::write(&path, b"shared-bytes").unwrap();
-        let (retained, _, mut incoming, incoming_id) = share_pair_for(&path, Some(0xef53));
+        let (retained, retained_id, mut incoming, incoming_id) =
+            share_pair_for(&path, Some(0xef53));
         incoming.by_id.get_mut(&incoming_id).unwrap().pre_copy_up = true;
-        let new_fds = share_scan_pins_with_retained(&mut incoming, [&retained]);
-        assert_eq!(new_fds, 1, "a pre-copy-up pin keeps its own fd");
+        let mut table = HandleTable::new(1000);
+        let lender = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&retained.by_id[&retained_id]),
+            "the lender admits",
+        );
+        assert!(lender.inserted);
+        let borrower = acquire_held_for_test(
+            &mut table,
+            reprove_for_test(&incoming.by_id[&incoming_id]),
+            "the borrower admits beside it",
+        );
+        assert!(borrower.inserted, "a pre-copy-up pin keeps its own fd");
+        assert_eq!(table.len(), 2);
     }
 
     /// View-collapse fix6 A2: the concurrent library-handle
@@ -21372,16 +21336,14 @@ mod tests {
         println!("\n{COMPLETED}");
     }
 
-    /// View-collapse fix8 F2 (blocking 1001-handle probe, kept as
-    /// the regression twin): one scan must not hold more than 1000
-    /// library handles. With the table wide open (no reserve trip, no
-    /// EMFILE) and 1001 distinct files requested, the scan stops after
-    /// exactly 1000: the rest wait under the named budget gap, never
-    /// rejected, and the post-open share/debit charges at most the cap.
-    /// Raises the soft `RLIMIT_NOFILE` to the hard limit in-process and
-    /// restores it afterwards (raising soft toward hard is reversible).
+    /// Handle-table twin (script A, no mid-scan change) of
+    /// `review_one_scan_must_not_hold_more_than_a_thousand_libraries`:
+    /// 1001 distinct files against a cap-1000 table stop after exactly
+    /// 1000 rows: the rest wait under the named budget gap, never
+    /// rejected, and the table holds exactly the cap. Same
+    /// `pin_wait_modules` fixture, same rlimit raise and restore.
     #[test]
-    fn review_one_scan_must_not_hold_more_than_a_thousand_libraries() {
+    fn handle_table_scan_stops_at_exactly_the_cap() {
         const PINS: usize = 1001;
         let dir = tempfile::tempdir().unwrap();
         let mut budget = CaptureWorkBudget::default();
@@ -21427,23 +21389,25 @@ mod tests {
                 !crate::fd_budget::reserve_defers(Some(&tick)),
                 "the wide-open table admits the scan"
             );
-            let handle_budget = PinHandleBudget {
-                held: 0,
-                cap: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
-                lenders: Vec::new(),
-            };
-            let (mut pins, skipped) = pin_scanned_view_objects_with_budgets(
+            let mut table = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+            let (pins, skipped) = pin_scanned_view_objects_with_table(
                 &view,
                 &modules,
                 &mut budget,
                 Some(&tick),
-                Some(&handle_budget),
+                &mut table,
+                DeferredReason::Live,
             )
             .unwrap();
             assert_eq!(
-                pins.entry_count_for_test(),
+                table.len(),
                 crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
                 "the scan stops at exactly the handle cap: {skipped:?}"
+            );
+            assert_eq!(
+                pins.entry_count_for_test(),
+                crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
+                "every row carries its entry: {skipped:?}"
             );
             let waited: Vec<_> = skipped
                 .iter()
@@ -21470,75 +21434,195 @@ mod tests {
                 "waited keys are never rejected: {:?}",
                 pins.rejected_keys
             );
-            let kept = share_scan_pins_with_retained(&mut pins, Vec::new());
             assert_eq!(
-                kept,
+                table.stats().admits,
                 crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES as u64,
-                "the share/debit charges exactly the cap, never 1001"
+                "the scan inserts exactly the cap, never 1001"
             );
+            assert_eq!(table.stats().shares, 0, "distinct files never share");
         }
     }
 
-    /// View-collapse fix8 F2 (budget-guard liveness): the per-pin budget
-    /// counts only pins the post-scan share cannot absorb. A scan whose
-    /// files all duplicate proven retained lenders proceeds even AT the
-    /// cap — a sharing-blind guard would stop before the first pin and
-    /// the whole-view deferral would starve the view forever.
+    /// Handle-table twin (script B, file replaced between two acquires
+    /// of one maps key) of
+    /// `review_one_scan_must_not_hold_more_than_a_thousand_libraries`:
+    /// the replacement files its own row — never a silent share — with
+    /// no gaps while the table holds room, and `len` stays within the
+    /// cap. The 1001 case cannot return: routing is by proven file
+    /// identity, and the cap is checked at every insert.
     #[test]
-    fn budget_stop_never_starves_a_fully_shared_scan() {
+    fn handle_table_replacement_files_two_rows_without_exceeding_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let mut budget = CaptureWorkBudget::default();
-        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
-            .unwrap();
-        let modules = pin_wait_modules(&view, dir.path(), 2, &mut budget);
-        // Lenders prove both files under their own scanned keys (ext4
-        // identity), so the post-scan share absorbs the whole scan.
-        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut lenders = Vec::new();
-        for module in &modules {
-            let mut lender = test_fixture::real_scan_pin(
-                std::path::Path::new(&module.path),
-                Some(module.key),
-                0,
-                sha,
-            );
-            if let Some(entry) = lender.by_id.values_mut().next() {
-                let (Ok(major), Ok(minor)) = (
-                    u32::try_from(module.key.device.major),
-                    u32::try_from(module.key.device.minor),
-                ) else {
-                    panic!("fixture device does not fit: {:?}", module.key.device);
-                };
-                entry.mapped = Some(MappedFile {
-                    identity: FileIdentity {
-                        dev: libc::makedev(major, minor),
-                        ino: module.key.inode,
-                    },
-                    fs_magic: Some(0xef53),
-                });
+        let lower = dir.path().join("lib.so");
+        let upper = dir.path().join("lib.so.1");
+        std::fs::write(&lower, b"same-bytes").unwrap();
+        std::fs::write(&upper, b"same-bytes").unwrap();
+        // One maps key (the merged mapping), two kernel files, one
+        // digest: only the proven file identity routes them apart.
+        let maps = {
+            let metadata = std::fs::metadata(&lower).unwrap();
+            ObjectKey {
+                device: Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
             }
-            lenders.push(lender);
-        }
-        let lender_refs: Vec<&PinnedObjects> = lenders.iter().collect();
-        let handle_budget = PinHandleBudget {
-            held: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
-            cap: crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
-            lenders: lender_refs,
         };
-        let (mut pins, skipped) = pin_scanned_view_objects_with_budgets(
-            &view,
-            &modules,
-            &mut budget,
-            None,
-            Some(&handle_budget),
-        )
-        .unwrap();
-        assert!(
-            skipped.is_empty(),
-            "a fully shared scan proceeds at the cap: {skipped:?}"
+        let mut table = HandleTable::new(2);
+        let first = acquire_held_for_test(
+            &mut table,
+            ProvedEntry::for_test(
+                std::fs::File::open(&lower).unwrap(),
+                maps,
+                "aa",
+                Some(mapped_proof_for_test(maps)),
+            ),
+            "the lower file admits",
         );
-        assert_eq!(pins.entry_count_for_test(), 2);
-        let kept = share_scan_pins_with_retained(&mut pins, lenders.iter());
-        assert_eq!(kept, 0, "the share absorbs the whole scan");
+        assert!(first.inserted);
+        let second = acquire_held_for_test(
+            &mut table,
+            ProvedEntry::for_test(
+                std::fs::File::open(&upper).unwrap(),
+                maps,
+                "aa",
+                Some(mapped_proof_for_test(maps)),
+            ),
+            "the replacement admits beside it",
+        );
+        assert!(
+            second.inserted,
+            "a replaced file never silently shares the old row"
+        );
+        assert_eq!(table.len(), 2);
+        assert!(
+            table.len() <= 2,
+            "the replacement stays within the cap, never 1001"
+        );
+    }
+
+    /// Handle-table twin of `budget_stop_never_starves_a_fully_shared_scan`:
+    /// a full table still shares: two borrowers over proven ext4 lender
+    /// rows file no new rows and no gaps. The table is pre-filled with
+    /// 998 live rows (same rlimit raise and restore as the 1001-handle
+    /// twin); the two lenders carry the same ext4 `0xef53` proofs.
+    #[test]
+    fn handle_table_full_table_shares_without_gaps() {
+        const PREFILL: usize = 998;
+        let dir = tempfile::tempdir().unwrap();
+        let mut saved = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one initialized writable rlimit.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0
+        );
+        assert!(
+            saved.rlim_max >= 2048,
+            "the box must allow a wide soft fd limit for the full-table twin"
+        );
+        let raised = libc::rlimit {
+            rlim_cur: saved.rlim_max,
+            rlim_max: saved.rlim_max,
+        };
+        // Restores the saved limits on drop, even when an assertion
+        // below panics: raising soft toward hard is process-global.
+        struct RestoreRlimit(libc::rlimit);
+        impl Drop for RestoreRlimit {
+            fn drop(&mut self) {
+                // SAFETY: restoring the exact saved limits.
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
+                }
+            }
+        }
+        // SAFETY: raising the soft limit toward the hard limit in this
+        // test only; the guard above restores it. The twin runs alone
+        // (`--test-threads=1` in the focused gate).
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) }, 0);
+        let _restore = RestoreRlimit(saved);
+        let mut table = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+        let mut live = Vec::new();
+        for n in 0..PREFILL {
+            let path = dir.path().join(format!("prefill{n:04}.so"));
+            std::fs::write(&path, format!("prefill-{n}")).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let maps = ObjectKey {
+                device: Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
+            };
+            let held = acquire_held_for_test(
+                &mut table,
+                ProvedEntry::for_test(
+                    std::fs::File::open(&path).unwrap(),
+                    maps,
+                    &format!("prefill-{n:04}"),
+                    None,
+                ),
+                "prefill admits",
+            );
+            assert!(held.inserted);
+            live.push(held);
+        }
+        assert_eq!(table.len(), PREFILL);
+        // Two lenders with ext4 proofs fill the table exactly.
+        let mut lenders = Vec::new();
+        for name in ["lend-a.so", "lend-b.so"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"lender-bytes").unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let maps = ObjectKey {
+                device: Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
+            };
+            let lender = acquire_held_for_test(
+                &mut table,
+                ProvedEntry::for_test(
+                    std::fs::File::open(&path).unwrap(),
+                    maps,
+                    "lender",
+                    Some(mapped_proof_for_test(maps)),
+                ),
+                "the lender admits",
+            );
+            assert!(lender.inserted);
+            lenders.push((path, maps, lender));
+        }
+        assert_eq!(
+            table.len(),
+            crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES
+        );
+        // Both borrowers share at the cap: no rows, no gaps.
+        for (path, maps, lender) in &lenders {
+            let borrower = acquire_held_for_test(
+                &mut table,
+                ProvedEntry::for_test(std::fs::File::open(path).unwrap(), *maps, "lender", None),
+                "a fully shared scan proceeds at the cap",
+            );
+            assert!(!borrower.inserted, "the share files no new row");
+            assert!(
+                std::sync::Arc::ptr_eq(lender.handle.arc(), borrower.handle.arc()),
+                "the borrower shares the lender's fd",
+            );
+            assert_eq!(borrower.mapped, lender.mapped);
+        }
+        assert_eq!(
+            table.len(),
+            crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES
+        );
+        assert_eq!(
+            table.stats().admits,
+            crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES as u64
+        );
+        assert_eq!(table.stats().shares, 2);
     }
 }

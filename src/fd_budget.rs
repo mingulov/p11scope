@@ -19,12 +19,12 @@ pub(crate) const FD_RESERVE: u64 = 128;
 
 /// Concurrent library handles a capture may hold at once (view-collapse
 /// fix6 A2, owner 20:20): scan pins, manifest pins and pre-arm pins hold
-/// one fd per physical file (see `share_scan_pins_with_retained`), and
+/// one fd per physical file (see the capture-owned handle table), and
 /// their distinct held files never exceed this. Past it, admissions wait
 /// for the next tick under the counted named gap below, never dropped.
 /// The lifetime number of distinct libraries stays unlimited: handles
-/// release when their view drops (or their duplicate closes at share
-/// time) and every pass recounts from the live sets.
+/// release when their view drops and every pass recounts from the live
+/// sets.
 pub(crate) const MAX_CONCURRENT_LIBRARY_HANDLES: usize = 1000;
 
 /// True when `held` distinct library handles reach the concurrent `cap`:
@@ -528,24 +528,24 @@ mod tests {
         assert!(tick.breached());
     }
 
-    /// View-collapse fix5 F2 (regression probe
-    /// `reviewed_fd_snapshot_must_count_retained_scan_pins`): each
-    /// admission retains its view's pidfd plus its scan pins, and the
-    /// once-per-tick estimate must debit both. With soft AND hard
-    /// `RLIMIT_NOFILE` at 512 (a host whose hard limit itself is small,
-    /// where the startup raise cannot help), admissions holding one
-    /// pidfd plus one real scan pin must defer while the 128-fd reserve
-    /// still holds — never reach `EMFILE`. Runs in an isolated child:
-    /// lowering the hard limit is process-global and irreversible.
+    /// Handle-table twin of `reviewed_fd_snapshot_must_count_retained_scan_pins`:
+    /// each admission retains its view's pidfd plus its scan pins, and
+    /// the once-per-tick estimate must debit both — the pins via the
+    /// table's inserted rows. With soft AND hard `RLIMIT_NOFILE` at 512
+    /// (a host whose hard limit itself is small, where the startup raise
+    /// cannot help), admissions holding one pidfd plus one real scan pin
+    /// must defer while the 128-fd reserve still holds — never reach
+    /// `EMFILE`. Same 512/512 isolated child, same final fd-count
+    /// assertion.
     #[test]
-    fn reviewed_fd_snapshot_must_count_retained_scan_pins() {
-        const CHILD: &str = "P11SCOPE_FD_PIN_RESERVE_CHILD";
-        const COMPLETED: &str = "P11SCOPE_FD_PIN_RESERVE_COMPLETED";
+    fn handle_table_inserted_rows_debit_the_fd_reserve() {
+        const CHILD: &str = "P11SCOPE_FD_TABLE_DEBIT_CHILD";
+        const COMPLETED: &str = "P11SCOPE_FD_TABLE_DEBIT_COMPLETED";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "fd_budget::tests::reviewed_fd_snapshot_must_count_retained_scan_pins",
+                    "fd_budget::tests::handle_table_inserted_rows_debit_the_fd_reserve",
                     "--nocapture",
                     "--test-threads=1",
                 ])
@@ -593,6 +593,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("a pin file directory");
         let pin_path = dir.path().join("pin.so");
         std::fs::write(&pin_path, b"pin").expect("a pin file");
+        let mut table =
+            crate::discovery::handle_table::HandleTable::new(MAX_CONCURRENT_LIBRARY_HANDLES);
         let mut held_views: Vec<std::fs::File> = Vec::new();
         let mut held_pins = Vec::new();
         let mut admitted = 0u32;
@@ -601,7 +603,8 @@ mod tests {
                 break true;
             }
             // One admission: its pidfd plus one real retained scan pin,
-            // debited through the production path.
+            // debited through the production path — the pidfd directly,
+            // the pin via its inserted table rows.
             let pidfd = std::fs::File::open("/dev/null")
                 .expect("a pidfd stand-in must open before the reserve trips");
             held_views.push(pidfd);
@@ -613,11 +616,12 @@ mod tests {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             );
             held_pins.push(pins);
-            crate::discovery::engine::note_retained_scan_pins(
-                Some(&mut tick),
-                held_pins.last_mut().expect("just pushed"),
-                std::iter::empty::<&crate::discovery::identity::PinnedObjects>(),
-            );
+            let admits_before = table.stats().admits;
+            held_pins
+                .last_mut()
+                .expect("just pushed")
+                .adopt_handles_into(&mut table);
+            tick.note_opened_n(table.stats().admits - admits_before);
             admitted = admitted.saturating_add(1);
             assert!(admitted < 2000, "the reserve never deferred");
         };

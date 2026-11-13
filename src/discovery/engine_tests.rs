@@ -25740,7 +25740,6 @@ int main(int argc, char **argv) {
         &mut engine.budget,
         engine.broad_admit,
         &mut engine.stage_timings,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (modules, _, _) = metadata.unwrap();
@@ -41232,7 +41231,6 @@ fn p2_refuse_then_exit(
             Ok(outcome)
         },
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     assert!(
@@ -46227,7 +46225,6 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
         false,
         &mut engine.stage_timings,
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the view still scans");
@@ -46906,7 +46903,6 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
         false,
         &mut engine.stage_timings,
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, fresh_pins, _) = scan_result.expect("the view still scans");
@@ -46986,7 +46982,6 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
-        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -47499,7 +47494,6 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the metadata snapshot scans");
@@ -47541,7 +47535,6 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
-        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -48329,7 +48322,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut crate::timing::StageTimings::default(),
         clean,
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
@@ -48356,7 +48348,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
                 scan_ms: 0,
             })
         },
-        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     )
@@ -48385,7 +48376,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
             })
         },
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
@@ -48410,7 +48400,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
             })
         },
         None,
-        None,
         crate::discovery::handle_table::Filing::Untracked,
     )
     .unwrap();
@@ -48429,7 +48418,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         false,
         &mut crate::timing::StageTimings::default(),
         clean,
-        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     )
@@ -48458,7 +48446,6 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
                 scan_ms: 0,
             })
         },
-        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     )
@@ -50872,7 +50859,8 @@ fn library_handle_budget_defers_newcomer_past_cap() {
             },
         );
     }
-    engine.library_handle_cap_for_test = Some(2);
+    engine.file_fixture_pins_for_test();
+    engine.set_table_cap_for_test(2);
     let live_pid = std::process::id();
     let tick_start = 1_000_000u64;
     engine
@@ -51265,7 +51253,6 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
             false,
             &mut timings,
             None,
-            None,
             crate::discovery::handle_table::Filing::Untracked,
         );
         let (_, pins, _) = scan.expect("the fixture scan runs");
@@ -51293,7 +51280,8 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
             counters: DiscoveryCounters::default(),
         },
     );
-    engine.library_handle_cap_for_test = Some(2);
+    engine.file_fixture_pins_for_test();
+    engine.set_table_cap_for_test(2);
     let tick_start = 1_000_000u64;
     engine
         .scheduler
@@ -51350,7 +51338,7 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
     );
     // Next-tick preservation: after the budget frees, the same pid
     // stages on retry and the mark is spent.
-    engine.library_handle_cap_for_test = Some(1000);
+    engine.set_table_cap_for_test(1000);
     engine.scheduler.begin_deep_scan_tick(Some(tick_start));
     let mut tick_now = || Some(tick_start);
     let (new_views, failed, skipped) = engine.admit_inventory_new_views(
@@ -51402,7 +51390,8 @@ fn library_handle_deferral_marks_handles_first_and_retries() {
             },
         );
     }
-    engine.library_handle_cap_for_test = Some(2);
+    engine.file_fixture_pins_for_test();
+    engine.set_table_cap_for_test(2);
     let live_pid = std::process::id();
     let tick_start = 1_000_000u64;
     engine

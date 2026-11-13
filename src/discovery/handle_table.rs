@@ -137,7 +137,8 @@ impl Held {
 /// Why a refusal waits where it does: the site class whose gap vocabulary
 /// the caller files. Admission scans map to the initial/live budget tails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Constructed by the Task-1+ callers of `acquire()`; unit tests until then.
+// Initial/Live are constructed by the Task-1 admission paths; Trusted
+// and Learned follow in Tasks 3-4, when this allow goes away.
 #[allow(dead_code)]
 pub(crate) enum DeferredReason {
     Initial,
@@ -147,8 +148,9 @@ pub(crate) enum DeferredReason {
 }
 
 /// The single acquire step's outcome: filed, or refused with its reason.
+/// The pin loops match this and record their fixed gap vocabulary; the
+/// carried reason stays an origin tag for debugging.
 #[derive(Debug)]
-// Matched by the Task-1+ pin paths; unit tests until then.
 #[allow(dead_code)]
 pub(crate) enum AcquireOutcome {
     Held(Held),
@@ -182,10 +184,17 @@ pub(crate) struct TableStats {
     pub(crate) len: usize,
 }
 
-/// Where the pin path files one worker-proven pin: a table row, no row,
-/// or a probe-local scratch dropped at return.
+/// Where the pin path files one worker-proven pin: a table row
+/// (count-only or refusing), no row, or a probe-local scratch dropped
+/// at return.
 pub(crate) enum Filing<'a> {
+    /// Count-only filing (Phase 0 migration): shares like `acquire()`
+    /// but never refuses. Converted row groups use `Acquire` instead;
+    /// deleted once every site acquires.
     Adopt(&'a mut HandleTable),
+    /// The single acquire step with the caller's refusal reason. The
+    /// pin loops record the refusal as waits; no site drops a pin.
+    Acquire(&'a mut HandleTable, DeferredReason),
     Untracked,
     /// Wired in Task 4 (the probationary probe files no rows at all).
     #[allow(dead_code)]
@@ -230,8 +239,6 @@ impl HandleTable {
     /// duplicate shares the resident handle; a new file inserts while
     /// `len < cap`; past the cap the table prunes once, retries once,
     /// then refuses with the caller's reason. Fstat-only I/O, no reads.
-    #[allow(dead_code)]
-    // Tasks 1-5 route their row groups through here.
     pub(crate) fn acquire(
         &mut self,
         file: std::fs::File,
@@ -374,8 +381,20 @@ impl HandleTable {
         self.rows.len()
     }
 
-    /// The table's counters, for `-v`/timing diagnostics only (Task 6).
-    #[allow(dead_code)]
+    /// The concurrent-handle cap this table enforces.
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Test-only cap override (the `library_handle_cap_for_test` seam,
+    /// repointed at the table).
+    #[cfg(test)]
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// The table's counters: the admission loops debit the fd reserve
+    /// from `admits`; `-v`/timing diagnostics surface the rest (Task 6).
     pub(crate) fn stats(&self) -> TableStats {
         TableStats {
             admits: self.admits,

@@ -69,7 +69,6 @@ fn cold_group_deep_scan_keeps_sparse_provider_targets_useful() {
             false,
             &mut timings,
             None,
-            None,
             crate::discovery::handle_table::Filing::Untracked,
         );
 

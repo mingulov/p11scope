@@ -19,21 +19,20 @@ use crate::capacity::CounterBudget;
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::elf_needed;
-use crate::discovery::handle_table::{Filing, HandleTable};
+use crate::discovery::handle_table::{DeferredReason, Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
     InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError, ManifestPinning,
-    ManifestStaleReason, Pin, PinHandleBudget, PinnedConservativeCursor, PinnedObjectId,
-    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
+    ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId, PinnedObjects,
+    PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
     open_view_executable_cached, open_view_rooted_object_cached, opened_file_matches_maps,
     pin_manifest_objects_deferred_in_views_with_budget_and_filing,
     pin_manifest_objects_deferred_in_views_with_prior_and_filing, pin_of,
-    pin_prearm_objects_in_views_with_budget_and_filing,
-    pin_scanned_view_objects_with_budgets_and_filing, preexec_object_key,
-    retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
+    pin_prearm_objects_in_views_with_budget_and_filing, pin_scanned_view_objects_with_filing,
+    preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -579,13 +578,6 @@ pub struct Engine {
     /// follows the process-wide environment variable the gate reads).
     #[cfg(test)]
     candidate_reuse_for_test: Option<bool>,
-    /// Test-only override for the concurrent library-handle cap (fix6
-    /// A2). Production always gates on
-    /// [`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
-    /// the budget twin scripts a small cap so the deferral is drivable
-    /// without holding a thousand fds.
-    #[cfg(test)]
-    library_handle_cap_for_test: Option<usize>,
     /// Test-only staging: latch the committed pin-set changed flags between
     /// the tick's First and Final candidate builds, exactly as a
     /// between-builds `check_unchanged` detection would. The reuse twin
@@ -7014,7 +7006,6 @@ fn scan_and_pin(
         stage,
         scan_process_view,
         None,
-        None,
         Filing::Untracked,
     )
     .map(|(modules, pins, _)| (modules, pins))
@@ -7041,7 +7032,6 @@ fn scan_and_pin_with(
         &mut CaptureWorkBudget,
     ) -> std::result::Result<ScanOutcome, String>,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
-    handles: Option<&PinHandleBudget<'_>>,
     filing: Filing<'_>,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     scan_and_pin_with_proof(
@@ -7056,7 +7046,6 @@ fn scan_and_pin_with(
             scan(request, view, budget).map(|outcome| (outcome, Vec::new(), BTreeSet::new()))
         },
         reserve,
-        handles,
         filing,
     )
     .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
@@ -7095,7 +7084,6 @@ fn scan_and_pin_with_proof(
         String,
     >,
     reserve: Option<&crate::fd_budget::FdReserveTick>,
-    handles: Option<&PinHandleBudget<'_>>,
     filing: Filing<'_>,
 ) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
@@ -7147,14 +7135,10 @@ fn scan_and_pin_with_proof(
     let pin_start = crate::attach::monotonic_ns();
     // Fix7 F1: the tick's reserve budgets the pin loop itself, so a scan
     // that wants more pins than the headroom covers stops with the rest
-    // pending instead of opening into `EMFILE`. Fix8 F2: the tick's
-    // library-handle budget does the same per acquisition, so one scan
-    // can no longer retain past the cap. Admission scans pass `Some`;
-    // every other scan site passes `None` (today's behavior). Every
-    // retaining site files `Adopt` into its lane's table (Phase 0).
-    let pinned = pin_scanned_view_objects_with_budgets_and_filing(
-        view, &modules, budget, reserve, handles, filing,
-    );
+    // pending instead of opening into `EMFILE`. Converted sites file
+    // through the single `acquire()`, so one scan can no longer retain
+    // past the cap; the rest adopt count-only until their task.
+    let pinned = pin_scanned_view_objects_with_filing(view, &modules, budget, reserve, filing);
     stage.span(
         crate::timing::StageKind::Pin,
         "pin_view_objects",
@@ -7635,37 +7619,6 @@ pub(crate) fn credited_scan_shape(
     } else {
         None
     }
-}
-
-/// Debit the scan pins one admission retains against the tick's fd
-/// reserve, beside the view's own pidfd (counted at open through
-/// [`FdReserveTick::note_opened`]). Both admission loops call this
-/// after a successful scan, before the pins are stored: without it a
-/// small hard `RLIMIT_NOFILE` reaches `EMFILE` mid-pass.
-///
-/// Fix6 A1: the incoming pins first share one
-/// retained pin per physical file across all views (see
-/// [`share_scan_pins_with_retained`]), and only the fds the admission
-/// newly holds are debited — the reserve stays a safety net over what
-/// remains after the duplicates are released, not over the duplicates.
-/// Sharing runs unconditionally; the debit needs the tick, so an
-/// unreadable snapshot still shares (fail open on the guard, never on
-/// the dedupe). Returns the newly held count so the library-handle
-/// budget (fix6 A2) can track the pass exactly without recounting per
-/// pid.
-///
-/// [`FdReserveTick::note_opened`]: crate::fd_budget::FdReserveTick::note_opened
-/// [`share_scan_pins_with_retained`]: crate::discovery::identity::share_scan_pins_with_retained
-pub(crate) fn note_retained_scan_pins<'a>(
-    tick: Option<&mut crate::fd_budget::FdReserveTick>,
-    pins: &mut PinnedObjects,
-    retained: impl IntoIterator<Item = &'a PinnedObjects>,
-) -> u64 {
-    let new_fds = crate::discovery::identity::share_scan_pins_with_retained(pins, retained);
-    if let Some(tick) = tick {
-        tick.note_opened_n(new_fds);
-    }
-    new_fds
 }
 
 /// True when a scan's pins filed the handle-exhaustion wait gap (fix6
@@ -8628,13 +8581,13 @@ fn discover_plan(
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
     }
-    // Library-handle budget (fix6 A2, owner 20:20), counted once for the
-    // whole pass: at most 1000 distinct library files held at once. The
-    // pass tracks its own admissions exactly (see the share step below);
-    // only removals and rebuilds move the count otherwise, and the next
-    // pass recounts from the live sets.
+    // Library-handle cap, read live from the capture-owned table: at
+    // most 1000 distinct library files held at once. One prune per pass
+    // keeps the O(1) `len()` pre-check below honest; the in-loop
+    // `acquire()` is exact, so a stale count only ever defers a pass
+    // that the next pass admits.
     let library_cap = discovered.library_handle_cap();
-    let mut held_handles = discovered.count_held_library_handles();
+    discovered.handle_table.prune(usize::MAX);
     for (index, pid) in selected.iter().enumerate() {
         // The pass counts its own opens against the snapshot (conservative
         // within the pass: drops are not subtracted; the fresh snapshot
@@ -8660,7 +8613,10 @@ fn discover_plan(
         // Past the handle cap the rest wait for the next tick with their
         // counted named gap, never dropped; a later pass with freed
         // handles serves them instead of losing the work.
-        if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
+        if crate::fd_budget::library_handle_budget_exhausted(
+            discovered.handle_table.len(),
+            library_cap,
+        ) {
             // Fix7: this pid and the unprocessed rest owe
             // a handles-first retry in the next round.
             for deferred_pid in &selected[index..] {
@@ -8765,21 +8721,10 @@ fn discover_plan(
         // itself (its own initial maps plus its examined evidence),
         // never from a caller-side maps pre-read outside the scan's
         // validation bracket. Same scan work as `scan_process_view`;
-        // only already-computed values are surfaced.
-        // Fix8 F2: the pass's handle budget (held count, cap, and the
-        // same lender sets the post-scan share borrows from) budgets
-        // the pin loop per acquisition, so one scan can no longer
-        // retain past the cap.
-        let pin_lenders: Vec<&PinnedObjects> = discovered
-            .scan_inputs
-            .values()
-            .map(|input| &input.pins)
-            .collect();
-        let pin_handles = PinHandleBudget {
-            held: held_handles,
-            cap: library_cap,
-            lenders: pin_lenders,
-        };
+        // only already-computed values are surfaced. The pin loop files
+        // through the single `acquire()`, so one scan can no longer
+        // retain past the cap; shares file no new row.
+        let admits_before = discovered.handle_table.stats().admits;
         let scan_result = scan_and_pin_with_proof(
             &view,
             &a.modules,
@@ -8794,15 +8739,14 @@ fn discover_plan(
             },
             // Fix7 F1: the pass's reserve budgets the pin loop itself.
             reserve_tick.as_ref(),
-            Some(&pin_handles),
-            Filing::Adopt(&mut discovered.handle_table),
+            Filing::Acquire(&mut discovered.handle_table, DeferredReason::Initial),
         );
         // 6.14 Option B: the scan observed this generation alive; learn
         // its executable path whether or not the scan completed.
         elf_needed::learn_view_exe(&mut discovered.extensive, &view);
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
-            Ok((found, mut pins, complete, scan_examined, scan_shape)) => {
+            Ok((found, pins, complete, scan_examined, scan_shape)) => {
                 // Fix6 A3: handle exhaustion waits, never
                 // skips. A scan with waited pins defers whole — the view
                 // drops, its ID returns to the pool, and the next tick
@@ -8876,19 +8820,13 @@ fn discover_plan(
                     examined_shapes.insert(shape);
                 }
                 // The pass retains this scan's pins from here (beside
-                // the view's pidfd, counted at open): share one pin per
-                // physical file with the already-admitted views, then
-                // debit what newly remains before the next admission
-                // decision, or a small hard `RLIMIT_NOFILE` reaches
-                // `EMFILE` mid-pass. The same new-fd count tracks the
-                // pass's library-handle budget exactly.
-                let new_fds = note_retained_scan_pins(
-                    reserve_tick.as_mut(),
-                    &mut pins,
-                    discovered.scan_inputs.values().map(|input| &input.pins),
-                );
-                held_handles =
-                    held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
+                // the view's pidfd, counted at open): debit the rows the
+                // scan newly filed before the next admission decision,
+                // or a small hard `RLIMIT_NOFILE` reaches `EMFILE`
+                // mid-pass. Shares filed no row and hold no new fd.
+                if let Some(tick) = reserve_tick.as_mut() {
+                    tick.note_opened_n(discovered.handle_table.stats().admits - admits_before);
+                }
                 discovered.debug_assert_table_coherent();
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
@@ -12926,8 +12864,6 @@ impl Engine {
             #[cfg(test)]
             candidate_reuse_for_test: None,
             #[cfg(test)]
-            library_handle_cap_for_test: None,
-            #[cfg(test)]
             latch_pinned_changed_between_builds_for_test: false,
             plan_rebuild_stable: false,
             graph_backing: None,
@@ -15982,7 +15918,6 @@ impl Engine {
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
         reserve: Option<&crate::fd_budget::FdReserveTick>,
-        handles: Option<&PinHandleBudget<'_>>,
         filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
@@ -15999,7 +15934,6 @@ impl Engine {
                 stage,
                 scan_process_view,
                 reserve,
-                handles,
                 filing,
             )
         })
@@ -16013,7 +15947,6 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
-        handles: Option<&PinHandleBudget<'_>>,
         filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
@@ -16030,7 +15963,6 @@ impl Engine {
                 stage,
                 scan_process_view_without_memory,
                 None,
-                handles,
                 filing,
             )
         })
@@ -19953,11 +19885,10 @@ impl Engine {
         let (pins, pin_skips) = {
             let view = &self.views[position];
             let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+            let pinned = pin_scanned_view_objects_with_filing(
                 view,
                 std::slice::from_ref(&lowered),
                 &mut self.budget,
-                None,
                 None,
                 Filing::Adopt(&mut self.handle_table),
             );
@@ -20426,7 +20357,6 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
-                None,
                 Filing::Adopt(&mut self.handle_table),
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
@@ -20436,7 +20366,6 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
-                None,
                 Filing::Adopt(&mut self.handle_table),
             ),
         };
@@ -20694,11 +20623,10 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+            let pinned = pin_scanned_view_objects_with_filing(
                 &self.views[position],
                 &new_modules,
                 &mut self.budget,
-                None,
                 None,
                 Filing::Adopt(&mut self.handle_table),
             );
@@ -20781,11 +20709,10 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+            let pinned = pin_scanned_view_objects_with_filing(
                 &self.views[position],
                 &new_modules,
                 &mut self.budget,
-                None,
                 None,
                 Filing::Adopt(&mut self.handle_table),
             );
@@ -23419,11 +23346,10 @@ impl Engine {
             &loader_path,
         );
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+        let pinned = pin_scanned_view_objects_with_filing(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
-            None,
             None,
             Filing::Adopt(&mut self.handle_table),
         );
@@ -23765,11 +23691,10 @@ impl Engine {
             interfaces: Vec::new(),
         };
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects_with_budgets_and_filing(
+        let pinned = pin_scanned_view_objects_with_filing(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
-            None,
             None,
             Filing::Adopt(&mut self.handle_table),
         );
@@ -27517,7 +27442,6 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
-                None,
                 Filing::Adopt(&mut self.handle_table),
             );
             // 6.14 Option B: learn the refreshed generation's executable.
@@ -28658,7 +28582,6 @@ impl Engine {
             broad_admit,
             &mut self.stage_timings,
             None,
-            None,
             Filing::Untracked,
         );
         // 6.14 Option B: learn the probationary generation's executable.
@@ -28713,15 +28636,45 @@ impl Engine {
         }
     }
 
-    /// The concurrent library-handle cap for this capture (fix6 A2):
-    /// [`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
-    /// or the test override when one is set.
+    /// The concurrent library-handle cap for this capture: the lane
+    /// table's cap ([`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
+    /// or the test override when one is set through
+    /// [`Engine::set_table_cap_for_test`]).
     fn library_handle_cap(&self) -> usize {
-        #[cfg(test)]
-        if let Some(cap) = self.library_handle_cap_for_test {
-            return cap;
+        self.handle_table.cap()
+    }
+
+    /// Test-only cap override, repointed at the lane table: budget
+    /// twins script a small cap so the deferral is drivable without
+    /// holding a thousand fds.
+    #[cfg(test)]
+    pub(crate) fn set_table_cap_for_test(&mut self, cap: usize) {
+        self.handle_table.set_cap(cap);
+    }
+
+    /// Test-only filing of already-seeded fixture pins: one row per
+    /// distinct open file across the recount sets, so a test cap binds
+    /// on fds like production. Fixture aliases of one fd converge on
+    /// one row.
+    #[cfg(test)]
+    pub(crate) fn file_fixture_pins_for_test(&mut self) {
+        for input in self.scan_inputs.values_mut() {
+            input
+                .pins
+                .adopt_existing_handles_into(&mut self.handle_table);
         }
-        crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES
+        for input in &mut self.manifest_inputs {
+            input
+                .pins
+                .adopt_existing_handles_into(&mut self.handle_table);
+        }
+        if let Some(prearm) = self.prearm_input.as_mut() {
+            prearm
+                .pins
+                .adopt_existing_handles_into(&mut self.handle_table);
+        }
+        self.pinned
+            .adopt_existing_handles_into(&mut self.handle_table);
     }
 
     /// Mark a pid deferred for handles (fix7, owner 21:10): a
@@ -28897,10 +28850,6 @@ impl Engine {
         // one is ever staged: every staging resolves at the very next
         // loop-top, and the last admitted pid never stages (empty tail).
         let mut staged_yield: Option<(u32, InventoryNewView)> = None;
-        // The staged admission's newly held library handles (fix6 A2):
-        // counted at staging like any admission, subtracted if the yield
-        // completes and drops the staged pins at the next loop-top.
-        let mut staged_new_fds: u64 = 0;
         // Fix7: handles-deferred members attempt first in
         // this round, ahead of window order (stable otherwise).
         let admitted = Self::order_handles_deferred_first(admitted, &self.handles_deferred);
@@ -28920,13 +28869,13 @@ impl Engine {
                 reason: crate::fd_budget::UNREADABLE_REASON.into(),
             });
         }
-        // Library-handle budget (fix6 A2, owner 20:20), counted once for
-        // the tick: at most 1000 distinct library files held at once.
-        // This tick's own admissions track their exact new-fd counts
-        // (see the share step below); the next tick recounts from the
-        // live sets, so releases between ticks free budget.
+        // Library-handle cap, read live from the capture-owned table:
+        // at most 1000 distinct library files held at once. One prune
+        // per tick keeps the O(1) `len()` pre-check below honest; the
+        // in-loop `acquire()` is exact, so a stale count only ever
+        // defers a pid that the next tick admits.
         let library_cap = self.library_handle_cap();
-        let mut held_handles = self.count_held_library_handles();
+        self.handle_table.prune(usize::MAX);
         while let Some(pid) = unprocessed.next() {
             // The tick quantum stops admissions before another scan: this
             // pid and the rest defer with their requests retained. This
@@ -28936,11 +28885,6 @@ impl Engine {
             if let Some((staged_pid, (staged_view, staged_modules, staged_pins))) =
                 staged_yield.take()
             {
-                // The staged admission's handles were counted at staging;
-                // a completion drops the staged pins, so the count drops
-                // with them. A keep carries the count into the push below.
-                let staged_held = staged_new_fds;
-                staged_new_fds = 0;
                 if quantum_expired {
                     // The tail is never attempted: the head keeps the
                     // slot it proved, exactly as without the yield.
@@ -28955,12 +28899,12 @@ impl Engine {
                     // The waiter is attempted: the provider-free head
                     // completes without a view (the probationary outcome),
                     // so the freed slot reaches the waiter in this tick.
+                    // The dropped staged pins free their rows; the next
+                    // tick's prune reaps them.
                     self.release_view_id(staged_view.id());
                     self.newcomer_first_seen.remove(&staged_pid);
                     self.newcomer_counted.remove(&staged_pid);
                     self.probationary_completions = self.probationary_completions.saturating_add(1);
-                    held_handles = held_handles
-                        .saturating_sub(usize::try_from(staged_held).unwrap_or(usize::MAX));
                 }
             }
             if quantum_expired {
@@ -29001,7 +28945,10 @@ impl Engine {
             // this pid and the rest defer with their requests retained,
             // exactly like the quantum-expiry tail, with their counted
             // named gap — never dropped.
-            if crate::fd_budget::library_handle_budget_exhausted(held_handles, library_cap) {
+            if crate::fd_budget::library_handle_budget_exhausted(
+                self.handle_table.len(),
+                library_cap,
+            ) {
                 for deferred_pid in std::iter::once(pid).chain(unprocessed.by_ref()) {
                     self.mark_unattempted_fresh(deferred_pid, ledger);
                     // Fix7: the rest owe a handles-first
@@ -29144,17 +29091,10 @@ impl Engine {
             // a departed pid prunes every tick).
             self.note_handles_retry(pid);
             let broad_admit = self.broad_admit;
-            // Fix8 F2: the tick's handle budget (held count, cap, and
-            // the same lender sets the post-scan share borrows from)
-            // budgets the pin loop per acquisition, so one scan can no
-            // longer retain past the cap.
-            let pin_lenders: Vec<&PinnedObjects> =
-                self.scan_inputs.values().map(|input| &input.pins).collect();
-            let pin_handles = PinHandleBudget {
-                held: held_handles,
-                cap: library_cap,
-                lenders: pin_lenders,
-            };
+            // The pin loop files through the single `acquire()`, so one
+            // scan can no longer retain past the cap; shares file no
+            // new row.
+            let admits_before = self.handle_table.stats().admits;
             let (scan_result, counters) = Self::scan_retained_view(
                 &view,
                 &self.module_hints,
@@ -29164,8 +29104,7 @@ impl Engine {
                 &mut self.stage_timings,
                 // Fix7 F1: the tick's reserve budgets the pin loop itself.
                 reserve_tick.as_ref(),
-                Some(&pin_handles),
-                Filing::Adopt(&mut self.handle_table),
+                Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             );
             // 6.14 Option B: learn the newcomer's executable path.
             elf_needed::learn_view_exe(&mut self.extensive, &view);
@@ -29181,7 +29120,7 @@ impl Engine {
                 // Completeness is otherwise unused here: a new view has
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
-                Ok((modules, mut pins, complete)) => {
+                Ok((modules, pins, complete)) => {
                     // Fix6 A3: handle exhaustion waits,
                     // never skips. A scan with waited pins defers whole
                     // with its request retained — the view drops and the
@@ -29223,22 +29162,16 @@ impl Engine {
                         break;
                     }
                     // The tick retains this scan's pins from here (staged
-                    // or pushed below): share one pin per physical file
-                    // with the already-retained views, then debit what
-                    // newly remains before the next admission decision, or
-                    // a small hard `RLIMIT_NOFILE` reaches `EMFILE`
+                    // or pushed below): debit the rows the scan newly
+                    // filed before the next admission decision, or a
+                    // small hard `RLIMIT_NOFILE` reaches `EMFILE`
                     // mid-tick. The reserve stays conservative (a staged
                     // yield that completes drops its pins at the next
-                    // loop-top without a refund); the library-handle
-                    // budget tracks the same new-fd count exactly (its
-                    // staged share is subtracted on completion above).
-                    let new_fds = note_retained_scan_pins(
-                        reserve_tick.as_mut(),
-                        &mut pins,
-                        self.scan_inputs.values().map(|input| &input.pins),
-                    );
-                    held_handles =
-                        held_handles.saturating_add(usize::try_from(new_fds).unwrap_or(usize::MAX));
+                    // loop-top without a refund). Shares filed no row
+                    // and hold no new fd.
+                    if let Some(tick) = reserve_tick.as_mut() {
+                        tick.note_opened_n(self.handle_table.stats().admits - admits_before);
+                    }
                     self.debug_assert_table_coherent();
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot
@@ -29272,7 +29205,6 @@ impl Engine {
                             staged_yield.is_none(),
                             "the previous staging resolved at this pid's loop-top"
                         );
-                        staged_new_fds = new_fds;
                         staged_yield = Some((pid, (view, modules, pins)));
                         continue;
                     }

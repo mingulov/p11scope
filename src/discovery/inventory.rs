@@ -980,7 +980,6 @@ impl Engine {
             &mut self.stage_timings,
             scan,
             None,
-            None,
             Filing::Adopt(&mut self.handle_table),
         );
         let pinning_complete = self.budget.stopped_reason().is_none()

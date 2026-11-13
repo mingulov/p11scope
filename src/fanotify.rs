@@ -772,6 +772,25 @@ fn close_unread_tail(buf: &[u8], mut offset: usize, len: usize) {
     }
 }
 
+/// Counts the parseable records at the buffer start: pure
+/// length-field walking, no fd touched. Stops at the first malformed
+/// record. The tail and the shed owe events, not bytes, so this is
+/// what their snapshots are accounted against.
+fn count_parsed_records(buf: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        match parse_fanotify_event(&buf[offset..]) {
+            Ok(event) => {
+                count += 1;
+                offset += event.total_len;
+            }
+            Err(_) => break,
+        }
+    }
+    count
+}
+
 /// Sets `FD_CLOEXEC` explicitly on a kernel-handed fd: the group is
 /// created with `FAN_CLOEXEC`, but event and pid fds must not rely on
 /// propagation through the observer's own `Command::spawn`s (the
@@ -881,8 +900,16 @@ pub(crate) struct FileLearner {
     /// (capabilities are per-thread). `None` once the drain runs.
     /// The bool records that the startup pass left a visible
     /// filesystem uncovered, which the drain files as the finite
-    /// unavailable-learning gap as soon as it runs.
-    pending: Option<(OwnedFd, SyncSender<LearnMsg>, BTreeSet<MountIdentity>, bool)>,
+    /// unavailable-learning gap as soon as it runs. The unit is this
+    /// kernel's measured `FIONREAD` bytes per event, which the drain's
+    /// tail and shed divide their snapshots by.
+    pending: Option<(
+        OwnedFd,
+        SyncSender<LearnMsg>,
+        BTreeSet<MountIdentity>,
+        bool,
+        usize,
+    )>,
 }
 
 /// Opens the fanotify group for learning: the kernel queue is
@@ -933,6 +960,10 @@ impl FileLearner {
         // past `LEARN_BACKLOG_CAP_BYTES` as a named overflow, and no
         // drain step blocks on a mount.
         let group = open_learn_group()?;
+        // The FIONREAD unit before any filesystem mark exists: the
+        // probe inode is the only marked object, so one open queues
+        // exactly one event and the snapshot is the unit.
+        let fionread_unit = measure_fionread_unit(&group);
         // The mark pass opens every visible mount: on a hung mount
         // (unreachable NFS/CIFS, dead FUSE) an open can block
         // indefinitely, which would wedge `--system` start before
@@ -960,7 +991,7 @@ impl FileLearner {
         }
         if crate::run::capture_diagnostics_on() {
             eprintln!(
-                "p11scope: file learning active: {} filesystems marked ({uncovered} skipped)",
+                "p11scope: file learning active: {} filesystems marked ({uncovered} skipped), FIONREAD unit {fionread_unit} B/event",
                 covered.len()
             );
         }
@@ -970,7 +1001,7 @@ impl FileLearner {
             Self {
                 state,
                 thread: None,
-                pending: Some((group, tx, covered, uncovered > 0)),
+                pending: Some((group, tx, covered, uncovered > 0, fionread_unit)),
             },
             rx,
         ))
@@ -987,7 +1018,8 @@ impl FileLearner {
         if self.thread.is_some() {
             return Ok(());
         }
-        let Some((group, tx, covered, initial_gap_owed)) = self.pending.take() else {
+        let Some((group, tx, covered, initial_gap_owed, fionread_unit)) = self.pending.take()
+        else {
             return Ok(());
         };
         let worker_state = Arc::clone(&self.state);
@@ -995,7 +1027,14 @@ impl FileLearner {
         match std::thread::Builder::new()
             .name("p11scope-learn".to_string())
             .spawn(move || {
-                drain_loop(group, tx, worker_state, covered, initial_gap_owed);
+                drain_loop(
+                    group,
+                    tx,
+                    worker_state,
+                    covered,
+                    initial_gap_owed,
+                    fionread_unit,
+                );
                 let _ = done_tx.send(());
             }) {
             Ok(thread) => {
@@ -1567,6 +1606,10 @@ struct DrainCtx<'a> {
     tx: &'a SyncSender<LearnMsg>,
     state: &'a Arc<LearnShutdownState>,
     self_pid: u32,
+    /// This kernel's `FIONREAD` bytes per event, measured once in
+    /// `start()`: the tail and the shed owe `snapshot / unit` events.
+    /// 24 before upstream `68615158c12d`, 32 after.
+    fionread_unit: usize,
     cache: LearnCache,
     stats: DrainStats,
     /// Inode ignore marks placed so far (bounded by
@@ -1740,12 +1783,17 @@ impl DrainCtx<'_> {
         IgnoreMarkOutcome::Marked
     }
 
-    /// Decides every event in one read buffer. Returns false when the
-    /// drain must exit (a send failed); the unread rest of the buffer
-    /// is closed and the loss is already marked.
-    fn process_read(&mut self, buf: &[u8], window: SendWindow) -> bool {
+    /// Decides every event in one read buffer. Returns whether the
+    /// drain continues, and how many records were parsed: the tail
+    /// owes `snapshot / unit` events and subtracts one per parsed
+    /// record, so the count — not the bytes — drives it. A send
+    /// failure (`false`) leaves the unread rest closed with the loss
+    /// already marked; an unparseable record closes the tail's fds,
+    /// marks the lost tail, and still continues (`true`).
+    fn process_read(&mut self, buf: &[u8], window: SendWindow) -> (bool, usize) {
         let len = buf.len();
         let mut offset = 0usize;
+        let mut parsed = 0usize;
         while offset < len {
             let event = match parse_fanotify_event(&buf[offset..len]) {
                 Ok(event) => event,
@@ -1754,16 +1802,17 @@ impl DrainCtx<'_> {
                     // its length fields still describe, then stop.
                     close_unread_tail(buf, offset, len);
                     self.state.lost_tail.store(true, Ordering::Release);
-                    return true;
+                    return (true, parsed);
                 }
             };
             offset += event.total_len;
+            parsed += 1;
             if !self.process_event(event, window) {
                 close_unread_tail(buf, offset, len);
-                return false;
+                return (false, parsed);
             }
         }
-        true
+        (true, parsed)
     }
 
     fn send(&self, msg: LearnMsg, window: SendWindow) -> bool {
@@ -1880,8 +1929,15 @@ impl DrainCtx<'_> {
     }
 }
 
-/// Bytes of events queued on the group right now (`FIONREAD` sums the
-/// queued records), or `None` when the kernel cannot say.
+/// What the kernel reports for the events queued on the group right
+/// now: `FIONREAD` sums the queued records — but the unit differs by
+/// kernel. Before upstream `68615158c12d` ("fanotify: report full event
+/// length for FIONREAD", mainline v7.3, backported to 6.6.157+,
+/// 6.12.110+, 6.18.52+ and 7.2.6+) it counts only the 24-byte event
+/// header per event; after it the full event, 32 bytes with the pidfd
+/// info record. Callers divide by the measured unit
+/// (`measure_fionread_unit`) to count events. `None` when the kernel
+/// cannot say.
 fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
     let mut queued: libc::c_int = 0;
     // SAFETY: FIONREAD on a valid fd writes one int.
@@ -1892,19 +1948,130 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
     usize::try_from(queued).ok()
 }
 
-/// User-space bound on the unlimited kernel queue: queued event records
-/// past this many bytes (about 262,000 events at the measured 32 bytes
-/// per event, a few tens of MiB of kernel memory) are shed. 16 times
-/// the default finite queue, so only a drain that truly cannot keep up
-/// reaches it.
+/// Measures this kernel's `FIONREAD` unit for the learning group: how
+/// many bytes one queued event reports. Before upstream `68615158c12d`
+/// ("fanotify: report full event length for FIONREAD", mainline v7.3,
+/// backported to 6.6.157+, 6.12.110+, 6.18.52+ and 7.2.6+) the kernel
+/// counts only the 24-byte event header; after it the full event, 32
+/// bytes with the pidfd info record. Runs in `start()` before the
+/// filesystem marks, while a private probe inode is the only marked
+/// object: one open queues exactly one event, so the snapshot is the
+/// unit. Never fails `start()`: any measurement doubt falls back to
+/// the 24-byte header, the smaller unit, which only ever over-counts
+/// the owed events — and over-draining ends at `EAGAIN` instead of
+/// abandoning a tail.
+fn measure_fionread_unit(group: &OwnedFd) -> usize {
+    // A probe file nobody else opens: created unmarked (so no event),
+    // inode-marked, opened once (exactly one event), drained, unmarked,
+    // deleted. `tempfile` is a dev-dependency, so plain stdio it is.
+    static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct ProbeGuard(std::path::PathBuf);
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let mut probe = None;
+    for _ in 0..8 {
+        let id = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("p11scope-learn-probe-{}-{id}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                probe = Some((file, ProbeGuard(path)));
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let Some((probe, guard)) = probe else {
+        return FANOTIFY_META_LEN;
+    };
+    // SAFETY: libc call; the group and probe descriptors are valid, and
+    // a NULL pathname marks the probe's inode (the default mark type).
+    let marked = 0
+        == unsafe {
+            libc::fanotify_mark(
+                group.as_raw_fd(),
+                libc::FAN_MARK_ADD,
+                libc::FAN_OPEN,
+                probe.as_raw_fd(),
+                std::ptr::null(),
+            )
+        };
+    if !marked {
+        return FANOTIFY_META_LEN;
+    }
+    let _opened = std::fs::File::open(&guard.0).ok();
+    let snapshot = queued_event_bytes(group.as_raw_fd());
+    let mut buf = [0u8; 4096];
+    // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
+    let got = unsafe {
+        libc::read(
+            group.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if got > 0 {
+        close_unread_tail(&buf, 0, got as usize);
+    }
+    // SAFETY: as above; removes the probe mark again. Best effort: the
+    // probe file is deleted either way, so a stuck mark watches nothing.
+    unsafe {
+        libc::fanotify_mark(
+            group.as_raw_fd(),
+            libc::FAN_MARK_REMOVE,
+            libc::FAN_OPEN,
+            probe.as_raw_fd(),
+            std::ptr::null(),
+        );
+    }
+    fionread_unit_from_probe(snapshot, got, &buf)
+}
+
+/// Decides the `FIONREAD` unit from one probe round: the snapshot is
+/// accepted only when the drain read back exactly one record and the
+/// snapshot fits inside it (24-or-32 inside 32). Anything else — no
+/// snapshot, no record, several records, a snapshot larger than the
+/// record — falls back to the 24-byte header (over-counts, safe).
+fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[u8]) -> usize {
+    let Ok(got) = usize::try_from(got) else {
+        return FANOTIFY_META_LEN;
+    };
+    let Some(snapshot) = snapshot else {
+        return FANOTIFY_META_LEN;
+    };
+    if snapshot == 0 || snapshot > got || buf.len() < got {
+        return FANOTIFY_META_LEN;
+    }
+    if count_parsed_records(&buf[..got]) != 1 {
+        return FANOTIFY_META_LEN;
+    }
+    snapshot
+}
+
+/// User-space bound on the unlimited kernel queue: queued events past
+/// `cap_bytes` of records (about 262,000 events at 32 `FIONREAD` bytes
+/// per event, about 349,000 at 24 — the unit differs by kernel, see
+/// `measure_fionread_unit` — a few tens of MiB of kernel memory either
+/// way) are shed. 16 times the default finite queue, so only a drain
+/// that truly cannot keep up reaches it.
 const LEARN_BACKLOG_CAP_BYTES: usize = 8 << 20;
 
 /// Sheds a backlog past `cap_bytes` (production passes
 /// `LEARN_BACKLOG_CAP_BYTES`): reads and closes queued events undecided
 /// down to half of `cap_bytes` and files the named overflow once for
 /// the episode — the finite-queue overflow, at a bound the drain
-/// chooses. Returns false when the overflow could not be sent (the
-/// drain must exit).
+/// chooses. Counts events, not bytes: the shed owes `snapshot / unit`
+/// events minus one per parsed record, so a 24-byte-unit kernel sheds
+/// the same backlog as a 32-byte one. Returns false when the overflow
+/// could not be sent (the drain must exit).
 fn shed_backlog_past_cap(
     raw: std::os::unix::io::RawFd,
     ctx: &mut DrainCtx<'_>,
@@ -1917,16 +2084,30 @@ fn shed_backlog_past_cap(
     if queued <= cap_bytes {
         return true;
     }
-    let mut owed = queued - cap_bytes / 2;
+    let unit = ctx.fionread_unit.max(1);
+    let mut owed = queued.div_ceil(unit).saturating_sub(cap_bytes / unit / 2);
     while owed > 0 {
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if read <= 0 {
+        if read < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if read == 0 {
             break;
         }
         let read = read as usize;
         close_unread_tail(buf, 0, read);
-        owed = owed.saturating_sub(read);
+        let shed = count_parsed_records(&buf[..read]);
+        if shed == 0 {
+            // Unaccountable bytes (no parseable record): stop instead
+            // of spinning without progress — the backlog is still past
+            // the cap, so the next check re-sheds.
+            break;
+        }
+        owed = owed.saturating_sub(shed);
     }
     ctx.stats.overflows = ctx.stats.overflows.saturating_add(1);
     ctx.state.loss_shed.fetch_add(1, Ordering::Relaxed);
@@ -1961,9 +2142,16 @@ fn drain_final_tail_with(
 ) -> bool {
     let deadline = tail_deadline_from(ctx.state);
     let window = SendWindow::Final(deadline);
-    let Some(mut owed) = queued_event_bytes(raw) else {
+    let Some(snapshot) = queued_event_bytes(raw) else {
         return false;
     };
+    // Events, not bytes: on a 24-byte-unit kernel a byte count stops
+    // after 75% of the snapshot (each record reads back 32 bytes),
+    // silently dropping the rest — so the tail owes `snapshot / unit`
+    // events minus one per parsed record. The ceiling over-counts by
+    // less than one event, which ends at `EAGAIN` instead of
+    // abandoning a tail.
+    let mut owed = snapshot.div_ceil(ctx.fionread_unit.max(1));
     while owed > 0 {
         if std::time::Instant::now() >= deadline {
             ctx.state.loss_tail_deadline.fetch_add(1, Ordering::Relaxed);
@@ -1990,8 +2178,9 @@ fn drain_final_tail_with(
             return true;
         }
         let got = got as usize;
-        owed = owed.saturating_sub(got);
-        if !ctx.process_read(&buf[..got], window) {
+        let (cont, decided) = ctx.process_read(&buf[..got], window);
+        owed = owed.saturating_sub(decided);
+        if !cont {
             return false;
         }
     }
@@ -2096,6 +2285,7 @@ fn drain_loop(
     state: Arc<LearnShutdownState>,
     mut covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
+    fionread_unit: usize,
 ) {
     // Scheduling note: loader processes live ~15 ms, so the drain
     // wants prompt scheduling to name them (files still stage via
@@ -2110,6 +2300,7 @@ fn drain_loop(
         tx: &tx,
         state: &state,
         self_pid: std::process::id(),
+        fionread_unit,
         cache: LearnCache::new(),
         stats: DrainStats::default(),
         ignore_marks: 0,
@@ -2213,7 +2404,7 @@ fn drain_loop(
         if read <= 0 {
             continue;
         }
-        if !ctx.process_read(&buf[..read as usize], SendWindow::Live) {
+        if !ctx.process_read(&buf[..read as usize], SendWindow::Live).0 {
             // The engine is gone or a send hit the tail bound (the
             // loss is marked): nothing more can be delivered.
             break 'drain;
@@ -2257,6 +2448,20 @@ fn drain_loop(
 #[cfg(test)]
 mod tests {
     use std::os::unix::io::AsRawFd;
+
+    /// One synthetic 32-byte open record with no fds (fd negative, no
+    /// pidfd info): the parser accepts it, the drain counts it, and
+    /// nothing needs closing. The mask is a plain open bit, never
+    /// overflow.
+    fn synthetic_open_record() -> [u8; 32] {
+        let mut record = [0u8; 32];
+        record[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        record[4] = super::FANOTIFY_METADATA_VERSION;
+        record[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        record[16..20].copy_from_slice(&(-1i32).to_ne_bytes());
+        record[20..24].copy_from_slice(&1234i32.to_ne_bytes());
+        record
+    }
 
     /// The operator off switch disables learning only for exactly
     /// `P11SCOPE_DISABLE_FILE_LEARNING=1`; unset and every other value
@@ -3631,6 +3836,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -3675,6 +3881,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -3698,6 +3905,130 @@ mod tests {
         );
     }
 
+    /// The probe decision accepts the snapshot only for exactly one
+    /// record it fits inside: 24-in-32 (a pre-`68615158c12d` kernel)
+    /// and 32-in-32 (a newer one). Anything else — no snapshot, a
+    /// failed or short read, several records, a snapshot larger than
+    /// the record — falls back to the 24-byte header, the smaller
+    /// unit, which only ever over-counts. (Unprivileged: pure over
+    /// synthetic bytes.)
+    #[test]
+    fn learn_fionread_unit_accepts_only_a_single_record_probe() {
+        let one = synthetic_open_record();
+        let mut two = Vec::from(one);
+        two.extend_from_slice(&one);
+        assert_eq!(
+            super::fionread_unit_from_probe(Some(24), 32, &one),
+            24,
+            "a 24-byte snapshot for one 32-byte record is the old unit"
+        );
+        assert_eq!(
+            super::fionread_unit_from_probe(Some(32), 32, &one),
+            32,
+            "a 32-byte snapshot for one 32-byte record is the new unit"
+        );
+        for (snapshot, got, buf, why) in [
+            (None, 32, one.as_slice(), "no snapshot"),
+            (Some(24), -1, one.as_slice(), "a failed read"),
+            (Some(24), 0, one.as_slice(), "an empty read"),
+            (Some(0), 32, one.as_slice(), "an empty snapshot"),
+            (
+                Some(64),
+                32,
+                one.as_slice(),
+                "a snapshot larger than the record",
+            ),
+            (
+                Some(48),
+                64,
+                two.as_slice(),
+                "two records are not a unit probe",
+            ),
+            (Some(24), 32, &[0u8; 32][..], "an unparseable record"),
+        ] {
+            assert_eq!(
+                super::fionread_unit_from_probe(snapshot, got, buf),
+                super::FANOTIFY_META_LEN,
+                "measurement doubt falls back to the header: {why}"
+            );
+        }
+    }
+
+    /// Event counting across the `FIONREAD` unit change (unprivileged):
+    /// on pre-`68615158c12d` kernels one queued event reports 24
+    /// `FIONREAD` bytes but reads back 32, so a byte-counted tail stops
+    /// after 75% of any snapshot. The tail owes `snapshot / unit`
+    /// events minus one per parsed record instead: with a 24-byte unit
+    /// and a hundred 32-byte records queued, all hundred are decided.
+    /// The pipe provides the snapshot; the read is injected.
+    #[test]
+    fn learn_tail_counts_events_not_bytes_across_fionread_units() {
+        use std::os::unix::io::FromRawFd;
+        use std::sync::atomic::Ordering;
+        const EVENTS: usize = 100;
+        const UNIT: usize = 24;
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        // The old-kernel snapshot for the events: 24 bytes each.
+        let snapshot = vec![7u8; EVENTS * UNIT];
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                snapshot.as_ptr() as *const libc::c_void,
+                snapshot.len(),
+            )
+        };
+        assert_eq!(written, snapshot.len() as libc::ssize_t);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: reader.as_raw_fd(),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: UNIT,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        // The records the kernel would return: 32 bytes each, served
+        // seven at a time so the accounting spans odd chunk splits.
+        let mut queued: Vec<u8> = Vec::with_capacity(EVENTS * 32);
+        for _ in 0..EVENTS {
+            queued.extend_from_slice(&synthetic_open_record());
+        }
+        let done =
+            super::drain_final_tail_with(reader.as_raw_fd(), &mut ctx, &mut buf, |_, into| {
+                if queued.is_empty() {
+                    // SAFETY: test-only errno for the injected drain end.
+                    unsafe {
+                        *libc::__errno_location() = libc::EAGAIN;
+                    }
+                    return -1;
+                }
+                let take = queued.len().min(7 * 32);
+                into[..take].copy_from_slice(&queued[..take]);
+                queued.drain(..take);
+                take as libc::ssize_t
+            });
+        assert!(done, "the tail decides the whole snapshot");
+        assert_eq!(
+            ctx.stats.events, EVENTS as u64,
+            "every queued event is decided, not the first 75%"
+        );
+        assert!(
+            !state.lost_tail.load(Ordering::Acquire),
+            "a decided snapshot is not a lost tail"
+        );
+    }
+
     /// The period mark state clears only after a successful flush: a
     /// failed flush keeps the counter and the per-period set, so the
     /// cap keeps bounding new marks instead of undercounting past it.
@@ -3710,6 +4041,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 5,
@@ -4121,7 +4453,7 @@ mod tests {
         );
         let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
         // Never begin the drain: this thread reads the group itself.
-        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let (group, tx, _, _, fionread_unit) = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         // 26000 opens with nobody reading: past the default 16384-event
         // queue limit whether the kernel counts 24 or 32 bytes per event
@@ -4150,6 +4482,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4194,7 +4527,7 @@ mod tests {
             let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if read > 0 {
                 let chunk = buf[..read as usize].to_vec();
-                assert!(ctx.process_read(&chunk, super::SendWindow::Live));
+                assert!(ctx.process_read(&chunk, super::SendWindow::Live).0);
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -4247,7 +4580,7 @@ mod tests {
         let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
         // Never begin the drain: this thread queues the snapshot, then
         // decides exactly it through the stop-tail path.
-        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let (group, tx, _, _, fionread_unit) = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         assert!(
             std::process::Command::new("sh")
@@ -4272,6 +4605,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4324,7 +4658,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let target = super::file_identity(&file).unwrap();
         let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
-        let (group, _tx, _, _) = learner.pending.take().expect("armed learner");
+        let (group, _tx, _, _, _) = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         let open_by_child = || {
             assert!(
@@ -4374,7 +4708,7 @@ mod tests {
         let path = dir.path().join("negative.dat");
         std::fs::write(&path, b"not elf").unwrap();
         let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
-        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let (group, tx, _, _, _) = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         let state = std::sync::Arc::new(super::LearnShutdownState::default());
         let mut ctx = super::DrainCtx {
@@ -4382,6 +4716,7 @@ mod tests {
             tx: &tx,
             state: &state,
             self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,

@@ -3457,6 +3457,17 @@ impl<N: Ord + Clone, S: Ord + Clone> OccurrenceCounter<N, S> {
 }
 
 fn decoded_occurrence_count(group: &[Discovered<'_>]) -> usize {
+    // One piece cannot repeat an occurrence: its k-th equal target (or
+    // skip) is numbered k, so every fed tuple is distinct and the set
+    // would hold exactly one per feed. Only corroborating pieces of one
+    // group can meet on an occurrence.
+    if let [module] = group {
+        return module.targets.len() + module.skipped.len();
+    }
+    decoded_occurrence_count_by_set(group)
+}
+
+fn decoded_occurrence_count_by_set(group: &[Discovered<'_>]) -> usize {
     let mut counter: OccurrenceCounter<&str, &str> = OccurrenceCounter::default();
     for module in group {
         debug_assert_eq!(
@@ -5623,6 +5634,94 @@ fn build_from_sources_with(
     );
     plan.skipped.extend(orphaned);
     plan
+}
+
+#[cfg(test)]
+mod decoded_occurrence_count_tests {
+    use super::*;
+
+    fn target(name: &'static str, object: u32, file_offset: u64) -> Target<'static> {
+        Target {
+            name,
+            object: PinnedObjectId(object),
+            object_path: "/lib/provider.so",
+            file_offset,
+            fork_safe: false,
+            semantic_authorized: false,
+            standard_layout_evidence: None,
+            reproven_unfinished: false,
+            name_authorized: false,
+            table: None,
+            ordinal: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn piece(
+        source: &'static str,
+        targets: Vec<Target<'static>>,
+        skipped: Vec<Skipped>,
+    ) -> Discovered<'static> {
+        Discovered {
+            object: PinnedObjectId(1),
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+                inode: 1,
+            },
+            path: "/lib/provider.so",
+            module_named: false,
+            source,
+            tables: Vec::new(),
+            interfaces: 0,
+            surfaces: Vec::new(),
+            entries_seen: targets.len() + skipped.len(),
+            targets,
+            skipped,
+            scan_evidence: None,
+        }
+    }
+
+    fn skip(subject: &str, reason: &str) -> Skipped {
+        Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// The one-piece shortcut equals the occurrence set on repeated
+    /// targets and skips; corroborating pieces still dedupe through it.
+    #[test]
+    fn one_piece_count_equals_the_occurrence_set() {
+        let single = [piece(
+            "scan",
+            vec![
+                target("C_Sign", 1, 8),
+                target("C_Sign", 1, 8),
+                target("C_Sign", 1, 16),
+                target("C_Init", 2, 8),
+                target("C_Sign", 1, 8),
+            ],
+            vec![skip("C_Foo", "null pointer"), skip("C_Foo", "null pointer")],
+        )];
+        assert_eq!(decoded_occurrence_count(&single), 7);
+        assert_eq!(decoded_occurrence_count_by_set(&single), 7);
+        let empty = [piece("scan", Vec::new(), Vec::new())];
+        assert_eq!(decoded_occurrence_count(&empty), 0);
+        assert_eq!(decoded_occurrence_count_by_set(&empty), 0);
+        let corroborated = [
+            piece(
+                "scan",
+                vec![target("C_Sign", 1, 8), target("C_Sign", 1, 8)],
+                Vec::new(),
+            ),
+            piece("manifest", vec![target("C_Sign", 1, 8)], Vec::new()),
+        ];
+        assert_eq!(decoded_occurrence_count(&corroborated), 2);
+        assert_eq!(
+            decoded_occurrence_count(&corroborated),
+            decoded_occurrence_count_by_set(&corroborated)
+        );
+    }
 }
 
 #[cfg(test)]

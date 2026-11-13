@@ -179,6 +179,25 @@ class AcceptTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("unproven=2 gaps=7", out)
 
+    def test_deadline_straddle_with_retained_refresh_passes_witness_available(self):
+        # F1 control: the N3 retained-refresh invariant applies
+        # irrespective of substrate — a witness-available report with
+        # the deadline gap and one retained row per caller qualifies.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 2})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=5", out)
+
     def test_witness_available_unbound_positive_passes_off_overlay(self):
         # Host leg (7.0.0-azure): the witness ran, so no unproven gaps
         # exist; the named counted positive on the owned module is
@@ -366,6 +385,43 @@ class RefuseTests(unittest.TestCase):
              "subject": "native owner refresh refused",
              "repeats": 1})
         rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("duplicate retained refresh for one caller", out)
+
+    def test_retained_refresh_without_deadline_fails_witness_available(self):
+        # F1: the N3 deadline rule is not degraded-only — a lone
+        # facts-retained row stays loud on a witness-available report.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("retained refresh without a run deadline", out)
+
+    def test_duplicate_retained_refresh_per_caller_fails_witness_available(self):
+        # F1: one row per owning caller on every substrate — a second
+        # retained row for the same caller stays loud even with the
+        # deadline present on a witness-available report.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 2})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("duplicate retained refresh for one caller", out)
 

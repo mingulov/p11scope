@@ -3508,6 +3508,14 @@ fn attach_session_context(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// The never-stop fallback when the named pid's view will not open but
+/// the pid may still be alive: name the cause and the degraded mode.
+/// States the fallback, never the outcome — a later failure can still
+/// abort before any report, so this must not promise one.
+fn named_view_open_fallback_line(pid: u32, error: &str) -> String {
+    format!("p11scope: --pid {pid}: {error}; continuing without the named process view")
+}
+
 fn capture_with_host(
     a: &CaptureArgs,
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
@@ -3540,9 +3548,7 @@ fn capture_with_host(
                     if crate::process::generation_gone(*p) {
                         return Err(crate::process::MissingNamedProcess { pid: *p }.into());
                     }
-                    emit_capture_diagnostic(&format!(
-                        "p11scope: --pid {p}: {error}; reporting an empty partial capture"
-                    ));
+                    emit_capture_diagnostic(&named_view_open_fallback_line(*p, &error));
                     (Scope::Pid(*p), None)
                 }
             }
@@ -27635,6 +27641,18 @@ int main(int argc, char **argv) {
             Some("/usr/bin/second"),
             "{reconciled:?}"
         );
+    }
+
+    /// O11: the never-stop fallback when the named pid's view will not
+    /// open must not promise a report — a later failure can still abort
+    /// before anything is reported. It names the cause and the degraded
+    /// mode instead.
+    #[test]
+    fn named_view_fallback_line_promises_no_report() {
+        let line = named_view_open_fallback_line(1, "permission denied");
+        assert!(line.contains("--pid 1"), "{line}");
+        assert!(line.contains("permission denied"), "{line}");
+        assert!(!line.contains("reporting"), "no promised report: {line}");
     }
 
     /// CLI text: with nothing attached yet, the readiness line says

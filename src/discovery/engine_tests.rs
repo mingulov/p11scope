@@ -79767,7 +79767,8 @@ fn cgroup_delayed_kthread_exit_after_user_relisting_skips() {
 }
 
 /// Fix6: departed kthread marks must not permanently exhaust the
-/// bounded exclusion. After 256 proved kthreads depart, a fresh
+/// bounded exclusion. After the departed history fills past its
+/// bound (MAX_SCAN_PIDS proved kthreads depart), a fresh
 /// proved kthread still earns its exemption.
 #[test]
 fn departed_kthreads_do_not_exhaust_future_exclusions() {
@@ -79776,7 +79777,8 @@ fn departed_kthreads_do_not_exhaust_future_exclusions() {
     }
     let dir = tempfile::tempdir().unwrap();
     let proc_root = dir.path();
-    for pid in 5000u32..5256u32 {
+    let bound: u32 = crate::discovery::engine::MAX_SCAN_PIDS as u32;
+    for pid in 5000u32..(5000u32 + bound) {
         let pid_dir = proc_root.join(pid.to_string());
         std::fs::create_dir_all(&pid_dir).unwrap();
         std::fs::write(
@@ -79796,7 +79798,7 @@ fn departed_kthreads_do_not_exhaust_future_exclusions() {
     std::fs::write(fresh_dir.join("maps"), "").unwrap();
     let mut engine = system_generation_engine();
     engine.proc_root = proc_root.to_path_buf();
-    let live: BTreeSet<u32> = (5000u32..5256u32).collect();
+    let live: BTreeSet<u32> = (5000u32..(5000u32 + bound)).collect();
     engine.note_scope_walk(&live, Some(100), Some(105));
     engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
     let fresh: BTreeSet<u32> = [4242].into_iter().collect();
@@ -79805,7 +79807,7 @@ fn departed_kthreads_do_not_exhaust_future_exclusions() {
     assert_eq!(
         engine.pid_descendant_gaps(),
         0,
-        "a fresh proved kthread must still skip after 256 departures"
+        "a fresh proved kthread must still skip after the history fills past its bound"
     );
 }
 
@@ -79899,10 +79901,10 @@ fn cgroup_relist_window_exit_counts_despite_history_overlap() {
     );
 }
 
-/// Fix7 pin (spark fix6 F1, history eviction): past the 256-entry
-/// bound the oldest departed interval evicts first — its delayed
-/// exit then counts (fail-closed) — while a retained entry still
-/// skips. 256 departures fill the history; the 257th (pid 4242)
+/// Fix7 pin (spark fix6 F1, history eviction): past the
+/// MAX_SCAN_PIDS-entry bound the oldest departed interval evicts
+/// first — its delayed exit then counts (fail-closed) — while a
+/// retained entry still skips. A full history plus one (pid 4242)
 /// evicts pid 5000's interval. Unbounded history must fail this
 /// twin.
 #[test]
@@ -79912,7 +79914,8 @@ fn evicted_departed_kthread_exit_counts_fail_closed() {
     }
     let dir = tempfile::tempdir().unwrap();
     let proc_root = dir.path();
-    for pid in 5000u32..5256u32 {
+    let bound: u32 = crate::discovery::engine::MAX_SCAN_PIDS as u32;
+    for pid in 5000u32..(5000u32 + bound) {
         let pid_dir = proc_root.join(pid.to_string());
         std::fs::create_dir_all(&pid_dir).unwrap();
         std::fs::write(
@@ -79932,7 +79935,7 @@ fn evicted_departed_kthread_exit_counts_fail_closed() {
     std::fs::write(fresh_dir.join("maps"), "").unwrap();
     let mut engine = system_generation_engine();
     engine.proc_root = proc_root.to_path_buf();
-    let live: BTreeSet<u32> = (5000u32..5256u32).collect();
+    let live: BTreeSet<u32> = (5000u32..(5000u32 + bound)).collect();
     engine.note_scope_walk(&live, Some(100), Some(105));
     engine.note_scope_walk(&BTreeSet::new(), Some(200), Some(205));
     let fresh: BTreeSet<u32> = [4242].into_iter().collect();

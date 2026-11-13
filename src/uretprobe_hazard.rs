@@ -2502,7 +2502,6 @@ mod tests {
         let sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
         let keep = crate::caps::post_setup_keep(true, true, false, sets.effective);
         let needed = crate::caps::post_setup_shed_needed(keep, sets);
-        let pre_shed_eff = crate::caps::read_effective();
         let pre_shed_context = AssessmentContext::current();
         // Seed a pre-shed approval for the live context without forking.
         let mut retained: Option<ReturnProbeAdmission> = None;
@@ -2523,7 +2522,6 @@ mod tests {
         .expect("the shed succeeds");
         let post_shed_context = AssessmentContext::current();
         let post_sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
-        let post_shed_eff = crate::caps::read_effective();
         // The next attach's ensure must reuse the retained approval.
         let mut probed = false;
         ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
@@ -2542,14 +2540,16 @@ mod tests {
             // comparison is the airtight "the shed ran" proof. The
             // tracked context only carries CapEff, so a
             // permitted/inheritable-only shed leaves it identical; the
-            // contexts-differ assert only proves movement when CapEff
-            // itself changed.
+            // contexts-differ assert only proves movement when the
+            // pre/post context capabilities themselves changed (both
+            // read thread-self on this thread, unlike the main-thread
+            // /proc/self read).
             assert!(
                 sets != post_sets,
                 "the shed must change the live capability sets when the keep differs; \
                  otherwise this twin cannot tell the re-key from a silently skipped shed"
             );
-            if pre_shed_eff != post_shed_eff {
+            if pre_shed_context.capabilities != post_shed_context.capabilities {
                 assert!(
                     pre_shed_context != post_shed_context,
                     "a shed that changed CapEff must change the live assessment context; \
@@ -2588,7 +2588,6 @@ mod tests {
             needed,
             "the privileged shed cell needs a real shed (run as root with capabilities to drop)"
         );
-        let pre_shed_eff = crate::caps::read_effective();
         let pre_shed_context = AssessmentContext::current();
         let mut retained: Option<ReturnProbeAdmission> = None;
         ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
@@ -2608,18 +2607,17 @@ mod tests {
         .expect("the shed succeeds");
         let post_shed_context = AssessmentContext::current();
         let post_sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
-        let post_shed_eff = crate::caps::read_effective();
         // Same movement proof as the plain twin: the set comparison is
         // airtight for "the shed ran", and the contexts-differ assert
-        // only proves movement when CapEff itself changed (a
-        // permitted/inheritable-only shed leaves the tracked context
-        // identical while `needed` is still true).
+        // only proves movement when the pre/post context capabilities
+        // themselves changed (both read thread-self on this thread,
+        // unlike the main-thread /proc/self read).
         assert!(
             sets != post_sets,
             "the shed must change the live capability sets; otherwise this twin cannot \
              tell the re-key from a silently skipped shed"
         );
-        if pre_shed_eff != post_shed_eff {
+        if pre_shed_context.capabilities != post_shed_context.capabilities {
             assert!(
                 pre_shed_context != post_shed_context,
                 "a shed that changed CapEff must change the live assessment context; \

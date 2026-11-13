@@ -1464,12 +1464,19 @@ fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32
 /// dropping it silently at the boundary, and `stop` records when the
 /// stop landed so the tail deadline is anchored to the stop — not to
 /// whenever the drain notices it — and always fits inside the join
-/// bound.
+/// bound. The `loss_*` counters attribute every learning loss to its
+/// source for the `-v` telemetry line: counts only, never paths, pids
+/// or file bytes.
 #[derive(Debug, Default)]
 struct LearnShutdownState {
     shutdown: AtomicBool,
     lost_tail: AtomicBool,
     stop: std::sync::Mutex<Option<std::time::Instant>>,
+    loss_shed: std::sync::atomic::AtomicU64,
+    loss_tail_deadline: std::sync::atomic::AtomicU64,
+    loss_tail_read_error: std::sync::atomic::AtomicU64,
+    loss_send_deadline: std::sync::atomic::AtomicU64,
+    loss_join_timeout: std::sync::atomic::AtomicU64,
 }
 
 /// Sends one message, waiting past a full channel in 1 ms steps so a
@@ -1510,6 +1517,7 @@ fn send_learn_in(
         };
         if closed {
             state.lost_tail.store(true, Ordering::Release);
+            state.loss_send_deadline.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         match tx.try_send(msg) {
@@ -1921,6 +1929,7 @@ fn shed_backlog_past_cap(
         owed = owed.saturating_sub(read);
     }
     ctx.stats.overflows = ctx.stats.overflows.saturating_add(1);
+    ctx.state.loss_shed.fetch_add(1, Ordering::Relaxed);
     ctx.send(LearnMsg::QueueOverflow, SendWindow::Live)
 }
 
@@ -1957,6 +1966,7 @@ fn drain_final_tail_with(
     };
     while owed > 0 {
         if std::time::Instant::now() >= deadline {
+            ctx.state.loss_tail_deadline.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let got = read(raw, buf);
@@ -1968,6 +1978,9 @@ fn drain_final_tail_with(
                 std::io::ErrorKind::WouldBlock => return true,
                 _ => {
                     ctx.stats.unreadable = ctx.stats.unreadable.saturating_add(1);
+                    ctx.state
+                        .loss_tail_read_error
+                        .fetch_add(1, Ordering::Relaxed);
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -2049,6 +2062,27 @@ fn run_remark_pass(
             Some((previous.clone(), 1))
         }
     }
+}
+
+/// Prints the drain's `-v` telemetry line: progress counts plus the
+/// per-source loss counters. Counts only, never paths, pids or bytes.
+fn print_drain_telemetry(ctx: &DrainCtx<'_>, state: &LearnShutdownState) {
+    let stats = &ctx.stats;
+    eprintln!(
+        "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable, shed {}, tail_deadline {}, tail_read_error {}, send_deadline {}, join_timeout {}",
+        stats.events,
+        stats.checked,
+        stats.proved,
+        stats.sent_candidates,
+        stats.sent_loads,
+        stats.overflows,
+        stats.unreadable,
+        state.loss_shed.load(Ordering::Relaxed),
+        state.loss_tail_deadline.load(Ordering::Relaxed),
+        state.loss_tail_read_error.load(Ordering::Relaxed),
+        state.loss_send_deadline.load(Ordering::Relaxed),
+        state.loss_join_timeout.load(Ordering::Relaxed),
+    );
 }
 
 /// The drain: poll/read the group, decide each opened file at most once
@@ -2162,17 +2196,7 @@ fn drain_loop(
                 }
             }
             if crate::run::capture_diagnostics_on() {
-                let stats = &ctx.stats;
-                eprintln!(
-                    "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable",
-                    stats.events,
-                    stats.checked,
-                    stats.proved,
-                    stats.sent_candidates,
-                    stats.sent_loads,
-                    stats.overflows,
-                    stats.unreadable,
-                );
+                print_drain_telemetry(&ctx, &state);
             }
         }
         if ready == 0 {
@@ -2199,19 +2223,34 @@ fn drain_loop(
         if !drain_final_tail(raw, &mut ctx, &mut buf) {
             state.lost_tail.store(true, Ordering::Release);
         }
-        return;
+    } else {
+        // Exiting with a readable queue means unprocessed events are lost
+        // with the group fd: mark the tail so the engine files it loudly.
+        let mut final_poll = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: libc poll on one valid fd with a zero timeout.
+        let ready = unsafe { libc::poll(&mut final_poll, 1, 0) };
+        if ready > 0 {
+            state.lost_tail.store(true, Ordering::Release);
+        }
     }
-    // Exiting with a readable queue means unprocessed events are lost
-    // with the group fd: mark the tail so the engine files it loudly.
-    let mut final_poll = libc::pollfd {
-        fd: raw,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: libc poll on one valid fd with a zero timeout.
-    let ready = unsafe { libc::poll(&mut final_poll, 1, 0) };
-    if ready > 0 {
-        state.lost_tail.store(true, Ordering::Release);
+    // Exiting past the join bound means the engine already gave up the
+    // join: count the join timeout with the other loss sources before
+    // the final line, which always prints the run's totals.
+    let late = state
+        .stop
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .is_some_and(|at| std::time::Instant::now() > at + LEARN_WORKER_BOUND);
+    if late {
+        state.loss_join_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+    if crate::run::capture_diagnostics_on() {
+        print_drain_telemetry(&ctx, &state);
     }
 }
 

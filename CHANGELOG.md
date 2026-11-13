@@ -131,9 +131,7 @@ versioned separately and are opaque, exact dispatch keys.
   raised at startup with a fixed reserve held back, and the reserve is
   sampled once per tick, failing open.
 - Library-handle pressure waits and retries instead of dropping work
-  (one scan pin per physical file, deferred handles retried first),
-  and the live tick tracks user processes only so kernel threads
-  never become newcomers or gaps.
+  (one scan pin per physical file, deferred handles retried first).
 
 ### Changed
 

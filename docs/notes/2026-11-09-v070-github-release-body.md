@@ -36,7 +36,7 @@ What is new vs 0.6.0:
   stdout, and `--event-interval <dur>` adds periodic `totals` snapshots.
 - Container image `ghcr.io/mingulov/p11scope:0.7.0` for one-host Docker
   use and the Kubernetes DaemonSet (tag appears at publish).
-- Linux 7.4-rc1 joins the BPF kernel matrix (6.6–7.3 plus 7.4-rc1).
+- Linux 7.4-rc2 joins the BPF kernel matrix (6.6–7.3 plus 7.4-rc2).
 - New real-client coverage: OpenSSL PKCS#11 clients, pkcs11-tool in the
   privileged campaign, pkcs11-spy forwarding at system scale.
 - Docs pack: troubleshooting page, real first-run output, "why not just

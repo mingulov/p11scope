@@ -25,7 +25,7 @@ Version 0.7.0 answers "which program called my token?": callers running
 under an interpreter now carry an app label, so the answer names the
 application, not just the runtime. Also new: inventory events stream to
 stdout (`inventory --event-log -` with `--event-interval`), a published
-container image, Linux 7.4-rc1 in the tested kernel matrix, and a docs
+container image, Linux 7.4-rc2 in the tested kernel matrix, and a docs
 pack (troubleshooting, real first-run output, a pkcs11-spy comparison).
 
 Honest limits, up front:

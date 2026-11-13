@@ -8,9 +8,9 @@ short-lived exit the scope walks never list counts a `pid_descendant_gap`.
 The product reports honest gap counts with no per-gap ancestry, so the
 oracle cannot tell ambient bursts from workload gaps on its own. The
 qualify harness runs this census alongside the `system` and `mt-system`
-cells; the oracle joins census exits outside the workload and observer
-trees as proven ambient and keeps the unproven remainder at the strict
-lone-gap ceiling.
+cells; the oracle joins census exits outside the workload, observer and
+harness trees as ambient evidence appended to the failure detail. The
+arm never accepts a cell: count cover is not proof.
 
 The poll loop uses only /proc reads and existence checks: no fork, no
 exec, no sleep binary. It is spawned before the observer starts and
@@ -22,8 +22,9 @@ command lines.
 Output is JSON lines: one `header`, any number of `baseline` (alive at
 census start), `birth`, `ephemeral` (seen but unreadable before exit),
 `exit` and `marker` records, then one `trailer`. The harness appends the
-`observer` line (observer pid, known only after launch) once the census
-stops. Marker files are touched with shell builtins when the harness
+`observer` line (observer pid, known only after launch) and the
+`harness` line (the harness shell pid, a never-joined root) once the
+census stops. Marker files are touched with shell builtins when the harness
 observes capture readiness (`capturing`) and observer settlement
 (`settled`); the capture window is the monotonic interval between them.
 The census creates the `--ready` file once its baseline sweep completes;

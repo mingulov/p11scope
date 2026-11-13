@@ -300,9 +300,10 @@ judge() {
   if [ "${4:-}" = select-endpoint-system ] && [[ $(uname -r) =~ ^6\.6\. ]]; then
     extra+=(--allow-66-discovery-gap)
   fi
-  # Ambient-burst lane: the harness census of out-of-tree exits lets the
-  # oracle join honest ambient bursts on the system count cells; without
-  # it the cells stay strict (a missing census never weakens the gate).
+  # Ambient-burst lane, evidence-only: the harness census of
+  # out-of-tree exits annotates system-cell failures for triage; the
+  # cells stay strict with or without it (a missing census never
+  # weakens the gate).
   if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ -s "$4.census.jsonl" ]; then
     extra+=(--census "$4.census.jsonl")
   fi
@@ -425,6 +426,11 @@ gated() {
     fi
   fi
   if [ -n "$pp" ] && [ -n "${CHILDREN[$pp]:-}" ]; then terminate "$pp"; observer_rc=$LAST_EXIT; fi
+  # The observer is settled above, so the capture window is closed: mark
+  # it before the harness tail (terminate sleeps) forks, or the tail
+  # lands in-window and inflates the join. The harness root below keeps
+  # any poll-quantum straggler out of the ambient join either way.
+  if [ -n "$census_pid" ] && [ "$census_pid" != pending ]; then : >> "$cell.census.settled"; fi
   case "$cell" in
     mt-exact|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|counter-latency-mt|mt-system)
       # The mt workloads self-exit after LEDGER; every other workload holds.
@@ -438,15 +444,15 @@ gated() {
     *)
       terminate "$wl"; workload_rc=$LAST_EXIT ;;
   esac
-  # The observer is settled above, so the capture window is closed: mark
-  # it, stop the census, and bind the observer pid for tree roots. All
-  # post-capture; a census that died mid-cell leaves its stderr behind
-  # and the oracle fails the burst arm closed on the incomplete window.
+  # Post-capture: stop the census and bind the observer and harness
+  # pids for tree roots. A census that died mid-cell leaves its stderr
+  # behind and the oracle fails the census arm closed on the incomplete
+  # window.
   if [ -n "$census_pid" ] && [ "$census_pid" != pending ]; then
-    : >> "$cell.census.settled"
     : >> "$cell.census.stop"
     finish "$census_pid" "$READY_TICKS" || true
     if [ -n "$pp" ]; then printf '{"type": "observer", "pid": %d}\n' "$pp" >> "$cell.census.jsonl"; fi
+    printf '{"type": "harness", "pid": %d}\n' "$$" >> "$cell.census.jsonl"
   fi
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }

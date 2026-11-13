@@ -2157,6 +2157,94 @@ fn snapshot_gap_lines_escape_target_controlled_control_characters() {
     );
 }
 
+/// Verbose Details folds identical object-size-cap gaps — one examining
+/// process per row — into one line with the process count, instead of
+/// one identical line per process. JSON keeps every row.
+#[test]
+fn verbose_details_folds_identical_object_size_gaps_with_process_count() {
+    let (mut harness, _caller) = single_caller_harness("present-size-fold", 1);
+    for pid in [1001u32, 1002, 1003] {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: "/opt/google/chrome/chrome".into(),
+                reason: "object is 600920136 bytes; limit is 536870912".into(),
+                budget: None,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let gap_lines: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(
+        gap_lines,
+        vec![
+            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912 (3 processes)"
+        ],
+        "one folded line, not three identical ones:\n{snapshot}"
+    );
+    // JSON keeps every row: the fold is text-only.
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 3);
+}
+
+/// The Details fold is exact: a lone object-size gap renders bare
+/// (no count suffix), and identical non-size rows never fold.
+#[test]
+fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
+    let (mut harness, _caller) = single_caller_harness("present-size-nofold", 1);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(1001),
+            subject: "/opt/big.so".into(),
+            reason: "object is 600920136 bytes; limit is 536870912".into(),
+            budget: None,
+        });
+    for pid in [1002u32, 1003] {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: "/opt/other.so".into(),
+                reason: "some other refusal".into(),
+                budget: None,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let gap_lines: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(
+        gap_lines,
+        vec![
+            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912",
+            "gap [/opt/other.so] some other refusal",
+            "gap [/opt/other.so] some other refusal",
+        ],
+        "{snapshot}"
+    );
+}
+
 #[test]
 fn uncovered_edges_read_neither_idle_nor_armed() {
     // I3 (review): quiet is a fact only under a loss-free count or a
@@ -3695,7 +3783,7 @@ fn gap_reason_names_the_host_root_fallback_when_attempted() {
     presentation.gaps_suppressed = 0;
     for reason in [
         "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: open failed: No such file or directory (os error 2))",
-        "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: object is 278755480 bytes; limit is 268435456)",
+        "opening object within retained target root: No such file or directory (os error 2) (host-root fallback: object is 578755480 bytes; limit is 536870912)",
     ] {
         presentation.gaps.push(GapView {
             caller: None,
@@ -3754,7 +3842,7 @@ fn concise_folds_foreign_root_gaps_by_reason_and_keeps_json_complete() {
     for (subject, reason) in [
         (
             "/lib/big.so",
-            "object is 278755480 bytes; limit is 268435456",
+            "object is 578755480 bytes; limit is 536870912",
         ),
         (
             "relative/path.so",
@@ -3960,7 +4048,7 @@ fn concise_keeps_other_object_failures_out_of_the_unreachable_line() {
         ),
         (
             "/lib/big.so",
-            "object is 278755480 bytes; limit is 268435456",
+            "object is 578755480 bytes; limit is 536870912",
         ),
         (
             "relative/path.so",

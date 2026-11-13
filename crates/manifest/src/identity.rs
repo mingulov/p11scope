@@ -24,7 +24,7 @@ use crate::elf::{ElfAbi, ExportWalk, classified_validated_object, exports_matchi
 use crate::maps::{Device, ObjectKey};
 
 #[cfg(feature = "identify")]
-pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(feature = "identify")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

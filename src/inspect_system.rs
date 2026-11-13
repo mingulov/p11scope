@@ -9718,12 +9718,12 @@ mod tests {
     #[test]
     fn concise_folds_too_large_gaps_to_one_plain_line() {
         let mut catalog = catalog_with(Vec::new());
-        for (pid, size) in [(21u32, 319346888u64), (22, 300000000)] {
+        for (pid, size) in [(21u32, 619346888u64), (22, 600000000)] {
             catalog.skipped.push(PidGap::member(
                 pid,
                 Skipped {
                     subject: format!("/proc/{pid}/root/usr/lib/big.so"),
-                    reason: format!("too_large ({size} bytes; per-object cap is 268435456)"),
+                    reason: format!("too_large ({size} bytes; per-object cap is 536870912)"),
                 },
             ));
         }
@@ -9731,12 +9731,12 @@ mod tests {
             23,
             Skipped {
                 subject: "/proc/23/root/usr/lib/huge.so".into(),
-                reason: "object is 407976096 bytes; limit is 268435456".into(),
+                reason: "object is 607976096 bytes; limit is 536870912".into(),
             },
         ));
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(
-            concise.contains("3 files over 256 MiB not read"),
+            concise.contains("3 files over 512 MiB not read"),
             "{concise}"
         );
         assert_eq!(
@@ -9748,9 +9748,9 @@ mod tests {
             "{concise}"
         );
         let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
-        assert!(verbose.contains("too_large (319346888 bytes"), "{verbose}");
+        assert!(verbose.contains("too_large (619346888 bytes"), "{verbose}");
         assert!(
-            verbose.contains("object is 407976096 bytes; limit is 268435456"),
+            verbose.contains("object is 607976096 bytes; limit is 536870912"),
             "{verbose}"
         );
     }
@@ -9775,16 +9775,16 @@ mod tests {
             31,
             Skipped {
                 subject: "/lib/big.so".into(),
-                reason: "object is 278755480 bytes; limit is 268435456".into(),
+                reason: "object is 578755480 bytes; limit is 536870912".into(),
             },
         ));
         assert_eq!(
-            too_large_cap("object is 278755480 bytes; limit is 268435456"),
-            Some(268435456)
+            too_large_cap("object is 578755480 bytes; limit is 536870912"),
+            Some(536870912)
         );
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(
-            concise.contains("1 file over 256 MiB not read"),
+            concise.contains("1 file over 512 MiB not read"),
             "the size-cap refusal keeps its too_large fold: {concise}"
         );
         assert!(

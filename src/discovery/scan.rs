@@ -667,10 +667,11 @@ impl Default for ScanLimits {
             // Measured (cgroup-256 Task 5, 2026-09-17): libxul.so is
             // 183,575,264 bytes on disk with 63,639,548 readable data bytes,
             // so the old 64 MiB cap refused its snapshots and held its data
-            // at a 5% margin. 256 MiB covers the largest known real-world
-            // object with headroom, matches the manifest per-object cap
-            // (`MAX_OBJECT_BYTES`), and still refuses absurd files; the
-            // unchanged 512 MiB total keeps bounding the worst case.
+            // at a 5% margin. 256 MiB bounds one object's budgeted snapshot
+            // reads here; the manifest open cap (`MAX_OBJECT_BYTES`) is
+            // wider, so a 256-512 MiB object opens but reads no snapshot
+            // on this path. The unchanged 512 MiB total keeps bounding the
+            // worst case.
             per_object_bytes: 256 * 1024 * 1024,
             total_bytes: 512 * 1024 * 1024,
         }
@@ -12195,7 +12196,7 @@ mod tests {
             foreign_failure("/lib/b.so", enoent, "/etc/avahi"),
             foreign_failure(
                 "/lib/big.so",
-                "object is 278755480 bytes; limit is 268435456",
+                "object is 578755480 bytes; limit is 536870912",
                 "/etc/avahi",
             ),
             foreign_failure(
@@ -12217,7 +12218,7 @@ mod tests {
         assert_eq!(skips[0].subject, "/lib/a.so");
         assert_eq!(skips[1].subject, "/lib/b.so");
         assert_eq!(
-            skips[2].reason, "object is 278755480 bytes; limit is 268435456",
+            skips[2].reason, "object is 578755480 bytes; limit is 536870912",
             "a size-cap refusal keeps its exact wording for the too_large fold: {:#?}",
             skips[2]
         );

@@ -1157,7 +1157,7 @@ mod tests {
         );
         for (reason, root) in [
             (
-                "object is 278755480 bytes; limit is 268435456",
+                "object is 578755480 bytes; limit is 536870912",
                 Some("/proc/99999/fdinfo"),
             ),
             (

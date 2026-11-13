@@ -351,8 +351,9 @@ gated() {
     # Ambient-burst lane: start the fork-free /proc census before the
     # observer exists and wait for its baseline, so every process born
     # inside the capture window gets ancestry. A census that never
-    # becomes ready fails the cell loud: system cells require ambient
-    # evidence, and a silent fallback would misjudge bursts as strict.
+    # becomes ready fails the cell on purpose: setup trouble means the
+    # harness itself is broken, and a degraded cell must fail loud
+    # rather than run silently uninstrumented.
     if [ "$census_pid" = pending ]; then
       python3 -I "$HERE/system-cell-census.py" --out "$cell.census.jsonl" --stop "$cell.census.stop" \
         --workload "$wl" --capturing "$cell.census.capturing" --settled "$cell.census.settled" \

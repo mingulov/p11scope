@@ -2847,30 +2847,110 @@ fn display_module_gaps(skipped: &[SkippedOut]) -> Vec<(String, &SkippedOut)> {
 }
 
 /// The concise twin of [`module_gap_lines`]: the most decision-relevant
-/// one or two refused or partially covered providers with file, plain
-/// status and the `--module` remedy, so a concise PARTIAL names its
-/// target without requiring `-v`. Empty when nothing was refused.
+/// refused or partially covered providers with file, plain status and
+/// the `--module` remedy, so a concise PARTIAL names its target
+/// without requiring `-v`. Identical proxy-closure refusals fold into
+/// one short line per distinct reason (see [`folded_closure_line`])
+/// instead of repeating the long planner reason per file; the header
+/// counts covered rows, so a fold reads "showing 3 of 3", never a
+/// hidden remainder. Empty when nothing was refused.
 fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     let total = ev.discovery.modules_skipped.len();
     if total == 0 {
         return String::new();
     }
-    let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
-    let mut out = format!("Module gaps (showing {shown} of {total}):\n");
-    for (name, skipped) in display_module_gaps(&ev.discovery.modules_skipped)
-        .into_iter()
-        .take(shown)
-    {
-        out.push_str(&format!(
-            "  {}: {}\n",
-            escape_controls(&name),
-            gap_line_body(ev, reports, skipped)
-        ));
+    let display = display_module_gaps(&ev.discovery.modules_skipped);
+    // Foldable members by exact reason, in display order. A fold
+    // renders where its first member sits, so severity order survives.
+    let mut folds: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for (index, (_, row)) in display.iter().enumerate() {
+        if crate::plan::is_closure_array_refusal(&row.reason) {
+            folds.entry(row.reason.as_str()).or_default().push(index);
+        }
     }
-    if total > shown {
-        out.push_str(&format!("  and {} more\n", total - shown));
+    let mut rendered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // Rendered lines with the row count each covers (1, or the fold size).
+    let mut lines: Vec<(String, usize)> = Vec::new();
+    for (name, row) in display.iter() {
+        if !crate::plan::is_closure_array_refusal(&row.reason) {
+            lines.push((
+                format!(
+                    "  {}: {}\n",
+                    escape_controls(name),
+                    gap_line_body(ev, reports, row)
+                ),
+                1,
+            ));
+            continue;
+        }
+        if !rendered.insert(row.reason.as_str()) {
+            continue;
+        }
+        let members: Vec<(&str, &SkippedOut)> = folds
+            .get(row.reason.as_str())
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&i| (display[i].0.as_str(), display[i].1))
+                    .collect()
+            })
+            .unwrap_or_default();
+        lines.push((folded_closure_line(&members), members.len().max(1)));
+    }
+    let shown = lines.len().min(CONCISE_MODULE_GAPS_SHOWN);
+    let covered: usize = lines.iter().take(shown).map(|(_, count)| count).sum();
+    let mut out = format!("Module gaps (showing {covered} of {total}):\n");
+    for (line, _) in lines.iter().take(shown) {
+        out.push_str(line);
+    }
+    if total > covered {
+        out.push_str(&format!("  and {} more\n", total - covered));
     }
     out
+}
+
+/// One folded concise line for identical proxy-closure refusals: the
+/// count, the shared library family, the status, and the forwarding
+/// parenthetical — never the long planner reason (that stays in
+/// `-v`). A lone member names its file; members disagreeing on a
+/// family fall back to "provider files" instead of naming a wrong one.
+fn folded_closure_line(members: &[(&str, &SkippedOut)]) -> String {
+    const SHORT: &str = "forwarding layer; the calls it forwards are counted at the providers";
+    let first = members.first().map(|(_, row)| row);
+    let status = match first {
+        Some(row) if crate::plan::is_partial_coverage(&row.reason) => "partially covered",
+        _ => "not attached",
+    };
+    if members.len() == 1 {
+        let name = members[0].0;
+        return format!("  {}: {status} ({SHORT})\n", escape_controls(name));
+    }
+    let raws: Vec<&str> = members.iter().map(|(_, row)| row.name.as_str()).collect();
+    match shared_library_stem(&raws) {
+        Some(stem) => format!(
+            "  {} {} files {status} ({SHORT})\n",
+            members.len(),
+            escape_controls(&stem)
+        ),
+        None => format!("  {} provider files {status} ({SHORT})\n", members.len()),
+    }
+}
+
+/// The shared `lib<stem>.so*` family of folded file names, if every
+/// member agrees: `lib` stripped, cut at `.so`. `None` on any
+/// disagreement or degenerate stem, so the fold falls back to
+/// "provider files" instead of naming a wrong family.
+fn shared_library_stem(names: &[&str]) -> Option<String> {
+    let mut stems = names.iter().map(|name| {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let base = base.strip_prefix("lib").unwrap_or(base);
+        base.split(".so").next().unwrap_or("").to_string()
+    });
+    let first = stems.next()?;
+    if first.is_empty() || stems.any(|stem| stem != first) {
+        return None;
+    }
+    Some(first)
 }
 
 /// The named module gaps behind a PARTIAL verdict: every refused or
@@ -9985,6 +10065,116 @@ pub(crate) mod tests {
         );
     }
 
+    /// Concise folds identical proxy-closure refusals into one short
+    /// line per distinct reason: the count, the family, the status,
+    /// and the forwarding parenthetical. The long planner reason
+    /// stays in `-v` (and the JSON keeps every row).
+    #[test]
+    fn concise_gaps_fold_identical_closure_refusals_into_one_short_line() {
+        const PROXY_AWAITING: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole, as a prefix when named by the operator, or as published tables; an unnamed layer in a detailed capture attaches only its published tables); the providers it forwards to attach when they load";
+        let mut ev = evidence();
+        for name in [
+            "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
+            "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
+            "/snap/snapd-desktop-integration/391/gnome-platform/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.5",
+        ] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: PROXY_AWAITING.into(),
+            });
+        }
+        let out = concise_module_gap_lines(&ev, &reports_fixture());
+        assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
+        assert!(
+            out.contains(
+                "3 p11-kit files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("lookalike function tables"), "{out}");
+        assert!(!out.contains("same-path file"), "{out}");
+        // Verbose keeps every row with the long reason.
+        let verbose = module_gap_lines(&ev, &reports_fixture());
+        assert!(
+            verbose.contains("Module gaps (showing 3 of 3):"),
+            "{verbose}"
+        );
+        assert_eq!(
+            verbose.matches("lookalike function tables").count(),
+            3,
+            "{verbose}"
+        );
+    }
+
+    /// The fold keys on the exact reason: distinct closure reasons
+    /// render one short line each, and a lone closure names its file.
+    #[test]
+    fn concise_gaps_fold_keys_on_the_exact_closure_reason() {
+        const FIRST: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole)";
+        const SECOND: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 12 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole)";
+        let mut ev = evidence();
+        for name in ["/opt/liba.so", "/opt/liba.so"] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: FIRST.into(),
+            });
+        }
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libb.so".into(),
+            reason: SECOND.into(),
+        });
+        let out = concise_module_gap_lines(&ev, &reports_fixture());
+        assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
+        assert!(
+            out.contains(
+                "2 a files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "/opt/libb.so: not attached (forwarding layer; the calls it forwards are counted at the providers)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("lookalike function tables"), "{out}");
+    }
+
+    /// Mixed concise rows keep their order and their remedies: the
+    /// fold covers only identical closure refusals, while a capacity
+    /// refusal beside it keeps its file and `--module` remedy.
+    #[test]
+    fn concise_gaps_fold_leaves_capacity_remedies_in_place() {
+        const PROXY_AWAITING: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole)";
+        let mut ev = evidence();
+        for name in ["/opt/liba.so", "/opt/liba.so"] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: PROXY_AWAITING.into(),
+            });
+        }
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/x.so".into(),
+            reason: "capacity".into(),
+        });
+        let out = concise_module_gap_lines(&ev, &reports_fixture());
+        assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
+        assert!(
+            out.contains(
+                "2 a files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("capture it alone with --module /opt/x.so"),
+            "{out}"
+        );
+        // Severity order survives the fold: capacity first.
+        let capacity = out.find("/opt/x.so").unwrap();
+        let folded = out.find("2 a files").unwrap();
+        assert!(capacity < folded, "{out}");
+    }
+
     /// F2: the concise profile summary names a refused provider with
     /// its file and the `--module` remedy (not just the aggregate
     /// "1 provider file not watched" fragment).
@@ -13558,18 +13748,19 @@ pub(crate) mod tests {
         assert!(refused < proxy, "{text}");
     }
 
-    /// Two physical files can share one path (two refused rows with the
-    /// same name and reason): each row then names its occurrence so the
-    /// reader can tell the lines apart.
+    /// Two physical files can share one path (two refused rows with
+    /// the same name but distinct reasons, so no fold): each row then
+    /// names its occurrence so the reader can tell the lines apart.
+    /// Identical rows fold instead (see the fold tests above).
     #[test]
     fn concise_module_gaps_number_same_path_files() {
         let mut ev = evidence();
-        for _ in 0..2 {
+        for tables in [67, 12] {
             ev.discovery.modules_skipped.push(SkippedOut {
                 name: "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8".into(),
                 reason: format!(
                     "a proxy closure array in a detailed capture attaches only its published \
-                     tables, and none of its 67 lookalike function tables is published yet, so \
+                     tables, and none of its {tables} lookalike function tables is published yet, so \
                      calls through it are not counted {}",
                     crate::plan::CLOSURE_ARRAY_NOTE_DETAILED,
                 ),

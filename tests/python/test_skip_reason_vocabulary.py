@@ -39,6 +39,8 @@ PRODUCER_CONSTANTS = (
     "STATIC_GAP_RECOVERED",
     # OD34: fixed product-limit skips name their limit.
     "PROCESS_VIEW_CAPACITY_EXHAUSTED",
+    # View-collapse fix1: the deep-scan selection cap names its limit.
+    "DEEP_SCAN_SELECTION_CAPPED",
     "LOADER_CONTEXT_CAPACITY_EXHAUSTED",
     "LOADER_SCAN_LEDGER_EXCEEDED",
     "LOADER_ARM_LEDGER_FULL",
@@ -82,7 +84,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    fourteen discovery reasons; the run-tree scope renders one of its three
+    fifteen discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its seven reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -101,6 +103,7 @@ def producer_reasons():
         const["STATIC_GAP_INCOMPLETE"],
         const["STATIC_GAP_RECOVERED"],
         const["PROCESS_VIEW_CAPACITY_EXHAUSTED"],
+        const["DEEP_SCAN_SELECTION_CAPPED"],
         const["LOADER_CONTEXT_CAPACITY_EXHAUSTED"],
         const["LOADER_SCAN_LEDGER_EXCEEDED"],
         const["LOADER_ARM_LEDGER_FULL"],
@@ -124,7 +127,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 14
+        and len(discovery) == 15
         and len(run_tree) == 3
         and len(learned) == 7
     ), const

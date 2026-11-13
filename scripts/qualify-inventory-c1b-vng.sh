@@ -10,7 +10,8 @@
 # a guest-local root-owned tmpfs base. Take the privileged lock around this.
 # The vng invocation runs under scripts/ci/vng-boot-watch.sh (console to
 # OUTDIR/vng-console.log, diagnostics to OUTDIR/vng-boot-diag.log): host
-# KVM is proven before the boot, and a guest that prints nothing and
+# KVM is probed (advisory: a denied open only selects TCG) before
+# the boot, and a guest that prints nothing and
 # writes no uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips
 # VNG_BOOT_TIMEOUT instead of hanging to the job timeout.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).

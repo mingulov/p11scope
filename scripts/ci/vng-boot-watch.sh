@@ -17,14 +17,20 @@
 # never killed, and a child that exits on its own (fast vng failure,
 # timeout budget) passes its exit code through untouched.
 #
-# Before starting, prove host KVM can create a VM (open VNG_KVM_NODE,
-# default /dev/kvm, KVM_GET_API_VERSION, KVM_CREATE_VM): without that
-# qemu's accel=kvm:tcg falls back to silent TCG. Failure is
-# VNG_KVM_UNUSABLE on stderr plus DIAG, exit 2, without starting vng.
+# Before starting, probe host KVM the way vng will use it (open
+# VNG_KVM_NODE, default /dev/kvm, as the invoking user, then
+# KVM_GET_API_VERSION and KVM_CREATE_VM): the result is advisory,
+# never a refusal. virtme's can_use_kvm treats a denied /dev/kvm open
+# as "boot with TCG" (CI runners sit at 0660 root:kvm after the qemu
+# install re-applies udev perms past the workflow's chmod 0666, and
+# every pre-watch vng leg passed that way), so a failed probe records
+# kvm_expected_accel=tcg-fallback in DIAG, warns on stderr, and still
+# starts vng. A genuinely silent stall trips VNG_BOOT_TIMEOUT below
+# with the same diagnostics.
 # VNG_BOOT_WATCH_TEST=1 skips the probe for stubbed-vng unit tests.
 #
-# Exit codes: COMMAND's exit code on a completed run; 2 on a boot trip,
-# a KVM failure or bad usage; 77 when python3 is missing for the probe.
+# Exit codes: COMMAND's exit code on a completed run; 2 on a boot trip
+# or bad usage.
 set -u
 
 MARKER=""
@@ -78,10 +84,11 @@ KVM_NODE="${VNG_KVM_NODE:-/dev/kvm}"
     fi
 } >>"$DIAG"
 
-# Prove KVM can create a VM. Prints the kvm_probe transcript line on
-# stdout; returns 0 when usable. Every failure mode is named: a missing
-# node, a denied open, a wrong API version, a refused CREATE_VM and a
-# wedged ioctl (the 30s timeout) each fail here instead of hanging vng.
+# Probe KVM the way vng will use it. Prints the kvm_probe transcript
+# line on stdout; returns 0 when usable. Every failure mode is named:
+# a missing node, a denied open, a wrong API version, a refused
+# CREATE_VM and a wedged ioctl (the 30s timeout) are each recorded by
+# the caller, which boots anyway: vng falls back to TCG.
 kvm_probe() {
     if [ "${VNG_BOOT_WATCH_TEST:-0}" = 1 ]; then
         echo "kvm_probe=skipped(test)"
@@ -128,16 +135,22 @@ print("kvm_probe=ok api=12")
     [ "$rc" -eq 0 ]
 }
 
-KVM_LINE=$(kvm_probe) || {
-    {
-        echo "$KVM_LINE"
-        echo "result=VNG_KVM_UNUSABLE"
-    } >>"$DIAG"
-    echo "vng-boot-watch.sh: VNG_KVM_UNUSABLE host KVM cannot create a VM ($KVM_LINE; see $DIAG)" >&2
-    exit 2
-}
-echo "$KVM_LINE" >>"$DIAG"
+if KVM_LINE=$(kvm_probe); then
+    KVM_ACCEL=kvm
+else
+    # Advisory, never a refusal: a denied KVM open only selects TCG
+    # (virtme can_use_kvm), so this host still boots. The watchdog
+    # below trips a genuinely silent stall with diagnostics.
+    KVM_ACCEL=tcg-fallback
+fi
+{
+    echo "$KVM_LINE"
+    echo "kvm_expected_accel=$KVM_ACCEL"
+} >>"$DIAG"
 echo "kvm_node=$KVM_NODE" >>"$DIAG"
+if [ "$KVM_ACCEL" != kvm ]; then
+    echo "vng-boot-watch.sh: KVM unusable ($KVM_LINE); continuing, qemu falls back to TCG (see $DIAG)" >&2
+fi
 
 # Start the child in its own process group so the trip kill reaches vng
 # and its qemu grandchild together. setsid only forks when it is already

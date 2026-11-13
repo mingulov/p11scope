@@ -1784,6 +1784,8 @@ impl PinnedObjects {
     /// (scan aliases included), sorted and deduplicated. Task 3 Stage A
     /// selects the object's ranges in `/proc/PID/maps` by these.
     pub(crate) fn raw_keys_for(&self, id: PinnedObjectId) -> Vec<ObjectKey> {
+        #[cfg(test)]
+        raw_key_scan_count::bump();
         let mut keys: Vec<ObjectKey> = self
             .raw_to_id
             .iter()
@@ -9838,6 +9840,31 @@ fn pin_scanned_object(
     )
     .map_err(PinFailure::from)
 }
+
+/// Test-only count of whole raw-map walks made to answer per-object
+/// raw-key queries, per test thread.
+#[cfg(test)]
+pub(crate) mod raw_key_scan_count {
+    thread_local! {
+        static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        SCANS.with(|scans| scans.set(scans.get() + 1));
+    }
+
+    pub(crate) fn reset() {
+        SCANS.with(|scans| scans.set(0));
+    }
+
+    pub(crate) fn get() -> u64 {
+        SCANS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+#[path = "identity_raw_key_index_tests.rs"]
+mod raw_key_index_tests;
 
 #[cfg(test)]
 pub(crate) mod test_fixture {

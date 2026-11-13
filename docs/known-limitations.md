@@ -569,6 +569,24 @@ hit `EMFILE`; 2048 stays behind `--max-scan-pids` pending a clean
 re-measure. Narrow the scope (`--pid`, `--cgroup`) or pass
 `--max-scan-pids` to cover more.
 
+### Diagnostics on stderr can be lost silently in three cases
+
+In v0.7.0, diagnostics on stderr can be lost silently in three
+cases. Capture data and the report file are not affected in any of
+these cases, and fixes are planned for 0.8.0:
+
+- p11scope runs as a different user than the owner of the terminal or
+  pipe it writes to (for example `su bob -c 'p11scope ...'` on alice's
+  terminal, or `sudo -u bob p11scope ... | tee`) without permission to
+  reopen it: messages, including the final error line, are not shown;
+  the exit code still reports failure. Running as root or with the
+  setcap capabilities on your own terminal is not affected.
+- An extremely low open-files limit (about 4) with stdout redirected
+  and stderr a pipe: messages are not shown either.
+- A very slow stderr reader (for example a slow SSH terminal or
+  `2>&1 | tee` under load): some diagnostic lines may be dropped, and
+  the number dropped is not reported yet.
+
 ## Known limitations in 0.6.0
 
 The following limits apply to the v0.6.0 release. Rate, latency and

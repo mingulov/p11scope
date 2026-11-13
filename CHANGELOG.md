@@ -132,6 +132,8 @@ versioned separately and are opaque, exact dispatch keys.
   sampled once per tick, failing open.
 - Library-handle pressure waits and retries instead of dropping work
   (one scan pin per physical file, deferred handles retried first).
+- Live discovery looks only at user processes, so kernel threads no
+  longer cause "new processes pending" skips on busy hosts.
 
 ### Changed
 
@@ -334,6 +336,12 @@ The v0.7.0 limits live in
   caught by kernel file-open learning. Wrap such tools in
   `sudo p11scope run --user $USER -- <tool>` (or pass `--prearm-module
   PATH`) when first-run coverage matters.
+- Diagnostics on stderr can be lost silently in three cases:
+  p11scope running as a different user than the owner of the terminal
+  or pipe it writes to, an extremely low open-files limit (about 4)
+  with stdout redirected and stderr a pipe, and a very slow stderr
+  reader (some lines dropped without a count). Capture data and the
+  report file are unaffected; fixes are planned for 0.8.0.
 
 ## [0.6.0] - 2026-11-06
 

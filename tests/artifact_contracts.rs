@@ -3913,6 +3913,12 @@ launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
     sh -c 'sleep 0.2 & echo $! > "$1/zombie.pid"; exec sleep 30' sh "$work"
 leader=$USER_PROCESS_PID
 sid=$USER_PROCESS_SID
+attempt=0
+while [ ! -s "$work/zombie.pid" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "zombie pid file never appeared" >&2; exit 1; }
+    sleep 0.05
+done
 zombie=$(cat "$work/zombie.pid")
 attempt=0
 while [ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" != Z ]; do
@@ -3951,6 +3957,79 @@ rm -rf "$work"
     assert!(
         output.status.success(),
         "zombie-member snapshot failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// The zombie-member snapshot with a gated pidfile writer: the writer
+// publishes zombie.pid only after the reader creates the gate, so a read
+// without a wait fails deterministically with the CI signature (cat ENOENT
+// on zombie.pid, ci 43404056467). The launcher records leader.pid before it
+// execs the child, so launch return never synchronizes with the child's own
+// pidfile write; the wait below (the live-member sibling's pattern) is that
+// synchronization point. This twin pins that the snapshot oracle holds even
+// when the writer runs late.
+#[test]
+fn snapshot_tolerates_a_delayed_zombie_pidfile() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
+    sh -c 'sleep 0.2 & pid=$!; until [ -e "$1/gate" ]; do sleep 0.05; done; echo $pid > "$1/zombie.pid"; exec sleep 30' sh "$work"
+leader=$USER_PROCESS_PID
+sid=$USER_PROCESS_SID
+: > "$work/gate"
+attempt=0
+while [ ! -s "$work/zombie.pid" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "zombie pid file never appeared" >&2; exit 1; }
+    sleep 0.05
+done
+zombie=$(cat "$work/zombie.pid")
+attempt=0
+while [ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" != Z ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "child never became a zombie" >&2; exit 1; }
+    sleep 0.05
+done
+snapshot_user_process_session "$sid" > "$work/members.json"
+python3 - "$work/members.json" "$leader" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(members) == 1, members
+assert members[0]["pid"] == int(sys.argv[2])
+assert members[0]["argv"] == ["sleep", "30"]
+assert set(members[0]) == {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}
+PY
+[ "$(awk '$1 == "State:" { print $2; exit }' "/proc/$zombie/status")" = Z ]
+kill -KILL "$leader"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+leader=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$sid")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise delayed-pidfile zombie-member snapshot");
+    assert!(
+        output.status.success(),
+        "delayed-pidfile zombie-member snapshot failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

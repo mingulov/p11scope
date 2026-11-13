@@ -70,9 +70,9 @@ Receipt, Docker 29.8.1 on Ubuntu 26.04: `docker inspect` reads
 default filter active). `scripts/matrix/verify-container-image.sh`
 covers the recipe as `five-cap-exact`.
 
-Alternative: the `SYS_ADMIN` set. Replacing the five `--cap-*` flags
-above with `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
-DAC_READ_SEARCH` also captures:
+Alternative: the `SYS_ADMIN` set. Replacing the `--cap-drop ALL`
+and five `--cap-add` flags above with `--cap-add SYS_ADMIN
+--cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH` also captures:
 
 ```sh
 docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \

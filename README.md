@@ -59,7 +59,8 @@ pages](docs/demo/README.md) have the full copy-paste
 commands, the hardened profile alternative, and the measured numbers.
 
 Alternative: `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
-DAC_READ_SEARCH` in place of the five `--cap-*` flags above.
+DAC_READ_SEARCH` in place of the `--cap-drop ALL` and five
+`--cap-add` flags above.
 `CAP_SYS_ADMIN` grants very broad power — close to full root (mounts,
 namespaces, many kernel admin operations) — so use it only when
 needed. What it adds for p11scope is file learning (fanotify): it

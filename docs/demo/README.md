@@ -58,7 +58,8 @@ seccomp flag; older engines use the vendored [seccomp
 profile](../../deploy/seccomp-p11scope.json).
 
 Alternative: `--cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add
-DAC_READ_SEARCH` in place of the five `--cap-*` flags above.
+DAC_READ_SEARCH` in place of the `--cap-drop ALL` and five
+`--cap-add` flags above.
 `CAP_SYS_ADMIN` grants very broad power — close to full root (mounts,
 namespaces, many kernel admin operations) — so use it only when
 needed. What it adds for p11scope is file learning (fanotify): it

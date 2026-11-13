@@ -56,7 +56,8 @@ class DeployDefaultsTests(unittest.TestCase):
         self.assertEqual(len(primary), 1, "the primary recipe drops to five caps")
         self.assertEqual(len(alternative), 1, "the alternative recipe keeps SYS_ADMIN")
         text = DEPLOY_README.read_text()
-        self.assertLess(text.index("--cap-drop ALL"), text.index("--cap-add SYS_ADMIN"),
+        self.assertLess(text.index(primary[0].splitlines()[0]),
+                        text.index(alternative[0].splitlines()[0]),
                         "the five-cap recipe stays primary, ahead of the SYS_ADMIN alternative")
         for block in recipes:
             self.assertIn("-v /sys/fs/cgroup:/sys/fs/cgroup:ro", block,

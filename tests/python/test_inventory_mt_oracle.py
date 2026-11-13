@@ -522,6 +522,26 @@ class InventoryMtGateTests(unittest.TestCase):
         self.assertIn("ended after", proc.stderr)
         self.assertLess(elapsed, 2.0)
 
+    def test_settle_observer_exit_fails_fast(self):
+        # The observer crashed mid-settle: with its pid passed in,
+        # settle fails at once with a named reason instead of idling.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            log = tmp / "log"
+            log.write_text(json.dumps(gate_started()) + "\n")
+            start = time.monotonic()
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log),
+                                   "--settle-passes", "2",
+                                   "--timeout", "3",
+                                   "--overall-timeout", "30",
+                                   "--observer-pid", str(self.dead_pid())],
+                                  capture_output=True, text=True, timeout=15)
+            elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("observer exited during settle", proc.stderr)
+        self.assertLess(elapsed, 5.0)
+
     def dead_pid(self):
         child = subprocess.Popen([sys.executable, "-c", "pass"])
         child.wait()
@@ -572,6 +592,30 @@ class InventoryMtGateTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=15)
         self.assertEqual(proc.returncode, 0)
 
+    def test_live_observer_pid_stall_still_waits(self):
+        # A live observer pid must reach the liveness check and count
+        # as alive: an unmatched run stalls on its own reason, never
+        # on a false "observer exited".
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            wl = tmp / "wl"
+            wl.write_text("\n".join(self.wl_single()) + "\n")
+            log = tmp / "log"
+            events = [gate_started(), gate_pass(1)]
+            log.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+            start = time.monotonic()
+            proc = subprocess.run([sys.executable, "-I", str(GATE),
+                                   "--event-log", str(log), "--wl", str(wl),
+                                   "--timeout", "0.3",
+                                   "--overall-timeout", "30",
+                                   "--observer-pid", str(os.getpid())],
+                                  capture_output=True, text=True, timeout=15)
+            elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stalled:", proc.stderr)
+        self.assertNotIn("observer exited", proc.stderr)
+        self.assertLess(elapsed, 5.0)
+
 
 def load_gate_module():
     spec = importlib.util.spec_from_file_location("inventory_mt_gate", GATE)
@@ -600,6 +644,43 @@ class InventoryMtEventTailTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["kind"], "pass_committed")
             self.assertEqual(tail_reader.passes, 1)
+            # A record appended after the torn poll resolves must arrive
+            # exactly once: the offset may not skip past it.
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(gate_pass(2)) + "\n")
+            records = tail_reader.poll()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["kind"], "pass_committed")
+            self.assertEqual(tail_reader.passes, 2)
+            self.assertEqual(tail_reader._offset, log.stat().st_size)
+            self.assertEqual(tail_reader.poll(), [])
+
+    def test_records_after_long_partial_line_arrive_once(self):
+        # Reviewer repro: a 350-byte partial line must not shift the
+        # file offset, so several records appended after it all arrive
+        # exactly once instead of being skipped.
+        gate = load_gate_module()
+        with tempfile.TemporaryDirectory() as raw:
+            log = Path(raw) / "log"
+            first = dict(gate_pass(1))
+            first["pad"] = "x" * 512
+            head_line = json.dumps(first)
+            assert len(head_line) > 350
+            log.write_text(head_line[:350])
+            tail_reader = gate.EventTail(str(log))
+            self.assertEqual(tail_reader.poll(), [])
+            rest = head_line[350:] + "\n"
+            rest += "".join(json.dumps(gate_pass(seq)) + "\n"
+                            for seq in range(2, 7))
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(rest)
+            records = tail_reader.poll()
+            self.assertEqual(len(records), 6)
+            self.assertEqual(tail_reader.passes, 6)
+            self.assertEqual([row["event"]["pass"] for row in records],
+                             [0, 1, 2, 3, 4, 5])
+            self.assertEqual(tail_reader._offset, log.stat().st_size)
+            self.assertEqual(tail_reader.poll(), [])
 
 
 if __name__ == "__main__":

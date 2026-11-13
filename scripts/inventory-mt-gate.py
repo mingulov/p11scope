@@ -65,14 +65,15 @@ class EventTail:
         except (FileNotFoundError, UnicodeDecodeError):
             return []
         data = self._pending + chunk
+        # The offset counts bytes consumed from the file; the buffer
+        # holds only a copy of the unterminated tail, never re-counted.
+        self._offset += len(chunk.encode("utf-8"))
         cut = data.rfind("\n")
         if cut == -1:
             self._pending = data
-            self._offset += len(chunk.encode("utf-8"))
             return []
         complete = data[:cut]
         self._pending = data[cut + 1:]
-        self._offset += len((complete + "\n").encode("utf-8"))
         records = []
         for line in complete.splitlines():
             line = line.strip()

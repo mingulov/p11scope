@@ -288,8 +288,9 @@ live `C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
 a manifest, or export agreement) — in every scope and arrival order.
 Unpublished templates take no slots, so the layer can never crowd out a real
 provider; a layer with nothing published yet stays a named gap while the
-capture continues. Calls it forwards are counted at the attached backend
-providers, named with counts on the gap line; calls the layer answered
+capture continues. Any calls it forwards to them are counted in the
+attached backend providers' totals, named with counts on the gap line;
+calls the layer answered
 itself, including its errors, appear only on the separate forwarding line,
 and one layer call that reaches several providers counts at each (below).
 Under inventory, counter and broad admission a closure array that does not

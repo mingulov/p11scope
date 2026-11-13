@@ -2932,9 +2932,10 @@ fn excluded_lines(ev: &Evidence) -> String {
 
 /// One named gap line's body: the status, the planner's reason, and the
 /// hint. A forwarding (proxy closure) layer points at the attached providers
-/// that count its forwarded calls and states plainly that calls the layer
-/// answers itself are not counted (through a template that was not attached,
-/// for a prefix); a refused provider points at `--module`
+/// whose totals would count any calls it forwards to them — the listed
+/// counts are the providers' own, never proven forwarded — and states plainly
+/// that calls the layer answers itself are not counted (through a template
+/// that was not attached, for a prefix); a refused provider points at `--module`
 /// (unless the reason already carries that hint, as shared-scope refusals do).
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
     let status = if crate::plan::is_partial_coverage(&skipped.reason) {
@@ -3024,7 +3025,7 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
         list.push(format!("and {more} more"));
     }
     format!(
-        "; calls it forwards are counted at the attached provider files ({})",
+        "; any calls it forwards to them are counted in the attached providers' totals ({})",
         list.join(", ")
     )
 }
@@ -11703,10 +11704,16 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains(
-                "calls it forwards are counted at the attached provider files \
+                "any calls it forwards to them are counted in the attached providers' totals \
                  (/opt/p11-kit-trust.so: 744 calls)"
             ),
             "{text}"
+        );
+        // O5: the unconditional claim ascribed backend counts to layer
+        // forwarding without evidence; the conditional must replace it.
+        assert!(
+            !text.contains("calls it forwards are counted at"),
+            "the over-claim is gone: {text}"
         );
         assert!(
             text.contains("Calls the forwarding layer answers itself are not counted"),
@@ -11747,7 +11754,9 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.contains("calls it forwards are counted at the attached provider files"),
+            text.contains(
+                "any calls it forwards to them are counted in the attached providers' totals"
+            ),
             "{text}"
         );
     }

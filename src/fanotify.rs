@@ -2989,6 +2989,49 @@ mod tests {
         let _ = holder.wait();
     }
 
+    /// Live end-of-capture proof (privileged): stopping the learner while
+    /// a child keeps opening files system-wide must drain the events
+    /// queued at the stop instead of reporting the stop itself as lost
+    /// learning. A busy desktop never has an empty queue at the end of
+    /// a capture, so a stop that counts any unread event as loss files
+    /// a spurious learned-loss gap on every busy host. Repeated so a
+    /// lucky empty queue cannot pass it.
+    /// Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_stop_under_open_churn_drains_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{index}")), b"not elf").unwrap();
+        }
+        for round in 0..3 {
+            let (mut learner, rx) =
+                super::FileLearner::start().expect("fanotify group (run as root)");
+            learner.begin_drain().expect("spawn drain");
+            // A *child* reopens the files without pause: its opens are
+            // never the observer's own, and the queue is never empty
+            // when the stop lands.
+            let mut churn = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "while :; do for f in \"$1\"/f*; do : < \"$f\"; done; done",
+                    "sh",
+                ])
+                .arg(dir.path())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let lost = learner.shutdown_and_join();
+            churn.kill().unwrap();
+            let _ = churn.wait();
+            while rx.try_recv().is_ok() {}
+            assert!(
+                !lost,
+                "round {round}: a stop under ordinary open churn must drain the queued events, not report learned loss"
+            );
+        }
+    }
+
     /// Live drain proof across mount namespaces (privileged): a child in
     /// a fresh mount namespace opens a provider file and the drain still
     /// reports it (fd identity is namespace-independent).

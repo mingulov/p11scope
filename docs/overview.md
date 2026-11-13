@@ -114,10 +114,12 @@ run with -v for details
 
 If a command refuses instead of capturing, see
 [troubleshooting](troubleshooting.md). For a recorded profile
-instead of a live inventory (`12345` below is a placeholder):
+instead of a live inventory, watch one program in detail
+(Firefox below is just an example):
 
 ```sh
-sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
+# -o saves the full JSON report to that file in the current directory.
+sudo p11scope profile --pid "$(pidof -s firefox)" --duration 30s -o firefox-profile.json
 ```
 
 Terminal text is concise by default — main results, one coverage line, and a
@@ -226,12 +228,15 @@ Public live cgroup qualification remains a development gate.
   non-NULL target (`linkage: "exports"`). Without name evidence, rows read
   `unknown#<ordinal>`, never a guessed name. `doctor` and
   `inspect` need the same privileges as a capture to assess or read another
-  user's process:
+  user's process (Firefox below is just an example program):
 
   ```bash
-  sudo p11scope doctor --pid 12345
-  sudo p11scope inspect --pid 12345
-  sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
+  # Check this machine can assess that program.
+  sudo p11scope doctor --pid "$(pidof -s firefox)"
+  # Show the PKCS#11 providers mapped by that program.
+  sudo p11scope inspect --pid "$(pidof -s firefox)"
+  # Watch it in detail; -o saves the full JSON report to that file in the current directory.
+  sudo p11scope profile --pid "$(pidof -s firefox)" --duration 60s -o firefox-profile.json
   ```
 
   Whole-machine capture needs no PID or cgroup path;

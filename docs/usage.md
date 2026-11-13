@@ -254,16 +254,16 @@ the environment first, hence
 `--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
 
 The 4-step command reference follows; read the concepts after it as needed
-(`12345` below is a placeholder PID):
+(Firefox below is just an example — use any running program):
 
 ```bash
 # 1. What can this host do, and what does the target map? (sudo: reading
 #    another user's process, and the BPF preflight, need the capture's privileges)
-sudo p11scope doctor --pid 12345
-sudo p11scope inspect --pid 12345
+sudo p11scope doctor --pid "$(pidof -s firefox)"
+sudo p11scope inspect --pid "$(pidof -s firefox)"
 
 # 2. Count-only diagnostics — no helper or observer-initiated provider calls.
-sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
+sudo p11scope profile --pid "$(pidof -s firefox)" --duration 60 -o observed-profile.json
 
 # 3. Or stream one line per call.
 sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
@@ -598,7 +598,7 @@ produced it.
 
 ```bash
 # Burst-heavy workload: bigger ring, faster drain.
-sudo p11scope profile --pid 12345 --ring-bytes 64M --drain-interval-ms 100 \
+sudo p11scope profile --pid "$(pidof -s firefox)" --ring-bytes 64M --drain-interval-ms 100 \
   --duration 60 -o observed-profile.json
 ```
 
@@ -634,7 +634,7 @@ offset claims; automatic discovery output is not independent attestation.
 Then supply that manifest explicitly:
 
 ```bash
-sudo p11scope profile --pid 12345 --module /opt/vendor/lib/pkcs11.so \
+sudo p11scope profile --pid "$(pidof -s firefox)" --module /opt/vendor/lib/pkcs11.so \
   --manifest provider-manifest.json --duration 60 -o observed-profile.json
 ```
 

@@ -368,3 +368,285 @@ fn withheld_edge_with_claimed_children_names_the_children() {
         "the instance child line shows the observed feed:\n{snapshot}"
     );
 }
+
+#[test]
+fn successor_binding_at_horizon_sheds_never_bound_exec() {
+    // A (7,1) burst retained before the bind still sheds at its own
+    // horizon after (7,2) binds: the horizon exemption covers the exact
+    // bound exec only, never a never-bound historical exec behind a
+    // successor binding.
+    let mut scene = workload_scene();
+    let child = spawn_post_attach_child();
+    let pid = child.id();
+    let caller = admit_mapped(&mut scene, pid);
+    // The burst is retained under (cookie 7, exec 1) ...
+    burst_without_pin(&mut scene, pid, 7);
+    let batch = scene.lane.tick(&[]).unwrap();
+    scene.publish(batch);
+    assert!(
+        unrouted_reasons(&scene).is_empty(),
+        "the pre-bind burst waits inside the horizon: {:?}",
+        unrouted_reasons(&scene)
+    );
+    // ... then the binding proves a later exec of the task.
+    let newer = ImageIdentity {
+        task_cookie: 7,
+        exec_id: 2,
+    };
+    production_bind(&mut scene, caller, pid, newer);
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert!(
+        unrouted_reasons(&scene).is_empty(),
+        "mismatched retained calls stay held before the horizon: {:?}",
+        unrouted_reasons(&scene)
+    );
+    {
+        let h0 = scene.h0.0.borrow();
+        assert_eq!(
+            h0.capture.retained.len(),
+            1,
+            "only the drained image holds a marker"
+        );
+        assert!(
+            h0.capture.retained.contains_key(&(7, 1)),
+            "the drained (7,1) holds its marker before the horizon"
+        );
+        let binding = h0.capture.bindings.get(&7).expect("binding installed");
+        assert!(
+            binding.current && binding.image == newer,
+            "the cookie binds the successor exec"
+        );
+    }
+    // Past the horizon the never-bound exec sheds mid-run as Unobserved.
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .advance_now(Duration::from_secs(31));
+    let batch = scene.tick();
+    scene.publish(batch);
+    assert_eq!(
+        unrouted_reasons(&scene),
+        vec!["2 calls shed without a route (unobserved=2) with 1 bindings".to_string()],
+        "the never-bound exec sheds at its own horizon despite the successor binding"
+    );
+    assert_eq!(
+        scene.h0.0.borrow().capture.router().pending_len(),
+        0,
+        "the horizon expiry frees the pending budget mid-run"
+    );
+    assert!(
+        !scene.h0.0.borrow().capture.retained.contains_key(&(7, 1)),
+        "the shed exec leaves the retained membership"
+    );
+    // Stop stays finite and the full account reconciles.
+    let joined = scene.h0.0.borrow().capture.router().counters().joined;
+    let finish = scene.h0.finish(scene.lane.domain());
+    scene.publish(finish);
+    let shed = scene.lane.shed_calls_disclosed();
+    assert_eq!(
+        joined + shed,
+        2,
+        "joined + shed still equals the physical calls at stop"
+    );
+}
+
+#[test]
+fn repeated_exec_transitions_drop_historical_markers() {
+    // H0-only marker-lifecycle regression: repeated exec transitions drop
+    // their historical `retained` markers at the next prune. No
+    // coordinator admission, no CallerId, no publish: the pin comes from
+    // `PidPin::open` on a held post-attach child, transitions run through
+    // `capture.refresh_with`, drains through `capture.tick_with`. (The
+    // coordinator seam cannot express this churn: admission history
+    // requires the same full image per caller, so a successor bind for an
+    // admitted caller is refused; H0's `accept_scan` is the legal churn
+    // seam.)
+    use std::sync::Arc;
+    let mut scene = workload_scene();
+    let child = spawn_post_attach_child();
+    let pid = child.id();
+    let pin = Arc::new(crate::process::PidPin::open(pid).expect("pin the live child"));
+    let slot = scene.h0.0.borrow().io.slot(0, "C_SignInit");
+    let mut shed: u64 = 0;
+    let mut joined: u64 = scene.h0.0.borrow().capture.router().counters().joined;
+    for k in 1u64..=8 {
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: k,
+        };
+        // (a) bump the file-0 local epoch before the burst.
+        {
+            let mut h0 = scene.h0.0.borrow_mut();
+            let (base, local, global) = h0.io.scan_input(0);
+            h0.io.scan_inputs.insert(0, (base, local + 1, global));
+        }
+        // (b) burst pin-less, tick, assert HELD.
+        {
+            let mut h0 = scene.h0.0.borrow_mut();
+            h0.io.targets.insert(pid, (pin.clone(), image));
+        }
+        for (name, mechanism) in WORKLOAD_MAIN.iter().take(2) {
+            enqueue_live_like(&mut scene, pid, name, *mechanism);
+        }
+        let burst_tick = {
+            let mut h0 = scene.h0.0.borrow_mut();
+            h0.io.targets.remove(&pid);
+            let HeldH0 { capture, io, .. } = &mut *h0;
+            capture.tick_with(io).unwrap()
+        };
+        shed += burst_tick
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Unknown(_)))
+            .count() as u64;
+        {
+            let h0 = scene.h0.0.borrow();
+            assert_eq!(
+                h0.capture.router().pending_len(),
+                2,
+                "k={k}: burst HELD as pending"
+            );
+            assert_eq!(
+                h0.capture.awaiting.len(),
+                2,
+                "k={k}: burst HELD in awaiting"
+            );
+            assert!(
+                h0.capture.retained.contains_key(&(7, k)),
+                "k={k}: marker present"
+            );
+        }
+        let stamp = scene
+            .h0
+            .0
+            .borrow()
+            .capture
+            .retained_registration_ns(image)
+            .unwrap();
+        // (c) refresh the SAME image, assert the 2 JOIN.
+        let same = {
+            let mut h0 = scene.h0.0.borrow_mut();
+            h0.io.targets.insert(pid, (pin.clone(), image));
+            let HeldH0 { capture, io, .. } = &mut *h0;
+            capture.refresh_with(io, pin.clone(), slot).unwrap()
+        };
+        assert!(
+            same.scan_refusals.is_empty(),
+            "k={k}: same-image refresh accepted"
+        );
+        shed += same
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Unknown(_)))
+            .count() as u64;
+        {
+            let h0 = scene.h0.0.borrow();
+            let now_joined = h0.capture.router().counters().joined;
+            assert_eq!(now_joined, joined + 2, "k={k}: the 2 JOIN");
+            joined = now_joined;
+            assert_eq!(
+                h0.capture.router().pending_len(),
+                0,
+                "k={k}: pending drained"
+            );
+            assert!(h0.capture.awaiting.is_empty(), "k={k}: awaiting drained");
+            assert_eq!(
+                h0.capture.retained_registration_ns(image),
+                Some(stamp),
+                "k={k}: drain stamp preserved"
+            );
+            let binding = h0.capture.bindings.get(&7).expect("binding installed");
+            assert!(
+                binding.current && binding.image == image,
+                "k={k}: bound to the burst image"
+            );
+        }
+        assert_eq!(shed, 0, "k={k}: zero shed through the join");
+        // (d) refresh the NEXT image (transition), tick (prune), assert membership.
+        let next = ImageIdentity {
+            task_cookie: 7,
+            exec_id: k + 1,
+        };
+        let trans = {
+            let mut h0 = scene.h0.0.borrow_mut();
+            h0.io.targets.insert(pid, (pin.clone(), next));
+            let HeldH0 { capture, io, .. } = &mut *h0;
+            capture.refresh_with(io, pin.clone(), slot).unwrap()
+        };
+        assert!(
+            trans.scan_refusals.is_empty(),
+            "k={k}: successor refresh accepted"
+        );
+        shed += trans
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Unknown(_)))
+            .count() as u64;
+        {
+            let h0 = scene.h0.0.borrow();
+            let binding = h0.capture.bindings.get(&7).expect("binding present");
+            assert!(
+                binding.current && binding.image == next,
+                "k={k}: transition installed"
+            );
+        }
+        let prune_tick = {
+            let mut h0 = scene.h0.0.borrow_mut();
+            let HeldH0 { capture, io, .. } = &mut *h0;
+            capture.tick_with(io).unwrap()
+        };
+        shed += prune_tick
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Unknown(_)))
+            .count() as u64;
+        {
+            let h0 = scene.h0.0.borrow();
+            let awaited: std::collections::BTreeSet<(u64, u64)> = h0
+                .capture
+                .awaiting
+                .values()
+                .map(|waiting| {
+                    let held = waiting.record.base.event.image;
+                    (held.task_cookie, held.exec_id)
+                })
+                .collect();
+            eprintln!(
+                "k={k}: retained={} awaited={} shed={shed}",
+                h0.capture.retained.len(),
+                awaited.len()
+            );
+            assert!(
+                h0.capture.retained.len() <= awaited.len() + 1,
+                "k={k}: retained {} <= awaited {} + 1",
+                h0.capture.retained.len(),
+                awaited.len()
+            );
+        }
+    }
+    // Final: horizon advance, stop-line identity.
+    {
+        let mut h0 = scene.h0.0.borrow_mut();
+        h0.io.script.advance_now(Duration::from_secs(31));
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        let horizon_tick = capture.tick_with(io).unwrap();
+        shed += horizon_tick
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Unknown(_)))
+            .count() as u64;
+        assert_eq!(h0.capture.router().pending_len(), 0);
+        assert!(h0.capture.awaiting.is_empty());
+    }
+    assert_eq!(joined, 16, "all 8 bursts joined");
+    assert_eq!(shed, 0, "zero shed overall");
+    let stop = scene.h0.0.borrow_mut().capture.stop();
+    shed += stop
+        .calls()
+        .filter(|call| matches!(call.route(), Route::Unknown(_)))
+        .count() as u64;
+    assert_eq!(shed, 0, "stop adds no shed");
+    assert!(
+        scene.h0.0.borrow().capture.retained.is_empty(),
+        "no stranded markers"
+    );
+}

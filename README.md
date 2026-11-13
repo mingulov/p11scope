@@ -62,8 +62,8 @@ commands, the hardened profile alternative, and the measured numbers.
 sudo p11scope doctor
 # List which programs use PKCS#11 providers right now.
 sudo p11scope inventory --system --duration 15s
-# Watch one program you picked in detail; -o saves the full JSON report to that file in the current directory.
-sudo p11scope profile --pid "$(pidof -s firefox)" --duration 30s -o firefox-profile.json
+# Watch one program in detail (use a PID from the inventory above, or `pidof <name>`).
+sudo p11scope profile --pid <PID> --duration 30s
 ```
 
 New here? Work through the [Quickstart](docs/usage.md#quickstart): it sets up a
@@ -88,7 +88,7 @@ run with -v for details
 
 Rows vary by host; `run with -v for details` lists every check.
 
-Firefox above is just an example — point `--pid` at any running program. If a command refuses instead of capturing, see [troubleshooting](docs/troubleshooting.md).
+`<PID>` is the program you picked. Add `-o report.json` to also save the full machine-readable report next to the terminal summary. If a command refuses instead of capturing, see [troubleshooting](docs/troubleshooting.md).
 Text is concise by default; `-v` shows full detail. Complete output: `--json` on inspect/inventory (incl. inventory diff, cbom); `-o FILE` on profile/run/inventory; trace streams text to `-o FILE` or `-o -`; inventory streams `--event-log`; doctor is text-only.
 
 ## Requirements

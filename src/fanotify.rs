@@ -1891,11 +1891,12 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
 /// reaches it.
 const LEARN_BACKLOG_CAP_BYTES: usize = 8 << 20;
 
-/// Sheds a backlog past `LEARN_BACKLOG_CAP_BYTES`: reads and closes
-/// queued events undecided down to half the cap and files the named
-/// overflow once for the episode — the finite-queue overflow, at a
-/// bound the drain chooses. Returns false when the overflow could not
-/// be sent (the drain must exit).
+/// Sheds a backlog past `cap_bytes` (production passes
+/// `LEARN_BACKLOG_CAP_BYTES`): reads and closes queued events undecided
+/// down to half of `cap_bytes` and files the named overflow once for
+/// the episode — the finite-queue overflow, at a bound the drain
+/// chooses. Returns false when the overflow could not be sent (the
+/// drain must exit).
 fn shed_backlog_past_cap(
     raw: std::os::unix::io::RawFd,
     ctx: &mut DrainCtx<'_>,
@@ -4083,13 +4084,15 @@ mod tests {
         // Never begin the drain: this thread reads the group itself.
         let (group, tx, _, _) = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
-        // 20000 opens with nobody reading: past the default queue limit.
-        // One process per pass, so the kernel cannot merge the repeats.
+        // 26000 opens with nobody reading: past the default 16384-event
+        // queue limit whether the kernel counts 24 or 32 bytes per event
+        // (metadata plus the pidfd info record). One process per pass,
+        // so the kernel cannot merge the repeats.
         assert!(
             std::process::Command::new("sh")
                 .args([
                     "-c",
-                    "for pass in 1 2 3 4 5 6 7 8 9 10; do cat \"$1\"/f* > /dev/null; done",
+                    "for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13; do cat \"$1\"/f* > /dev/null; done",
                     "sh",
                 ])
                 .arg(dir.path())
@@ -4099,8 +4102,8 @@ mod tests {
         );
         let queued = super::queued_event_bytes(raw).expect("FIONREAD");
         assert!(
-            queued >= 20_000 * super::FANOTIFY_META_LEN,
-            "the unlimited queue holds the whole flood: {queued} bytes"
+            queued > 16_384 * (super::FANOTIFY_META_LEN + 8),
+            "the unlimited queue holds past the default 16384-event limit: {queued} bytes"
         );
         let state = std::sync::Arc::new(super::LearnShutdownState::default());
         let mut ctx = super::DrainCtx {

@@ -256,6 +256,21 @@ already for process churn. There is no per-filesystem workaround;
 wrapping the tool in `run` or passing `--prearm-module` covers a
 known provider regardless of learning.
 
+### A provider installed through a writable mapping re-proves at the next 30 s flush
+
+File learning suppresses repeat opens of a proved-negative file with a
+kernel ignore mark that any modification clears — except a write
+performed purely through a shared writable `mmap`, which sends no
+modification event. A provider installed that way over a previously
+negative inode keeps its stale mark until the periodic ignore-mark
+flush (every 30 s), and is re-proved on its next open after the flush
+(the mapping write moves the file's ctime, so the next open is a new
+generation). The blind window is therefore at most one flush period
+plus the wait for the next open; a provider rewritten through a
+mapping and opened only inside that window is learned at its next
+open after the flush. Ordinary `write`/`truncate` installs re-prove
+on their next open with no window.
+
 ### Kernels before 6.12
 
 Per the owner's 2026-11-08 ruling, specific pre-6.12 edge cases are

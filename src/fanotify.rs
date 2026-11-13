@@ -871,8 +871,14 @@ impl FileLearner {
             libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK | libc::FAN_REPORT_PIDFD;
         // `O_CLOEXEC` in the event flags makes the kernel install every
         // event fd close-on-exec at read time (pidfds always are), so
-        // the hot path needs no extra fcntl.
-        let event_flags = libc::O_RDONLY as u32 | libc::O_LARGEFILE as u32 | libc::O_CLOEXEC as u32;
+        // the hot path needs no extra fcntl. `O_NONBLOCK` keeps the
+        // read itself from blocking: the kernel opens each event's file
+        // inside `read(2)`, and a FIFO opened read-only without it
+        // waits for a writer, stalling the whole drain until one comes.
+        let event_flags = libc::O_RDONLY as u32
+            | libc::O_LARGEFILE as u32
+            | libc::O_CLOEXEC as u32
+            | libc::O_NONBLOCK as u32;
         // SAFETY: libc call with flag constants only; the return is
         // checked before any use.
         let mut fd = unsafe { libc::fanotify_init(flags | libc::FAN_UNLIMITED_QUEUE, event_flags) };

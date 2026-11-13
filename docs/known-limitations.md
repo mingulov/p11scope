@@ -155,18 +155,19 @@ a scale cell joined 0 of 309,861 calls. Missed calls are shed with
 exact counts and named causes, never silently dropped.
 
 Avoid it with `--prearm-module PATH`, `run`, or a narrower
-`--pid`/`--cgroup` scope. A scheduling redesign is planned for a later release.
+`--pid`/`--cgroup` scope. A newcomer-priority scheduling fix is
+planned for 0.8.0.
 
 ### Manifest captures at very large endpoint counts may shed calls
 
 An `inventory --system --manifest ...` capture watching around four
 thousand endpoints or more (measured at 4,097 with `--max-endpoints
 8192`) can shed calls with exact counted causes while per-endpoint
-detail stays empty, and the run can exit nonzero. The shed counts are
-exact, never silent; smaller scopes are unaffected. Workaround:
-narrow the scope (`--pid` or `--cgroup`), or rerun on a quieter host
-— the same capture passes and fails across hosts and runs. Under
-investigation for a later release.
+detail stays empty, and the run can exit nonzero. This is a known bug
+in v0.7.0, not a host problem: a late provider at that scale can end
+with zero of its calls joined. The shed counts are exact, never
+silent; smaller scopes are unaffected. Workaround: narrow the scope
+(`--pid` or `--cgroup`). A fix is planned for 0.8.0.
 
 ### Observer memory grows under heavy process churn
 
@@ -196,9 +197,8 @@ callers' binaries: on the same 5-vCPU VM, callers built as non-PIE
 executables kept the observer at 110 to 330 MB. v0.6.0 behaves the
 pre-fix way. Plan for about 400 MB of observer memory for a
 quarter-hour system-wide capture on a busy host; `--pid`, cgroup and
-`run` captures of a quiet scope stay far below that. A formal
-long-soak ceiling and bounded observer memory are still planned for
-a later release.
+`run` captures of a quiet scope stay far below that. A bound on RSS
+growth during long captures is planned for 0.8.0.
 
 ### Short-lived processes never scanned
 
@@ -381,7 +381,8 @@ end-of-capture program in `capture.caller.exec_to_exe`, while the
 stderr `target:` end note and the stdout `caller:` line name both
 programs plainly. A pathname change alone is not an exec: renaming or
 unlinking the running executable keeps the attach-time name with no
-transition claimed.
+transition claimed. Nothing is claimed either when the end-of-capture
+read cannot be tied to the target.
 Residual limits: per-program call counts are not attributed (nothing
 says which program made which calls); at most one transition is
 provable from the two reads, so an intermediate program (A->B->C
@@ -429,23 +430,33 @@ planned for 0.8.0.
 
 ### System key operations without a manifest show no per-key rows
 
-`inventory --system --key-operations` without `--manifest` prints
-`key operations: requested, but per-key tracking needs --manifest`
-and shows no per-key rows. Workaround: build a manifest with the
+A short `inventory --system --key-operations` capture without
+`--manifest` can end before the scan seal seats (8 stable passes
+over one provider set) and shows no per-key rows, with a `key
+operations unavailable` gap naming the seal state and the remedies:
+a longer `--duration`, a narrower scope (`--pid` or `--module`), or
+`--manifest manifest.json`. Longer captures and narrowed scopes
+seal and show per-key rows with no flag since v0.7.0, and `--cgroup`
+captures attempt the seal since v0.7.0 (previously it never ran
+there). Broad inventory continues with mechanisms and API results
+either way. Workaround for short runs: build a manifest with the
 offline helper (`p11scope-discover --module <path> -o manifest.json`)
 and pass `--manifest manifest.json`, or capture the process by
-`--pid`. Per-key rows without a manifest are planned for 0.8.0.
+`--pid`.
 
 ### Calls through the p11-kit proxy can publish no mechanism names
 
-When the application reaches its provider through the p11-kit proxy,
-the mechanism table can come back empty: calls are counted exactly
-at the provider, but no `CKM_*` rows publish and `mechanisms[]`
-stays empty. Measured: 140 proxy calls counted with 0 mechanism
-rows, while the same workload against the provider directly
-publishes its rows. Workaround: point the application at the
-provider itself instead of the proxy when mechanism names matter.
-A fix is planned for 0.8.0.
+Since v0.7.0, ELF interposition under p11-kit-proxy no longer
+refuses the whole table: a `C_GetFunctionList`/`C_GetInterface`/
+`C_GetInterfaceList` slot forwarded by verified linker interposition
+keeps the standard-layout proof when the other object's own
+`.dynsym` defines the same name at that exact offset, the forwarded
+slot itself stays count-only, and own-object slots publish their
+`CKM_*` rows. Unverified forwards still refuse as before. Measured
+pre-fix: 140 proxy calls counted with 0 mechanism rows, while the
+same workload against the provider directly publishes its rows. If
+mechanism names still matter for an unverified shape, point the
+application at the provider itself instead of the proxy.
 
 ### `trace --system` and `profile` rate ceilings on a small VM
 
@@ -474,18 +485,18 @@ closed). Residual: a lifted browser child keeps its
 tracked) while rows follow. Measured: the pre-fix baseline was 4 of
 20 observer-first Chromium runs on a busy desktop (load 6-14) ending
 `bootstrap_unavailable` with thousands of `ImageTainted` birth
-refusals; after the fix, 0 of 20 runs ended that way (load 3-10),
-with zero `ImageTainted` birth refusals for the browser, and a
-20-browser-engaged-cell re-proof (61 attempts under load 3-83)
-showed 0 of 20 `bootstrap_unavailable`, with per-key rows tracked in
-12 and the shed→bind trigger exercised in 10. Cells where desktop
-saturation kept the observer from ever engaging the browser (no
-browser bindings, births, rows, or gaps) carry no verdict on this fix
-and sit outside the counted set; short-lived children the scan never
-admits under extreme load stay a separate admission-coverage
-limitation. The same harness measured
-0 of 22 release Firefox runs (plus 0 of 5 debug-confounded runs) and
-0 of 2 quiet-host Chromium runs at baseline.
+refusals. The integrated-trunk proof ran 40 attempts (load 1.8-13.4):
+1 errored environmentally, 20 engaged the browser and 19 never
+engaged it — desktop saturation kept the observer from the browser
+entirely (no bindings, births, rows, or gaps), so those cells carry
+no verdict on this fix. Of the 20 engaged cells, 0 ended
+`bootstrap_unavailable`, per-key rows tracked in 13, and the
+shed→bind trigger fired in 10; no `ImageTainted` appeared anywhere
+in all 39 valid cells. Short-lived children the scan never admits
+under load stay a separate admission-coverage limitation. The same
+harness measured 0 of 22 release Firefox runs (plus 0 of 5
+debug-confounded runs) and 0 of 2 quiet-host Chromium runs at
+baseline.
 
 ### Starting Firefox mid-capture can withhold mechanism names
 
@@ -1374,11 +1385,14 @@ Shipped in 0.6.0 and no longer planned: live key operations
 (`inventory --key-operations`) and promoting one endpoint to full
 detail during a counter capture (`--select-endpoint`).
 
+Shipped in 0.7.0 and no longer planned: per-key tracking for
+programs started after a background caller.
+
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
   (packet 6.13 follow-ups).
 - Bounded observer memory for long system-wide captures on busy hosts
-  (a later release), for example by keeping capture data on disk and
+  (0.8.0), for example by keeping capture data on disk and
   building the report from it separately.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
@@ -1419,8 +1433,11 @@ detail during a counter capture (`--select-endpoint`).
   still leaves a later pre side refused.
 - An independent event reader for sustained 10,000 key
   operations per second with exact per-call rows (0.8.0).
-- Per-key tracking for programs started after a background caller
-  (a later release).
+- Inferred key family and size class from operation mechanisms and
+  output lengths (0.8.0).
+- Creation-template curves and parameter sets (0.8.0).
+- One capture-owned open-handle table with a single acquire step
+  (0.8.0).
 - Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
   exits (a later release).
@@ -1603,8 +1620,10 @@ release.
 
 ## Planned for later versions
 
-- Live key operations (key type and size, sign/verify per key) in 0.6.0.
-- Promoting one endpoint to full detail during a counter capture, in 0.6.0.
+Shipped in 0.6.0 and no longer planned: live key operations
+(key type and size, sign/verify per key) and promoting one endpoint
+to full detail during a counter capture.
+
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.

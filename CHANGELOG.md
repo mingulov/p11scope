@@ -6,7 +6,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.7.0] - 2026-11-12
+## [0.7.0] - 2026-11-13
 
 ### Added
 
@@ -78,6 +78,47 @@ versioned separately and are opaque, exact dispatch keys.
   level for both capability sets (measured denials name hostPID, the
   capabilities and the hostPath volume).
   <!-- lane: nosysadmin -->
+- Pid-scope captures name the program after an exec: when a `profile
+  --pid` or `metrics --pid` target execs another program during the
+  capture, the report keeps the attach-time program in
+  `capture.caller.exe` and discloses the end-of-capture program in
+  the new `capture.caller.exec_to_exe` field, and the text output
+  names both programs. A transition is claimed only when the
+  executable file identity changed between the two reads through one
+  held descriptor (a rename or unlink alone claims nothing), and
+  nothing is claimed when the end read cannot be tied to the target.
+- A browser started after a background PKCS#11 process now gets
+  per-key tracking: when its exact image binds within a bounded
+  grace, its shed-taint lifts and tracking starts above the
+  unattributed pre-bind calls. Images with a genuine contradiction,
+  or proven only by another exec of the same process, stay refused.
+- Per-key tracking now rules out LTO kernels on hosts without
+  `/boot/config-*`: the check reads the running kernel's own
+  `/proc/config.gz` first, then the boot file, then the modules
+  tree's `.config` (only with a release proof). Arch and NixOS hosts
+  are covered; a kernel whose LTO status cannot be verified still
+  refuses. (New dependency: `flate2` for gzip decoding.)
+- `inventory --system --key-operations` without `--manifest` shows
+  per-key rows once the scan seal seats: longer captures and narrowed
+  scopes (`--pid`, `--module`) seal with no flag, and `--cgroup`
+  captures attempt the seal. Short runs that end first carry a `key
+  operations unavailable` gap naming the seal state and the remedies
+  instead of the misleading `needs --manifest` line.
+- Quiet Docker and `--cgroup` captures no longer report PARTIAL when
+  post-ready completion attached only publication hooks: the window
+  files a gap only when counting coverage was added. Scan-only
+  captures with layout evidence now read COMPLETE instead of PARTIAL.
+- Text output prints full provider paths with their container origins
+  in ASCII-only text, so large-host inventories name the exact file;
+  narrow cells keep the provider name visible.
+- Verified linker-interposition forwards keep the standard-layout
+  proof: a getter slot forwarded into another object stays count-only
+  itself while own-object slots publish their mechanism names, so
+  p11-kit-proxy interposition no longer refuses the whole table.
+- File learning under `--system` marks through shadowing mounts and
+  file binds, so providers under an overlay or a bind-mounted file are
+  learned; automount triggers and device binds are skipped, and the
+  mark pass is bounded so a hung mount cannot stall the capture.
 
 ### Changed
 
@@ -218,6 +259,21 @@ versioned separately and are opaque, exact dispatch keys.
 - `doctor` on the static release build samples the host's loader facts
   from init when the observer itself is statically linked, instead of
   warning that the loader is unbound on every host.
+- A stalled stderr no longer stalls the capture: diagnostics shed
+  with counts instead of blocking when stderr is a full pipe or
+  terminal, and a capture with no free file descriptor still prints
+  its refusal instead of exiting silently.
+- System-wide captures no longer count kernel-thread exits as lost
+  processes, retry loader attaches blocked by a racing exit, replace
+  stale thread-ID entries when the loader binds, and disclose failed
+  cleanup detaches as named gaps instead of dropping them.
+- Guest and cgroup captures classify stopped and refused work
+  correctly: returns that predate continuity are not counted, failed
+  retirements count as unmatched, and retired refused joins count as
+  semantic instead of unmatched.
+- A stale manifest grants no semantic authority: replacement tables
+  lend names only, never semantics, and non-standard, disagreeing or
+  forged replacements stay count-only.
 
 ### Corrections
 
@@ -240,17 +296,18 @@ versioned separately and are opaque, exact dispatch keys.
   stacking it: 15-minute churn soaks stay flat at 368 MB peak
   (VmHWM) on the musl static observer and 322 MB on glibc.
   See [Observer memory grows under heavy process churn](docs/known-limitations.md#observer-memory-grows-under-heavy-process-churn);
-  bounded memory is planned for a later release.
+  bounded memory is planned for 0.8.0.
 
 ### Known limitations
 
 The v0.7.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-070).
 
-- A browser started after a background PKCS#11 process can,
-  intermittently, end without per-key operation tracking (reported as
-  `bootstrap_unavailable`); its calls and counts are still recorded.
-  Planned for a later release.
+- A manifest capture watching around four thousand endpoints or more
+  can shed calls with exact counted causes while per-endpoint detail
+  stays empty, and the run can exit nonzero. This is a known bug in
+  v0.7.0, not a host problem; a fix is planned for 0.8.0. Narrow the
+  scope (`--pid` or `--cgroup`) to avoid it.
 - On a busy host, a multi-threaded program that exits during a
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting

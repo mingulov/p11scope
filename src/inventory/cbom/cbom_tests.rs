@@ -462,6 +462,39 @@ fn projection_accepts_profile_mechanisms_and_modules() {
     assert!(projection.dependencies.is_empty());
 }
 
+/// O9: a profile input without a scope note renders "(scope
+/// unknown)", never the doubled "(scope unknown scope)".
+#[test]
+fn concise_head_names_an_unknown_scope_once() {
+    let bytes = serde_json::to_vec(&json!({
+        "schema": "p11scope/observed-profile/v3",
+        "capture": {
+            "mode": "profile",
+            "start": "2026-11-07T00:00:00Z",
+            "end": "2026-11-07T00:01:00Z",
+            "modules": [
+                {"path": "/lib/p.so", "dev": [8, 1], "ino": 7,
+                 "sha256": "d".repeat(64), "build_id": null}
+            ]
+        },
+        "evidence": {"completeness": "PARTIAL"},
+        "functions": [],
+        "mechanisms": [],
+        "sessions": {}, "logins": {}, "templates": {"operations": []}, "cgroups": []
+    }))
+    .unwrap();
+    let projection = parse_input(&bytes).unwrap();
+    assert!(
+        projection.scope_note.is_none(),
+        "the fixture carries no scope"
+    );
+    let mut output = Vec::new();
+    super::render::render_concise(&projection, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("(scope unknown):"), "{text}");
+    assert!(!text.contains("unknown scope"), "no doubled word: {text}");
+}
+
 #[test]
 fn projection_enforces_the_shared_row_bound() {
     let bytes = inventory_document(

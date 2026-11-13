@@ -415,7 +415,7 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 }
 
 fn head_line(projection: &Projection) -> String {
-    let scope = projection.scope_note.as_deref().unwrap_or("unknown scope");
+    let scope = projection.scope_note.as_deref().unwrap_or("unknown");
     format!(
         "CBOM from {} (scope {scope}): {}, {}, {}, {}",
         escape_controls(&projection.source_schema),

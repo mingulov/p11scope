@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,7 @@ RUN_TREE_CELLS = (
 # A canned guest: parses --rwdir from the wrapper's vng invocation and
 # writes the result files per FAKE_WRAPPER_MODE. Never boots.
 FAKE_VNG = r'''#!/bin/sh
+case "$1" in --version) echo "virtme-ng 1.41-stub"; exit 0;; esac
 out=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,6 +57,7 @@ write_qual() {
 mode="${FAKE_WRAPPER_MODE:-cli-pass-0}"
 case "$mode" in
     vng-fail) echo "vng: unknown kernel"; exit 1;;
+    hang-no-output) sleep 30; exit 0;;
 esac
 echo "6.6.157" > "$out/uname.txt"
 case "$mode" in
@@ -113,8 +116,15 @@ class VngWrapperExitTests(unittest.TestCase):
         (cache_boot / "config-6.6.157").write_text("CONFIG_LTO=y\n")
         self.vng_cache = self.home_scratch / "vng-cache"
 
-    def run_wrapper(self, wrapper, *extra, mode):
-        env = dict(os.environ, FAKE_WRAPPER_MODE=mode)
+    def run_wrapper(self, wrapper, *extra, mode, extra_env=None):
+        # VNG_BOOT_WATCH_TEST skips the helper's live KVM probe: these
+        # tests pin exit plumbing with a stubbed vng, and KVM is not
+        # openable on CI script lanes. The probe itself is covered by
+        # tests/python/test_vng_boot_watch.py.
+        env = dict(os.environ, FAKE_WRAPPER_MODE=mode,
+                   VNG_BOOT_WATCH_TEST="1")
+        if extra_env:
+            env.update(extra_env)
         env["PATH"] = str(self.staged_bin) + os.pathsep + env["PATH"]
         out = self.home_scratch / ("out-" + mode.replace("/", "-"))
         command = [str(wrapper), "v6.6.157", str(self.binary), str(out), *extra]
@@ -162,6 +172,21 @@ class VngWrapperExitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("minimal-cells/results.jsonl", result.stderr)
 
+    def test_cli_silent_hang_trips_the_boot_watchdog(self):
+        # Same zero-byte signature as the run-tree leg: a silent vng
+        # must trip VNG_BOOT_TIMEOUT fast (the wrapper maps the
+        # helper's exit 2 to its documented vng-failure exit 1).
+        extra = {"VNG_BOOT_TIMEOUT_S": "3"}
+        start = time.monotonic()
+        result, out = self.run_wrapper(CLI_WRAPPER, mode="hang-no-output",
+                                       extra_env=extra)
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("VNG_BOOT_TIMEOUT", result.stderr)
+        self.assertTrue((out / "vng-boot-diag.log").is_file(),
+                        f"diag missing; stderr: {result.stderr}")
+        self.assertLess(elapsed, 25, f"watchdog did not trip fast: {elapsed:.1f}s")
+
     def test_c1b_pass_and_fail_propagate(self):
         result, _ = self.run_wrapper(C1B_WRAPPER, mode="c1b-pass-0")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -180,7 +205,22 @@ class VngWrapperExitTests(unittest.TestCase):
                 result, _ = self.run_wrapper(C1B_WRAPPER, mode=mode)
                 self.assertEqual(result.returncode, 1, result.stderr)
 
-    def run_runtree(self, mode, id_stub=None):
+    def test_c1b_silent_hang_trips_the_boot_watchdog(self):
+        # Same zero-byte signature as the run-tree leg: a silent vng
+        # must trip VNG_BOOT_TIMEOUT fast (exit 1 is this wrapper's
+        # documented vng-failure code).
+        extra = {"VNG_BOOT_TIMEOUT_S": "3"}
+        start = time.monotonic()
+        result, out = self.run_wrapper(C1B_WRAPPER, mode="hang-no-output",
+                                       extra_env=extra)
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("VNG_BOOT_TIMEOUT", result.stderr)
+        self.assertTrue((out / "vng-boot-diag.log").is_file(),
+                        f"diag missing; stderr: {result.stderr}")
+        self.assertLess(elapsed, 25, f"watchdog did not trip fast: {elapsed:.1f}s")
+
+    def run_runtree(self, mode, id_stub=None, extra_env=None):
         # The run-tree wrapper takes TESTBIN OUTDIR KERNEL and stages
         # the kernel config from RUN_TREE_VNG_CACHE. inner.sh is
         # generated before vng runs, so even a vng failure leaves it
@@ -192,7 +232,10 @@ class VngWrapperExitTests(unittest.TestCase):
             stub.chmod(0o700)
             self.addCleanup(stub.unlink)
         env = dict(os.environ, FAKE_WRAPPER_MODE=mode,
-                   RUN_TREE_VNG_CACHE=str(self.vng_cache))
+                   RUN_TREE_VNG_CACHE=str(self.vng_cache),
+                   VNG_BOOT_WATCH_TEST="1")
+        if extra_env:
+            env.update(extra_env)
         env["PATH"] = str(self.staged_bin) + os.pathsep + env["PATH"]
         out = self.home_scratch / ("out-runtree-" + mode.replace("/", "-"))
         command = [str(RUNTREE_WRAPPER), str(self.binary), str(out), "v6.6.157"]
@@ -225,6 +268,23 @@ class VngWrapperExitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("non-root", result.stderr)
         self.assertFalse((out / "inner.sh").is_file())
+
+    def test_runtree_silent_hang_trips_the_boot_watchdog_fast(self):
+        # The CI zero-byte hang (privileged 43426725707 run-tree
+        # v6.6.157: qemu SIGTERM'd by the 1200s timeout with 0 guest
+        # bytes): a vng that stays silent must trip a NAMED boot
+        # failure within the boot deadline, with a diagnostics file,
+        # instead of riding the blind 1200s timeout. The stub sleeps
+        # 30s silent; the watchdog deadline here is 3s.
+        extra = {"VNG_BOOT_TIMEOUT_S": "3"}
+        start = time.monotonic()
+        result, out = self.run_runtree("hang-no-output", extra_env=extra)
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("VNG_BOOT_TIMEOUT", result.stderr)
+        diag = out / "vng-boot-diag.log"
+        self.assertTrue(diag.is_file(), f"diag missing; stderr: {result.stderr}")
+        self.assertLess(elapsed, 25, f"watchdog did not trip fast: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

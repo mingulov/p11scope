@@ -27,7 +27,7 @@ Pick one demo (each takes a few minutes):
   Docker and Docker Desktop cannot work: watching the whole
   machine needs real host capabilities, and Docker Desktop's
   `--pid=host` sees the Desktop virtual machine, not your PC.
-- About a minute per demo. The commands below use the published
+- A few minutes per demo. The commands below use the published
   release image `ghcr.io/mingulov/p11scope:latest`. To pin this
   exact release, use `ghcr.io/mingulov/p11scope:0.7.0` instead of
   `:latest`.

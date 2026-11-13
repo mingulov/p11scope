@@ -108,6 +108,7 @@ C_GetAttributeValue: CKR_ATTRIBUTE_TYPE_INVALID x3
 MECHANISM                       CALLS    ERR
 CKM_SHA256_RSA_PKCS                 3      0
 CKM_RSA_PKCS_KEY_PAIR_GEN           1      0
+[...]
 ```
 
 In plain words: two logins, one RSA key pair generated, one

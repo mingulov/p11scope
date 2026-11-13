@@ -23,7 +23,7 @@ p11scope: inventory --system: live capture needs root: the kernel refused to loa
 `doctor` without privileges agrees (observed, exit 1):
 
 ```
-verdict: capture unavailable; inventory capture unavailable (preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: map error: failed to create map: Operation not permitted (os error 1)); run startup capture not in this build (run reports stay partial; run itself works)
+verdict: capture unavailable; inventory capture unavailable (preparing Inventory: LoadObject: loading fresh Inventory object with exact capacity: map error: failed to create map: Operation not permitted (os error 1))
 effective capabilities ............ warn  none — live capture needs root
 BPF map create .................... FAIL  loading BPF object with required task storage: map error: failed to create map `TASK_COOKIE`: Operation not permitted (os error 1)
 uprobe-multi attach (own libc) .... FAIL  live capture needs root: the kernel refused to load p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture.
@@ -31,7 +31,9 @@ Next: run as root: sudo p11scope doctor.
 ```
 
 (The failing map name varies run to run; the cause is the same
-`Operation not permitted`.)
+`Operation not permitted`. `doctor -v` keeps the `run startup capture
+not in this build` note on its verdict line; the default line leaves
+it out.)
 
 Why: loading BPF needs `CAP_BPF` (or `CAP_SYS_ADMIN`, which covers the
 BPF/perf checks); this process has neither. Fix: capture as root

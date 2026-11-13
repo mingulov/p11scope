@@ -1995,6 +1995,11 @@ arguments instead of environment wherever a script is invoked by hand.
   one-shot tools). Exactly `1` disables it; anything else (including
   unset) keeps learning on. A disabled capture keeps ordinary discovery
   and files the named disabled-learning gap. Capture-visible.
+- `P11SCOPE_IMAGE` — observer-image marker, set to `1` by both
+  observer Dockerfiles (never by hand): inside the image `p11scope
+  doctor` names `docker run` capability flags instead of `setcap`.
+  Read-only guidance input, never a capture switch; not
+  capture-visible.
 - `P11SCOPE_PRODUCT_BUILD_MODE` — build lane selector for `scripts/`: `ordinary`
   (default) builds with the ambient toolchain, `prepared` builds with the
   pinned prepared-dependency toolchain. Affects builds, never a capture.
@@ -2503,6 +2508,10 @@ binary (the xattr does not survive image builds and `nosuid` mounts).
 Log out and back in for the group membership to apply, then run
 `p11scope doctor` as yourself: the `effective capabilities` row lists the
 held set, and any gap names the missing capability with what it enables.
+The five-capability set deliberately omits `CAP_SYS_ADMIN`, so kernel
+file-open learning stays off under it: doctor names `file learning
+unavailable (needs CAP_SYS_ADMIN)` on its verdict line, and `--system`
+captures file the named learning gap instead of learning later runs.
 A capture missing a capability refuses or degrades with a plain `needs
 CAP_...` line rather than a raw errno. `run` as root additionally needs
 `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` in the invoking set for the

@@ -61,7 +61,7 @@ available and never calls `C_Initialize`; live observation remains passive.
 
 After installing, check host readiness, then start with a whole-machine
 inventory and inspect a process you found there. Below is real output
-from the v0.6.0 release binary on Ubuntu 26.04 (kernel 7.0.0-38,
+from the v0.8.0 release binary on Ubuntu 26.04 (kernel 7.0.0-43,
 `perf_event_paranoid=4`, lockdown `integrity`); the `--system` window
 is shortened to 15 s here and the `--pid` target is a long-lived
 SoftHSM caller:
@@ -72,11 +72,8 @@ sudo p11scope doctor
 
 ```
 Doctor: requested-lane checks passed.
-verdict: capture available; run startup capture not in this build (run reports stay partial; run itself works)
-target loader build ............... warn  unbound
-debug-state hook .................. warn  unavailable
-loader-state live read ............ warn  unavailable
-Next: sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target).
+verdict: capture available
+Next: choose --pid <PID> or --cgroup <PATH> to assess a target scope.
 run with -v for details
 ```
 
@@ -85,30 +82,46 @@ sudo p11scope inventory --system --duration 15s
 ```
 
 ```
-inventory system (2 passes, 179 callers, 5 provider files, 29 edges)
-coverage: partial - 304 gaps, 0 refused, 0 more not shown
+inventory system (2 passes, 539 callers, 9 provider files, 52 edges)
+coverage: partial - 11 gaps
 key operations: not reported (per-key tracking is off)
-/snap/snapd-desktop-integration/391/gnome-platform/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.5: mapped by 1 application (snapd-desktop-integration); activity unknown
-/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 0:35 ino 38051]: mapped by 24 applications (NetworkManager, chronyd, cups-browsed, ...); activity unknown
-/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 7:6 ino 4518]: mapped by 2 applications (cups-proxyd, cupsd); activity unknown
-/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so: mapped by 1 application (gsd-smartcard); activity unknown
-/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so: mapped by 1 application (gsd-smartcard); activity unknown
-limits: 179 callers, 5 provider files, 29 edges (0 refused); 19607 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
-gaps: 26 x maps attribution - maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 x /opt/vendor/bin/big-tool-1.4.14-R7309.1 - object is 414927192 bytes; limit is 268435456; 11 x maps attribution - maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 x /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0 (deleted) - replaced on disk while running; not examined, calls not counted; and 35 more (--json has every item)
+/snap/firefox/9057/usr/lib/firefox/libsoftokn3.so: mapped by 10 applications (firefox (from firefox), firefox (from xfce4-panel)); no use in the covered interval; 10 of 10 mappings predate the watch, earlier calls are not counted
+/snap/snapd-desktop-integration/391/gnome-platform/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.5: mapped by 1 application (snapd-desktop-integration (from user-session-helper)); activity unknown
+/usr/lib/x86_64-linux-gnu/libnssckbi.so: mapped by 1 application (chrome (from xfce4-panel)); no use in the covered interval; mapped at least 6.85s before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 0:35 ino 38051]: mapped by 34 applications (NetworkManager (from NetworkManager.service), chrome, chrome (from chrome), ...); no use in the covered interval; 34 of 34 mappings predate the watch, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8 [dev 7:6 ino 4521]: mapped by 2 applications (cups-proxyd (from dash), cupsd (from dash)); no use in the covered interval; 2 of 2 mappings predate the watch, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/libsoftokn3.so: mapped by 1 application (chrome (from xfce4-panel)); no use in the covered interval; mapped at least 6.85s before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 6.85s before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 6.85s before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 6.85s before the watch started, earlier calls are not counted
+limits: 539 callers, 9 provider files, 52 edges (0 refused); 20167 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
+gaps: 11
+  2 x kernel threads - 508 process examinations found kernel threads with no user memory to scan
+  1 x discovery coverage ended before stop - 61 process(es) started after the last completed...
+  1 x process identity checked from /proc (PID... - some processes were identified from /proc only
+  3 x native endpoint attach deferred - attach unfinished at stop: 5966 endpoint(s) deferred...
+  2 x native endpoint attach deferred - attach finished late: 6009 endpoint(s) deferred over 1...
+  1 x caller admission failed - cannot pin caller pid 1065660: no live process with that pid (it...
+  1 x leader exit status unresolved at stop - 1 pending leader exit(s) remain unknown; first...
+note: 3783 endpoints still deferred at stop; counted uses are lower bounds.
 run with -v for details
 ```
 
 ```sh
-sudo p11scope inventory --pid 920308 --duration 15s
+sudo p11scope inventory --pid 7237 --duration 15s
 ```
 
 ```
-inventory pid:920308 (15 passes, 1 caller, 1 provider file, 1 edge)
-coverage: partial - 1 gap, 0 refused, 0 more not shown
+inventory pid:7237 (14 passes, 1 caller, 4 provider files, 4 edges)
+coverage: partial - 1 gap
 key operations: not reported (per-key tracking is off)
-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so: mapped by 1 application (python3.14); 30 entries observed
-limits: 1 caller, 1 provider file, 1 edge (0 refused); 68 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
-gaps: 1 x process identity checked from /proc (PID and start time), not by the kernel - some processes were identified from /proc only (--json has every item)
+/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 333.9ms before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 336.8ms before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 335.2ms before the watch started, earlier calls are not counted
+/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so: mapped by 1 application (gsd-smartcard (from org.gnome.SettingsDaemon.Smartcard.service)); no use in the covered interval; mapped at least 337.7ms before the watch started, earlier calls are not counted
+limits: 1 caller, 4 provider files, 4 edges (0 refused); 6975 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
+gaps: 1
+  1 x process identity checked from /proc (PID... - some processes were identified from /proc only
 run with -v for details
 ```
 

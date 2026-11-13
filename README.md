@@ -91,11 +91,11 @@ named miss — wrap such tools in `sudo p11scope run --user $USER --
 <tool>` (or pass `--prearm-module PATH`) when first-run coverage
 matters.
 
-`doctor` reports host readiness (real output, v0.7.0 on Ubuntu 26.04):
+`doctor` reports host readiness (real output, v0.8.0 on Ubuntu 26.04):
 
 ```
 Doctor: requested-lane checks passed.
-verdict: capture available; run startup capture not in this build (run reports stay partial; run itself works)
+verdict: capture available
 Next: choose --pid <PID> or --cgroup <PATH> to assess a target scope.
 run with -v for details
 ```

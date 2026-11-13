@@ -825,6 +825,40 @@ pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&
     (Some(exe), None)
 }
 
+/// Runs the arming mark pass on a bounded helper: `Some` with the
+/// marked group when it finishes in time, `None` on timeout. On
+/// timeout the helper is detached holding the group, so the owner
+/// stops its further marks through a shared cancel flag and removes
+/// the marks it already placed: a duplicate of the group names the
+/// same group, and flushing the filesystem marks through it (the
+/// startup `CAP_SYS_ADMIN` grant is still held here) leaves the
+/// detached group with nothing queued behind it — no unbounded
+/// kernel queue, no pinned mounts — before the duplicate is closed.
+/// The `mark` closure receives the group and the cancel flag;
+/// production marks every visible filesystem, tests inject a stalled
+/// pass.
+fn arm_with_bound(
+    group: OwnedFd,
+    mark: impl FnOnce(&OwnedFd, &AtomicBool) -> (BTreeSet<MountIdentity>, usize) + Send + 'static,
+) -> Option<(OwnedFd, BTreeSet<MountIdentity>, usize)> {
+    let dup = group.try_clone().ok();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_helper = Arc::clone(&cancel);
+    let pass = run_with_bound("p11scope-learn-mark", LEARN_WORKER_BOUND, move || {
+        let (covered, uncovered) = mark(&group, &cancel_helper);
+        (group, covered, uncovered)
+    });
+    let Some(result) = pass else {
+        cancel.store(true, Ordering::Release);
+        if let Some(dup) = dup {
+            flush_filesystem_marks(dup.as_raw_fd());
+        }
+        return None;
+    };
+    drop(dup);
+    Some(result)
+}
+
 /// The drain thread with its exit signal: the handle joins only after
 /// the done channel fires (or breaks on panic), so the end join can
 /// wait with the worker bound and detach a hung drain instead of
@@ -851,6 +885,42 @@ pub(crate) struct FileLearner {
     pending: Option<(OwnedFd, SyncSender<LearnMsg>, BTreeSet<MountIdentity>, bool)>,
 }
 
+/// Opens the fanotify group for learning: the kernel queue is
+/// unlimited (`FAN_UNLIMITED_QUEUE`, which the startup grant allows)
+/// so the events queued between arming and the post-shed drain start
+/// — the whole BPF setup — and short bursts never overflow the
+/// default 16384-event queue on a busy host. A kernel that refuses
+/// the flag falls back to the finite queue, whose overflow is the
+/// same named gap.
+fn open_learn_group() -> Result<OwnedFd, LearnAbsent> {
+    let flags =
+        libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK | libc::FAN_REPORT_PIDFD;
+    // `O_CLOEXEC` in the event flags makes the kernel install every
+    // event fd close-on-exec at read time (pidfds always are), so
+    // the hot path needs no extra fcntl. `O_NONBLOCK` keeps the
+    // read itself from blocking: the kernel opens each event's file
+    // inside `read(2)`, and a FIFO opened read-only without it
+    // waits for a writer, stalling the whole drain until one comes.
+    let event_flags = libc::O_RDONLY as u32
+        | libc::O_LARGEFILE as u32
+        | libc::O_CLOEXEC as u32
+        | libc::O_NONBLOCK as u32;
+    // SAFETY: libc call with flag constants only; the return is
+    // checked before any use.
+    let mut fd = unsafe { libc::fanotify_init(flags | libc::FAN_UNLIMITED_QUEUE, event_flags) };
+    if fd < 0 {
+        // SAFETY: as above.
+        fd = unsafe { libc::fanotify_init(flags, event_flags) };
+    }
+    if fd < 0 {
+        return Err(LearnAbsent {
+            reason: format!("fanotify_init failed: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: fanotify_init returned an owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 impl FileLearner {
     /// Opens the fanotify group and marks every real filesystem
     /// (both need the startup `CAP_SYS_ADMIN` grant), but does not
@@ -859,51 +929,21 @@ impl FileLearner {
     /// returns `LearnAbsent` and the capture keeps today's gaps,
     /// never a fatal.
     pub(crate) fn start() -> Result<(Self, Receiver<LearnMsg>), LearnAbsent> {
-        // The kernel queue is unlimited (`FAN_UNLIMITED_QUEUE`, which
-        // the startup grant allows): the events queued between arming
-        // and the post-shed drain start — the whole BPF setup — and
-        // short bursts must not overflow the default 16384-event queue
-        // on a busy host. The bound moves to user space instead: the
-        // drain sheds a backlog past `LEARN_BACKLOG_CAP_BYTES` as a
-        // named overflow, and no drain step blocks on a mount. A kernel
-        // that refuses the flag falls back to the finite queue, whose
-        // overflow is the same named gap.
-        let flags =
-            libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK | libc::FAN_REPORT_PIDFD;
-        // `O_CLOEXEC` in the event flags makes the kernel install every
-        // event fd close-on-exec at read time (pidfds always are), so
-        // the hot path needs no extra fcntl. `O_NONBLOCK` keeps the
-        // read itself from blocking: the kernel opens each event's file
-        // inside `read(2)`, and a FIFO opened read-only without it
-        // waits for a writer, stalling the whole drain until one comes.
-        let event_flags = libc::O_RDONLY as u32
-            | libc::O_LARGEFILE as u32
-            | libc::O_CLOEXEC as u32
-            | libc::O_NONBLOCK as u32;
-        // SAFETY: libc call with flag constants only; the return is
-        // checked before any use.
-        let mut fd = unsafe { libc::fanotify_init(flags | libc::FAN_UNLIMITED_QUEUE, event_flags) };
-        if fd < 0 {
-            // SAFETY: as above.
-            fd = unsafe { libc::fanotify_init(flags, event_flags) };
-        }
-        if fd < 0 {
-            return Err(LearnAbsent {
-                reason: format!("fanotify_init failed: {}", std::io::Error::last_os_error()),
-            });
-        }
-        // SAFETY: fanotify_init returned an owned fd.
-        let group = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The bound moves to user space: the drain sheds a backlog
+        // past `LEARN_BACKLOG_CAP_BYTES` as a named overflow, and no
+        // drain step blocks on a mount.
+        let group = open_learn_group()?;
         // The mark pass opens every visible mount: on a hung mount
         // (unreachable NFS/CIFS, dead FUSE) an open can block
         // indefinitely, which would wedge `--system` start before
         // `capturing:`. Run it on a helper under the worker bound; on
-        // timeout the helper is detached (it owns the group and closes
-        // it when the hang clears) and learning is unavailable — a
-        // named gap, never a hung start.
-        let pass = run_with_bound("p11scope-learn-mark", LEARN_WORKER_BOUND, move || {
-            let (covered, uncovered) = mark_visible_filesystems(&group, &BTreeSet::new());
-            (group, covered, uncovered)
+        // timeout the helper is detached (its marks are flushed
+        // through a duplicate while the startup grant is still held,
+        // it places no further marks once cancelled, and it closes
+        // the group when the hang clears) and learning is unavailable
+        // — a named gap, never a hung start.
+        let pass = arm_with_bound(group, |group, cancel| {
+            mark_visible_filesystems(group, &BTreeSet::new(), cancel)
         });
         let Some((group, covered, uncovered)) = pass else {
             return Err(LearnAbsent {
@@ -1362,13 +1402,24 @@ fn try_mark_filesystem(
 
 /// One (re-)mark pass over the visible filesystems, retaining the
 /// coverage earlier passes established. Returns the next covered set
-/// and how many visible filesystems it leaves uncovered.
+/// and how many visible filesystems it leaves uncovered. `cancel` is
+/// checked before each mark: a cancelled pass places no further marks
+/// (a mount it already passed keeps its mark; a mount it never reached
+/// stays uncovered), so a detached arming helper stops dirtying the
+/// group once the owner gives up on it.
 fn mark_visible_filesystems(
     group: &OwnedFd,
     previously_covered: &BTreeSet<MountIdentity>,
+    cancel: &AtomicBool,
 ) -> (BTreeSet<MountIdentity>, usize) {
     let mounts = visible_mounts();
     evaluate_mark_coverage(previously_covered, &mounts, |point| {
+        if cancel.load(Ordering::Acquire) {
+            return MarkOutcome {
+                resolved: None,
+                marked: None,
+            };
+        }
         try_mark_filesystem(group, point, &mounts)
     })
 }
@@ -1520,6 +1571,24 @@ fn ignore_negative_inode(group: std::os::unix::io::RawFd, file: &std::fs::File) 
             libc::FAN_MARK_ADD | libc::FAN_MARK_IGNORED_MASK | libc::FAN_MARK_EVICTABLE,
             libc::FAN_OPEN,
             file.as_raw_fd(),
+            std::ptr::null(),
+        )
+    };
+    rc == 0
+}
+
+/// Removes every filesystem mark of the group (inode ignore marks
+/// stay): flushing filesystem marks needs `CAP_SYS_ADMIN`, so it runs
+/// only where the startup grant is still held — the arming-timeout
+/// cleanup below. Best effort.
+fn flush_filesystem_marks(group: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: libc call on the live group; flush takes no path.
+    let rc = unsafe {
+        libc::fanotify_mark(
+            group,
+            libc::FAN_MARK_FLUSH | libc::FAN_MARK_FILESYSTEM,
+            0,
+            libc::AT_FDCWD,
             std::ptr::null(),
         )
     };
@@ -1876,7 +1945,10 @@ fn drain_loop(
             let previous = covered.clone();
             let remark = group.try_clone().ok().and_then(|dup| {
                 run_with_bound("p11scope-learn-remark", LEARN_WORKER_BOUND, move || {
-                    mark_visible_filesystems(&dup, &previous)
+                    // The periodic pass is never cancelled: it runs to
+                    // completion or the bound detaches it whole.
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    mark_visible_filesystems(&dup, &previous, &never)
                 })
             });
             let (next_covered, uncovered) = remark.unwrap_or_else(|| (covered.clone(), 1));
@@ -3113,6 +3185,106 @@ mod tests {
             state,
             libc::PTHREAD_CREATE_DETACHED,
             "a dropped handle leaves the worker detached (state={state})"
+        );
+    }
+
+    /// Counts this process's open fanotify group fds through
+    /// `/proc/self/fd` readlinks: the arming-timeout twin uses it to
+    /// prove the owner's duplicate is closed while the stalled helper
+    /// still holds the group.
+    fn fanotify_fd_count() -> usize {
+        let mut count = 0;
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            for entry in entries.flatten() {
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    if target.to_string_lossy().contains("anon_inode:[fanotify]") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Live arming-timeout proof (privileged): a mark pass stalled past
+    /// the worker bound times out, and the timed-out group keeps no
+    /// filesystem marks — nothing queues behind the detached helper,
+    /// pins mounts or holds the queue — while the owner's duplicate is
+    /// closed. The hook marks the scratch filesystem once (proving a
+    /// mark existed to remove), then stalls; while it is still stalled
+    /// the owner must already have flushed the mark and closed the
+    /// duplicate. Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_arming_timeout_flushes_marks_and_closes_dup() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = fanotify_fd_count();
+        let group = super::open_learn_group().expect("fanotify group (run as root)");
+        let group_fd = group.as_raw_fd();
+        let marked = std::sync::Arc::new(AtomicBool::new(false));
+        let saw_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let hook_done = std::sync::Arc::new(AtomicBool::new(false));
+        let marked_hook = std::sync::Arc::clone(&marked);
+        let saw_cancel_hook = std::sync::Arc::clone(&saw_cancel);
+        let hook_done_hook = std::sync::Arc::clone(&hook_done);
+        let mount = dir.path().to_path_buf();
+        let start = std::time::Instant::now();
+        let pass = super::arm_with_bound(group, move |group, cancel| {
+            let outcome = super::try_mark_filesystem(group, &mount, &[]);
+            marked_hook.store(outcome.marked.is_some(), Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            saw_cancel_hook.store(cancel.load(Ordering::Acquire), Ordering::Release);
+            hook_done_hook.store(true, Ordering::Release);
+            (std::collections::BTreeSet::new(), 0)
+        });
+        let elapsed = start.elapsed();
+        assert!(pass.is_none(), "a stalled arming pass times out");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the arming wait stays bounded: {elapsed:?}"
+        );
+        assert!(
+            marked.load(Ordering::Acquire),
+            "the hook placed a mark for the timeout to remove"
+        );
+        assert!(
+            !hook_done.load(Ordering::Acquire),
+            "the helper is still stalled past the timeout"
+        );
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{group_fd}"))
+            .expect("fdinfo of the stalled group");
+        assert!(
+            !fdinfo.lines().any(|line| line.starts_with("fanotify ")
+                && (line.contains("sdev:") || line.contains("mnt_id:"))),
+            "the timed-out group holds no filesystem marks: {fdinfo}"
+        );
+        assert_eq!(
+            fanotify_fd_count(),
+            baseline + 1,
+            "only the helper's group stays open while it stalls"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !hook_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            hook_done.load(Ordering::Acquire),
+            "the stalled helper exits after its sleep"
+        );
+        assert!(
+            saw_cancel.load(Ordering::Acquire),
+            "the helper observed the cancel flag"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fanotify_fd_count() != baseline && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            fanotify_fd_count(),
+            baseline,
+            "the helper's group closes with it: no leaked group"
         );
     }
 

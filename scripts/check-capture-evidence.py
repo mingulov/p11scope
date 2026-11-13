@@ -1286,6 +1286,13 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
+    # The trace terminal's counted caller-reasons fold: past the
+    # 4096-caller cap the record carries `caller_reasons_overflow`;
+    # under the cap the field is absent, so it is allowed only when
+    # present — never pre-added — and only on terminal documents.
+    if terminal and "caller_reasons_overflow" in evidence:
+        wanted.add("caller_reasons_overflow")
+        exact_caller_reasons_overflow(evidence["caller_reasons_overflow"])
     if not historical and not terminal and "counter_collection" in evidence:
         wanted.add("counter_collection")
         exact_counter_collection(evidence["counter_collection"])
@@ -1388,6 +1395,18 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
         require(u64(evidence["run_tree_handed_back"]),
                 f"invalid run_tree_handed_back: {evidence['run_tree_handed_back']!r}")
+
+
+def exact_caller_reasons_overflow(value):
+    """The trace terminal's counted caller-reasons fold: the rendered
+    failing lines folded past the caller cap (`folded_lines`) and the
+    distinct folded (function, rv) pairs (`folded_rows`). The producer
+    publishes it only once a line folded, so both counts are positive."""
+    exact_keys(value, {"folded_lines", "folded_rows"}, "caller_reasons_overflow")
+    require(u64(value["folded_lines"], positive=True),
+            f"invalid caller_reasons_overflow.folded_lines: {value!r}")
+    require(u64(value["folded_rows"], positive=True),
+            f"invalid caller_reasons_overflow.folded_rows: {value!r}")
 
 
 def exact_excluded_modules(value):

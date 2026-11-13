@@ -2547,4 +2547,82 @@ mod tests {
             serde_json::from_str(legacy.strip_prefix("EVIDENCE ").unwrap()).unwrap();
         assert!(legacy_value.get("caller_reasons_overflow").is_none());
     }
+
+    /// B0 fold shape: overflow groups by function, not by pair — one
+    /// rendered line per function with worst-first reasons — while
+    /// `folded_rows` counts the folded (function, rv) pairs.
+    #[test]
+    fn caller_reasons_fold_groups_overflow_by_function_worst_first() {
+        let device = pkcs11_types::CkRv::DEVICE_ERROR.0;
+        let general = pkcs11_types::CkRv::GENERAL_ERROR.0;
+        let mut reasons = CallerReasons::default();
+        for pid in 0..4096u32 {
+            reasons.note(pid, None, "C_OpenSession", device);
+        }
+        assert!(!reasons.overflowed());
+        let mut pid = 4096u32;
+        for (function, rv, n) in [
+            ("C_Login", device, 5),
+            ("C_Login", general, 3),
+            ("C_OpenSession", general, 2),
+        ] {
+            for _ in 0..n {
+                reasons.note(pid, None, function, rv);
+                pid += 1;
+            }
+        }
+        assert!(reasons.overflowed());
+        assert_eq!(reasons.folded_lines(), 10);
+        assert_eq!(reasons.folded_rows(), 3);
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            4106,
+            4106,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            &reasons,
+        );
+        let folded: Vec<&str> = tail
+            .iter()
+            .filter(|line| line.contains("(other callers)"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            folded,
+            [
+                "(other callers): C_Login: CKR_DEVICE_ERROR x5, CKR_GENERAL_ERROR x3",
+                "(other callers): C_OpenSession: CKR_GENERAL_ERROR x2",
+            ]
+        );
+        // The verbose fold shows the same grouped lines: two reasons need
+        // no concise bounding, so both views agree exactly.
+        let verbose = terminal_summary(
+            4106,
+            4106,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+            &reasons,
+        );
+        let folded_verbose: Vec<&str> = verbose
+            .iter()
+            .filter(|line| line.contains("(other callers)"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(folded_verbose, folded);
+        // The EVIDENCE gap conserves the fold: ten folded lines over three
+        // folded pairs, matching the rendered rows above.
+        let line = evidence_line_with_caller_overflow(
+            &empty_evidence(),
+            crate::attach::CapturePolicy::Allowlisted,
+            &reasons,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(
+            value["caller_reasons_overflow"],
+            serde_json::json!({"folded_lines": 10, "folded_rows": 3})
+        );
+    }
 }

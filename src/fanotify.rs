@@ -1709,9 +1709,10 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
 }
 
 /// User-space bound on the unlimited kernel queue: queued event records
-/// past this many bytes (about 230,000 events, a few tens of MiB of
-/// kernel memory) are shed. 14 times the default finite queue, so only
-/// a drain that truly cannot keep up reaches it.
+/// past this many bytes (about 262,000 events at the measured 32 bytes
+/// per event, a few tens of MiB of kernel memory) are shed. 16 times
+/// the default finite queue, so only a drain that truly cannot keep up
+/// reaches it.
 const LEARN_BACKLOG_CAP_BYTES: usize = 8 << 20;
 
 /// Sheds a backlog past `LEARN_BACKLOG_CAP_BYTES`: reads and closes
@@ -3589,6 +3590,101 @@ mod tests {
             }
         }
         assert!(learned, "a provider opened after the shed is still learned");
+    }
+
+    /// Live stop-tail proof (privileged): with no drain thread, 2600
+    /// negative opens followed by one provider open queue a snapshot;
+    /// `drain_final_tail` must decide the whole snapshot — the provider
+    /// opened last is reported and every queued event is counted. A tail
+    /// that stops early (a byte/event unit error) drops the last quarter,
+    /// including the provider. Run with `sudo -n` (fanotify needs
+    /// `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_final_tail_decides_queued_snapshot() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..2600 {
+            std::fs::write(dir.path().join(format!("f{index}")), b"not elf").unwrap();
+        }
+        let c = dir.path().join("tailsnap.c");
+        let so = dir.path().join("libtailsnap.so");
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
+        // Never begin the drain: this thread queues the snapshot, then
+        // decides exactly it through the stop-tail path.
+        let (group, tx, _, _) = learner.pending.take().expect("armed learner");
+        let raw = group.as_raw_fd();
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", "cat \"$1\"/f* > /dev/null", "sh"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("cat")
+                .arg(&so)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let queued = super::queued_event_bytes(raw).expect("FIONREAD");
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: raw,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        assert!(
+            super::drain_final_tail(raw, &mut ctx, &mut buf),
+            "the snapshot tail is decided within the bound (queued {queued} bytes)"
+        );
+        let mut seen = false;
+        let mut overflow = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                super::LearnMsg::Candidate(candidate) => {
+                    seen |= candidate.display_path.ends_with("libtailsnap.so");
+                }
+                super::LearnMsg::QueueOverflow => overflow = true,
+                _ => {}
+            }
+        }
+        assert!(
+            !overflow,
+            "the unlimited queue never overflows in the kernel"
+        );
+        assert!(
+            seen,
+            "the provider opened last is reported (queued {queued} bytes, {} events decided)",
+            ctx.stats.events
+        );
+        assert!(
+            ctx.stats.events >= 2601,
+            "the whole snapshot is decided, not a prefix: {} events for {queued} queued bytes",
+            ctx.stats.events
+        );
     }
 
     /// Live ignore-mark proof (privileged): a file proved negative stops

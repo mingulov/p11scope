@@ -380,7 +380,8 @@ discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executab
 # provider a child process opens, also across a fresh mount namespace;
 # a stop under open churn decides the queued tail without loss; a
 # backlog past the user-space cap is shed as the named overflow; ignore
-# marks filter negatives until the periodic flush (root, CAP_SYS_ADMIN;
+# marks filter negatives until the periodic flush; the stop tail decides
+# a queued snapshot with the provider last (root, CAP_SYS_ADMIN;
 # seconds).
 fanotify::tests::learn_live_drain_reports_opened_provider
 fanotify::tests::learn_live_drain_reports_opened_provider_across_mount_ns
@@ -388,6 +389,7 @@ fanotify::tests::learn_live_stop_under_open_churn_drains_without_loss
 fanotify::tests::learn_live_stop_under_rewrite_churn_decides_queued_tail
 fanotify::tests::learn_live_backlog_past_cap_is_shed_as_named_overflow
 fanotify::tests::learn_live_ignore_mark_filters_until_flush
+fanotify::tests::learn_live_final_tail_decides_queued_snapshot
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up no-re-edge positive runs in the

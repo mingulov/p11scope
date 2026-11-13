@@ -1030,6 +1030,14 @@ impl FileLearner {
     /// leaving those sends stuck behind a full channel.
     pub(crate) fn shutdown_and_join_pumping(&mut self, mut pump: impl FnMut()) -> bool {
         self.state.shutdown.store(true, Ordering::Release);
+        // Record when the stop landed (first stop wins): the tail
+        // deadline anchors to it, so the tail fits inside the join
+        // bound however late the drain notices the stop.
+        if let Ok(mut stop) = self.state.stop.lock() {
+            if stop.is_none() {
+                *stop = Some(std::time::Instant::now());
+            }
+        }
         // A never-begun learner holds the only sender: drop it so the
         // channel closes terminally instead of dangling.
         self.pending = None;
@@ -1453,11 +1461,15 @@ fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32
 /// Shutdown coordination between the learner handle and the drain
 /// thread: `shutdown` stops the loop, `lost_tail` records an
 /// unsent/unread tail so the engine files loss loudly instead of
-/// dropping it silently at the boundary.
+/// dropping it silently at the boundary, and `stop` records when the
+/// stop landed so the tail deadline is anchored to the stop — not to
+/// whenever the drain notices it — and always fits inside the join
+/// bound.
 #[derive(Debug, Default)]
 struct LearnShutdownState {
     shutdown: AtomicBool,
     lost_tail: AtomicBool,
+    stop: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// Sends one message, waiting past a full channel in 1 ms steps so a
@@ -1487,9 +1499,10 @@ fn send_learn_in(
     loop {
         // A live send caught by the stop keeps its message: the engine
         // pumps the channel while it waits for the join, so the send
-        // gets the tail drain's bound instead of dropping at once.
+        // gets the tail drain's bound — anchored to the stop, like the
+        // tail itself — instead of dropping at once.
         if matches!(window, SendWindow::Live) && state.shutdown.load(Ordering::Acquire) {
-            window = SendWindow::Final(std::time::Instant::now() + FINAL_DRAIN_BOUND);
+            window = SendWindow::Final(tail_deadline_from(state));
         }
         let closed = match window {
             SendWindow::Live => false,
@@ -1514,6 +1527,17 @@ fn send_learn_in(
 /// inside the engine's join bound, so a tail it cannot finish is
 /// reported as lost before the join gives up on the thread.
 const FINAL_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// The end-of-capture tail deadline: the recorded stop instant plus
+/// the final drain bound, so the tail fits inside the engine's join
+/// bound however late the drain notices the stop. Falls back to now
+/// plus the bound when no stop was recorded (a bare tail drain in
+/// tests) or the lock is poisoned.
+fn tail_deadline_from(state: &LearnShutdownState) -> std::time::Instant {
+    let stop = state.stop.lock().ok().and_then(|guard| *guard);
+    stop.map(|at| at + FINAL_DRAIN_BOUND)
+        .unwrap_or_else(|| std::time::Instant::now() + FINAL_DRAIN_BOUND)
+}
 
 /// Drain counters for the periodic `-v` telemetry line: counts only,
 /// never paths, pids or file bytes.
@@ -1825,7 +1849,24 @@ fn shed_backlog_past_cap(
 /// Returns true when the tail was fully decided; false (and the lost
 /// tail marked) when it could not be within the bound.
 fn drain_final_tail(raw: std::os::unix::io::RawFd, ctx: &mut DrainCtx<'_>, buf: &mut [u8]) -> bool {
-    let deadline = std::time::Instant::now() + FINAL_DRAIN_BOUND;
+    drain_final_tail_with(raw, ctx, buf, |fd, buf| {
+        // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
+        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
+    })
+}
+
+/// The tail drain with an injectable read: production passes the
+/// blocking-safe `read(2)` above, tests simulate read errors without
+/// a group. A read error drops only the head event: it is counted as
+/// unreadable and the tail continues with the rest of the snapshot
+/// instead of abandoning the whole tail as lost.
+fn drain_final_tail_with(
+    raw: std::os::unix::io::RawFd,
+    ctx: &mut DrainCtx<'_>,
+    buf: &mut [u8],
+    mut read: impl FnMut(std::os::unix::io::RawFd, &mut [u8]) -> libc::ssize_t,
+) -> bool {
+    let deadline = tail_deadline_from(ctx.state);
     let window = SendWindow::Final(deadline);
     let Some(mut owed) = queued_event_bytes(raw) else {
         return false;
@@ -1834,23 +1875,26 @@ fn drain_final_tail(raw: std::os::unix::io::RawFd, ctx: &mut DrainCtx<'_>, buf: 
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
-        let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if read < 0 {
+        let got = read(raw, buf);
+        if got < 0 {
             let error = std::io::Error::last_os_error();
             match error.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 // Nothing left to read: the snapshot is consumed.
                 std::io::ErrorKind::WouldBlock => return true,
-                _ => return false,
+                _ => {
+                    ctx.stats.unreadable = ctx.stats.unreadable.saturating_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
             }
         }
-        if read == 0 {
+        if got == 0 {
             return true;
         }
-        let read = read as usize;
-        owed = owed.saturating_sub(read);
-        if !ctx.process_read(&buf[..read], window) {
+        let got = got as usize;
+        owed = owed.saturating_sub(got);
+        if !ctx.process_read(&buf[..got], window) {
             return false;
         }
     }
@@ -3355,6 +3399,104 @@ mod tests {
         );
         assert!(!ok);
         assert!(state.lost_tail.load(Ordering::Acquire));
+    }
+
+    /// The tail deadline anchors to the recorded stop, not to when the
+    /// drain notices it: with the stop a second in the past and bytes
+    /// still queued, the tail gives up at once instead of draining
+    /// under a fresh bound that would overrun the join. (Unprivileged:
+    /// a pipe stands in for the group for the queued-bytes snapshot.)
+    #[test]
+    fn learn_tail_deadline_anchors_to_the_stop_instant() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let payload = [7u8; 128];
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        };
+        assert_eq!(written, payload.len() as libc::ssize_t);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        *state.stop.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let mut ctx = super::DrainCtx {
+            group: reader.as_raw_fd(),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        assert!(
+            !super::drain_final_tail(reader.as_raw_fd(), &mut ctx, &mut buf),
+            "a tail past the stop-anchored deadline gives up without deciding"
+        );
+        assert_eq!(ctx.stats.events, 0, "nothing is decided past the deadline");
+    }
+
+    /// A tail read error drops only the head event: the error is
+    /// counted as unreadable and the tail continues instead of
+    /// abandoning the snapshot as lost. (Unprivileged: the read is
+    /// injected; the pipe only provides the queued-bytes snapshot.)
+    #[test]
+    fn learn_tail_read_error_counts_unreadable_and_continues() {
+        use std::os::unix::io::FromRawFd;
+        use std::sync::atomic::Ordering;
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let payload = [7u8; 128];
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        };
+        assert_eq!(written, payload.len() as libc::ssize_t);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: reader.as_raw_fd(),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut calls = 0;
+        let done = super::drain_final_tail_with(reader.as_raw_fd(), &mut ctx, &mut buf, |_, _| {
+            calls += 1;
+            // SAFETY: test-only errno for the injected error.
+            unsafe {
+                *libc::__errno_location() = if calls == 1 { libc::EIO } else { libc::EAGAIN };
+            }
+            -1
+        });
+        assert!(done, "the tail continues past a read error");
+        assert_eq!(ctx.stats.unreadable, 1, "the error is counted once");
+        assert!(
+            !state.lost_tail.load(Ordering::Acquire),
+            "a continued error is not a lost tail"
+        );
     }
 
     /// The tally pid falls back to the metadata capture when the

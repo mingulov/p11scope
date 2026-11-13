@@ -1299,16 +1299,21 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "selected_detail" in evidence:
         wanted.add("selected_detail")
         exact_selected_detail(evidence["selected_detail"])
-    if not historical and not terminal and "excluded_modules" in evidence:
+    # The operator-miss lists ride the terminal trace EVIDENCE lane like
+    # the profile lane (`trace --module <miss>` publishes them there):
+    # additive in every current lane that renders them, like
+    # `slot_sizing` below. `unmatched_excludes` keeps its existing
+    # terminal exclusion (outside this ruling's scope).
+    if not historical and "excluded_modules" in evidence:
         wanted.add("excluded_modules")
         exact_excluded_modules(evidence["excluded_modules"])
     if not historical and not terminal and "unmatched_excludes" in evidence:
         wanted.add("unmatched_excludes")
         exact_unmatched_excludes(evidence["unmatched_excludes"])
-    if not historical and not terminal and "unmatched_forwarding" in evidence:
+    if not historical and "unmatched_forwarding" in evidence:
         wanted.add("unmatched_forwarding")
         exact_unmatched_forwarding(evidence["unmatched_forwarding"])
-    if not historical and not terminal and "unmatched_modules" in evidence:
+    if not historical and "unmatched_modules" in evidence:
         wanted.add("unmatched_modules")
         exact_unmatched_modules(evidence["unmatched_modules"])
     if not historical and not terminal and "legacy_collection" in evidence:
@@ -6475,6 +6480,34 @@ def self_test():
     sized_trace["slot_sizing"] = copy.deepcopy(sized["evidence"]["slot_sizing"])
     exact_profile_v3_selection(sized_trace, terminal=True, run=True)
     print("slot_sizing rides the profile, run, and terminal lanes unchanged: OK")
+    # Terminal trace EVIDENCE carries the operator-miss lists like the
+    # profile lane (`trace --module <miss>` publishes them): one twin
+    # per key, each with its shape negative.
+    missed_trace = copy.deepcopy(run_trace)
+    missed_trace["unmatched_modules"] = ["/nonexistent/pkcs11.so"]
+    exact_profile_v3_selection(missed_trace, terminal=True, run=True)
+    bad_missed = copy.deepcopy(missed_trace)
+    bad_missed["unmatched_modules"] = ["/nonexistent/pkcs11.so", 42]
+    rejected(lambda: exact_profile_v3_selection(bad_missed, terminal=True, run=True))
+    print("unmatched_modules rides the terminal trace lane with its shape: OK")
+    fwd_trace = copy.deepcopy(run_trace)
+    fwd_trace["unmatched_forwarding"] = ["nope.so"]
+    exact_profile_v3_selection(fwd_trace, terminal=True, run=True)
+    bad_fwd = copy.deepcopy(fwd_trace)
+    bad_fwd["unmatched_forwarding"] = "nope.so"
+    rejected(lambda: exact_profile_v3_selection(bad_fwd, terminal=True, run=True))
+    print("unmatched_forwarding rides the terminal trace lane with its shape: OK")
+    excluded_trace = copy.deepcopy(run_trace)
+    excluded_trace["excluded_modules"] = [
+        {"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3}
+    ]
+    exact_profile_v3_selection(excluded_trace, terminal=True, run=True)
+    bad_excluded = copy.deepcopy(excluded_trace)
+    bad_excluded["excluded_modules"] = [
+        {"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 0}
+    ]
+    rejected(lambda: exact_profile_v3_selection(bad_excluded, terminal=True, run=True))
+    print("excluded_modules rides the terminal trace lane with its shape: OK")
     external_pid = copy.deepcopy(run_profile)
     rejected(lambda: exact_profile_v3_selection(external_pid, run=False))
     unreadable_match = copy.deepcopy(selection_doc)

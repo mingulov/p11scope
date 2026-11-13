@@ -944,6 +944,37 @@ impl JournalContradictionDiagnosis {
     }
 }
 
+/// Diagnostic-only Joint void telemetry (Task 0): where stream breaks
+/// were recorded (dispose vs ingest arm), how many seal endings refused
+/// at the void-fence check, and the current per-key gauges (total,
+/// refused, tainted, pending). Counts only; no identities, paths or
+/// payloads. Disclosed on stderr when verbose text is requested, never
+/// a contract and never part of reports. Instrumentation only: it
+/// changes no Joint decision, seal, fence or gap.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct JointVoidDiagnosis {
+    /// Breaks recorded through dispose_without_ingest (non-contiguous
+    /// cut or failed collection on the dispose path).
+    pub(crate) break_dispose: u64,
+    /// Breaks recorded through RawJointQuantum::ingest (non-contiguous
+    /// stream on the ingest path).
+    pub(crate) break_ingest: u64,
+    /// Seal endings refused at the void-fence check (receipt cut below
+    /// the fence is the refusing cause).
+    pub(crate) seal_below_fence: u64,
+    /// Keys currently retained.
+    pub(crate) keys_total: u64,
+    /// Keys with the refused flag set.
+    pub(crate) keys_refused: u64,
+    /// Keys that cannot birth for taint: per-key flag set or image
+    /// refused future proof (individually tainted, or untracked past
+    /// saturation).
+    pub(crate) keys_tainted: u64,
+    /// Keys with no pinned bootstrap cut (never sealed in this
+    /// era/window, including every key after a staged clear).
+    pub(crate) keys_pending: u64,
+}
+
 /// Why a seal attempt answered `BoundNotReady` (internal diagnostics
 /// and the frame's future-input decision; never authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1268,14 @@ pub(crate) struct JournalAdapter {
     consumed_through: u64,
     stream_boundary: Option<crate::events::EventsConsumptionCut>,
     stream_broken: bool,
+    /// Diagnostic-only break source counts (Task 0): breaks recorded
+    /// through the dispose arm vs the ingest arm. Saturating;
+    /// instrumentation only, never authority.
+    break_dispose: u64,
+    break_ingest: u64,
+    /// Diagnostic-only below-fence seal endings (Task 0): seals refused
+    /// at the void-fence check. Saturating; instrumentation only.
+    seal_below_fence: u64,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -1388,6 +1427,9 @@ impl JournalAdapter {
             consumed_through: 0,
             stream_boundary: None,
             stream_broken: false,
+            break_dispose: 0,
+            break_ingest: 0,
+            seal_below_fence: 0,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
@@ -2203,6 +2245,36 @@ impl JournalAdapter {
     /// cause. No image identities.
     pub(crate) fn contradiction_diagnosis(&self) -> JournalContradictionDiagnosis {
         self.contradictions
+    }
+
+    /// Diagnostic-only Joint void telemetry (Task 0): break source
+    /// counts, below-fence seal endings, and per-key gauges computed
+    /// from retained state. Counts only; no identities. Readonly;
+    /// instrumentation only, never authority.
+    pub(crate) fn joint_void_diagnosis(&self) -> JointVoidDiagnosis {
+        let mut refused = 0u64;
+        let mut tainted = 0u64;
+        let mut pending = 0u64;
+        for (key, state) in &self.keys {
+            if state.refused {
+                refused = refused.saturating_add(1);
+            }
+            if state.tainted || self.is_tainted((key.cookie, key.exec)) {
+                tainted = tainted.saturating_add(1);
+            }
+            if state.bootstraps.is_empty() {
+                pending = pending.saturating_add(1);
+            }
+        }
+        JointVoidDiagnosis {
+            break_dispose: self.break_dispose,
+            break_ingest: self.break_ingest,
+            seal_below_fence: self.seal_below_fence,
+            keys_total: self.keys.len() as u64,
+            keys_refused: refused,
+            keys_tainted: tainted,
+            keys_pending: pending,
+        }
     }
 
     fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
@@ -5972,6 +6044,9 @@ impl JournalAdapter {
         // above the cut). The fence covers keys created after the void
         // as well as the keys the void fenced directly.
         if bootstrap.birth_cut() < fenced_through {
+            // Diagnostic-only (Task 0): count the below-fence ending.
+            // The refusal below is unchanged.
+            self.seal_below_fence = self.seal_below_fence.saturating_add(1);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Unclaimed staged history barriers every seal past it: an
@@ -12778,6 +12853,195 @@ pub(crate) mod tests {
         .expect("absence at the fence attests");
         let success = scene.seal(&resume).expect("absence at the fence seals");
         assert_eq!(success.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_seal_below_fence_counts_ending() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Failure twin: a seal whose receipt cut sits below the void fence
+        // refuses as BootstrapMismatch through the fence arm and counts
+        // exactly one below-fence ending. Setup mirrors
+        // object_journal_birth_after_h3_void_respects_fence, which is known
+        // to reach the fence check with an otherwise-valid receipt.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        let x_begin = begin_bytes_image(2, 1, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest(&x_begin);
+        let x_end = end_bytes(&x_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&x_end), JournalDisposition::EndStaged);
+        let mut x_fixture = AttestationFixture::new(x_image);
+        let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
+        assert_eq!(
+            scene.adapter.joint_void_diagnosis().seal_below_fence,
+            0,
+            "no below-fence seal has run yet"
+        );
+        let scripted = BootstrapReceipt::scripted(
+            x_proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &scripted,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&scripted),
+            )
+            .expect_err("seal below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(
+            scene.adapter.joint_void_diagnosis().seal_below_fence,
+            1,
+            "the fence arm counts its own ending"
+        );
+    }
+
+    #[test]
+    fn object_journal_seal_at_fence_ignores_healthy_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Healthy twin: a seal whose receipt cut sits exactly at the void
+        // fence seals successfully and counts no below-fence ending.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let _ = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let x_begin = begin_bytes_image(2, 1, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest(&x_begin);
+        let x_end = end_bytes(&x_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&x_end), JournalDisposition::EndStaged);
+        let mut x_fixture = AttestationFixture::new(x_image);
+        let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
+        let resume = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(
+                x_proof,
+                BirthKind::AbsenceAppearance,
+                3,
+                scene.closure_generation(),
+            ),
+        )
+        .expect("absence at the fence attests");
+        let _ = scene.seal(&resume).expect("absence at the fence seals");
+        assert_eq!(
+            scene.adapter.joint_void_diagnosis().seal_below_fence,
+            0,
+            "a healthy at-fence seal counts no below-fence ending"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_diagnosis_counts_per_key_states() {
+        // Per-key gauges: a fresh adapter counts zero keys in every state;
+        // after one key is attested, refused and image-tainted (never
+        // sealed), it counts one total, one refused, one tainted and one
+        // pending (no pinned bootstrap).
+        let mut scene = Scene::new(image_default());
+        let empty = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (
+                empty.keys_total,
+                empty.keys_refused,
+                empty.keys_tainted,
+                empty.keys_pending
+            ),
+            (0, 0, 0, 0),
+            "a fresh adapter holds no keys"
+        );
+        let image = (scene.fixture.image.task_cookie, scene.fixture.image.exec_id);
+        let _ = scene.attest();
+        let populated = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (
+                populated.keys_total,
+                populated.keys_refused,
+                populated.keys_tainted,
+                populated.keys_pending
+            ),
+            (1, 0, 0, 1),
+            "an attested-but-unsealed key pends"
+        );
+        let _ = scene.adapter.refuse_disposed_raw(
+            &mut scene.model,
+            std::iter::empty(),
+            true,
+            JournalGap::Malformed,
+        );
+        scene
+            .adapter
+            .taint_image(image, TaintCause::SightingFailure);
+        let marked = scene.adapter.joint_void_diagnosis();
+        assert_eq!(marked.keys_total, 1, "refusal and taint keep the key");
+        assert_eq!(marked.keys_refused, 1, "the refused key counts");
+        assert_eq!(
+            marked.keys_tainted, 1,
+            "a key of a tainted image counts as tainted"
+        );
+        assert_eq!(marked.keys_pending, 1, "an unsealed key still pends");
     }
 
     #[test]

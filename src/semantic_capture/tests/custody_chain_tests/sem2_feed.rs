@@ -16,7 +16,7 @@ use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
     image_query_refusal_label, joint_births_line, joint_seals_line, joint_taints_line,
-    scan_refusals_gap_reason, semantic_stop_line,
+    joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -352,5 +352,19 @@ fn joint_births_line_format_is_exact() {
     assert_eq!(
         joint_births_line("fits", 4096, 1, 2),
         "p11scope: joint births: first_capacity_arm=fits records=4096 grants=1 negatives=2"
+    );
+}
+
+#[test]
+fn joint_voids_line_format_is_exact() {
+    assert_eq!(
+        joint_voids_line(0, 0, 0, 0, 0, 0, 0),
+        "p11scope: joint voids: break_dispose=0 break_ingest=0 seal_below_fence=0 \
+         keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0"
+    );
+    assert_eq!(
+        joint_voids_line(3, 5, 7, 11, 2, 4, 6),
+        "p11scope: joint voids: break_dispose=3 break_ingest=5 seal_below_fence=7 \
+         keys_total=11 keys_refused=2 keys_tainted=4 keys_pending=6"
     );
 }

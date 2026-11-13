@@ -2257,6 +2257,8 @@ impl RawJointQuantum {
             owner.adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());
         } else if !self.ordered.is_empty() || self.collection_failed() {
             owner.adapter.stream_broken = true;
+            // Diagnostic-only (Task 0): the dispose side recorded a break.
+            owner.adapter.break_dispose = owner.adapter.break_dispose.saturating_add(1);
         }
         if unlocalized {
             owner.adapter.last_audit_failure = Some(owner.adapter.consumed_through);
@@ -2300,6 +2302,8 @@ impl RawJointQuantum {
         let clean_stream = self.contiguous_stream(adapter);
         if !clean_stream {
             adapter.stream_broken = true;
+            // Diagnostic-only (Task 0): the ingest side recorded a break.
+            adapter.break_ingest = adapter.break_ingest.saturating_add(1);
         }
         for (item, quiet, origin) in self.classified_items() {
             let resource = match item {

@@ -768,3 +768,78 @@ fn joint_ingest_break_void_keeps_stopped_and_exhausted_lanes_fail_closed() {
         assert!(!owner.adapter.invalidated);
     }
 }
+
+#[test]
+fn joint_void_break_dispose_counts_dispose_side_break() {
+    // Failure twin: disposing a non-empty quantum collected without cuts
+    // (no birth cut, non-contiguous) breaks the stream through the dispose
+    // arm (joint_driver.rs dispose_without_ingest) and counts exactly one
+    // dispose-side break, leaving the ingest counter at zero.
+    let events = EventsDomain::test_standin(0xb230);
+    let retained = producers(&events);
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let before = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (before.break_dispose, before.break_ingest),
+        (0, 0),
+        "a fresh adapter counts no breaks"
+    );
+    let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+    let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    let mut raw = collect(
+        &mut owner,
+        &pool,
+        &retained,
+        &events,
+        [begin.to_vec(), end.to_vec()],
+    );
+    let report = crate::semantic_capture::deliver_collected_raw_for_resource_test(
+        &mut raw,
+        retained.native_domain(),
+    );
+    assert!(!report.outcomes().is_empty());
+    assert!(raw.h0_reported && raw.ordinary.is_empty() && !raw.h0_pending);
+    let _ = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::NoAdmission)
+        .unwrap_or_else(|(_, reason)| panic!("owned disposal: {reason:?}"));
+    assert!(
+        owner.adapter.stream_broken_for_test(),
+        "the non-contiguous disposal breaks the stream"
+    );
+    let after = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        after.break_dispose, 1,
+        "the dispose arm counts its own break"
+    );
+    assert_eq!(
+        after.break_ingest, 0,
+        "a dispose-side break never counts as ingest"
+    );
+}
+
+#[test]
+fn joint_void_break_dispose_ignores_clean_empty_dispose() {
+    // Healthy twin: disposing an empty quantum (no records, no failure)
+    // breaks nothing and counts nothing on either side.
+    let events = EventsDomain::test_standin(0xb231);
+    let retained = producers(&events);
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let raw = collect(&mut owner, &pool, &retained, &events, []);
+    let _ = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Empty)
+        .unwrap_or_else(|(_, reason)| panic!("empty disposal: {reason:?}"));
+    assert!(
+        !owner.adapter.stream_broken_for_test(),
+        "an empty disposal breaks nothing"
+    );
+    let after = owner.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (after.break_dispose, after.break_ingest),
+        (0, 0),
+        "a clean dispose counts no breaks"
+    );
+}

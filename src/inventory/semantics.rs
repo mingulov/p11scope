@@ -1832,6 +1832,29 @@ pub(crate) fn joint_births_line(
     )
 }
 
+/// One stderr line for the diagnostic Joint-void summary (Task 0):
+/// stream breaks by recording side (dispose vs ingest), seal endings
+/// refused at the void-fence check, and per-key gauges (total,
+/// refused, tainted, pending). Counts only; no identities, paths or
+/// payloads. Diagnostic-only: printed beside the stop line only when
+/// verbose text is requested, never a contract and never in reports.
+pub(crate) fn joint_voids_line(
+    break_dispose: u64,
+    break_ingest: u64,
+    seal_below_fence: u64,
+    keys_total: u64,
+    keys_refused: u64,
+    keys_tainted: u64,
+    keys_pending: u64,
+) -> String {
+    format!(
+        "p11scope: joint voids: break_dispose={break_dispose} \
+         break_ingest={break_ingest} seal_below_fence={seal_below_fence} \
+         keys_total={keys_total} keys_refused={keys_refused} \
+         keys_tainted={keys_tainted} keys_pending={keys_pending}"
+    )
+}
+
 /// One stderr line for the diagnostic ingest-taint summary:
 /// contradiction counts by kind, other taint causes, total
 /// events, and the first taint's cause. Counts and one frozen

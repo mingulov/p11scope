@@ -8758,3 +8758,70 @@ fn a_miss_era_is_named_only_when_won_miss_raises_moved_the_fault() {
     assert!(!miss_era(3, 3, 10, 11), "no won raise: an ordinary era");
     assert!(!miss_era(3, 4, 10, 10), "no fault move");
 }
+
+#[test]
+fn joint_void_break_ingest_counts_ingest_side_break() {
+    // Failure twin: ingesting a quantum collected without cuts
+    // (no birth cut, non-contiguous) breaks the stream through the ingest
+    // arm (joint_driver.rs RawJointQuantum::ingest) and counts exactly one
+    // ingest-side break, leaving the dispose counter at zero.
+    use crate::semantics_objects::journal::SessionDrainGrant;
+    use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+
+    let mut harness = JointBirthHarness::new();
+    let before = harness.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (before.break_dispose, before.break_ingest),
+        (0, 0),
+        "a fresh adapter counts no breaks"
+    );
+    harness.push_create(1);
+    let mut raw = RawJointQuantum::collect_with_adapter(
+        &mut harness.drain,
+        &harness.rows,
+        4_096,
+        &BirthFault,
+        &harness.producers,
+        |bytes| harness.pool.reserve(bytes),
+        &mut harness.adapter,
+    )
+    .expect("unbounded collection without cuts");
+    let (_, admitted) = harness.route(&mut raw);
+    harness.adapter.bind_admitted_key(&admitted).unwrap();
+    let grant = SessionDrainGrant::observe(&harness.producers, &admitted).unwrap();
+    harness.adapter.bind_session_drain(&grant).unwrap();
+    let _ = raw
+        .ingest(&mut harness.adapter, &harness.producers, &grant)
+        .unwrap_or_else(|(_, reason)| panic!("actual raw ingest: {reason:?}"));
+    assert!(
+        harness.adapter.stream_broken_for_test(),
+        "the cut-less ingest breaks the stream"
+    );
+    let after = harness.adapter.joint_void_diagnosis();
+    assert_eq!(after.break_ingest, 1, "the ingest arm counts its own break");
+    assert_eq!(
+        after.break_dispose, 0,
+        "an ingest-side break never counts as dispose"
+    );
+}
+
+#[test]
+fn joint_void_break_ingest_ignores_clean_bounded_ingest() {
+    // Healthy twin: ingesting a clean bounded quantum (cuts, resolved
+    // birth, no failure) breaks nothing and counts nothing on either side.
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (_, admitted) = harness.route(&mut raw);
+    let _ = harness.ingest(raw, &admitted);
+    assert!(
+        !harness.adapter.stream_broken_for_test(),
+        "a clean bounded ingest breaks nothing"
+    );
+    let after = harness.adapter.joint_void_diagnosis();
+    assert_eq!(
+        (after.break_dispose, after.break_ingest),
+        (0, 0),
+        "a clean ingest counts no breaks"
+    );
+}

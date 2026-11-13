@@ -3099,6 +3099,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture.adapter().contradiction_diagnosis()
     }
 
+    /// Joint void telemetry: break sources, below-fence endings and
+    /// per-key gauges (diagnostics, Task 0).
+    pub(crate) fn joint_void_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::JointVoidDiagnosis {
+        self.joint_capture.adapter().joint_void_diagnosis()
+    }
+
     /// First birth-registration `Capacity` arm and table sizes
     /// (diagnostics).
     pub(crate) fn first_birth_capacity(

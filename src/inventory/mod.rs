@@ -3339,6 +3339,21 @@ fn disclose_semantic_stop(
             seals.deliver.d_other,
         ));
     }
+    // Diagnostic-only Joint-void summary (Task 0): verbose text only,
+    // never in reports. Counts which break side dominates and how many
+    // endings refused below the fence, with per-key gauges.
+    if crate::cli::text_is_verbose() {
+        let voids = coordinator.joint_void_diagnosis();
+        warn.emit(&crate::inventory_semantics::joint_voids_line(
+            voids.break_dispose,
+            voids.break_ingest,
+            voids.seal_below_fence,
+            voids.keys_total,
+            voids.keys_refused,
+            voids.keys_tainted,
+            voids.keys_pending,
+        ));
+    }
 }
 
 /// The shared once-gate predicate for winding stop disclosures: a

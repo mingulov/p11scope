@@ -5414,14 +5414,16 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
     // terminal: a mid-capture exec keeps the attach-time name (calls the
     // first program made are never relabeled) and discloses the
     // end-of-capture program, and the stderr note names both. The
-    // re-read binds the same retained pin, so a recycled pid can never
-    // misattach an unrelated program's exe.
+    // transition is claimed only when the re-read binds the same
+    // retained pin, so a recycled pid with no pin can never misattach
+    // an unrelated program's exe.
     let terminal_caller: Option<render::CaptureCaller> = match (context.scope, &target_caller) {
         (Scope::Pid(pid), Some(attach)) => {
             let owned_pin = context.owned.child.as_ref().map(|child| child.pin());
             let engine_pin = context.engine.pid_target_pin(*pid);
             let pin = owned_pin.or(engine_pin.as_deref());
-            let reconciled = render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
+            let reconciled =
+                reconcile_end_caller_exec(attach, resolve_pid_caller(*pid, pin), pin.is_some());
             if let (Some(from), Some(to)) =
                 (reconciled.exe.as_deref(), reconciled.exec_to_exe.as_deref())
             {
@@ -8557,6 +8559,23 @@ fn read_exe_observation_with(path: &str, after_open: impl FnOnce()) -> Option<Ex
 /// on a live pid stays unreadable, never presumed exited. The pid itself
 /// never enters the report — stderr diagnostics name it beside this
 /// identity. No cwd, cmdline, environ, argument, or payload read; the
+/// Reconcile the attach-time caller with the end-of-capture re-read,
+/// claiming a transition only when the end read was bracketed by a
+/// retained pin. Without a pin a recycled pid could name an unrelated
+/// program, so the transition stays unset; the attach-time identity is
+/// untouched (it still names the program that made the calls).
+fn reconcile_end_caller_exec(
+    attach: &render::CaptureCaller,
+    end: render::CaptureCaller,
+    end_pinned: bool,
+) -> render::CaptureCaller {
+    let mut reconciled = render::reconcile_caller_exec(attach, end);
+    if !end_pinned {
+        reconciled.exec_to_exe = None;
+    }
+    reconciled
+}
+
 /// exit proof reuses the existing signal and stat checks.
 pub(crate) fn resolve_pid_caller(
     pid: u32,
@@ -10539,10 +10558,11 @@ fn capture_profile(
         // The end-of-capture exe re-read: a mid-capture exec keeps the
         // attach-time name (calls the first program made are never
         // relabeled) and discloses the end-of-capture program, and the
-        // stderr note names both. The re-read binds the same retained pin
-        // (the owned child's, else the named view's), so a recycled pid can
-        // never misattach an unrelated program's exe; an unknown end read
-        // keeps the attach-time identity.
+        // stderr note names both. The transition is claimed only when
+        // the re-read binds the same retained pin (the owned child's,
+        // else the named view's), so a recycled pid with no pin can
+        // never misattach an unrelated program's exe; an unknown end
+        // read keeps the attach-time identity.
         let terminal_caller: Option<render::CaptureCaller> = match (scope, target_caller) {
             (Scope::Pid(pid), Some(attach)) => {
                 let owned_pin = context
@@ -10554,7 +10574,7 @@ fn capture_profile(
                 let engine_pin = context.0.pid_target_pin(*pid);
                 let pin = owned_pin.or(engine_pin.as_deref());
                 let reconciled =
-                    render::reconcile_caller_exec(attach, resolve_pid_caller(*pid, pin));
+                    reconcile_end_caller_exec(attach, resolve_pid_caller(*pid, pin), pin.is_some());
                 if let (Some(from), Some(to)) =
                     (reconciled.exe.as_deref(), reconciled.exec_to_exe.as_deref())
                 {
@@ -27254,6 +27274,56 @@ int main(int argc, char **argv) {
         assert!(
             child.0.try_wait().unwrap().is_none(),
             "the fixture is still the same live child"
+        );
+    }
+
+    #[test]
+    fn reconcile_end_caller_exec_withholds_the_transition_without_a_pin() {
+        // N1: a recycled pid with no retained pin must not produce
+        // `exec_to_exe` — the end read is unbracketed, so a different
+        // device and inode proves no exec. The attach-time identity
+        // stays: it still names the program that made the calls.
+        let attach = render::CaptureCaller {
+            exe: Some("/usr/bin/first".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = render::CaptureCaller {
+            exe: Some("/usr/bin/unrelated".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_end_caller_exec(&attach, end, false);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/first"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(reconciled.exec_to_exe, None, "{reconciled:?}");
+    }
+
+    #[test]
+    fn reconcile_end_caller_exec_keeps_the_transition_with_a_pin() {
+        // Healthy twin: the same two reads bracketed by a retained pin
+        // still disclose the exec.
+        let attach = render::CaptureCaller {
+            exe: Some("/usr/bin/first".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 11)),
+            exec_to_exe: None,
+        };
+        let end = render::CaptureCaller {
+            exe: Some("/usr/bin/second".into()),
+            exe_unknown_reason: None,
+            exe_id: Some((7, 12)),
+            exec_to_exe: None,
+        };
+        let reconciled = reconcile_end_caller_exec(&attach, end, true);
+        assert_eq!(reconciled.exe.as_deref(), Some("/usr/bin/first"));
+        assert_eq!(reconciled.exe_unknown_reason, None);
+        assert_eq!(
+            reconciled.exec_to_exe.as_deref(),
+            Some("/usr/bin/second"),
+            "{reconciled:?}"
         );
     }
 

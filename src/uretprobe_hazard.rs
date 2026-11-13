@@ -252,6 +252,19 @@ fn ensure_admission_with(
     Ok(())
 }
 
+/// Pre-shed credential snapshot for the conditional approval re-key.
+/// Opaque so the shed site can take one but never fabricate or alter it.
+#[derive(Debug, Clone)]
+pub(crate) struct PreShedSnapshot(AssessmentContext);
+
+/// Snapshot the live credential context immediately before the
+/// post-setup shed drops capabilities. The shed site passes the snapshot
+/// to [`rekey_approval_to_current`], which re-keys only when the shed
+/// provably changed nothing but capabilities.
+pub(crate) fn pre_shed_snapshot() -> PreShedSnapshot {
+    PreShedSnapshot(AssessmentContext::current())
+}
+
 /// Re-key a stored return-probe approval to the live credential context
 /// after the post-setup capability shed. The kernel verdict the approval
 /// carries (the uretprobe trampoline's syscall is exempt) is a property
@@ -262,9 +275,26 @@ fn ensure_admission_with(
 /// (whose forked child would exit unlisted and count a descendant gap).
 /// A missing approval stays missing: the next ensure admits fresh, as
 /// before. The override reason, when present, is preserved.
-pub(crate) fn rekey_approval_to_current(retained: &mut Option<ReturnProbeAdmission>) {
+pub(crate) fn rekey_approval_to_current(
+    retained: &mut Option<ReturnProbeAdmission>,
+    pre_shed: &PreShedSnapshot,
+) {
+    rekey_approval_to_post(retained, &pre_shed.0, &AssessmentContext::current())
+}
+
+/// Policy point for the conditional re-key (Opus I1): the stored
+/// approval may move to `post` only when it matches the pre-shed
+/// snapshot, the snapshot is reusable, and `post` differs from it only
+/// in capabilities and only as a subset. Any refusal leaves `retained`
+/// untouched so the next check re-probes. The checks land with the
+/// hardening fix; until then this relabels like the original.
+fn rekey_approval_to_post(
+    retained: &mut Option<ReturnProbeAdmission>,
+    _pre_shed: &AssessmentContext,
+    post: &AssessmentContext,
+) {
     if let Some(admission) = retained {
-        admission.context = AssessmentContext::current();
+        admission.context = post.clone();
     }
 }
 
@@ -2467,5 +2497,196 @@ mod tests {
                 "an unshed capture reuses its approval (vacuous unprivileged leg)"
             );
         }
+    }
+
+    /// Synthetic pre-shed context for the re-key policy twins: reusable,
+    /// holding two capability bits so the post-shed side can drop one.
+    fn rekey_pre_shed() -> AssessmentContext {
+        let mut pre = assessment_context();
+        pre.capabilities = Some(0b11);
+        pre
+    }
+
+    /// The re-key moves a matching approval to the post-shed context when
+    /// only capabilities shrank, preserving the override reason verbatim
+    /// (already granted, same session); an unchanged post-shed context
+    /// relabels to itself.
+    #[test]
+    fn rekey_moves_a_matching_approval_when_only_capabilities_shrank() {
+        for reason in [None, Some("explicitly accepted risk".to_string())] {
+            for post_caps in [Some(0b01), Some(0b11)] {
+                let pre = rekey_pre_shed();
+                let mut post = pre.clone();
+                post.capabilities = post_caps;
+                let mut retained = Some(ReturnProbeAdmission {
+                    context: pre.clone(),
+                    override_reason: reason.clone(),
+                });
+                rekey_approval_to_post(&mut retained, &pre, &post);
+                let kept = retained.expect("a matching approval stays stored");
+                assert_eq!(kept.context, post, "override={reason:?}");
+                assert_eq!(kept.override_reason, reason, "override={reason:?}");
+            }
+        }
+    }
+
+    /// A missing approval stays missing across the shed: the next ensure
+    /// admits fresh, as before.
+    #[test]
+    fn rekey_keeps_a_missing_approval_missing() {
+        let pre = rekey_pre_shed();
+        let mut post = pre.clone();
+        post.capabilities = Some(0b01);
+        let mut retained: Option<ReturnProbeAdmission> = None;
+        rekey_approval_to_post(&mut retained, &pre, &post);
+        assert!(retained.is_none(), "None stays None across the shed");
+    }
+
+    /// The re-key must refuse when the stored approval does not match the
+    /// pre-shed snapshot: something changed the credentials between the
+    /// self-probe and the shed, so the approval is stale. Fails while the
+    /// re-key relabels blindly.
+    #[test]
+    fn rekey_refuses_a_stored_approval_that_does_not_match_the_pre_shed_snapshot() {
+        let pre = rekey_pre_shed();
+        let mut stored = pre.clone();
+        stored.capabilities = Some(0b100);
+        let mut post = pre.clone();
+        post.capabilities = Some(0b01);
+        let mut retained = Some(ReturnProbeAdmission {
+            context: stored.clone(),
+            override_reason: None,
+        });
+        rekey_approval_to_post(&mut retained, &pre, &post);
+        assert_eq!(
+            retained
+                .expect("a refused re-key keeps the approval stored")
+                .context,
+            stored,
+            "a stale stored approval must stay untouched so the next check re-probes"
+        );
+    }
+
+    /// The re-key must refuse when the pre-shed snapshot is not reusable:
+    /// an approval earned under unreadable credentials must never be
+    /// carried forward. Fails while the re-key relabels blindly.
+    #[test]
+    fn rekey_refuses_when_the_pre_shed_snapshot_is_not_reusable() {
+        for broken in 0..3 {
+            let mut pre = rekey_pre_shed();
+            match broken {
+                0 => pre.capabilities = None,
+                1 => pre.user_namespace = None,
+                _ => {
+                    pre.seccomp = Some(SeccompMode::Filter);
+                    pre.filters = None;
+                }
+            }
+            // The post-shed side drops a capability bit, so a blind
+            // relabel is observable; only reusability can refuse the
+            // userns/seccomp variants (the capabilities-None variant
+            // additionally fails the subset check, which is the same
+            // fail-closed direction).
+            let mut post = pre.clone();
+            post.capabilities = Some(0b01);
+            let mut retained = Some(ReturnProbeAdmission {
+                context: pre.clone(),
+                override_reason: None,
+            });
+            rekey_approval_to_post(&mut retained, &pre, &post);
+            assert_eq!(
+                retained
+                    .expect("a refused re-key keeps the approval stored")
+                    .context,
+                pre,
+                "variant {broken}: an unreusable pre-shed snapshot must refuse the re-key"
+            );
+        }
+    }
+
+    /// The re-key must refuse when the post-shed context differs from the
+    /// snapshot in anything but capabilities: only a pure capability shed
+    /// preserves the verdict. Fails while the re-key relabels blindly.
+    #[test]
+    fn rekey_refuses_when_the_post_shed_context_differs_beyond_capabilities() {
+        for field in 0..6 {
+            let pre = rekey_pre_shed();
+            let mut post = pre.clone();
+            post.capabilities = Some(0b01);
+            match field {
+                0 => post.process += 1,
+                1 => post.euid += 1,
+                2 => post.egid += 1,
+                3 => post.user_namespace = Some(43),
+                4 => post.seccomp = Some(SeccompMode::Filter),
+                _ => post.filters = Some(1),
+            }
+            let mut retained = Some(ReturnProbeAdmission {
+                context: pre.clone(),
+                override_reason: None,
+            });
+            rekey_approval_to_post(&mut retained, &pre, &post);
+            assert_eq!(
+                retained
+                    .expect("a refused re-key keeps the approval stored")
+                    .context,
+                pre,
+                "field {field}: a non-capability change must refuse the re-key"
+            );
+        }
+    }
+
+    /// The re-key must refuse when post-shed capabilities are not a subset
+    /// of the snapshot: the shed only removes, so an added bit (or an
+    /// unreadable post-shed set) means something else changed the thread.
+    /// Fails while the re-key relabels blindly.
+    #[test]
+    fn rekey_refuses_when_post_shed_capabilities_are_not_a_subset() {
+        for post_caps in [Some(0b111), None] {
+            let pre = rekey_pre_shed();
+            let mut post = pre.clone();
+            post.capabilities = post_caps;
+            let mut retained = Some(ReturnProbeAdmission {
+                context: pre.clone(),
+                override_reason: None,
+            });
+            rekey_approval_to_post(&mut retained, &pre, &post);
+            assert_eq!(
+                retained
+                    .expect("a refused re-key keeps the approval stored")
+                    .context,
+                pre,
+                "post caps {post_caps:?}: a non-subset must refuse the re-key"
+            );
+        }
+    }
+
+    /// A refused re-key leaves the stored approval untouched, so the next
+    /// check sees the mismatch and re-probes instead of reusing stale
+    /// authority. Fails while the re-key relabels blindly (the next
+    /// ensure would reuse the laundered approval without probing).
+    #[test]
+    fn a_refused_rekey_leaves_the_next_check_to_reprobe() {
+        let pre = rekey_pre_shed();
+        let mut post = pre.clone();
+        post.euid += 1;
+        let mut retained = Some(ReturnProbeAdmission {
+            context: pre.clone(),
+            override_reason: None,
+        });
+        rekey_approval_to_post(&mut retained, &pre, &post);
+        let mut probed = false;
+        ensure_admission_with(&mut retained, post.clone(), |_| {
+            probed = true;
+            Ok(ReturnProbeAdmission {
+                context: post.clone(),
+                override_reason: None,
+            })
+        })
+        .expect("the re-probe succeeds");
+        assert!(
+            probed,
+            "after a refused re-key the next check must re-probe, not reuse"
+        );
     }
 }

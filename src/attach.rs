@@ -11515,11 +11515,12 @@ pub(crate) fn drop_post_setup_capabilities_for(
     if !crate::caps::post_setup_shed_needed(keep, sets) {
         return Ok(());
     }
+    let snapshot = crate::uretprobe_hazard::pre_shed_snapshot();
     crate::caps::drop_to_keep(keep)?;
     if let Some(worker) = worker {
         worker.shed_to(keep)?;
     }
-    crate::uretprobe_hazard::rekey_approval_to_current(retained);
+    crate::uretprobe_hazard::rekey_approval_to_current(retained, &snapshot);
     Ok(())
 }
 

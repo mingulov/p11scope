@@ -320,26 +320,97 @@ type CallerKey = (u32, Option<String>);
 /// One counted line: the function label plus its return code.
 type FunctionRv = (String, u64);
 
+/// Maximum distinct failing callers retained in [`CallerReasons`]
+/// (Opus residual pin 5): further callers fold into one bounded
+/// "(other callers)" row per (function, rv) with a counted EVIDENCE gap,
+/// so the roll-up stays proportional to retained callers, never to the
+/// 10M-event trace stream.
+pub(crate) const MAX_CALLER_REASONS_CALLERS: usize = 4096;
+
+/// The roll-up cell naming the folded overflow: lines whose caller
+/// arrived past [`MAX_CALLER_REASONS_CALLERS`], counted per
+/// (function, rv) without retaining their caller identity.
+const OTHER_CALLERS_CELL: &str = "(other callers)";
+
 /// Per-caller CKR attribution accumulated over rendered trace lines:
-/// caller → (function, rv) → count. A pure projection of the line
-/// stream — every counted line was rendered, every rendered line is
-/// counted — so the terminal roll-up can never disagree with the lines
-/// above it. Threads group into their process (TID stays line detail).
-/// Labels rendered from these keys reuse the line quoting, so a roll-up
-/// row names exactly the caller the lines named.
+/// caller → (function, rv) → count. A pure projection of the failing
+/// line stream — every counted line was rendered, every rendered failing
+/// line is counted (retained per caller under the cap, folded past it) —
+/// so the terminal roll-up can never disagree with the lines above it.
+/// Success and pending returns are never reasons and leave no entry.
+/// Threads group into their process (TID stays line detail). Labels
+/// rendered from these keys reuse the line quoting, so a roll-up row
+/// names exactly the caller the lines named.
 #[derive(Debug, Default)]
 pub(crate) struct CallerReasons {
     calls: BTreeMap<CallerKey, BTreeMap<FunctionRv, u64>>,
+    /// Folded (function, rv) counts for rendered failing lines whose
+    /// caller arrived past [`MAX_CALLER_REASONS_CALLERS`]: bounded by
+    /// distinct functions × return codes, never by caller count.
+    overflow: BTreeMap<FunctionRv, u64>,
+    /// Rendered failing lines folded into `overflow` (exact, saturating).
+    folded_lines: u64,
 }
 
 impl CallerReasons {
     pub(crate) fn note(&mut self, pid: u32, path: Option<&str>, function: &str, rv: u64) {
+        // Success and pending returns are never reasons: skip them at
+        // the intake so a clean caller leaves no entry at all. The
+        // roll-up drops them too, so output is unchanged either way.
+        if rv == pkcs11_types::CkRv::OK.0 || rv == pkcs11_types::CkRv::PENDING.0 {
+            return;
+        }
+        let key = (pid, path.map(str::to_string));
+        if !self.calls.contains_key(&key) && self.calls.len() >= MAX_CALLER_REASONS_CALLERS {
+            self.overflow
+                .entry((function.to_string(), rv))
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+            self.folded_lines = self.folded_lines.saturating_add(1);
+            return;
+        }
         self.calls
-            .entry((pid, path.map(str::to_string)))
+            .entry(key)
             .or_default()
             .entry((function.to_string(), rv))
             .and_modify(|count| *count = count.saturating_add(1))
             .or_insert(1);
+    }
+
+    /// Retained distinct failing callers (outer entries, at most the
+    /// cap) — the R11 outer size for the memory-counter lane.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged R11 size API; the memory-counter lane consumes it.
+    pub(crate) fn caller_entries(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// Retained (function, rv) rows across callers, folded overflow rows
+    /// included — the R11 inner size for the memory-counter lane.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged R11 size API; the memory-counter lane consumes it.
+    pub(crate) fn row_entries(&self) -> usize {
+        self.calls
+            .values()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            .saturating_add(self.overflow.len())
+    }
+
+    /// True once a rendered failing line folded past the caller cap.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.folded_lines > 0
+    }
+
+    /// Rendered failing lines folded into "(other callers)" (exact,
+    /// saturating). A distinct overflow-caller count is intentionally not
+    /// tracked: retaining those identities would be the unbounded
+    /// structure the cap removes.
+    pub(crate) fn folded_lines(&self) -> u64 {
+        self.folded_lines
+    }
+
+    /// Distinct folded (function, rv) pairs — the EVIDENCE row count.
+    pub(crate) fn folded_rows(&self) -> usize {
+        self.overflow.len()
     }
 }
 
@@ -378,6 +449,48 @@ struct CallerRow<'a> {
     path: Option<&'a str>,
     total: u64,
     rows: Vec<FunctionRow>,
+    /// True for the folded overflow: renders under [`OTHER_CALLERS_CELL`]
+    /// after every retained caller, never among them.
+    overflow: bool,
+}
+
+/// Groups one (function, rv) count map into failure-sorted function rows
+/// plus the failure total, worst-first. Shared by retained callers and
+/// the "(other callers)" fold so both order and bound reasons the same
+/// way. Success and pending returns are never reasons.
+fn function_rows(calls: &BTreeMap<FunctionRv, u64>) -> (Vec<FunctionRow>, u64) {
+    let ok = pkcs11_types::CkRv::OK.0;
+    let pending = pkcs11_types::CkRv::PENDING.0;
+    let mut functions: Vec<FunctionRow> = Vec::new();
+    for ((function, rv), count) in calls {
+        if *count == 0 || *rv == ok || *rv == pending {
+            continue;
+        }
+        match functions.iter_mut().find(|row| row.function == *function) {
+            Some(row) => row.reasons.push((*rv, *count)),
+            None => functions.push(FunctionRow {
+                function: function.clone(),
+                failures: 0,
+                reasons: vec![(*rv, *count)],
+            }),
+        }
+    }
+    let mut total = 0u64;
+    for row in &mut functions {
+        row.reasons
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        row.failures = row
+            .reasons
+            .iter()
+            .fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
+        total = total.saturating_add(row.failures);
+    }
+    functions.sort_by(|a, b| {
+        b.failures
+            .cmp(&a.failures)
+            .then(a.function.cmp(&b.function))
+    });
+    (functions, total)
 }
 
 /// Terminal `CALLER ERROR REASONS:` section over the rendered lines:
@@ -389,56 +502,29 @@ struct CallerRow<'a> {
 /// reasons; unregistered codes keep the trace `CKR_UNKNOWN` spelling,
 /// matching the lines this section summarizes. Rows read worst-first:
 /// callers by failure count, then pid and path; functions within a
-/// caller by failure count, then name; reasons by count, then code.
+/// caller by failure count, then name; reasons by count, then code. Past
+/// the caller cap the folded lines render last as "(other callers)" rows,
+/// one per function with the same reason bounding.
 fn caller_reason_lines(
     reasons: &CallerReasons,
     verbose: bool,
     truncated: bool,
     errors: u64,
 ) -> Vec<String> {
-    let ok = pkcs11_types::CkRv::OK.0;
-    let pending = pkcs11_types::CkRv::PENDING.0;
     // Per caller: per function failure reasons, worst-first; the caller
     // totals below sort the callers the same way.
     let mut callers: Vec<CallerRow<'_>> = Vec::new();
     for ((pid, path), calls) in &reasons.calls {
-        let mut functions: Vec<FunctionRow> = Vec::new();
-        for ((function, rv), count) in calls {
-            if *count == 0 || *rv == ok || *rv == pending {
-                continue;
-            }
-            match functions.iter_mut().find(|row| row.function == *function) {
-                Some(row) => row.reasons.push((*rv, *count)),
-                None => functions.push(FunctionRow {
-                    function: function.clone(),
-                    failures: 0,
-                    reasons: vec![(*rv, *count)],
-                }),
-            }
-        }
+        let (functions, total) = function_rows(calls);
         if functions.is_empty() {
             continue;
         }
-        let mut total = 0u64;
-        for row in &mut functions {
-            row.reasons
-                .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            row.failures = row
-                .reasons
-                .iter()
-                .fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
-            total = total.saturating_add(row.failures);
-        }
-        functions.sort_by(|a, b| {
-            b.failures
-                .cmp(&a.failures)
-                .then(a.function.cmp(&b.function))
-        });
         callers.push(CallerRow {
             pid: *pid,
             path: path.as_deref(),
             total,
             rows: functions,
+            overflow: false,
         });
     }
     callers.sort_by(|a, b| {
@@ -447,6 +533,20 @@ fn caller_reason_lines(
             .then(a.pid.cmp(&b.pid))
             .then(a.path.cmp(&b.path))
     });
+    // The fold renders after every retained caller, so the overflow is
+    // unmistakable and retained detail keeps its worst-first order.
+    if !reasons.overflow.is_empty() {
+        let (functions, total) = function_rows(&reasons.overflow);
+        if !functions.is_empty() {
+            callers.push(CallerRow {
+                pid: 0,
+                path: None,
+                total,
+                rows: functions,
+                overflow: true,
+            });
+        }
+    }
     let mut lines = Vec::new();
     if callers.is_empty() {
         if errors == 0 {
@@ -460,7 +560,11 @@ fn caller_reason_lines(
     } else {
         lines.push("CALLER ERROR REASONS:".to_string());
         for caller in &callers {
-            let cell = caller_cell(caller.pid, caller.path);
+            let cell = if caller.overflow {
+                OTHER_CALLERS_CELL.to_string()
+            } else {
+                caller_cell(caller.pid, caller.path)
+            };
             for row in &caller.rows {
                 let shown = if verbose {
                     row.reasons.len()
@@ -524,6 +628,32 @@ pub(crate) fn terminal_summary(
 /// A truncated trace (`ev.trace_truncated`) is PARTIAL even behind a proven
 /// drain: its line stream is short (DR-RETRO-C6-1).
 pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
+    evidence_line_inner(ev, policy, None)
+}
+
+/// Trace terminal record with the caller-reasons overflow gap: past the
+/// caller cap the record carries a counted `caller_reasons_overflow`
+/// object (`folded_lines`, `folded_rows`); under the cap the field is
+/// absent and the record matches [`evidence_line`] exactly.
+pub(crate) fn evidence_line_with_caller_overflow(
+    ev: &render::Evidence,
+    policy: CapturePolicy,
+    callers: &CallerReasons,
+) -> String {
+    let overflow = callers.overflowed().then(|| {
+        serde_json::json!({
+            "folded_lines": callers.folded_lines(),
+            "folded_rows": callers.folded_rows(),
+        })
+    });
+    evidence_line_inner(ev, policy, overflow)
+}
+
+fn evidence_line_inner(
+    ev: &render::Evidence,
+    policy: CapturePolicy,
+    caller_reasons_overflow: Option<serde_json::Value>,
+) -> String {
     let mut value = render::versioned_evidence(ev);
     let object = value
         .as_object_mut()
@@ -551,6 +681,9 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
         "trace_truncated".into(),
         serde_json::Value::Bool(ev.trace_truncated),
     );
+    if let Some(overflow) = caller_reasons_overflow {
+        object.insert("caller_reasons_overflow".into(), overflow);
+    }
     format!("EVIDENCE {value}")
 }
 
@@ -2299,5 +2432,119 @@ mod tests {
             "\"cryptsetup\" (PID 400) exe=\"/sbin/cryptsetup\": C_CloseSession: \
              CKR_SESSION_HANDLE_INVALID x1"
         );
+    }
+
+    /// B0 sizes: `note()` records failing lines only — OK/PENDING never
+    /// occupy the roll-up, so a clean caller leaves no entry at all.
+    #[test]
+    fn caller_reasons_note_skips_ok_and_pending() {
+        let ok = pkcs11_types::CkRv::OK.0;
+        let pending = pkcs11_types::CkRv::PENDING.0;
+        let device = pkcs11_types::CkRv::DEVICE_ERROR.0;
+        let mut reasons = CallerReasons::default();
+        for _ in 0..3 {
+            reasons.note(60, None, "C_OpenSession", ok);
+        }
+        for _ in 0..2 {
+            reasons.note(60, None, "C_OpenSession", pending);
+        }
+        assert_eq!(reasons.caller_entries(), 0);
+        assert_eq!(reasons.row_entries(), 0);
+        assert!(!reasons.overflowed());
+        assert_eq!(reasons.folded_lines(), 0);
+        reasons.note(60, None, "C_OpenSession", device);
+        assert_eq!(reasons.caller_entries(), 1);
+        assert_eq!(reasons.row_entries(), 1);
+    }
+
+    /// B0 cap: the roll-up retains at most 4096 failing callers; further
+    /// distinct callers fold into one bounded "(other callers)" row per
+    /// (function, rv), rendered after the retained callers.
+    #[test]
+    fn caller_reasons_fold_overflow_callers_past_4096() {
+        let device = pkcs11_types::CkRv::DEVICE_ERROR.0;
+        let mut reasons = CallerReasons::default();
+        for pid in 0..4096u32 {
+            reasons.note(pid, None, "C_OpenSession", device);
+        }
+        assert_eq!(reasons.caller_entries(), MAX_CALLER_REASONS_CALLERS);
+        assert!(!reasons.overflowed());
+        for pid in 4096..4099u32 {
+            reasons.note(pid, None, "C_OpenSession", device);
+        }
+        assert_eq!(reasons.caller_entries(), MAX_CALLER_REASONS_CALLERS);
+        assert!(reasons.overflowed());
+        assert_eq!(reasons.folded_lines(), 3);
+        // A retained caller still counts exactly past the cap.
+        reasons.note(7, None, "C_OpenSession", device);
+        assert_eq!(reasons.folded_lines(), 3);
+        assert_eq!(reasons.caller_entries(), MAX_CALLER_REASONS_CALLERS);
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            4100,
+            4100,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            &reasons,
+        );
+        let folded = tail
+            .iter()
+            .rposition(|line| line.contains("(other callers)"))
+            .expect("the fold renders plainly");
+        assert_eq!(
+            tail[folded],
+            "(other callers): C_OpenSession: CKR_DEVICE_ERROR x3"
+        );
+        assert!(
+            tail[..folded]
+                .iter()
+                .all(|line| !line.contains("(other callers)")),
+            "the fold renders after every retained caller"
+        );
+        assert!(
+            tail[..folded]
+                .iter()
+                .any(|line| line.contains("PID 7") && line.contains("CKR_DEVICE_ERROR x2")),
+            "retained callers keep exact counts past the cap"
+        );
+    }
+
+    /// B0 EVIDENCE: `caller_reasons_overflow` is absent under the cap and
+    /// a counted gap past it.
+    #[test]
+    fn caller_reasons_overflow_evidence_field_counts_the_fold() {
+        let device = pkcs11_types::CkRv::DEVICE_ERROR.0;
+        let ev = empty_evidence();
+        let mut under = CallerReasons::default();
+        under.note(1, None, "C_OpenSession", device);
+        let line = evidence_line_with_caller_overflow(
+            &ev,
+            crate::attach::CapturePolicy::Allowlisted,
+            &under,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert!(value.get("caller_reasons_overflow").is_none(), "{value}");
+        let mut over = CallerReasons::default();
+        for pid in 0..4097u32 {
+            over.note(pid, None, "C_OpenSession", device);
+        }
+        let line = evidence_line_with_caller_overflow(
+            &ev,
+            crate::attach::CapturePolicy::Allowlisted,
+            &over,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(
+            value["caller_reasons_overflow"],
+            serde_json::json!({"folded_lines": 1, "folded_rows": 1})
+        );
+        // The legacy entry point never carries the field.
+        let legacy = evidence_line(&ev, crate::attach::CapturePolicy::Allowlisted);
+        let legacy_value: serde_json::Value =
+            serde_json::from_str(legacy.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert!(legacy_value.get("caller_reasons_overflow").is_none());
     }
 }

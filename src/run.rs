@@ -12134,7 +12134,9 @@ fn emit_trace_terminal_accounted<W: Write>(
     // where stdout IS the file.
     let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
     let emit_evidence = verbose || stdout_is_file;
-    let stdout_line = emit_evidence.then(|| trace::evidence_line(evidence, policy));
+    let stdout_line = emit_evidence.then(|| {
+        trace::evidence_line_with_caller_overflow(evidence, policy, tracer.caller_reasons())
+    });
     // Trailing newline included: a withheld line contributes zero bytes,
     // so the file record below counts the whole line as stdout-missing.
     let stdout_line_len = stdout_line.as_ref().map_or(0, |line| line.len() + 1);
@@ -12210,12 +12212,17 @@ fn emit_trace_terminal_accounted<W: Write>(
     let counted = evidence.scheduling.sink_dropped_bytes;
     let total = resolve_terminal_sink_total(counted, stdout_line_len, |candidate| {
         evidence.scheduling.sink_dropped_bytes = candidate;
-        trace::evidence_line(evidence, policy).len() + 1
+        trace::evidence_line_with_caller_overflow(evidence, policy, tracer.caller_reasons()).len()
+            + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
     if let Some(file) = out_file.as_mut() {
-        writeln!(file, "{}", trace::evidence_line(evidence, policy))
-            .context("writing trace output file")?;
+        writeln!(
+            file,
+            "{}",
+            trace::evidence_line_with_caller_overflow(evidence, policy, tracer.caller_reasons())
+        )
+        .context("writing trace output file")?;
         file.flush().context("flushing trace output file")?;
     }
     {

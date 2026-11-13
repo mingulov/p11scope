@@ -350,9 +350,9 @@ forwarded call would count twice — declare the shim with repeatable
 path and inode, a bare name by basename) to split its calls out of the
 headline totals exactly like a closure layer under the same gates. No
 declaration, no split: the observer never guesses a forwarding role
-from coincident counts. When two attached non-layer modules show
-exactly coincident vectors, the report instead prints a
-`Possible forwarding` hint naming both modules and the flag; like the
+from coincident counts. When every per-function count of one attached
+non-layer module is contained in another's, the report instead prints
+a `Possible forwarding` hint naming both modules and the flag; like the
 `--manifest` hints it is advisory text only and changes no count. A
 `--forwarding-module` input that matched no mapped file is named as an
 unmatched declaration. A full-path match is inode-corroborated, not a

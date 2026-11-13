@@ -222,11 +222,12 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// (an unproven pid filter on 6.6-6.9 without the backport), keeps it
 /// for dynamic perf re-attach. An owned `run` session (`owned`) always
 /// keeps it when held and never sheds it; a setcap `run` needs none
-/// (bisected to be50cad25: after the shed the first attach reruns the
-/// return-probe safety check's uretprobe self-probe, keyed on the
-/// thread's effective capabilities, inside the owned pause window;
-/// controller ruling 2026-11-08, F1; re-keying the stored approval to
-/// the post-shed context is a 0.7.x follow-up).
+/// (bisected to be50cad25: before the re-key, after the shed the first
+/// attach reran the return-probe safety check's uretprobe self-probe,
+/// keyed on the thread's effective capabilities, inside the owned pause
+/// window; controller ruling 2026-11-08, F1; shedding sessions now
+/// re-key the stored approval to the post-shed context via
+/// `uretprobe_hazard::rekey_approval_to_current`).
 pub(crate) fn post_setup_keep(
     multi: bool,
     dynamic_multi: bool,
@@ -685,10 +686,11 @@ mod tests {
     /// setcap process without it is untouched either way. An owned `run`
     /// always keeps it when held and never sheds it; a setcap `run`
     /// needs none (bisected to be50cad25: the shed broke owned
-    /// pause_auto, F1 — the first attach after it reruns the
+    /// pause_auto, F1 — the first attach after it reran the
     /// return-probe safety check's uretprobe self-probe, keyed on the
-    /// thread's effective capabilities; re-keying the stored approval
-    /// to the post-shed context is a 0.7.x follow-up; least privilege
+    /// thread's effective capabilities; shedding sessions now re-key the
+    /// stored approval to the post-shed context via
+    /// `uretprobe_hazard::rekey_approval_to_current`; least privilege
     /// must never behave worse than v0.6.0).
     #[test]
     fn post_setup_keep_sheds_only_the_transient_sys_admin() {

@@ -222,6 +222,8 @@ pub(crate) fn admit(
 /// A shared Session backstop, checked once per link mutation, not per endpoint.
 /// A credential change needs a fresh assessment under the same explicit risk
 /// acceptance, if any; default Sessions never inherit another capture's override.
+/// Exception: the post-setup capability shed re-keys the retained approval to
+/// the live context (`rekey_approval_to_current`) instead of re-probing.
 pub(crate) fn ensure_admission(
     retained: &mut Option<ReturnProbeAdmission>,
 ) -> std::result::Result<(), Action> {

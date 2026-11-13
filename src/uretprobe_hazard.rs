@@ -2748,10 +2748,13 @@ mod tests {
 
     /// The re-key must refuse when the post-shed context differs from the
     /// snapshot in anything but capabilities: only a pure capability shed
-    /// preserves the verdict. Fails while the re-key relabels blindly.
+    /// preserves the verdict. Each field flips both ways (scalars up and
+    /// down, options to a second `Some` and to `None`), so neither
+    /// direction can launder through the comparison. Fails while the
+    /// re-key relabels blindly.
     #[test]
     fn rekey_refuses_when_the_post_shed_context_differs_beyond_capabilities() {
-        for field in 0..6 {
+        for field in 0..12 {
             let pre = rekey_pre_shed();
             let mut post = pre.clone();
             post.capabilities = Some(0b01);
@@ -2761,7 +2764,13 @@ mod tests {
                 2 => post.egid += 1,
                 3 => post.user_namespace = Some(43),
                 4 => post.seccomp = Some(SeccompMode::Filter),
-                _ => post.filters = Some(1),
+                5 => post.filters = Some(1),
+                6 => post.process -= 1,
+                7 => post.euid -= 1,
+                8 => post.egid -= 1,
+                9 => post.user_namespace = None,
+                10 => post.seccomp = None,
+                _ => post.filters = None,
             }
             let mut retained = Some(ReturnProbeAdmission {
                 context: pre.clone(),

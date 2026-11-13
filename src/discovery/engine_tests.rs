@@ -77735,6 +77735,10 @@ fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
     let (_fixture, mut engine, mut session) =
         initial_export_route_from_seed(loaded_seed_provider_with_seed_table(false, true));
     engine.scope = Scope::System;
+    // Closed universe: this completion measures the window and the
+    // return's own slot, so the service tick must not admit live host
+    // processes (a zero cap selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
     session.dynamic_attach_reports_added = true;
     engine.attach_initial_exports(
         &mut session,
@@ -77857,6 +77861,10 @@ fn complete_initial_arming_names_the_post_ready_window_as_a_gap() {
 fn complete_initial_arming_files_no_window_gap_when_only_exports_attached() {
     let (_fixture, mut engine, mut session) = initial_export_route();
     engine.scope = Scope::System;
+    // Closed universe: this completion must add no counting coverage, so
+    // the service tick must not admit live host processes (a zero cap
+    // selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(9000);
     session.dynamic_attach_reports_added = true;
@@ -77925,6 +77933,10 @@ fn complete_initial_arming_files_no_window_gap_when_only_exports_attached() {
 fn complete_initial_arming_files_no_window_gap_when_no_coverage_added() {
     let (_fixture, mut engine, mut session, _binding) = attached_selection_route();
     engine.scope = Scope::System;
+    // Closed universe: this completion must add no counting coverage, so
+    // the service tick must not admit live host processes (a zero cap
+    // selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(9000);
     let arms_before = engine.loader_arms();
@@ -78018,6 +78030,10 @@ fn complete_initial_arming_measures_the_window_on_the_real_clock() {
     module_b.view = ProcessViewId(1);
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
+    // Closed universe: this completion measures the window and the
+    // return's own slot, so the service tick must not admit live host
+    // processes (a zero cap selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
     engine.next_view_id = 2;
     engine.views.push(view_a);
     engine
@@ -78166,6 +78182,199 @@ fn complete_initial_arming_measures_the_window_on_the_real_clock() {
     );
 }
 
+/// Startup B4 twin (closed universe): a System-scope completion ticks
+/// against the live host /proc, and on a quiet host the admission window
+/// covers every pid — including a sibling test's live seed provider. The
+/// tick deep-scans it, statically decodes its function table, and files a
+/// second counting slot next to the mid-completion return's live one
+/// (ci 43402732527: slots left 2, right 1). This twin parks the admission
+/// cursor just below a live foreign readable-seed child — a window state
+/// any earlier tick could leave behind — so the foreign admission is
+/// deterministic on any host. The zero scan cap closes the universe (the
+/// tick selects nothing new and retires nothing), keeping the exact count
+/// at the return's own slot.
+#[test]
+fn complete_initial_arming_closed_universe_admits_no_foreign_slot() {
+    let (fixture_a, view_a, mut module_a, pins_a) = loaded_seed_provider();
+    let _fixture_a = fixture_a;
+    let (fixture_b, view_b, mut module_b, pins_b) =
+        loaded_seed_provider_with_seed_table(false, true);
+    let _fixture_b = fixture_b;
+    let _view_b = view_b;
+    for module in [&mut module_a, &mut module_b] {
+        module.exports = vec![
+            "C_GetFunctionList".into(),
+            "C_GetInterfaceList".into(),
+            "C_GetInterface".into(),
+        ];
+    }
+    // Distinct view ids: the second child re-opens under id 1, and its
+    // module rides that id so the candidate binds it to the right view.
+    module_b.view = ProcessViewId(1);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    // Closed universe: this completion measures the window and the
+    // return's own slot, so the service tick must not admit live host
+    // processes (a zero cap selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
+    engine.next_view_id = 2;
+    engine.views.push(view_a);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), _fixture_b.child.id()).unwrap());
+    let mut pins = pins_a;
+    let skipped = pins.absorb(pins_b);
+    let candidate = engine
+        .live_candidate(pins, vec![module_a, module_b], skipped)
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    session.dynamic_loader_reports_added = true;
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    // Only the table view arms up front; the plain view's loader stays
+    // unarmed so the completion arms it and the attach sleeps.
+    engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut additions_allowed,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(additions_allowed);
+    // Only the table view's exports attach up front: the scripted return
+    // below must name a live binding. The plain view's exports attach
+    // during the completion like production.
+    let mut pending_views = PendingViewRetirements::new();
+    let mut closure = PauseClosure::new(true);
+    let mut export_incomplete = BTreeSet::new();
+    let outcome =
+        engine.attach_refreshed_exports(ProcessViewId(1), &mut session, &mut additions_allowed);
+    engine.note_export_attach_outcome(
+        ProcessViewId(1),
+        outcome,
+        &mut pending_views,
+        &mut closure,
+        &mut export_incomplete,
+    );
+    let binding = *engine.selection_bindings.values().next().unwrap();
+    // The return below must travel the exhausted-authority path (like the
+    // selection twin it copies) so the fresh table word becomes a slot.
+    let tuple = LiveSelectionTuple {
+        module: binding.provider,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::Null,
+            flags: 0,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::Other,
+            version: SelectionVersionClass::Other,
+            flags: 0,
+        }),
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for flags in 0..MAX_LIVE_SELECTION_TUPLES {
+        engine
+            .capture_facts
+            .history
+            .selections
+            .push(LiveSelectionTuple {
+                request: SelectionRequest {
+                    flags: flags as u64,
+                    ..tuple.request
+                },
+                ..tuple.clone()
+            });
+    }
+    let provider = engine.pinned.summary(binding.object).unwrap();
+    let file = engine.pinned.file_for(binding.object).unwrap();
+    let offset = ElfSnapshot::read(file)
+        .unwrap()
+        .defined_symbol("seed_selection_table")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let maps = parse_maps(&std::fs::read(format!("/proc/{}/maps", _fixture_b.child.id())).unwrap())
+        .unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| {
+            ObjectKey::of(mapping) == provider.key
+                && offset
+                    .checked_sub(mapping.file_offset)
+                    .is_some_and(|delta| delta < mapping.end - mapping.start)
+        })
+        .unwrap();
+    let address = mapping.start + offset - mapping.file_offset;
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(_fixture_b.child.id()) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_NULL;
+    record.name_class = DISCOVERY_NAME_OTHER;
+    record.selection_version_class = DISCOVERY_VERSION_OTHER;
+    record.table_ptr = address;
+    record.binding_id = binding.id;
+    assert!(
+        valid_discovery_record(&record),
+        "real opaque transport carries an address, not fabricated prefix words"
+    );
+    // A live foreign provider this completion never set up, parked at the
+    // head of the admission window: without the closed universe, the
+    // completion's tick admits it and its static slot doubles the count.
+    let (foreign, _foreign_view, _foreign_module, _foreign_pins) =
+        loaded_seed_provider_with_seed_table(false, true);
+    let foreign_pid = foreign.child.id();
+    let _foreign = foreign;
+    engine
+        .scheduler
+        .note_new_view_attempt(foreign_pid.saturating_sub(1));
+    engine.initial_arming_pending = true;
+    assert!(
+        engine.plan.slots.is_empty(),
+        "no counting coverage before the completion"
+    );
+    session.before_dynamic_loader_attach = Some(Box::new(|| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }));
+    session
+        .dequeues
+        .push_back(Ok(Some(crate::events::DiscoveryItem::Record(record))));
+    engine
+        .complete_initial_arming(&mut session, &|| false)
+        .expect("healthy completion runs");
+    assert_eq!(
+        engine.plan.slots.len(),
+        1,
+        "the closed universe keeps the count at the return's own slot"
+    );
+    let gap = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "initial loader arming")
+        .expect("the real-clock window names its gap");
+    assert!(
+        gap.reason.contains("ms after the capturing: line")
+            && gap.reason.contains("were not counted"),
+        "the gap names the measured window: {}",
+        gap.reason
+    );
+    assert!(
+        !gap.reason.contains("finished 0ms"),
+        "the measured window is nonzero: {}",
+        gap.reason
+    );
+}
+
 /// The arming window ends when the export attach settles; the discovery
 /// staging that follows it is not part of the window a provider call
 /// could have raced.
@@ -78206,6 +78415,10 @@ fn complete_initial_arming_files_no_window_gap_when_nothing_armed() {
     // Provider-free views under system scope stay exploratory: the arming
     // gate skips them, so the completion attempts no arm.
     engine.scope = Scope::System;
+    // Closed universe: this completion must add no counting coverage, so
+    // the service tick must not admit live host processes (a zero cap
+    // selects nothing new and retires nothing).
+    engine.max_scan_pids = 0;
     engine.initial_arming_pending = true;
     engine.initial_arming_window_ms_for_test = Some(9000);
     let mut session = ScriptedSession::default();

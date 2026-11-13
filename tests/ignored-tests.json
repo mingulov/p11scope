@@ -1181,6 +1181,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/uretprobe_hazard.rs",
+      "path": "uretprobe_hazard::tests::privileged_post_setup_shed_rekeys_the_retained_approval_as_root",
+      "reason": "privileged: post-setup shed re-keys the retained approval as root (needs a real shed)",
+      "cell": "privileged"
+    },
+    {
       "file": "src/first_use_probe/native.rs",
       "path": "first_use_probe::native::system_capture_observer_facts",
       "reason": "owned root first-use observer; frozen config, supervisor and exclusive BPF lane required",

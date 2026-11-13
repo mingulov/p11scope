@@ -2479,11 +2479,16 @@ mod tests {
     /// re-probe is observed through the injected assess closure), so the
     /// twin is non-vacuous as root and vacuous-but-green unprivileged (no
     /// shed, no mismatch), like the `post_setup_shed` twins in attach.rs.
+    /// The shed leg additionally pins that the pre- and post-shed contexts
+    /// differ, so the twin cannot mistake a silently skipped shed for a
+    /// working re-key. The privileged campaign twin below is the same
+    /// scenario as root, where the shed is always real.
     #[test]
     fn post_setup_shed_rekeys_the_retained_approval_so_the_next_attach_skips_the_self_probe() {
         let sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
         let keep = crate::caps::post_setup_keep(true, true, false, sets.effective);
         let needed = crate::caps::post_setup_shed_needed(keep, sets);
+        let pre_shed_context = AssessmentContext::current();
         // Seed a pre-shed approval for the live context without forking.
         let mut retained: Option<ReturnProbeAdmission> = None;
         ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
@@ -2501,6 +2506,7 @@ mod tests {
             &mut retained,
         )
         .expect("the shed succeeds");
+        let post_shed_context = AssessmentContext::current();
         // The next attach's ensure must reuse the retained approval.
         let mut probed = false;
         ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
@@ -2513,6 +2519,11 @@ mod tests {
         .expect("the post-shed ensure succeeds");
         if needed {
             assert!(
+                pre_shed_context != post_shed_context,
+                "the shed must change the live assessment context when the keep differs; \
+                 otherwise this twin cannot tell the re-key from a silently skipped shed"
+            );
+            assert!(
                 !probed,
                 "a shed capture must not re-run the self-probe on the next attach"
             );
@@ -2522,6 +2533,63 @@ mod tests {
                 "an unshed capture reuses its approval (vacuous unprivileged leg)"
             );
         }
+    }
+
+    /// Privileged twin of
+    /// `post_setup_shed_rekeys_the_retained_approval_so_the_next_attach_skips_the_self_probe`,
+    /// curated in the privileged campaign where the shed is always real:
+    /// the plain twin above runs unprivileged in CI and only exercises its
+    /// vacuous leg there. Requires a needed shed (fails loud without
+    /// privilege instead of self-skipping: a self-skip is not a pass),
+    /// pins that the shed changed the live assessment context, and
+    /// asserts the next attach reuses the re-keyed approval without
+    /// re-running the self-probe.
+    #[test]
+    #[ignore = "privileged: post-setup shed re-keys the retained approval as root"]
+    fn privileged_post_setup_shed_rekeys_the_retained_approval_as_root() {
+        let sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
+        let keep = crate::caps::post_setup_keep(true, true, false, sets.effective);
+        let needed = crate::caps::post_setup_shed_needed(keep, sets);
+        assert!(
+            needed,
+            "the privileged shed cell needs a real shed (run as root with capabilities to drop)"
+        );
+        let pre_shed_context = AssessmentContext::current();
+        let mut retained: Option<ReturnProbeAdmission> = None;
+        ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
+            Ok(ReturnProbeAdmission {
+                context: AssessmentContext::current(),
+                override_reason: None,
+            })
+        })
+        .expect("seeding the retained approval succeeds");
+        crate::attach::drop_post_setup_capabilities_for(
+            crate::attach::AttachBackend::Multi,
+            true,
+            false,
+            None,
+            &mut retained,
+        )
+        .expect("the shed succeeds");
+        let post_shed_context = AssessmentContext::current();
+        assert!(
+            pre_shed_context != post_shed_context,
+            "the shed must change the live assessment context; otherwise this twin cannot \
+             tell the re-key from a silently skipped shed"
+        );
+        let mut probed = false;
+        ensure_admission_with(&mut retained, AssessmentContext::current(), |_| {
+            probed = true;
+            Ok(ReturnProbeAdmission {
+                context: AssessmentContext::current(),
+                override_reason: None,
+            })
+        })
+        .expect("the post-shed ensure succeeds");
+        assert!(
+            !probed,
+            "a shed capture must not re-run the self-probe on the next attach"
+        );
     }
 
     /// Synthetic pre-shed context for the re-key policy twins: reusable,

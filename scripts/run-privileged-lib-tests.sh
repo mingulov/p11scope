@@ -412,6 +412,11 @@ discovery::sweep_attribution::tests::privileged_tmpfs_inode32_refuses_while_inod
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
 events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map
 events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
+# Post-setup shed authority: the stored return-probe approval must be
+# re-keyed to the post-shed context, so the next attach reuses it
+# without re-running the self-probe (whose forked child would count a
+# descendant gap). Needs a real shed, so root only.
+uretprobe_hazard::tests::privileged_post_setup_shed_rekeys_the_retained_approval_as_root
 # Task 6 C5.1 native inventory lane cells (production classic loop over owned
 # inventory-ledger workloads; need gcc, softhsm2-util and SoftHSM2 at
 # /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; about 5-20 s each): --pid

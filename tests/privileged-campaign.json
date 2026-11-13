@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 245,
+  "default_floor": 246,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -160,6 +160,7 @@
     "events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains",
     "events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map",
     "events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict",
+    "uretprobe_hazard::tests::privileged_post_setup_shed_rekeys_the_retained_approval_as_root",
     "inventory::privileged_tests::privileged_native_lane_pid_lp64",
     "inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64",
     "inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64",

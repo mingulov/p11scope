@@ -8,12 +8,19 @@
 # file. The guest shares the host rootfs read-only and hides /tmp and
 # /var/tmp, so the binary and OUTDIR must live under /home; the cells run on
 # a guest-local root-owned tmpfs base. Take the privileged lock around this.
+# The vng invocation runs under scripts/ci/vng-boot-watch.sh (console to
+# OUTDIR/vng-console.log, diagnostics to OUTDIR/vng-boot-diag.log): host
+# KVM is proven before the boot, and a guest that prints nothing and
+# writes no uname.txt within VNG_BOOT_TIMEOUT_S (default 300) trips
+# VNG_BOOT_TIMEOUT instead of hanging to the job timeout.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
 # Exit codes: the guest's cells exit (0 every cell held, 1 failed);
 # 1 when vng itself fails or the results are missing.
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3; CELLS=${4:-"overlay cap"}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+WATCH="$REPO/scripts/ci/vng-boot-watch.sh"
+[ -x "$WATCH" ] || { echo "qualify-inventory-c1b-vng.sh: boot watch missing: $WATCH" >&2; exit 1; }
 case "$BIN:$OUT" in /tmp/*|/var/tmp/*|*:/tmp/*|*:/var/tmp/*) echo "binary and OUTDIR must be under /home" >&2; exit 64;; esac
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e "$OUT")
 # Mainline guest kernels build overlayfs as a module the host rootfs lacks:
@@ -28,7 +35,8 @@ ${MODULE:+MODULE=$MODULE }$REPO/scripts/qualify-inventory-c1b.sh $BIN --base /tm
 echo "cells_exit=\$?" >> $OUT/cells.log
 INNER
 s=$(date +%s)
-vng --run "$K" --user root --cpus 4 --memory 6G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1
+"$WATCH" --marker "$OUT/uname.txt" --console "$OUT/vng-console.log" --diag "$OUT/vng-boot-diag.log" -- \
+    vng --run "$K" --user root --cpus 4 --memory 6G --rwdir "$OUT" --exec "sh $OUT/inner.sh"
 vng_exit=$?
 echo "vng_exit=$vng_exit wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(grep -E 'VERDICT|cells_exit' "$OUT/cells.log" 2>/dev/null | tr '\n' ' ')"
 [ "$vng_exit" -eq 0 ] || exit 1

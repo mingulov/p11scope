@@ -1033,10 +1033,10 @@ impl FileLearner {
         // Record when the stop landed (first stop wins): the tail
         // deadline anchors to it, so the tail fits inside the join
         // bound however late the drain notices the stop.
-        if let Ok(mut stop) = self.state.stop.lock() {
-            if stop.is_none() {
-                *stop = Some(std::time::Instant::now());
-            }
+        if let Ok(mut stop) = self.state.stop.lock()
+            && stop.is_none()
+        {
+            *stop = Some(std::time::Instant::now());
         }
         // A never-begun learner holds the only sender: drop it so the
         // channel closes terminally instead of dangling.
@@ -3437,10 +3437,10 @@ mod tests {
         let mut count = 0;
         if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
             for entry in entries.flatten() {
-                if let Ok(target) = std::fs::read_link(entry.path()) {
-                    if target.to_string_lossy().contains("anon_inode:[fanotify]") {
-                        count += 1;
-                    }
+                if let Ok(target) = std::fs::read_link(entry.path())
+                    && target.to_string_lossy().contains("anon_inode:[fanotify]")
+                {
+                    count += 1;
                 }
             }
         }

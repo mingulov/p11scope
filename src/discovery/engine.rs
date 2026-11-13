@@ -793,17 +793,20 @@ pub struct Engine {
     /// re-classifies on its next listing, so a later user generation
     /// never inherits the live mark (a death plus reuse inside one
     /// walk interval is the documented hole). Bounded: past
-    /// `MAX_SCAN_PIDS` new marks drop and count (fail-closed).
+    /// `MAX_SCAN_PIDS` new marks drop and count (fail-closed), as do
+    /// proofs with no known generation bound (failed clock samples).
     known_kernel_threads: BTreeMap<u32, u64>,
     /// Departed proved-kthread generations as `(pid, lower, upper)`:
     /// the lower bound is the live proof's generation bound, the
-    /// upper the end of the walk that found the pid absent. A delayed
-    /// exit record from the old kthread still skips when its hook
-    /// timestamp falls inside; a later user generation reusing the
-    /// pid counts, since its exit is past the upper (or past the
-    /// relisted generation's own bound). Bounded separately from the
-    /// live set, oldest evicted first, so departed entries never block
-    /// fresh exemptions; an evicted delayed exit counts (fail-closed).
+    /// upper the end of the walk that found the pid absent (or that
+    /// walk's start when the end sample failed; a walk with neither
+    /// sample records nothing). A delayed exit record from the old
+    /// kthread still skips when its hook timestamp falls inside; a
+    /// later user generation reusing the pid counts, since its exit
+    /// is past the upper (or past the relisted generation's own
+    /// bound). Bounded separately from the live set, oldest evicted
+    /// first, so departed entries never block fresh exemptions; an
+    /// evicted delayed exit counts (fail-closed).
     departed_kernel_threads: BTreeSet<(u32, u64, u64)>,
     /// Proc root the kernel-thread classifier reads (`/proc` in
     /// production; tests point it at a fixture dir).
@@ -15546,7 +15549,8 @@ impl Engine {
         walk_start: Option<u64>,
         walk_end: Option<u64>,
     ) {
-        let previous_start = self.last_scope_walk.and_then(|(start, _)| start);
+        let previous_walk = self.last_scope_walk;
+        let previous_start = previous_walk.and_then(|(start, _)| start);
         self.last_scope_walk = Some((walk_start, walk_end));
         self.close_pruned_newcomer_gaps(live);
         self.newcomer_first_seen.retain(|pid, _| live.contains(pid));
@@ -15555,12 +15559,30 @@ impl Engine {
             return;
         }
         let bound = previous_start.unwrap_or(0);
+        // A failed clock sample is neither capture origin nor
+        // eternity: the kthread exclusion keeps only known bounds. A
+        // departure the walk observed absent is bounded above by the
+        // walk end, or — when the end sample failed — by the walk
+        // start the absence provably postdates; with neither sample
+        // the uncertain history entry is declined (a delayed exit then
+        // counts, fail-closed). Likewise a newly listed kthread earns
+        // its live proof under the previous walk's start, or 0 on the
+        // first walk (capture origin); a failed previous start falls
+        // back to this walk's start, and with neither the live proof
+        // is declined. The scope listing keeps `bound` (0 there only
+        // tightens the relist guard toward counting; newcomer bounds
+        // are unchanged).
+        let upper = walk_end.or(walk_start);
+        let proof_lower = if previous_walk.is_none() {
+            Some(0)
+        } else {
+            previous_start.or(walk_start)
+        };
         // Departed proved kthreads leave the live set for the bounded
         // history: their delayed exits still skip by interval, while a
         // later user generation reusing the pid counts. This runs after
         // the prune sweep above, so a kthread's own mark (which never
         // forms outside hand-built tests) still skips there.
-        let upper = walk_end.unwrap_or(u64::MAX);
         let departed: Vec<(u32, u64)> = self
             .known_kernel_threads
             .iter()
@@ -15569,12 +15591,14 @@ impl Engine {
             .collect();
         for (pid, lower) in departed {
             self.known_kernel_threads.remove(&pid);
-            self.remember_departed_kthread(pid, lower, upper);
+            if let Some(upper) = upper {
+                self.remember_departed_kthread(pid, lower, upper);
+            }
         }
         self.scope_listed_since.retain(|pid, _| live.contains(pid));
         for pid in live {
             if !self.scope_listed_since.contains_key(pid) {
-                self.classify_newly_listed_pid(*pid, bound);
+                self.classify_newly_listed_pid(*pid, proof_lower);
             }
             self.scope_listed_since.entry(*pid).or_insert(bound);
         }
@@ -15585,11 +15609,14 @@ impl Engine {
     /// generation bound (its exit never gaps), a user pid leaves it
     /// (PID reuse never inherits the live mark; the old generation's
     /// interval stays in the departed history for delayed exits).
-    /// Fail-closed: past the bound new marks drop.
-    fn classify_newly_listed_pid(&mut self, pid: u32, bound: u64) {
+    /// Fail-closed: past the bound new marks drop, and a kthread with
+    /// no known generation bound earns no live proof.
+    fn classify_newly_listed_pid(&mut self, pid: u32, proof_lower: Option<u64>) {
         if pid_is_kernel_thread(&self.proc_root, pid) {
-            if self.known_kernel_threads.len() < MAX_SCAN_PIDS {
-                self.known_kernel_threads.insert(pid, bound);
+            if let Some(lower) = proof_lower
+                && self.known_kernel_threads.len() < MAX_SCAN_PIDS
+            {
+                self.known_kernel_threads.insert(pid, lower);
             }
         } else {
             self.known_kernel_threads.remove(&pid);

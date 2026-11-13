@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # r/PKI first-post text for p11scope v0.7.0 — DRAFT (owner edits before posting)
 
 > Draft for the first public r/PKI post. Plain and non-hype by brief;

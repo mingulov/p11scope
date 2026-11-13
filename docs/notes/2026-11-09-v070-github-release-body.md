@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.7.0 GitHub release body — DRAFT (owner edits before posting)
 
 > Draft for the GitHub release page. Concise by owner rule; every claim

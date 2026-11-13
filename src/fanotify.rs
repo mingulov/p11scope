@@ -858,23 +858,28 @@ impl FileLearner {
     /// returns `LearnAbsent` and the capture keeps today's gaps,
     /// never a fatal.
     pub(crate) fn start() -> Result<(Self, Receiver<LearnMsg>), LearnAbsent> {
+        // The kernel queue is unlimited (`FAN_UNLIMITED_QUEUE`, which
+        // the startup grant allows): the events queued between arming
+        // and the post-shed drain start — the whole BPF setup — and
+        // short bursts must not overflow the default 16384-event queue
+        // on a busy host. The bound moves to user space instead: the
+        // drain sheds a backlog past `LEARN_BACKLOG_CAP_BYTES` as a
+        // named overflow, and no drain step blocks on a mount. A kernel
+        // that refuses the flag falls back to the finite queue, whose
+        // overflow is the same named gap.
+        let flags =
+            libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK | libc::FAN_REPORT_PIDFD;
+        // `O_CLOEXEC` in the event flags makes the kernel install every
+        // event fd close-on-exec at read time (pidfds always are), so
+        // the hot path needs no extra fcntl.
+        let event_flags = libc::O_RDONLY as u32 | libc::O_LARGEFILE as u32 | libc::O_CLOEXEC as u32;
         // SAFETY: libc call with flag constants only; the return is
         // checked before any use.
-        let fd = unsafe {
-            libc::fanotify_init(
-                // Finite queue and marks on purpose: overload must
-                // surface as FAN_Q_OVERFLOW (a named gap), never as
-                // unbounded kernel memory behind a stalled drain.
-                libc::FAN_CLASS_NOTIF
-                    | libc::FAN_CLOEXEC
-                    | libc::FAN_NONBLOCK
-                    | libc::FAN_REPORT_PIDFD,
-                // `O_CLOEXEC` here makes the kernel install every event
-                // fd close-on-exec at read time (pidfds always are), so
-                // the hot path needs no extra fcntl per event.
-                libc::O_RDONLY as u32 | libc::O_LARGEFILE as u32 | libc::O_CLOEXEC as u32,
-            )
-        };
+        let mut fd = unsafe { libc::fanotify_init(flags | libc::FAN_UNLIMITED_QUEUE, event_flags) };
+        if fd < 0 {
+            // SAFETY: as above.
+            fd = unsafe { libc::fanotify_init(flags, event_flags) };
+        }
         if fd < 0 {
             return Err(LearnAbsent {
                 reason: format!("fanotify_init failed: {}", std::io::Error::last_os_error()),
@@ -1672,6 +1677,43 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
     usize::try_from(queued).ok()
 }
 
+/// User-space bound on the unlimited kernel queue: queued event records
+/// past this many bytes (about 230,000 events, a few tens of MiB of
+/// kernel memory) are shed. 14 times the default finite queue, so only
+/// a drain that truly cannot keep up reaches it.
+const LEARN_BACKLOG_CAP_BYTES: usize = 8 << 20;
+
+/// Sheds a backlog past `LEARN_BACKLOG_CAP_BYTES`: reads and closes
+/// queued events undecided down to half the cap and files the named
+/// overflow once for the episode — the finite-queue overflow, at a
+/// bound the drain chooses. Returns false when the overflow could not
+/// be sent (the drain must exit).
+fn shed_backlog_past_cap(
+    raw: std::os::unix::io::RawFd,
+    ctx: &mut DrainCtx<'_>,
+    buf: &mut [u8],
+) -> bool {
+    let Some(queued) = queued_event_bytes(raw) else {
+        return true;
+    };
+    if queued <= LEARN_BACKLOG_CAP_BYTES {
+        return true;
+    }
+    let mut owed = queued - LEARN_BACKLOG_CAP_BYTES / 2;
+    while owed > 0 {
+        // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
+        let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if read <= 0 {
+            break;
+        }
+        let read = read as usize;
+        close_unread_tail(buf, 0, read);
+        owed = owed.saturating_sub(read);
+    }
+    ctx.stats.overflows = ctx.stats.overflows.saturating_add(1);
+    ctx.send(LearnMsg::QueueOverflow, SendWindow::Live)
+}
+
 /// The end-of-capture tail: every event queued when the stop landed
 /// happened inside the capture, so it is drained and decided like any
 /// other — a busy host never has an empty queue at the stop, and
@@ -1744,6 +1786,7 @@ fn drain_loop(
     };
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_remark = std::time::Instant::now();
+    let mut last_backlog_check = std::time::Instant::now();
     let mut unavailable_sent = false;
     // The startup pass already left a visible filesystem uncovered:
     // name that partial coverage now, once (data-always), instead of
@@ -1784,7 +1827,18 @@ fn drain_loop(
             // post-shed drain cannot mark — files the finite
             // unavailable-learning gap once, however busy the covered
             // filesystems are. The capture continues (data-always).
-            let (next_covered, uncovered) = mark_visible_filesystems(&group, &covered);
+            // The pass runs on a bounded helper with a duplicate of the
+            // group: a hung mount must never stall the drain, because
+            // the unlimited queue would grow behind it. A pass that
+            // does not finish (or cannot start) leaves coverage
+            // unproven, which files the unavailable-learning gap.
+            let previous = covered.clone();
+            let remark = group.try_clone().ok().and_then(|dup| {
+                run_with_bound("p11scope-learn-remark", LEARN_WORKER_BOUND, move || {
+                    mark_visible_filesystems(&dup, &previous)
+                })
+            });
+            let (next_covered, uncovered) = remark.unwrap_or_else(|| (covered.clone(), 1));
             covered = next_covered;
             if uncovered > 0 && !unavailable_sent {
                 unavailable_sent = true;
@@ -1808,6 +1862,12 @@ fn drain_loop(
         }
         if ready == 0 {
             continue;
+        }
+        if last_backlog_check.elapsed() >= std::time::Duration::from_secs(1) {
+            last_backlog_check = std::time::Instant::now();
+            if !shed_backlog_past_cap(raw, &mut ctx, &mut buf) {
+                break 'drain;
+            }
         }
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };

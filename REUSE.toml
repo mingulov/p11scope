@@ -67,10 +67,10 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Denis Mingulov <denis@mingulov.com>"
 SPDX-License-Identifier = "GPL-3.0-or-later"
 
-# Upstream CycloneDX schemas (controller ruling 2026-11-09 09:45):
+# Upstream CycloneDX schemas (project decision 2026-11-09):
 # byte-identical Apache-2.0 files from the CycloneDX specification (see
 # tests/fixtures/cbom/README.md); their $comment fields name no holder,
-# so the ruling's holder text applies. `override` wins over the fixtures
+# so the decision's holder text applies. `override` wins over the fixtures
 # glob above, which still matches them; REUSE resolves these three paths
 # to upstream only.
 [[annotations]]

@@ -120,7 +120,7 @@ from then on every new process is invisible — its calls and fork
 records are not captured, providers loaded after that point never
 attach, and the newcomer queue stalls. The earlier measurements below
 were taken on the old 16,384 budget and are kept for comparison: a 2 h
-soak on fedora-sm1 spent it at +12–16 min with 168,027 refusals by the
+soak on the reference host spent it at +12–16 min with 168,027 refusals by the
 end (11 late providers, live and calling, absent from that capture
 while a fresh `inventory` attached them; 66 pending newcomers, oldest
 wait 115 min), and a 6-minute desktop capture at 200 new processes/s
@@ -393,12 +393,12 @@ invisible (the name is unchanged).
 
 In v0.6.0, keys created during the capture that never got a
 label were summarised instead of listed: re-measured 2026-11-10 on
-fedora.local (5 vCPU, kernel 7.2.9, SoftHSM 2.7.0-rc1), the published
+a 5-vCPU Fedora host (kernel 7.2.9, SoftHSM 2.7.0-rc1), the published
 v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250 calls/s for
 60 s in the joint-10k-single cell. v0.7.0 lists such keys as per-key
 rows labelled `unknown`: on the development host at 6,250 calls/s
 for 60 s the cell shows one row with 187,499 started / 187,499
-completed. The fedora and sm1 reruns are pending. On small VMs
+completed. Reruns on the remaining hosts are pending. On small VMs
 where hook events are missed, the affected key stays unattributable
 for the rest of the capture with a named gap (see [Missed hook
 events leave one key unattributable](#missed-hook-events-leave-one-key-unattributable));
@@ -460,7 +460,7 @@ application at the provider itself instead of the proxy.
 
 ### `trace --system` and `profile` rate ceilings on a small VM
 
-On a 3-vCPU VM (sm1, fedora guest, rc-8 build), `trace --system`
+On a 3-vCPU VM (Fedora guest, rc-8 build), `trace --system`
 keeps every event up to about 10,000 calls/s with no loss; at
 25,000 calls/s the observer is CPU-bound and the loss is named
 (3,059,017 records lost at that rate). `profile --pid` and
@@ -785,10 +785,10 @@ names the source SHA behind each check the release rounds re-measured.
 
 Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
 calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring
-events on small hosts: on a quiet 3-vCPU sm1 host the twelve-thread
+events on small hosts: on a quiet 3-vCPU host the twelve-thread
 flood lost 356,859 of ~976k events, disclosed as `event_loss` with
 PARTIAL coverage, while the same-volume six-thread flood completed
-947k calls with zero loss (sm1 live-triage measurements). vng guests
+947k calls with zero loss (live-triage measurements). vng guests
 (6.6/6.12/6.18/7.0/7.3.1) hold the twelve-thread flood
 in the same runs, except one v6.12 guest `mt-exact` failure observed in
 the same campaign — loss-free at twelve threads is typical off the
@@ -1092,15 +1092,15 @@ confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%); whole-pass p95 rose f
 255.444 to 288.012 ms (+12.75%). Those figures are the 2026-10-27 campaign
 (POST `b58ef1b5ec41bcb793b8741c3fc5ba62ae849d8e`, PRE R-14 `96624556`;
 H4A FAIL with coverage ok; paired-median total +6.50%, bootstrap 95%
-upper +8.10% within its 10% bar, wall ok; record
-`tmp/codex-v050/h4a-b58-status.md`). A second 2026-10-31 campaign at
+upper +8.10% within its 10% bar, wall ok; internal qualification
+record). A second 2026-10-31 campaign at
 POST `ba92b4e2c29fc4db97b870ec1f0b28d4acabebef` (same PRE, same
 400-process/8-provider Btrfs shape, 40/40 runs) is also H4A FAIL with
 coverage ok: confirm-stage p95 168.529 to 178.216 ms (+5.75%),
 whole-pass p95 612.2 to 850.9 ms (+39.00%; absolutes derived in the
 analysis, the gate prints only the percentage), paired-median total
-+37.83%, CI95 upper +43.53%, wall ok (controller record
-`tmp/muse-jobs/h4a-qual-verdict.md`, analysis `tmp/muse-jobs/616-analysis.md`).
++37.83%, CI95 upper +43.53%, wall ok (internal qualification record
+and analysis).
 Absolute times are not comparable across campaigns, only
 within-campaign ratios are. These are measured costs for that workload, not
 bounds for every host. The default `--identity-backend auto` uses kernel
@@ -2361,7 +2361,7 @@ The old bounds are measurements, not a product startup SLA.
   `observation.settlement: "unsettled"`. A call in flight at stop may still
   be unrecorded; absence of use is claimed only through `watched_no_use`
   intervals ending at the last clean read before stop.
-- Kernels/conditions: all native runs (controller ruling D3).
+- Kernels/conditions: all native runs (by design: no settled verdict is published).
 - Disclosure: `observation.settlement`, `observation.retirement`,
   coverage `until_ns`.
 - Workaround: none; positives are monotonic `NOEXIST` inserts, so the risk

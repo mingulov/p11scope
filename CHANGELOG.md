@@ -27,22 +27,19 @@ versioned separately and are opaque, exact dispatch keys.
   entrypoint is now `p11scope`, so plain `docker run IMAGE <p11scope args>`
   reaches the observer; this changes behaviour for `docker run IMAGE`
   with in-cluster entry-script arguments (address the entry script by
-  explicit name instead). <!-- lane: container-image -->
+  explicit name instead).
 - Callers running under an interpreter carry an app label beside it:
-  `python3 [backup.py]`, `java [app.jar]`. <!-- lane: app-identity -->
+  `python3 [backup.py]`, `java [app.jar]`.
 - Callers show their launcher chain: one hop (`from backup.sh`) by
   default, up to four in `-v` and JSON (`launched_by`).
-  <!-- lane: parent-chain -->
-- Linux 7.4-rc2 joins the tested kernel matrix. <!-- lane: k74 -->
+- Linux 7.4-rc2 joins the tested kernel matrix.
 - A forwarding layer's whole table set is watched when the probe
   budget allows, so calls through pre-attach tables count and the
   layer's own calls separate from application calls.
-  <!-- lane: p11kit-cov -->
 - A container copy-up attributes both sides of the file: the witness-proven
   pre-copy-up lower file gets its own module row carrying
   `"layer": "pre_copy_up"` in JSON (`(file before copy-up)` in verbose
   text), so stale-mapping calls count on the lower edge.
-  <!-- lane: copyup -->
 - Failed calls explain themselves per caller: the trace tail carries
   a `CALLER ERROR REASONS` section naming each failing
   caller-and-function pair with its return codes and counts, and
@@ -57,7 +54,6 @@ versioned separately and are opaque, exact dispatch keys.
 - Every `mechanisms[]` and `cgroups[].mechanisms[]` JSON row carries
   `name`: the `CKM_*` name when the id is a known standard or listed
   vendor mechanism, else null, never guessed.
-  <!-- lane: mech-generic -->
 - A documented least-privilege container recipe (no `--privileged`,
   no `CAP_SYS_ADMIN`): `--cap-drop ALL` plus `BPF`, `PERFMON`,
   `CHECKPOINT_RESTORE`, `SYS_PTRACE` and `DAC_READ_SEARCH` under the
@@ -66,18 +62,17 @@ versioned separately and are opaque, exact dispatch keys.
   with `deploy/seccomp-p11scope.json` (vendored Docker default plus
   one `bpf()` allow) for older engines, custom daemon defaults and
   Kubernetes `Localhost` profiles. The shipped `SYS_ADMIN` default is
-  unchanged. <!-- lane: nosysadmin -->
+  unchanged.
 - AppArmor-enforcing hosts get `deploy/apparmor-p11scope` (the Docker
   default profile plus one `ptrace (read, trace) peer=unconfined`
   rule), which captures the least-privilege matrix exactly without
   `apparmor=unconfined`; SELinux-enforcing hosts need no extra flag
   (`--pid=host` containers run as `spc_t`, zero AVCs; full-multiset
-  exactness shown on sm1 8/8 plus the fedora five-cap twin, fedora
-  system-shipped 7/8 with one noise-only surplus leg), and Pod
-  Security Admission keeps demanding the `privileged`
+  exactness shown on the reference host 8/8 plus the Fedora five-cap
+  twin, Fedora system-shipped 7/8 with one noise-only surplus leg),
+  and Pod Security Admission keeps demanding the `privileged`
   level for both capability sets (measured denials name hostPID, the
   capabilities and the hostPath volume).
-  <!-- lane: nosysadmin -->
 - Pid-scope captures name the program after an exec: when a `profile
   --pid` or `metrics --pid` target execs another program during the
   capture, the report keeps the attach-time program in
@@ -236,7 +231,6 @@ versioned separately and are opaque, exact dispatch keys.
   further observations shed into the named
   `evidence.mechanism_id_overflow` count and force `PARTIAL`, never
   silently.
-  <!-- lane: mech-generic -->
 - Known vendor mechanism ids resolve display-only `CKM_*` names over
   the generic per-number counts: 41 NSS ids plus 6 CloudHSM, 4 Luna
   and 2 YubiHSM ids. Removing the name table would change only the
@@ -245,9 +239,9 @@ versioned separately and are opaque, exact dispatch keys.
 ### Fixed
 
 - `inventory --system` binds usage on hosts with many endpoints (was:
-  zero rows with `not_attached`). <!-- lane: invsys-zero -->
+  zero rows with `not_attached`).
 - stdout/stderr keep working under sudo with the tightened kept
-  capability set. <!-- lane: caps-fix -->
+  capability set.
 - The empty-report heading names refused providers ("none attached (N
   found, refused)") instead of claiming "no modules discovered" beside
   the stderr refusal line; a proxy closure still awaiting publication
@@ -296,12 +290,12 @@ versioned separately and are opaque, exact dispatch keys.
 
 - In v0.6.0, keys created during the capture that never got a
   label were summarised instead of listed: re-measured 2026-11-10
-  on fedora.local (5 vCPU, kernel 7.2.9, SoftHSM 2.7.0-rc1), the
+  on a 5-vCPU Fedora host (kernel 7.2.9, SoftHSM 2.7.0-rc1), the
   published v0.6.0, rc-5 and rc-8 all show 0 per-key rows at 6,250
   calls/s for 60 s. v0.7.0 lists such keys as per-key rows labelled
   `unknown`: on the development host at 6,250 calls/s for 60 s the
-  cell shows one row with 187,499 started / 187,499 completed. The
-  fedora and sm1 reruns are pending.
+  cell shows one row with 187,499 started / 187,499 completed.
+  Reruns on the remaining hosts are pending.
   On small VMs where hook events are missed, the affected key stays
   unattributable for the rest of the capture with a named gap;
   plain-path counts stay exact.

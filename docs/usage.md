@@ -1036,7 +1036,7 @@ default is 1024 by the 2026-11-12 guard round: the raised cap stays (owner
 the `-v` log) and holds a fixed fd reserve so fanotify/file learning and
 later attaches never hit `EMFILE`; when the reserve would be breached the
 remaining views wait for the next tick instead of failing. 2048 still needs
-a clean sm1 TTC re-measure and stays behind the flag.
+a clean re-measure on the reference host and stays behind the flag.
 `--max-scan-pids <n>` sets the cap:
 
 sudo p11scope profile --cgroup /sys/fs/cgroup/... --max-scan-pids 1024 --duration 60 -o observed-profile.json

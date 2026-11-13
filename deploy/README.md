@@ -94,8 +94,9 @@ carrying `profiles/seccomp/default.json`) plus exactly one appended
 allow rule for `bpf()`; the vendored 31 groups are byte-identical to
 upstream. `perf_event_open()` stays at the default (conditional),
 proven unneeded on the default uprobe-multi lane. With this file the
-five-cap matrix measured 8/8 on sm1 (Docker 29.9.2, quiet host) and
-6/8 on fedora (Docker 29.7.2): the two `--system` legs there miss
+five-cap matrix measured 8/8 on the reference host (Docker 29.9.2,
+quiet host) and 6/8 on Fedora (Docker 29.7.2): the two `--system`
+legs there miss
 only at full-multiset level amid another lane's container workload
 (host-module rows exact), so `--system` full-multiset exactness
 needs a quiet host.
@@ -105,8 +106,9 @@ Mandatory access control and kernel knobs (measured 2026-11-11):
 - SELinux (Fedora, Enforcing, Docker 29.7/29.9): both capability sets
   capture with the engine's default labeling — no
   `--security-opt label` flag, no policy module. Full-multiset
-  exactness was shown on sm1 8/8 plus the fedora five-cap twin;
-  fedora system-shipped was 7/8 with one noise-only surplus leg.
+  exactness was shown 8/8 on the reference host plus the Fedora
+  five-cap twin; Fedora system-shipped was 7/8 with one noise-only
+  surplus leg.
   `--pid=host`
   containers run as `system_u:system_r:spc_t:s0` (bisected: plain and
   five-cap-only containers get `container_t` with MCS categories;

@@ -103,7 +103,7 @@ PID observation session may retain its other attachable probes and publish
 `PARTIAL` through the existing discovery-unavailable evidence. A cgroup
 observation path may degrade only when it does not require the mandatory
 `task/task_newtask`; an event-producing cgroup scope still requires readable
-process-creation tracefs and can fail closed under the controller ruling. Owned `run`
+process-creation tracefs and can fail closed by design. Owned `run`
 refuses before releasing its barrier. The interim non-root host preparation is
 a tracefs remount granting the observer's dedicated group, for example
 `gid=<observer-group>,mode=0750`. The current restricted-observer rows above

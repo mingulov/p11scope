@@ -23,8 +23,7 @@ pub(crate) use joint::{
 #[cfg(test)]
 pub(crate) use joint::{
     JointMachineIo, JointNativeIo, LiveJointMachine, MAX_UNPAID_VOID_YIELDS, RUNNING_REARM_LIMIT,
-    StagingDetail,
-    bind_collected_semantic_callers, with_joint_commit_io_for_births_test,
+    StagingDetail, bind_collected_semantic_callers, with_joint_commit_io_for_births_test,
     with_joint_commit_io_for_test,
 };
 
@@ -1051,6 +1050,10 @@ pub(crate) struct AttestedSemanticLane {
     /// the driver's begin-once wiring runs unprivileged.
     #[cfg(test)]
     scripted_joint_begin: Option<Result<(), JointCommitRefusal>>,
+    /// Tests-only scripted running re-arm answer, taken once: the
+    /// driver's re-arm wiring runs without a live machine.
+    #[cfg(test)]
+    scripted_joint_rearm: Option<Option<bool>>,
     /// Tests-only count of `begin_joint_commit` calls.
     #[cfg(test)]
     joint_commit_begin_calls: usize,
@@ -2125,6 +2128,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             scripted_joint_begin: None,
             #[cfg(test)]
+            scripted_joint_rearm: None,
+            #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
             joint_service_calls: 0,
@@ -2351,6 +2356,8 @@ impl AttestedSemanticLane {
             joint_init_calls: 0,
             #[cfg(test)]
             scripted_joint_begin: None,
+            #[cfg(test)]
+            scripted_joint_rearm: None,
             #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
@@ -3055,6 +3062,12 @@ impl AttestedSemanticLane {
         outcome: Option<Result<(), JointCommitRefusal>>,
     ) {
         self.scripted_joint_begin = outcome;
+    }
+
+    /// Script the next running re-arm answer (taken once).
+    #[cfg(test)]
+    pub(crate) fn set_scripted_joint_rearm_for_test(&mut self, outcome: Option<bool>) {
+        self.scripted_joint_rearm = Some(outcome);
     }
 
     /// How many `begin_joint_commit` calls this lane served.

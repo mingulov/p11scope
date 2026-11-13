@@ -63,6 +63,8 @@ pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 /// re-arm disposes one refused quantum through the named exit abandon;
 /// past the bound the latch stands and the lane is held, named.
 pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
+/// Gap subject of one abandoned running quantum the lane continued past.
+pub(crate) const RUNNING_REARM_SUBJECT: &str = "semantic quantum abandoned; lane continues";
 
 /// Total wire rows one pre-grant quantum may attempt. This doubles as
 /// the collection's allocation limit (the quantum reserves exactly
@@ -1312,6 +1314,13 @@ pub(crate) struct LiveJointMachine {
     /// wall-time bound fired. Set once per demand, never cleared:
     /// the trip latches the disposition and the lane is held past it.
     audit_no_progress_trip: Option<FinishNoProgressTrip>,
+    /// Set when the running service latched an Audited refusal whose
+    /// retained frame the exit abandon can dispose in full; cleared by
+    /// the re-arm. Every other latch leaves it false.
+    rearm_eligible: bool,
+    /// Running quanta abandoned and re-armed past, bounded by
+    /// [`RUNNING_REARM_LIMIT`].
+    running_rearms: u32,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1392,6 +1401,8 @@ impl LiveJointMachine {
             finish_no_progress_trip: None,
             audit_no_progress_polls: 0,
             audit_no_progress_trip: None,
+            rearm_eligible: false,
+            running_rearms: 0,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1501,22 +1512,90 @@ impl LiveJointMachine {
             .note_h0_merge(before, has_pending_scans, has_future_job, has_hold)
     }
 
+    /// The one latched shape a running re-arm admits: an `Unavailable`
+    /// refusal at Audited, outside any Finish and without a no-progress
+    /// trip, with the retained frame still held. The exit abandon
+    /// disposes exactly that custody in full (the frame through
+    /// `abandon_unfinished_joint_publication`); every other phase keeps
+    /// Raw/H8/report custody no running path may drop or replay.
+    fn running_rearm_shape(&self, reason: SemanticRefusal) -> bool {
+        reason == SemanticRefusal::Unavailable
+            && self.finish.is_none()
+            && self.finish_original.is_none()
+            && self.audit_no_progress_trip.is_none()
+            && self.finish_no_progress_trip.is_none()
+            && matches!(self.phase, Some(Phase::Audited { frame: Some(_), .. }))
+    }
+
+    /// Re-arm a running machine past one transient refusal ("partial,
+    /// never stop"): abandon only the refused quantum through the same
+    /// named abandon the exit hold uses, break the linked journal stream
+    /// so the next Idle collect voids every key open across the
+    /// unsealed quantum (named) and re-syncs above a fence, and resume
+    /// at Idle. The refused phase is never re-run and its frame never
+    /// resumes. `None` admits no re-arm and changes nothing: the latch
+    /// stands for the driver's hold (any other latched shape, a Finish,
+    /// a no-progress trip, the per-run bound, or a lane no longer live).
+    /// A frame abandon that still leaves a publication standing also
+    /// returns `None`; the hold's own abandon then finds it exactly as
+    /// it would have. `Some(true)` when the abandoned publication was
+    /// the bound commit demand's (its physical work published in the
+    /// abandon), `Some(false)` otherwise (an unbound demand is kept).
+    pub(crate) fn rearm_after_running_refusal(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        reason: &str,
+    ) -> Option<bool> {
+        let RunState::DispositionRequired(latched) = self.state else {
+            return None;
+        };
+        if !self.rearm_eligible
+            || !self.running_rearm_shape(latched)
+            || self.running_rearms >= RUNNING_REARM_LIMIT
+            || !lane.is_live()
+            || lane.is_finished()
+            || lane.exit_retained
+            || lane.domain() != self.producers.native_domain()
+        {
+            return None;
+        }
+        self.rearm_eligible = false;
+        let frame = self.take_abandoned_frame();
+        coordinator.abandon_unfinished_joint_publication(lane, frame, reason.to_string());
+        if coordinator.publication_pending() {
+            return None;
+        }
+        if self.producers.journal_linked() {
+            coordinator
+                .joint_capture_mut()
+                .break_stream_after_running_abandon();
+        }
+        let published = matches!(self.demand, Some(Demand::Bound { .. }));
+        if published {
+            self.demand = None;
+        }
+        self.phase = Some(Phase::Idle);
+        self.state = RunState::Runnable;
+        self.audit_no_progress_polls = 0;
+        self.finish_no_progress_polls = 0;
+        self.finish_no_progress_since = None;
+        self.unpaid_void_yields = 0;
+        self.running_rearms += 1;
+        coordinator.note_scope_gap(
+            RUNNING_REARM_SUBJECT.to_string(),
+            format!(
+                "{reason}; key tracking open across the quantum ends, later key operations are tracked again"
+            ),
+        );
+        Some(published)
+    }
+
     /// Take the retained audit frame for the exit-hold abandon, if
     /// the machine holds one: only the Audited phase carries a
     /// finished audit frame. Anything else leaves the phase
     /// untouched and yields None (the unapplied abandon needs no
     /// frame).
-    /// Re-arm a running machine latched by a transient refusal
-    /// (placeholder: no shape re-arms yet).
-    pub(crate) fn rearm_after_running_refusal(
-        &mut self,
-        _lane: &mut AttestedSemanticLane,
-        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
-        _reason: &str,
-    ) -> Option<bool> {
-        None
-    }
-
     pub(crate) fn take_abandoned_frame(
         &mut self,
     ) -> Option<crate::semantics_objects::journal::joint_audit::IngestedJointQuantum> {
@@ -2268,6 +2347,7 @@ impl LiveJointMachine {
                         )
                     {
                         self.state = RunState::DispositionRequired(reason);
+                        self.rearm_eligible = self.running_rearm_shape(reason);
                     }
                     return Err(reason);
                 }
@@ -2455,6 +2535,36 @@ impl LiveJointMachine {
             return None;
         };
         Some(frame.consumer_progress_for_test())
+    }
+
+    /// The phase a latched machine holds, as a finite label for the
+    /// stop gap (no identities or payloads). `None` while runnable.
+    pub(crate) fn latched_phase_label(&self) -> Option<&'static str> {
+        if !matches!(self.state, RunState::DispositionRequired(_)) {
+            return None;
+        }
+        Some(match self.phase.as_ref()? {
+            Phase::Idle => "Idle",
+            Phase::Collecting(_) => "Collecting",
+            Phase::Binding(_) => "Binding",
+            Phase::AwaitH0(_) => "AwaitH0",
+            Phase::PendingQ { .. } => "PendingQReport",
+            Phase::Preparing(_) => "Preparing",
+            Phase::FinishStopReady(_) => "FinishStopReady",
+            Phase::FinishStopReport { .. } => "FinishStopReport",
+            Phase::PreparationAttempted(_) => "PreparationAttempted",
+            Phase::PreparingAdmissions(_) => "PreparingAdmissions",
+            Phase::BindingKeys { .. } => "BindingKeys",
+            Phase::Ingesting(_) => "Ingesting",
+            Phase::StagingNegative(_) => "StagingNegative",
+            Phase::Claiming { .. } => "Claiming",
+            Phase::InstallingClosure { .. } => "InstallingClosure",
+            Phase::Births { .. } => "Births",
+            Phase::Staging { .. } => "Staging",
+            Phase::Auditing { .. } => "Auditing",
+            Phase::Negative { .. } => "Negative",
+            Phase::Audited { .. } => "Audited",
+        })
     }
 
     #[cfg(test)]
@@ -4857,6 +4967,43 @@ impl AttestedSemanticLane {
             .and_then(|live| live.joint_machine.as_mut())
             .ok_or(JointCommitRefusal::NotInitialized)?;
         machine.begin_commit(engine_changed)
+    }
+
+    /// The phase this lane's latched machine holds, for the stop gap.
+    pub(crate) fn joint_latched_phase(&self) -> Option<&'static str> {
+        self.live
+            .as_deref()
+            .and_then(|live| live.joint_machine.as_ref())
+            .and_then(LiveJointMachine::latched_phase_label)
+    }
+
+    /// Running quanta this lane's machine abandoned and re-armed past.
+    pub(crate) fn joint_running_rearms(&self) -> u32 {
+        self.live
+            .as_deref()
+            .and_then(|live| live.joint_machine.as_ref())
+            .map_or(0, |machine| machine.running_rearms)
+    }
+
+    /// Re-arm this lane's latched running machine past one transient
+    /// refusal ([`LiveJointMachine::rearm_after_running_refusal`]).
+    /// `None` when there is no live machine or the latch must stand.
+    pub(crate) fn rearm_joint_after_running_refusal(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        reason: &str,
+    ) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_joint_rearm.take() {
+            return scripted;
+        }
+        let mut machine = self.live.as_deref_mut()?.joint_machine.take()?;
+        let result = machine.rearm_after_running_refusal(self, coordinator, reason);
+        self.live
+            .as_deref_mut()
+            .expect("the re-arm cannot extract its native owner")
+            .joint_machine = Some(machine);
+        result
     }
 
     pub(crate) fn poll_joint_commit(

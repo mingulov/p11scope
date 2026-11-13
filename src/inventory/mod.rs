@@ -4891,12 +4891,43 @@ impl ClassicDriver<'_> {
         &mut self,
         engine_changed: bool,
         reason: &str,
-        acquisition: Option<&mut dyn ImageAcquisition>,
+        mut acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<PassCommitProgress> {
+        // Partial, never stop: a transient running refusal whose
+        // quantum the abandon disposes in full re-arms the lane (that
+        // quantum's loss is named), and the commit continues on it. A
+        // bound demand published its physical work in the abandon; an
+        // unbound or not yet begun demand polls the re-armed machine.
+        // Bounded by the machine's per-run re-arm limit; every other
+        // latch holds the lane below as before.
+        let coordinator = &mut *self.coordinator;
+        let rearmed = self
+            .semantic
+            .as_mut()
+            .and_then(|lane| lane.rearm_joint_after_running_refusal(coordinator, reason));
+        if let Some(published) = rearmed {
+            if self
+                .semantic
+                .as_ref()
+                .is_some_and(|lane| lane.joint_running_rearms() == 1)
+            {
+                self.warn(&format!(
+                    "p11scope: abandoned one unfinished live publication ({reason}); the semantic lane continues, coverage is partial"
+                ));
+            }
+            if published {
+                self.joint_commit_pending = false;
+                return Ok(PassCommitProgress::Published);
+            }
+            return self
+                .poll_joint_commit_path(engine_changed, reborrow_acquisition(&mut acquisition));
+        }
         let mut warn = WarnSink {
             display: &mut self.display,
         };
         let lane = self.semantic.take().expect("a joint lane is seated");
+        let rearms = lane.joint_running_rearms();
+        let latched_at = lane.joint_latched_phase();
         let (_, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
@@ -4910,10 +4941,21 @@ impl ClassicDriver<'_> {
             summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
         }
         self.joint_commit_pending = false;
+        // Name the earlier re-arms when the lane stops past them (the
+        // re-arm bound, or a later refusal no re-arm admits).
+        let mut rearmed = String::new();
+        if let Some(phase) = latched_at {
+            rearmed.push_str(&format!(" at {phase}"));
+        }
+        if rearms != 0 {
+            rearmed.push_str(&format!(
+                "; after {rearms} abandoned quanta the lane continued past"
+            ));
+        }
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
             format!(
-                "{reason}; broad inventory continues; semantic probes stay attached until exit"
+                "{reason}{rearmed}; broad inventory continues; semantic probes stay attached until exit"
             ),
         );
         match self.commit_with_acquisition(engine_changed, acquisition) {
@@ -20707,6 +20749,89 @@ mod tests {
             "every pass commits its native evidence"
         );
         assert_eq!(driver.joint_commit_polls, 1, "no further joint poll runs");
+    }
+
+    #[test]
+    fn joint_poll_commit_rearmed_refusal_keeps_the_lane_seated() {
+        // Owner rule "partial, never stop": a refused poll whose quantum
+        // the machine re-arms past keeps the lane seated; the bound
+        // demand published in the abandon, so the pass publishes with no
+        // legacy commit and no stop gap. A later refusal no re-arm
+        // admits still holds the lane, named.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_joint_rearm_for_test(Some(true));
+        driver.semantic = Some(lane);
+        let first = driver.poll_commit(true);
+        assert!(
+            matches!(
+                first,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the re-armed pass publishes"
+        );
+        assert!(driver.semantic.is_some(), "the re-armed lane stays seated");
+        assert!(!driver.joint_commit_pending, "the bound demand is done");
+        assert_eq!(driver.commit_calls, 0, "no legacy commit past a re-arm");
+        assert!(
+            gaps(&mut driver)
+                .iter()
+                .all(|gap| gap.0 != "semantic lane stopped"),
+            "a re-arm is not a stop"
+        );
+        // The next refusal finds no re-arm (scripted once): it holds.
+        let second = driver.poll_commit(false);
+        assert!(
+            matches!(
+                second,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the held pass still publishes"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the later refusal holds the lane"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+    }
+
+    #[test]
+    fn joint_poll_commit_rearm_without_bound_demand_polls_again() {
+        // A re-arm whose demand was not bound keeps the commit going on
+        // the re-armed machine: the driver polls again in the same call
+        // (here the poll refuses again and no second re-arm is admitted,
+        // so the lane holds, named, and the pass still publishes).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_joint_rearm_for_test(Some(false));
+        driver.semantic = Some(lane);
+        let first = driver.poll_commit(true);
+        assert!(
+            matches!(
+                first,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the pass publishes"
+        );
+        assert_eq!(
+            driver.joint_commit_polls, 2,
+            "the re-armed demand polls again"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the second refusal holds the lane"
+        );
+        assert_eq!(driver.commit_calls, 1, "the hold commits the pass once");
     }
 
     #[test]

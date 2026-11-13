@@ -11263,17 +11263,18 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
         Some(false),
         "a running Audited refusal with its frame re-arms (no demand was bound)"
     );
-    assert_eq!(fixture.machine.disposition_reason(), None, "the latch clears");
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the latch clears"
+    );
     assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
     assert!(
         !fixture.scene.real.scene.coordinator.publication_pending(),
         "the abandon disposed the refused quantum's publication"
     );
     let subjects = fixture.all_gap_subjects();
-    for subject in [
-        "unfinished joint publication abandoned",
-        QUANTUM_ABANDONED,
-    ] {
+    for subject in ["unfinished joint publication abandoned", QUANTUM_ABANDONED] {
         assert!(
             subjects.iter().any(|seen| seen == subject),
             "{subject} is named: {subjects:?}"
@@ -11425,7 +11426,11 @@ fn joint_machine_running_rearms_are_bounded() {
         );
     }
     fixture.refuse_at_audited(2 + limit as u64);
-    assert_eq!(fixture.rearm("semantic_unavailable"), None, "the bound holds");
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "the bound holds"
+    );
     assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable)

@@ -366,6 +366,18 @@ impl JointCaptureOwner {
         Ok(true)
     }
 
+    /// Break the linked stream after a running quantum was abandoned
+    /// unsealed: its ingested history never passed a seal, so the next
+    /// running Idle collect voids every key open across it
+    /// ([`Self::void_ingest_break`], named) and re-syncs above a fence,
+    /// exactly like a stream broken while ingesting. A stopped adapter
+    /// takes nothing (the void refuses it anyway).
+    pub(crate) fn break_stream_after_running_abandon(&mut self) {
+        if !self.adapter.stopped {
+            self.adapter.stream_broken = true;
+        }
+    }
+
     /// Take the void's failure for an audit frame's raw slot.
     pub(crate) fn take_pending_void(&mut self) -> Option<PendingVoid> {
         self.pending_void.take()

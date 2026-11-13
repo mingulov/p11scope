@@ -429,8 +429,9 @@ impl CaptureFacts {
     /// topology. A target that exited keeps its provider in the heading, so
     /// "no modules discovered" can never print beside retained historical
     /// calls; only a capture that never accepted a provider says it — and
-    /// when refused providers were found, the heading says none attached
-    /// with the found count instead of contradicting the refusal line.
+    /// when refused providers were found, or the operator excluded files
+    /// the report lists, the heading says none attached with those counts
+    /// instead of contradicting the refusal or exclusion lines.
     /// The found count shares the stderr hint's classifier: a proxy
     /// closure still awaiting publication reads like nothing mapped
     /// yet, never as a found provider.
@@ -441,9 +442,19 @@ impl CaptureFacts {
             .iter()
             .filter(|skipped| crate::plan::skip_is_found_provider(&skipped.reason))
             .count();
+        let excluded = self.discovery.excluded_modules.len();
         match self.discovery.modules.as_slice() {
-            [] if found == 0 => "no modules discovered".to_string(),
-            [] => format!("none attached ({found} found, refused)"),
+            [] if found == 0 && excluded == 0 => "no modules discovered".to_string(),
+            [] => {
+                let mut parts = Vec::new();
+                if found > 0 {
+                    parts.push(format!("{found} found, refused"));
+                }
+                if excluded > 0 {
+                    parts.push(format!("{excluded} excluded by you"));
+                }
+                format!("none attached ({})", parts.join("; "))
+            }
             [only] => escape_controls(&only.path).into_owned(),
             [first, rest @ ..] => {
                 format!("{} (+{} more)", escape_controls(&first.path), rest.len())
@@ -4365,7 +4376,17 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             }
         };
         let fragment = match cause {
-            "discovery" => "no provider files found".to_string(),
+            "discovery" => {
+                // Excluded files were found (the report lists them with
+                // identity), so "no provider files found" would contradict
+                // the exclusion lines beside it.
+                let excluded = ev.discovery.excluded_modules.len();
+                if excluded > 0 {
+                    format!("no provider files attached ({excluded} excluded by you)")
+                } else {
+                    "no provider files found".to_string()
+                }
+            }
             "slots" => "no functions watched".to_string(),
             "scan_unavailable" => format!(
                 "memory scan unavailable ({})",
@@ -12993,6 +13014,28 @@ pub(crate) mod tests {
         assert_eq!(json["unmatched_excludes"][0], "nope.so");
     }
 
+    /// O7: excluding the only provider must not print "no provider
+    /// files found" — the file was found. The coverage fragment names
+    /// the exclusion instead.
+    #[test]
+    fn scope_summary_coverage_names_operator_exclusions_instead_of_none_found() {
+        let mut ev = evidence();
+        ev.discovery.modules = Vec::new();
+        ev.discovery.excluded_modules.push(ExcludedOut {
+            path: "/opt/libonly.so".into(),
+            dev: 8,
+            ino: 99,
+            processes: 1,
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(!text.contains("no provider files found"), "{text}");
+        assert!(
+            text.contains("no provider files attached (1 excluded by you)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn slot_sizing_json_reports_the_downsize_or_stays_absent() {
         // The 512 build never downsizes, so it renders a synthetic
@@ -19336,6 +19379,52 @@ pub(crate) mod tests {
             ..CaptureFacts::default()
         };
         assert_eq!(facts.heading(), "none attached (1 found, refused)");
+    }
+
+    /// Excluding the only provider contradicts "no modules discovered":
+    /// the file was found (the report lists it with its identity), so
+    /// the empty heading names the exclusion instead.
+    #[test]
+    fn the_empty_heading_names_operator_exclusions_instead_of_none_found() {
+        let facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                excluded_modules: vec![ExcludedOut {
+                    path: "/opt/libonly.so".into(),
+                    dev: 8,
+                    ino: 99,
+                    processes: 1,
+                }],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(facts.heading(), "none attached (1 excluded by you)");
+    }
+
+    /// Refused and excluded providers combine in the empty heading
+    /// instead of contradicting either line.
+    #[test]
+    fn the_empty_heading_combines_refused_and_excluded_providers() {
+        let facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules_skipped: vec![SkippedOut {
+                    name: "/opt/p11.so".into(),
+                    reason: "whole refusal: needs 12 slots, 4 free".into(),
+                }],
+                excluded_modules: vec![ExcludedOut {
+                    path: "/opt/libonly.so".into(),
+                    dev: 8,
+                    ino: 99,
+                    processes: 1,
+                }],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(
+            facts.heading(),
+            "none attached (1 found, refused; 1 excluded by you)"
+        );
     }
 
     /// A proxy closure still awaiting publication reads like nothing

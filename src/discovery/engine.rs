@@ -20488,10 +20488,15 @@ impl Engine {
     /// never drain death. Idempotent and a no-op without a learner.
     pub(crate) fn shutdown_file_learning(&mut self) {
         let mut lost_tail = false;
-        if let Some(mut learner) = self.file_learner.take() {
-            lost_tail = learner.shutdown_and_join();
-        }
+        // Set before the pump below: the drain's sender closing during
+        // the join is the expected terminal state, never drain death.
         self.learned_close_expected = true;
+        if let Some(mut learner) = self.file_learner.take() {
+            // Keep receiving while the drain decides the tail queued at
+            // the stop: its candidates queue for the flush below (no
+            // pin work inside the join), its tallies land as usual.
+            lost_tail = learner.shutdown_and_join_pumping(|| self.service_learned_files_inner(0));
+        }
         self.flush_learned_files_at_capture_end();
         self.learned_rx = None;
         if lost_tail {

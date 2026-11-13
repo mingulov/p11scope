@@ -20,8 +20,13 @@ use std::sync::mpsc::{Receiver, SyncSender};
 pub(crate) const LEARNED_FILES_PER_CAPTURE_CAP: usize = 32;
 
 /// Bound on the drain's per-file decision cache: negatives past the cap are
-/// forgotten (a re-check is just work), staged providers never are.
-pub(crate) const LEARN_CACHE_CAP: usize = 8192;
+/// forgotten (a re-check is just work), staged providers never are. Sized
+/// for a busy desktop's working set of distinct opened files (a build
+/// tree, a mail store, a package cache): a cap below that set clears the
+/// negatives every few thousand opens and turns every repeat open back
+/// into a full check, which is what lets the finite kernel queue
+/// overflow under ordinary churn. One entry is a 40-byte key plus a bool.
+pub(crate) const LEARN_CACHE_CAP: usize = 65536;
 
 /// Channel depth between the drain thread and the engine: the drain blocks
 /// past it, so overload degrades to kernel queue overflow (a named gap),
@@ -217,14 +222,34 @@ pub(crate) fn file_generation(file: &std::fs::File) -> Result<FileGeneration, St
 /// caller must NOT cache them (a transient stall retries on the next
 /// open). Never blocks: the fd is non-blocking and every read is
 /// bounded, so a fifo or a stalled pseudo-file cannot wedge the drain.
+#[cfg(test)]
 pub(crate) fn check_elf_provider(file: &std::fs::File) -> Result<bool, String> {
+    Ok(prove_with_loader(file, || (None, None))?.is_some())
+}
+
+/// A loader's program, or the finite reason it is unknown.
+type LoaderNaming = (Option<String>, Option<&'static str>);
+
+/// The provider test with loader naming in the middle: the cheap byte
+/// tests (file type, ELF magic, the export-name prefilter) run first, so
+/// the overwhelming majority of opens — data files, non-provider
+/// libraries — are refused without touching procfs; only an ELF that may
+/// export an entry point names its loader, and it does so before the
+/// full export parse spends time a one-shot loader does not have.
+/// `Ok(None)` is a certain negative; `Ok(Some(loader))` a proved provider
+/// with whatever `name_loader` returned; `Err` an I/O failure the caller
+/// must not cache.
+fn prove_with_loader(
+    file: &std::fs::File,
+    name_loader: impl FnOnce() -> LoaderNaming,
+) -> Result<Option<LoaderNaming>, String> {
     use std::os::unix::fs::FileExt;
     let file_type = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?
         .file_type();
     if !file_type.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     // SAFETY: fcntl on our own event fd; preserves existing flags.
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
@@ -238,18 +263,19 @@ pub(crate) fn check_elf_provider(file: &std::fs::File) -> Result<bool, String> {
         .read_at(&mut magic, 0)
         .map_err(|error| format!("magic read failed: {error}"))?;
     if read < 4 || magic[0..4] != [0x7f, b'E', b'L', b'F'] {
-        return Ok(false);
+        return Ok(None);
     }
     if !elf_may_export_entry_points(file)? {
-        return Ok(false);
+        return Ok(None);
     }
+    let loader = name_loader();
     let inspected = p11scope_manifest::identity::inspect_file_with_reader_exporting(
         file,
         |file, bytes, offset| file.read_at(bytes, offset),
         &crate::discovery::scan::standard_function_names(),
     )
     .map_err(|error| format!("identify failed: {error}"))?;
-    Ok(exports_entry_point(&inspected.exports))
+    Ok(exports_entry_point(&inspected.exports).then_some(loader))
 }
 
 /// Whether an export list proves a PKCS#11 provider: an entry-point
@@ -749,14 +775,12 @@ fn close_unread_tail(buf: &[u8], mut offset: usize, len: usize) {
 /// Sets `FD_CLOEXEC` explicitly on a kernel-handed fd: the group is
 /// created with `FAN_CLOEXEC`, but event and pid fds must not rely on
 /// propagation through the observer's own `Command::spawn`s (the
-/// discover helper) on every supported kernel.
+/// discover helper) on every supported kernel. One syscall:
+/// `FD_CLOEXEC` is the only fd flag, so no read-modify-write is needed.
 fn set_cloexec(fd: std::os::unix::io::RawFd) {
     // SAFETY: fcntl on a live owned fd; failure only loses the flag.
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
 }
 
@@ -845,7 +869,10 @@ impl FileLearner {
                     | libc::FAN_CLOEXEC
                     | libc::FAN_NONBLOCK
                     | libc::FAN_REPORT_PIDFD,
-                libc::O_RDONLY as u32 | libc::O_LARGEFILE as u32,
+                // `O_CLOEXEC` here makes the kernel install every event
+                // fd close-on-exec at read time (pidfds always are), so
+                // the hot path needs no extra fcntl per event.
+                libc::O_RDONLY as u32 | libc::O_LARGEFILE as u32 | libc::O_CLOEXEC as u32,
             )
         };
         if fd < 0 {
@@ -941,6 +968,15 @@ impl FileLearner {
     /// and counts as lost. The engine files that loss loudly (the
     /// overflow aggregate). Bounded: the report is never blocked.
     pub(crate) fn shutdown_and_join(&mut self) -> bool {
+        self.shutdown_and_join_pumping(|| {})
+    }
+
+    /// `shutdown_and_join` with the engine's channel pump: the drain
+    /// decides the events queued at the stop and may send their
+    /// candidates and load tallies, so the caller keeps receiving
+    /// (`pump`) while it waits for the drain to exit, instead of
+    /// leaving those sends stuck behind a full channel.
+    pub(crate) fn shutdown_and_join_pumping(&mut self, mut pump: impl FnMut()) -> bool {
         self.state.shutdown.store(true, Ordering::Release);
         // A never-begun learner holds the only sender: drop it so the
         // channel closes terminally instead of dangling.
@@ -950,9 +986,18 @@ impl FileLearner {
             // A panic breaks the channel (the sender drops unsent), so
             // a disconnect also means the thread is gone and the join
             // below reaps it without blocking.
-            let exited = match worker.done.recv_timeout(LEARN_WORKER_BOUND) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            let deadline = std::time::Instant::now() + LEARN_WORKER_BOUND;
+            let exited = loop {
+                pump();
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break false;
+                }
+                let step = (deadline - now).min(std::time::Duration::from_millis(5));
+                match worker.done.recv_timeout(step) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
             };
             if exited {
                 if worker.handle.join().is_err() {
@@ -1353,17 +1398,41 @@ struct LearnShutdownState {
 }
 
 /// Sends one message, waiting past a full channel in 1 ms steps so a
-/// shutdown (or a dropped receiver) always breaks the wait: a blocking
-/// send here could wedge the engine's drop on a full channel. Returns
-/// false when the drain must exit; an unsent message at shutdown marks
-/// the lost tail.
-fn send_learn(
+/// shutdown (or a dropped receiver) always breaks the wait within the
+/// tail bound: a blocking send here could wedge the engine's drop on a
+/// full channel. Returns false when the drain must exit; a message
+/// still unsent at the bound marks the lost tail.
+fn send_learn(tx: &SyncSender<LearnMsg>, state: &Arc<LearnShutdownState>, msg: LearnMsg) -> bool {
+    send_learn_in(tx, state, msg, SendWindow::Live)
+}
+
+/// When a send may still wait for channel room: during the capture
+/// until shutdown, during the end-of-capture tail drain until its
+/// deadline (the engine pumps the channel while it waits for the join).
+#[derive(Clone, Copy)]
+enum SendWindow {
+    Live,
+    Final(std::time::Instant),
+}
+
+fn send_learn_in(
     tx: &SyncSender<LearnMsg>,
     state: &Arc<LearnShutdownState>,
     mut msg: LearnMsg,
+    mut window: SendWindow,
 ) -> bool {
     loop {
-        if state.shutdown.load(Ordering::Acquire) {
+        // A live send caught by the stop keeps its message: the engine
+        // pumps the channel while it waits for the join, so the send
+        // gets the tail drain's bound instead of dropping at once.
+        if matches!(window, SendWindow::Live) && state.shutdown.load(Ordering::Acquire) {
+            window = SendWindow::Final(std::time::Instant::now() + FINAL_DRAIN_BOUND);
+        }
+        let closed = match window {
+            SendWindow::Live => false,
+            SendWindow::Final(deadline) => std::time::Instant::now() >= deadline,
+        };
+        if closed {
             state.lost_tail.store(true, Ordering::Release);
             return false;
         }
@@ -1378,6 +1447,11 @@ fn send_learn(
     }
 }
 
+/// How long the end-of-capture tail drain may run: it must finish
+/// inside the engine's join bound, so a tail it cannot finish is
+/// reported as lost before the join gives up on the thread.
+const FINAL_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Drain counters for the periodic `-v` telemetry line: counts only,
 /// never paths, pids or file bytes.
 #[derive(Default)]
@@ -1389,6 +1463,254 @@ struct DrainStats {
     sent_loads: u64,
     overflows: u64,
     unreadable: u64,
+}
+
+/// The drain's per-event state: the decision cache, the counters and
+/// the channel to the engine.
+struct DrainCtx<'a> {
+    group: std::os::unix::io::RawFd,
+    tx: &'a SyncSender<LearnMsg>,
+    state: &'a Arc<LearnShutdownState>,
+    self_pid: u32,
+    cache: LearnCache,
+    stats: DrainStats,
+    /// Inode ignore marks placed so far (bounded by
+    /// `LEARN_IGNORE_MARK_CAP`).
+    ignore_marks: usize,
+}
+
+/// Bound on the kernel-side ignore marks the drain places on files it
+/// proved negative: the marks count against the user's fanotify mark
+/// limit, which other root watchers share. Past the cap repeat opens
+/// are still decided through the user-space cache, only without the
+/// kernel filter.
+const LEARN_IGNORE_MARK_CAP: usize = 16384;
+
+/// Asks the kernel to stop queueing opens of one file the drain proved
+/// is not a provider: an inode ignore mark (`FAN_MARK_IGNORED_MASK`)
+/// suppresses the filesystem mark's `FAN_OPEN` for exactly that inode.
+/// Without `FAN_MARK_IGNORED_SURV_MODIFY` the kernel clears the ignore
+/// on the file's next modification, so rewritten bytes are re-proved on
+/// their next open. The mark is evictable (`FAN_MARK_EVICTABLE`): it
+/// never pins the inode, and an evicted inode simply reports its next
+/// open again. Repeat opens of the same files dominate a busy
+/// host's open traffic (shared libraries of every exec, build inputs,
+/// mail and package stores); filtering them in the kernel is what keeps
+/// the finite queue from overflowing under ordinary churn. Best effort:
+/// a refused mark (mark limit, permission) leaves the user-space cache
+/// deciding repeat opens as before.
+fn ignore_negative_inode(group: std::os::unix::io::RawFd, file: &std::fs::File) -> bool {
+    // SAFETY: libc call; the group and the held event fd are valid,
+    // and a NULL pathname marks the held fd's inode.
+    let rc = unsafe {
+        libc::fanotify_mark(
+            group,
+            libc::FAN_MARK_ADD | libc::FAN_MARK_IGNORED_MASK | libc::FAN_MARK_EVICTABLE,
+            libc::FAN_OPEN,
+            file.as_raw_fd(),
+            std::ptr::null(),
+        )
+    };
+    rc == 0
+}
+
+impl DrainCtx<'_> {
+    /// Records a certain negative: cached in user space, and filtered
+    /// in the kernel while the ignore-mark budget lasts.
+    fn note_negative(&mut self, generation: FileGeneration, file: &std::fs::File) {
+        self.cache.note_decided(generation, false);
+        if self.ignore_marks < LEARN_IGNORE_MARK_CAP && ignore_negative_inode(self.group, file) {
+            self.ignore_marks += 1;
+        }
+    }
+
+    /// Decides every event in one read buffer. Returns false when the
+    /// drain must exit (a send failed); the unread rest of the buffer
+    /// is closed and the loss is already marked.
+    fn process_read(&mut self, buf: &[u8], window: SendWindow) -> bool {
+        let len = buf.len();
+        let mut offset = 0usize;
+        while offset < len {
+            let event = match parse_fanotify_event(&buf[offset..len]) {
+                Ok(event) => event,
+                Err(_) => {
+                    // Unparseable tail: best-effort close of the fds
+                    // its length fields still describe, then stop.
+                    close_unread_tail(buf, offset, len);
+                    self.state.lost_tail.store(true, Ordering::Release);
+                    return true;
+                }
+            };
+            offset += event.total_len;
+            if !self.process_event(event, window) {
+                close_unread_tail(buf, offset, len);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn send(&self, msg: LearnMsg, window: SendWindow) -> bool {
+        send_learn_in(self.tx, self.state, msg, window)
+    }
+
+    fn process_event(&mut self, event: ParsedFanotifyEvent, window: SendWindow) -> bool {
+        self.stats.events = self.stats.events.saturating_add(1);
+        // Take ownership of the pidfd first: every path below closes.
+        // SAFETY: the kernel sent an owned pidfd; negatives are not fds.
+        let pidfd = match event.pidfd {
+            Some(fd) if fd >= 0 => {
+                set_cloexec(fd);
+                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+            _ => None,
+        };
+        if event.overflow {
+            // Marks survive a queue overflow, so no re-mark here: the
+            // periodic pass covers new mounts, and re-opening every
+            // mount per overflow record would slow the drain exactly
+            // when it is already behind.
+            self.stats.overflows = self.stats.overflows.saturating_add(1);
+            return self.send(LearnMsg::QueueOverflow, window);
+        }
+        if event.fd < 0 {
+            return true;
+        }
+        set_cloexec(event.fd);
+        // SAFETY: the kernel sent an owned event fd.
+        let file = unsafe { std::fs::File::from_raw_fd(event.fd) };
+        if event.pid as u32 == self.self_pid {
+            return true;
+        }
+        let generation = match file_generation(&file) {
+            Ok(generation) => generation,
+            Err(_) => return true,
+        };
+        if !self.cache.needs_check(generation) {
+            if self.cache.decided_provider(generation) != Some(true) {
+                return true;
+            }
+            // A later open of a sent file: tally the load. The pid
+            // falls back to the metadata capture when the loader is
+            // already gone (lower-bound-correct for counts).
+            let Some(pid) = tally_pid(&event, pidfd.as_ref()) else {
+                return true;
+            };
+            let (dev, ino) = (generation.0, generation.1);
+            if !self.send(LearnMsg::Load { dev, ino, pid }, window) {
+                return false;
+            }
+            self.stats.sent_loads = self.stats.sent_loads.saturating_add(1);
+            return true;
+        }
+        self.stats.checked = self.stats.checked.saturating_add(1);
+        // The loader is named inside the proof, after the cheap byte
+        // tests admitted the file and before the full parse, bracketed
+        // by pidfd liveness.
+        let proved = prove_with_loader(&file, || match pidfd.as_ref() {
+            Some(pidfd) => loader_exe_for_pidfd(pidfd),
+            None => (None, Some(LOADER_EXE_UNREADABLE_REASON)),
+        });
+        let (loader_exe, loader_unknown_reason) = match proved {
+            Ok(Some(loader)) => loader,
+            Ok(None) => {
+                self.note_negative(generation, &file);
+                return true;
+            }
+            Err(_) => {
+                // Unreadable now: not cached, retried on the next open.
+                self.stats.unreadable = self.stats.unreadable.saturating_add(1);
+                return true;
+            }
+        };
+        self.stats.proved = self.stats.proved.saturating_add(1);
+        // Provider-positive: tally this first run and send Load ahead
+        // of the candidate so the staged note counts it.
+        let tally = tally_pid(&event, pidfd.as_ref());
+        let Some(display_path) = display_path_for(&file) else {
+            // Not cached: a later open retries instead of losing
+            // this proved provider for the whole capture.
+            self.stats.unreadable = self.stats.unreadable.saturating_add(1);
+            return true;
+        };
+        let (dev, ino) = (generation.0, generation.1);
+        if let Some(pid) = tally {
+            if !self.send(LearnMsg::Load { dev, ino, pid }, window) {
+                return false;
+            }
+            self.stats.sent_loads = self.stats.sent_loads.saturating_add(1);
+        }
+        let candidate = LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path,
+            loader_exe,
+            loader_unknown_reason,
+        };
+        if !self.send(LearnMsg::Candidate(candidate), window) {
+            return false;
+        }
+        // Only a sent candidate settles the generation: caching a
+        // positive before the send would lose the file silently
+        // if the send (or the display read above) failed.
+        self.cache.note_decided(generation, true);
+        self.stats.sent_candidates = self.stats.sent_candidates.saturating_add(1);
+        true
+    }
+}
+
+/// Bytes of events queued on the group right now (`FIONREAD` sums the
+/// queued records), or `None` when the kernel cannot say.
+fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: FIONREAD on a valid fd writes one int.
+    let rc = unsafe { libc::ioctl(raw, libc::FIONREAD, &mut queued as *mut libc::c_int) };
+    if rc != 0 {
+        return None;
+    }
+    usize::try_from(queued).ok()
+}
+
+/// The end-of-capture tail: every event queued when the stop landed
+/// happened inside the capture, so it is drained and decided like any
+/// other — a busy host never has an empty queue at the stop, and
+/// counting that queue as lost would file a learned-loss gap on every
+/// busy desktop. Events queued after the snapshot are opens after the
+/// capture ended (post-scope, like the engine's own end flush).
+/// Returns true when the tail was fully decided; false (and the lost
+/// tail marked) when it could not be within the bound.
+fn drain_final_tail(raw: std::os::unix::io::RawFd, ctx: &mut DrainCtx<'_>, buf: &mut [u8]) -> bool {
+    let deadline = std::time::Instant::now() + FINAL_DRAIN_BOUND;
+    let window = SendWindow::Final(deadline);
+    let Some(mut owed) = queued_event_bytes(raw) else {
+        return false;
+    };
+    while owed > 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
+        let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                // Nothing left to read: the snapshot is consumed.
+                std::io::ErrorKind::WouldBlock => return true,
+                _ => return false,
+            }
+        }
+        if read == 0 {
+            return true;
+        }
+        let read = read as usize;
+        owed = owed.saturating_sub(read);
+        if !ctx.process_read(&buf[..read], window) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The drain: poll/read the group, decide each opened file at most once
@@ -1411,9 +1733,15 @@ fn drain_loop(
     // nice, and an invoker-niced observer degrades naming latency
     // honestly instead of misnaming.
     let raw = group.as_raw_fd();
-    let self_pid = std::process::id();
-    let mut cache = LearnCache::new();
-    let mut stats = DrainStats::default();
+    let mut ctx = DrainCtx {
+        group: raw,
+        tx: &tx,
+        state: &state,
+        self_pid: std::process::id(),
+        cache: LearnCache::new(),
+        stats: DrainStats::default(),
+        ignore_marks: 0,
+    };
     let mut buf = vec![0u8; 64 * 1024];
     let mut last_remark = std::time::Instant::now();
     let mut unavailable_sent = false;
@@ -1426,7 +1754,14 @@ fn drain_loop(
             return;
         }
     }
-    'drain: while !state.shutdown.load(Ordering::Acquire) {
+    // Whether the loop ended on an orderly stop (then the queued tail
+    // is drained) rather than a failed send or poll.
+    let mut stopped = false;
+    'drain: loop {
+        if state.shutdown.load(Ordering::Acquire) {
+            stopped = true;
+            break 'drain;
+        }
         let mut polled = libc::pollfd {
             fd: raw,
             events: libc::POLLIN,
@@ -1458,6 +1793,7 @@ fn drain_loop(
                 }
             }
             if crate::run::capture_diagnostics_on() {
+                let stats = &ctx.stats;
                 eprintln!(
                     "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable",
                     stats.events,
@@ -1478,127 +1814,17 @@ fn drain_loop(
         if read <= 0 {
             continue;
         }
-        let mut offset = 0usize;
-        while offset < read as usize {
-            let event = match parse_fanotify_event(&buf[offset..read as usize]) {
-                Ok(event) => event,
-                Err(_) => {
-                    // Unparseable tail: best-effort close of the fds
-                    // its length fields still describe, then stop.
-                    close_unread_tail(&buf, offset, read as usize);
-                    state.lost_tail.store(true, Ordering::Release);
-                    break;
-                }
-            };
-            offset += event.total_len;
-            stats.events = stats.events.saturating_add(1);
-            // Take ownership of the pidfd first: every path below closes.
-            // SAFETY: the kernel sent an owned pidfd; negatives are not fds.
-            let pidfd = match event.pidfd {
-                Some(fd) if fd >= 0 => {
-                    set_cloexec(fd);
-                    Some(unsafe { OwnedFd::from_raw_fd(fd) })
-                }
-                _ => None,
-            };
-            if event.overflow {
-                stats.overflows = stats.overflows.saturating_add(1);
-                let (next_covered, _) = mark_visible_filesystems(&group, &covered);
-                covered = next_covered;
-                if !send_learn(&tx, &state, LearnMsg::QueueOverflow) {
-                    close_unread_tail(&buf, offset, read as usize);
-                    break 'drain;
-                }
-                continue;
-            }
-            if event.fd < 0 {
-                continue;
-            }
-            set_cloexec(event.fd);
-            // SAFETY: the kernel sent an owned event fd.
-            let file = unsafe { std::fs::File::from_raw_fd(event.fd) };
-            if event.pid as u32 == self_pid {
-                continue;
-            }
-            let generation = match file_generation(&file) {
-                Ok(generation) => generation,
-                Err(_) => continue,
-            };
-            if !cache.needs_check(generation) {
-                if cache.decided_provider(generation) != Some(true) {
-                    continue;
-                }
-                // A later open of a sent file: tally the load. The pid
-                // falls back to the metadata capture when the loader is
-                // already gone (lower-bound-correct for counts).
-                let Some(pid) = tally_pid(&event, pidfd.as_ref()) else {
-                    continue;
-                };
-                let (dev, ino) = (generation.0, generation.1);
-                if !send_learn(&tx, &state, LearnMsg::Load { dev, ino, pid }) {
-                    close_unread_tail(&buf, offset, read as usize);
-                    break 'drain;
-                }
-                stats.sent_loads = stats.sent_loads.saturating_add(1);
-                continue;
-            }
-            stats.checked = stats.checked.saturating_add(1);
-            // Name the loader now, at event receipt and bracketed by
-            // pidfd liveness, before the ELF proof spends time a
-            // one-shot loader does not have.
-            let early_loader = pidfd.as_ref().map(loader_exe_for_pidfd);
-            let proved = match check_elf_provider(&file) {
-                Ok(proved) => proved,
-                Err(_) => {
-                    // Unreadable now: not cached, retried on the next open.
-                    stats.unreadable = stats.unreadable.saturating_add(1);
-                    continue;
-                }
-            };
-            if !proved {
-                cache.note_decided(generation, false);
-                continue;
-            }
-            stats.proved = stats.proved.saturating_add(1);
-            // Provider-positive: tally this first run, name its loader
-            // from the pinned pidfd when still alive (else the finite
-            // unknown reason — the file still stages), and send Load
-            // ahead of the candidate so the staged note counts it.
-            let tally = tally_pid(&event, pidfd.as_ref());
-            let (loader_exe, loader_unknown_reason) =
-                early_loader.unwrap_or((None, Some(LOADER_EXE_UNREADABLE_REASON)));
-            let Some(display_path) = display_path_for(&file) else {
-                // Not cached: a later open retries instead of losing
-                // this proved provider for the whole capture.
-                stats.unreadable = stats.unreadable.saturating_add(1);
-                continue;
-            };
-            let (dev, ino) = (generation.0, generation.1);
-            if let Some(pid) = tally {
-                if !send_learn(&tx, &state, LearnMsg::Load { dev, ino, pid }) {
-                    close_unread_tail(&buf, offset, read as usize);
-                    break 'drain;
-                }
-                stats.sent_loads = stats.sent_loads.saturating_add(1);
-            }
-            let candidate = LearnedCandidate {
-                file,
-                dev,
-                ino,
-                display_path,
-                loader_exe,
-                loader_unknown_reason,
-            };
-            if !send_learn(&tx, &state, LearnMsg::Candidate(candidate)) {
-                close_unread_tail(&buf, offset, read as usize);
-                break 'drain;
-            }
-            // Only a sent candidate settles the generation: caching a
-            // positive before the send would lose the file silently
-            // if the send (or the display read above) failed.
-            cache.note_decided(generation, true);
-            stats.sent_candidates = stats.sent_candidates.saturating_add(1);
+        if !ctx.process_read(&buf[..read as usize], SendWindow::Live) {
+            // The engine is gone or a send hit the tail bound (the
+            // loss is marked): nothing more can be delivered.
+            break 'drain;
         }
+    }
+    if stopped {
+        if !drain_final_tail(raw, &mut ctx, &mut buf) {
+            state.lost_tail.store(true, Ordering::Release);
+        }
+        return;
     }
     // Exiting with a readable queue means unprocessed events are lost
     // with the group fd: mark the tail so the engine files it loudly.
@@ -3028,6 +3254,79 @@ mod tests {
             assert!(
                 !lost,
                 "round {round}: a stop under ordinary open churn must drain the queued events, not report learned loss"
+            );
+        }
+    }
+
+    /// The rewrite twin of the stop proof (privileged): a child that
+    /// truncates its files on every open defeats the kernel ignore
+    /// filter (a modification clears it), so every open is queued and
+    /// the stop must still decide the queued tail instead of counting
+    /// it as loss. A provider opened just before the stop is still
+    /// reported through the pumped channel.
+    /// Run with `sudo -n` (fanotify needs `CAP_SYS_ADMIN`).
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN fanotify group"]
+    fn learn_live_stop_under_rewrite_churn_decides_queued_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{index}")), b"").unwrap();
+        }
+        let c = dir.path().join("tail.c");
+        let so = dir.path().join("libtail.so");
+        std::fs::write(
+            &c,
+            "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&c)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for round in 0..3 {
+            let (mut learner, rx) =
+                super::FileLearner::start().expect("fanotify group (run as root)");
+            learner.begin_drain().expect("spawn drain");
+            let mut churn = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "while :; do for f in \"$1\"/f*; do : > \"$f\"; done; done",
+                    "sh",
+                ])
+                .arg(dir.path())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let opener = std::process::Command::new("cat")
+                .arg(&so)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(opener.success());
+            let mut seen = false;
+            let lost = learner.shutdown_and_join_pumping(|| {
+                while let Ok(msg) = rx.try_recv() {
+                    if let super::LearnMsg::Candidate(candidate) = msg {
+                        seen |= candidate.display_path.ends_with("libtail.so");
+                    }
+                }
+            });
+            churn.kill().unwrap();
+            let _ = churn.wait();
+            while let Ok(msg) = rx.try_recv() {
+                if let super::LearnMsg::Candidate(candidate) = msg {
+                    seen |= candidate.display_path.ends_with("libtail.so");
+                }
+            }
+            assert!(!lost, "round {round}: the queued tail is decided, not lost");
+            assert!(
+                seen,
+                "round {round}: the provider opened before the stop is learned"
             );
         }
     }

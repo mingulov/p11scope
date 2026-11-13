@@ -382,6 +382,7 @@ discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executab
 fanotify::tests::learn_live_drain_reports_opened_provider
 fanotify::tests::learn_live_drain_reports_opened_provider_across_mount_ns
 fanotify::tests::learn_live_stop_under_open_churn_drains_without_loss
+fanotify::tests::learn_live_stop_under_rewrite_churn_decides_queued_tail
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up no-re-edge positive runs in the

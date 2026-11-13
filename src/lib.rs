@@ -88,6 +88,7 @@ pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;
 pub mod mechanism_names;
+pub(crate) mod memory_counters;
 pub mod metrics;
 pub mod output;
 pub mod pidns;

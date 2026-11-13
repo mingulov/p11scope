@@ -750,6 +750,32 @@ pub(super) enum SettlementTransition {
 }
 
 impl ModelState {
+    /// A0 lens (R4): session/object/pending tables plus pruned counts.
+    /// Read-only; O(structures).
+    pub(super) fn memory_lens(&self) -> crate::memory_counters::ModelLens {
+        use crate::memory_counters::{HEAP_MODEL_RECORD, counter_row};
+        use std::mem::size_of;
+        crate::memory_counters::ModelLens {
+            sessions: counter_row(
+                self.sessions.len(),
+                size_of::<(super::SessionIncarnation, SessionRecord)>(),
+                HEAP_MODEL_RECORD,
+            ),
+            objects: counter_row(
+                self.objects.len(),
+                size_of::<(super::ObjectId, ViewRecord)>(),
+                HEAP_MODEL_RECORD,
+            ),
+            pending: counter_row(
+                self.pending.len(),
+                size_of::<(super::CallToken, PendingCall)>(),
+                HEAP_MODEL_RECORD,
+            ),
+            pruned_sessions: self.pruned_sessions,
+            pruned_objects: self.pruned_objects,
+        }
+    }
+
     pub(super) fn new(limits: ObjectLimits) -> Self {
         Self {
             limits,
@@ -4664,6 +4690,81 @@ mod tests {
             !complete.contains("redeem_deferred"),
             "complete stages only; redemption awaits the Q2 design: {complete}"
         );
+    }
+
+    #[test]
+    fn model_memory_lens_moves_with_begun_and_created_calls() {
+        use crate::kinds::function_id;
+        use crate::semantics_objects::journal::StagingLedger;
+        use crate::semantics_objects::{
+            CallKey, CompleteInputPrefix, CompletedFact, HandleInput, MechanismEvidence,
+            ObjectDomain, ObjectHandle, ObjectSemantics, OriginFact, RefCut, ResultSlot,
+            SessionHandle, SlotScope,
+        };
+        use pkcs11_types::CkRv;
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        let mut model = ObjectSemantics::new();
+        model.register_domain(domain).expect("domain registers");
+        let zero = model.memory_lens();
+        assert_eq!(zero.sessions.len, 0);
+        assert_eq!(zero.objects.len, 0);
+        assert_eq!(zero.pending.len, 0);
+        assert_eq!(zero.pruned_sessions, 0);
+        assert_eq!(zero.pruned_objects, 0);
+
+        let mut ledger = StagingLedger::new();
+        let session = SessionHandle::new(7).unwrap();
+        let input = ObjectHandle::new(0xA11CE).unwrap();
+        let scope = SlotScope::reference_known(3, 1);
+        let origin = |cut: u64, key: u64, function: u32, inputs| OriginFact {
+            domain,
+            cut: RefCut::reference(cut),
+            key: CallKey::reference(key),
+            entry_ns: 100 + cut,
+            function,
+            session: HandleInput::Value(session),
+            inputs,
+            requested: [None, None],
+            entry_mechanism: MechanismEvidence::Value(0x17),
+            scope,
+            entry_output: crate::semantics_objects::OutputEvidence::NonNull,
+        };
+        let create = function_id("C_CreateObject").unwrap();
+        let token = model
+            .begin(
+                origin(1, 11, create, [HandleInput::Absent, HandleInput::Absent]),
+                &mut ledger,
+            )
+            .expect("create begins");
+        assert_eq!(model.memory_lens().pending.len, 1);
+        model.complete(
+            token,
+            CompletedFact {
+                cut: RefCut::reference(2),
+                end_ns: 202,
+                rv: CkRv::OK.0,
+                return_mechanism: MechanismEvidence::Value(0x17),
+                results: [ResultSlot::Handle(input), ResultSlot::NotCaptured],
+                session_out: HandleInput::Value(session),
+                found: crate::semantics_objects::FindResult::NotCaptured,
+                attributes: None,
+            },
+            &mut ledger,
+        );
+        model.settle(
+            CompleteInputPrefix::reference(
+                domain,
+                RefCut::reference(2),
+                &[],
+                Some(RefCut::reference(0)),
+            ),
+            &mut ledger,
+        );
+        let lens = model.memory_lens();
+        assert_eq!(lens.pending.len, 0);
+        assert_eq!(lens.objects.len, 1);
+        assert_eq!(lens.sessions.len, 1);
+        assert!(lens.objects.bytes > 0);
     }
 
     fn scalar(value: u16) -> FieldState {

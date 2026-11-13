@@ -61,6 +61,15 @@ impl Registry {
             .as_ref()
             .map_or(0, crate::events::EventsDomain::id)
     }
+    /// A0 lens (R9): admitted task cookies ever. Read-only; the
+    /// registry never evicts (the 262,144 cliff), so this only grows.
+    pub(crate) fn memory_tasks_row(&self) -> crate::memory_counters::CounterRow {
+        crate::memory_counters::counter_row(
+            self.tasks.len(),
+            std::mem::size_of::<(u64, Task)>(),
+            crate::memory_counters::HEAP_MAP_ENTRY,
+        )
+    }
     /// The domain comes from the sole retained EVENTS consumer, never a wire
     /// field or a live process lookup. The producer authenticates the tuple.
     pub(crate) fn admit(

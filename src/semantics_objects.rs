@@ -1218,6 +1218,11 @@ impl ObjectSemantics {
         self.state.exhaust_generation(domain);
     }
 
+    /// A0 lens (R4), via the model state.
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::ModelLens {
+        self.state.memory_lens()
+    }
+
     /// Reference fact: a call's terminal outcome was lost; the cut is an
     /// upper bound on where it could have taken effect.
     pub(crate) fn outcome_lost(

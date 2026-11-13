@@ -30454,6 +30454,85 @@ impl Engine {
             .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len))
     }
 
+    /// A0 lens (R6): every `CaptureHistory` per-ever set of the visible
+    /// history. Read-only; O(structures).
+    pub(crate) fn memory_history_lens(&self) -> crate::memory_counters::HistoryLens {
+        use crate::memory_counters::{
+            HEAP_HISTORY_VALUE, HEAP_MAP_ENTRY, HistoryLens, HistoryRows, counter_row,
+        };
+        use std::mem::size_of;
+        let history = self.capture_facts.visible_history();
+        HistoryLens {
+            rows: HistoryRows {
+                modules: counter_row(
+                    history.modules.len(),
+                    size_of::<(plan::ModuleId, render::DiscoveredModule)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                decoded: counter_row(
+                    history.decoded.len(),
+                    size_of::<DecodedOccurrence>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                surfaces: counter_row(
+                    history.surfaces.len(),
+                    size_of::<(SurfaceOccurrence, plan::SurfaceSummary)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                tables: counter_row(
+                    history.tables.len(),
+                    size_of::<(TableOccurrence, plan::TableSummary)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                skips: counter_row(
+                    history.skips.len(),
+                    size_of::<(DecodedOccurrence, Skipped)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                losses: counter_row(
+                    history.losses.len(),
+                    size_of::<((String, String), Skipped)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                refusals: counter_row(
+                    history.refusals.len(),
+                    size_of::<(plan::ModuleId, (Skipped, plan::RefusalKind))>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                fallbacks: counter_row(
+                    history.fallbacks.len(),
+                    size_of::<((u32, u32), render::ManifestObjectFallback)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                recorroborated: counter_row(
+                    history.recorroborated.len(),
+                    size_of::<(plan::ModuleId, Corroboration)>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                conflicted: counter_row(
+                    history.conflicted.len(),
+                    size_of::<plan::ModuleId>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                scan_gap_tombstones: counter_row(
+                    history.scan_gap_tombstones.len(),
+                    size_of::<(String, String)>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                corroboration_tombstones: counter_row(
+                    history.corroboration_tombstones.len(),
+                    size_of::<plan::ModuleId>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                fallback_tombstones: counter_row(
+                    history.fallback_tombstones.len(),
+                    size_of::<(u32, u32)>(),
+                    HEAP_MAP_ENTRY,
+                ),
+            },
+        }
+    }
+
     /// Userspace-owned discovery items outside the caller's batch locals:
     /// the session FIFO plus Engine pending and terminal holdings. Every
     /// fresh acquisition stops before exceeding the shared allowance minus

@@ -188,6 +188,16 @@ impl MetadataFrame {
         }
     }
 
+    /// A0 lens: metadata table rows. The rows are one boxed slice of
+    /// `Copy` records, so the entry size is exact with no heap factor.
+    pub(crate) fn memory_row(&self) -> crate::memory_counters::CounterRow {
+        crate::memory_counters::counter_row(
+            self.rows.as_ref().map_or(0, |rows| rows.rows.len()),
+            std::mem::size_of::<FrameRow>(),
+            0,
+        )
+    }
+
     pub(crate) fn contains(&self, caller: CallerId) -> bool {
         self.rows.as_ref().is_some_and(|rows| {
             rows.rows

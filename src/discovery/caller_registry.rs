@@ -1229,6 +1229,21 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
     }
 
+    /// A0 lens (R1): the caller and incarnation tables. Read-only;
+    /// O(structures).
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::AdapterLens {
+        use crate::memory_counters::{HEAP_CALLER_RECORD, counter_row};
+        use std::mem::size_of;
+        crate::memory_counters::AdapterLens {
+            callers: counter_row(
+                self.callers.len(),
+                size_of::<(CallerId, TrackedCaller<Source::Pin>)>(),
+                HEAP_CALLER_RECORD,
+            ),
+            incarnations: counter_row(self.incarnations.len(), size_of::<(u32, u32)>(), 0),
+        }
+    }
+
     /// Take and clear the detection-clock failure flag (F7a): true
     /// when a per-incarnation stamp saw a clock-read failure since the
     /// last take. The coordinator disables the stale-exit guard on
@@ -3879,6 +3894,59 @@ pub(crate) struct CallerRegistry {
 }
 
 impl CallerRegistry {
+    /// A0 lens (R2+R3): caller/module/edge tables, plus the R3 edge
+    /// maps summed over materialized edges. Read-only; O(edges) on
+    /// the emit path, never on the hot path.
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::RegistryLens {
+        use crate::memory_counters::{
+            HEAP_EDGE_RECORD, HEAP_MAP_ENTRY, HEAP_MODULE_RECORD, counter_row,
+        };
+        use std::mem::size_of;
+        let mut open = (0u64, 0u64);
+        let mut active = (0u64, 0u64);
+        let mut mechs = (0u64, 0u64);
+        let mut pending = (0u64, 0u64);
+        for edge in self.edges.values() {
+            let Some(semantics) = edge.semantics.as_ref() else {
+                continue;
+            };
+            let lens = semantics.memory_lens();
+            open.0 += lens.open.len;
+            open.1 += lens.open.bytes;
+            active.0 += lens.active.len;
+            active.1 += lens.active.bytes;
+            mechs.0 += lens.mechs.len;
+            mechs.1 += lens.mechs.bytes;
+            pending.0 += lens.pending.len;
+            pending.1 += lens.pending.bytes;
+        }
+        let row = |(len, bytes): (u64, u64)| crate::memory_counters::CounterRow { len, bytes };
+        crate::memory_counters::RegistryLens {
+            callers: counter_row(self.callers.len(), size_of::<CallerId>(), HEAP_MAP_ENTRY),
+            retired: counter_row(
+                self.retired.len(),
+                size_of::<(CallerId, String)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            modules: counter_row(
+                self.modules.len(),
+                size_of::<(ModuleId, ModuleRecord)>(),
+                HEAP_MODULE_RECORD,
+            ),
+            edges: counter_row(
+                self.edges.len(),
+                size_of::<((CallerId, ModuleId), EdgeRecord)>(),
+                HEAP_EDGE_RECORD,
+            ),
+            edge: crate::memory_counters::EdgeLens {
+                open: row(open),
+                active: row(active),
+                mechs: row(mechs),
+                pending: row(pending),
+            },
+        }
+    }
+
     pub(crate) fn semantic_storage_reserver(&self) -> SemanticResourceReserver {
         self.semantic_resources.reserver()
     }
@@ -7843,6 +7911,64 @@ pub(crate) mod tests {
             CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
         );
         (source, adapter)
+    }
+
+    #[test]
+    fn adapter_and_registry_memory_lens_move_with_admission() {
+        let (source, mut adapter) = adapter();
+        let zero = adapter.memory_lens();
+        assert_eq!(zero.callers.len, 0);
+        assert_eq!(zero.incarnations.len, 0);
+        source.spawn(200, 22);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let lens = adapter.memory_lens();
+        assert_eq!(lens.callers.len, 1);
+        assert_eq!(lens.incarnations.len, 1);
+        assert!(lens.callers.bytes > 0);
+
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let zero = registry.memory_lens();
+        assert_eq!(zero.callers.len, 0);
+        assert_eq!(zero.modules.len, 0);
+        assert_eq!(zero.edges.len, 0);
+        registry.callers.insert(id);
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        registry.scripted_module_edge(key, id);
+        let lens = registry.memory_lens();
+        assert_eq!(lens.callers.len, 1);
+        assert_eq!(lens.retired.len, 0);
+        assert_eq!(lens.modules.len, 1);
+        assert_eq!(lens.edges.len, 1);
+        assert!(lens.edges.bytes > 0);
+    }
+
+    /// A0 step 3: the per-entry heap ceilings behind the R1/R2 byte
+    /// factors, measured with the committed allocation probe.
+    #[test]
+    fn per_entry_heap_costs_stay_pinned() {
+        let (source, mut adapter) = adapter();
+        source.spawn(300, 33);
+        let (_, _, admit_bytes) =
+            crate::test_alloc::count_allocs_during(|| adapter.admit(300, AUTHORITY, 10).unwrap());
+        assert!(
+            admit_bytes <= 4096,
+            "one incarnation admit cost {admit_bytes} heap bytes, ceiling 4096"
+        );
+
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let key = ModuleKey::physical(8, 1, 12, Some("sha0012".into()), "/lib/b.so");
+        // Unmeasured: the module, its key index, and the first edge.
+        // The ceiling below pins the marginal second edge on the same
+        // module (steady-state insert cost at scale, not first-insert
+        // root allocation).
+        registry.scripted_module_edge(key.clone(), CallerId(1));
+        let (_, _, edge_bytes) = crate::test_alloc::count_allocs_during(|| {
+            registry.scripted_module_edge(key, CallerId(2))
+        });
+        assert!(
+            edge_bytes <= 3072,
+            "one edge insert cost {edge_bytes} heap bytes, ceiling 3072"
+        );
     }
 
     #[test]

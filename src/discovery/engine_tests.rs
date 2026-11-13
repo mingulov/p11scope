@@ -5565,6 +5565,157 @@ fn system_generation_engine() -> Engine {
 }
 
 #[test]
+fn history_memory_lens_moves_with_recorded_sets() {
+    let mut engine = system_generation_engine();
+    let zero = engine.memory_history_lens();
+    for row in [
+        zero.rows.modules,
+        zero.rows.decoded,
+        zero.rows.surfaces,
+        zero.rows.tables,
+        zero.rows.skips,
+        zero.rows.losses,
+        zero.rows.refusals,
+        zero.rows.fallbacks,
+        zero.rows.recorroborated,
+        zero.rows.conflicted,
+        zero.rows.scan_gap_tombstones,
+        zero.rows.corroboration_tombstones,
+        zero.rows.fallback_tombstones,
+    ] {
+        assert_eq!(row.len, 0);
+    }
+
+    // Real mutators: a publication decodes two occurrences, and a
+    // selection loss records one loss row.
+    let (mut published, mut raw) = retained_publication_engine(210, 1);
+    raw.tables[0].entries = overlay_entries(&raw, first_offsets(2));
+    let outcome = apply_publication_candidate(&mut published, &raw);
+    assert!(outcome.changed);
+    assert_eq!(published.memory_history_lens().rows.decoded.len, 2);
+    insert_selection_loss(&mut published.capture_facts.history, "test loss");
+    assert_eq!(published.memory_history_lens().rows.losses.len, 1);
+
+    // Direct mapping pins for the remaining sets.
+    let history = &mut engine.capture_facts.history;
+    history.modules.insert(
+        crate::plan::ModuleId(0),
+        crate::render::DiscoveredModule {
+            id: crate::plan::ModuleId(0),
+            admission_class: None,
+            dev: (8, 1),
+            ino: 11,
+            sha256: None,
+            path: "/lib/a.so".to_string(),
+            build_id: None,
+            layer: None,
+            objects: Vec::new(),
+            sources: Vec::new(),
+            corroborated: false,
+            corroboration: Vec::new(),
+            tables: Vec::new(),
+            interfaces: 0,
+            skipped: Vec::new(),
+            watch: None,
+            attached_at_ns: None,
+            unobserved_windows: None,
+            first_loaded_by: None,
+        },
+    );
+    history.surfaces.insert(
+        SurfaceOccurrence::Manifest {
+            module: crate::plan::ModuleId(0),
+            manifest: 0,
+            surface: 0,
+        },
+        crate::plan::SurfaceSummary {
+            source: "s".to_string(),
+            walk: "w".to_string(),
+            acquisition: "a".to_string(),
+            functions: 1,
+        },
+    );
+    history.tables.insert(
+        TableOccurrence::Manifest {
+            module: crate::plan::ModuleId(0),
+            manifest: 0,
+            surface: 0,
+        },
+        crate::plan::TableSummary {
+            version: (3, 0),
+            entries: 1,
+            source: "scan",
+            file_offset: None,
+            linkage: "heuristic",
+            exports_agreeing: None,
+        },
+    );
+    let occurrence = DecodedOccurrence::ManifestFunction {
+        module: crate::plan::ModuleId(0),
+        manifest: 0,
+        surface: 0,
+        function: 0,
+    };
+    history.decoded.insert(occurrence.clone());
+    history.skips.insert(
+        occurrence,
+        Skipped {
+            subject: "s".to_string(),
+            reason: "r".to_string(),
+        },
+    );
+    history.refusals.insert(
+        crate::plan::ModuleId(1),
+        (
+            Skipped {
+                subject: "s".to_string(),
+                reason: "r".to_string(),
+            },
+            crate::plan::RefusalKind::AwaitingPublication,
+        ),
+    );
+    history.fallbacks.insert(
+        (1, 2),
+        crate::render::ManifestObjectFallback {
+            manifest: 0,
+            object: 0,
+            reason: "test",
+            replacement: crate::render::ManifestReplacement {
+                dev: (8, 1),
+                ino: 11,
+                sha256: "sha".to_string(),
+            },
+        },
+    );
+    history
+        .recorroborated
+        .insert(crate::plan::ModuleId(2), Corroboration::Agreed);
+    history.conflicted.insert(crate::plan::ModuleId(3));
+    history
+        .scan_gap_tombstones
+        .insert(("a".to_string(), "b".to_string()));
+    history
+        .corroboration_tombstones
+        .insert(crate::plan::ModuleId(4));
+    history.fallback_tombstones.insert((3, 4));
+
+    let lens = engine.memory_history_lens();
+    assert_eq!(lens.rows.modules.len, 1);
+    assert_eq!(lens.rows.decoded.len, 1);
+    assert_eq!(lens.rows.surfaces.len, 1);
+    assert_eq!(lens.rows.tables.len, 1);
+    assert_eq!(lens.rows.skips.len, 1);
+    assert_eq!(lens.rows.losses.len, 0);
+    assert_eq!(lens.rows.refusals.len, 1);
+    assert_eq!(lens.rows.fallbacks.len, 1);
+    assert_eq!(lens.rows.recorroborated.len, 1);
+    assert_eq!(lens.rows.conflicted.len, 1);
+    assert_eq!(lens.rows.scan_gap_tombstones.len, 1);
+    assert_eq!(lens.rows.corroboration_tombstones.len, 1);
+    assert_eq!(lens.rows.fallback_tombstones.len, 1);
+}
+
+#[test]
 fn cgroup_exit_between_walk_and_mark_counts_one_gap() {
     // The walk lists the newcomer before its admission stamp is taken;
     // an exit in between is the same generation, never a second one.

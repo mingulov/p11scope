@@ -17,6 +17,25 @@ fn caller(id: u32) -> MetadataCaller {
 }
 
 #[test]
+fn metadata_frame_memory_row_counts_rows() {
+    use super::super::presentation::{CallerMetadata, MetadataReason};
+    let unavailable = MetadataFrame::unavailable(MetadataReason::RowLimit);
+    assert_eq!(unavailable.memory_row().len, 0);
+    let frame = MetadataFrame::for_test(&[
+        (
+            CallerId(0),
+            CallerMetadata::unknown(MetadataReason::RowLimit, 1),
+        ),
+        (
+            CallerId(1),
+            CallerMetadata::unknown(MetadataReason::RowLimit, 1),
+        ),
+    ]);
+    assert_eq!(frame.memory_row().len, 2);
+    assert!(frame.memory_row().bytes > 0);
+}
+
+#[test]
 fn scheduler_starts_one_admitted_native_caller_without_blocking_admission() {
     let mut runtime = MetadataRuntime::new(7);
     runtime.synchronize([caller(0)], 0);

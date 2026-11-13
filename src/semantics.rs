@@ -4486,6 +4486,99 @@ impl State {
     pub fn semantic_evidence(&self) -> SemanticEvidence {
         self.evidence
     }
+    /// A0 lens (R7/R8/R10/R12). Read-only: lens plus the two tail
+    /// totals (O(rows), emit path only, never on the hot path).
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::StateLens {
+        use crate::memory_counters::{
+            HEAP_MAP_ENTRY, HEAP_MECH_ROW, HEAP_TEMPLATE_ROW, StateLens, counter_row,
+        };
+        use std::mem::size_of;
+        let param_combos: usize = self.mechanisms.values().map(|m| m.param_combos.len()).sum();
+        let attr_types: usize = self.templates.values().map(|t| t.attr_types.len()).sum();
+        StateLens {
+            param_combos: counter_row(
+                param_combos,
+                size_of::<((u32, u64, u64, u64), u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            attr_types: counter_row(attr_types, size_of::<u64>(), HEAP_MAP_ENTRY),
+            mechanisms: counter_row(
+                self.mechanisms.len(),
+                size_of::<(u64, MechStat)>(),
+                HEAP_MECH_ROW,
+            ),
+            templates: counter_row(
+                self.templates.len(),
+                size_of::<((u32, u8), TemplateStat)>(),
+                HEAP_TEMPLATE_ROW,
+            ),
+            logins: counter_row(self.logins.len(), size_of::<(u32, u64)>(), HEAP_MAP_ENTRY),
+            cgroups: counter_row(
+                self.cgroups.len(),
+                size_of::<(u64, CgroupStat)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            mech_shapes: counter_row(
+                self.mech_shapes.len(),
+                size_of::<(u64, u32)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            reduced: counter_row(
+                self.reduced_histories.len(),
+                size_of::<ProcessKey>(),
+                HEAP_MAP_ENTRY,
+            ),
+            open: counter_row(
+                self.open.len(),
+                size_of::<((ProcessKey, SessionRef), SessionInfo)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            active_ops: counter_row(
+                self.active_ops.len(),
+                size_of::<((ProcessKey, SessionRef, u16), Binding)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            next_pseudonym: counter_row(
+                self.next_pseudonym.len(),
+                size_of::<(ProcessKey, u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            find_active: counter_row(
+                self.find_active.len(),
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            pending: counter_row(
+                self.pending.len(),
+                size_of::<((ProcessKey, SessionRef, u32), Pending)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            detached: counter_row(
+                self.detached.len(),
+                size_of::<((ModuleId, u64, u32, u64, u64), Detached)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            inherited_ambiguous: counter_row(
+                self.inherited_ambiguous.len(),
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
+        }
+    }
+    /// A0 sample: distinct processes owning R12 rows, for the 60 s
+    /// live/dead split. O(entries): called only on the emit path,
+    /// never on the hot path.
+    pub(crate) fn memory_process_keys(&self) -> Vec<ProcessKey> {
+        let mut keys = BTreeSet::new();
+        keys.extend(self.reduced_histories.iter().copied());
+        keys.extend(self.open.keys().map(|(process, _)| *process));
+        keys.extend(self.active_ops.keys().map(|(process, _, _)| *process));
+        keys.extend(self.next_pseudonym.keys().copied());
+        keys.extend(self.find_active.iter().map(|(process, _)| *process));
+        keys.extend(self.pending.keys().map(|(process, _, _)| *process));
+        keys.extend(self.inherited_ambiguous.iter().map(|(process, _)| *process));
+        keys.into_iter().collect()
+    }
     pub fn pending_at_end(&self) -> u64 {
         (self.pending.len() + self.detached.len()) as u64
     }
@@ -4916,6 +5009,144 @@ mod tests {
             .expect("the failed attempt is still evidence");
         assert_eq!(m251.calls, 1);
         assert_eq!(m251.errors, 1);
+    }
+
+    #[test]
+    fn state_memory_lens_moves_with_observed_calls() {
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
+        let before = s.memory_lens();
+        assert_eq!(before.mechanisms.len, 0);
+        assert_eq!(before.open.len, 0);
+        assert_eq!(before.active_ops.len, 0);
+        s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100));
+        s.observe(&login_ev(100, 1));
+        let mut find = ev(100, 6, fnkind::TEMPLATE_ARG1, 10, MECH_NONE, 0, 10);
+        find.attr_types = [1, 2, 0, 0, 0, 0, 0, 0];
+        find.attr_count = 2;
+        find.attr_total = 2;
+        s.observe(&find);
+        let after = s.memory_lens();
+        assert_eq!(after.mechanisms.len, 1);
+        assert_eq!(after.logins.len, 1);
+        assert_eq!(after.templates.len, 1);
+        assert_eq!(after.attr_types.len, 2);
+        assert_eq!(after.open.len, 1);
+        assert_eq!(after.active_ops.len, 1);
+        assert_eq!(after.next_pseudonym.len, 1);
+        assert!(after.open.bytes > 0);
+        assert_eq!(s.memory_process_keys().len(), 1);
+    }
+
+    #[test]
+    fn state_memory_lens_reads_every_owned_map() {
+        let mut s = State::with_policy(&test_plan(), crate::attach::CapturePolicy::Allowlisted);
+        let zero = s.memory_lens();
+        for row in [
+            zero.param_combos,
+            zero.attr_types,
+            zero.mechanisms,
+            zero.templates,
+            zero.logins,
+            zero.cgroups,
+            zero.mech_shapes,
+            zero.reduced,
+            zero.open,
+            zero.active_ops,
+            zero.next_pseudonym,
+            zero.find_active,
+            zero.pending,
+            zero.detached,
+            zero.inherited_ambiguous,
+        ] {
+            assert_eq!(row.len, 0);
+        }
+        assert!(s.memory_process_keys().is_empty());
+
+        let process = ProcessKey::from_pid(4242);
+        let session = SessionRef {
+            module: ModuleId(0),
+            handle: 10,
+        };
+        s.mechanisms.insert(0x250, MechStat::default());
+        s.mechanisms
+            .get_mut(&0x250)
+            .expect("inserted row")
+            .param_combos
+            .insert((1, 2, 3, 4), 1);
+        let mut template = TemplateStat::default();
+        template.attr_types.insert(7);
+        s.templates.insert((6, 0), template);
+        s.logins.insert(1, 1);
+        s.cgroups.insert(0xC0, CgroupStat::default());
+        s.mech_shapes.insert(0x250, 1);
+        s.reduced_histories.insert(process);
+        s.open.insert(
+            (process, session),
+            SessionInfo {
+                pseudonym: 1,
+                slot: 0,
+                fork_safe: false,
+            },
+        );
+        s.active_ops.insert(
+            (process, session, 1),
+            Binding {
+                mechanism: 0x250,
+                fork_safe: false,
+                unregistered: false,
+                standard_layout: false,
+            },
+        );
+        s.next_pseudonym.insert(process, 2);
+        s.find_active.insert((process, session));
+        let pending = Pending {
+            event: ev(4242, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 5),
+            meta: SlotMeta {
+                names: vec!["C_Sign".to_string()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                function_id: None,
+                fork_safe: false,
+                module: ModuleId(0),
+                module_ids: vec![ModuleId(0)],
+                standard_layout: false,
+            },
+            started_ns: 0,
+            sequence: 0,
+        };
+        s.pending.insert((process, session, 9), pending.clone());
+        s.detached.insert(
+            (ModuleId(0), 1, 2, 3, 4),
+            Detached {
+                pending,
+                owner: Some((process, session)),
+                process,
+                collided: false,
+            },
+        );
+        s.inherited_ambiguous.insert((process, session));
+
+        let lens = s.memory_lens();
+        assert_eq!(lens.param_combos.len, 1);
+        assert_eq!(lens.attr_types.len, 1);
+        assert_eq!(lens.mechanisms.len, 1);
+        assert_eq!(lens.templates.len, 1);
+        assert_eq!(lens.logins.len, 1);
+        assert_eq!(lens.cgroups.len, 1);
+        assert_eq!(lens.mech_shapes.len, 1);
+        assert_eq!(lens.reduced.len, 1);
+        assert_eq!(lens.open.len, 1);
+        assert_eq!(lens.active_ops.len, 1);
+        assert_eq!(lens.next_pseudonym.len, 1);
+        assert_eq!(lens.find_active.len, 1);
+        assert_eq!(lens.pending.len, 1);
+        assert_eq!(lens.detached.len, 1);
+        assert_eq!(lens.inherited_ambiguous.len, 1);
+        assert_eq!(s.memory_process_keys(), vec![process]);
     }
 
     #[test]

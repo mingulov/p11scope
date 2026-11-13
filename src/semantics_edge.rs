@@ -635,6 +635,31 @@ pub(crate) struct S1Occupancy {
 }
 
 impl EdgeSemantics {
+    /// A0 lens (R3): this edge's session/operation/mechanism maps.
+    /// Read-only; O(structures).
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::EdgeLens {
+        use crate::memory_counters::{HEAP_MAP_ENTRY, HEAP_MECH_ROW, counter_row};
+        use std::mem::size_of;
+        crate::memory_counters::EdgeLens {
+            open: counter_row(self.open.len(), size_of::<(u64, u64)>(), HEAP_MAP_ENTRY),
+            active: counter_row(
+                self.active.len(),
+                size_of::<((u64, u16), OpMachine)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            mechs: counter_row(
+                self.mechs.len(),
+                size_of::<(u64, EdgeMechStat)>(),
+                HEAP_MECH_ROW,
+            ),
+            pending: counter_row(
+                self.pending.len(),
+                size_of::<((u64, u32), PendingCall)>(),
+                HEAP_MAP_ENTRY,
+            ),
+        }
+    }
+
     pub(crate) fn with_resources(
         pool: &SemanticResourcePool,
     ) -> Result<Self, SemanticResourceRefusal> {
@@ -2461,6 +2486,23 @@ mod tests {
             ts_ns,
             ..SemanticCall::default()
         }
+    }
+
+    #[test]
+    fn edge_memory_lens_moves_with_observed_sessions() {
+        let mut edge = EdgeSemantics::default();
+        let zero = edge.memory_lens();
+        assert_eq!(zero.open.len, 0);
+        assert_eq!(zero.active.len, 0);
+        assert_eq!(zero.mechs.len, 0);
+        assert_eq!(zero.pending.len, 0);
+        edge.observe(&call("C_OpenSession", 7, 0, 100));
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 200));
+        let lens = edge.memory_lens();
+        assert_eq!(lens.open.len, 1);
+        assert_eq!(lens.active.len, 1);
+        assert_eq!(lens.mechs.len, 1);
+        assert!(lens.open.bytes > 0);
     }
 
     #[test]

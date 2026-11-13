@@ -1959,6 +1959,8 @@ fn run_with_terminal_budget(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
+    // A0 end-of-run line: `-v` stderr only.
+    driver.coordinator.emit_memory_end_line();
     // Terminal pre-arm close for the scan lane only (no `on_lane_stopped`):
     // the native lane already closed before its final commit. The scan
     // tail also discloses post-pass newcomers here (the native lane did
@@ -7060,6 +7062,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             let engine_scope = self.seal_scope.clone();
             self.attempt_deferred_scan_seal(engine_scope);
         }
+        // A0 periodic line: one `-v` stderr line every 60 s, checked
+        // once per pass after publication.
+        self.coordinator.maybe_emit_memory_line();
         Ok(())
     }
 
@@ -9001,6 +9006,8 @@ fn run_dashboard(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
+    // A0 end-of-run line: `-v` stderr only.
+    driver.coordinator.emit_memory_end_line();
     // Terminal pre-arm close for the scan lane only, as on the classic
     // path (the dashboard quit flag is an operator-initiated end): the
     // native lane already closed before its final commit. Frozen probe

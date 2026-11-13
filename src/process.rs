@@ -267,6 +267,11 @@ impl Tracker {
         self.evidence
     }
 
+    /// A0 lens (R9): admitted task cookies ever, via the registry.
+    pub(crate) fn memory_tasks_row(&self) -> crate::memory_counters::CounterRow {
+        self.history.memory_tasks_row()
+    }
+
     #[cfg(test)]
     fn make_pidfd_room(&mut self) {
         if self.pidfd_count() < self.pidfd_limit || self.pidfd_limit == 0 {
@@ -1877,6 +1882,25 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tracker_tasks_row_moves_with_admission() {
+        let domain = crate::events::EventsDomain::test_standin(7);
+        let id = domain.id();
+        let mut tracker = Tracker::for_producer(domain, 100);
+        assert_eq!(tracker.memory_tasks_row().len, 0);
+        let image = |cookie: u64| p11scope_ebpf_common::ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 1,
+        };
+        assert!(tracker.admit_history(id, 4242, image(1)).0.is_some());
+        assert!(tracker.admit_history(id, 4243, image(2)).0.is_some());
+        assert_eq!(tracker.memory_tasks_row().len, 2);
+        // Re-admitting a live cookie admits no second task.
+        assert!(tracker.admit_history(id, 4242, image(1)).0.is_some());
+        assert_eq!(tracker.memory_tasks_row().len, 2);
+        assert!(tracker.memory_tasks_row().bytes > 0);
+    }
 
     #[test]
     fn mountinfo_is_read_only_after_the_fd_is_open_with_retained_rechecks() {

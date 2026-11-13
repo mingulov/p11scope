@@ -281,6 +281,11 @@ impl JointCaptureOwner {
         (&mut self.adapter, &mut self.model)
     }
 
+    /// A0 lens (R4): the capture's object model.
+    pub(crate) fn memory_lens(&self) -> crate::memory_counters::ModelLens {
+        self.model.memory_lens()
+    }
+
     /// The capture's one journal adapter (read side): raw collection
     /// binds producers and ingests through this identity.
     #[cfg_attr(not(test), allow(dead_code))] // Raw collection through the owner arrives with the capture lane.

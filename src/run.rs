@@ -8455,6 +8455,44 @@ pub(crate) fn capture_diagnostics_on() -> bool {
         || std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
 }
 
+/// A0 assembly: the profile/trace capture lens over the live owners.
+/// The R12 pid sample is O(entries): call only on the 60 s emit path
+/// and at end of capture, never on the hot path.
+fn capture_memory_lens(
+    engine: &Engine,
+    state: &semantics::State,
+    tracker: &process::Tracker,
+) -> crate::memory_counters::ProfileLens {
+    crate::memory_counters::ProfileLens {
+        history: engine.memory_history_lens(),
+        state: state.memory_lens(),
+        process_pids: state
+            .memory_process_keys()
+            .iter()
+            .map(|key| key.pid)
+            .collect(),
+        tasks: tracker.memory_tasks_row(),
+    }
+}
+
+/// A0 periodic emit: one `-v` stderr `p11scope: memory` line every
+/// 60 s. The closure builds the snapshot only when due, so ticks
+/// between lines pay one `Instant` comparison.
+fn maybe_emit_memory_line(
+    cadence: &mut crate::memory_counters::MemoryCadence,
+    snapshot: impl FnOnce(u64) -> crate::memory_counters::MemorySnapshot,
+) {
+    if !capture_diagnostics_on() {
+        return;
+    }
+    let now = Instant::now();
+    if !cadence.due(now) {
+        return;
+    }
+    cadence.mark(now);
+    crate::memory_counters::emit_line(&snapshot(cadence.elapsed_secs(now)));
+}
+
 /// The one startup line, printed on stderr as the first action of
 /// every live capture, before the slow discovery/attach work: the
 /// flagship command spends tens of seconds between launch and the
@@ -9261,6 +9299,7 @@ fn capture_profile(
         ));
     }
     let clock = Instant::now();
+    let mut mem_cadence = crate::memory_counters::MemoryCadence::new();
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker,
@@ -9744,6 +9783,14 @@ fn capture_profile(
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
         scheduling.maybe_sample_resource_periodic();
+        maybe_emit_memory_line(&mut mem_cadence, |elapsed| {
+            crate::memory_counters::MemorySnapshot::for_profile(
+                elapsed,
+                capture_memory_lens(engine, &state, &process_tracker),
+                resolve_capture_ring_bytes(policy, false, ring_bytes),
+                None,
+            )
+        });
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Rounds drain the ring to empty-or-allowance in pinned
@@ -9860,6 +9907,9 @@ fn capture_profile(
     let k0_tail_records =
         std::cell::RefCell::<Vec<p11scope_ebpf_common::DiscoveryRecord>>::new(Vec::new());
     let k0_tail_malformed = std::cell::Cell::new(0u64);
+    // A0 (R5): the sealed report `Value`'s heap, measured at the seal
+    // site below; `None` without `-o` (no tree is built).
+    let mut seal_value_bytes: Option<u64> = None;
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -10066,6 +10116,7 @@ fn capture_profile(
                         select_endpoint.map(|_| &mut selection_ledger),
                         &target_caller,
                         last_snapshot.as_ref(),
+                        &mut seal_value_bytes,
                     )
                     .map(|_| ());
                     combine_deferred_failure(published, stdout_error.take())
@@ -10286,6 +10337,7 @@ fn capture_profile(
                         select_endpoint.map(|_| &mut selection_ledger),
                         &target_caller,
                         last_snapshot.as_ref(),
+                        &mut seal_value_bytes,
                     )
                 },
             );
@@ -10321,6 +10373,7 @@ fn capture_profile(
         mut selection_ledger: Option<&mut metrics::selected_detail_driver::SelectionLedger>,
         target_caller: &Option<render::CaptureCaller>,
         last_good: Option<&metrics::CaptureSnapshot>,
+        seal_value_bytes: &mut Option<u64>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -10680,6 +10733,8 @@ fn capture_profile(
                 Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
                 None => j,
             };
+            // A0 (R5): measure the sealed tree before it streams to disk.
+            *seal_value_bytes = Some(crate::memory_counters::json_value_bytes(&j));
             poll_terminal_cancellation();
             let out_path = out_file.path().to_path_buf();
             publish_profile_report_with_drop_accounting(
@@ -10711,6 +10766,16 @@ fn capture_profile(
         Ok(ev)
     }
 
+    // A0 end-of-capture line: `-v` stderr only, after the seal so R5
+    // rides along. Error paths that never sealed keep `None` there.
+    if capture_diagnostics_on() {
+        crate::memory_counters::emit_line(&crate::memory_counters::MemorySnapshot::for_profile(
+            clock.elapsed().as_secs(),
+            capture_memory_lens(engine, &state, &process_tracker),
+            resolve_capture_ring_bytes(policy, false, ring_bytes),
+            seal_value_bytes,
+        ));
+    }
     outcome
 }
 
@@ -10997,6 +11062,7 @@ fn capture_trace(
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
     let clock = Instant::now();
+    let mut mem_cadence = crate::memory_counters::MemoryCadence::new();
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -11300,6 +11366,14 @@ fn capture_trace(
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
         scheduling.maybe_sample_resource_periodic();
+        maybe_emit_memory_line(&mut mem_cadence, |elapsed| {
+            crate::memory_counters::MemorySnapshot::for_trace(
+                elapsed,
+                capture_memory_lens(engine, &state, &process_tracker),
+                resolve_ring_bytes(None),
+                None,
+            )
+        });
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Rounds drain the ring to empty-or-allowance in pinned
@@ -11548,7 +11622,7 @@ fn capture_trace(
     };
     let (quiesced, stop_quiescence) = quiesce_outcome;
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
-    finish_capture_with(
+    let trace_outcome = finish_capture_with(
         &mut finish_context,
         loop_result,
         |context| context.0.note_capture_loop_failure(),
@@ -12044,7 +12118,18 @@ fn capture_trace(
             );
             combine_deferred_failure(sealed, stdout_error.take())
         },
-    )
+    );
+    // A0 end-of-capture line: `-v` stderr only. The trace path seals
+    // no `Value` tree, so R5 stays N/A; R11 is pending on B0.
+    if capture_diagnostics_on() {
+        crate::memory_counters::emit_line(&crate::memory_counters::MemorySnapshot::for_trace(
+            clock.elapsed().as_secs(),
+            capture_memory_lens(engine, &state, &process_tracker),
+            resolve_ring_bytes(None),
+            None,
+        ));
+    }
+    trace_outcome
 }
 
 fn terminal_trace_count_line(reports: &[metrics::SlotReport], tracer: &trace::Tracer) -> String {

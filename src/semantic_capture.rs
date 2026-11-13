@@ -1560,9 +1560,9 @@ pub(crate) struct SemanticCapture {
     /// capture-clock retention instant for the horizon. Membership only;
     /// the records wait in `awaiting`/router-pending under the existing
     /// pending budget. Entries leave when their records are gone and no
-    /// binding holds the cookie, or when the retention horizon expires
-    /// them; a joined image keeps its drain stamp for conversion. At
-    /// most one entry per pending or bound image.
+    /// binding holds that exact image, or when the retention horizon
+    /// expires them; a joined image keeps its drain stamp for conversion.
+    /// At most one entry per pending or bound image.
     retained: BTreeMap<(u64, u64), (u64, Instant)>,
     terminal_cursor: u64,
     /// Fairness among tick-local Joined partitions when Pending scans leave
@@ -4062,10 +4062,12 @@ impl SemanticCapture {
             self.expire(image, &mut report);
         }
         self.prune_jobs();
-        // Retained images with no records left and no binding holding the
-        // cookie are gone (shed without ever binding); the rest keep
-        // waiting for their binding's scan proof, and joined images keep
-        // their drain stamp for conversion.
+        // Retained images with no records left and no binding holding
+        // that exact image are gone (shed without ever binding); the rest
+        // keep waiting for their binding's scan proof, and joined images
+        // keep their drain stamp for conversion. The binding half compares
+        // the full image: a historical exec marker drops at the next prune
+        // once its cookie's binding moves on.
         let awaited: BTreeSet<(u64, u64)> = self
             .awaiting
             .values()
@@ -4074,8 +4076,13 @@ impl SemanticCapture {
                 (image.task_cookie, image.exec_id)
             })
             .collect();
-        self.retained
-            .retain(|key, _| awaited.contains(key) || self.bindings.contains_key(&key.0));
+        self.retained.retain(|key, _| {
+            awaited.contains(key)
+                || self
+                    .bindings
+                    .get(&key.0)
+                    .is_some_and(|binding| binding.current && binding.image.exec_id == key.1)
+        });
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
         let mut attempted_keys = BTreeSet::new();
@@ -4226,24 +4233,25 @@ impl SemanticCapture {
         // Retained images that never bind get a bounded horizon: past it
         // their records expire mid-run as Unobserved (the existing shed
         // disclosure) instead of occupying the pending budget until stop.
-        // Bound images are skipped: their scans resolve or refuse them.
-        let over_horizon: Vec<ImageIdentity> = self
-            .retained
-            .iter()
-            .filter(|((cookie, _), (_, at))| {
-                io.now()
-                    .checked_duration_since(*at)
-                    .is_some_and(|age| age > RETAINED_IMAGE_HORIZON)
-                    && !self
-                        .bindings
-                        .get(cookie)
-                        .is_some_and(|binding| binding.current)
-            })
-            .map(|((cookie, exec), _)| ImageIdentity {
-                task_cookie: *cookie,
-                exec_id: *exec,
-            })
-            .collect();
+        // Exactly-bound images are skipped: their scans resolve or refuse
+        // them. A never-bound exec expires at its own horizon even when
+        // its cookie's binding has moved on to a successor exec.
+        let over_horizon: Vec<ImageIdentity> =
+            self.retained
+                .iter()
+                .filter(|((cookie, exec), (_, at))| {
+                    io.now()
+                        .checked_duration_since(*at)
+                        .is_some_and(|age| age > RETAINED_IMAGE_HORIZON)
+                        && !self.bindings.get(cookie).is_some_and(|binding| {
+                            binding.current && binding.image.exec_id == *exec
+                        })
+                })
+                .map(|((cookie, exec), _)| ImageIdentity {
+                    task_cookie: *cookie,
+                    exec_id: *exec,
+                })
+                .collect();
         for image in over_horizon {
             self.expire(image, &mut report);
             self.retained.remove(&(image.task_cookie, image.exec_id));

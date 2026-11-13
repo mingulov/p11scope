@@ -909,13 +909,19 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
 /// (versioned `.so` links resolve to the same file). Either leg alone
 /// suffices, exactly as the narrowing admits by path or inode; a rotated
 /// same-spelling file still matched (rotation is an identity concern,
-/// not a match concern). Returns the inputs that matched nothing, in
-/// operator order. Modules share [`match_forwarding_inputs`]'s key
-/// shape `(id, path, dev, ino)`; ids and devices are never compared.
+/// not a match concern). A module the scan published with the kernel's
+/// ` (deleted)` suffix (a replaced file's still-mapped copy, admitted
+/// by the narrowing's deleted leg) matches its hint too: the suffix
+/// strips on the module side only, like
+/// `stripped_deleted_hint_matches`. Returns the inputs that matched
+/// nothing, in operator order. Modules share
+/// [`match_forwarding_inputs`]'s key shape `(id, path, dev, ino)`; ids
+/// and devices are never compared.
 pub(crate) fn match_module_inputs<Id>(
     hints: &[std::path::PathBuf],
     modules: &[(Id, String, (u64, u64), u64)],
 ) -> Vec<String> {
+    const DELETED_SUFFIX: &str = " (deleted)";
     let mut unmatched: Vec<String> = Vec::new();
     for input in hints {
         let input_string = input.display().to_string();
@@ -924,7 +930,9 @@ pub(crate) fn match_module_inputs<Id>(
             meta.ino()
         });
         let hit = modules.iter().any(|(_, path, _, ino)| {
+            let stripped = path.strip_suffix(DELETED_SUFFIX).unwrap_or(path);
             crate::discovery::identity::target_paths_equal(&input_string, path)
+                || crate::discovery::identity::target_paths_equal(&input_string, stripped)
                 || inode.is_some_and(|file_ino| *ino == file_ino)
         });
         if !hit {
@@ -13342,6 +13350,47 @@ pub(crate) mod tests {
         let modules = vec![(7u32, "/opt/liba.so".to_string(), (8, 1), 100u64)];
         let unmatched = match_module_inputs(&[], &modules);
         assert!(unmatched.is_empty());
+    }
+
+    /// A `--module` hint naming a provider the scan published with the
+    /// kernel's ` (deleted)` suffix (replaced mid-capture, still-mapped
+    /// copy admitted) matches at evidence time: the suffix strips on
+    /// the module side, mirroring the scan's narrowing. The replacement
+    /// file carries a new inode (the common case), so the stripped
+    /// path leg alone must match.
+    #[test]
+    fn deleted_mapping_module_matches_its_hint() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let hint = dir.path().join("libreplaced.so.1");
+        std::fs::write(&hint, b"fake-replacement").unwrap();
+        let ino = std::fs::metadata(&hint).unwrap().ino();
+        let modules = vec![(
+            7u32,
+            format!("{} (deleted)", hint.display()),
+            (8, 1),
+            ino.wrapping_add(1),
+        )];
+        let unmatched = match_module_inputs(std::slice::from_ref(&hint), &modules);
+        assert!(
+            unmatched.is_empty(),
+            "the scan matched this hint (deleted leg); evidence must agree: {unmatched:?}"
+        );
+    }
+
+    /// The strip is module-side and exact: a ` (deleted)` published
+    /// path for another file never matches this hint.
+    #[test]
+    fn deleted_mapping_module_rejects_another_files_hint() {
+        use std::path::PathBuf;
+        let modules = vec![(
+            7u32,
+            "/opt/libother.so.1 (deleted)".to_string(),
+            (8, 1),
+            100u64,
+        )];
+        let unmatched = match_module_inputs(&[PathBuf::from("/opt/liba.so")], &modules);
+        assert_eq!(unmatched, vec!["/opt/liba.so".to_string()]);
     }
 
     /// A refused closure array with nothing captured below it says so: its

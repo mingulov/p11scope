@@ -3965,7 +3965,9 @@ rm -rf "$work"
 // The zombie-member snapshot with a gated pidfile writer: the writer
 // publishes zombie.pid only after the reader creates the gate, so a read
 // without a wait fails deterministically with the CI signature (cat ENOENT
-// on zombie.pid, ci 43404056467). The launcher records leader.pid before it
+// on zombie.pid, ci 43404056467). The gate precedes the fork: the loop's
+// own foreground sleeps would reap the zombie before the exec. The launcher
+// records leader.pid before it
 // execs the child, so launch return never synchronizes with the child's own
 // pidfile write; the wait below (the live-member sibling's pattern) is that
 // synchronization point. This twin pins that the snapshot oracle holds even
@@ -3982,7 +3984,7 @@ work=$(mktemp -d)
 leader=
 trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
 launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
-    sh -c 'sleep 0.2 & pid=$!; until [ -e "$1/gate" ]; do sleep 0.05; done; echo $pid > "$1/zombie.pid"; exec sleep 30' sh "$work"
+    sh -c 'until [ -e "$1/gate" ]; do sleep 0.05; done; sleep 0.2 & echo $! > "$1/zombie.pid"; exec sleep 30' sh "$work"
 leader=$USER_PROCESS_PID
 sid=$USER_PROCESS_SID
 : > "$work/gate"

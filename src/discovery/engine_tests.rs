@@ -79951,3 +79951,135 @@ fn evicted_departed_kthread_exit_counts_fail_closed() {
         "the evicted oldest entry counts its delayed exit fail-closed"
     );
 }
+
+/// Fix8 (codex fix6 F1, departure direction): a departure walk whose
+/// end clock failed must not store an indefinitely valid exemption.
+/// System scope: prove kthread 4242, depart it on a walk with
+/// `walk_end=None`, confirm the absence on a complete walk, then an
+/// unknown reused-pid user exit past every known bound counts.
+#[test]
+fn review_system_unknown_departure_clock_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    // The pid is gone from proc; the departure walk's end clock failed.
+    std::fs::remove_dir_all(&pid_dir).unwrap();
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), None);
+    engine.note_scope_walk(&BTreeSet::new(), Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an unknown exit past a failed departure clock must count"
+    );
+}
+
+/// Fix8 cgroup twin of the failed-departure-clock pin above.
+#[test]
+fn review_cgroup_unknown_departure_clock_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(100), Some(105));
+    // The pid is gone from proc; the departure walk's end clock failed.
+    std::fs::remove_dir_all(&pid_dir).unwrap();
+    engine.note_scope_walk(&BTreeSet::new(), Some(200), None);
+    engine.note_scope_walk(&BTreeSet::new(), Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an unknown exit past a failed departure clock must count"
+    );
+}
+
+/// Fix8 (codex fix6 F1, lower-bound direction): a failed previous
+/// walk-start sample must not become capture-origin proof for a later
+/// kthread's live exemption. System scope: two empty walks, the second
+/// with `walk_start=None`, then a new kthread proves; an earlier
+/// unproved user exit predates every known proof, so it counts.
+#[test]
+fn review_system_unknown_lower_bound_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    engine.note_scope_walk(&BTreeSet::new(), Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), None, Some(205));
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an exit predating a failed start sample must count"
+    );
+}
+
+/// Fix8 cgroup twin of the failed-lower-bound pin above.
+#[test]
+fn review_cgroup_unknown_lower_bound_counts() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("stat"),
+        stat_line(4242, "k", crate::process::PF_KTHREAD),
+    )
+    .unwrap();
+    std::fs::write(pid_dir.join("maps"), "").unwrap();
+    let mut engine = cgroup_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    engine.note_scope_walk(&BTreeSet::new(), Some(100), Some(105));
+    engine.note_scope_walk(&BTreeSet::new(), None, Some(205));
+    let live: BTreeSet<u32> = [4242].into_iter().collect();
+    engine.note_scope_walk(&live, Some(300), Some(305));
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an exit predating a failed start sample must count"
+    );
+}

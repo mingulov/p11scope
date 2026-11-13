@@ -1030,8 +1030,8 @@ A `--cgroup` capture sweeps every member's mappings, then deep-scans at most
 1024 members per pass, rarest providers first; past the cap the capture
 publishes a skip naming the bound. Kernel threads never count toward the
 cap (they have no user address space and cannot call a provider). The
-default is 1024 by the 2026-11-12 guard round: the raised cap stays (owner
-14:35) now that the fd wall is fixed at the cause — the capture raises its
+default is 1024 by the 2026-11-12 guard round: the raised cap stays
+now that the fd wall is fixed at the cause — the capture raises its
 `RLIMIT_NOFILE` soft limit to the hard limit at startup (effective value on
 the `-v` log) and holds a fixed fd reserve so fanotify/file learning and
 later attaches never hit `EMFILE`; when the reserve would be breached the

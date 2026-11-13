@@ -1236,6 +1236,14 @@ class BurstClassificationTests(unittest.TestCase):
                                census=burst_census(ambient=2, broken="no-markers"))
         self.assertIn("census capture window", result["detail"])
 
+    def test_burst_without_observer_pid_fails(self):
+        # No single observer pid, no observer tree to exclude: the join
+        # cannot tell a regressed self-probe fork from ambient, so the
+        # census fails closed.
+        result = self.run_case(burst_mutate(37), cell="system", want=1,
+                               census=burst_census(ambient=37, broken="no-observer"))
+        self.assertIn("census names no single observer pid", result["detail"])
+
     def test_lone_gap_with_full_census_join_reports_the_burst(self):
         # One gap fully joined by the census takes the burst
         # qualification (with its exact accounting) over the lone arm.

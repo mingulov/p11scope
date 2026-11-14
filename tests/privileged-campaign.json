@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 246,
+  "default_floor": 247,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -172,6 +172,7 @@
     "inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64",
     "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
     "inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_wound_down_lp64",
+    "inventory::privileged_tests::privileged_joint_rearm_wrapper_roundtrips_live_machine",
     "inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64",
     "inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64",
     "inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64",

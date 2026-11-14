@@ -9349,14 +9349,35 @@ fn is_attach_progress_line(line: &str) -> bool {
     rest[digits + 2..].starts_with("attach ")
 }
 
+/// True for the per-pass handle-table census line of
+/// [`progress_lines`]: a routine counter, verbose-only on the
+/// dashboard like the attach-decision tail, so it cannot evict real
+/// gap warnings from the replay buffer at default verbosity. Pinned
+/// to the `p11scope: pass N: handle table: ` prefix with a numeric
+/// pass, so a target-controlled reason stays visible. The
+/// stage-timings line keeps its own census suffix at every verbosity:
+/// benches parse it without `-v`.
+fn is_handle_table_progress_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("p11scope: pass ") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(": ") {
+        return false;
+    }
+    rest[digits + 2..].starts_with("handle table: ")
+}
+
 /// The dashboard sink of [`progress_lines`]: the headline plus events
-/// and gaps always; the attach-decision tail only when verbose, so a
-/// large scope's admission notes cannot evict real gap warnings from
-/// the replay buffer at default verbosity.
+/// and gaps always; the attach-decision tail and the handle-table
+/// census only when verbose, so routine progress cannot evict real
+/// gap warnings from the replay buffer at default verbosity.
 fn dashboard_visible_lines(lines: &[String], verbose: bool) -> Vec<&String> {
     lines
         .iter()
-        .filter(|line| verbose || !is_attach_progress_line(line))
+        .filter(|line| {
+            verbose || (!is_attach_progress_line(line) && !is_handle_table_progress_line(line))
+        })
         .collect()
 }
 
@@ -16282,6 +16303,25 @@ mod tests {
             lines.len(),
             "verbose dashboard keeps every line"
         );
+    }
+
+    #[test]
+    fn dashboard_census_filter_matches_only_census_shapes() {
+        // The filter pins the `p11scope: pass N: handle table: `
+        // prefix, so the timings line keeps its suffix and a
+        // target-controlled reason mentioning the census stays visible.
+        assert!(is_handle_table_progress_line(
+            "p11scope: pass 6: handle table: 4/1000 rows (admits 10, shares 3, defers 1, prunes 0)"
+        ));
+        for line in [
+            "p11scope: pass 6: 128 scanned (0 maps-matched; 0 native, 128 scan-pinned)",
+            "p11scope: pass 6: stage timings: scan 1 ms; handle table: 4/1000 rows (admits 10, shares 3, defers 1, prunes 0)",
+            "p11scope: pass 6: 1 caller admissions failed; first: pid 9: handle table: forged",
+            "p11scope: pass six: handle table: forged",
+            "handle table: 4/1000 rows (admits 10, shares 3, defers 1, prunes 0)",
+        ] {
+            assert!(!is_handle_table_progress_line(line), "{line}");
+        }
     }
 
     #[test]

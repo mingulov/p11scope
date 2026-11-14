@@ -116,7 +116,7 @@ impl RunningRearmRefusal {
             Self::FinishActive => "the lane was already finishing",
             Self::WatchdogTripped => "a no-progress trip was already standing",
             Self::FrameMissing => "the audited pass had nothing left to abandon",
-            Self::WrongPhase => "only a refusal at the audited step can be continued past",
+            Self::WrongPhase => "only a refusal at the audit step can be continued past",
             Self::BoundSpent => "the per-run re-arm limit was already spent",
             Self::LaneNotLive => "the lane was no longer live",
             Self::CannotResync => "the journal stream could not re-sync",
@@ -1373,9 +1373,10 @@ pub(crate) struct LiveJointMachine {
     /// wall-time bound fired. Set once per demand, never cleared:
     /// the trip latches the disposition and the lane is held past it.
     audit_no_progress_trip: Option<FinishNoProgressTrip>,
-    /// Set when the running service latched an Audited refusal whose
-    /// retained frame the exit abandon can dispose in full; cleared by
-    /// the re-arm. Every other latch leaves it false.
+    /// Set when the running service latched an audit-step refusal (at
+    /// Auditing, or at Audited with its retained frame) the exit
+    /// abandon can dispose in full; cleared by the re-arm. Every other
+    /// latch leaves it false.
     rearm_eligible: bool,
     /// Running quanta abandoned and re-armed past, bounded by
     /// [`RUNNING_REARM_LIMIT`].

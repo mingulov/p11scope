@@ -21008,7 +21008,7 @@ mod tests {
                 crate::inventory_semantics::RUNNING_REARM_LIMIT,
                 Some(RunningRearmRefusal::WrongPhase),
             ),
-            " at BindingKeys; after continuing past 32 interruptions, the lane could not continue: only a refusal at the audited step can be continued past",
+            " at BindingKeys; after continuing past 32 interruptions, the lane could not continue: only a refusal at the audit step can be continued past",
         );
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(
@@ -21057,7 +21057,7 @@ mod tests {
             ),
             (
                 RunningRearmRefusal::WrongPhase,
-                "only a refusal at the audited step can be continued past",
+                "only a refusal at the audit step can be continued past",
             ),
             (
                 RunningRearmRefusal::LaneNotLive,

@@ -21552,6 +21552,28 @@ impl Engine {
         if let Some(path) = self.learned_unlink_before_pin_for_test.take() {
             let _ = std::fs::remove_file(path);
         }
+        // Cheap pre-check before paying for proof: a full table cannot
+        // admit, so prune-then-recheck (like `acquire`) and requeue
+        // without proving — no re-hash, no mountinfo re-read, no new
+        // row. The one wait row files here, deduped, under the same
+        // subject the prove path would file (the normalized display
+        // spelling), so retries add nothing and the capture-wide I/O
+        // ceiling stands still.
+        self.handle_table.prune(usize::MAX);
+        if crate::fd_budget::library_handle_budget_exhausted(
+            self.handle_table.len(),
+            self.handle_table.scan_cap(),
+        ) {
+            let subject =
+                crate::discovery::identity::normalize_target_path(&candidate.display_path)
+                    .unwrap_or_else(|| candidate.display_path.clone());
+            self.mark_partial(
+                &subject,
+                crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
+            );
+            self.requeue_learned_candidate(candidate);
+            return;
+        }
         // The candidate owns its fd for this whole call, so the pin
         // worker's `/proc/self/fd/N` open cannot dangle.
         let open =
@@ -21582,7 +21604,7 @@ impl Engine {
             open,
             candidate.display_path.clone(),
         );
-        let pinning = match crate::discovery::identity::pin_prearm_requests_in_views_with_budget(
+        let mut pinning = match crate::discovery::identity::pin_prearm_requests_in_views_with_budget(
             std::slice::from_ref(&request),
             &[],
             None,
@@ -21618,21 +21640,21 @@ impl Engine {
             self.refuse_learned_gone_file(identity, &candidate.display_path);
             return;
         }
-        for skip in &pinning.skipped {
-            attribution::note(skip);
-            self.counters.object_skips.push(skip.clone());
-        }
+        // The skips file deduped by exact row (a retry re-filing the
+        // same wait adds nothing): the wait predicate reads the batch
+        // before the merge takes it.
+        let learned_wait = pinning
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED);
+        self.note_object_skips(std::mem::take(&mut pinning.skipped));
         if pinning.inputs.is_empty() {
             // A budget wait is not a refusal: the candidate stays
             // learnable and rides the next drain instead of settling.
             // The learned gap above already filed through the merge.
             // Past the pending bound the requeue refuses loudly instead
             // (never an unbounded queue, never a silent close).
-            if pinning
-                .skipped
-                .iter()
-                .any(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED)
-            {
+            if learned_wait {
                 self.requeue_learned_candidate(candidate);
                 return;
             }
@@ -26951,16 +26973,16 @@ impl Engine {
     }
 
     /// The live-tail library-handle wait gap: one counted row per
-    /// deferral point (never per record). Live tails share the live
-    /// budget reason: the operative clause — budget exhausted,
-    /// deferred to the next tick — is what the retry honors.
+    /// capture (never per record, never per deferral). Live tails share
+    /// the live budget reason: the operative clause — budget exhausted,
+    /// deferred to the next tick — is what the retry honors. The mark
+    /// dedupes by exact row and dirties the publication inputs, so a
+    /// full table over many ticks cannot grow the gap list.
     fn file_handles_wait_gap(&mut self) {
-        let skipped = Skipped {
-            subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
-            reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into(),
-        };
-        attribution::note(&skipped);
-        self.counters.object_skips.push(skipped);
+        self.mark_partial(
+            crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT,
+            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE,
+        );
     }
 
     /// Restore a handles-deferred record plus the unprocessed rest at

@@ -540,7 +540,27 @@ fn check_stream_file(
         ));
     }
     let owner = metadata.uid();
-    if owner != unsafe { libc::geteuid() } && Some(owner) != handover_owner {
+    if let Some(target) = handover_owner {
+        // A handover is armed: reuse only the target's own single-linked
+        // file. Anything else — a root-owned file the flag would
+        // truncate and hand away, or a hard-linked file whose truncation
+        // would reach shared bytes — is refused.
+        if owner != target {
+            return Err(format!(
+                "output {} exists and is owned by uid {}, not the handover target uid {}; refusing to overwrite it",
+                final_path.display(),
+                owner,
+                target
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "output {} exists with {} hard links; refusing to truncate it",
+                final_path.display(),
+                metadata.nlink()
+            ));
+        }
+    } else if owner != unsafe { libc::geteuid() } {
         return Err(format!(
             "output {} exists and is owned by uid {}; refusing to overwrite it",
             final_path.display(),
@@ -864,10 +884,16 @@ fn directory_owner_trusted(
         || (euid == 0 && named.is_some_and(|(uid, _)| uid == owner))
 }
 
+/// The kernel overflow uid (`overflowuid`, nobody): ids the kernel
+/// could not map render as this, and handing a report to it fails —
+/// so the refusal hint below never suggests it.
+const OVERFLOW_UID: u32 = 65534;
+
 /// The ownership refusal for one ancestor: the legacy shape, plus —
 /// for root only, where the flag can help — the exact fix naming the
 /// ancestor's owner. Away from root the text is byte-identical to the
-/// legacy shape.
+/// legacy shape. The overflow uid is never suggested: it cannot
+/// receive the report, so the hint names the real remedy instead.
 fn owner_refusal_message(path: &Path, owner: u32, euid: u32) -> String {
     let base = format!(
         "output directory ancestor {} is untrusted: owned by uid {}",
@@ -876,6 +902,11 @@ fn owner_refusal_message(path: &Path, owner: u32, euid: u32) -> String {
     );
     if euid != 0 {
         return base;
+    }
+    if owner == OVERFLOW_UID {
+        return format!(
+            "{base}. Uid 65534 is the overflow id, so --output-owner cannot hand the report to them; give the directory a real owner first"
+        );
     }
     format!(
         "{base}. To write here as root, repeat with --output-owner {owner} to trust that owner and hand the report to them"

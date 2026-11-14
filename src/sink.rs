@@ -2056,6 +2056,46 @@ mod tests {
         assert_eq!(got, expected.as_bytes());
     }
 
+    /// A receipt following cleanup narrative is the completion of a
+    /// visible story, never noise: after progress lines or the stop
+    /// estimate, the instant receipt stays.
+    #[test]
+    fn quiet_cleanup_writer_keeps_the_receipt_after_cleanup_narrative() {
+        for narrative in [
+            "p11scope: cleanup 4/251 links released, 0 s\n",
+            "p11scope: closing 40 probe links one at a time (no batched uprobe detach on this kernel); about 2 s, progress follows\n",
+        ] {
+            let (writer, mut reader) = pair();
+            let mut out = QuietCleanupWriter::new(bounded_writer_on_fd(writer.as_raw_fd()));
+            out.write_all(narrative.as_bytes()).unwrap();
+            out.write_all(b"p11scope: cleanup completed, 4/4 links released, 0 s\n")
+                .unwrap();
+            out.flush().unwrap();
+            drop(out);
+            drop(writer);
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).unwrap();
+            let mut expected = narrative.as_bytes().to_vec();
+            expected.extend_from_slice(b"p11scope: cleanup completed, 4/4 links released, 0 s\n");
+            assert_eq!(got, expected, "narrative: {narrative:?}");
+        }
+    }
+
+    /// A dropped writer delivers its held tail instead of eating it:
+    /// every current caller writes whole lines, but an unterminated
+    /// tail must survive a drop without an explicit flush.
+    #[test]
+    fn quiet_cleanup_writer_flushes_its_tail_on_drop() {
+        let (writer, mut reader) = pair();
+        let mut out = QuietCleanupWriter::new(bounded_writer_on_fd(writer.as_raw_fd()));
+        out.write_all(b"p11scope: capturing: 1466 probes attached").unwrap();
+        drop(out);
+        drop(writer);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"p11scope: capturing: 1466 probes attached");
+    }
+
     /// A fd no transport can be opened on sheds every line to the sink:
     /// writes succeed and the driver never learns stderr is gone.
     #[test]

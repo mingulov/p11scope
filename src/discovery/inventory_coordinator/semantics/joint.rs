@@ -572,6 +572,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         completed: Option<&mut Option<CompletedJointFinish>>,
         producers: &SessionDrainProducers,
     ) -> Result<JointCommitProgress> {
+        // Scope round: disclose this completion's audit voids as
+        // counted sub-cause gaps. The commit's apply already ran, so
+        // the gaps ride the next apply (or the terminal commits at
+        // stop); the drain is idempotent across retries (see it).
+        self.disclose_audit_void_gaps();
         let original = disposed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing actual disposal"))?;

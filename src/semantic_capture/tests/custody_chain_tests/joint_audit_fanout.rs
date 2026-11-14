@@ -9596,8 +9596,9 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
 
 /// Scope-round drain twin: each audit void discloses one counted scope
 /// gap for its sub-cause (`joint_void_<subcause>_history_loss`), like
-/// ingest-break voids do — published with the voiding completion,
-/// exactly once per void.
+/// ingest-break voids do — staged exactly once by the voiding
+/// completion, scope-wide (the next apply publishes it; the I2 twin
+/// proves staged gaps publish end to end).
 #[test]
 fn joint_audit_void_discloses_counted_subcause_gap() {
     let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
@@ -9616,19 +9617,28 @@ fn joint_audit_void_discloses_counted_subcause_gap() {
         .registry()
         .published_revision();
     fixture.complete_publication(&mut frame, &fault, old_revision);
-    let registry = fixture.scene.real.scene.coordinator.registry();
-    let at = registry
-        .gaps()
+    let staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test();
+    let disclosed: Vec<_> = staged
         .iter()
-        .position(|gap| gap.reason == "joint_void_fault_changed_history_loss")
-        .expect("the audit void discloses its sub-cause gap");
+        .filter(|gap| gap.reason == "joint_void_fault_changed_history_loss")
+        .collect();
     assert_eq!(
-        registry.gap_repeats()[at],
+        disclosed.len(),
         1,
-        "one counted gap per audit void"
+        "the voiding completion stages its sub-cause gap exactly once: {staged:?}"
+    );
+    assert_eq!(
+        disclosed[0].subject, "Joint key operations unavailable; retained S1",
+        "the void gap shares the Joint-unavailable subject"
     );
     assert!(
-        registry.gaps()[at].caller.is_none(),
+        disclosed[0].caller.is_none(),
         "the void gap is scope-wide, not per process"
     );
 }

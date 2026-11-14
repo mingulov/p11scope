@@ -21931,6 +21931,53 @@ fn joint_ingest_break_loss_is_resumable_history_loss() {
     );
 }
 
+/// Scope-round Step 5 pin: only the ingest-break void is named as
+/// resumable loss — audit voids keep their own dispositions (the two
+/// fault gaps never resume; ResourceUnavailable falls back instead of
+/// voiding history).
+#[test]
+fn joint_void_gaps_keep_their_own_resumability() {
+    use crate::semantics_key_use::SealFailureDisposition;
+    // The fault gaps end history without a clean point on this feed.
+    for gap in [JournalGap::FaultChanged, JournalGap::FaultUnreadable] {
+        assert_eq!(
+            crate::semantics_key_use::disposition_of(gap),
+            SealFailureDisposition::HistoryLoss,
+            "{gap:?} is history loss"
+        );
+        assert!(
+            !crate::semantics_key_use::segment_resumable_after(gap),
+            "{gap:?} never resumes"
+        );
+    }
+    // ResourceUnavailable is proof-only: fall back, never dispose.
+    assert_eq!(
+        crate::semantics_key_use::disposition_of(JournalGap::ResourceUnavailable),
+        SealFailureDisposition::Fallback,
+    );
+    assert!(
+        crate::semantics_key_use::segment_resumable_after(JournalGap::ResourceUnavailable),
+        "the proof-only gap stays resumable"
+    );
+    // The remaining audit-void gaps stay resumable history loss.
+    for gap in [
+        JournalGap::H3Loss,
+        JournalGap::Discarded,
+        JournalGap::Malformed,
+        JournalGap::CounterUnprovable,
+    ] {
+        assert_eq!(
+            crate::semantics_key_use::disposition_of(gap),
+            SealFailureDisposition::HistoryLoss,
+            "{gap:?} is history loss"
+        );
+        assert!(
+            crate::semantics_key_use::segment_resumable_after(gap),
+            "{gap:?} stays resumable"
+        );
+    }
+}
+
 /// Keyrows B1 twin: a voided feed stores the void's fence at its loss
 /// close, and a receipt cut below that fence never resumes Joint —
 /// re-selection (Task 3) is the only way back.

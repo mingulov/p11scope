@@ -342,6 +342,10 @@ pub(crate) struct JointStaging {
     /// endings never lower it. A retained receipt cut below it never
     /// resumes Joint (see [`Self::resume_joint`]); cleared on resume.
     segment_fence: Option<u64>,
+    /// The fence last disclosed as deferring a below-fence resume
+    /// (I2): the per-feed reason fires once per recorded fence and a
+    /// new void re-arms it. Cleared on resume.
+    resume_deferral_disclosed: Option<u64>,
     /// Ledger releases pended by a ledger-less ordered fallback
     /// (C4): flushed on the next ledger contact. One fallback drains
     /// staging, and re-staging after a clean-point resume flushes
@@ -394,6 +398,7 @@ impl JointStaging {
             fell_back: false,
             segment_resumable: false,
             segment_fence: None,
+            resume_deferral_disclosed: None,
             pending_releases: Vec::new(),
         }
     }
@@ -468,6 +473,7 @@ impl JointStaging {
             self.mode = FeedMode::Joint;
             self.segment_resumable = false;
             self.segment_fence = None;
+            self.resume_deferral_disclosed = None;
             self.degraded_window = None;
             self.degraded_loss = false;
             self.fell_back = false;
@@ -497,7 +503,14 @@ impl JointStaging {
     /// refusing silently. A new void re-arms it; a clean resume clears
     /// it.
     pub(crate) fn take_below_fence_deferral(&mut self) -> bool {
-        self.receipt_below_recorded_fence()
+        if self.receipt_below_recorded_fence()
+            && self.resume_deferral_disclosed != self.segment_fence
+        {
+            self.resume_deferral_disclosed = self.segment_fence;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a later birth may still select Joint for this feed: it

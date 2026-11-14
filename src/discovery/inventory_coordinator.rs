@@ -492,6 +492,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Joint-seal outcomes by progress kind (diagnostics, disclosed
     /// beside the stop line while stage timings are requested).
     seal_diagnosis: semantics::SealDiagnosis,
+    /// Audit voids already disclosed as counted scope gaps, per
+    /// audit-void sub-cause in `AUDIT_VOID_GAPS` order (scope round):
+    /// the drain notes one gap per void above this baseline, so
+    /// retries and owner replacement neither repeat nor lose a void.
+    audit_voids_disclosed: [u64; 7],
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
@@ -1136,6 +1141,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 crate::run::capture_diagnostics_on(),
             ),
             seal_diagnosis: semantics::SealDiagnosis::default(),
+            audit_voids_disclosed: [0; 7],
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             #[cfg(test)]
@@ -3117,6 +3123,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self,
     ) -> crate::semantics_objects::journal::JointVoidDiagnosis {
         self.joint_capture.adapter().joint_void_diagnosis()
+    }
+
+    /// Disclose audit voids as counted scope gaps (scope round): one
+    /// `joint_void_<subcause>_history_loss` gap per void since the last
+    /// drain, like ingest-break voids. Scope-wide (not per process).
+    /// Idempotent: the baseline tracks the adapter's run-global
+    /// counters, which retirement carries, so retries, replacement
+    /// owners and repeated stop disclosures neither repeat nor lose a
+    /// void. A replaced owner that recounts from zero re-baselines
+    /// instead of disclosing stale totals.
+    pub(crate) fn disclose_audit_void_gaps(&mut self) {
+        use crate::semantics_objects::journal::{AUDIT_VOID_GAPS, JournalGap};
+        let split = self.joint_capture.adapter().joint_void_counts();
+        for (index, gap) in AUDIT_VOID_GAPS.into_iter().enumerate() {
+            // Gap-level disclosure: the two FaultChanged site buckets
+            // merge into the one fault_changed gap.
+            let total = match gap {
+                JournalGap::FaultChanged => split
+                    .audit_fault_changed_chain
+                    .saturating_add(split.audit_fault_changed_reread),
+                JournalGap::H3Loss => split.audit_h3_loss,
+                JournalGap::Discarded => split.audit_discarded,
+                JournalGap::Malformed => split.audit_malformed,
+                JournalGap::CounterUnprovable => split.audit_counter_unprovable,
+                JournalGap::FaultUnreadable => split.audit_fault_unreadable,
+                JournalGap::ResourceUnavailable => split.audit_resource_unavailable,
+                _ => 0,
+            };
+            let disclosed = &mut self.audit_voids_disclosed[index];
+            let new = total.saturating_sub(*disclosed);
+            *disclosed = total;
+            for _ in 0..new {
+                self.note_scope_gap(
+                    "Joint key operations unavailable; retained S1".to_string(),
+                    format!("joint_void_{}_history_loss", gap.label()),
+                );
+            }
+        }
     }
 
     /// First birth-registration `Capacity` arm and table sizes

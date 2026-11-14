@@ -1143,6 +1143,19 @@ impl JournalGap {
     }
 }
 
+/// The seven `reject_audit` void gaps, in disclosure order: each void
+/// discloses one counted `joint_void_<label>_history_loss` scope gap.
+/// Parallel to the coordinator's per-gap disclosure baseline.
+pub(crate) const AUDIT_VOID_GAPS: [JournalGap; 7] = [
+    JournalGap::FaultChanged,
+    JournalGap::H3Loss,
+    JournalGap::Discarded,
+    JournalGap::Malformed,
+    JournalGap::CounterUnprovable,
+    JournalGap::FaultUnreadable,
+    JournalGap::ResourceUnavailable,
+];
+
 /// The model's bootstrap floor: strictly above the birth, the last
 /// sealed frontier, the void fence and every recorded or pending loss
 /// bound. The maximum of strict successors is the strict successor of
@@ -13599,6 +13612,25 @@ pub(crate) mod tests {
             split(&fresh),
             (0, 1, 1),
             "the fresh-baseline re-read counts as reread, not chain"
+        );
+    }
+
+    #[test]
+    fn audit_void_gaps_cover_every_void_arm_gap_in_order() {
+        // The drain's gap order is load-bearing: it drives disclosure
+        // and parallels the coordinator baseline. It must name exactly
+        // the seven reject_audit void gaps, in brief order.
+        assert_eq!(
+            AUDIT_VOID_GAPS,
+            [
+                JournalGap::FaultChanged,
+                JournalGap::H3Loss,
+                JournalGap::Discarded,
+                JournalGap::Malformed,
+                JournalGap::CounterUnprovable,
+                JournalGap::FaultUnreadable,
+                JournalGap::ResourceUnavailable,
+            ]
         );
     }
 

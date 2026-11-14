@@ -3405,7 +3405,10 @@ impl CallerRegistry {
         {
             // Clean point after a closed segment: a feed that fell
             // back or lost authority resumes Joint for the segment
-            // this call opens; the closed segment stays counted.
+            // this call opens; the closed segment stays counted. A
+            // resume refused below the recorded void fence names one
+            // counted per-feed reason (I2) instead of refusing
+            // silently; the feed takes it once per fence.
             let resumed = self
                 .instance_state
                 .semantics
@@ -3416,6 +3419,25 @@ impl CallerRegistry {
             if resumed {
                 joint = true;
                 self.joint_feeds = self.joint_feeds.saturating_add(1);
+            } else {
+                let (caller, deferred) = {
+                    let state = self
+                        .instance_state
+                        .semantics
+                        .get_mut(&id)
+                        .expect("retained edge");
+                    (state.caller, state.feed.take_below_fence_deferral())
+                };
+                if deferred {
+                    self.record_gap(RegistryGap {
+                        caller: Some(caller),
+                        module: None,
+                        pid: None,
+                        subject: "Joint key operations unavailable; retained S1".into(),
+                        reason: "joint_resume_deferred_below_fence".into(),
+                        budget: None,
+                    });
+                }
             }
         }
         let mut fallback_refused = 0u64;

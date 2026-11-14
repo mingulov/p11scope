@@ -7341,6 +7341,60 @@ mod promotion_lifecycle_tests {
     }
 
     #[test]
+    fn disclose_audit_void_gaps_drains_once_and_merges_chain_reread() {
+        // Scope-round drain pin: the drain discloses one gap per void
+        // above its baseline (the two FaultChanged site buckets merge
+        // into the one fault_changed gap), and a second drain with no
+        // new voids discloses nothing.
+        let mut coordinator = coordinator();
+        let carried = crate::semantics_objects::journal::JointVoidCounts {
+            break_dispose: 0,
+            break_ingest: 0,
+            void_audit: 6,
+            void_resync: 0,
+            seal_below_fence: 0,
+            audit_fault_changed_chain: 2,
+            audit_fault_changed_reread: 3,
+            audit_h3_loss: 1,
+            audit_discarded: 0,
+            audit_malformed: 0,
+            audit_counter_unprovable: 0,
+            audit_fault_unreadable: 0,
+            audit_resource_unavailable: 0,
+            voids_ended_joint_feed: 0,
+        };
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
+        coordinator.disclose_audit_void_gaps();
+        let staged = coordinator.registry().staged_scope_gaps_for_test();
+        assert_eq!(
+            staged
+                .iter()
+                .filter(|(_, reason)| reason == "joint_void_fault_changed_history_loss")
+                .count(),
+            5,
+            "both FaultChanged sites merge into one gap reason: {staged:?}"
+        );
+        assert_eq!(
+            staged
+                .iter()
+                .filter(|(_, reason)| reason == "joint_void_h3_loss_history_loss")
+                .count(),
+            1,
+            "each H3Loss void discloses its own gap: {staged:?}"
+        );
+        coordinator.disclose_audit_void_gaps();
+        let restaged = coordinator.registry().staged_scope_gaps_for_test();
+        assert_eq!(
+            restaged.len(),
+            staged.len(),
+            "a second drain with no new voids discloses nothing"
+        );
+    }
+
+    #[test]
     fn retire_joint_domain_disposes_refused_drop_shadow_without_positives() {
         // Terminal loss stays disposable: a refused domain's drop
         // shadow retires instead of stranding, without restoring

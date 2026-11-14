@@ -3305,6 +3305,10 @@ fn disclose_semantic_stop(
     warn: &mut WarnSink<'_>,
 ) {
     coordinator.record_scan_refusals_gap_with_overflow(&counts.refusals, counts.overflow_refusals);
+    // Scope round: disclose audit voids the last completion never
+    // drained (an unfinished publication stands in front of them).
+    // Idempotent: completions already drained disclose nothing new.
+    coordinator.disclose_audit_void_gaps();
     warn.emit(&crate::inventory_semantics::semantic_stop_line(
         counts.collected,
         counts.joined,

@@ -222,11 +222,11 @@ pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
     use SealFailureDisposition::*;
     match gap {
         FaultChanged | FaultUnreadable | FaultSaturated | Malformed | CounterUnprovable
-        | H3Loss | H3Exhausted | Discarded | IngestBreakLoss => HistoryLoss,
+        | H3Loss | H3Exhausted | Discarded => HistoryLoss,
         H3Pending | BoundNotReady | FrontierRegression => Retry,
         ModelRefused | BootstrapMismatch | ClosureStale | DomainTainted | ImageTainted
         | DomainEnded | AdapterInvalidated | Stopped | DrainMismatch | CutExhausted
-        | ResourceUnavailable | ClaimUnmatched => Fallback,
+        | ResourceUnavailable | ClaimUnmatched | IngestBreakLoss => Fallback,
     }
 }
 
@@ -658,8 +658,9 @@ impl JointStaging {
     /// (`record_lost`), exactly like loss disposal: staged Joint
     /// calls are unreduced by construction, so dropping them
     /// uncounted would lose calls. Never reduces or replays. The
-    /// segment stays open: the recovery's own seals stage and
-    /// deliver normally.
+    /// segment stays open: the recovery's own seals stage, then
+    /// replay as unknown-key rows when the fenced void delivers
+    /// (fallback, never Joint-certified).
     pub(crate) fn drop_abandoned_staged(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,

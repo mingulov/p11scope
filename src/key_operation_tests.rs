@@ -21917,24 +21917,26 @@ fn key_operation_clean_resume_clears_loss_latch() {
     );
 }
 
-/// Keyrows B3: the ingest-break void names a resumable history-loss
-/// gap; AdapterInvalidated stays non-resumable Fallback on its own
-/// paths.
+/// Keyrows B3: the ingest-break void names a resumable fenced
+/// fallback gap, so calls staged past the void replay as
+/// unknown-key rows; AdapterInvalidated stays non-resumable
+/// Fallback on its own paths.
 #[test]
-fn joint_ingest_break_loss_is_resumable_history_loss() {
+fn joint_ingest_break_loss_is_resumable_fenced_fallback() {
     assert!(crate::semantics_key_use::segment_resumable_after(
         JournalGap::IngestBreakLoss
     ));
     assert_eq!(
         crate::semantics_key_use::disposition_of(JournalGap::IngestBreakLoss),
-        crate::semantics_key_use::SealFailureDisposition::HistoryLoss
+        crate::semantics_key_use::SealFailureDisposition::Fallback
     );
 }
 
 /// Scope-round Step 5 pin: only the ingest-break void is named as
-/// resumable loss — audit voids keep their own dispositions (the two
-/// fault gaps never resume; ResourceUnavailable falls back instead of
-/// voiding history).
+/// resumable fenced fallback — audit voids keep their own
+/// dispositions (the two fault gaps never resume; a seal-time
+/// ResourceUnavailable refusal falls back, while the audit void
+/// carrying it upgrades to history loss and ends feeds degraded).
 #[test]
 fn joint_void_gaps_keep_their_own_resumability() {
     use crate::semantics_key_use::SealFailureDisposition;
@@ -21950,7 +21952,11 @@ fn joint_void_gaps_keep_their_own_resumability() {
             "{gap:?} never resumes"
         );
     }
-    // ResourceUnavailable is proof-only: fall back, never dispose.
+    // A seal-time ResourceUnavailable refusal with retained
+    // custody is proof-only: fall back, never dispose. (An audit
+    // void carrying it with resource_refused upgrades to history
+    // loss instead and ends feeds degraded — pinned by the
+    // resource-void fanout twin.)
     assert_eq!(
         crate::semantics_key_use::disposition_of(JournalGap::ResourceUnavailable),
         SealFailureDisposition::Fallback,
@@ -21978,9 +21984,9 @@ fn joint_void_gaps_keep_their_own_resumability() {
     }
 }
 
-/// Keyrows B1 twin: a voided feed stores the void's fence at its loss
-/// close, and a receipt cut below that fence never resumes Joint —
-/// re-selection (Task 3) is the only way back.
+/// Keyrows B1 twin: a voided feed stores the void's fence at its
+/// fenced fallback close, and a receipt cut below that fence never
+/// resumes Joint — re-selection (Task 3) is the only way back.
 #[test]
 fn key_operation_below_fence_receipt_never_resumes() {
     let instance =
@@ -22021,7 +22027,7 @@ fn key_operation_below_fence_receipt_never_resumes() {
     );
     assert!(matches!(
         outcome,
-        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
     ));
     assert!(
         !staging.resume_joint(),
@@ -22069,11 +22075,11 @@ fn key_operation_ordered_fallback_keeps_recorded_void_fence() {
     );
     assert!(matches!(
         outcome,
-        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
     ));
     let (replayed, _) =
         staging.ordered_fallback(&mut edge, &mut keyuse, instance, &mut sink, None, None);
-    assert_eq!(replayed, 0, "staging already drained by the loss");
+    assert_eq!(replayed, 0, "staging already drained by the replay");
     assert!(
         !staging.resume_joint(),
         "the void fence survives the local ending"
@@ -22125,7 +22131,7 @@ fn key_operation_below_fence_deferral_takes_once_per_fence() {
     );
     assert!(matches!(
         outcome,
-        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
     ));
     assert!(
         !staging.resume_joint(),
@@ -22203,7 +22209,7 @@ fn key_operation_at_fence_receipt_resumes() {
     );
     assert!(matches!(
         outcome,
-        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
     ));
     assert!(
         staging.resume_joint(),

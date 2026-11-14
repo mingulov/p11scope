@@ -326,9 +326,11 @@ impl JointCaptureOwner {
     /// the state a fenced loss leaves: staged unbounded abandonments
     /// preserved as permanent refusals, the consumed history fenced on
     /// every domain, all staged custody voided, the stream invalidated —
-    /// but no key refused. Later seals re-prove above the recorded
-    /// fence as `IngestBreakLoss` history loss; receipts cut below it
-    /// never resume. The next collect then re-syncs above the fence,
+    /// but no key refused. The void delivers as fenced
+    /// `IngestBreakLoss` fallback: staged calls replay as unknown-key
+    /// rows, and later seals re-prove above the recorded fence;
+    /// receipts cut below it never resume. The next collect then
+    /// re-syncs above the fence,
     /// like any unlocalized loss. The void's storage is prepaid from
     /// the ledger's reserver as in `dispose_without_ingest`; a refusal
     /// keeps the fail-closed refusal. Returns whether the lane was

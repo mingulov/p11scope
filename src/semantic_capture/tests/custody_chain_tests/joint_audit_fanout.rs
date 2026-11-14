@@ -9348,10 +9348,11 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
-/// Keyrows B1 machine twin: after a re-arm's void closes the feed with
-/// loss, a clean-point probe does NOT resume Joint onto the below-fence
-/// receipt — it reduces direct under the loss window, staging nothing.
-/// Without the gate the feed would resume onto its stale receipt.
+/// Keyrows B1 machine twin: after a re-arm's void closes the feed as
+/// fallback, a clean-point probe does NOT resume Joint onto the
+/// below-fence receipt — it reduces direct under the fallback
+/// window, staging nothing. Without the gate the feed would resume
+/// onto its stale receipt.
 #[test]
 fn joint_machine_voided_feed_refuses_below_fence_resume() {
     let mut fixture = MachineScene::new(1);
@@ -9371,7 +9372,7 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
         .scene
         .push(std::process::id(), 0, "C_CreateObject", 3);
     fixture.published_labeled("after running re-arm", None);
-    // Precondition: the void failure closed the feed with loss.
+    // Precondition: the void failure closed the feed as fallback.
     let feed_state = |fixture: &MachineScene| {
         let registry = fixture.scene.real.scene.coordinator.registry();
         let module = registry
@@ -9387,35 +9388,38 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
         let feed = &edges[0].feed;
         (
             feed.mode(),
-            feed.degraded_loss(),
             feed.fell_back(),
+            feed.degraded_loss(),
             feed.reduced(),
             feed.history_disposed(),
-            feed.degraded_loss_direct(),
+            feed.degraded_fallback_direct(),
         )
     };
-    let (mode_before, degraded_before, fell_back_before, _, _, _) = feed_state(&fixture);
+    let (mode_before, fell_back_before, degraded_before, _, _, _) = feed_state(&fixture);
     assert_eq!(
         mode_before,
         crate::semantics_key_use::FeedMode::S1Only,
         "the void failure closed the feed"
     );
     assert!(
-        degraded_before,
-        "the void failure closed the feed with loss"
+        fell_back_before,
+        "the void failure closed the feed as fallback"
     );
-    assert!(!fell_back_before, "no fallback precedes the probe");
+    assert!(!degraded_before, "replay is not loss");
     let (_, _, _, reduced_before, disposed_before, direct_before) = feed_state(&fixture);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
     fixture.published_labeled("below-fence-resume-probe", None);
-    let (mode_after, _, fell_back_after, reduced_after, disposed_after, direct_after) =
+    let (mode_after, fell_back_after, _, reduced_after, disposed_after, direct_after) =
         feed_state(&fixture);
     assert_eq!(
         mode_after,
         crate::semantics_key_use::FeedMode::S1Only,
         "no resume onto the below-fence receipt"
     );
-    assert!(!fell_back_after, "the probe never replays through fallback");
+    assert!(
+        fell_back_after,
+        "the fallback latch stands; the probe adds no replay"
+    );
     assert_eq!(reduced_after, reduced_before, "no replay without a resume");
     assert_eq!(
         disposed_after, disposed_before,
@@ -9424,17 +9428,18 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
     assert_eq!(
         direct_after,
         direct_before + 1,
-        "the probe reduces direct under the loss window"
+        "the probe reduces direct under the fallback window"
     );
 }
 
 /// Owner rule "calls happened => show data": after the re-arm's void
 /// delivers, a call staged above the fence replays through fallback
-/// — reduced +1 with its plain unknown-key row — instead of
-/// disposing; a later call below the fence still reduces direct
-/// (S1-only) without certifying or attesting anything.
+/// — reduced +1 with its plain `proof_refused_fallback` row —
+/// instead of disposing; a later call below the fence still reduces
+/// direct (S1-only) without certifying or attesting anything.
 #[test]
 fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() {
+    use crate::key_operation_projection::UnattributedRow;
     use crate::semantics_objects::journal::{BirthRefusal, BootstrapReceipt, SessionBirthGrant};
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
@@ -9475,13 +9480,14 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
     };
     let reduced = fixture.reduced_for(0);
     let disposed = fixture.disposed_total();
-    let unknown = fixture.unknown_terminals();
     fixture
         .scene
         .push(std::process::id(), 0, "C_CreateObject", 3);
     fixture.published_labeled("after running re-arm", None);
     // The recovery call replays: reduced +1, nothing disposed, and
-    // its observed completion stands as one unknown-key row.
+    // the production projection reads one plain fallback row for it
+    // (the refused quantum staged nothing, so no loss row stands
+    // beside it).
     assert_eq!(
         fixture.reduced_for(0),
         reduced + 1,
@@ -9492,20 +9498,24 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
         disposed,
         "replay disposes nothing"
     );
-    let unknown_after = fixture.unknown_terminals();
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let module = registry
+        .modules()
+        .find(|module| module.key == fixture.scene.real.modules[0].0)
+        .unwrap()
+        .id;
+    let feed = &registry
+        .instance_semantic_edges()
+        .find(|record| record.module == module)
+        .expect("the provider keeps its feed")
+        .feed;
     assert_eq!(
-        unknown_after[0] - unknown[0],
-        1,
-        "the replayed call keeps its plain unknown-key row"
-    );
-    assert_eq!(
-        (
-            unknown_after[1] - unknown[1],
-            unknown_after[2] - unknown[2],
-            unknown_after[3] - unknown[3],
-        ),
-        (0, 0, 0),
-        "replay adds no failed, cancelled or unknown outcomes"
+        crate::key_operation_projection::producer::unattributed(&[feed]),
+        vec![UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: 1,
+        },],
+        "the replayed call keeps its plain fallback row"
     );
     let (mode, fell_back, degraded_loss, _, replayed, _, _, fence) = feed_state(&fixture);
     assert_eq!(
@@ -12470,7 +12480,8 @@ impl MachineScene {
 
 /// Owner rule "partial, never stop": a transient whole-quantum native
 /// refusal mid-run abandons only that quantum, with named gaps, and the
-/// lane re-arms; the next quantum publishes and records rows again.
+/// lane re-arms; the next quantum publishes and records rows again
+/// (the fenced void replays the recovery as fallback).
 #[test]
 fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
     let mut fixture = MachineScene::new(1);
@@ -12535,18 +12546,18 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
             > revision,
         "the next quantum publishes"
     );
-    // The fenced void disposes post-re-arm staging as loss instead of
-    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
-    // while the recovery call is disposed once as counted history.
+    // The fenced void replays post-re-arm staging as fallback
+    // (Fallback, not HistoryLoss): `reduced` rises by the recovery
+    // call while disposed history stays put.
     assert_eq!(
         fixture.reduced_for(0),
-        reduced,
-        "the fenced void ends fallback replay across the re-arm"
+        reduced + 1,
+        "the fenced void replays the recovery call across the re-arm"
     );
     assert_eq!(
         fixture.disposed_total() - disposed_before_recovery,
-        1,
-        "the recovery call is disposed once as history"
+        0,
+        "replay disposes nothing"
     );
     // Journal history ingested in the abandoned quantum never certifies
     // later rows: the next collect voided every existing key, named.
@@ -13619,18 +13630,18 @@ fn joint_machine_bound_demand_refusal_rearms_as_published() {
             > revision,
         "the next quantum publishes"
     );
-    // The fenced void disposes post-re-arm staging as loss instead of
-    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
-    // while the recovery call is disposed once as counted history.
+    // The fenced void replays post-re-arm staging as fallback
+    // (Fallback, not HistoryLoss): `reduced` rises by the recovery
+    // call while disposed history stays put.
     assert_eq!(
         fixture.reduced_for(0),
-        reduced,
-        "the fenced void ends fallback replay across the re-arm"
+        reduced + 1,
+        "the fenced void replays the recovery call across the re-arm"
     );
     assert_eq!(
         fixture.disposed_total() - disposed_before_recovery,
-        1,
-        "the recovery call is disposed once as history"
+        0,
+        "replay disposes nothing"
     );
 }
 
@@ -13802,19 +13813,18 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
             > revision,
         "the next quantum publishes"
     );
-    // The fenced void disposes post-re-arm staging as loss instead of
-    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
-    // past the re-arm while the recovery call is disposed once as
-    // counted history.
+    // The fenced void replays post-re-arm staging as fallback
+    // (Fallback, not HistoryLoss): `reduced` rises by the recovery
+    // call past the re-arm while disposed history stays put.
     assert_eq!(
         fixture.reduced_for(0),
-        reduced_at_rearm,
-        "the fenced void replays nothing after the re-arm"
+        reduced_at_rearm + 1,
+        "the fenced void replays the recovery call after the re-arm"
     );
     assert_eq!(
         fixture.disposed_total() - disposed_before_recovery,
-        1,
-        "the recovery call is disposed once as history"
+        0,
+        "replay disposes nothing"
     );
     assert_eq!(
         api_returns(&fixture),

@@ -99,6 +99,9 @@ use std::sync::Arc;
 
 #[path = "inventory.rs"]
 pub(crate) mod inventory;
+#[path = "member_stop.rs"]
+mod member_stop;
+pub(crate) use member_stop::MemberStopIo;
 #[path = "inventory_coordinator.rs"]
 pub(crate) mod inventory_coordinator;
 
@@ -527,6 +530,9 @@ pub struct Engine {
     /// inventory refresh consumed them: shallow-idle frames must not
     /// skip the apply that attaches the new file.
     learned_unapplied: bool,
+    /// Run-tree first-map stop service state (`member_stop`): members
+    /// stopped at their first map of an uncleared executable file.
+    member_stops: member_stop::MemberStopState,
     /// Pids deferred for handles (view-collapse fix7, owner 21:10):
     /// reserve/budget/wait deferrals that owe a retry, each with its
     /// deferral mono-ns (`None` when that clock read failed — ordering
@@ -13205,6 +13211,7 @@ impl Engine {
             owned_watch_run_budget_ns: OWNED_WATCH_RUN_BUDGET_NS,
             child_priority_spared: BTreeSet::new(),
             learned_unapplied: false,
+            member_stops: member_stop::MemberStopState::default(),
             handles_deferred: BTreeMap::new(),
             handles_last_retry_delay_ns: None,
             handles_freed_frame_owed: false,
@@ -22496,9 +22503,13 @@ impl Engine {
                 // first-use gap row would mislead. Transient provers
                 // (whose slots retire with them) and uncovered keys
                 // still owe the row.
+                // A file a run-member stop staged owes no row either:
+                // its mapper is still stopped before its first call, and
+                // the hold files the row itself if it ends unattached.
                 if !(candidate.run_learned
                     && candidate.proving_retained
                     && scan_covered.contains_key(&input.key))
+                    && !self.member_stops.stop_staged.contains(&identity)
                 {
                     row_owed = true;
                 }

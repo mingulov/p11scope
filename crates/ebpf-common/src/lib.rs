@@ -889,6 +889,59 @@ pub struct PauseKey {
     pub generation_token: u64,
 }
 
+/// Run-tree first-map stops: pending stops, one row per stopped tgid.
+/// The kernel inserts a row (no-overwrite) and sends one SIGSTOP when a
+/// member of an owned, pause-armed run maps an executable file it has
+/// not seen cleared; userspace inspects the file, attaches any provider
+/// it proves, clears the file, removes the row and resumes the member.
+pub const MEMBER_STOP_ENTRIES: u32 = 1024;
+/// Executable files cleared for every later mapping of this capture:
+/// non-providers, and providers whose probes are attached. An LRU, so a
+/// full table forgets the oldest clearance (one more stop) instead of
+/// stopping every later mapper.
+pub const MEMBER_CLEARED_ENTRIES: u32 = 16_384;
+/// Member-stop counters (per-CPU, summed by userspace).
+pub const MEMBER_STOP_COUNTERS: u32 = 4;
+/// Stops requested (a row inserted and the helper accepted SIGSTOP).
+pub const MEMBER_STOP_COUNTER_REQUESTED: u32 = 0;
+/// Mappings that needed a stop but found the pending table full: those
+/// members ran on unprotected (a counted named gap).
+pub const MEMBER_STOP_COUNTER_TABLE_FULL: u32 = 1;
+/// Stops the helper refused (the row was withdrawn): unprotected.
+pub const MEMBER_STOP_COUNTER_SIGNAL_FAILED: u32 = 2;
+/// Executable mappings whose file identity could not be read: no stop,
+/// unprotected.
+pub const MEMBER_STOP_COUNTER_IDENTITY_UNREAD: u32 = 3;
+
+/// Kernel identity of one mapped file: the superblock device and inode
+/// number exactly as the kernel stores them. Userspace never derives a
+/// key from `stat`: it copies the kernel's pending rows or the
+/// kernel-written `maps` device and inode of the same file.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MemberFileKey {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// The member-stop object's one config row: `active` gates every stop;
+/// `exempt_tgid` is the owned child, whose own pause chain owns it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MemberStopConfig {
+    pub active: u32,
+    pub exempt_tgid: u32,
+}
+
+/// One pending member stop: the file whose mapping requested it, and the
+/// kernel time of the request.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MemberStop {
+    pub file: MemberFileKey,
+    pub hook_ts_ns: u64,
+}
+
 fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
     record.binding_id == 0 && zero_discovery_payload_except_binding(record)
 }
@@ -1273,6 +1326,12 @@ unsafe impl aya::Pod for StateKey {}
 unsafe impl aya::Pod for StartState {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PauseKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MemberFileKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MemberStop {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MemberStopConfig {}
 
 /// Mechanism parameter shape codes. Userspace maps the registry's shape
 /// string to one of these and publishes it into MECH_SHAPE, keyed by
@@ -3047,6 +3106,15 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    #[test]
+    fn member_stop_shapes_are_fixed() {
+        assert_eq!(core::mem::size_of::<MemberFileKey>(), 16);
+        assert_eq!(core::mem::size_of::<MemberStop>(), 24);
+        assert_eq!(core::mem::offset_of!(MemberStop, hook_ts_ns), 16);
+        assert_eq!(core::mem::size_of::<MemberStopConfig>(), 8);
+        assert_eq!(core::mem::offset_of!(MemberStopConfig, exempt_tgid), 4);
     }
 
     /// A legacy acquisition describes the common ordinal catalog, independently

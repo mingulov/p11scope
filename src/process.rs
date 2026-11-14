@@ -1176,6 +1176,42 @@ impl ProcPin<'_> {
         Ok(ProcPin { pin, directory })
     }
 
+    /// Opens the file one mapped range names, read-only, through its
+    /// `map_files` link (the kernel follows the VMA's own file, so no
+    /// pathname is re-resolved). Needs `CAP_SYS_ADMIN` (or
+    /// `CAP_CHECKPOINT_RESTORE`); a refusal is returned, never retried.
+    pub(crate) fn open_mapped_file(
+        &self,
+        start: u64,
+        end: u64,
+        deadline: std::time::Instant,
+    ) -> Result<std::fs::File, String> {
+        if start >= end || start & 4095 != 0 || end & 4095 != 0 {
+            return Err("invalid mapped range".into());
+        }
+        self.before_io(deadline)?;
+        let path = std::ffi::CString::new(format!("map_files/{start:x}-{end:x}")).unwrap();
+        // SAFETY: retained directory, typed internally generated range
+        // path; without O_NOFOLLOW the open follows the map_files link.
+        let fd = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "opening retained mapped file: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: openat returned a newly owned fd.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        self.before_io(deadline)?;
+        Ok(file)
+    }
+
     /// Typed range confirmation only; no raw descriptor or arbitrary-path API.
     pub(crate) fn mapped_file_identity(
         &self,

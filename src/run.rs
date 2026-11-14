@@ -11553,6 +11553,14 @@ fn capture_trace(
                     Ok(end)
                 },
                 |context, consumers| {
+                    // Exit transfer ahead of the EVENTS drain: exits the
+                    // discovery pass just tapped stamp the current producer
+                    // position, and the drain below retires what is due. A
+                    // positions failure skips the transfer; the drain below
+                    // fails loudly.
+                    if let Ok(positions) = context.1.event_drain_positions() {
+                        transfer_exit_taps(context.0, consumers.tracker, positions.producer);
+                    }
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
                         context.3,
@@ -12030,6 +12038,12 @@ fn capture_trace(
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
+                    // Terminal exit transfer: exits the terminal discovery
+                    // drain tapped stamp the current producer position ahead
+                    // of the terminal EVENTS drain, which retires what is due.
+                    if let Ok(positions) = context.1.event_drain_positions() {
+                        transfer_exit_taps(context.0, consumers.tracker, positions.producer);
+                    }
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
                         context.3,
@@ -13652,6 +13666,7 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
         }
     }
     combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
+    retire_due_exits(drain, state, tracker);
     Ok((drain.take_malformed_delta(), post_q_record))
 }
 
@@ -13969,6 +13984,7 @@ fn drain_trace_events_from_with_identities<S: crate::events::BoundedRecordSource
         }
     });
     combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
+    retire_due_exits(drain, state, tracker);
     // A reached live limit owns no more live work: the readiness loop must
     // not re-poll past it, and the terminal drain owns the remainder.
     let live_limited = quantum.is_some() && matches!(*remaining, Some(0));

@@ -8457,11 +8457,13 @@ pub(crate) fn capture_diagnostics_on() -> bool {
 
 /// A0 assembly: the profile/trace capture lens over the live owners.
 /// The R12 pid sample is O(entries): call only on the 60 s emit path
-/// and at end of capture, never on the hot path.
+/// and at end of capture, never on the hot path. The baseline is the
+/// loop-start RSS the caller sampled once (the floor row).
 fn capture_memory_lens(
     engine: &Engine,
     state: &semantics::State,
     tracker: &process::Tracker,
+    baseline_rss_kb: Option<u64>,
 ) -> crate::memory_counters::ProfileLens {
     crate::memory_counters::ProfileLens {
         history: engine.memory_history_lens(),
@@ -8472,7 +8474,22 @@ fn capture_memory_lens(
             .map(|key| key.pid)
             .collect(),
         tasks: tracker.memory_tasks_row(),
+        baseline_rss_kb,
     }
+}
+
+/// A0 assembly: the trace R11 lens over the live tracer, read only
+/// through B0's size accessors (spec §3.5; A0 never touches
+/// `trace.rs` internals).
+fn tracer_memory_lens(tracer: &trace::Tracer) -> crate::memory_counters::TracerLens {
+    let reasons = tracer.caller_reasons();
+    crate::memory_counters::TracerLens::from_sizes(
+        reasons.caller_entries(),
+        reasons.row_entries(),
+        reasons.overflowed(),
+        reasons.folded_lines(),
+        reasons.folded_rows(),
+    )
 }
 
 /// A0 periodic emit: one `-v` stderr `p11scope: memory` line every
@@ -9300,6 +9317,10 @@ fn capture_profile(
     }
     let clock = Instant::now();
     let mut mem_cadence = crate::memory_counters::MemoryCadence::new();
+    // A0 floor row: the observer's own RSS once attach is done, before
+    // the first tick grows anything (the discovery-baseline proxy A1
+    // refines against smaps).
+    let mem_baseline_rss_kb = crate::memory_counters::self_rss_hwm_kb().map(|(rss, _)| rss);
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker,
@@ -9786,7 +9807,7 @@ fn capture_profile(
         maybe_emit_memory_line(&mut mem_cadence, |elapsed| {
             crate::memory_counters::MemorySnapshot::for_profile(
                 elapsed,
-                capture_memory_lens(engine, &state, &process_tracker),
+                capture_memory_lens(engine, &state, &process_tracker, mem_baseline_rss_kb),
                 resolve_capture_ring_bytes(policy, false, ring_bytes),
                 None,
             )
@@ -10771,7 +10792,7 @@ fn capture_profile(
     if capture_diagnostics_on() {
         crate::memory_counters::emit_line(&crate::memory_counters::MemorySnapshot::for_profile(
             clock.elapsed().as_secs(),
-            capture_memory_lens(engine, &state, &process_tracker),
+            capture_memory_lens(engine, &state, &process_tracker, mem_baseline_rss_kb),
             resolve_capture_ring_bytes(policy, false, ring_bytes),
             seal_value_bytes,
         ));
@@ -11063,6 +11084,10 @@ fn capture_trace(
     let mut pin_gate = crate::timing::PinSweepGate::new();
     let clock = Instant::now();
     let mut mem_cadence = crate::memory_counters::MemoryCadence::new();
+    // A0 floor row: the observer's own RSS once attach is done, before
+    // the first tick grows anything (the discovery-baseline proxy A1
+    // refines against smaps).
+    let mem_baseline_rss_kb = crate::memory_counters::self_rss_hwm_kb().map(|(rss, _)| rss);
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -11369,9 +11394,10 @@ fn capture_trace(
         maybe_emit_memory_line(&mut mem_cadence, |elapsed| {
             crate::memory_counters::MemorySnapshot::for_trace(
                 elapsed,
-                capture_memory_lens(engine, &state, &process_tracker),
+                capture_memory_lens(engine, &state, &process_tracker, mem_baseline_rss_kb),
                 resolve_ring_bytes(None),
                 None,
+                &tracer_memory_lens(&tracer),
             )
         });
         // Stage the discovery ring on every tick: discovery is applied once
@@ -12120,13 +12146,14 @@ fn capture_trace(
         },
     );
     // A0 end-of-capture line: `-v` stderr only. The trace path seals
-    // no `Value` tree, so R5 stays N/A; R11 is pending on B0.
+    // no `Value` tree, so R5 stays N/A; R11 rides the live tracer.
     if capture_diagnostics_on() {
         crate::memory_counters::emit_line(&crate::memory_counters::MemorySnapshot::for_trace(
             clock.elapsed().as_secs(),
-            capture_memory_lens(engine, &state, &process_tracker),
+            capture_memory_lens(engine, &state, &process_tracker, mem_baseline_rss_kb),
             resolve_ring_bytes(None),
             None,
+            &tracer_memory_lens(&tracer),
         ));
     }
     trace_outcome

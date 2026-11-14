@@ -47,6 +47,15 @@ pub(crate) const HEAP_TEMPLATE_ROW: usize = 160;
 pub(crate) const HEAP_HISTORY_VALUE: usize = 256;
 /// Object-model records: views, pending calls, deferred origins.
 pub(crate) const HEAP_MODEL_RECORD: usize = 192;
+/// Registry key/index strings: module-key paths/digests, gap
+/// subject/reason strings.
+pub(crate) const HEAP_MODULE_KEY: usize = 192;
+/// Deferred-origin records: frozen inputs and pruned-domain memory.
+pub(crate) const HEAP_DEFERRED_RECORD: usize = 128;
+/// R11 caller key: exe path string plus the inner row-map shell.
+pub(crate) const HEAP_R11_CALLER: usize = 192;
+/// R11 (function, rv) row: function-name string.
+pub(crate) const HEAP_R11_ROW: usize = 96;
 
 /// One counter row: entry count and estimated bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,11 +78,13 @@ pub(crate) fn counter_row(
     }
 }
 
-/// R1 lens: the adapter's caller and incarnation tables.
+/// R1 lens: the adapter's caller and incarnation tables, plus the
+/// live-pid index (spec §3.1 siblings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdapterLens {
     pub callers: CounterRow,
     pub incarnations: CounterRow,
+    pub live_by_pid: CounterRow,
 }
 
 /// R3 lens: per-edge session/operation/mechanism maps, summed over
@@ -84,19 +95,27 @@ pub(crate) struct EdgeLens {
     pub active: CounterRow,
     pub mechs: CounterRow,
     pub pending: CounterRow,
+    pub detached: CounterRow,
 }
 
-/// R2 lens: registry caller/module/edge tables plus R3.
+/// R2 lens: registry caller/module/edge tables plus R3, the key/gap
+/// sibling indexes, and the semantic pool charge (spec §3.1: the R3
+/// mechanism-cell bytes against the 160 MiB pool).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryLens {
     pub callers: CounterRow,
     pub retired: CounterRow,
     pub modules: CounterRow,
     pub edges: CounterRow,
+    pub modules_by_key: CounterRow,
+    pub gap_index: CounterRow,
     pub edge: EdgeLens,
+    pub mech_pool_used_bytes: u64,
 }
 
-/// R4 lens: the object model's session/object/pending tables.
+/// R4 lens: the object model's session/object/pending tables, the
+/// domain/instance maps, the deferred-origin tables, the
+/// pruned-domain memory, and the gap counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelLens {
     pub sessions: CounterRow,
@@ -104,6 +123,13 @@ pub(crate) struct ModelLens {
     pub pending: CounterRow,
     pub pruned_sessions: u64,
     pub pruned_objects: u64,
+    pub domains: CounterRow,
+    pub instances: CounterRow,
+    pub deferred_pending: CounterRow,
+    pub deferred_detached: CounterRow,
+    pub deferred_releases: CounterRow,
+    pub recently_pruned: CounterRow,
+    pub gaps: CounterRow,
 }
 
 /// R6 rows: every `CaptureHistory` per-ever set. No set is skipped:
@@ -123,6 +149,11 @@ pub(crate) struct HistoryRows {
     pub scan_gap_tombstones: CounterRow,
     pub corroboration_tombstones: CounterRow,
     pub fallback_tombstones: CounterRow,
+    pub selection_inventory: CounterRow,
+    pub selection_surfaces: CounterRow,
+    pub manifest_selection_ordinals: CounterRow,
+    pub selections: CounterRow,
+    pub standard_exports: CounterRow,
 }
 
 /// R6 lens.
@@ -138,6 +169,9 @@ pub(crate) struct HistoryLens {
 pub(crate) struct StateLens {
     pub param_combos: CounterRow,
     pub attr_types: CounterRow,
+    pub by_module: CounterRow,
+    pub cgroup_mechanisms: CounterRow,
+    pub cgroup_retained_paths: CounterRow,
     pub mechanisms: CounterRow,
     pub templates: CounterRow,
     pub logins: CounterRow,
@@ -153,18 +187,58 @@ pub(crate) struct StateLens {
     pub inherited_ambiguous: CounterRow,
 }
 
+/// R11 lens: the trace `CallerReasons` sizes, read only through the
+/// size accessors B0 adds (`trace.rs`: `caller_entries`, `row_entries`,
+/// `overflowed`, `folded_lines`, `folded_rows`). Entry shapes mirror
+/// B0's private aliases (`CallerKey = (u32, Option<String>)`,
+/// `FunctionRv = (String, u64)`); A0 never touches `trace.rs`
+/// internals (spec §3.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TracerLens {
+    pub outer: CounterRow,
+    pub rows: CounterRow,
+    pub overflowed: bool,
+    pub folded_lines: u64,
+    pub folded_rows: u64,
+}
+
+impl TracerLens {
+    pub(crate) fn from_sizes(
+        outer: usize,
+        rows: usize,
+        overflowed: bool,
+        folded_lines: u64,
+        folded_rows: usize,
+    ) -> Self {
+        Self {
+            outer: counter_row(
+                outer,
+                std::mem::size_of::<(u32, Option<String>)>(),
+                HEAP_R11_CALLER,
+            ),
+            rows: counter_row(rows, std::mem::size_of::<(String, u64)>(), HEAP_R11_ROW),
+            overflowed,
+            folded_lines,
+            folded_rows: folded_rows as u64,
+        }
+    }
+}
+
 /// Profile/trace capture lens: engine history, semantic state,
-/// distinct R12 pids for the live/dead sample, and history tasks.
+/// distinct R12 pids for the live/dead sample, history tasks, and the
+/// capture-start RSS baseline for the floor row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileLens {
     pub history: HistoryLens,
     pub state: StateLens,
     pub process_pids: Vec<u32>,
     pub tasks: CounterRow,
+    pub baseline_rss_kb: Option<u64>,
 }
 
 /// Inventory capture lens: adapter, registry (+R3), history, object
-/// model, and the metadata frame row count if the lane is active.
+/// model, the metadata frame row count if the lane is active, and the
+/// capture-start RSS baseline for the floor row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InventoryLens {
     pub adapter: AdapterLens,
@@ -172,6 +246,7 @@ pub(crate) struct InventoryLens {
     pub history: HistoryLens,
     pub model: ModelLens,
     pub metadata_rows: Option<CounterRow>,
+    pub baseline_rss_kb: Option<u64>,
 }
 
 /// One capture's memory snapshot. `None` rows are N/A: the command
@@ -182,24 +257,39 @@ pub(crate) struct MemorySnapshot {
     elapsed_secs: u64,
     r1_adapter_callers: Option<CounterRow>,
     r1_adapter_incarnations: Option<CounterRow>,
+    r1_adapter_live_by_pid: Option<CounterRow>,
     r2_registry_callers: Option<CounterRow>,
     r2_registry_retired: Option<CounterRow>,
     r2_registry_modules: Option<CounterRow>,
     r2_registry_edges: Option<CounterRow>,
+    r2_modules_by_key: Option<CounterRow>,
+    r2_gap_index: Option<CounterRow>,
     r3_edge_open: Option<CounterRow>,
     r3_edge_active: Option<CounterRow>,
     r3_edge_mechs: Option<CounterRow>,
     r3_edge_pending: Option<CounterRow>,
+    r3_edge_detached: Option<CounterRow>,
     r3_mech_pool_bytes: u64,
+    r3_mech_pool_used_bytes: Option<u64>,
     r4_model_sessions: Option<CounterRow>,
     r4_model_objects: Option<CounterRow>,
     r4_model_pending: Option<CounterRow>,
     r4_pruned_sessions: Option<u64>,
     r4_pruned_objects: Option<u64>,
+    r4_domains: Option<CounterRow>,
+    r4_instances: Option<CounterRow>,
+    r4_deferred_pending: Option<CounterRow>,
+    r4_deferred_detached: Option<CounterRow>,
+    r4_deferred_releases: Option<CounterRow>,
+    r4_recently_pruned: Option<CounterRow>,
+    r4_gaps: Option<CounterRow>,
     r5_seal_value_bytes: Option<u64>,
     r6: Option<HistoryRows>,
     r7_param_combos: Option<CounterRow>,
     r7_attr_types: Option<CounterRow>,
+    r7_by_module: Option<CounterRow>,
+    r7_cgroup_mechanisms: Option<CounterRow>,
+    r7_cgroup_retained_paths: Option<CounterRow>,
     r8_mechanisms: Option<CounterRow>,
     r8_templates: Option<CounterRow>,
     r8_logins: Option<CounterRow>,
@@ -209,7 +299,9 @@ pub(crate) struct MemorySnapshot {
     r10_reduced: Option<CounterRow>,
     r11_caller_reasons_outer: Option<CounterRow>,
     r11_caller_reasons_rows: Option<CounterRow>,
-    r11_pending_b0: bool,
+    r11_overflowed: bool,
+    r11_folded_lines: u64,
+    r11_folded_rows: u64,
     r12_open: Option<CounterRow>,
     r12_active_ops: Option<CounterRow>,
     r12_next_pseudonym: Option<CounterRow>,
@@ -220,6 +312,7 @@ pub(crate) struct MemorySnapshot {
     r12_live_processes: Option<u64>,
     r12_dead_processes: Option<u64>,
     caller_metadata_rows: Option<CounterRow>,
+    floor_discovery_baseline_kb: Option<u64>,
     floor_staging_bytes: u64,
     floor_ring_bytes: u64,
     self_rss_kb: Option<u64>,
@@ -289,19 +382,20 @@ impl MemorySnapshot {
             lens,
             ring_bytes,
             seal_value_bytes,
-            false,
+            None,
             probe,
         )
     }
 
     /// Trace snapshot: like profile, but R5 is always N/A (the trace
-    /// path streams lines; it seals no `Value` tree) and R11 is
-    /// pending on the B0 accessors (TODO hook, trace only).
+    /// path streams lines; it seals no `Value` tree) and R11 rides the
+    /// B0 accessors through `tracer` (trace only).
     pub(crate) fn for_trace(
         elapsed_secs: u64,
         lens: ProfileLens,
         ring_bytes: u32,
         seal_value_bytes: Option<u64>,
+        tracer: &TracerLens,
     ) -> Self {
         Self::for_event_capture(
             "trace",
@@ -309,7 +403,7 @@ impl MemorySnapshot {
             lens,
             ring_bytes,
             seal_value_bytes,
-            true,
+            Some(tracer),
             &proc_pid_live,
         )
     }
@@ -321,8 +415,17 @@ impl MemorySnapshot {
         lens: ProfileLens,
         ring_bytes: u32,
         probe: &dyn Fn(u32) -> bool,
+        tracer: &TracerLens,
     ) -> Self {
-        Self::for_event_capture("trace", elapsed_secs, lens, ring_bytes, None, true, probe)
+        Self::for_event_capture(
+            "trace",
+            elapsed_secs,
+            lens,
+            ring_bytes,
+            None,
+            Some(tracer),
+            probe,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,7 +435,7 @@ impl MemorySnapshot {
         lens: ProfileLens,
         ring_bytes: u32,
         seal_value_bytes: Option<u64>,
-        r11_pending_b0: bool,
+        r11: Option<&TracerLens>,
         probe: &dyn Fn(u32) -> bool,
     ) -> Self {
         let (live, dead) = split_live_dead(&lens.process_pids, probe);
@@ -343,24 +446,39 @@ impl MemorySnapshot {
             elapsed_secs,
             r1_adapter_callers: None,
             r1_adapter_incarnations: None,
+            r1_adapter_live_by_pid: None,
             r2_registry_callers: None,
             r2_registry_retired: None,
             r2_registry_modules: None,
             r2_registry_edges: None,
+            r2_modules_by_key: None,
+            r2_gap_index: None,
             r3_edge_open: None,
             r3_edge_active: None,
             r3_edge_mechs: None,
             r3_edge_pending: None,
+            r3_edge_detached: None,
             r3_mech_pool_bytes: crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64,
+            r3_mech_pool_used_bytes: None,
             r4_model_sessions: None,
             r4_model_objects: None,
             r4_model_pending: None,
             r4_pruned_sessions: None,
             r4_pruned_objects: None,
+            r4_domains: None,
+            r4_instances: None,
+            r4_deferred_pending: None,
+            r4_deferred_detached: None,
+            r4_deferred_releases: None,
+            r4_recently_pruned: None,
+            r4_gaps: None,
             r5_seal_value_bytes: seal_value_bytes,
             r6: Some(lens.history.rows),
             r7_param_combos: Some(state.param_combos),
             r7_attr_types: Some(state.attr_types),
+            r7_by_module: Some(state.by_module),
+            r7_cgroup_mechanisms: Some(state.cgroup_mechanisms),
+            r7_cgroup_retained_paths: Some(state.cgroup_retained_paths),
             r8_mechanisms: Some(state.mechanisms),
             r8_templates: Some(state.templates),
             r8_logins: Some(state.logins),
@@ -368,9 +486,11 @@ impl MemorySnapshot {
             r8_mech_shapes: Some(state.mech_shapes),
             r9_tasks: Some(lens.tasks),
             r10_reduced: Some(state.reduced),
-            r11_caller_reasons_outer: None,
-            r11_caller_reasons_rows: None,
-            r11_pending_b0,
+            r11_caller_reasons_outer: r11.map(|t| t.outer),
+            r11_caller_reasons_rows: r11.map(|t| t.rows),
+            r11_overflowed: r11.is_some_and(|t| t.overflowed),
+            r11_folded_lines: r11.map_or(0, |t| t.folded_lines),
+            r11_folded_rows: r11.map_or(0, |t| t.folded_rows),
             r12_open: Some(state.open),
             r12_active_ops: Some(state.active_ops),
             r12_next_pseudonym: Some(state.next_pseudonym),
@@ -381,6 +501,7 @@ impl MemorySnapshot {
             r12_live_processes: Some(live),
             r12_dead_processes: Some(dead),
             caller_metadata_rows: None,
+            floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
             floor_ring_bytes: ring,
             self_rss_kb: rss,
@@ -397,24 +518,39 @@ impl MemorySnapshot {
             elapsed_secs,
             r1_adapter_callers: Some(lens.adapter.callers),
             r1_adapter_incarnations: Some(lens.adapter.incarnations),
+            r1_adapter_live_by_pid: Some(lens.adapter.live_by_pid),
             r2_registry_callers: Some(lens.registry.callers),
             r2_registry_retired: Some(lens.registry.retired),
             r2_registry_modules: Some(lens.registry.modules),
             r2_registry_edges: Some(lens.registry.edges),
+            r2_modules_by_key: Some(lens.registry.modules_by_key),
+            r2_gap_index: Some(lens.registry.gap_index),
             r3_edge_open: Some(lens.registry.edge.open),
             r3_edge_active: Some(lens.registry.edge.active),
             r3_edge_mechs: Some(lens.registry.edge.mechs),
             r3_edge_pending: Some(lens.registry.edge.pending),
+            r3_edge_detached: Some(lens.registry.edge.detached),
             r3_mech_pool_bytes: crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64,
+            r3_mech_pool_used_bytes: Some(lens.registry.mech_pool_used_bytes),
             r4_model_sessions: Some(lens.model.sessions),
             r4_model_objects: Some(lens.model.objects),
             r4_model_pending: Some(lens.model.pending),
             r4_pruned_sessions: Some(lens.model.pruned_sessions),
             r4_pruned_objects: Some(lens.model.pruned_objects),
+            r4_domains: Some(lens.model.domains),
+            r4_instances: Some(lens.model.instances),
+            r4_deferred_pending: Some(lens.model.deferred_pending),
+            r4_deferred_detached: Some(lens.model.deferred_detached),
+            r4_deferred_releases: Some(lens.model.deferred_releases),
+            r4_recently_pruned: Some(lens.model.recently_pruned),
+            r4_gaps: Some(lens.model.gaps),
             r5_seal_value_bytes: None,
             r6: Some(lens.history.rows),
             r7_param_combos: None,
             r7_attr_types: None,
+            r7_by_module: None,
+            r7_cgroup_mechanisms: None,
+            r7_cgroup_retained_paths: None,
             r8_mechanisms: None,
             r8_templates: None,
             r8_logins: None,
@@ -424,7 +560,9 @@ impl MemorySnapshot {
             r10_reduced: None,
             r11_caller_reasons_outer: None,
             r11_caller_reasons_rows: None,
-            r11_pending_b0: false,
+            r11_overflowed: false,
+            r11_folded_lines: 0,
+            r11_folded_rows: 0,
             r12_open: None,
             r12_active_ops: None,
             r12_next_pseudonym: None,
@@ -435,6 +573,7 @@ impl MemorySnapshot {
             r12_live_processes: None,
             r12_dead_processes: None,
             caller_metadata_rows: lens.metadata_rows,
+            floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
             floor_ring_bytes: ring,
             self_rss_kb: rss,
@@ -592,6 +731,11 @@ mod tests {
                 scan_gap_tombstones: row(11),
                 corroboration_tombstones: row(12),
                 fallback_tombstones: row(13),
+                selection_inventory: row(14),
+                selection_surfaces: row(15),
+                manifest_selection_ordinals: row(16),
+                selections: row(17),
+                standard_exports: row(18),
             },
         }
     }
@@ -600,6 +744,9 @@ mod tests {
         StateLens {
             param_combos: row(1),
             attr_types: row(2),
+            by_module: row(16),
+            cgroup_mechanisms: row(17),
+            cgroup_retained_paths: row(18),
             mechanisms: row(3),
             templates: row(4),
             logins: row(5),
@@ -622,6 +769,7 @@ mod tests {
             state: full_state(),
             process_pids: vec![1, 2],
             tasks: row(3),
+            baseline_rss_kb: Some(4321),
         }
     }
 
@@ -630,18 +778,23 @@ mod tests {
             adapter: AdapterLens {
                 callers: row(1),
                 incarnations: row(2),
+                live_by_pid: row(3),
             },
             registry: RegistryLens {
                 callers: row(3),
                 retired: row(4),
                 modules: row(5),
                 edges: row(6),
+                modules_by_key: row(7),
+                gap_index: row(8),
                 edge: EdgeLens {
                     open: row(7),
                     active: row(8),
                     mechs: row(9),
                     pending: row(10),
+                    detached: row(11),
                 },
+                mech_pool_used_bytes: 999,
             },
             history: full_history(),
             model: ModelLens {
@@ -650,8 +803,16 @@ mod tests {
                 pending: row(13),
                 pruned_sessions: 14,
                 pruned_objects: 15,
+                domains: row(17),
+                instances: row(18),
+                deferred_pending: row(19),
+                deferred_detached: row(20),
+                deferred_releases: row(21),
+                recently_pruned: row(22),
+                gaps: row(23),
             },
             metadata_rows: Some(row(16)),
+            baseline_rss_kb: Some(4321),
         }
     }
 
@@ -698,24 +859,51 @@ mod tests {
         assert!(profile.r4_model_pending.is_none());
         assert!(profile.r11_caller_reasons_outer.is_none());
         assert!(profile.r11_caller_reasons_rows.is_none());
-        assert!(!profile.r11_pending_b0);
+        assert!(!profile.r11_overflowed);
+        assert_eq!(profile.r11_folded_lines, 0);
+        assert_eq!(profile.r11_folded_rows, 0);
         assert!(profile.caller_metadata_rows.is_none());
+        // Full §3.1 list (round 2): N/A rows for structures the
+        // profile path does not own, owned rows present.
+        assert!(profile.r1_adapter_live_by_pid.is_none());
+        assert!(profile.r2_modules_by_key.is_none());
+        assert!(profile.r2_gap_index.is_none());
+        assert!(profile.r3_edge_detached.is_none());
+        assert_eq!(profile.r3_mech_pool_used_bytes, None);
+        assert!(profile.r4_domains.is_none());
+        assert!(profile.r4_instances.is_none());
+        assert!(profile.r4_deferred_pending.is_none());
+        assert!(profile.r4_deferred_detached.is_none());
+        assert!(profile.r4_deferred_releases.is_none());
+        assert!(profile.r4_recently_pruned.is_none());
+        assert!(profile.r4_gaps.is_none());
+        assert_eq!(r6.selection_inventory.len, 14);
+        assert_eq!(r6.selection_surfaces.len, 15);
+        assert_eq!(r6.manifest_selection_ordinals.len, 16);
+        assert_eq!(r6.selections.len, 17);
+        assert_eq!(r6.standard_exports.len, 18);
+        assert_eq!(profile.r7_by_module.expect("R7").len, 16);
+        assert_eq!(profile.r7_cgroup_mechanisms.expect("R7").len, 17);
+        assert_eq!(profile.r7_cgroup_retained_paths.expect("R7").len, 18);
+        assert_eq!(profile.floor_discovery_baseline_kb, Some(4321));
 
         let trace = MemorySnapshot::for_trace_with_probe(
             60,
             full_profile_lens(),
             32 * 1024 * 1024,
             &|_| true,
+            &TracerLens::from_sizes(2, 5, true, 7, 3),
         );
         assert_eq!(trace.command, "trace");
         assert_eq!(trace.r9_tasks.expect("trace owns R9").len, 3);
         assert_eq!(trace.r12_live_processes, Some(2));
         assert_eq!(trace.r12_dead_processes, Some(0));
-        // R11 sizes arrive with the B0 accessors; until then the row is
-        // N/A with the pending marker set (trace only).
-        assert!(trace.r11_caller_reasons_outer.is_none());
-        assert!(trace.r11_caller_reasons_rows.is_none());
-        assert!(trace.r11_pending_b0);
+        // R11 rides B0's accessors (round 2): no pending hook remains.
+        assert_eq!(trace.r11_caller_reasons_outer.expect("R11").len, 2);
+        assert_eq!(trace.r11_caller_reasons_rows.expect("R11").len, 5);
+        assert!(trace.r11_overflowed);
+        assert_eq!(trace.r11_folded_lines, 7);
+        assert_eq!(trace.r11_folded_rows, 3);
 
         let inventory = MemorySnapshot::for_inventory(60, full_inventory_lens(), 32 * 1024 * 1024);
         assert_eq!(inventory.command, "inventory");
@@ -728,12 +916,34 @@ mod tests {
         assert_eq!(inventory.r4_model_pending.expect("R4").len, 13);
         assert_eq!(inventory.r4_pruned_sessions, Some(14));
         assert_eq!(inventory.r4_pruned_objects, Some(15));
+        assert_eq!(inventory.r1_adapter_live_by_pid.expect("R1").len, 3);
+        assert_eq!(inventory.r2_modules_by_key.expect("R2").len, 7);
+        assert_eq!(inventory.r2_gap_index.expect("R2").len, 8);
+        assert_eq!(inventory.r3_edge_detached.expect("R3").len, 11);
+        assert_eq!(inventory.r3_mech_pool_used_bytes, Some(999));
+        assert_eq!(inventory.r4_domains.expect("R4").len, 17);
+        assert_eq!(inventory.r4_instances.expect("R4").len, 18);
+        assert_eq!(inventory.r4_deferred_pending.expect("R4").len, 19);
+        assert_eq!(inventory.r4_deferred_detached.expect("R4").len, 20);
+        assert_eq!(inventory.r4_deferred_releases.expect("R4").len, 21);
+        assert_eq!(inventory.r4_recently_pruned.expect("R4").len, 22);
+        assert_eq!(inventory.r4_gaps.expect("R4").len, 23);
         assert!(inventory.r6.is_some());
+        assert_eq!(
+            inventory.r6.as_ref().expect("R6").selection_inventory.len,
+            14
+        );
         assert_eq!(inventory.caller_metadata_rows.expect("metadata").len, 16);
+        assert_eq!(inventory.r11_folded_lines, 0);
+        assert_eq!(inventory.r11_folded_rows, 0);
+        assert_eq!(inventory.floor_discovery_baseline_kb, Some(4321));
         // Not owned: R5, R7-R12.
         assert!(inventory.r5_seal_value_bytes.is_none());
         assert!(inventory.r7_param_combos.is_none());
         assert!(inventory.r7_attr_types.is_none());
+        assert!(inventory.r7_by_module.is_none());
+        assert!(inventory.r7_cgroup_mechanisms.is_none());
+        assert!(inventory.r7_cgroup_retained_paths.is_none());
         assert!(inventory.r8_mechanisms.is_none());
         assert!(inventory.r8_templates.is_none());
         assert!(inventory.r8_logins.is_none());
@@ -743,7 +953,7 @@ mod tests {
         assert!(inventory.r10_reduced.is_none());
         assert!(inventory.r11_caller_reasons_outer.is_none());
         assert!(inventory.r11_caller_reasons_rows.is_none());
-        assert!(!inventory.r11_pending_b0);
+        assert!(!inventory.r11_overflowed);
         assert!(inventory.r12_open.is_none());
         assert!(inventory.r12_active_ops.is_none());
         assert!(inventory.r12_next_pseudonym.is_none());
@@ -761,7 +971,13 @@ mod tests {
     fn memory_line_roundtrip_matches_snapshot() {
         for snapshot in [
             MemorySnapshot::for_profile(60, full_profile_lens(), 32 * 1024 * 1024, Some(100)),
-            MemorySnapshot::for_trace(120, full_profile_lens(), 32 * 1024 * 1024, None),
+            MemorySnapshot::for_trace(
+                120,
+                full_profile_lens(),
+                32 * 1024 * 1024,
+                None,
+                &TracerLens::from_sizes(1, 2, false, 0, 0),
+            ),
             MemorySnapshot::for_inventory(60, full_inventory_lens(), 32 * 1024 * 1024),
         ] {
             let line = snapshot.format_line();
@@ -770,6 +986,25 @@ mod tests {
             let parsed = MemorySnapshot::parse_line(&line).expect("line parses");
             assert_eq!(parsed, snapshot);
         }
+    }
+
+    /// R11 sizes ride B0's accessors (spec §3.5): the outer/rows byte
+    /// math pins the (pid, path) and (function, rv) entry shapes from
+    /// `trace.rs` (`CallerKey`/`FunctionRv`), plus the fold diagnostics.
+    #[test]
+    fn tracer_lens_bytes_cover_caller_and_row() {
+        let lens = TracerLens::from_sizes(2, 5, true, 7, 3);
+        assert_eq!(lens.outer.len, 2);
+        assert_eq!(lens.rows.len, 5);
+        assert!(lens.overflowed);
+        assert_eq!(lens.folded_lines, 7);
+        assert_eq!(lens.folded_rows, 3);
+        assert!(lens.outer.bytes > 0);
+        assert!(lens.rows.bytes > 0);
+        let clean = TracerLens::from_sizes(0, 0, false, 0, 0);
+        assert_eq!(clean.outer.bytes, 0);
+        assert_eq!(clean.rows.bytes, 0);
+        assert!(!clean.overflowed);
     }
 
     #[test]

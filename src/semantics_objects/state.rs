@@ -750,10 +750,14 @@ pub(super) enum SettlementTransition {
 }
 
 impl ModelState {
-    /// A0 lens (R4): session/object/pending tables plus pruned counts.
-    /// Read-only; O(structures).
+    /// A0 lens (R4): session/object/pending tables plus pruned counts,
+    /// the domain/instance maps, the deferred-origin tables, the
+    /// pruned-domain memory, and the gap counts. Read-only;
+    /// O(structures).
     pub(super) fn memory_lens(&self) -> crate::memory_counters::ModelLens {
-        use crate::memory_counters::{HEAP_MODEL_RECORD, counter_row};
+        use crate::memory_counters::{
+            HEAP_DEFERRED_RECORD, HEAP_MAP_ENTRY, HEAP_MODEL_RECORD, counter_row,
+        };
         use std::mem::size_of;
         crate::memory_counters::ModelLens {
             sessions: counter_row(
@@ -773,6 +777,42 @@ impl ModelState {
             ),
             pruned_sessions: self.pruned_sessions,
             pruned_objects: self.pruned_objects,
+            domains: counter_row(
+                self.domains.len(),
+                size_of::<(ObjectDomain, DomainState)>(),
+                HEAP_MODEL_RECORD,
+            ),
+            instances: counter_row(
+                self.instances.len(),
+                size_of::<(InstanceKey, InstanceUsage)>(),
+                HEAP_MODEL_RECORD,
+            ),
+            deferred_pending: counter_row(
+                self.deferred_pending.len(),
+                size_of::<((super::SessionIncarnation, u32), DeferredOrigin)>(),
+                HEAP_DEFERRED_RECORD,
+            ),
+            deferred_detached: counter_row(
+                self.deferred_detached.len(),
+                size_of::<(
+                    (ObjectDomain, super::KnownScope, u32, super::AsyncValue),
+                    DetachedDeferred,
+                )>(),
+                HEAP_DEFERRED_RECORD,
+            ),
+            deferred_releases: counter_row(self.deferred_releases.len(), size_of::<u64>(), 0),
+            // The deque length; entry bytes cover the deque slot plus
+            // the parallel set node for the same domain.
+            recently_pruned: counter_row(
+                self.recently_pruned.len(),
+                size_of::<(ObjectDomain, ObjectDomain)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            gaps: counter_row(
+                self.gaps.len(),
+                size_of::<(super::ObjectGap, u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
         }
     }
 
@@ -4765,6 +4805,64 @@ mod tests {
         assert_eq!(lens.objects.len, 1);
         assert_eq!(lens.sessions.len, 1);
         assert!(lens.objects.bytes > 0);
+    }
+
+    #[test]
+    fn model_memory_lens_moves_with_deferred_and_pruned_maps() {
+        use crate::semantics_objects::{
+            HandleInput, ObjectDomain, ObjectHandle, ObjectSemantics, SessionHandle,
+        };
+        // Domains and their instance usage register together.
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        let mut model = ObjectSemantics::new();
+        let before = model.memory_lens();
+        assert_eq!(before.domains.len, 0);
+        assert_eq!(before.instances.len, 0);
+        model.register_domain(domain).expect("domain registers");
+        let lens = model.memory_lens();
+        assert_eq!(lens.domains.len, 1);
+        assert_eq!(lens.instances.len, 1);
+        assert!(lens.domains.bytes > 0);
+
+        // Deferred mint lands in deferred_pending; GetID detach moves
+        // the record to deferred_detached.
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let zero = fx.state.memory_lens();
+        assert_eq!(zero.deferred_pending.len, 0);
+        assert_eq!(zero.deferred_detached.len, 0);
+        let (token, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+        );
+        assert!(DeferredFixture::minted(&effects, token), "mint effect");
+        assert_eq!(fx.state.memory_lens().deferred_pending.len, 1);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("detaches");
+        let lens = fx.state.memory_lens();
+        assert_eq!(lens.deferred_pending.len, 0);
+        assert_eq!(lens.deferred_detached.len, 1);
+        assert!(lens.deferred_detached.bytes > 0);
+
+        // Releases, gaps and the pruned-domain memory through the
+        // production writers on a policy-limits state.
+        let mut state = ModelState::new(ObjectLimits::policy());
+        let zero = state.memory_lens();
+        assert_eq!(zero.deferred_releases.len, 0);
+        assert_eq!(zero.recently_pruned.len, 0);
+        assert_eq!(zero.gaps.len, 0);
+        state.deferred_releases.push(7);
+        state.gap(ObjectGap::BootstrapUnproven);
+        let pruned = ObjectDomain::reference(9, 9, 9, 9, 9);
+        state.recently_pruned.push_back(pruned);
+        state.recently_pruned_set.insert(pruned);
+        let lens = state.memory_lens();
+        assert_eq!(lens.deferred_releases.len, 1);
+        assert_eq!(lens.recently_pruned.len, 1);
+        assert_eq!(lens.gaps.len, 1);
+        assert!(lens.gaps.bytes > 0);
     }
 
     fn scalar(value: u16) -> FieldState {

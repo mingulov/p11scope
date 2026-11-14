@@ -1241,6 +1241,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 HEAP_CALLER_RECORD,
             ),
             incarnations: counter_row(self.incarnations.len(), size_of::<(u32, u32)>(), 0),
+            live_by_pid: counter_row(self.live_by_pid.len(), size_of::<(u32, CallerId)>(), 0),
         }
     }
 
@@ -3899,13 +3900,14 @@ impl CallerRegistry {
     /// the emit path, never on the hot path.
     pub(crate) fn memory_lens(&self) -> crate::memory_counters::RegistryLens {
         use crate::memory_counters::{
-            HEAP_EDGE_RECORD, HEAP_MAP_ENTRY, HEAP_MODULE_RECORD, counter_row,
+            HEAP_EDGE_RECORD, HEAP_MAP_ENTRY, HEAP_MODULE_KEY, HEAP_MODULE_RECORD, counter_row,
         };
         use std::mem::size_of;
         let mut open = (0u64, 0u64);
         let mut active = (0u64, 0u64);
         let mut mechs = (0u64, 0u64);
         let mut pending = (0u64, 0u64);
+        let mut detached = (0u64, 0u64);
         for edge in self.edges.values() {
             let Some(semantics) = edge.semantics.as_ref() else {
                 continue;
@@ -3919,6 +3921,8 @@ impl CallerRegistry {
             mechs.1 += lens.mechs.bytes;
             pending.0 += lens.pending.len;
             pending.1 += lens.pending.bytes;
+            detached.0 += lens.detached.len;
+            detached.1 += lens.detached.bytes;
         }
         let row = |(len, bytes): (u64, u64)| crate::memory_counters::CounterRow { len, bytes };
         crate::memory_counters::RegistryLens {
@@ -3938,12 +3942,24 @@ impl CallerRegistry {
                 size_of::<((CallerId, ModuleId), EdgeRecord)>(),
                 HEAP_EDGE_RECORD,
             ),
+            modules_by_key: counter_row(
+                self.modules_by_key.len(),
+                size_of::<(ModuleKey, ModuleId)>(),
+                HEAP_MODULE_KEY,
+            ),
+            gap_index: counter_row(
+                self.gap_index.len(),
+                size_of::<(RegistryGap, usize)>(),
+                HEAP_MODULE_KEY,
+            ),
             edge: crate::memory_counters::EdgeLens {
                 open: row(open),
                 active: row(active),
                 mechs: row(mechs),
                 pending: row(pending),
+                detached: row(detached),
             },
+            mech_pool_used_bytes: self.semantic_resource_snapshot().charged_bytes as u64,
         }
     }
 
@@ -7919,11 +7935,13 @@ pub(crate) mod tests {
         let zero = adapter.memory_lens();
         assert_eq!(zero.callers.len, 0);
         assert_eq!(zero.incarnations.len, 0);
+        assert_eq!(zero.live_by_pid.len, 0);
         source.spawn(200, 22);
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
         let lens = adapter.memory_lens();
         assert_eq!(lens.callers.len, 1);
         assert_eq!(lens.incarnations.len, 1);
+        assert_eq!(lens.live_by_pid.len, 1);
         assert!(lens.callers.bytes > 0);
 
         let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
@@ -7931,14 +7949,33 @@ pub(crate) mod tests {
         assert_eq!(zero.callers.len, 0);
         assert_eq!(zero.modules.len, 0);
         assert_eq!(zero.edges.len, 0);
+        assert_eq!(zero.modules_by_key.len, 0);
+        assert_eq!(zero.gap_index.len, 0);
         registry.callers.insert(id);
         let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
         registry.scripted_module_edge(key, id);
+        registry.push_gap_as(
+            RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "lens".to_string(),
+                reason: "gap-index movement".to_string(),
+                budget: None,
+            },
+            false,
+        );
         let lens = registry.memory_lens();
         assert_eq!(lens.callers.len, 1);
         assert_eq!(lens.retired.len, 0);
         assert_eq!(lens.modules.len, 1);
         assert_eq!(lens.edges.len, 1);
+        assert_eq!(lens.modules_by_key.len, 1);
+        assert_eq!(lens.gap_index.len, 1);
+        assert_eq!(
+            lens.mech_pool_used_bytes,
+            registry.semantic_resource_snapshot().charged_bytes as u64
+        );
         assert!(lens.edges.bytes > 0);
     }
 

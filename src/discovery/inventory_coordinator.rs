@@ -485,6 +485,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     promotion_records_discarded: u64,
     /// A0 memory-line cadence: first line at 60 s, then every 60 s.
     memory_cadence: crate::memory_counters::MemoryCadence,
+    /// A0 floor row: the observer's own RSS sampled once at
+    /// coordinator construction (the discovery-baseline proxy A1
+    /// refines against smaps).
+    memory_baseline_rss_kb: Option<u64>,
     /// Joint-seal outcomes by progress kind (diagnostics, disclosed
     /// beside the stop line while stage timings are requested).
     seal_diagnosis: semantics::SealDiagnosis,
@@ -1126,6 +1130,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             promotion_finish: false,
             promotion_records_discarded: 0,
             memory_cadence: crate::memory_counters::MemoryCadence::new(),
+            memory_baseline_rss_kb: crate::memory_counters::self_rss_hwm_kb().map(|(rss, _)| rss),
             seal_diagnosis: semantics::SealDiagnosis::default(),
             #[cfg(test)]
             engine_collected_finish_calls: 0,
@@ -4088,6 +4093,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .caller_metadata
                     .as_ref()
                     .map(|lane| lane.frame().memory_row()),
+                baseline_rss_kb: self.memory_baseline_rss_kb,
             },
             p11scope_ebpf_common::RING_BYTES,
         )
@@ -12191,16 +12197,37 @@ pub(crate) mod tests {
         assert_eq!(value["elapsed_secs"], 61);
         assert_eq!(value["r1_adapter_callers"]["len"], 1);
         assert_eq!(value["r1_adapter_incarnations"]["len"], 1);
+        assert_eq!(value["r1_adapter_live_by_pid"]["len"], 1);
         // The admission has not published: the R2 tables are present
         // but empty (R2 movement is pinned in the registry tests).
         assert_eq!(value["r2_registry_callers"]["len"], 0);
         assert!(value["r6"]["losses"]["len"].is_number());
+        assert!(value["r2_modules_by_key"]["len"].is_number());
+        assert!(value["r2_gap_index"]["len"].is_number());
+        assert!(value["r3_edge_detached"]["len"].is_number());
+        assert!(value["r3_mech_pool_used_bytes"].is_number());
         assert!(value["r4_model_sessions"]["len"].is_number());
+        assert!(value["r4_domains"]["len"].is_number());
+        assert!(value["r4_instances"]["len"].is_number());
+        assert!(value["r4_deferred_pending"]["len"].is_number());
+        assert!(value["r4_deferred_detached"]["len"].is_number());
+        assert!(value["r4_deferred_releases"]["len"].is_number());
+        assert!(value["r4_recently_pruned"]["len"].is_number());
+        assert!(value["r4_gaps"]["len"].is_number());
+        assert!(value["r6"]["selection_inventory"]["len"].is_number());
+        assert!(value["r6"]["selection_surfaces"]["len"].is_number());
+        assert!(value["r6"]["manifest_selection_ordinals"]["len"].is_number());
+        assert!(value["r6"]["selections"]["len"].is_number());
+        assert!(value["r6"]["standard_exports"]["len"].is_number());
+        assert!(value["floor_discovery_baseline_kb"].is_number());
         assert!(value["r5_seal_value_bytes"].is_null());
         assert!(value["r7_param_combos"].is_null());
+        assert!(value["r7_by_module"].is_null());
         assert!(value["r9_tasks"].is_null());
         assert!(value["r11_caller_reasons_outer"].is_null());
-        assert_eq!(value["r11_pending_b0"], false);
+        assert_eq!(value["r11_overflowed"], false);
+        assert_eq!(value["r11_folded_lines"], 0);
+        assert_eq!(value["r11_folded_rows"], 0);
         // And the typed twin parses it back identically.
         let parsed =
             crate::memory_counters::MemorySnapshot::parse_line(&line).expect("line parses");

@@ -4495,6 +4495,8 @@ impl State {
         use std::mem::size_of;
         let param_combos: usize = self.mechanisms.values().map(|m| m.param_combos.len()).sum();
         let attr_types: usize = self.templates.values().map(|t| t.attr_types.len()).sum();
+        let by_module: usize = self.mechanisms.values().map(|m| m.by_module.len()).sum();
+        let cgroup_mechanisms: usize = self.cgroups.values().map(|c| c.mechanisms.len()).sum();
         StateLens {
             param_combos: counter_row(
                 param_combos,
@@ -4502,6 +4504,21 @@ impl State {
                 HEAP_MAP_ENTRY,
             ),
             attr_types: counter_row(attr_types, size_of::<u64>(), HEAP_MAP_ENTRY),
+            by_module: counter_row(
+                by_module,
+                size_of::<(ModuleId, MechCallStat)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            cgroup_mechanisms: counter_row(
+                cgroup_mechanisms,
+                size_of::<(u64, MechCallStat)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            cgroup_retained_paths: counter_row(
+                self.cgroup_retained_paths.len(),
+                size_of::<(u64, String)>(),
+                HEAP_MAP_ENTRY,
+            ),
             mechanisms: counter_row(
                 self.mechanisms.len(),
                 size_of::<(u64, MechStat)>(),
@@ -5048,6 +5065,9 @@ mod tests {
         for row in [
             zero.param_combos,
             zero.attr_types,
+            zero.by_module,
+            zero.cgroup_mechanisms,
+            zero.cgroup_retained_paths,
             zero.mechanisms,
             zero.templates,
             zero.logins,
@@ -5077,11 +5097,23 @@ mod tests {
             .expect("inserted row")
             .param_combos
             .insert((1, 2, 3, 4), 1);
+        s.mechanisms
+            .get_mut(&0x250)
+            .expect("inserted row")
+            .by_module
+            .insert(ModuleId(0), MechCallStat::default());
         let mut template = TemplateStat::default();
         template.attr_types.insert(7);
         s.templates.insert((6, 0), template);
         s.logins.insert(1, 1);
         s.cgroups.insert(0xC0, CgroupStat::default());
+        s.cgroups
+            .get_mut(&0xC0)
+            .expect("inserted row")
+            .mechanisms
+            .insert(0x250, MechCallStat::default());
+        s.cgroup_retained_paths
+            .insert(0xC0, "group/test.slice".to_string());
         s.mech_shapes.insert(0x250, 1);
         s.reduced_histories.insert(process);
         s.open.insert(
@@ -5133,6 +5165,9 @@ mod tests {
         let lens = s.memory_lens();
         assert_eq!(lens.param_combos.len, 1);
         assert_eq!(lens.attr_types.len, 1);
+        assert_eq!(lens.by_module.len, 1);
+        assert_eq!(lens.cgroup_mechanisms.len, 1);
+        assert_eq!(lens.cgroup_retained_paths.len, 1);
         assert_eq!(lens.mechanisms.len, 1);
         assert_eq!(lens.templates.len, 1);
         assert_eq!(lens.logins.len, 1);

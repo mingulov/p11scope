@@ -657,6 +657,11 @@ impl EdgeSemantics {
                 size_of::<((u64, u32), PendingCall)>(),
                 HEAP_MAP_ENTRY,
             ),
+            detached: counter_row(
+                self.detached.len(),
+                size_of::<((u64, u32, crate::semantics_objects::AsyncValue), AsyncId)>(),
+                HEAP_MAP_ENTRY,
+            ),
         }
     }
 
@@ -2496,12 +2501,23 @@ mod tests {
         assert_eq!(zero.active.len, 0);
         assert_eq!(zero.mechs.len, 0);
         assert_eq!(zero.pending.len, 0);
+        assert_eq!(zero.detached.len, 0);
         edge.observe(&call("C_OpenSession", 7, 0, 100));
         edge.observe(&init("C_SignInit", 7, RSA_PSS, 200));
+        // One PENDING op minted through GetID lands in detached.
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 210);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 220);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
         let lens = edge.memory_lens();
         assert_eq!(lens.open.len, 1);
         assert_eq!(lens.active.len, 1);
         assert_eq!(lens.mechs.len, 1);
+        assert_eq!(lens.detached.len, 1);
         assert!(lens.open.bytes > 0);
     }
 

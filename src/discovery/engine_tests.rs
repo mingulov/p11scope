@@ -5582,6 +5582,11 @@ fn history_memory_lens_moves_with_recorded_sets() {
         zero.rows.scan_gap_tombstones,
         zero.rows.corroboration_tombstones,
         zero.rows.fallback_tombstones,
+        zero.rows.selection_inventory,
+        zero.rows.selection_surfaces,
+        zero.rows.manifest_selection_ordinals,
+        zero.rows.selections,
+        zero.rows.standard_exports,
     ] {
         assert_eq!(row.len, 0);
     }
@@ -5698,6 +5703,46 @@ fn history_memory_lens_moves_with_recorded_sets() {
         .corroboration_tombstones
         .insert(crate::plan::ModuleId(4));
     history.fallback_tombstones.insert((3, 4));
+    history.manifest_selection_ordinals.insert(3);
+    history.standard_exports.insert(
+        crate::plan::ModuleId(0),
+        BTreeSet::from([StandardExportFact::Present]),
+    );
+    history.selections.push(LiveSelectionTuple {
+        module: crate::plan::ModuleId(0),
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        },
+        rv: 0,
+        result: None,
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::Inventory,
+        count: 1,
+    });
+    let surface = InventorySurfaceKey {
+        base: InventorySurfaceBase {
+            provider: timing_key(0),
+            table_file_offset: 0x2000,
+            kind: InventorySurfaceKind::Interface,
+            name: PrivateSelectionName::Legacy,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+            manifest_identity: None,
+        },
+        duplicate: 0,
+    };
+    history.selection_surfaces.insert(surface.clone());
+    history.selection_inventory.insert(
+        ExactSelectionTable {
+            view: ProcessViewId(0),
+            provider: timing_key(1),
+            address: 0x1000,
+            file_offset: 0x2000,
+        },
+        vec![surface],
+    );
 
     let lens = engine.memory_history_lens();
     assert_eq!(lens.rows.modules.len, 1);
@@ -5713,6 +5758,12 @@ fn history_memory_lens_moves_with_recorded_sets() {
     assert_eq!(lens.rows.scan_gap_tombstones.len, 1);
     assert_eq!(lens.rows.corroboration_tombstones.len, 1);
     assert_eq!(lens.rows.fallback_tombstones.len, 1);
+    assert_eq!(lens.rows.selection_inventory.len, 1);
+    assert_eq!(lens.rows.selection_surfaces.len, 1);
+    assert_eq!(lens.rows.manifest_selection_ordinals.len, 1);
+    assert_eq!(lens.rows.selections.len, 1);
+    assert_eq!(lens.rows.standard_exports.len, 1);
+    assert!(lens.rows.selection_inventory.bytes > 0);
 }
 
 #[test]

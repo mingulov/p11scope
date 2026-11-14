@@ -30529,6 +30529,31 @@ impl Engine {
                     size_of::<(u32, u32)>(),
                     HEAP_MAP_ENTRY,
                 ),
+                selection_inventory: counter_row(
+                    history.selection_inventory.len(),
+                    size_of::<(ExactSelectionTable, Vec<InventorySurfaceKey>)>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                selection_surfaces: counter_row(
+                    history.selection_surfaces.len(),
+                    size_of::<InventorySurfaceKey>(),
+                    HEAP_MAP_ENTRY,
+                ),
+                manifest_selection_ordinals: counter_row(
+                    history.manifest_selection_ordinals.len(),
+                    size_of::<u32>(),
+                    0,
+                ),
+                selections: counter_row(
+                    history.selections.len(),
+                    size_of::<LiveSelectionTuple>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                standard_exports: counter_row(
+                    history.standard_exports.len(),
+                    size_of::<(plan::ModuleId, BTreeSet<StandardExportFact>)>(),
+                    HEAP_MAP_ENTRY,
+                ),
             },
         }
     }

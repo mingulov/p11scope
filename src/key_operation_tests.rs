@@ -15455,6 +15455,52 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     guarded.scene.adapter.ledger_mut().set_byte_limit(u64::MAX);
 }
 
+/// A voided pre-void claim on a Joint feed reduces as plain S1: the
+/// observed call keeps its return, never stages against the wiped H8
+/// (which would wedge the next delivery), and the feed stays Joint
+/// for its other calls. S1 direct is the one disposition that keeps
+/// the data without inventing a Joint evidence claim.
+#[test]
+fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    let mut admitted =
+        AdmittedInstanceCall::scripted(joint_key.clone(), guarded.caller, position, facts);
+    admitted.retain_as_plain_s1();
+    guarded.registry.observe_instance_semantic(admitted);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        1,
+        "the voided claim reduces S1 direct, keeping its observed call"
+    );
+    assert_eq!(
+        guarded.registry.joint_direct_fallback(),
+        1,
+        "it is counted as a call reduced without Joint evidence"
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        0,
+        "it never stages against the wiped H8"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the feed stays Joint for every other call"
+    );
+}
+
 /// N1: seal delivery replays the staged head through the shared
 /// reducer, releases the ledger, and capture commits Populated from
 /// the retained projection.

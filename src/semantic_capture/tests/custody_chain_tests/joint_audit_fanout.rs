@@ -2095,6 +2095,22 @@ impl MachineScene {
             .map(|record| record.feed.reduced())
             .collect()
     }
+
+    /// Summed S1 observations across every retained instance reducer: a
+    /// call staged Joint counts only when it replays, while a plain S1
+    /// call counts when it applies. A dropped call would pass an
+    /// `api_returns` check but fail this one.
+    fn edge_calls_total(&self) -> u64 {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.semantics.as_ref())
+            .map(|semantics| semantics.calls())
+            .sum()
+    }
 }
 
 /// Same decoded DISCOVERY transport as the production reader, scoped to an
@@ -10881,6 +10897,7 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
     // S1 with a counted gap instead of latching the whole lane.
     let disposed_before = fixture.disposed_total();
     let api_before = fixture.api_returns_total();
+    let edge_calls_before = fixture.edge_calls_total();
     let direct_fallback_before = fixture.direct_fallback_total();
     let reduced_before: u64 = fixture.reduced().iter().sum();
     fixture
@@ -10939,6 +10956,11 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         fixture.api_returns_total(),
         api_before + 2,
         "the orphaned call is kept as plain S1 and the post-void call is delivered"
+    );
+    assert_eq!(
+        fixture.edge_calls_total(),
+        edge_calls_before + 2,
+        "both calls reach their S1 reducers: the orphan direct and the post-void call at the fallback replay"
     );
     assert_eq!(
         fixture.direct_fallback_total(),

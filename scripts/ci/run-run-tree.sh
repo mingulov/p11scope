@@ -4,7 +4,7 @@
 # run-run-tree.sh TESTBIN OUTDIR
 # run-run-tree.sh --self-test
 #
-# Runs the 5 run-tree CLI cells (tests/run_tree.rs) as root
+# Runs the 8 run-tree CLI cells (tests/run_tree.rs) as root
 # with exact-positive judging: every cell drives the real command line
 # against SoftHSM and must exit 0 with exactly one passed test. The
 # run-tree CI job calls this on the host leg directly and inside vng
@@ -16,6 +16,9 @@
 #   privileged_run_tree_outliving_child_is_disclosed
 #   privileged_run_tree_many_children_land_exact
 #   privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
+#   privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+#   privileged_run_tree_many_shortlived_workers_stage_and_count
+#   privileged_run_tree_non_member_provider_is_never_staged
 #
 # Each results.jsonl row carries exactly cell/pass/qualification/detail
 # (the shared cell-result contract). A zero exit alone is not a pass:
@@ -50,6 +53,9 @@ privileged_run_tree_double_fork_shows_reparented_calls
 privileged_run_tree_outliving_child_is_disclosed
 privileged_run_tree_many_children_land_exact
 privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
+privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+privileged_run_tree_many_shortlived_workers_stage_and_count
+privileged_run_tree_non_member_provider_is_never_staged
 )
 
 # One results.jsonl row: exactly cell/pass/qualification/detail.
@@ -136,7 +142,7 @@ run_self_test() {
     POSITIVE='test one ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'
     # Every curated cell passes on the healthy shape (this also pins the
-    # five names: a dropped or renamed cell fails here, not silently).
+    # eight names: a dropped or renamed cell fails here, not silently).
     for cell in "${CELLS[@]}"; do
         LOG_BODY=$POSITIVE
         check "$cell" 0 0 True qualified 'rc=0 42ms ok'

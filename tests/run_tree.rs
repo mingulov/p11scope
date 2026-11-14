@@ -1035,16 +1035,17 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
 /// NO `--module`/`--prearm-module` hint. The run owns the whole tree,
 /// so the first live mapper must teach it the provider file: probes
 /// attach by file identity and every later grandchild's calls land.
-/// The first worker's calls may be missed honestly (PARTIAL with
-/// descendant gaps), so coverage of the oracle after the first worker
-/// must clear 90% (measured ~100%: the linger keeps every mapper
-/// provable). The linger is load-bearing, not padding: at ~15 ms
-/// without it the debug observer under test cannot complete a proof
-/// scan inside one lifetime, so the cell would test build-profile
-/// speed instead of the fix; the release-measured 50 ms operator
-/// shape and the smoke leg cover the faster workers. Without the fix
-/// this cell sees 0 probes and 0.0 coverage (scan-only discovery
-/// never lands an attach for short-lived mappers).
+/// The first worker's calls may be missed honestly (PARTIAL with the
+/// learned-file gap row plus descendant gaps), so coverage of the oracle
+/// after the first worker must clear 95% (measured 1.0 across the fix1
+/// qualification runs: the linger keeps every mapper provable). The
+/// linger is load-bearing, not padding: at ~15 ms without it the debug
+/// observer under test cannot complete a proof scan inside one lifetime,
+/// so the cell would test build-profile speed instead of the fix; the
+/// release-measured 50 ms operator shape and the smoke leg cover the
+/// faster workers. Without the fix this cell sees 0 probes and 0.0
+/// coverage (scan-only discovery never lands an attach for short-lived
+/// mappers).
 #[test]
 #[ignore = "privileged: run-tree unprearmed shortlived cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
@@ -1106,8 +1107,361 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     );
     let coverage = observed_total as f64 / oracle_rest_total as f64;
     assert!(
-        coverage >= 0.90,
+        coverage >= 0.95,
         "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+    );
+    // Honesty half: the first mapper's miss stays disclosed, never silent.
+    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    let gaps = evidence
+        .get("pid_descendant_gaps")
+        .and_then(|gaps| gaps.as_u64())
+        .expect("pid_descendant_gaps");
+    assert!(
+        gaps > 0,
+        "members that retired before admission stay counted: {profile}"
+    );
+}
+
+/// Unprearmed short-lived descendants under `--pause never`: 32 sequential
+/// grandchildren (each 300 ms linger, twice the auto-pause twin's 150 ms)
+/// with NO prearm hint. Frames admit (the pause never holds them back), so
+/// the first admitted mapper's frame scan commits the provider key before
+/// later run-learned proofs stage. Without the `run_learned` staging bypass
+/// those later proofs would hit the scan-covered exemption and vanish
+/// (coverage collapses below 0.95; measured mutant 0.87 vs fixed 1.0); with
+/// it the persistent piece stages and later mappers land. This cell pins
+/// that bypass at the committed level (the unit twin pins it faster); the
+/// auto-pause twin above cannot catch the regression (its frames never
+/// admit, so `scan_covered` stays empty either way). The 300 ms linger
+/// (vs 150 ms) is load-bearing for stability: `--pause never` admits,
+/// scans and arms every mapper (heavy under shared-host load), so 150 ms
+/// workers time out before slow frames (measured 0.54 coverage in the
+/// 8-cell gate); 300 ms survives and holds 1.0.
+#[test]
+#[ignore = "privileged: run-tree unprearmed shortlived never-pause cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
+    const CHILDREN: u32 = 32;
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    let mut ledgers = Vec::new();
+    let mut script = String::new();
+    for i in 0..CHILDREN {
+        let ledger = dir.path().join(format!("l{i}"));
+        script.push_str(&format!(
+            "{} {} {} 1 300; ",
+            workload.display(),
+            module.display(),
+            ledger.display()
+        ));
+        ledgers.push(ledger);
+    }
+    script.push_str("exec sleep 2");
+    // No --module/--prearm-module, plus --pause never so frames admit.
+    let mut args = vec![
+        "run".to_string(),
+        "--pause".to_string(),
+        "never".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+        "--".to_string(),
+    ];
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    let profile = read_profile(&out);
+    let evidence = profile.get("evidence").expect("evidence");
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    let oracle_rest = sum_ledgers(&ledgers[1..]);
+    let oracle_rest_total: u64 = oracle_rest.values().sum();
+    assert!(oracle_rest_total > 0, "the oracle is non-empty");
+    let sha = record_sha256(&profile, &module);
+    let observed = function_calls(&profile, &sha);
+    let observed_total: u64 = observed.values().sum();
+    let oracle_all = sum_ledgers(&ledgers);
+    let oracle_all_total: u64 = oracle_all.values().sum();
+    assert!(
+        observed_total <= oracle_all_total,
+        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
+    );
+    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    assert!(
+        coverage >= 0.95,
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+    );
+    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    let gaps = evidence
+        .get("pid_descendant_gaps")
+        .and_then(|gaps| gaps.as_u64())
+        .expect("pid_descendant_gaps");
+    assert!(
+        gaps > 0,
+        "members that retired before admission stay counted: {profile}"
+    );
+}
+
+/// Many short-lived workers: 270 grandchildren in 9 waves of 30 concurrent
+/// workers (each 1 iteration, 1500 ms linger) under `--pause never`, with NO
+/// prearm hint. Short-lived workers retire before admission (measured: ~50
+/// admitted, ~270 gaps), so they never spend the 256 loader contexts and
+/// never exhaust: the capture names NO exhaustion gap (0, not 1 —
+/// exhaustion requires 256+ ADMITTED members, not merely spawned; the E1
+/// arming lift is safe for exactly the suite workloads it targets). The
+/// watch still stages the provider by scan (first wave) and later waves'
+/// calls still land via the file-identity probes (which need no loader
+/// context): probes > 0, learned >= 1, coverage >= 90%. The
+/// exhaustion-once gap logic itself (mark dedupes, exactly one row when 256
+/// ARE spent) is pinned by the unit twin
+/// `loader_exhaustion_names_once_and_watch_still_stages` (direct registry
+/// fill, like the pressure tests); this cell pins the privileged safe
+/// behavior under high churn. Without the watch staging this cell would see
+/// 0 probes. Waves (not one burst) are load-bearing for coverage: a single
+/// 270-wide burst makes all calls before the ~100 ms stage+attach lands
+/// (0.0 coverage), while waves let later mappers land after the first
+/// wave stages.
+#[test]
+#[ignore = "privileged: run-tree many-shortlived cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_many_shortlived_workers_stage_and_count() {
+    const WAVES: u32 = 9;
+    const PER_WAVE: u32 = 30;
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    let mut ledgers = Vec::new();
+    let mut script = String::new();
+    for wave in 0..WAVES {
+        for i in 0..PER_WAVE {
+            let ledger = dir.path().join(format!("w{wave}l{i}"));
+            script.push_str(&format!(
+                "{} {} {} 1 1500 & ",
+                workload.display(),
+                module.display(),
+                ledger.display()
+            ));
+            ledgers.push(ledger);
+        }
+        // Each wave's 30 workers run concurrently for ~1.5 s, then join:
+        // the first wave stages the provider, later waves land via the
+        // file-identity probes.
+        script.push_str("wait; ");
+    }
+    script.push_str("exec sleep 2");
+    let mut args = vec![
+        "run".to_string(),
+        "--pause".to_string(),
+        "never".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+        "--".to_string(),
+    ];
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    let profile = read_profile(&out);
+    let evidence = profile.get("evidence").expect("evidence");
+    // The watch staged the provider (exhaustion or not, staging needs no
+    // loader context).
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    // No exhaustion: short-lived workers retire before admission (they
+    // never spend loader contexts), so the 256-capacity gap must NOT fire.
+    // (The once-naming logic when 256 ARE spent is unit-pinned; see the
+    // cell doc above.)
+    let skipped = evidence
+        .get("skipped")
+        .and_then(|skipped| skipped.as_array())
+        .expect("evidence.skipped");
+    let exhaustion = skipped
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("reason")
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| reason.contains("loader context capacity 256 is exhausted"))
+        })
+        .count();
+    assert_eq!(
+        exhaustion, 0,
+        "short-lived churn must not exhaust loader contexts: {skipped:?}"
+    );
+    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    // Later calls still counted: coverage after the first wave clears 90%
+    // (270 workers in 9 waves; the first wave's 30 workers may be missed
+    // honestly before the stage+attach lands ~100 ms in, like the first
+    // worker in the twin cells; file-identity probes need no loader
+    // context, so later waves still land).
+    let oracle_rest = sum_ledgers(&ledgers[(PER_WAVE as usize)..]);
+    let oracle_rest_total: u64 = oracle_rest.values().sum();
+    assert!(oracle_rest_total > 0, "the oracle is non-empty");
+    let sha = record_sha256(&profile, &module);
+    let observed = function_calls(&profile, &sha);
+    let observed_total: u64 = observed.values().sum();
+    let oracle_all = sum_ledgers(&ledgers);
+    let oracle_all_total: u64 = oracle_all.values().sum();
+    assert!(
+        observed_total <= oracle_all_total,
+        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle"
+    );
+    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    assert!(
+        coverage >= 0.90,
+        "coverage after the first wave is {coverage:.4} ({observed_total}/{oracle_rest_total})"
+    );
+}
+
+/// Non-member privacy: a process outside the run cgroup opens a different
+/// provider file (a copy of SoftHSM at another path) while an owned run
+/// captures its own prearmed SoftHSM grandchildren ledger-exact. The
+/// non-member's file is never staged: fanotify never arms for `run`
+/// (unit-pinned `start_file_learning` no-op), and the watch scans only
+/// owned-cgroup members. The profile lists the owned provider only.
+#[test]
+#[ignore = "privileged: run-tree non-member privacy cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_non_member_provider_is_never_staged() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload", WORKLOAD_C);
+    // A second provider file (same bytes, different inode): the
+    // non-member's private copy. Same-device copy keeps the fixture fast.
+    let copy = dir.path().join("copy-softhsm2.so");
+    std::fs::copy(&module, &copy).expect("copy SoftHSM for the non-member");
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    // Non-member script: loop opening the copy while the run captures.
+    // Runs as the test (outside the run cgroup), proving the file was
+    // opened concurrently yet never staged.
+    let (nonmember_ledger, nonmember_done) =
+        (dir.path().join("nm-ledger"), dir.path().join("nm-done"));
+    let nm_script = format!(
+        "for i in 1 2 3 4 5 6 7 8; do {} {} {} 1; sleep 0.5; done; touch {}",
+        workload.display(),
+        copy.display(),
+        nonmember_ledger.display(),
+        nonmember_done.display()
+    );
+    let mut nonmember = Command::new("sh")
+        .arg("-c")
+        .arg(&nm_script)
+        .env("SOFTHSM2_CONF", &conf)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn non-member");
+    // Owned run: two prearmed grandchildren, ledger-exact (shell-wrapper
+    // shape, without the wrapper's settle comment duplication).
+    let (ledger1, ledger2) = (dir.path().join("l1"), dir.path().join("l2"));
+    let script = format!(
+        "{} {} {} 3; {} {} {} 3; exec sleep 2",
+        workload.display(),
+        module.display(),
+        ledger1.display(),
+        workload.display(),
+        module.display(),
+        ledger2.display()
+    );
+    let mut args = run_prefix(&module, &out);
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    // Reap the non-member (bounded): it must have run to make this cell
+    // non-vacuous.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(nm_status) = nonmember.try_wait().expect("try_wait non-member") {
+            assert!(
+                nm_status.success(),
+                "the non-member workload exits 0 (it opened the copy)"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the non-member would not exit within {}s",
+            TIMEOUT.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        nonmember_done.is_file(),
+        "the non-member loop completed (its file was opened during the run)"
+    );
+    let nm_ledger = read_ledger_file(&nonmember_ledger);
+    assert!(
+        nm_ledger.values().sum::<u64>() > 0,
+        "the non-member made calls through its copy: {nm_ledger:?}"
+    );
+    // Owned calls land exact; the copy never appears.
+    let profile = read_profile(&out);
+    let want = sum_ledgers(&[ledger1, ledger2]);
+    let sha = record_sha256(&profile, &module);
+    assert_exact_counts(&function_calls(&profile, &sha), &want);
+    let modules = profile
+        .get("evidence")
+        .and_then(|evidence| evidence.get("discovery"))
+        .and_then(|discovery| discovery.as_array())
+        .expect("evidence.discovery");
+    let copy_str = copy.to_str().expect("utf8 copy path");
+    assert!(
+        modules
+            .iter()
+            .all(|record| { record.get("path").and_then(|p| p.as_str()) != Some(copy_str) }),
+        "the non-member's file is never staged: {:?}",
+        modules
+            .iter()
+            .filter_map(|record| record.get("path"))
+            .collect::<Vec<_>>()
+    );
+    // Prearmed owned run stages nothing learned (and certainly not the copy).
+    let evidence = profile.get("evidence").expect("evidence");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert_eq!(
+        learned, 0,
+        "a prearmed run stages no learned files: {profile}"
     );
 }
 

@@ -20037,6 +20037,111 @@ fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// A re-noticed member keeps its original first-seen time: a live but
+/// transiently unopenable member (its view fails to open, so the scan
+/// drops it from rotation) rejoins with its old clock, not a fresh one,
+/// so it still ages out at the 5 s horizon instead of pinning a slot.
+#[test]
+fn owned_tree_watch_renotice_keeps_first_seen_time() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    // A fake pid that stays listed as live but never opens as a view:
+    // every scan drops it from rotation, every watch re-notices it.
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{me}\n{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    // The ghost was noticed (fail-closed user) then dropped from rotation
+    // when its view failed to open — but its first-seen stays.
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&ghost),
+        "an unopenable member leaves rotation at once"
+    );
+    assert_eq!(
+        engine.owned_watch_seen.get(&ghost).copied(),
+        Some(first),
+        "the first notice takes the clock"
+    );
+    // A later watch re-notices the still-live ghost: the clock must not
+    // refresh, or the member never ages out.
+    let later = first + OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(later));
+    assert_eq!(
+        engine.owned_watch_seen.get(&ghost).copied(),
+        Some(first),
+        "a re-noticed member keeps its original first-seen time"
+    );
+    // And it still ages out at the horizon from the original clock.
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_RESCAN_HORIZON_NS));
+    assert!(
+        !engine.owned_watch_seen.contains_key(&ghost)
+            || engine
+                .owned_watch_seen
+                .get(&ghost)
+                .is_some_and(|seen| *seen == first),
+        "the ghost never refreshes past the horizon: {:?}",
+        engine.owned_watch_seen.get(&ghost)
+    );
+}
+
+/// The lazy user-pid selector stops once its room fills: two user pids
+/// taken from five costs two predicate calls, not five — and a full
+/// rotation (room zero) costs zero stat reads.
+#[test]
+fn select_user_pids_lazily_stops_after_limit() {
+    let pids = vec![1u32, 2, 3, 4, 5];
+    let mut calls = 0usize;
+    let out = select_user_pids_lazily(
+        &pids,
+        |_| {
+            calls += 1;
+            true
+        },
+        2,
+    );
+    assert_eq!(out, vec![1, 2]);
+    assert_eq!(calls, 2, "stops after the limit, not all pids");
+    let mut calls_zero = 0usize;
+    let out_zero = select_user_pids_lazily(
+        &pids,
+        |_| {
+            calls_zero += 1;
+            true
+        },
+        0,
+    );
+    assert!(out_zero.is_empty());
+    assert_eq!(calls_zero, 0, "a full rotation reads no stats");
+    // Kernel threads skip without counting toward the room.
+    let mut thread_calls = 0usize;
+    let mixed = select_user_pids_lazily(
+        &[10u32, 11, 12],
+        |pid| {
+            thread_calls += 1;
+            pid != 11
+        },
+        2,
+    );
+    assert_eq!(mixed, vec![10, 12]);
+    assert_eq!(thread_calls, 3, "skipped threads still cost one read each");
+}
+
 #[test]
 fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
@@ -79983,6 +80088,151 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
     );
 }
 
+/// A run-learned candidate stages despite scan coverage: the proving
+/// mapper is a transient descendant whose scan-owned slots retire with
+/// it, so only the persistent piece covers later mappers. Twin of the
+/// fanotify control above (which stays unstaged): deleting the
+/// `run_learned` bypass must fail this test while the control stays green.
+#[test]
+fn learned_run_learned_scan_covered_file_still_stages() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned.absorb(pins);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the run-learned file stages despite scan coverage"
+    );
+    assert_eq!(
+        engine.learned_notes.len(),
+        1,
+        "one loader note per staged file"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "staging files the named first-run gap: {public:?}"
+    );
+}
+
+/// A run-learned proof of an already-prearmed file dedupes by file
+/// identity, never by path spelling: the operator's `--prearm-module`
+/// spelling may differ lexically from the scan's display spelling
+/// (symlink, `/lib` vs `/usr/lib`), but the same key stages no second
+/// input and files no spurious first-use gap — only the loader note.
+#[test]
+fn learned_run_learned_prearmed_file_dedupes_by_identity_not_spelling() {
+    use crate::discovery::identity::{PrearmPinRequest, pin_prearm_requests_in_views_with_budget};
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("dedupe.c");
+    let real = dir.path().join("libdedupe-real.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&real)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let link = dir.path().join("libdedupe-link.so");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // Operator prearm at the real spelling (no learned gap: prearm first).
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let prearm = pin_prearm_requests_in_views_with_budget(
+        &[PrearmPinRequest::path(real.clone())],
+        &[],
+        None,
+        0,
+        0,
+        &mut budget,
+    )
+    .expect("the prearm pins");
+    assert_eq!(prearm.inputs.len(), 1, "one prearmed input");
+    let prearmed_key = prearm.inputs[0].key;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.prearm_input = Some(PrearmInput {
+        pins: prearm.pins,
+        inputs: prearm.inputs,
+    });
+    // Run-learned proof of the same file under the symlink spelling.
+    let file = std::fs::File::open(&real).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: link.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+        },
+    ))
+    .unwrap();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "the same file under another spelling stages nothing new"
+    );
+    assert!(
+        engine.learned_notes.contains_key(&prearmed_key),
+        "the duplicate still gains the loader note"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "no spurious first-use gap for an already-prearmed file: {public:?}"
+    );
+}
+
 /// The per-capture learned-file cap names its excess once: the 33rd file
 /// is refused loudly, the first 32 are unaffected.
 #[test]
@@ -80818,6 +81068,148 @@ fn learned_unavailable_files_a_named_gap() {
     pid_engine.start_file_learning();
     assert!(pid_engine.file_learner.is_none());
     assert!(pid_engine.counters.object_skips.is_empty());
+}
+
+/// File learning never arms for an owned `run`: `start_file_learning`
+/// is a no-op on the run-tree cgroup scope, so a non-member process
+/// opening a provider during a run is never staged (privacy, run-tree
+/// only via the watch's direct scans — fanotify marks are
+/// filesystem-wide and never armed here).
+#[test]
+fn start_file_learning_is_noop_for_owned_run_tree() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.start_file_learning();
+    assert!(
+        engine.file_learner.is_none(),
+        "an owned run never arms the fanotify drain"
+    );
+    assert!(
+        engine.learned_rx.is_none(),
+        "an owned run never opens the learn channel"
+    );
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a no-op arming files no gap: {:?}",
+        engine.counters.object_skips
+    );
+    // A plain user cgroup (no owned run) likewise never arms.
+    let mut cgroup_engine = Engine::empty();
+    cgroup_engine.scope = Scope::Cgroup {
+        id: 2,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    cgroup_engine.start_file_learning();
+    assert!(cgroup_engine.file_learner.is_none());
+    assert!(cgroup_engine.learned_rx.is_none());
+}
+
+/// Loader exhaustion names once and never blocks run-tree learning: with
+/// all 256 contexts spent, the 257th preflight refuses with the exact
+/// capacity reason, two such refusals file exactly one deduped gap row,
+/// and a run-learned provider still stages (staging needs no loader
+/// context, so post-exhaustion mappers' calls still land via the
+/// file-identity probes). Twin of the privileged many-shortlived cell,
+/// which pins that short-lived churn never reaches exhaustion at all.
+#[test]
+fn loader_exhaustion_names_once_and_watch_still_stages() {
+    use crate::discovery::loader::{LoaderContextSpec, MAX_LOADER_CONTEXTS};
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    // Spend all 256 contexts through direct registry commits (pressure
+    // precedent): each preflight+prepare mints one lifetime ID.
+    let view = ProcessViewId(0);
+    for _ in 0..MAX_LOADER_CONTEXTS {
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("envelope fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("envelope fill must prepare");
+    }
+    // The 257th refuses with the exact named reason.
+    let refusal = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: None,
+            hook: p11scope_manifest::elf::SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state_address: None,
+        })
+        .expect_err("the 257th preflight must refuse");
+    assert_eq!(
+        refusal, "loader context capacity 256 is exhausted",
+        "the capacity names itself exactly"
+    );
+    // Two refusals file exactly one gap row (mark dedupes).
+    engine.mark_partial("live loader arming", &refusal);
+    engine.mark_partial("live loader arming", &refusal);
+    let exhaustion_rows = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == "live loader arming"
+                && skip.reason == "loader context capacity 256 is exhausted"
+        })
+        .count();
+    assert_eq!(
+        exhaustion_rows, 1,
+        "exhaustion names itself once, never twice: {:?}",
+        engine.counters.object_skips
+    );
+    // Run-tree learning still stages despite the full registry.
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+        },
+    ))
+    .unwrap();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "run-learned staging needs no loader context"
+    );
 }
 
 /// The file-only apply attaches a staged learned file without any

@@ -4,7 +4,7 @@
 # run-tree-vng.sh TESTBIN OUTDIR KERNEL — run the run-tree CLI
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
 # tag such as v6.6.157) via scripts/ci/run-run-tree.sh, and judge the
-# rows exactly like the host leg (exit 0 plus five qualified rows).
+# rows exactly like the host leg (exit 0 plus eight qualified rows).
 #
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp,
 # so TESTBIN and OUTDIR must live under /home. Inside the guest the cells
@@ -161,7 +161,7 @@ if [ ! -s "$OUT/cells/results.jsonl" ] || [ ! -s "$OUT/cells/summary.txt" ]; the
     echo "run-tree-vng.sh: guest produced no cell results on $KERNEL" >&2
     exit 2
 fi
-# The rows must be exactly the five run-tree cells: a truncated or
+# The rows must be exactly the eight run-tree cells: a truncated or
 # hand-edited file is a harness error, never a partial pass.
 if ! python3 -I - "$OUT/cells/results.jsonl" <<'PY'
 import json,sys
@@ -170,10 +170,13 @@ want={'privileged_run_tree_shell_wrapper_shows_grandchild_calls',
       'privileged_run_tree_double_fork_shows_reparented_calls',
       'privileged_run_tree_outliving_child_is_disclosed',
       'privileged_run_tree_many_children_land_exact',
-      'privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage'}
+      'privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage',
+      'privileged_run_tree_unprearmed_shortlived_never_pause_still_learns',
+      'privileged_run_tree_many_shortlived_workers_stage_and_count',
+      'privileged_run_tree_non_member_provider_is_never_staged'}
 ids=[row['cell'] for row in rows]
 if len(ids) != len(set(ids)) or set(ids) != want:
-    sys.exit('row set is not exactly the five run-tree cells')
+    sys.exit('row set is not exactly the eight run-tree cells')
 PY
 then
     echo "run-tree-vng.sh: bad row set on $KERNEL (see $OUT/cells/results.jsonl)" >&2

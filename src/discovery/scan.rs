@@ -270,14 +270,17 @@ fn read_export_facts_budgeted(
 
 /// Debit window bytes for one export-facts step: a window too small
 /// for the step drains its remainder and refuses with the I/O ceiling
-/// gap, never a partial debit.
+/// gap, never a partial debit. Window-only: the demand-paged table
+/// walk must not convert bytes to collection work (entries are
+/// already charged via `spend`), or one pandoc-sized walk stops the
+/// whole cgroup pass against the shared allowance.
 fn debit_window_io(budget: &mut CaptureWorkBudget, bytes: u64) -> Result<(), String> {
     let remaining = budget.remaining_window_io().unwrap_or(0);
     if bytes > remaining {
-        budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+        budget.record_window_io(usize::try_from(remaining).unwrap_or(usize::MAX));
         return Err(format!("read failed: {IO_CEILING_REASON}"));
     }
-    budget.record_io(usize::try_from(bytes).unwrap_or(usize::MAX));
+    budget.record_window_io(usize::try_from(bytes).unwrap_or(usize::MAX));
     Ok(())
 }
 
@@ -1606,6 +1609,22 @@ impl CaptureWorkBudget {
         // Bound input/parse amplification as well as decoded work. Existing
         // I/O ceilings remain independent. Checks cannot interrupt a read.
         self.collection_checkpoint((bytes as u64).div_ceil(32));
+        self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
+        if let Some(window) = self.active_window.as_mut() {
+            window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    /// Window-only I/O debit for the demand-paged table walk: the bytes
+    /// charge the window (and the capture total) without the 1 unit per
+    /// 32 bytes collection-work conversion. Table entries are already
+    /// charged separately through `spend`, so converting the bytes too
+    /// would debit one pandoc-sized walk (55 MB = 1.7M units) against
+    /// the 1 MiB cgroup collection allowance and stop the whole pass.
+    /// Still polls the collection stop (0 units) so an operator stop
+    /// or deadline reaches the walk without charging it.
+    pub(crate) fn record_window_io(&mut self, bytes: usize) {
+        self.collection_checkpoint(0);
         self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
         if let Some(window) = self.active_window.as_mut() {
             window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
@@ -16712,6 +16731,67 @@ mod tests {
         assert_eq!(budget.stopped_reason(), None);
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
+    }
+
+    /// fix4 C1: pandoc-sized spans admit under the production cgroup
+    /// collection allowance. The 55 MB table walk charges window I/O
+    /// only (entries via `spend`), never 1 unit per 32 bytes of
+    /// collection work, so neither the pandoc-sized object nor the
+    /// next small object stops the pass.
+    #[test]
+    fn inventory_pandoc_sized_spans_admit_under_production_collection_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let pandoc_path = dir.path().join("pandoc-sized.so");
+        write_pandoc_sized_dynsym_elf(&pandoc_path);
+        let small_path = dir.path().join("small.so");
+        write_many_phdr_elf(&small_path, 1);
+        let pandoc = File::open(&pandoc_path).unwrap();
+        let small = File::open(&small_path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&pandoc)
+                && crate::discovery::identity::file_inodes_are_unique(&small),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let pandoc_key = object_key_of(&pandoc);
+        let small_key = object_key_of(&small);
+        // Production inventory window (`inventory_config`) and the
+        // production cgroup walk allowance (`CgroupWalkLimits::default`).
+        let window =
+            InventoryWindowLimits::new(INVENTORY_WINDOW_IO_BYTES, 1 << 20, 4096, 32768, 4096)
+                .unwrap();
+        let retained = InventoryRetainedLimits::new(8192, 32768, 8192, 128, 128, 16 << 20).unwrap();
+        let limits = InventoryDiscoveryLimits::new(8 << 20, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::scope::inventory_cgroup::CgroupWalkBudget::new(
+                crate::scope::inventory_cgroup::CgroupWalkLimits::default(),
+            ),
+        ));
+        let checked = control.clone();
+        let charged = std::sync::Arc::clone(&shared);
+        budget.set_collection_work(CollectionWork::new(move |units| {
+            let units = usize::try_from(units).unwrap_or(usize::MAX);
+            charged.lock().unwrap().charge_work(&checked, units).is_ok()
+        }));
+        assert!(
+            budget.has_collection_work(),
+            "the twin must install the production collection hook"
+        );
+        let window_token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window_token.clone()).unwrap();
+        provider_facts_for(&pandoc, pandoc_key, &[], &mut budget)
+            .expect("pandoc-sized spans must admit under the production collection allowance");
+        provider_facts_for(&small, small_key, &[], &mut budget)
+            .expect("a later object still scans under the production collection allowance");
+        assert_eq!(budget.stopped_reason(), None);
+        let used = shared.lock().unwrap().used.units;
+        assert!(
+            used < (1 << 20),
+            "the table walk must not exhaust the 1 MiB collection allowance, used {used}"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window_token).unwrap();
     }
 
     /// fix3: a 2 GiB sparse `.shstrtab` next to a real library leaves

@@ -2800,8 +2800,10 @@ at 183 MB on disk / 61 MiB readable data, the largest known real-world
 object). Provider export
 checks read only the object's ELF tables via demand paging, refusing
 header tables over the parse bounds (64 KiB program headers, 1 MiB
-section headers, each with its named gap), so a large provider costs
-kilobytes of table reads; identity hashing reads the whole file once
+section headers, each with its named gap) and dynamic spans or walked
+totals larger than the whole production window (`ELF dynamic-symbol table
+is...`, `ELF tables are...`) as guards against crafted files, so a large
+provider costs kilobytes of table reads; identity hashing reads the whole file once
 against the window allowance, and memory snapshots read in bounded
 chunks — a large object degrades through a named gap when an
 allowance runs out, never through a size refusal. Decoding stops at

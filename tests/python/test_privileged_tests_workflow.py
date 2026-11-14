@@ -348,8 +348,13 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         full = job_body(self.yml, "pkcs11-check-full")
         self.assertIn("github.event_name == 'schedule'", full)
         self.assertIn("inputs.pkcs11_check_full", full)
+        providers_full = job_body(self.yml, "pkcs11-check-providers-full")
+        self.assertIn("github.event_name == 'schedule'", providers_full)
+        self.assertIn("inputs.pkcs11_check_full", providers_full)
         smoke = job_body(self.yml, "pkcs11-check-smoke")
         self.assertIn("github.event_name != 'schedule'", smoke)
+        providers = job_body(self.yml, "pkcs11-check-providers")
+        self.assertIn("github.event_name != 'schedule'", providers)
 
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], _BPF.check_no_tag_triggers(self.yml))
@@ -949,8 +954,8 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                                   "bare unhashed pip install remains")
 
     def test_schedule_runs_only_release_build_and_full(self):
-        # Every job except release-build and pkcs11-check-full skips on
-        # schedule, so the nightly runs only the FULL suite on main.
+        # Every job except release-build and the two FULL jobs skips on
+        # schedule, so the nightly runs only the FULL suites on main.
         names = [match.group(1) for match in
                  re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", self.yml, re.M)]
         jobs = [name for name in names
@@ -960,10 +965,13 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("release-build", jobs)
         self.assertIn("pkcs11-check-smoke", jobs)
         self.assertIn("pkcs11-check-full", jobs)
+        self.assertIn("pkcs11-check-providers", jobs)
+        self.assertIn("pkcs11-check-providers-full", jobs)
         for name in jobs:
             body = job_body(self.yml, name)
             with self.subTest(job=name):
-                if name in ("release-build", "pkcs11-check-full"):
+                if name in ("release-build", "pkcs11-check-full",
+                            "pkcs11-check-providers-full"):
                     continue
                 self.assertIn("github.event_name != 'schedule'", body,
                               f"{name} must skip on schedule")

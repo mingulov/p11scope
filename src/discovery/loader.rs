@@ -23,9 +23,13 @@ pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
 /// churn. The refusal names the capacity reason, like exhaustion.
 pub(crate) const OWNED_CHILD_CONTEXT_RESERVE: usize = 8;
 /// Finite reason when no loader context is available: the registry is
-/// full, or the owned-child reserve holds the remainder.
+/// full.
 pub(crate) const LOADER_CAPACITY_EXHAUSTED_REASON: &str =
     "loader context capacity 256 is exhausted";
+/// Finite reason for an owned run's descendant arm refused at the
+/// reserve line: contexts remain, but only for the direct child, so the
+/// gap names the reserve instead of reading as total exhaustion.
+pub(crate) const LOADER_CHILD_RESERVE_REASON: &str = "loader contexts 249-256 are reserved for the run's own command; a descendant arm past 248 was refused";
 /// Generation pinned by the pre-reuse token adapter: production allocation
 /// issues each context exactly once and never recycles storage, so every
 /// allocated context is its slot's first incarnation.

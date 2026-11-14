@@ -81927,7 +81927,7 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
         .iter()
         .filter(|skip| {
             skip.subject == "live loader arming"
-                && skip.reason == "loader context capacity 256 is exhausted"
+                && skip.reason == crate::discovery::loader::LOADER_CHILD_RESERVE_REASON
         })
         .count();
     assert_eq!(
@@ -81971,7 +81971,8 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
 #[test]
 fn loader_reserve_holds_contexts_for_the_owned_child() {
     use crate::discovery::loader::{
-        LOADER_CAPACITY_EXHAUSTED_REASON, MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE,
+        LOADER_CAPACITY_EXHAUSTED_REASON, LOADER_CHILD_RESERVE_REASON, MAX_LOADER_CONTEXTS,
+        OWNED_CHILD_CONTEXT_RESERVE,
     };
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
@@ -82027,13 +82028,17 @@ fn loader_reserve_holds_contexts_for_the_owned_child() {
         engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
         "the child below the reserve line draws normally"
     );
-    // At the line members refuse with the capacity reason while the
-    // child still draws.
+    // At the line members refuse with the reserve reason (distinct
+    // from total exhaustion) while the child still draws.
     fill(&mut engine, 1);
     assert_eq!(
         engine.loader_reserve_refusal(ProcessViewId(1)).as_deref(),
-        Some(LOADER_CAPACITY_EXHAUSTED_REASON),
-        "a member past the line refuses with the capacity reason"
+        Some(LOADER_CHILD_RESERVE_REASON),
+        "a member past the line refuses with the reserve reason"
+    );
+    assert_ne!(
+        LOADER_CHILD_RESERVE_REASON,
+        LOADER_CAPACITY_EXHAUSTED_REASON
     );
     assert!(
         engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
@@ -82170,7 +82175,7 @@ fn loader_reserve_refuses_member_arms_but_arms_the_child() {
         .iter()
         .filter(|skip| {
             skip.subject == "live loader arming"
-                && skip.reason == "loader context capacity 256 is exhausted"
+                && skip.reason == crate::discovery::loader::LOADER_CHILD_RESERVE_REASON
         })
         .count();
     assert_eq!(

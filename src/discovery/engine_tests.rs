@@ -32221,10 +32221,9 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
     let (candidate, _) = fixture.candidate(&mut engine, false);
     assert_eq!(loader_planning_operation_counts(&engine), before);
 
-    // A genuine later mutation preserves final public fields (a repeated
-    // marker would be non-mutating). Equality alone cannot carry the
-    // earlier proof.
-    engine.note_facts_mutated();
+    // A repeated marker preserves final public fields but still follows a
+    // genuine later mutation. Equality alone cannot carry the earlier proof.
+    engine.mark_partial("loader cache control", "repeated dirty input");
     apply_loader_planning_candidate(&mut engine, candidate);
     assert_eq!(engine.plan, published_plan);
     assert_eq!(engine.discovery, discovery);

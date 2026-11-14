@@ -7796,13 +7796,15 @@ pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
 
 /// One cached pid classification (§8.2): the `/proc/<pid>` directory
 /// mtime the class was read under (procfs destroys and recreates the
-/// directory on reuse, so a reused pid never keeps its mtime), the stat
-/// start time confirming the generation, and whether the pid is a user
-/// process.
+/// directory on reuse, so a reused pid never keeps its mtime), and
+/// whether the pid is a user process. No start time: stat field 22
+/// has 10 ms (jiffy) resolution, so a same-jiffy reuse carries the
+/// same start time and it cannot confirm the generation — the mtime
+/// guard plus always-fresh classification on a miss is the whole
+/// guard.
 #[derive(Debug, Clone)]
 struct PidClassCacheEntry {
     dir_mtime: std::time::SystemTime,
-    start_time: Option<u64>,
     is_user: bool,
 }
 
@@ -7811,11 +7813,15 @@ impl Engine {
     /// across refreshes (§8.2): a pid whose `/proc/<pid>` directory
     /// mtime is unchanged since its classification reuses it without
     /// re-reading its stat file; a changed or missing mtime re-reads
-    /// and re-parses exactly like [`user_process_pids`], with the stat
-    /// start time confirming the generation. Same fail-closed semantics
-    /// as the uncached predicate: unreadable or unparsable stats stay
-    /// eligible and are never cached. Prunes departed pids so the cache
-    /// never outgrows the live scope.
+    /// and re-classifies from the fresh stat exactly like
+    /// [`user_process_pids`], never keeping the cached class. The
+    /// fresh read is correct either way: `PF_KTHREAD` is immutable
+    /// per task generation, and stat start time (10 ms jiffies)
+    /// cannot tell same-jiffy reuse from the same generation, so on
+    /// any doubt the fresh class wins. Same fail-closed semantics as
+    /// the uncached predicate: unreadable or unparsable stats stay
+    /// eligible and are never cached. Prunes departed pids so the
+    /// cache never outgrows the live scope.
     pub(crate) fn cached_user_process_pids(&mut self, pids: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(pids.len());
         let mut dir = self.proc_root.clone();
@@ -7837,28 +7843,21 @@ impl Engine {
             self.pid_cache_misses = self.pid_cache_misses.saturating_add(1);
             // Miss or unreadable guard: one stat read classifies and
             // refreshes the cache, exactly like `user_process_pids`.
+            // Always the fresh class: a changed mtime is reuse until
+            // proven otherwise, and the start time cannot prove
+            // otherwise (same-jiffy reuse shares it), so keeping the
+            // cached class would pin a stale verdict for the new
+            // generation's lifetime.
             dir.push("stat");
-            let cached = self.pid_class_cache.get(pid).cloned();
             match std::fs::read_to_string(&dir) {
                 Ok(text) => {
-                    let fresh_is_user = !process::stat_flags_from_stat_text(&text)
+                    let is_user = !process::stat_flags_from_stat_text(&text)
                         .is_some_and(|flags| flags & process::PF_KTHREAD != 0);
-                    let (start_time, _) = process::stat_pair_from_stat(&text);
-                    // Same start time despite a changed mtime means the
-                    // same generation (a clock flake, not reuse): the
-                    // class cannot have changed, so keep it.
-                    let is_user = match (&cached, start_time) {
-                        (Some(entry), Some(fresh)) if entry.start_time == Some(fresh) => {
-                            entry.is_user
-                        }
-                        _ => fresh_is_user,
-                    };
                     if let Ok(mtime) = mtime {
                         self.pid_class_cache.insert(
                             *pid,
                             PidClassCacheEntry {
                                 dir_mtime: mtime,
-                                start_time,
                                 is_user,
                             },
                         );

@@ -8608,6 +8608,8 @@ fn capture_memory_lens(
     let (self_rss_kb, self_hwm_kb) = crate::memory_counters::self_rss_hwm_kb().unzip();
     let (live, dead, dead_rows, sample_us) =
         state.memory_sample(&crate::memory_counters::proc_pid_live);
+    let (tie, unmatched, reopened, late) = tracker.exit_gap_counts();
+    let (engine_pending, overflow) = engine.exit_tap_stats();
     crate::memory_counters::ProfileLens {
         history: engine.memory_history_lens(),
         state: state.memory_lens(),
@@ -8618,6 +8620,16 @@ fn capture_memory_lens(
         self_rss_kb,
         self_hwm_kb,
         tasks: tracker.memory_tasks_row(),
+        exit_gaps: crate::memory_counters::ExitGapCounts {
+            tie,
+            unmatched,
+            reopened,
+            late,
+            overflow,
+            tracker_pending: tracker.pending_exit_taps() as u64,
+            engine_pending: engine_pending as u64,
+            retired_evictions: state.retired_session_evictions(),
+        },
         baseline_rss_kb,
     }
 }

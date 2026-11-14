@@ -260,13 +260,30 @@ impl TracerLens {
     }
 }
 
+/// Exit-retire gap counters, stderr sampler only (never the report):
+/// how often exits tied, dropped unmatched, reopened or arrived late;
+/// engine tap overflow and both tap-queue depths; retired-session
+/// tombstone evictions. One object key so the soak sees overflow and
+/// unmatched rates without spending the pipe-atomic budget per counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExitGapCounts {
+    pub tie: u64,
+    pub unmatched: u64,
+    pub reopened: u64,
+    pub late: u64,
+    pub overflow: u64,
+    pub tracker_pending: u64,
+    pub engine_pending: u64,
+    pub retired_evictions: u64,
+}
+
 /// Profile/trace capture lens: engine history, semantic state
 /// totals, the dead-owned ROW split from one live-pid set, the
 /// live/dead process counts over R10+R12 owners, the sample cost,
-/// the pre-sample RSS/HWM, history tasks, and the capture-start RSS
-/// baseline for the floor row. The RSS is read BEFORE the sample is
-/// built (Important 3), so the sample's own allocations never skew
-/// the line it reports on.
+/// the pre-sample RSS/HWM, history tasks, exit gaps, and the
+/// capture-start RSS baseline for the floor row. The RSS is read
+/// BEFORE the sample is built (Important 3), so the sample's own
+/// allocations never skew the line it reports on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileLens {
     pub history: HistoryLens,
@@ -278,6 +295,7 @@ pub(crate) struct ProfileLens {
     pub self_rss_kb: Option<u64>,
     pub self_hwm_kb: Option<u64>,
     pub tasks: CounterRow,
+    pub exit_gaps: ExitGapCounts,
     pub baseline_rss_kb: Option<u64>,
 }
 
@@ -341,6 +359,7 @@ pub(crate) struct MemorySnapshot {
     r8_cgroups: Option<CounterRow>,
     r8_mech_shapes: Option<CounterRow>,
     r9_tasks: Option<CounterRow>,
+    exit_gaps: Option<ExitGapCounts>,
     r10_reduced: Option<CounterRow>,
     r11_caller_reasons_outer: Option<CounterRow>,
     r11_caller_reasons_rows: Option<CounterRow>,
@@ -496,6 +515,7 @@ impl MemorySnapshot {
             r8_cgroups: Some(state.cgroups),
             r8_mech_shapes: Some(state.mech_shapes),
             r9_tasks: Some(lens.tasks),
+            exit_gaps: Some(lens.exit_gaps),
             r10_reduced: Some(state.reduced),
             r11_caller_reasons_outer: r11.map(|t| t.outer),
             r11_caller_reasons_rows: r11.map(|t| t.rows),
@@ -582,6 +602,7 @@ impl MemorySnapshot {
             r8_cgroups: None,
             r8_mech_shapes: None,
             r9_tasks: None,
+            exit_gaps: None,
             r10_reduced: None,
             r11_caller_reasons_outer: None,
             r11_caller_reasons_rows: None,
@@ -833,6 +854,19 @@ mod tests {
         }
     }
 
+    fn full_exit_gaps() -> ExitGapCounts {
+        ExitGapCounts {
+            tie: 1,
+            unmatched: 2,
+            reopened: 3,
+            late: 4,
+            overflow: 5,
+            tracker_pending: 6,
+            engine_pending: 7,
+            retired_evictions: 8,
+        }
+    }
+
     fn full_profile_lens() -> ProfileLens {
         ProfileLens {
             history: full_history(),
@@ -844,6 +878,7 @@ mod tests {
             self_rss_kb: Some(1111),
             self_hwm_kb: Some(2222),
             tasks: row(3),
+            exit_gaps: full_exit_gaps(),
             baseline_rss_kb: Some(4321),
         }
     }
@@ -906,6 +941,7 @@ mod tests {
         assert_eq!(profile.r7_param_combos.expect("R7").len, 1);
         assert_eq!(profile.r8_mech_shapes.expect("R8").len, 7);
         assert_eq!(profile.r9_tasks.expect("R9").len, 3);
+        assert_eq!(profile.exit_gaps.expect("exit gaps"), full_exit_gaps());
         assert_eq!(profile.r10_reduced.expect("R10").len, 8);
         assert_eq!(profile.r12_open.expect("R12").len, 9);
         assert_eq!(profile.r12_inherited_ambiguous.expect("R12").len, 15);
@@ -1033,6 +1069,7 @@ mod tests {
         assert!(inventory.r8_cgroups.is_none());
         assert!(inventory.r8_mech_shapes.is_none());
         assert!(inventory.r9_tasks.is_none());
+        assert!(inventory.exit_gaps.is_none());
         assert!(inventory.r10_reduced.is_none());
         assert!(inventory.r11_caller_reasons_outer.is_none());
         assert!(inventory.r11_caller_reasons_rows.is_none());

@@ -188,15 +188,24 @@ impl Tracker {
         self.history
             .retire_exits_due(consumer_now, producer_now, budget)
     }
+    /// `(tie_skipped, unmatched, reopened, late)` exit gap counters,
+    /// for the A0 sampler.
+    pub(crate) fn exit_gap_counts(&self) -> (u64, u64, u64, u64) {
+        self.history.exit_gap_counts()
+    }
     /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.
     #[cfg(test)]
     pub(crate) fn exit_counters_for_test(&self) -> (u64, u64, u64, u64) {
-        self.history.exit_counters_for_test()
+        self.exit_gap_counts()
+    }
+    /// Pending (transferred, not yet retired) exit taps, for the A0 sampler.
+    pub(crate) fn pending_exit_taps(&self) -> usize {
+        self.history.pending_exit_taps()
     }
     /// Pending (transferred, not yet retired) exit taps.
     #[cfg(test)]
     pub(crate) fn pending_exit_taps_for_test(&self) -> usize {
-        self.history.pending_exit_taps_for_test()
+        self.pending_exit_taps()
     }
     pub(crate) fn history_call(&mut self, key: ProcessKey) {
         self.history.mark_call(key);

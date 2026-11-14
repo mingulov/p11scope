@@ -532,9 +532,9 @@ impl Registry {
         (matched, tie_seen)
     }
 
-    /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.
-    #[cfg(test)]
-    pub(crate) fn exit_counters_for_test(&self) -> (u64, u64, u64, u64) {
+    /// `(tie_skipped, unmatched, reopened, late)` exit gap counters,
+    /// for the A0 sampler.
+    pub(crate) fn exit_gap_counts(&self) -> (u64, u64, u64, u64) {
         (
             self.exit_tie_skipped,
             self.exit_retire_unmatched,
@@ -543,9 +543,20 @@ impl Registry {
         )
     }
 
+    /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.
+    #[cfg(test)]
+    pub(crate) fn exit_counters_for_test(&self) -> (u64, u64, u64, u64) {
+        self.exit_gap_counts()
+    }
+
+    /// Pending (transferred, not yet retired) exit taps, for the A0 sampler.
+    pub(crate) fn pending_exit_taps(&self) -> usize {
+        self.pending_exits.len()
+    }
+
     /// Pending (transferred, not yet retired) exit taps.
     #[cfg(test)]
     pub(crate) fn pending_exit_taps_for_test(&self) -> usize {
-        self.pending_exits.len()
+        self.pending_exit_taps()
     }
 }

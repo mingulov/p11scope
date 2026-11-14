@@ -2695,3 +2695,214 @@ fn producer_history_limit_is_the_ticket_budget() {
         p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize
     );
 }
+
+// ---- Reviewer probes: failing-first exit-retire twins ----
+// Each asserts the correct behaviour: a FORK-admitted reuse successor is
+// spared (probe 1), a post-exec generation first admitted by a FORK is
+// spared (probe 2), a leader exit with live threads keeps session
+// continuity (probe 3), a fork+exec child frees every R10 entry on exit
+// (probe 4), and an exit retire keeps naming pending gaps (probe 5).
+
+#[test]
+fn probe_fork_admitted_reuse_successor_is_spared() {
+    // Real reducer seam: FORK records carry ts_ns 0 from BPF
+    // (p11_link_emit_fork builds `..Event::default()`).
+    let (mut s, mut t, _) = setup(64);
+    let mut popen = ev(50, 80, 0, 0);
+    popen.ts_ns = 10;
+    let mut ocall = ev(100, 90, 0, 0);
+    ocall.ts_ns = 100;
+    feed(&mut s, &mut t, [popen, ocall]);
+    let old = key(90, 0);
+    assert!(s.has_process_state(old));
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let mut birth = ev(50, 80, 0, 0);
+    birth.event_type = event_type::FORK;
+    birth.session = 100;
+    birth.child_image = ImageIdentity {
+        task_cookie: 91,
+        exec_id: 0,
+    };
+    birth.ts_ns = 0;
+    feed(&mut s, &mut t, [birth]);
+    let child = semantics::ProcessKey::history(1, 91, 0, 100);
+    assert!(s.has_process_state(child), "child inherited the session");
+    let closed_before = s.sessions().closed;
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    eprintln!(
+        "PROBE1 due={due:?} closed {closed_before}->{} child_state={}",
+        s.sessions().closed,
+        s.has_process_state(child)
+    );
+    assert!(
+        !due.contains(&child),
+        "FORK-admitted reuse successor (live) was retired with the old generation"
+    );
+}
+
+#[test]
+fn probe_exec_bump_via_fork_spares_post_exec_generation() {
+    let (mut s, mut t, _) = setup(64);
+    let mut pre = ev(100, 90, 0, 0);
+    pre.ts_ns = 100;
+    feed(&mut s, &mut t, [pre]);
+    // de_thread: the old leader exits at 200 while a non-leader execs.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    // First post-exec event is a FORK (ts 0), then a CALL opening session 8.
+    let mut birth = ev(100, 90, 1, 0);
+    birth.event_type = event_type::FORK;
+    birth.session = 300;
+    birth.child_image = ImageIdentity {
+        task_cookie: 95,
+        exec_id: 0,
+    };
+    birth.ts_ns = 0;
+    let mut open8 = ev(100, 90, 1, 0);
+    open8.session = 8;
+    open8.ts_ns = 300;
+    feed(&mut s, &mut t, [birth, open8]);
+    let live = key(90, 1);
+    assert!(s.has_process_state(live));
+    let closed_before = s.sessions().closed;
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    eprintln!(
+        "PROBE2 due={due:?} closed {closed_before}->{} live_state={}",
+        s.sessions().closed,
+        s.has_process_state(live)
+    );
+    assert!(
+        !due.contains(&live),
+        "post-exec live generation (first admitted by a ts-0 FORK) was retired by the pre-exec leader exit"
+    );
+}
+
+#[test]
+fn probe_leader_exit_with_live_threads_session_continuity() {
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let k = key(90, 0);
+    let p7 = s.session_pseudonym_process(k, 0, 7);
+    // Leader thread exits (pthread_exit) at 200; workers keep running.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    // A worker opens session 8 at 300, then closes session 7 at 310.
+    let mut open8 = ev(100, 90, 0, 0);
+    open8.session = 8;
+    open8.ts_ns = 300;
+    let mut close7 = ev(100, 90, 0, 8);
+    close7.ts_ns = 310;
+    feed(&mut s, &mut t, [open8, close7]);
+    let p8 = s.session_pseudonym_process(k, 0, 8);
+    let v = s.sessions();
+    eprintln!(
+        "PROBE3 p7={p7:?} p8={p8:?} opened={} closed={} unmatched_closes={} counters={:?}",
+        v.opened,
+        v.closed,
+        s.unmatched_closes(),
+        t.exit_counters_for_test()
+    );
+    assert_ne!(
+        p7, p8,
+        "a reopened live process reuses a retired session's pseudonym"
+    );
+    assert_eq!(
+        s.unmatched_closes(),
+        0,
+        "closing the retired session counts unmatched"
+    );
+}
+
+#[test]
+fn probe_fork_exec_child_exit_frees_every_r10_entry() {
+    let (mut s, mut t, _) = setup(64);
+    let mut popen = ev(50, 80, 0, 0);
+    popen.ts_ns = 10;
+    feed(&mut s, &mut t, [popen]);
+    let mut birth = ev(50, 80, 0, 0);
+    birth.event_type = event_type::FORK;
+    birth.session = 300;
+    birth.child_image = ImageIdentity {
+        task_cookie: 95,
+        exec_id: 0,
+    };
+    feed(&mut s, &mut t, [birth]);
+    // The child execs and calls under the new image (exec bump).
+    let mut ccall = ev(300, 95, 1, 0);
+    ccall.session = 9;
+    ccall.ts_ns = 100;
+    feed(&mut s, &mut t, [ccall]);
+    let r10_before = s.memory_lens().reduced.len;
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 300,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    let parent_alive = |pid: u32| pid == 50;
+    let (_, dead, dead_rows, _) = s.memory_sample(&parent_alive);
+    eprintln!(
+        "PROBE4 r10 before={r10_before} after={} dead_procs={dead} r10_dead={}",
+        s.memory_lens().reduced.len,
+        dead_rows.reduced_dead.len
+    );
+    assert_eq!(
+        dead_rows.reduced_dead.len, 0,
+        "the exec-superseded generation's R10 entry stays dead-owned after the exit"
+    );
+}
+
+#[test]
+fn probe_exit_retire_keeps_pending_at_end() {
+    let (mut s, mut t, _) = setup(64);
+    let mut open = ev(100, 90, 0, 0);
+    open.ts_ns = 100;
+    let mut pending = ev(100, 90, 0, 2);
+    pending.ts_ns = 101;
+    pending.rv = pkcs11_types::CkRv::PENDING.0;
+    feed(&mut s, &mut t, [open, pending]);
+    let before = s.pending_at_end();
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    eprintln!(
+        "PROBE5 pending_at_end before={before} after={}",
+        s.pending_at_end()
+    );
+    assert_eq!(
+        s.pending_at_end(),
+        before,
+        "exit retire silently removes an unresolved async call from the rendered pending_at_end gap"
+    );
+}

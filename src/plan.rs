@@ -14779,8 +14779,12 @@ pub(crate) mod tests {
         assert_eq!(plan.module_ambiguous, 1);
     }
 
+    /// Named heuristic growth after retirement stays under the Detailed
+    /// reserve: with retired churn, allocated slots already exceed the open
+    /// ceiling, so heuristic fresh endpoints refuse honestly (protecting a
+    /// later exact table), instead of fitting one more prefix.
     #[test]
-    fn extend_exact_refuses_only_a_crossing_module_after_retirement() {
+    fn extend_exact_refuses_heuristic_growth_after_retirement_under_reserve() {
         let old = PinnedObjectId(10);
         let old_key = ObjectKey {
             device: Device { major: 8, minor: 1 },
@@ -14833,19 +14837,19 @@ pub(crate) mod tests {
 
         let delta = plan.extend_exact(rebuilt).unwrap();
 
-        assert_eq!(delta.new.len(), 1);
-        assert_eq!(delta.new[0].index, MAX_SLOTS - 1);
-        assert_eq!(delta.new[0].object, later);
+        assert_eq!(delta.new.len(), 0);
         assert!(plan.slots.iter().all(|slot| slot.object != crossing));
+        assert!(plan.slots.iter().all(|slot| slot.object != later));
         assert_eq!(
             plan.modules
                 .iter()
                 .map(|module| module.id)
                 .collect::<Vec<_>>(),
-            [ModuleId(0), ModuleId(1)]
+            [ModuleId(0)]
         );
-        assert_eq!(plan.modules_skipped.len(), 1);
+        assert_eq!(plan.modules_skipped.len(), 2);
         assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
+        assert_eq!(plan.modules_skipped[1].subject, "/opt/later.so");
     }
 
     /// Omission details with no holders and no remedies, for shape tests.
@@ -20000,11 +20004,13 @@ pub(crate) mod tests {
 
     /// A capacity refusal says how many allocated slots are live and how many
     /// are retired — lifetime cells never reused — and which modules hold the
-    /// live ones. Named scope keeps its rule and its ending: no reserve, no
-    /// `--module` hint.
+    /// live ones. Named scope with retired churn keeps the Detailed reserve
+    /// (initial builds keep no reserve); the ending names the reserve and the
+    /// remedies.
     #[test]
     fn capacity_refusal_names_active_and_retired_slots_and_their_holders() {
         let capacity = MAX_SLOTS as usize;
+        let reserve = shared_scope_reserve(capacity);
         let kept = provider_with_tables(71, "/opt/kept.so", 1, capacity - 212, false);
         let ended = provider_with_tables(72, "/opt/ended.so", 1, 200, false);
         let late = provider_with_tables(73, "/opt/late.so", 1, 20, false);
@@ -20022,9 +20028,10 @@ pub(crate) mod tests {
             refusal.reason,
             format!(
                 "module needs 20 more; only {capacity} attach slots are available; {} are in \
-                 use ({} active, 200 retired; held by /opt/kept.so {}) - refusing to attach \
-                 a prefix; to capture one provider, name it with --module <path>; to free \
-                 slots, exclude an unneeded module with --exclude-module <name>",
+                 use ({} active, 200 retired; held by /opt/kept.so {}); {reserve} are reserved \
+                 for providers with a corroborated function table - refusing to attach a prefix; \
+                 to capture one provider, name it with --module <path>; to free slots, exclude \
+                 an unneeded module with --exclude-module <name>",
                 capacity - 12,
                 capacity - 212,
                 capacity - 212,

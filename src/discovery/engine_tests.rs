@@ -5579,6 +5579,192 @@ fn cgroup_finish_sweep_counts_a_never_admitted_never_exited_newcomer() {
     );
 }
 
+/// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
+/// the bound. The child must already be killed (else this proves nothing).
+fn wait_until_zombie(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .unwrap_or("?");
+        if state == "Z" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} never reached zombie state (last: {state})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// One fixture `{proc_root}/{pid}/stat` line: `sleep` comm, `state`, user
+/// flags (never `PF_KTHREAD`), `starttime`. Mirrors a real stat line field
+/// for field so the user-process and liveness filters parse it like live
+/// input; ppid is synthetic (nothing on this path reads parentage).
+fn write_proc_stat_fixture(dir: &std::path::Path, pid: u32, state: &str, starttime: u64) {
+    let pid_dir = dir.join(pid.to_string());
+    std::fs::create_dir_all(&pid_dir).expect("fixture pid dir");
+    let line = format!(
+        "{pid} (sleep) {state} 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0\n"
+    );
+    std::fs::write(pid_dir.join("stat"), line).expect("fixture stat");
+}
+
+/// A tracked generation that exits but lingers unreaped (zombie, still
+/// enumerated) must not be re-marked as a newcomer: its exit already matched
+/// its admission, and re-marking files a spurious prune gap at reap.
+/// (mt-system: workload children reaped after the tick gap +1 each.)
+#[test]
+fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let view = ProcessView::open(ProcessViewId(7001), pid).expect("track the sleeper");
+    engine.views.push(view);
+    engine.next_view_id = 7002;
+    engine.seed_initial_cgroup_views();
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    child.kill().expect("exit the sleeper");
+    wait_until_zombie(pid);
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    let starttime = crate::process::process_start_time(pid).expect("zombie keeps starttime");
+    write_proc_stat_fixture(procdir.path(), pid, "Z", starttime);
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&pid),
+        "lingering zombie re-marked as newcomer"
+    );
+    child.wait().expect("reap the sleeper");
+    std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "reap of a tracked zombie filed a prune gap"
+    );
+}
+
+/// An unreadable pid whose view pends removal this tick is the same dying
+/// generation, never a running newcomer (a new generation is always
+/// stat-readable): it must not mark either.
+#[test]
+fn tick_does_not_remark_unreadable_pid_with_pending_view() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let view = ProcessView::open(ProcessViewId(7003), pid).expect("track the sleeper");
+    engine.views.push(view);
+    engine.next_view_id = 7004;
+    engine.seed_initial_cgroup_views();
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    child.kill().expect("exit the sleeper");
+    wait_until_zombie(pid);
+    // No fixture stat at all: reaped between enumeration and admission.
+    // (fail-open user filter still desires it; the arrival filter skips it.)
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&pid),
+        "unreadable tracked pid re-marked as newcomer"
+    );
+    child.wait().expect("reap the sleeper");
+    std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "reap of an unreadable tracked pid filed a prune gap"
+    );
+}
+
+/// A genuinely new RUNNING pid (no view) still marks: the arrival filter
+/// only skips dead or dying-tracked pids.
+#[test]
+fn tick_still_marks_running_newcomer_without_view() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("live stat");
+    let starttime = crate::process::process_start_time(pid).expect("live starttime");
+    assert!(!stat.contains(" Z "), "sleeper must be running, got: {stat}");
+    write_proc_stat_fixture(procdir.path(), pid, "S", starttime);
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    // Marked, then possibly admitted in the same tick (admission consumes
+    // the mark): either way the running newcomer is processed, never skipped.
+    let marked = engine.newcomer_first_seen.contains_key(&pid);
+    let admitted = engine.views.iter().any(|view| view.pid() == pid);
+    assert!(
+        marked || admitted,
+        "running newcomer without a view must still be processed (mark/admit)"
+    );
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// An unreadable pid with NO tracked view still marks (fail-closed): it may
+/// be a genuinely new generation racing exit; its exit record decides the gap.
+#[test]
+fn tick_still_marks_unreadable_pid_without_view() {
+    let pid = 424242u32;
+    assert!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err(),
+        "test pid must stay absent"
+    );
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
+    engine.proc_root = test_empty_proc_root();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.newcomer_first_seen.contains_key(&pid),
+        "unreadable untracked pid must still mark (fail-closed)"
+    );
+}
+
+/// A REUSED pid (new running generation, different start_time) while the old
+/// view pends removal still marks: only the same lingering generation skips.
+#[test]
+fn tick_still_marks_reused_pid_with_pending_view() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let view = ProcessView::open(ProcessViewId(7005), pid).expect("track the sleeper");
+    let old_start = view.start_time();
+    engine.views.push(view);
+    engine.next_view_id = 7006;
+    engine.seed_initial_cgroup_views();
+    child.kill().expect("exit the sleeper");
+    wait_until_zombie(pid);
+    // From the filter's viewpoint this is now a REUSED pid: the old view
+    // pends removal, but a running generation with a new start_time answers.
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    write_proc_stat_fixture(procdir.path(), pid, "R", old_start.unwrap_or(0).wrapping_add(100));
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.newcomer_first_seen.contains_key(&pid),
+        "reused running pid with a pending view must still mark"
+    );
+    child.wait().ok();
+}
+
 /// One drained leader exit for `pid` at `hook_ts` (unadmitted, so it
 /// reaches the generation ledger).
 fn drain_newcomer_exit(engine: &mut Engine, pid: u32, hook_ts: u64) {

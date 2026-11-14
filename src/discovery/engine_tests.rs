@@ -19882,21 +19882,13 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
 fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    // Small members only: the test runner itself has huge maps, and a
-    // per-run time budget must never decide these exact counts, even
-    // loaded. Ownership still names the test process (it need not be
-    // a tree member for the watch to run).
-    let mut first_sleeper = std::process::Command::new("sleep")
+    let mut sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
-        .expect("spawn first sleeper");
-    let mut second_sleeper = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn second sleeper");
+        .expect("spawn sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+        format!("{me}\n{}\n", sleeper.id()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -19906,6 +19898,10 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
     };
     engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive (the budget
+    // mechanism itself is pinned separately with a tight budget).
+    engine.owned_watch_run_budget_ns = u64::MAX;
     engine.owned_tree_watch(Some(1_000));
     assert_eq!(
         engine.owned_watch_unproven.len(),
@@ -19913,15 +19909,15 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         "unseen members join the rescan rotation"
     );
     assert!(
-        engine.owned_watch_seen.contains_key(&first_sleeper.id())
-            && engine.owned_watch_seen.contains_key(&second_sleeper.id()),
+        engine.owned_watch_seen.contains_key(&me)
+            && engine.owned_watch_seen.contains_key(&sleeper.id()),
         "noticed members take first-seen times"
     );
     assert!(
         engine.refresh_requested.is_empty() && engine.newcomer_first_seen.is_empty(),
         "the watch never queues frame work nor marks (exits gap exactly)"
     );
-    // Both members scan per run (neither maps a provider, so
+    // Newest plus oldest scan per run (neither maps a provider, so
     // both stay unproven for the rotation).
     let scanned: u32 = engine
         .owned_watch_unproven
@@ -19969,10 +19965,8 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         engine.owned_watch_unproven.is_empty(),
         "a degraded exact-PID run has no tree to watch"
     );
-    first_sleeper.kill().expect("kill first sleeper");
-    first_sleeper.wait().expect("reap first sleeper");
-    second_sleeper.kill().expect("kill second sleeper");
-    second_sleeper.wait().expect("reap second sleeper");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
 }
 
 #[test]
@@ -20118,20 +20112,13 @@ fn owned_tree_watch_renotice_keeps_first_seen_time() {
 fn owned_tree_watch_backs_off_unproductive_members() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    // Small members only, so the per-run time budget never decides
-    // these exact counts, even loaded (the test runner itself has
-    // huge maps).
-    let mut first_sleeper = std::process::Command::new("sleep")
+    let mut sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
-        .expect("spawn first sleeper");
-    let mut second_sleeper = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn second sleeper");
+        .expect("spawn sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+        format!("{me}\n{}\n", sleeper.id()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -20141,6 +20128,9 @@ fn owned_tree_watch_backs_off_unproductive_members() {
         dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
     };
     engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive.
+    engine.owned_watch_run_budget_ns = u64::MAX;
     let scans = |engine: &Engine| {
         engine
             .owned_watch_unproven
@@ -20164,10 +20154,8 @@ fn owned_tree_watch_backs_off_unproductive_members() {
     // Past the backoff the rotation resumes.
     engine.owned_tree_watch(Some(second + 25_000_000));
     assert_eq!(scans(&engine), 6, "a slow starter still gets rescanned");
-    first_sleeper.kill().expect("kill first sleeper");
-    first_sleeper.wait().expect("reap first sleeper");
-    second_sleeper.kill().expect("kill second sleeper");
-    second_sleeper.wait().expect("reap second sleeper");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
 }
 
 /// Rotation reaches every member, not just the extremes: with three
@@ -20177,9 +20165,6 @@ fn owned_tree_watch_backs_off_unproductive_members() {
 fn owned_tree_watch_rotation_reaches_the_middle_member() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    // Small members only, so the per-run time budget never decides
-    // these exact counts, even loaded (the test runner itself has
-    // huge maps).
     let mut first_sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -20188,18 +20173,9 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
         .arg("30")
         .spawn()
         .expect("spawn second sleeper");
-    let mut third_sleeper = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn third sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!(
-            "{}\n{}\n{}\n",
-            first_sleeper.id(),
-            second_sleeper.id(),
-            third_sleeper.id()
-        ),
+        format!("{me}\n{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -20209,11 +20185,14 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
         dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
     };
     engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive.
+    engine.owned_watch_run_budget_ns = u64::MAX;
     let first = 1_000u64;
     engine.owned_tree_watch(Some(first));
     engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
     engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
-    let mut pids = vec![first_sleeper.id(), second_sleeper.id(), third_sleeper.id()];
+    let mut pids = vec![me, first_sleeper.id(), second_sleeper.id()];
     pids.sort_unstable();
     for pid in &pids {
         assert_eq!(
@@ -20229,8 +20208,6 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
     first_sleeper.wait().expect("reap first sleeper");
     second_sleeper.kill().expect("kill second sleeper");
     second_sleeper.wait().expect("reap second sleeper");
-    third_sleeper.kill().expect("kill third sleeper");
-    third_sleeper.wait().expect("reap third sleeper");
 }
 
 /// A rotation member that gains a retained view leaves the rotation:
@@ -20505,20 +20482,81 @@ fn absorb_watch_scan_counters_counts_refusals_without_marking_gaps() {
 /// run's further scans, while a failed clock read alone stops nothing.
 #[test]
 fn watch_run_over_budget_bounds_time_and_io() {
-    assert!(!watch_run_over_budget(100, 100, 1_000, Some(1_000)));
+    assert!(!watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        Some(1_000),
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
     assert!(watch_run_over_budget(
         100,
         100,
         1_000,
-        Some(1_000 + OWNED_WATCH_RUN_BUDGET_NS)
+        Some(1_000 + OWNED_WATCH_RUN_BUDGET_NS),
+        OWNED_WATCH_RUN_BUDGET_NS
     ));
     assert!(watch_run_over_budget(
         100,
         100 + OWNED_WATCH_RUN_IO_CAP_BYTES,
         1_000,
-        Some(1_000)
+        Some(1_000),
+        OWNED_WATCH_RUN_BUDGET_NS
     ));
-    assert!(!watch_run_over_budget(100, 100, 1_000, None));
+    assert!(!watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        None,
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
+}
+
+/// A spent run budget stops the run after its first scan (progress is
+/// kept, the rest waits): with a 1 ns budget every run scans exactly
+/// one member however many are eligible, deterministically (elapsed
+/// wall time is always >= 1 ns on a monotonic clock).
+#[test]
+fn owned_tree_watch_spent_budget_scans_exactly_one_member_per_run() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.owned_watch_run_budget_ns = 1;
+    engine.owned_tree_watch(Some(1_000));
+    let scans: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scans, 1, "a spent budget scans exactly one member");
+    assert_eq!(
+        engine.owned_watch_unproven.len(),
+        2,
+        "the unscanned member keeps its rotation slot"
+    );
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
 }
 
 /// The lazy user-pid selector stops once its room fills: two user pids

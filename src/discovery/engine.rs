@@ -495,6 +495,12 @@ pub struct Engine {
     /// cursor; each run continues after it (wrapping). `None` before
     /// the first scan.
     owned_watch_cursor: Option<u32>,
+    /// Per-run wall-time budget for the owned-tree watch, in
+    /// nanoseconds: `OWNED_WATCH_RUN_BUDGET_NS` in production. Tests
+    /// that pin exact per-run scan counts set `u64::MAX` (a wall
+    /// budget is inherently load-sensitive; the budget mechanism
+    /// itself is pinned separately with a tight budget).
+    owned_watch_run_budget_ns: u64,
     /// Views the owned-child priority deferred last tick: they arm
     /// normally this tick, so a repeatedly-rescheduled child cannot
     /// starve provider-free descendants. Recomputed every tick arm pass.
@@ -8016,12 +8022,19 @@ fn select_user_pids_lazily(
 }
 
 /// Whether an owned-tree watch run has spent its per-run budget and
-/// must stop scanning further members: either the wall-time or the
-/// attempted-I/O ceiling stops the run. A failed clock read never
-/// stops the run alone (the I/O ceiling still binds it).
-fn watch_run_over_budget(io_start: u64, io_now: u64, ns_start: u64, ns_now: Option<u64>) -> bool {
+/// must stop scanning further members: either the `budget_ns`
+/// wall-time or the attempted-I/O ceiling stops the run. A failed
+/// clock read never stops the run alone (the I/O ceiling still binds
+/// it).
+fn watch_run_over_budget(
+    io_start: u64,
+    io_now: u64,
+    ns_start: u64,
+    ns_now: Option<u64>,
+    budget_ns: u64,
+) -> bool {
     io_now.saturating_sub(io_start) >= OWNED_WATCH_RUN_IO_CAP_BYTES
-        || ns_now.is_some_and(|now| now.saturating_sub(ns_start) >= OWNED_WATCH_RUN_BUDGET_NS)
+        || ns_now.is_some_and(|now| now.saturating_sub(ns_start) >= budget_ns)
 }
 
 /// Rescan delay after `unproductive` consecutive unproductive scans
@@ -12965,6 +12978,7 @@ impl Engine {
             owned_watch_seen: BTreeMap::new(),
             owned_watch_last_ns: None,
             owned_watch_cursor: None,
+            owned_watch_run_budget_ns: OWNED_WATCH_RUN_BUDGET_NS,
             child_priority_spared: BTreeSet::new(),
             learned_unapplied: false,
             handles_deferred: BTreeMap::new(),
@@ -21345,6 +21359,7 @@ impl Engine {
         // clock synthetically).
         let io_start = self.budget.attempted_io_bytes();
         let wall_start = crate::attach::monotonic_ns();
+        let budget_ns = self.owned_watch_run_budget_ns;
         for (index, pid) in picks.into_iter().enumerate() {
             let wall_now = wall_start.and_then(|_| crate::attach::monotonic_ns());
             if index > 0
@@ -21353,6 +21368,7 @@ impl Engine {
                     self.budget.attempted_io_bytes(),
                     wall_start.unwrap_or(0),
                     wall_now,
+                    budget_ns,
                 )
             {
                 break;

@@ -5499,7 +5499,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 None,
             );
             let streamed = render::StreamedProfileReport::new(
-                &reports, &ev, &envelope, &state, &capture, None,
+                &reports, &ev, &envelope, &state, &capture, None, true,
             );
             write_json_report(out_file.file(), &streamed)?;
         } else {
@@ -5509,7 +5509,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 None,
             );
             let streamed =
-                render::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture, None);
+                render::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture, None, true);
             write_json_report(out_file.file(), &streamed)?;
         }
         out_file.commit().map_err(anyhow::Error::msg)?;
@@ -10791,6 +10791,7 @@ fn capture_profile(
                     consumers.state,
                     &capture,
                     None,
+                    true,
                 );
                 // The rescue streamer is built inside the closure below;
                 // its largest section rides out through this cell so R5
@@ -10817,6 +10818,7 @@ fn capture_profile(
                             consumers.state,
                             &capture,
                             Some(delivery),
+                            true,
                         );
                         let result = serde_json::to_writer(&mut *bytes, &rescued);
                         rescue_largest
@@ -10845,8 +10847,9 @@ fn capture_profile(
                 );
                 poll_terminal_cancellation();
                 let out_path = out_file.path().to_path_buf();
-                let streamed =
-                    render::StreamedMetricsReport::new(reports, &ev, &envelope, &capture, None);
+                let streamed = render::StreamedMetricsReport::new(
+                    reports, &ev, &envelope, &capture, None, true,
+                );
                 let rescue_largest = std::cell::Cell::new(0u64);
                 publish_streamed_report_with_drop_accounting(
                     context.3,
@@ -10868,6 +10871,7 @@ fn capture_profile(
                             &envelope,
                             &capture,
                             Some(delivery),
+                            true,
                         );
                         let result = serde_json::to_writer(&mut *bytes, &rescued);
                         rescue_largest
@@ -27745,6 +27749,62 @@ int main(int argc, char **argv) {
             None
         );
         assert_eq!(seal_value_bytes_if_diagnostics(true, || 7), Some(7));
+    }
+
+    /// The sealed size is assigned before the publication error
+    /// propagates, in both lanes: a rescue always returns the `-o`
+    /// error, so assigning after the `?` would lose R5 exactly when
+    /// the rescue ran. Ledger-style per-lane slice.
+    #[test]
+    fn sealed_size_is_assigned_before_publication_errors() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .expect("profile loop")
+            .1
+            .split_once("fn write_json_report")
+            .expect("report site")
+            .0;
+        let mut rest = profile;
+        for lane in ["profile", "metrics"] {
+            let after_publish = rest
+                .split_once("publish_streamed_report_with_drop_accounting(")
+                .unwrap_or_else(|| panic!("{lane} publish call"))
+                .1;
+            let (before_propagate, after_propagate) = after_publish
+                .split_once(".map_err(|error| terminal_publication_error")
+                .unwrap_or_else(|| panic!("{lane} publication error propagation"));
+            assert!(
+                before_propagate.contains("*seal_value_bytes ="),
+                "capture_profile must assign the sealed size before propagating the {lane} publication error, so a rescue still reports R5"
+            );
+            rest = after_propagate;
+        }
+    }
+
+    /// A write error on the last buffered chunk names the same step
+    /// as a write error elsewhere: the inner `BufWriter` flush
+    /// reports as a write, while the outer file flush keeps the
+    /// flushing wording.
+    #[test]
+    fn seal_writer_names_the_inner_flush_as_a_write() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let writer = production
+            .split_once("fn write_json_report(")
+            .expect("seal writer")
+            .1
+            .split_once("\nfn ")
+            .expect("seal writer end")
+            .0;
+        assert!(
+            writer.contains("writer.flush().context(\"writing profile output\")"),
+            "the inner flush must report as a write"
+        );
+        assert!(
+            writer.contains("file.flush().context(\"flushing profile output\")"),
+            "the outer file flush keeps the flushing wording"
+        );
     }
 
     /// Startup T2: both capture loops emit the ready line before the

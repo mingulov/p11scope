@@ -3134,6 +3134,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Disclose audit voids as counted scope gaps (scope round): one
     /// `joint_void_<subcause>_history_loss` gap per void since the last
     /// drain, like ingest-break voids. Scope-wide (not per process).
+    /// Linked lanes only: an S1-only lane re-syncs without fencing
+    /// voids (breaks and re-syncs never count there), so its audit
+    /// counters name no Joint history loss — with zero feeds there is
+    /// none to lose, and the quiet cells fail on any `loss` reason.
+    /// An unlinked drain still advances its baseline, swallowing its
+    /// counters, so a later linked void discloses only itself.
     /// Idempotent: the baseline tracks the adapter's run-global
     /// counters, which retirement carries, so retries and repeated
     /// stop disclosures neither repeat nor lose a void. A replaced
@@ -3142,6 +3148,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// undisclosed.
     pub(crate) fn disclose_audit_void_gaps(&mut self) {
         use crate::semantics_objects::journal::{AUDIT_VOID_GAPS, JournalGap};
+        let linked = self.registry.journal_linked();
         let split = self.joint_capture.adapter().joint_void_counts();
         for (index, gap) in AUDIT_VOID_GAPS.into_iter().enumerate() {
             // Gap-level disclosure: the two FaultChanged site buckets
@@ -3161,6 +3168,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let disclosed = &mut self.audit_voids_disclosed[index];
             let new = total.saturating_sub(*disclosed);
             *disclosed = total;
+            if !linked {
+                continue;
+            }
             for _ in 0..new {
                 self.note_scope_gap(
                     "Joint key operations unavailable; retained S1".to_string(),

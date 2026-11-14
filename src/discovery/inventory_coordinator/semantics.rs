@@ -7402,6 +7402,45 @@ mod promotion_lifecycle_tests {
     }
 
     #[test]
+    fn disclose_audit_void_gaps_stays_quiet_when_unlinked() {
+        // S1-only lanes re-sync without fencing voids (breaks and
+        // re-syncs are linked-only), so their audit H3Loss counters
+        // must not disclose Joint history-loss scope gaps: with zero
+        // Joint feeds there is no Joint history to lose, and the
+        // quiet privileged cells fail on any `loss` reason. Fails
+        // pre-fix disclosing 5 H3Loss gaps.
+        let mut coordinator = coordinator();
+        coordinator.note_journal_linked(false);
+        let carried = crate::semantics_objects::journal::JointVoidCounts {
+            break_dispose: 0,
+            break_ingest: 0,
+            void_audit: 7,
+            void_resync: 0,
+            seal_below_fence: 0,
+            audit_fault_changed_chain: 0,
+            audit_fault_changed_reread: 0,
+            audit_h3_loss: 5,
+            audit_discarded: 0,
+            audit_malformed: 0,
+            audit_counter_unprovable: 0,
+            audit_fault_unreadable: 0,
+            audit_resource_unavailable: 0,
+            voids_ended_joint_feed: 0,
+        };
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
+        coordinator.disclose_audit_void_gaps();
+        let staged = coordinator.registry().staged_scope_gaps_for_test();
+        assert_eq!(
+            staged.len(),
+            0,
+            "an unlinked lane discloses no audit-void gaps: {staged:?}"
+        );
+    }
+
+    #[test]
     fn retire_joint_domain_disposes_refused_drop_shadow_without_positives() {
         // Terminal loss stays disposable: a refused domain's drop
         // shadow retires instead of stranding, without restoring

@@ -2794,14 +2794,16 @@ manifest document, and one manifest's objects share a 512 MiB batch byte
 allowance enforced incrementally as identify reads stream (no object is
 refused for its own size). Separately, one capture-wide 512 MiB attempted-I/O
 budget covers memory scanning and scan-sourced file hashing across every
-selected process, retry, and failed pin, with 256 MiB per scan/hash operation
+selected process, retry, and failed pin, with 256 MiB per scan operation
 enforced incrementally as bytes stream (measured 2026-09-17 against libxul.so
 at 183 MB on disk / 61 MiB readable data, the largest known real-world
 object). Provider export
-checks read only the object's ELF tables via demand paging (bounded), so a
-large provider costs kilobytes of table reads; identity hashing streams the
-whole file in bounded chunks, and memory snapshots read in bounded chunks —
-a large object degrades through the I/O ceiling's named gap when an
+checks read only the object's ELF tables via demand paging, refusing
+header tables over the parse bounds (64 KiB program headers, 1 MiB
+section headers, each with its named gap), so a large provider costs
+kilobytes of table reads; identity hashing reads the whole file once
+against the window allowance, and memory snapshots read in bounded
+chunks — a large object degrades through a named gap when an
 allowance runs out, never through a size refusal. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
 cgroup discovery considers at most 1024 members by default (`--max-scan-pids`)

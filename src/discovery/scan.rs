@@ -76,10 +76,12 @@ const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 /// (14.8 MiB on dev) plus ~1 MiB of provider pin and snapshot reads, so the
 /// old 16 MiB window tripped from pass 0 there and the fedora cgroup cell
 /// attached zero endpoints. 64 MiB fits that closure with margin and covers
-/// larger PKCS#11 hosts' sub-cap closures; files over the 8 MiB
-/// per-operation cap still refuse pre-debit, and the work-units, retained,
-/// and deadline bounds still fence worst-case passes. May be raised when
-/// measured, never lowered: the closure-fit test below pins the floor.
+/// larger PKCS#11 hosts' closures; identity hashing charges the window
+/// only (large providers pin while the window admits them), per-object
+/// shortfalls on snapshots and memory reads name themselves without
+/// stopping the pass, and the work-units, retained, and deadline bounds
+/// still fence worst-case passes. May be raised when measured, never
+/// lowered: the closure-fit test below pins the floor.
 pub(crate) const INVENTORY_WINDOW_IO_BYTES: u64 = 64 << 20;
 pub(crate) const IO_CEILING_REASON: &str =
     "capture attempted-I/O ceiling reached; remaining provider bytes were not read";

@@ -802,8 +802,8 @@ enum AdmissionDecision {
 const REFUSAL_HOLDERS_SHOWN: usize = 3;
 
 /// `N are in use (A active, R retired[; held by …])`: retired slots stay
-/// allocated for the capture lifetime and are never reused, so "in use" alone
-/// overstated what live modules hold.
+/// allocated for the capture lifetime until a cleared exact target reclaims
+/// them, so "in use" alone overstated what live modules hold.
 fn slot_use(in_use: usize, retired: usize, holders: &[(&str, usize)]) -> String {
     let active = in_use.saturating_sub(retired);
     let mut text = format!("{in_use} are in use ({active} active, {retired} retired");
@@ -1163,6 +1163,12 @@ pub struct AttachPlan {
     revivable: BTreeMap<AttachKey, usize>,
     // Exact bootstrap targets which have not yet acquired table authority.
     provisional_get_function_list: BTreeMap<AttachKey, PinnedObjectId>,
+    // Rebuild-only reclaim ticket: each new exact target computed by merge
+    // as eligible to reoccupy one retired slot index, one position per key
+    // and one key per position. Extend applies exactly this assignment (and
+    // clears it), so merge accounting, capacity validation and allocation
+    // cannot disagree about what rides free. Empty on committed plans.
+    reclaimed: BTreeMap<AttachKey, usize>,
     // Every table ordinal that reached an exact target this capture. Keyed
     // like `slot_by_key` but never pruned: a retired row keeps its ordinals.
     slot_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
@@ -1412,6 +1418,285 @@ pub(crate) enum CounterHistoryError {
     Topology,
 }
 
+/// Facts about one retired slot index that decide whether a returning
+/// exact target may reoccupy it. Shared by merge accounting, extension
+/// capacity validation and extend allocation through [`reclaimable`].
+struct RetiredSlotFacts<'a> {
+    position: usize,
+    key: AttachKey,
+    slot: &'a Slot,
+    identity: Option<&'a TargetObject>,
+}
+
+/// The returning target's side of the reclaim decision.
+struct ReclaimTarget<'a> {
+    key: AttachKey,
+    path: &'a str,
+    names: &'a [String],
+    descriptor_index: u32,
+    identity: Option<&'a TargetObject>,
+}
+
+/// The one reclaim predicate: a returning exact target may reoccupy a
+/// retired index only when it is the same exact target, or — for a new pin
+/// of the same file — the same file offset, path, names and descriptor,
+/// with a positive file identity match on both sides. A missing identity
+/// never reclaims: path names are not identity. Aggregated ownership is
+/// applied separately (a reclaim that would make a semantic cell ambiguous
+/// downgrades it to count-only and reports the ambiguity) so merge can
+/// account the same set before module IDs are resolved.
+fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
+    if AttachKey::of(old.slot) != old.key {
+        return false;
+    }
+    if old.key == new.key {
+        // Same pinned object and offset: the same exact target.
+    } else {
+        if old.key.file_offset != new.key.file_offset {
+            return false;
+        }
+        if old.slot.object_path != new.path {
+            return false;
+        }
+        let (Some(old_identity), Some(new_identity)) = (old.identity, new.identity) else {
+            return false;
+        };
+        if old_identity != new_identity
+            || old_identity.sha256.is_none()
+            || new_identity.sha256.is_none()
+        {
+            return false;
+        }
+    }
+    old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names
+}
+
+/// Migration predicate for a same-file new pin arriving while the old pin
+/// is still active: same offset, path, names, descriptor and a positive
+/// file identity match on both sides. Every mismatch fails closed.
+fn migration_matches(
+    old: &Slot,
+    old_identity: Option<&TargetObject>,
+    new: &Slot,
+    new_identity: Option<&TargetObject>,
+) -> bool {
+    if old.file_offset != new.file_offset || old.object_path != new.object_path {
+        return false;
+    }
+    if old.descriptor_index != new.descriptor_index || old.names != new.names {
+        return false;
+    }
+    let (Some(old_identity), Some(new_identity)) = (old_identity, new_identity) else {
+        return false;
+    };
+    old_identity == new_identity && old_identity.sha256.is_some() && new_identity.sha256.is_some()
+}
+
+/// Retired-slot memory borrowed from a plan (or from merge's
+/// [`ExistingAllocation`]) for reclaim decisions.
+struct RetiredMemory<'a> {
+    revivable: &'a BTreeMap<AttachKey, usize>,
+    retired_keys: &'a BTreeMap<AttachKey, usize>,
+    retired_slots: &'a BTreeSet<usize>,
+    slots: &'a [Slot],
+    identities: &'a BTreeMap<PinnedObjectId, TargetObject>,
+}
+
+impl RetiredMemory<'_> {
+    /// The retired facts for `old_key`, or `None` unless the key is still
+    /// cleared revivable at its remembered, still-retired position.
+    fn facts(&self, old_key: &AttachKey) -> Option<RetiredSlotFacts<'_>> {
+        let position = *self.revivable.get(old_key)?;
+        if self.retired_keys.get(old_key) != Some(&position) {
+            return None;
+        }
+        if !self.retired_slots.contains(&position) {
+            return None;
+        }
+        let slot = self.slots.get(position)?;
+        Some(RetiredSlotFacts {
+            position,
+            key: *old_key,
+            slot,
+            identity: self.identities.get(&slot.object),
+        })
+    }
+
+    /// Retired keys by `(file offset, path)` for cross-ID candidate lookup
+    /// without scanning every revivable key once per new target.
+    fn cross_index(&self) -> BTreeMap<(u64, &str), Vec<AttachKey>> {
+        let mut index: BTreeMap<(u64, &str), Vec<AttachKey>> = BTreeMap::new();
+        for old_key in self.revivable.keys() {
+            let Some(facts) = self.facts(old_key) else {
+                continue;
+            };
+            index
+                .entry((old_key.file_offset, facts.slot.object_path.as_str()))
+                .or_default()
+                .push(*old_key);
+        }
+        index
+    }
+}
+
+fn reclaim_target_from_slot<'a>(
+    slot: &'a Slot,
+    identities: &'a BTreeMap<PinnedObjectId, TargetObject>,
+) -> ReclaimTarget<'a> {
+    ReclaimTarget {
+        key: AttachKey::of(slot),
+        path: &slot.object_path,
+        names: &slot.names,
+        descriptor_index: slot.descriptor_index,
+        identity: identities.get(&slot.object),
+    }
+}
+
+fn target_object_from_summary(
+    summary: &crate::discovery::identity::PinnedSummary<'_>,
+) -> TargetObject {
+    TargetObject {
+        dev: (summary.key.device.major, summary.key.device.minor),
+        ino: summary.key.inode,
+        sha256: (!summary.sha256.is_empty()).then(|| summary.sha256.to_string()),
+    }
+}
+
+/// The slot shape a key's targets would build when every target survives
+/// table admission: one presented name, no aliases, and one authorization
+/// value across all of them. Only that robust shape is used for merge's
+/// reclaim accounting: any subset of the key's targets then builds exactly
+/// the predicted names and descriptor, so merge and extend agree by
+/// construction.
+fn predicted_reclaim_shape<'a>(
+    group: &'a [Discovered<'a>],
+    key: &AttachKey,
+    policy: AdmissionPolicy,
+) -> Option<(&'a str, &'a str, u32)> {
+    let mut name: Option<&str> = None;
+    let mut path: Option<&str> = None;
+    let mut authorized: Option<bool> = None;
+    let mut seen = false;
+    for module in group {
+        for target in &module.targets {
+            if target.object != key.object || target.file_offset != key.file_offset {
+                continue;
+            }
+            seen = true;
+            if !target.aliases.is_empty() {
+                return None;
+            }
+            let presented = presented_name(target.name_authorized, target.name);
+            if let Some(known) = name {
+                if known != presented {
+                    return None;
+                }
+            } else {
+                name = Some(presented);
+            }
+            if let Some(known) = path {
+                if known != target.object_path {
+                    return None;
+                }
+            } else {
+                path = Some(target.object_path);
+            }
+            if let Some(known) = authorized {
+                if known != target.semantic_authorized {
+                    return None;
+                }
+            } else {
+                authorized = Some(target.semantic_authorized);
+            }
+        }
+    }
+    if !seen {
+        return None;
+    }
+    let name = name?;
+    let path = path?;
+    let names = [name.to_string()];
+    let (descriptor, _) = crate::kinds::descriptor_index(&names);
+    let descriptor = if policy.forces_count_only() || !authorized.unwrap_or(false) {
+        0
+    } else {
+        descriptor
+    };
+    Some((name, path, descriptor))
+}
+
+/// Merge's reclaim accounting: each new key of `group` eligible for one
+/// retired position, first match wins per the shared predicate and the
+/// already-claimed set. One position per key and one key per position.
+fn reclaim_tickets(
+    group: &[Discovered<'_>],
+    memory: &RetiredMemory<'_>,
+    new_identities: &BTreeMap<PinnedObjectId, TargetObject>,
+    existing: &BTreeMap<AttachKey, usize>,
+    claimed_positions: &BTreeSet<usize>,
+    policy: AdmissionPolicy,
+) -> BTreeMap<AttachKey, usize> {
+    let index = memory.cross_index();
+    let mut keys = BTreeSet::new();
+    for module in group {
+        for target in &module.targets {
+            keys.insert(AttachKey {
+                object: target.object,
+                file_offset: target.file_offset,
+            });
+        }
+    }
+    let mut tickets = BTreeMap::new();
+    let mut claimed_here = BTreeSet::new();
+    for key in keys {
+        if existing.contains_key(&key) {
+            continue;
+        }
+        let Some((name, path, descriptor)) = predicted_reclaim_shape(group, &key, policy) else {
+            continue;
+        };
+        let names = [name.to_string()];
+        let target = ReclaimTarget {
+            key,
+            path,
+            names: &names,
+            descriptor_index: descriptor,
+            identity: new_identities.get(&key.object),
+        };
+        let mut found = None;
+        if let Some(facts) = memory.facts(&key)
+            && !claimed_positions.contains(&facts.position)
+            && !claimed_here.contains(&facts.position)
+            && reclaimable(&facts, &target)
+        {
+            found = Some(facts.position);
+        }
+        if found.is_none()
+            && let Some(candidates) = index.get(&(key.file_offset, path))
+        {
+            for old_key in candidates {
+                let Some(facts) = memory.facts(old_key) else {
+                    continue;
+                };
+                if claimed_positions.contains(&facts.position)
+                    || claimed_here.contains(&facts.position)
+                {
+                    continue;
+                }
+                if reclaimable(&facts, &target) {
+                    found = Some(facts.position);
+                    break;
+                }
+            }
+        }
+        if let Some(position) = found {
+            claimed_here.insert(position);
+            tickets.insert(key, position);
+        }
+    }
+    tickets
+}
+
 impl AttachPlan {
     /// Whether two plans agree on everything the rebuild derives. The
     /// recorded skip list is excluded: every commit's publication
@@ -1434,6 +1719,7 @@ impl AttachPlan {
             plan.entries_seen = 0;
             plan.vendor_interfaces = 0;
             plan.interface_list.clear();
+            plan.reclaimed.clear();
         }
         ours == theirs
     }
@@ -1656,6 +1942,7 @@ impl AttachPlan {
             retired_keys: BTreeMap::new(),
             revivable: BTreeMap::new(),
             provisional_get_function_list: BTreeMap::new(),
+            reclaimed: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
             counter_consumed_end: 0,
@@ -1934,6 +2221,51 @@ impl AttachPlan {
         self.rebuild_from_sources_broad(scanned, manifests, pinned, false)
     }
 
+    /// Test-only rebuild with explicit returning-object identities: the
+    /// production path reads them from the pins in hand, while unit tests
+    /// inject the same facts directly so the fail-closed cross-ID predicate
+    /// is exercised without live pins.
+    #[cfg(test)]
+    pub(crate) fn rebuild_from_sources_with_identities(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        new_identities: &BTreeMap<PinnedObjectId, TargetObject>,
+    ) -> AttachPlan {
+        let owned = self.active_keys_by_owner();
+        let mut rebuilt = build_from_sources_with(
+            scanned,
+            manifests,
+            &[],
+            |_, _| None,
+            |_, _| false,
+            None,
+            Some(new_identities),
+            ExistingAllocation {
+                slots: self.slots.len(),
+                active: &self.slot_by_key,
+                revivable: &self.revivable,
+                retired_keys: &self.retired_keys,
+                retired_slots: &self.retired_slots,
+                prior_slots: &self.slots,
+                prior_identities: &self.object_identities,
+                owned: &owned,
+                first_plan: Some(&self.first_plan_objects),
+                first_plan_had_provider: self.first_plan_had_provider,
+            },
+            false,
+            self.admission_policy,
+            self.admission_scope,
+            false,
+        );
+        rebuilt.object_identities.extend(
+            new_identities
+                .iter()
+                .map(|(id, facts)| (*id, facts.clone())),
+        );
+        rebuilt
+    }
+
     /// Task 1.6 experiment: `broad_admit` lifts the per-object heuristic cap
     /// and refuses a module whole unless every validated table fits. Only the
     /// engine's broad pass sets this; every other caller keeps `false`.
@@ -1973,6 +2305,7 @@ impl AttachPlan {
             prearm,
             pinned_id,
             compatible,
+            Some(pinned),
             broad_admit,
             self.admission_policy,
             counter_hint,
@@ -1989,6 +2322,7 @@ impl AttachPlan {
         prearm: &[PrearmPlanPiece],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
+        pinned: Option<&PinnedObjects>,
         broad_admit: bool,
         admission_policy: AdmissionPolicy,
         counter_hint: bool,
@@ -2000,11 +2334,16 @@ impl AttachPlan {
             prearm,
             pinned_id,
             compatible,
+            pinned,
+            None,
             ExistingAllocation {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
                 revivable: &self.revivable,
+                retired_keys: &self.retired_keys,
+                retired_slots: &self.retired_slots,
                 prior_slots: &self.slots,
+                prior_identities: &self.object_identities,
                 owned: &owned,
                 first_plan: Some(&self.first_plan_objects),
                 first_plan_had_provider: self.first_plan_had_provider,
@@ -2014,6 +2353,12 @@ impl AttachPlan {
             self.admission_scope,
             counter_hint,
         );
+        // Record the returning objects' pinned identities before provisional
+        // seeding, so cross-ID seed reclaim can require a positive match on
+        // both sides exactly like table reclaim.
+        if let Some(pinned) = pinned {
+            rebuilt.note_object_identities(pinned);
+        }
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
                 continue;
@@ -2085,23 +2430,38 @@ impl AttachPlan {
         }
         // View-collapse fix8 F1: a retired seed whose key cleared
         // revivable reoccupies its old cell instead of burning a fresh
-        // one per retry — the provisional counterpart of merge revival
-        // (see `revival_target`). Same clearance, same match: Detailed
-        // policy, still retired at the remembered position, same
-        // descriptor and names, so the reused cookie names the same
-        // endpoint. Seeds are always count-only descriptor 0, for which
-        // the aggregate-ambiguity gate always passes. Every
-        // inconsistency fails closed to a fresh slot below.
-        if matches!(self.admission_policy, AdmissionPolicy::Detailed(_))
+        // one per retry — the provisional counterpart of merge revival.
+        // Same clearance, same predicate as table reclaim: Detailed
+        // policy, still retired at the remembered position, count-only
+        // seed shape, and — for a new pin of the same file — the same
+        // path, offset and a positive identity match on both sides.
+        // Every inconsistency fails closed to a fresh slot below.
+        let names = ["C_GetFunctionList".to_string()];
+        let reuse = if matches!(self.admission_policy, AdmissionPolicy::Detailed(_))
             && !self.slot_by_key.contains_key(&key)
-            && let Some(position) = self.revivable.get(&key).copied()
-            && self.retired_keys.get(&key) == Some(&position)
-            && self.retired_slots.contains(&position)
-            && let Some(retired) = self.slots.get(position)
-            && AttachKey::of(retired) == key
-            && retired.descriptor_index == 0
-            && retired.names == ["C_GetFunctionList"]
         {
+            let memory = self.retired_memory();
+            let target = ReclaimTarget {
+                key,
+                path: &provisional.object_path,
+                names: &names,
+                descriptor_index: 0,
+                identity: self.object_identities.get(&provisional.object),
+            };
+            let same = memory
+                .facts(&key)
+                .filter(|facts| reclaimable(facts, &target))
+                .map(|facts| (facts.position, key));
+            same.or_else(|| {
+                memory.revivable.keys().find_map(|old_key| {
+                    let facts = memory.facts(old_key)?;
+                    reclaimable(&facts, &target).then_some((facts.position, *old_key))
+                })
+            })
+        } else {
+            None
+        };
+        if let Some((position, old_key)) = reuse {
             // Same slot the fresh path below would build, on the old
             // index: like merge revival, the content is the fresh
             // evidence (seeds carry no learned names or descriptors),
@@ -2126,6 +2486,10 @@ impl AttachPlan {
             self.slots[position] = updated.clone();
             self.slot_by_key.insert(key, position);
             self.retired_slots.remove(&position);
+            // Cross-ID seed reclaim consumes the old retired key at this
+            // position, not just the returning key.
+            self.retired_keys.remove(&old_key);
+            self.revivable.remove(&old_key);
             self.retired_keys.remove(&key);
             self.revivable.remove(&key);
             self.provisional_get_function_list
@@ -2253,6 +2617,12 @@ impl AttachPlan {
                     ordinal,
                 }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
+                // A selection name changes the slot's shape after merge
+                // computed its reclaim ticket: drop the ticket so extend
+                // cannot apply a reclaim the shared predicate no longer
+                // proves. Capacity above was checked without any reclaim
+                // discount for this key, so the fresh slot still fits.
+                self.reclaimed.remove(&key);
                 // A retired unknown sibling keeps rendering under this
                 // key, so the entry stays for it when one exists; named
                 // slots read nothing regardless (see
@@ -2366,16 +2736,22 @@ impl AttachPlan {
         self.revivable = revivable;
     }
 
-    /// The retired position a reappearing exact target may reoccupy, or
-    /// `None` when it must take a fresh slot: Detailed policy only, the
-    /// key cleared revivable for this rebuild and still retired at its
-    /// remembered position, the rebuilt slot carrying the same
-    /// descriptor and names (the same function, so counts continue),
-    /// and no new aggregate ambiguity on a semantic descriptor.
-    /// Every inconsistency fails closed to a fresh slot. Shared by
-    /// [`Self::extend_exact_prepared`] and
-    /// [`Self::validate_extension_capacity`] so validation counts
-    /// exactly what extend allocates.
+    /// Retired-slot memory of this plan, for the shared reclaim predicate.
+    fn retired_memory(&self) -> RetiredMemory<'_> {
+        RetiredMemory {
+            revivable: &self.revivable,
+            retired_keys: &self.retired_keys,
+            retired_slots: &self.retired_slots,
+            slots: &self.slots,
+            identities: &self.object_identities,
+        }
+    }
+
+    /// The strict same-key/cross-ID revival target, with the aggregate
+    /// ambiguity gate: used by the unit tests that pin that gate. Live
+    /// allocation applies merge's exact ticket assignment instead (see
+    /// [`Self::reclaim_assignment`]).
+    #[cfg(test)]
     fn revival_target(&self, key: &AttachKey, rebuilt: &AttachPlan, slot: &Slot) -> Option<usize> {
         if !matches!(self.admission_policy, AdmissionPolicy::Detailed(_)) {
             return None;
@@ -2383,83 +2759,151 @@ impl AttachPlan {
         if self.slot_by_key.contains_key(key) {
             return None;
         }
-        if let Some(position) = self.revivable.get(key) {
-            let position = *position;
-            if self.retired_keys.get(key) != Some(&position) {
-                return None;
+        let memory = self.retired_memory();
+        let candidate = reclaim_target_from_slot(slot, &rebuilt.object_identities);
+        let position = if let Some(facts) = memory.facts(key) {
+            (reclaimable(&facts, &candidate)).then_some(facts.position)?
+        } else {
+            let index = memory.cross_index();
+            let candidates = index.get(&(key.file_offset, slot.object_path.as_str()))?;
+            let mut found = None;
+            for old_key in candidates {
+                let Some(facts) = memory.facts(old_key) else {
+                    continue;
+                };
+                if reclaimable(&facts, &candidate) {
+                    found = Some(facts.position);
+                    break;
+                }
             }
-            if !self.retired_slots.contains(&position) {
-                return None;
-            }
-            let retired = self.slots.get(position)?;
-            if AttachKey::of(retired) != *key {
-                return None;
-            }
-            if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
-                return None;
-            }
-            let previous = self.aggregate_owners.get(position).copied()?;
-            let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
-                AggregateOwner::Ambiguous
-            } else {
-                AggregateOwner::from_module_ids(&slot.module_ids)
-            };
-            if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
-                return None;
-            }
-            return Some(position);
+            found?
+        };
+        let previous = self.aggregate_owners.get(position).copied()?;
+        let candidate_owner = if rebuilt.slot_is_module_ambiguous(slot.index) {
+            AggregateOwner::Ambiguous
+        } else {
+            AggregateOwner::from_module_ids(&slot.module_ids)
+        };
+        if previous.merge(candidate_owner) != previous && slot.descriptor_index != 0 {
+            return None;
         }
-        // Cross-ID same-file reclaim: a new pin for the same file reuses a
-        // revivable retired index with the same file offset + same path +
-        // same names/descriptor, so short-lived churn (new pin IDs) stops
-        // burning fresh slots. Counts continue (same function, same file).
-        // Every inconsistency fails closed to a fresh slot. File identity
-        // (dev/ino/sha) must match when both sides carry it; synthetic
-        // plans without identities rely on path + offset + names.
-        let new_identity = rebuilt.object_identities.get(&slot.object);
-        for (old_key, position) in &self.revivable {
-            if old_key.file_offset != key.file_offset {
-                continue;
-            }
-            let position = *position;
-            if self.retired_keys.get(old_key) != Some(&position) {
-                continue;
-            }
-            if !self.retired_slots.contains(&position) {
-                continue;
-            }
-            let Some(retired) = self.slots.get(position) else {
-                continue;
-            };
-            if AttachKey::of(retired) != *old_key {
-                continue;
-            }
-            if retired.object_path != slot.object_path {
-                continue;
-            }
-            if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
-                continue;
-            }
-            if let (Some(old_identity), Some(new_identity)) =
-                (self.object_identities.get(&retired.object), new_identity)
-                && old_identity != new_identity
-            {
-                continue;
-            }
-            let Some(previous) = self.aggregate_owners.get(position).copied() else {
-                continue;
-            };
-            let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
-                AggregateOwner::Ambiguous
-            } else {
-                AggregateOwner::from_module_ids(&slot.module_ids)
-            };
-            if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
-                continue;
-            }
-            return Some(position);
+        Some(position)
+    }
+
+    /// The exact retired-index assignment extend will apply. Every ticket is
+    /// re-checked against the shared predicate with the rebuilt slot's
+    /// actual facts, at one position per key and one key per position, so
+    /// validation counts exactly what allocation reoccupies.
+    ///
+    /// Keys that migrate onto an active index are excluded (migration takes
+    /// precedence: it leaves no retired cell and no detach gap).
+    fn reclaim_assignment(
+        &self,
+        rebuilt: &AttachPlan,
+        migrated: &BTreeMap<AttachKey, usize>,
+    ) -> BTreeMap<AttachKey, usize> {
+        if !matches!(self.admission_policy, AdmissionPolicy::Detailed(_)) {
+            return BTreeMap::new();
         }
-        None
+        let memory = self.retired_memory();
+        let mut assigned = BTreeMap::new();
+        let mut claimed_positions = BTreeSet::new();
+        for (key, position) in &rebuilt.reclaimed {
+            if migrated.contains_key(key) {
+                continue;
+            }
+            let Some(&new_position) = rebuilt.slot_by_key.get(key) else {
+                continue;
+            };
+            if !rebuilt.is_active(new_position as u32) {
+                continue;
+            }
+            if claimed_positions.contains(position) {
+                continue;
+            }
+            let Some(old_slot) = memory.slots.get(*position) else {
+                continue;
+            };
+            let old_key = AttachKey::of(old_slot);
+            let Some(facts) = memory.facts(&old_key) else {
+                continue;
+            };
+            if facts.position != *position {
+                continue;
+            }
+            let slot = &rebuilt.slots[new_position];
+            let target = reclaim_target_from_slot(slot, &rebuilt.object_identities);
+            if reclaimable(&facts, &target) {
+                assigned.insert(*key, *position);
+                claimed_positions.insert(*position);
+            }
+        }
+        assigned
+    }
+
+    /// The exact active-index migration assignment extend will apply: a
+    /// new pin of the same file reuses the still-active index in place,
+    /// with no retire/new delta. One old position per new key and one new
+    /// key per old position (first match in rebuilt slot order).
+    fn migration_assignment(&self, rebuilt: &AttachPlan) -> BTreeMap<AttachKey, usize> {
+        let mut index: BTreeMap<(u64, &str), Vec<(AttachKey, &Slot)>> = BTreeMap::new();
+        for slot in &rebuilt.slots {
+            if !rebuilt.is_active(slot.index) {
+                continue;
+            }
+            index
+                .entry((slot.file_offset, slot.object_path.as_str()))
+                .or_default()
+                .push((AttachKey::of(slot), slot));
+        }
+        let mut assigned = BTreeMap::new();
+        let mut claimed_positions = BTreeSet::new();
+        for (old_key, position) in &self.slot_by_key {
+            if rebuilt.slot_by_key.contains_key(old_key) || claimed_positions.contains(position) {
+                continue;
+            }
+            let Some(old_slot) = self.slots.get(*position) else {
+                continue;
+            };
+            let Some(candidates) =
+                index.get(&(old_slot.file_offset, old_slot.object_path.as_str()))
+            else {
+                continue;
+            };
+            for (new_key, new_slot) in candidates {
+                if assigned.contains_key(new_key) {
+                    continue;
+                }
+                if migration_matches(
+                    old_slot,
+                    self.object_identities.get(&old_slot.object),
+                    new_slot,
+                    rebuilt.object_identities.get(&new_slot.object),
+                ) {
+                    assigned.insert(*new_key, *position);
+                    claimed_positions.insert(*position);
+                    break;
+                }
+            }
+        }
+        assigned
+    }
+
+    /// Bounds capture-lifetime metadata to the cells the plan still holds:
+    /// only live and retired slots (and live modules) keep ordinals and
+    /// object identities. A reclaimed position transfers the old key's
+    /// ordinals to the returning key first, so no history is lost.
+    fn prune_capture_memory(&mut self) {
+        let live_keys: BTreeSet<AttachKey> = self.slots.iter().map(AttachKey::of).collect();
+        self.slot_ordinals.retain(|key, _| live_keys.contains(key));
+        let live_objects: BTreeSet<PinnedObjectId> = self
+            .slots
+            .iter()
+            .map(|slot| slot.object)
+            .chain(self.modules.iter().map(|module| module.object))
+            .collect();
+        self.object_identities
+            .retain(|object, _| live_objects.contains(object));
     }
 
     /// The slot index for one exact attach target, if this plan holds it
@@ -2652,6 +3096,28 @@ impl AttachPlan {
         rebuilt.validate_slot_index()?;
         self.validate_extension_capacity(&rebuilt)?;
 
+        // Exact reuse assignments, computed once and applied verbatim so
+        // merge accounting, capacity validation and allocation agree:
+        // migration onto a still-active index first, then the merge's
+        // reclaim tickets onto retired indices (one key per position).
+        let migrated = self.migration_assignment(&rebuilt);
+        let reclaimed = self.reclaim_assignment(&rebuilt, &migrated);
+        let mut migrated_by_position: BTreeMap<usize, (AttachKey, usize)> = BTreeMap::new();
+        for (new_key, position) in &migrated {
+            if let Some(new_index) = rebuilt.slot_by_key.get(new_key) {
+                migrated_by_position.insert(*position, (*new_key, *new_index));
+            }
+        }
+        // Old retired keys by position, built once: consuming a reclaimed
+        // position never scans the retirement memory per slot.
+        let mut retired_by_position: BTreeMap<usize, Vec<AttachKey>> = BTreeMap::new();
+        for (old_key, position) in &self.retired_keys {
+            retired_by_position
+                .entry(*position)
+                .or_default()
+                .push(*old_key);
+        }
+
         let mut slots = self.slots.clone();
         let mut slot_by_key = self.slot_by_key.clone();
         let mut retired_slots = self.retired_slots.clone();
@@ -2674,55 +3140,40 @@ impl AttachPlan {
             if rebuilt.slot_by_key.contains_key(key) {
                 continue;
             }
-            // Pin migration (coverage): same-file new pin (same offset+path+
-            // names/descriptor, same file identity when both sides carry it)
-            // reuses the active index in place with no retire/new delta, so
-            // file-based links stay attached and counts continue with no blind
-            // gap. Every mismatch fails closed to retire+admit as before.
-            // Count-only tolerates the new pin's fresh module IDs (Ambiguous);
-            // new ambiguity on a semantic descriptor refuses migration.
-            let migrated = rebuilt
-                .slot_by_key
-                .iter()
-                .find_map(|(new_key, new_position)| {
-                    if new_key.file_offset != key.file_offset {
-                        return None;
-                    }
-                    let new_slot = rebuilt.slots.get(*new_position)?;
-                    let old_slot = slots.get(*position)?;
-                    if new_slot.object_path != old_slot.object_path {
-                        return None;
-                    }
-                    if new_slot.descriptor_index != old_slot.descriptor_index
-                        || new_slot.names != old_slot.names
-                    {
-                        return None;
-                    }
-                    if let (Some(old_identity), Some(new_identity)) = (
-                        self.object_identities.get(&old_slot.object),
-                        rebuilt.object_identities.get(&new_slot.object),
-                    ) && old_identity != new_identity
-                    {
-                        return None;
-                    }
-                    let previous = aggregate_owners.get(*position).copied()?;
-                    let candidate = if rebuilt.slot_is_module_ambiguous(new_slot.index) {
-                        AggregateOwner::Ambiguous
-                    } else {
-                        AggregateOwner::from_module_ids(&new_slot.module_ids)
-                    };
-                    if previous.merge(candidate) != previous && new_slot.descriptor_index != 0 {
-                        return None;
-                    }
-                    Some((*new_key, new_slot.clone(), previous.merge(candidate)))
-                });
-            if let Some((new_key, new_slot, merged_owner)) = migrated {
-                let mut updated = new_slot;
+            // Pin migration (coverage): a same-file new pin (same offset,
+            // path, names, descriptor and positive file identity on both
+            // sides) reuses the still-active index in place with no
+            // retire/new delta, so file-based links stay attached and
+            // counts continue with no blind gap. The assignment is exact
+            // and one-to-one; every mismatch fails closed to retire+admit.
+            if let Some((new_key, new_index)) = migrated_by_position.get(position).copied() {
+                let new_slot = &rebuilt.slots[new_index];
+                let mut updated = new_slot.clone();
                 updated.index = *position as u32;
-                aggregate_owners[*position] = merged_owner;
+                let previous = aggregate_owners[*position];
+                let candidate = if rebuilt.slot_is_module_ambiguous(new_slot.index) {
+                    AggregateOwner::Ambiguous
+                } else {
+                    AggregateOwner::from_module_ids(&updated.module_ids)
+                };
+                let merged = previous.merge(candidate);
+                aggregate_owners[*position] = merged;
+                if merged == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
+                    updated.descriptor_index = 0;
+                    updated.semantics = SlotSemantics::COUNT_ONLY;
+                    updated.semantic_ambiguous = true;
+                }
+                if let Some(ordinals) = self.slot_ordinals.remove(key) {
+                    self.slot_ordinals
+                        .entry(new_key)
+                        .or_default()
+                        .extend(ordinals);
+                }
                 slots[*position] = updated;
                 slot_by_key.remove(key);
                 slot_by_key.insert(new_key, *position);
+                retired_keys.remove(&new_key);
+                revivable.remove(&new_key);
                 continue;
             }
             retired_slots.insert(*position);
@@ -2851,13 +3302,15 @@ impl AttachPlan {
                     }
                 }
                 slots[position] = updated;
-            } else if let Some(position) = self.revival_target(&key, &rebuilt, slot) {
-                // Same-target revival (or cross-ID same-file reclaim): the
-                // key cleared revivable and still matches its retired slot
-                // (same key, or same file offset + path + names for a new
-                // pin ID), so it reoccupies the old index instead of
-                // burning a fresh one. Counts continue in place — revive
-                // zeroes nothing.
+            } else if let Some(position) = reclaimed.get(&key).copied() {
+                // Merge's revisit ticket: the key is eligible for this
+                // retired index under the shared predicate (same target, or
+                // a new pin of the same file with a positive identity
+                // match), so it reoccupies the old index instead of burning
+                // a fresh one. Counts continue in place — revive zeroes
+                // nothing. A reclaim that would make a semantic cell
+                // ambiguous downgrades it to count-only and reports the
+                // ambiguity rather than refusing the slot.
                 let mut updated = slot.clone();
                 updated.index = position as u32;
                 let previous_owner = aggregate_owners[position];
@@ -2866,21 +3319,32 @@ impl AttachPlan {
                 } else {
                     AggregateOwner::from_module_ids(&updated.module_ids)
                 };
-                aggregate_owners[position] = previous_owner.merge(candidate_owner);
+                let merged_owner = previous_owner.merge(candidate_owner);
+                aggregate_owners[position] = merged_owner;
+                if merged_owner == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
+                    updated.descriptor_index = 0;
+                    updated.semantics = SlotSemantics::COUNT_ONLY;
+                    updated.semantic_ambiguous = true;
+                }
+                // The same function of the same file: its capture-lifetime
+                // ordinals follow the returning key.
+                let old_key = AttachKey::of(&slots[position]);
+                if let Some(ordinals) = self.slot_ordinals.remove(&old_key) {
+                    self.slot_ordinals.entry(key).or_default().extend(ordinals);
+                }
                 slots[position] = updated.clone();
                 slot_by_key.insert(key, position);
                 retired_slots.remove(&position);
-                // Cross-ID reclaim consumes the old retired key (same
-                // position, different pin ID), not just the new key.
-                let old_keys: Vec<AttachKey> = retired_keys
-                    .iter()
-                    .filter_map(|(old_key, old_position)| {
-                        (*old_position == position).then_some(*old_key)
-                    })
-                    .collect();
-                for old_key in old_keys {
-                    retired_keys.remove(&old_key);
-                    revivable.remove(&old_key);
+                // Cross-ID reclaim consumes every old retired key at this
+                // position (same position, different pin ID), not just the
+                // new key.
+                for old_key in retired_by_position
+                    .get(&position)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
+                    retired_keys.remove(old_key);
+                    revivable.remove(old_key);
                 }
                 retired_keys.remove(&key);
                 revivable.remove(&key);
@@ -2949,7 +3413,10 @@ impl AttachPlan {
         self.reproven_unfinished_slots = merged_reproven;
         self.standard_layout_evidence
             .extend(rebuilt.standard_layout_evidence.iter().copied());
-        // Capture-lifetime disclosure: ordinals and identities only grow.
+        // Capture-lifetime disclosure: ordinals and identities follow the
+        // live cells (a reclaim or migration transfers the old key's
+        // ordinals first) and are then bounded to the live and retired
+        // slots, so pin churn cannot grow them without bound.
         for (key, ordinals) in rebuilt.slot_ordinals {
             self.slot_ordinals.entry(key).or_default().extend(ordinals);
         }
@@ -2987,6 +3454,8 @@ impl AttachPlan {
             .iter()
             .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
             .count();
+        self.reclaimed.clear();
+        self.prune_capture_memory();
         Ok(delta)
     }
 
@@ -3018,9 +3487,12 @@ impl AttachPlan {
     }
 
     fn validate_extension_capacity(&self, rebuilt: &AttachPlan) -> Result<(), String> {
-        // Only additions that need a new index count: revived targets
-        // reoccupy retired positions (see `revival_target`, the same
-        // predicate extend allocates by).
+        // Only additions that need a new index count. Reuse is the exact
+        // assignment extend applies — migration onto an active index first,
+        // then merge's reclaim tickets — so validation counts exactly what
+        // allocation allocates.
+        let migrated = self.migration_assignment(rebuilt);
+        let reclaimed = self.reclaim_assignment(rebuilt, &migrated);
         let additions = rebuilt
             .slots
             .iter()
@@ -3032,7 +3504,7 @@ impl AttachPlan {
                 if self.slot_by_key.contains_key(&key) {
                     return false;
                 }
-                self.revival_target(&key, rebuilt, slot).is_none()
+                !migrated.contains_key(&key) && !reclaimed.contains_key(&key)
             })
             .count();
         self.admission_policy
@@ -3184,6 +3656,7 @@ impl AttachPlan {
             .iter()
             .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
             .count();
+        self.prune_capture_memory();
     }
 
     /// Excises never-linked tail cells this candidate allocated past
@@ -3302,6 +3775,7 @@ impl AttachPlan {
             .iter()
             .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
             .count();
+        self.prune_capture_memory();
         old_to_new
     }
 
@@ -3457,7 +3931,6 @@ impl AttachPlan {
     }
 
     fn remap_modules(&self, rebuilt: &mut AttachPlan) -> Result<(), String> {
-        let mut source_ids = BTreeMap::new();
         let mut objects = BTreeSet::new();
         let mut next = self
             .modules
@@ -3470,45 +3943,61 @@ impl AttachPlan {
             )
             .max()
             .map_or(0, |id| id + 1);
-        // Ids already spoken for in this remap: live modules keep
-        // theirs, and the retired-memory fallback below must never
-        // hand one historical id to two returning objects. Same-file pin
-        // churn transfers live ids separately (old pin IDs absent from the
-        // rebuild, same key+path), so a new pin for the same file keeps the
-        // provider's id with no false ambiguity.
-        let mut stable_in_use: BTreeSet<ModuleId> =
-            self.modules.iter().map(|module| module.id).collect();
-        let mut same_file_donated: BTreeSet<ModuleId> = BTreeSet::new();
-        for module in &mut rebuilt.modules {
+        let rebuilt_objects: BTreeSet<PinnedObjectId> =
+            rebuilt.modules.iter().map(|module| module.object).collect();
+        let new_identities = rebuilt.object_identities.clone();
+        // Live modules keep their ids. Assigning them first means a
+        // same-file donation below can never take an id that a module
+        // still present in this rebuild owns.
+        let mut reserved: BTreeSet<ModuleId> = BTreeSet::new();
+        let mut stable_by_source: BTreeMap<ModuleId, ModuleId> = BTreeMap::new();
+        for module in &rebuilt.modules {
             if !objects.insert(module.object) {
                 return Err(format!("duplicate module object {:?}", module.object));
             }
-            let source = module.id;
-            let stable = self
-                .modules
-                .iter()
-                .find(|old| old.object == module.object)
-                .map(|old| old.id)
-                .or_else(|| self.retired_module_id(module.object, &stable_in_use))
+            if let Some(old) = self.modules.iter().find(|old| old.object == module.object) {
+                stable_by_source.insert(module.id, old.id);
+                reserved.insert(old.id);
+            }
+        }
+        // Returning objects without a live module: the still-retired slot
+        // memory donates the historical id when the exact object returns,
+        // when the same verified file identity returns (dev/ino/sha and
+        // path match), or when the same file key+path returns and no
+        // still-present module owns that id. One id is donated at most
+        // once.
+        for module in &rebuilt.modules {
+            if stable_by_source.contains_key(&module.id) {
+                continue;
+            }
+            let mut stable = self
+                .retired_module_id(module, &reserved, &new_identities)
                 .or_else(|| {
                     self.modules
                         .iter()
                         .find(|old| {
                             old.key == module.key
                                 && old.path == module.path
-                                && !same_file_donated.contains(&old.id)
+                                && !reserved.contains(&old.id)
+                                && !rebuilt_objects.contains(&old.object)
                         })
-                        .map(|old| {
-                            same_file_donated.insert(old.id);
-                            old.id
-                        })
-                })
-                .unwrap_or_else(|| {
-                    let id = ModuleId(next);
-                    next += 1;
-                    id
+                        .map(|old| old.id)
                 });
-            stable_in_use.insert(stable);
+            if stable.is_some_and(|id| !reserved.insert(id)) {
+                stable = None;
+            }
+            let stable = stable.unwrap_or_else(|| {
+                let id = ModuleId(next);
+                next += 1;
+                reserved.insert(id);
+                id
+            });
+            stable_by_source.insert(module.id, stable);
+        }
+        let mut source_ids = BTreeMap::new();
+        for module in &mut rebuilt.modules {
+            let source = module.id;
+            let stable = stable_by_source[&source];
             if source_ids.insert(source, stable).is_some() {
                 return Err(format!("duplicate rebuilt module id {}", source.0));
             }
@@ -3532,33 +4021,55 @@ impl AttachPlan {
         Ok(())
     }
 
-    /// Historical module id for a returning object: a still-retired
-    /// slot that names exactly this object under one module id donates
-    /// that id, so the returnee reoccupies its retired indices
-    /// (revival) instead of burning fresh slots. Multi-module retired
-    /// slots cannot donate (the id for this object is ambiguous
-    /// there), reoccupied positions are skipped (their slot key no
-    /// longer matches the retired memory), and an id already spoken
-    /// for in this remap is never donated twice.
+    /// Historical module id for a returning provider: a still-retired
+    /// slot that named the exact object, or the same verified file
+    /// identity (dev/ino/sha) at the same path, under one module id
+    /// donates that id, so the returnee keeps its historical module
+    /// identity across pin churn and its reclaimed indices stay owned by
+    /// one module (no false ambiguity). Multi-module retired slots cannot
+    /// donate (the id for this object is ambiguous there), and an id
+    /// already spoken for in this remap is never donated twice.
     fn retired_module_id(
         &self,
-        object: PinnedObjectId,
+        module: &ModuleSummary,
         in_use: &BTreeSet<ModuleId>,
+        new_identities: &BTreeMap<PinnedObjectId, TargetObject>,
     ) -> Option<ModuleId> {
-        self.retired_keys
-            .iter()
-            .filter(|(key, _)| key.object == object)
-            .filter_map(|(key, position)| {
-                if !self.retired_slots.contains(position) {
-                    return None;
-                }
-                let slot = self.slots.get(*position)?;
-                (AttachKey::of(slot) == *key).then_some(slot)
-            })
-            .find_map(|slot| match slot.module_ids.as_slice() {
+        let retired = |key: &AttachKey, position: &usize| -> Option<&Slot> {
+            if !self.retired_slots.contains(position) {
+                return None;
+            }
+            let slot = self.slots.get(*position)?;
+            (AttachKey::of(slot) == *key).then_some(slot)
+        };
+        let donated = |slot: &Slot| -> Option<ModuleId> {
+            match slot.module_ids.as_slice() {
                 [id] if !in_use.contains(id) => Some(*id),
                 _ => None,
+            }
+        };
+        // Same exact pinned object returning.
+        let same_object = self
+            .retired_keys
+            .iter()
+            .filter(|(key, _)| key.object == module.object)
+            .filter_map(|(key, position)| retired(key, position))
+            .find_map(donated);
+        if same_object.is_some() {
+            return same_object;
+        }
+        // Same verified file identity, independent of the pin ID: the
+        // positive identity match that also gates cross-ID reclaim.
+        let new_identity = new_identities.get(&module.object)?;
+        new_identity.sha256.as_ref()?;
+        self.retired_keys
+            .iter()
+            .filter_map(|(key, position)| retired(key, position))
+            .find(|slot| {
+                slot.object_path == module.path
+                    && self.object_identities.get(&slot.object) == Some(new_identity)
             })
+            .and_then(donated)
     }
 }
 
@@ -3847,6 +4358,7 @@ fn merge(
     discovered: Vec<Discovered<'_>>,
     vendor_interfaces: usize,
     interface_list: String,
+    new_identities: &BTreeMap<PinnedObjectId, TargetObject>,
     allocated: ExistingAllocation<'_>,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
@@ -3855,16 +4367,23 @@ fn merge(
 ) -> AttachPlan {
     let capacity = admission_policy.endpoint_limit();
     let existing_slots = allocated.active;
-    // Same-target revival (Detailed only): cleared retired keys reoccupy
-    // their old positions at extend, so they cost no new slot. Counters
-    // publish by position and Inventory owns its own budget — neither
-    // revives, and their revivable input stays empty. Cross-ID same-file
-    // reclaim reads the same clearance plus `prior_slots` paths: a new pin
+    // Reuse (Detailed only): cleared retired keys reoccupy their old
+    // positions at extend, so they cost no new slot. Counters publish by
+    // position and Inventory owns its own budget — neither reuses, and
+    // their revivable input stays empty. Cross-ID same-file reclaim reads
+    // the same clearance plus the prior plan's known identities: a new pin
     // for the same file reuses a revivable retired index with the same
-    // file offset and path.
+    // file offset, path, names/descriptor and a positive identity match.
     let revival_allowed = matches!(admission_policy, AdmissionPolicy::Detailed(_));
-    let revivable = allocated.revivable;
-    let prior_slots = allocated.prior_slots;
+    let memory = RetiredMemory {
+        revivable: allocated.revivable,
+        retired_keys: allocated.retired_keys,
+        retired_slots: allocated.retired_slots,
+        slots: allocated.prior_slots,
+        identities: allocated.prior_identities,
+    };
+    let mut claimed_positions: BTreeSet<usize> = BTreeSet::new();
+    let mut reclaimed: BTreeMap<AttachKey, usize> = BTreeMap::new();
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
@@ -4021,6 +4540,24 @@ fn merge(
             || (class == AdmissionClass::ClosureArray
                 && (!is_detailed_closure || closure_late_start))
             || (shared && class != AdmissionClass::Operator);
+        // G-03: the exact targets this module already has attached — active
+        // in the current plan with this module among their owners — that its
+        // sources still list. Empty for a module new to the capture.
+        let kept: BTreeSet<AttachKey> = allocated
+            .owned
+            .get(&object)
+            .map(|owned| {
+                group
+                    .iter()
+                    .flat_map(|module| &module.targets)
+                    .map(|target| AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .filter(|key| owned.contains(key))
+                    .collect()
+            })
+            .unwrap_or_default();
         // A Detailed closure's whole and prefix budgets leave the reserve
         // free (M4); its published-only retry below uses the full budget, as
         // do corroborated tables. Detailed uncorroborated modules keep the
@@ -4036,7 +4573,14 @@ fn merge(
             // passes below re-cap accordingly.
             closure_late_start
         } else if matches!(admission_policy, AdmissionPolicy::Detailed(_)) {
-            class.leaves_reserve() && (shared || retired > 0)
+            // The reserve holds room for a *new* corroborated arrival. An
+            // already-admitted module's growth competes against the full
+            // budget: its active footprint already determined the reserve
+            // outcome when it was admitted, and re-applying the ceiling to
+            // its own re-listed endpoints only publishes a false loss (the
+            // PC-1 replay shape). Churn generations are new modules (no
+            // kept endpoints), so the F2 reserve still applies to them.
+            class.leaves_reserve() && (shared || retired > 0) && kept.is_empty()
         } else {
             shared && class.leaves_reserve()
         };
@@ -4076,24 +4620,6 @@ fn merge(
                 capacity
             },
         };
-        // G-03: the exact targets this module already has attached — active
-        // in the current plan with this module among their owners — that its
-        // sources still list. Empty for a module new to the capture.
-        let kept: BTreeSet<AttachKey> = allocated
-            .owned
-            .get(&object)
-            .map(|owned| {
-                group
-                    .iter()
-                    .flat_map(|module| &module.targets)
-                    .map(|target| AttachKey {
-                        object: target.object,
-                        file_offset: target.file_offset,
-                    })
-                    .filter(|key| owned.contains(key))
-                    .collect()
-            })
-            .unwrap_or_default();
         // The demand a capacity check refused this module while it has
         // endpoints to keep. Admission then runs once more over `kept` alone:
         // the module keeps every endpoint it has, no prefix of its growth is
@@ -4140,6 +4666,23 @@ fn merge(
         // scope as the table prefix — operator modules stay whole.
         let provider_partial_allowed = provider_prefix_allowed;
         let mut use_provider_partial_fallback = false;
+        // The one reclaim assignment this group's budget may ride free on:
+        // computed here from the prior plan's cleared retired memory and the
+        // returning targets' robust predicted shape, then committed on
+        // admission. Merge, capacity validation and extend all apply this
+        // exact set, one position per key and one key per position.
+        let tickets = if revival_allowed {
+            reclaim_tickets(
+                group,
+                &memory,
+                new_identities,
+                existing_slots,
+                &claimed_positions,
+                admission_policy,
+            )
+        } else {
+            BTreeMap::new()
+        };
         // Set when this pass refuses an unpublished closure limited to its
         // published tables: no capacity check failed, so the refusal states
         // no demand and leaves a named capture free to start.
@@ -4192,7 +4735,7 @@ fn merge(
                         admissible(target)
                             && !claimed.contains(target)
                             && !existing_slots.contains_key(target)
-                            && !(revival_allowed && revivable.contains_key(target))
+                            && !tickets.contains_key(target)
                     })
                     .collect();
                 if budget
@@ -4287,41 +4830,13 @@ fn merge(
                         }
                     }
                 }
-                // New pin path per exact key, for cross-ID same-file reclaim:
-                // same file offset + same path as a revivable retired index
-                // reuses it, so short-lived churn (new pin IDs for the same
-                // file) stops burning fresh slots. First wins; same key
-                // implies same file.
-                let mut new_paths: BTreeMap<AttachKey, &str> = BTreeMap::new();
-                for module in group.iter() {
-                    for target in &module.targets {
-                        new_paths
-                            .entry(AttachKey {
-                                object: target.object,
-                                file_offset: target.file_offset,
-                            })
-                            .or_insert(target.object_path);
-                    }
-                }
-                let cross_reclaimable = |key: &AttachKey| -> bool {
-                    if !revival_allowed {
-                        return false;
-                    }
-                    let Some(new_path) = new_paths.get(key) else {
-                        return false;
-                    };
-                    revivable.iter().any(|(old_key, position)| {
-                        old_key.file_offset == key.file_offset
-                            && prior_slots
-                                .get(*position)
-                                .is_some_and(|slot| slot.object_path == *new_path)
-                    })
-                };
+                // Reclaim tickets ride free: the shared predicate already
+                // matched each to one retired position (same target, or new
+                // pin of the same file with a positive identity match).
                 let is_fresh = |key: &AttachKey| {
                     !claimed.contains(key)
                         && !existing_slots.contains_key(key)
-                        && !(revival_allowed && revivable.contains_key(key))
-                        && !cross_reclaimable(key)
+                        && !tickets.contains_key(key)
                 };
                 // A table the module already has attached must never spill:
                 // its kept endpoints would vanish from the snapshot and
@@ -4450,9 +4965,7 @@ fn merge(
                                 continue;
                             }
                             let chargeable = is_fresh(&key);
-                            let free = revival_allowed
-                                && revivable.contains_key(&key)
-                                && !claimed.contains(&key);
+                            let free = tickets.contains_key(&key) && !claimed.contains(&key);
                             if !chargeable && !free {
                                 continue;
                             }
@@ -4763,7 +5276,7 @@ fn merge(
                             revived.extend(
                                 keys.iter()
                                     .filter(|key| {
-                                        (revivable.contains_key(key) || cross_reclaimable(key))
+                                        tickets.contains_key(key)
                                             && partial_pick
                                                 .as_ref()
                                                 .is_none_or(|(chosen, _, _)| chosen.contains(key))
@@ -4778,7 +5291,7 @@ fn merge(
                                 object: target.object,
                                 file_offset: target.file_offset,
                             };
-                            if revivable.contains_key(&key) || cross_reclaimable(&key) {
+                            if tickets.contains_key(&key) {
                                 revived.insert(key);
                             }
                         }
@@ -4823,7 +5336,7 @@ fn merge(
                     .filter(|key| {
                         !claimed.contains(key)
                             && !existing_slots.contains_key(key)
-                            && !(revival_allowed && revivable.contains_key(key))
+                            && !tickets.contains_key(key)
                     })
                     .collect()
             } else {
@@ -4967,8 +5480,16 @@ fn merge(
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
         revived_total += revived.len();
+        // Commit this group's reclaim tickets: their positions are now
+        // spoken for, one key per position, so a later group cannot claim
+        // the same retired cell.
+        for (key, position) in &tickets {
+            claimed_positions.insert(*position);
+            reclaimed.insert(*key, *position);
+        }
         claimed.extend(fresh.iter().copied());
         claimed.extend(revived.iter().copied());
+        claimed.extend(tickets.keys().copied());
         holding.insert(object, kept.len() + fresh.len() + revived.len());
         decisions[position] = Some(AdmissionDecision::Admitted {
             admitted,
@@ -5450,6 +5971,12 @@ fn merge(
     plan.standard_layout_slots = standard_layout_slots;
     plan.standard_layout_evidence = standard_layout_evidence;
     plan.reproven_unfinished_slots = reproven_unfinished_slots;
+    // Only tickets whose returning key actually built a slot are applied at
+    // extend; a ticket whose table spilled stays an unused claim.
+    plan.reclaimed = reclaimed
+        .into_iter()
+        .filter(|(key, _)| positions.contains_key(&(key.object, key.file_offset)))
+        .collect();
     plan
 }
 
@@ -5459,11 +5986,15 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         modules.iter().map(lower_scanned).collect(),
         0,
         "absent".into(),
+        &BTreeMap::new(),
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            retired_keys: &BTreeMap::new(),
+            retired_slots: &BTreeSet::new(),
             prior_slots: &[],
+            prior_identities: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5681,11 +6212,15 @@ pub(crate) fn build_from_sources_scan_authorized(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
+        &BTreeMap::new(),
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            retired_keys: &BTreeMap::new(),
+            retired_slots: &BTreeSet::new(),
             prior_slots: &[],
+            prior_identities: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5910,11 +6445,16 @@ fn build_from_sources_with_policy(
         prearm,
         pinned_id,
         compatible,
+        Some(pinned),
+        None,
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            retired_keys: &BTreeMap::new(),
+            retired_slots: &BTreeSet::new(),
             prior_slots: &[],
+            prior_identities: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5941,10 +6481,17 @@ struct ExistingAllocation<'a> {
     /// same file reuses a revivable retired index with the same file
     /// offset and path, so short-lived churn stops burning fresh slots.
     revivable: &'a BTreeMap<AttachKey, usize>,
+    /// Exact target -> retired position, for the same reclaim memory.
+    retired_keys: &'a BTreeMap<AttachKey, usize>,
+    /// Retired positions, for the same reclaim memory.
+    retired_slots: &'a BTreeSet<usize>,
     /// Allocated slots by index, for cross-ID reclaim path comparison
     /// (old retired index path vs new target path). Empty for an initial
     /// build; borrowed from the prior plan for a rebuild.
     prior_slots: &'a [Slot],
+    /// Recorded identities of the prior plan's objects: cross-ID reclaim
+    /// requires a positive match against the returning object.
+    prior_identities: &'a BTreeMap<PinnedObjectId, TargetObject>,
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
@@ -5986,6 +6533,8 @@ fn build_from_sources_with(
     prearm: &[PrearmPlanPiece],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
+    pinned: Option<&PinnedObjects>,
+    new_identities: Option<&BTreeMap<PinnedObjectId, TargetObject>>,
     allocated: ExistingAllocation<'_>,
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
@@ -6003,6 +6552,30 @@ fn build_from_sources_with(
     // engine resolves fresh before each build, so a retired object simply
     // has no piece here).
     discovered.extend(prearm.iter().map(lower_prearm));
+    // Identities of the objects this rebuild names, from the pins in hand
+    // (or an explicit test injection). Merge needs them for the fail-closed
+    // cross-ID reclaim predicate; the plan records them after the build.
+    let new_identities: BTreeMap<PinnedObjectId, TargetObject> =
+        if let Some(identities) = new_identities {
+            identities.clone()
+        } else {
+            let mut identities = BTreeMap::new();
+            if let Some(pinned) = pinned {
+                for module in &discovered {
+                    for object in std::iter::once(module.object)
+                        .chain(module.targets.iter().map(|target| target.object))
+                    {
+                        if identities.contains_key(&object) {
+                            continue;
+                        }
+                        if let Some(summary) = pinned.summary(object) {
+                            identities.insert(object, target_object_from_summary(&summary));
+                        }
+                    }
+                }
+            }
+            identities
+        };
     // The scan never calls the provider, so it contributes no C_GetInterfaceList
     // enumeration and leaves nothing present-but-undecoded: every interface it
     // records names a table it decoded. Only a manifest can report either.
@@ -6013,6 +6586,7 @@ fn build_from_sources_with(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
+        &new_identities,
         allocated,
         broad_admit,
         admission_policy,
@@ -6129,11 +6703,16 @@ fn build_from_test_sources_with_policy(
         &[],
         |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
         |_, _| true,
+        None,
+        None,
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            retired_keys: &BTreeMap::new(),
+            retired_slots: &BTreeSet::new(),
             prior_slots: &[],
+            prior_identities: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -6733,11 +7312,15 @@ fn build(m: &Manifest) -> AttachPlan {
         discovered.into_iter().collect(),
         m.vendor_interfaces.len(),
         acquisition_label(&m.interface_list),
+        &BTreeMap::new(),
         ExistingAllocation {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            retired_keys: &BTreeMap::new(),
+            retired_slots: &BTreeSet::new(),
             prior_slots: &[],
+            prior_identities: &BTreeMap::new(),
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -13274,11 +13857,16 @@ pub(crate) mod tests {
             prearm,
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
+            None,
+            None,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -13413,11 +14001,16 @@ pub(crate) mod tests {
             &[],
             |_, _| Some(manifest_object),
             |_, _| true,
+            None,
+            None,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -13461,11 +14054,16 @@ pub(crate) mod tests {
             &[],
             |_, _| Some(PinnedObjectId(1)),
             |_, _| false,
+            None,
+            None,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -14280,6 +14878,55 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fresh.index, 3);
+        assert!(plan.validate_slot_index().is_ok());
+    }
+
+    /// F6: a provisional seed from a new pin of the same verified file
+    /// reoccupies the retired seed cell instead of burning one per pin
+    /// generation; a missing identity fails closed to a fresh cell.
+    #[test]
+    fn provisional_seed_revives_a_same_file_new_pin() {
+        let old = PinnedObjectId(7);
+        let new = PinnedObjectId(9);
+        let seed = |object| ProvisionalGetFunctionList {
+            module: ModuleId(0),
+            object,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+        };
+        let mut plan = provisional_plan(old);
+        plan.object_identities
+            .insert(old, test_identity(7, "sha-seed"));
+        let first = plan
+            .add_provisional_get_function_list(seed(old))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.index, 0);
+        plan.deactivate(0);
+        plan.revivable.clone_from(&plan.retired_keys);
+        plan.modules[0].object = new;
+        plan.modules[0].key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 9,
+        };
+        // Missing identity on the returning side: fail closed.
+        let fresh = plan
+            .add_provisional_get_function_list(seed(new))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.index, 1, "no identity, no reclaim");
+        plan.deactivate(1);
+        plan.forget_retired_key(1);
+        plan.revivable.clone_from(&plan.retired_keys);
+        plan.object_identities
+            .insert(new, test_identity(7, "sha-seed"));
+        let revived = plan
+            .add_provisional_get_function_list(seed(new))
+            .unwrap()
+            .unwrap();
+        assert_eq!(revived.index, 0, "the same file reoccupies the seed cell");
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
         assert!(plan.validate_slot_index().is_ok());
     }
 
@@ -16426,6 +17073,7 @@ pub(crate) mod tests {
             &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
+            None,
             false,
             AdmissionPolicy::detailed(),
             false,
@@ -16590,11 +17238,15 @@ pub(crate) mod tests {
             ],
             0,
             "absent".into(),
+            &BTreeMap::new(),
             ExistingAllocation {
                 slots: plan.slots.len(),
                 active: &plan.slot_by_key,
                 revivable: &plan.revivable,
+                retired_keys: &plan.retired_keys,
+                retired_slots: &plan.retired_slots,
                 prior_slots: &plan.slots,
+                prior_identities: &plan.object_identities,
                 owned: &plan.active_keys_by_owner(),
                 first_plan: Some(&plan.first_plan_objects),
                 first_plan_had_provider: plan.first_plan_had_provider,
@@ -17690,6 +18342,14 @@ pub(crate) mod tests {
         module
     }
 
+    fn test_identity(ino: u64, sha: &str) -> TargetObject {
+        TargetObject {
+            dev: (8, 1),
+            ino,
+            sha256: Some(sha.into()),
+        }
+    }
+
     fn scoped_plan(modules: &[ReconciledModule], scope: AdmissionScope) -> AttachPlan {
         build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope, false)
     }
@@ -17846,11 +18506,16 @@ pub(crate) mod tests {
             &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
+            None,
+            None,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -17891,11 +18556,15 @@ pub(crate) mod tests {
             vec![lower_scanned(&existing), lowered],
             0,
             "absent".into(),
+            &BTreeMap::new(),
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -19004,7 +19673,8 @@ pub(crate) mod tests {
     /// Fedora churn shape: opensc 105 + softhsm 68 stay while a 241-slot
     /// file leaves; the rebuild carries 414 lifetime slots and refuses
     /// p11-kit-trust 68 although the 173 active endpoints plus 68 would
-    /// fit — retired slots are never reused, so churn starves later
+    /// fit — no retired slot is cleared for reuse here, and the different
+    /// path/identity forbids cross-file reclaim, so churn starves later
     /// admissions. Only the 512 build can show it: the wide budget fits
     /// 414 + 68 under its heuristic ceiling.
     #[cfg(not(feature = "wide-detailed-2112"))]
@@ -19045,6 +19715,8 @@ pub(crate) mod tests {
         let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
         assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-churn"));
         for generation in 1u32..32u32 {
             let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
             plan.extend_exact(rebuilt).unwrap();
@@ -19053,21 +19725,43 @@ pub(crate) mod tests {
             let pin = PinnedObjectId(100 + generation);
             churn.object = pin;
             churn.entry_objects = vec![vec![pin; 68]];
-            let rebuilt = plan.rebuild_from_sources(
+            let identities = BTreeMap::from([(pin, test_identity(82, "sha-churn"))]);
+            let rebuilt = plan.rebuild_from_sources_with_identities(
                 std::slice::from_ref(&churn),
                 &[],
-                &PinnedObjects::empty(),
+                &identities,
             );
             plan.extend_exact(rebuilt).unwrap();
         }
         let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
         plan.extend_exact(rebuilt).unwrap();
+        let live_objects: BTreeSet<_> = plan
+            .slots
+            .iter()
+            .map(|slot| slot.object)
+            .chain(plan.modules.iter().map(|module| module.object))
+            .collect();
+        assert!(
+            plan.object_identities
+                .keys()
+                .all(|object| live_objects.contains(object)),
+            "identities are bounded to live and retired cells"
+        );
+        let live_keys: BTreeSet<_> = plan.slots.iter().map(AttachKey::of).collect();
+        assert!(
+            plan.slot_ordinals.keys().all(|key| live_keys.contains(key)),
+            "ordinals are bounded to live and retired cells"
+        );
         plan.revivable.clone_from(&plan.retired_keys);
         let mut exact = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         exact.object = PinnedObjectId(84);
         exact.entry_objects = vec![vec![PinnedObjectId(84); 68]];
-        let rebuilt =
-            plan.rebuild_from_sources(std::slice::from_ref(&exact), &[], &PinnedObjects::empty());
+        let identities = BTreeMap::from([(PinnedObjectId(84), test_identity(82, "sha-churn"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&exact),
+            &[],
+            &identities,
+        );
         assert!(
             rebuilt.modules_skipped.is_empty(),
             "exact attaches after same-file churn (F2): {:?}",
@@ -19151,11 +19845,17 @@ pub(crate) mod tests {
         let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
         assert_eq!(plan.slots.len(), 68, "gen1 admits");
         assert_eq!(plan.active_slot_count(), 68, "gen1 active");
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-migrate"));
         let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         gen2.object = PinnedObjectId(83);
         gen2.entry_objects = vec![vec![PinnedObjectId(83); 68]];
-        let rebuilt =
-            plan.rebuild_from_sources(std::slice::from_ref(&gen2), &[], &PinnedObjects::empty());
+        let identities = BTreeMap::from([(PinnedObjectId(83), test_identity(82, "sha-migrate"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&gen2),
+            &[],
+            &identities,
+        );
         assert!(
             rebuilt.modules_skipped.is_empty(),
             "gen2 same-file admits: {:?}",
@@ -19192,6 +19892,8 @@ pub(crate) mod tests {
         let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
         assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-semantic"));
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
         let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
         for slot in &mut plan.slots {
@@ -19203,8 +19905,12 @@ pub(crate) mod tests {
         let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         gen2.object = PinnedObjectId(83);
         gen2.entry_objects = vec![vec![PinnedObjectId(83); 68]];
-        let mut rebuilt =
-            plan.rebuild_from_sources(std::slice::from_ref(&gen2), &[], &PinnedObjects::empty());
+        let identities = BTreeMap::from([(PinnedObjectId(83), test_identity(82, "sha-semantic"))]);
+        let mut rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&gen2),
+            &[],
+            &identities,
+        );
         assert!(
             rebuilt.modules_skipped.is_empty(),
             "gen2 same-file admits: {:?}",
@@ -19229,6 +19935,334 @@ pub(crate) mod tests {
                 .iter()
                 .all(|slot| slot.object == PinnedObjectId(83)),
             "object IDs migrate to new pin"
+        );
+    }
+
+    /// One retired cell may be reoccupied by exactly one returning target
+    /// per rebuild. Two pins of the same verified file arrive together
+    /// after the old generation retired: the first rides the retired
+    /// indices, the second is charged fresh (no aliasing, no overwritten
+    /// slot, no double-claimed position).
+    #[test]
+    fn slot_reclaim_never_claims_one_retired_cell_twice() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-twin"));
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        assert_eq!(plan.retired_slots.len(), 68, "the old generation retired");
+        let mut first = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        first.object = PinnedObjectId(90);
+        first.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let mut second = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        second.object = PinnedObjectId(91);
+        second.entry_objects = vec![vec![PinnedObjectId(91); 68]];
+        let identities = BTreeMap::from([
+            (PinnedObjectId(90), test_identity(82, "sha-twin")),
+            (PinnedObjectId(91), test_identity(82, "sha-twin")),
+        ]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(&[first, second], &[], &identities);
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "one pin rides the retired cells, the other pays fresh"
+        );
+        let positions: BTreeSet<_> = rebuilt.reclaimed.values().copied().collect();
+        assert_eq!(positions.len(), 68, "no retired position is ticketed twice");
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        let indices: BTreeSet<u32> = delta.new.iter().map(|slot| slot.index).collect();
+        assert_eq!(
+            indices.len(),
+            delta.new.len(),
+            "every returning target gets its own index"
+        );
+        assert_eq!(plan.slots.len(), 136, "68 reclaimed + 68 fresh");
+        assert_eq!(plan.slot_by_key.len(), 136, "every key has one slot");
+        plan.validate_slot_index().expect("a consistent slot index");
+    }
+
+    /// Cross-ID reclaim fails closed without a positive file identity match
+    /// on both sides: a path and offset match alone never reuses a retired
+    /// cell, and a missing identity on either side keeps it retired.
+    #[test]
+    fn slot_reclaim_requires_positive_file_identity() {
+        for (old_identity, new_identity, label) in [
+            (
+                Some(test_identity(82, "sha-old")),
+                Some(test_identity(82, "sha-new")),
+                "different digest",
+            ),
+            (
+                Some(test_identity(82, "sha-old")),
+                None,
+                "missing new identity",
+            ),
+            (
+                None,
+                Some(test_identity(82, "sha-old")),
+                "missing old identity",
+            ),
+        ] {
+            let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+            let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+            if let Some(identity) = old_identity {
+                plan.object_identities.insert(PinnedObjectId(82), identity);
+            }
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            plan.revivable.clone_from(&plan.retired_keys);
+            let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+            returning.object = PinnedObjectId(90);
+            returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+            let identities: BTreeMap<_, _> = new_identity
+                .map(|identity| (PinnedObjectId(90), identity))
+                .into_iter()
+                .collect();
+            let rebuilt = plan.rebuild_from_sources_with_identities(
+                std::slice::from_ref(&returning),
+                &[],
+                &identities,
+            );
+            assert!(
+                rebuilt.reclaimed.is_empty(),
+                "{label}: no ticket without a positive match"
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap();
+            assert!(
+                delta.new.iter().all(|slot| slot.index >= 68),
+                "{label}: a fresh index, never the retired one"
+            );
+            assert_eq!(plan.slots.len(), 136, "{label}: fresh slots beside retired");
+            assert!(
+                plan.retired_slots.contains(&0),
+                "{label}: retired cell kept"
+            );
+        }
+    }
+
+    /// Merge's reclaim accounting uses the same names/descriptor gate as
+    /// extend: a heuristic generation (unknown, count-only) retired
+    /// revivable is not reclaimed by a corroborated table of the same file,
+    /// and a same-shape generation is.
+    #[test]
+    fn slot_reclaim_merge_requires_matching_names_and_descriptor() {
+        let heuristic = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&heuristic), AdmissionScope::Shared);
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-names"));
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut corroborated = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        corroborated.object = PinnedObjectId(90);
+        corroborated.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities = BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-names"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&corroborated),
+            &[],
+            &identities,
+        );
+        assert!(
+            rebuilt.reclaimed.is_empty(),
+            "changed names/descriptor must be charged fresh at merge"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            delta.new.iter().all(|slot| slot.index >= 68),
+            "different evidence never reoccupies the retired indices"
+        );
+        // A same-shape generation of the same file does ride free.
+        let mut same = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, false);
+        same.object = PinnedObjectId(91);
+        same.entry_objects = vec![vec![PinnedObjectId(91); 68]];
+        let identities = BTreeMap::from([(PinnedObjectId(91), test_identity(82, "sha-names"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&same),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "the same count-only shape reclaims its cells"
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            delta.new.iter().all(|slot| slot.index < 68 + 68),
+            "the count-only generation reoccupies retired indices"
+        );
+    }
+
+    /// Semantic cross-ID reclaim keeps one module identity: a same-file
+    /// new pin reoccupies retired semantic cells under the historical
+    /// module id (positive identity donation), so no cell turns ambiguous
+    /// and no PARTIAL is latched.
+    #[test]
+    fn slot_reclaim_semantic_same_file_keeps_module_id() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+        for slot in &mut plan.slots {
+            slot.descriptor_index = descriptor;
+            slot.semantics = semantics;
+            slot.semantic_authorized = true;
+        }
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-semantic-cross"));
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities =
+            BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-semantic-cross"))]);
+        let mut rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        for slot in &mut rebuilt.slots {
+            slot.descriptor_index = descriptor;
+            slot.semantics = semantics;
+            slot.semantic_authorized = true;
+        }
+        // This synthetic provider's scan evidence is count-only, so merge
+        // cannot predict the semantic shape; issue the equivalent tickets
+        // directly to exercise extension's application (predicate,
+        // identity donation and aggregate ownership) in isolation.
+        for (old_key, position) in &plan.retired_keys {
+            rebuilt.reclaimed.insert(
+                AttachKey {
+                    object: PinnedObjectId(90),
+                    file_offset: old_key.file_offset,
+                },
+                *position,
+            );
+        }
+        assert_eq!(rebuilt.reclaimed.len(), 68, "semantic cells are ticketed");
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+            (0..68).collect::<Vec<_>>(),
+            "retired semantic indices reoccupied"
+        );
+        assert_eq!(plan.slots.len(), 68, "no fresh semantic slots");
+        assert_eq!(plan.module_ambiguous, 0, "one module owns the cells");
+        assert!(plan.retired_slots.is_empty(), "nothing stays retired");
+    }
+
+    /// Two active pins of one file and a third arrival: only one old index
+    /// may migrate onto the returning key; the other retires honestly.
+    /// The old search could point two source keys at the same returning
+    /// slot, leaving one live slot unreachable from the attach index.
+    #[test]
+    fn slot_migration_never_reuses_one_active_index_twice() {
+        let first = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut second = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        second.object = PinnedObjectId(83);
+        second.entry_objects = vec![vec![PinnedObjectId(83); 68]];
+        let mut plan = scoped_plan(&[first, second], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 136, "both pins admit");
+        for object in [82, 83] {
+            plan.object_identities
+                .insert(PinnedObjectId(object), test_identity(82, "sha-active-twin"));
+        }
+        let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities =
+            BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-active-twin"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(90))
+                .count(),
+            68,
+            "the returning pin occupies exactly one set of cells"
+        );
+        assert_eq!(delta.new.len(), 0, "migration allocates no new cell");
+        assert_eq!(
+            plan.slots.len(),
+            136,
+            "one generation migrated, one retired"
+        );
+        assert_eq!(plan.active_slot_count(), 68, "only the migrated generation");
+        plan.validate_slot_index()
+            .expect("every active cell stays reachable exactly once");
+    }
+
+    /// Partial function-level admission keeps reclaimable targets: when a
+    /// corroborated provider fits neither whole nor as a table prefix, its
+    /// count-only/lifecycle reclaimable endpoints ride free and the fresh
+    /// ones are the only partial gap. Dropping them from the fallback would
+    /// refuse the provider whole with no record of what could have attached.
+    #[test]
+    fn partial_reclaim_fallback_keeps_reclaimable_targets() {
+        let fill = provider_with_tables(201, "/opt/fill.so", 1, MAX_SLOTS as usize - 68, true);
+        let mut old = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut old_targets: Vec<(&'static str, u32, u64)> = (0..60)
+            .map(|index| ("C_Initialize", 82, index * 8))
+            .collect();
+        old_targets.extend((0..8).map(|index| ("C_Sign", 82, 480 + index * 8)));
+        replace_table_targets(&mut old, 0, &old_targets);
+        let plan = build_from_sources_for_policy_scoped(
+            &[fill, old],
+            &[],
+            &PinnedObjects::empty(),
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "budget is full");
+        let mut plan = plan;
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-partial"));
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        returning.object = PinnedObjectId(90);
+        let mut targets: Vec<(&'static str, u32, u64)> = (0..60)
+            .map(|index| ("C_Initialize", 90, index * 8))
+            .collect();
+        targets.extend((0..8).map(|index| ("C_Sign", 90, 0x10000 + index * 8)));
+        replace_table_targets(&mut returning, 0, &targets);
+        let identities = BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-partial"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        assert_eq!(rebuilt.reclaimed.len(), 60, "lifecycle endpoints ride free");
+        assert!(
+            rebuilt
+                .modules_skipped
+                .iter()
+                .any(|skipped| skipped.reason.contains("(provider_partial)")),
+            "the provider is admitted partially, not refused whole: {:?}",
+            rebuilt.modules_skipped
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            delta.new.len(),
+            60,
+            "only the free lifecycle endpoints attach"
+        );
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(90))
+                .count(),
+            60
         );
     }
 
@@ -19364,7 +20398,7 @@ pub(crate) mod tests {
 
     /// Revival needs engine clearance: a retired target that reappears
     /// without it takes a fresh slot — an unfinalized retired slot is
-    /// never reused, even when the budget has room.
+    /// never reclaimed, even when the budget has room.
     #[test]
     fn unfinalized_retired_slot_is_never_reused() {
         let provider = provider_with_tables(93, "/opt/return-pkcs11.so", 1, 68, true);
@@ -19777,11 +20811,16 @@ pub(crate) mod tests {
             &[],
             |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
             |_, _| true,
+            None,
+            None,
             ExistingAllocation {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                retired_keys: &BTreeMap::new(),
+                retired_slots: &BTreeSet::new(),
                 prior_slots: &[],
+                prior_identities: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -20169,10 +21208,10 @@ pub(crate) mod tests {
     }
 
     /// A capacity refusal says how many allocated slots are live and how many
-    /// are retired — lifetime cells never reused — and which modules hold the
-    /// live ones. Named scope with retired churn keeps the Detailed reserve
-    /// (initial builds keep no reserve); the ending names the reserve and the
-    /// remedies.
+    /// are retired — lifetime cells reused only when a cleared exact target
+    /// reclaims them — and which modules hold the live ones. Named scope with
+    /// retired churn keeps the Detailed reserve (initial builds keep no
+    /// reserve); the ending names the reserve and the remedies.
     #[test]
     fn capacity_refusal_names_active_and_retired_slots_and_their_holders() {
         let capacity = MAX_SLOTS as usize;

@@ -29907,13 +29907,20 @@ fn conservative_replays_under_churn_never_burn_capacity() {
         .apply_candidate(&mut session, candidate, &mut true, false, &[])
         .unwrap();
     assert!(outcome.accepted());
+    // The Detailed Shared reserve holds room for corroborated tables once
+    // heuristic modules pass the reserve-free ceiling. The busy provider's
+    // own growth keeps its place and is re-attempted (30 fresh cells when
+    // additions open), while the later heuristic provider is refused by the
+    // reserve rather than starving the room it protects.
     assert!(
-        engine.plan.modules_skipped.is_empty(),
-        "the late provider was admitted: {:?}",
+        engine.plan.modules_skipped.iter().any(|skip| {
+            skip.subject.contains("libc.so.6") && skip.reason.contains("are reserved")
+        }),
+        "the later heuristic provider meets the reserve: {:?}",
         engine.plan.modules_skipped
     );
-    assert_eq!(engine.plan.slots.len(), allocated + 30 + 50);
-    assert_eq!(engine.plan.active_slot_count(), allocated + 50);
+    assert_eq!(engine.plan.slots.len(), allocated + 30);
+    assert_eq!(engine.plan.active_slot_count(), allocated);
 }
 
 /// Kills and reaps its child when dropped.

@@ -81577,11 +81577,12 @@ fn start_file_learning_is_noop_for_owned_run_tree() {
 
 /// Loader exhaustion names once and never blocks run-tree learning: with
 /// all 256 contexts spent, the 257th preflight refuses with the exact
-/// capacity reason, two such refusals file exactly one deduped gap row,
-/// and a run-learned provider still stages (staging needs no loader
-/// context, so post-exhaustion mappers' calls still land via the
-/// file-identity probes). Twin of the privileged many-shortlived cell,
-/// which pins that short-lived churn never reaches exhaustion at all.
+/// capacity reason, two real arms through the arming path file exactly
+/// one deduped gap row, and a run-learned provider still stages
+/// (staging needs no loader context, so post-exhaustion mappers'
+/// calls still land via the file-identity probes). Twin of the
+/// privileged many-shortlived cell, which pins that short-lived churn
+/// never reaches exhaustion at all.
 #[test]
 fn loader_exhaustion_names_once_and_watch_still_stages() {
     use crate::discovery::loader::{LoaderContextSpec, MAX_LOADER_CONTEXTS};
@@ -81632,9 +81633,35 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
         refusal, "loader context capacity 256 is exhausted",
         "the capacity names itself exactly"
     );
-    // Two refusals file exactly one gap row (mark dedupes).
-    engine.mark_partial("live loader arming", &refusal);
-    engine.mark_partial("live loader arming", &refusal);
+    // Two real arms through the arming path file exactly one gap row
+    // (mark dedupes): the refusal must surface from the arm, not from
+    // a test that files the row itself.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    let mut session = ScriptedSession::default();
+    let arms_before = engine.loader_arms;
+    for _ in 0..2 {
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .expect("a refused arm is ordinary, never fatal");
+    }
+    assert_eq!(
+        engine.loader_arms,
+        arms_before + 2,
+        "both arms ran through the arming path"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
     let exhaustion_rows = engine
         .counters
         .object_skips

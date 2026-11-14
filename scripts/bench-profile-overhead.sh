@@ -55,7 +55,10 @@
 # passwordless sudo; the observer goes through sudo -n, everything else
 # runs unprivileged. Both binaries must be prebuilt (BASE_BIN has no
 # default: pass the exact pre-A0 build; builds never run during a
-# measurement window). Environment: BASE_BIN (required), CAND_BIN
+# measurement window) and both must be named `p11scope` (basename):
+# the observer pid is resolved via `pgrep -x p11scope` under the sudo
+# parentage, and a differently named binary is unresolvable (refuse).
+# Environment: BASE_BIN (required), CAND_BIN
 # (default ./target/release/p11scope), RATE (default 5000 iters/s,
 # ~10k calls/s: an ok-iteration is open+close), FAIL_SHARE (default
 # 0.2), FORK_EVERY (default 0), SECS (default 60), ROUNDS (default 1),
@@ -224,15 +227,25 @@ rss_sampler() {
 # immediately, so without this the sudo'd observer and the RSS sampler
 # outlive the campaign; the next campaign then refuses on the live
 # capture until they end. run_sample arms this as the EXIT trap once
-# the observer exists and disarms it after both are waited. sudo
-# forwards the TERM to the observer; empty-safe so a refuse before
-# either pid exists reaps nothing.
+# the observer exists and disarms it after both are waited. The
+# observer runs as root, so an unprivileged kill fails across the sudo
+# boundary (sudo-rs here): signal it via sudo, preferring the resolved
+# observer pid and otherwise the sudo parent's children. Empty-safe so
+# a refuse before either pid exists reaps nothing.
 cleanup_sample() {
-    for pid in "${sudo_pid:-}" "${sampler_pid:-}"; do
-        if [ -n "$pid" ]; then
-            kill "$pid" 2>/dev/null || true
-        fi
-    done
+    if [ -n "${obs_pid:-}" ]; then
+        sudo -n kill -TERM "$obs_pid" 2>/dev/null || true
+    elif [ -n "${sudo_pid:-}" ]; then
+        sudo -n pkill -TERM -P "$sudo_pid" 2>/dev/null || true
+    fi
+    # Same-user fallback for the self-test probes (which use sudo_pid
+    # as a plain sleeper pid) plus the user-owned sampler and wrapper.
+    if [ -n "${sudo_pid:-}" ]; then
+        kill -TERM "$sudo_pid" 2>/dev/null || true
+    fi
+    if [ -n "${sampler_pid:-}" ]; then
+        kill "$sampler_pid" 2>/dev/null || true
+    fi
 }
 
 # run_sample DIR ARM BIN: one measured sample. Starts the observer,
@@ -372,6 +385,9 @@ EOF
 
 # self_test: validate the SAMPLE parsing and delta math on fixture lines
 # (no privileged run, no binaries). Fails loudly on any mismatch.
+# Note: the trap probe below uses same-user sleepers, so it does NOT
+# cover the sudo path (`sudo -n kill/pkill` for the root observer);
+# that path is probed once under sudo (see the round-4 report).
 self_test() {
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT

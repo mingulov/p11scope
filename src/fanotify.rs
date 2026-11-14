@@ -10,6 +10,7 @@
 //! the provider test never leave this module.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -541,6 +542,7 @@ const PSEUDO_FS: &[&str] = &[
     "binfmt_misc",
     "mqueue",
     "devpts",
+    "devtmpfs",
     "sockfs",
     "pipefs",
     "anon_inodefs",
@@ -884,18 +886,31 @@ fn arm_with_bound(
 /// the arming-timeout flush, the events queued before the flush still
 /// pin their mounts until the hung helper exits — draining them
 /// through the duplicate releases the pins now instead of waiting.
-/// The group is non-blocking, so an empty queue ends the drain.
+/// The group is non-blocking, so an empty queue ends the drain. A read
+/// error other than `EAGAIN`/`EINTR` (a device-node `EBUSY`, whose head
+/// was consumed) continues past the head instead of pinning the rest of
+/// the queue behind it, bounded so a persistently failing fd cannot
+/// spin forever.
 fn drain_group_closing_to_eagain(raw: std::os::unix::io::RawFd) {
     let mut buf = [0u8; 64 * 1024];
+    let mut consecutive_errors = 0usize;
     loop {
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let got = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if got < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(errno) if errno == libc::EINTR => continue,
+                Some(errno) if errno == libc::EAGAIN => return,
+                _ => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors > 1024 {
+                        return;
+                    }
+                    continue;
+                }
             }
-            return;
         }
+        consecutive_errors = 0;
         if got == 0 {
             return;
         }
@@ -1114,7 +1129,9 @@ impl FileLearner {
         // channel closes terminally instead of dangling.
         self.pending = None;
         let mut lost = self.state.lost_tail.load(Ordering::Acquire);
+        let mut had_thread = false;
         if let Some(worker) = self.thread.take() {
+            had_thread = true;
             // A panic breaks the channel (the sender drops unsent), so
             // a disconnect also means the thread is gone and the join
             // below reaps it without blocking.
@@ -1133,24 +1150,35 @@ impl FileLearner {
             };
             if exited {
                 if worker.handle.join().is_err() {
-                    self.state.loss_other.fetch_add(1, Ordering::Relaxed);
+                    self.state.note_unexpected_exit_once();
                     lost = true;
                 }
             } else {
                 // Dropping the handle detaches the drain; forgetting
                 // it would leave the thread joinable (leaked) instead.
+                // The timeout itself is a loss source, counted here:
+                // the detached drain may never exit to count it.
                 drop(worker.handle);
+                self.state.loss_join_timeout.fetch_add(1, Ordering::Relaxed);
                 lost = true;
             }
+        }
+        // The final learner line, after the join so post-drain bumps
+        // (panic, join timeout) appear on it. The drain stored its last
+        // counters at every tick and at exit; a drain that never ran
+        // prints nothing.
+        if had_thread && crate::run::capture_diagnostics_on() {
+            print_final_telemetry(&self.state);
         }
         lost || self.state.lost_tail.load(Ordering::Acquire)
     }
 
-    /// Attributes one residual loss to the `other` telemetry counter:
-    /// the engine's unexpected-disconnect path funnels through here so
-    /// the next `learned_event_loss` can be traced to its source.
+    /// Attributes the engine's unexpected-disconnect path to the `other`
+    /// telemetry counter, once per learner together with the join panic:
+    /// both observe the same drain death, but the next
+    /// `learned_event_loss` traces to a single source.
     pub(crate) fn note_other_loss(&self) {
-        self.state.loss_other.fetch_add(1, Ordering::Relaxed);
+        self.state.note_unexpected_exit_once();
     }
 }
 
@@ -1605,7 +1633,12 @@ fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32
 /// or file bytes. `other` covers the residual sources — parse errors,
 /// `FIONREAD` failures, drain exits after failed sends or poll errors,
 /// drain panics, and engine disconnects — so the next
-/// `learned_event_loss` can be traced.
+/// `learned_event_loss` can be traced. `final_stats` carries the
+/// drain's last counters to the join for the final telemetry line (the
+/// drain stores at every tick and at exit; the join prints after
+/// reaping, so post-drain bumps appear). `unexpected_exit_filed` makes
+/// the panic/disconnect `other` bump once-only: both the join and the
+/// engine observe the same death, but the telemetry counts it once.
 #[derive(Debug, Default)]
 struct LearnShutdownState {
     shutdown: AtomicBool,
@@ -1617,6 +1650,19 @@ struct LearnShutdownState {
     loss_send_deadline: std::sync::atomic::AtomicU64,
     loss_join_timeout: std::sync::atomic::AtomicU64,
     loss_other: std::sync::atomic::AtomicU64,
+    final_stats: std::sync::Mutex<DrainStats>,
+    unexpected_exit_filed: AtomicBool,
+}
+
+impl LearnShutdownState {
+    /// Attributes one unexpected drain death (panic or disconnect) to
+    /// `other`, once per learner: the join and the engine both observe
+    /// the same death, but only the first files it.
+    fn note_unexpected_exit_once(&self) {
+        if !self.unexpected_exit_filed.swap(true, Ordering::AcqRel) {
+            self.loss_other.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Sends one message, waiting past a full channel in 1 ms steps so a
@@ -1689,7 +1735,7 @@ fn tail_deadline_from(state: &LearnShutdownState) -> std::time::Instant {
 
 /// Drain counters for the periodic `-v` telemetry line: counts only,
 /// never paths, pids or file bytes.
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug)]
 struct DrainStats {
     events: u64,
     checked: u64,
@@ -1934,6 +1980,16 @@ impl DrainCtx<'_> {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
+    /// Counts one device-node miss (`EBUSY`/`ENXIO`/`ENODEV`) as
+    /// unreadable without filing it: the head event named a file the
+    /// observer could never open (a single-open device held by its
+    /// owner, a vanished node), not a lost learning event. The 1 ms
+    /// pacing matches `note_read_error`.
+    fn note_unreadable_without_filing(&mut self) {
+        self.stats.unreadable = self.stats.unreadable.saturating_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
     fn process_event(&mut self, event: ParsedFanotifyEvent, window: SendWindow) -> bool {
         self.stats.events = self.stats.events.saturating_add(1);
         // Take ownership of the pidfd first: every path below closes.
@@ -2077,8 +2133,10 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
 /// abandoning a tail.
 fn measure_fionread_unit(group: &OwnedFd) -> usize {
     // A probe file nobody else opens: created unmarked (so no event),
-    // inode-marked, opened once (exactly one event), drained, unmarked,
-    // deleted. `tempfile` is a dev-dependency, so plain stdio it is.
+    // unlinked at once (no pathname left to swap for a FIFO or to go
+    // stale on SIGKILL), inode-marked, opened once through
+    // `/proc/self/fd` (exactly one event), drained, unmarked.
+    // `tempfile` is a dev-dependency, so plain stdio it is.
     static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct ProbeGuard(std::path::PathBuf);
     impl Drop for ProbeGuard {
@@ -2107,6 +2165,9 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
     let Some((probe, guard)) = probe else {
         return FANOTIFY_META_LEN;
     };
+    // Unlink while open: the inode stays alive behind the fd for the
+    // mark and the fd reopen below, but no pathname remains.
+    let _ = std::fs::remove_file(&guard.0);
     // SAFETY: libc call; the group and probe descriptors are valid, and
     // a NULL pathname marks the probe's inode (the default mark type).
     let marked = 0
@@ -2122,7 +2183,16 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
     if !marked {
         return FANOTIFY_META_LEN;
     }
-    let _opened = std::fs::File::open(&guard.0).ok();
+    // Reopen through the fd, never the pathname: a pathname reopen in a
+    // caller-owned TMPDIR could be swapped for a FIFO (blocking `start`)
+    // or hang on a hung mount. `O_NONBLOCK` is defense in depth (a
+    // regular file ignores it).
+    let proc_fd = format!("/proc/self/fd/{}", probe.as_raw_fd());
+    let _opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&proc_fd)
+        .ok();
     let snapshot = queued_event_bytes(group.as_raw_fd());
     let mut buf = [0u8; 4096];
     // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
@@ -2152,9 +2222,10 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
 
 /// Decides the `FIONREAD` unit from one probe round: the snapshot is
 /// accepted only when the drain read back exactly one record and the
-/// snapshot fits inside it (24-or-32 inside 32). Anything else — no
-/// snapshot, no record, several records, a snapshot larger than the
-/// record — falls back to the 24-byte header (over-counts, safe).
+/// snapshot is exactly the 24-byte header or exactly the read size
+/// (24-in-32 on an old kernel, 32-in-32 on a new one). Anything else —
+/// no snapshot, no record, several records, a near-miss or oversized
+/// snapshot — falls back to the 24-byte header (over-counts, safe).
 fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[u8]) -> usize {
     let Ok(got) = usize::try_from(got) else {
         return FANOTIFY_META_LEN;
@@ -2162,7 +2233,10 @@ fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[
     let Some(snapshot) = snapshot else {
         return FANOTIFY_META_LEN;
     };
-    if snapshot == 0 || snapshot > got || buf.len() < got {
+    if snapshot != FANOTIFY_META_LEN && snapshot != got {
+        return FANOTIFY_META_LEN;
+    }
+    if buf.len() < got {
         return FANOTIFY_META_LEN;
     }
     if count_parsed_records(&buf[..got]) != 1 {
@@ -2195,9 +2269,18 @@ fn classify_group_read(got: libc::ssize_t) -> GroupReadOutcome {
     if got == 0 {
         return GroupReadOutcome::Empty;
     }
-    match std::io::Error::last_os_error().kind() {
-        std::io::ErrorKind::Interrupted => GroupReadOutcome::Interrupted,
-        std::io::ErrorKind::WouldBlock => GroupReadOutcome::Empty,
+    // Raw errnos, not `ErrorKind`: several distinct fanotify failures
+    // share one kind (`EBUSY` and `EACCES` are both `Other`/`PermissionDenied`
+    // on some mappings), but only device-node misses are unreadable without
+    // filing. `EWOULDBLOCK` equals `EAGAIN` on Linux, so one arm covers the
+    // empty queue; a conflicting lease can also surface here (see the tail's
+    // `Empty`-with-owed re-check).
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(errno) if errno == libc::EINTR => GroupReadOutcome::Interrupted,
+        Some(errno) if errno == libc::EAGAIN => GroupReadOutcome::Empty,
+        Some(errno) if errno == libc::EBUSY || errno == libc::ENXIO || errno == libc::ENODEV => {
+            GroupReadOutcome::Unreadable
+        }
         _ => GroupReadOutcome::Failed,
     }
 }
@@ -2232,15 +2315,28 @@ fn shed_backlog_past_cap(
     }
     let unit = ctx.fionread_unit.max(1);
     let mut owed = queued.div_ceil(unit).saturating_sub(cap_bytes / unit / 2);
+    let mut consecutive_errors = 0usize;
     while owed > 0 {
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if read < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(errno) if errno == libc::EINTR => continue,
+                Some(errno) if errno == libc::EAGAIN => break,
+                _ => {
+                    // A failed head was consumed: account it and continue
+                    // past it instead of pinning the rest behind it,
+                    // bounded so a persistently failing fd ends the shed.
+                    owed = owed.saturating_sub(1);
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors > 1024 {
+                        break;
+                    }
+                    continue;
+                }
             }
-            break;
         }
+        consecutive_errors = 0;
         if read == 0 {
             break;
         }
@@ -2313,13 +2409,38 @@ fn drain_final_tail_with(
                     return false;
                 }
             }
-            // Nothing left to read: the snapshot is consumed.
-            GroupReadOutcome::Empty => return true,
+            GroupReadOutcome::Empty => {
+                if owed == 0 {
+                    return true;
+                }
+                // Owed events remain but the read says empty: the empty
+                // could be a conflicting-lease `EWOULDBLOCK` (the same
+                // errno as `EAGAIN`) that consumed the head with more
+                // queued behind it. Re-check the queue: more bytes means
+                // continue, an empty queue means the ceiling over-counted
+                // by less than one event (harmless, decided), and an
+                // unreadable queue gives up.
+                match queued_event_bytes(raw) {
+                    Some(0) => return true,
+                    Some(_) => continue,
+                    None => {
+                        ctx.state.loss_other.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                }
+            }
             GroupReadOutcome::Interrupted => continue,
             GroupReadOutcome::Unreadable => {
-                unreachable!("classifier does not return Unreadable yet");
+                // The head named an unopenable device node and was
+                // consumed: account it without filing.
+                owed = owed.saturating_sub(1);
+                ctx.note_unreadable_without_filing();
+                continue;
             }
             GroupReadOutcome::Failed => {
+                // The head was consumed unproven: account it, file it,
+                // and continue with the rest.
+                owed = owed.saturating_sub(1);
                 ctx.note_read_error();
                 continue;
             }
@@ -2334,10 +2455,12 @@ fn drain_final_tail_with(
 /// The helper holds no group fd of its own, only the shared slot,
 /// which it locks solely around each `fanotify_mark`, so a helper hung
 /// in a mount open pins nothing. `pending` carries the in-flight
-/// pass's receiver across ticks. Returns false only when no pass could
-/// start (spawn failure), which files the gap at once; a pass already
-/// in flight skips this tick (`true`, nothing started) instead of
-/// stacking another thread every period.
+/// pass's receiver across ticks. Returns false when no pass could start
+/// (spawn failure) or when a pass is still pending from the previous
+/// period — both leave coverage unproven, which files the
+/// unavailable-learning gap at once. A pending pass starts nothing
+/// (never stacks another thread), but the tick is a gap, not a silent
+/// skip.
 fn spawn_remark_pass(
     shared: &Arc<Mutex<Option<OwnedFd>>>,
     previous: &BTreeSet<MountIdentity>,
@@ -2350,7 +2473,7 @@ fn spawn_remark_pass(
     + 'static,
 ) -> bool {
     if pending.is_some() {
-        return true;
+        return false;
     }
     let helper_shared = Arc::clone(shared);
     let prev = previous.clone();
@@ -2415,6 +2538,45 @@ fn print_drain_telemetry(ctx: &DrainCtx<'_>, state: &LearnShutdownState) {
         state.loss_join_timeout.load(Ordering::Relaxed),
         state.loss_other.load(Ordering::Relaxed),
     );
+}
+
+/// Prints the final learner `-v` line after the join: the drain's last
+/// stored counters plus the current loss totals, so post-drain bumps
+/// (panic, join timeout) appear. A poisoned or missing store prints
+/// zeros for progress (the loss counters are still live atomics).
+fn print_final_telemetry(state: &LearnShutdownState) {
+    let stats = state
+        .final_stats
+        .lock()
+        .ok()
+        .map(|guard| *guard)
+        .unwrap_or_default();
+    eprintln!(
+        "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable, shed {}, tail_deadline {}, read_error {}, send_deadline {}, join_timeout {}, other {}",
+        stats.events,
+        stats.checked,
+        stats.proved,
+        stats.sent_candidates,
+        stats.sent_loads,
+        stats.overflows,
+        stats.unreadable,
+        state.loss_shed.load(Ordering::Relaxed),
+        state.loss_tail_deadline.load(Ordering::Relaxed),
+        state.loss_read_error.load(Ordering::Relaxed),
+        state.loss_send_deadline.load(Ordering::Relaxed),
+        state.loss_join_timeout.load(Ordering::Relaxed),
+        state.loss_other.load(Ordering::Relaxed),
+    );
+}
+
+/// Stores the drain's counters for the join's final line: called at
+/// every telemetry tick and at drain exit, so a drain that panics still
+/// leaves its last tick behind. Poison is harmless (the store is
+/// best-effort; the final line falls back to zeros).
+fn store_final_stats(state: &LearnShutdownState, stats: &DrainStats) {
+    if let Ok(mut guard) = state.final_stats.lock() {
+        *guard = *stats;
+    }
 }
 
 /// The drain: poll/read the group, decide each opened file at most once
@@ -2525,9 +2687,10 @@ fn drain_loop(
             // unlimited queue would grow behind it. The spawn never
             // waits — the result lands through the pending receiver on
             // a later tick — and a pass still running from the previous
-            // period skips this tick instead of stacking another. A
-            // pass that cannot start leaves coverage unproven, which
-            // files the unavailable-learning gap.
+            // period, or one that cannot start, leaves coverage
+            // unproven, which files the unavailable-learning gap. A
+            // pending pass starts nothing (never stacks another), but
+            // the tick is a gap, not a silent skip.
             if !spawn_remark_pass(
                 &shared_group,
                 &covered,
@@ -2540,6 +2703,9 @@ fn drain_loop(
                     break 'drain;
                 }
             }
+            // The join prints the final line from the last store, so
+            // store every period even when diagnostics are off now.
+            store_final_stats(&state, &ctx.stats);
             if crate::run::capture_diagnostics_on() {
                 print_drain_telemetry(&ctx, &state);
             }
@@ -2565,7 +2731,8 @@ fn drain_loop(
             }
             GroupReadOutcome::Empty | GroupReadOutcome::Interrupted => continue,
             GroupReadOutcome::Unreadable => {
-                unreachable!("classifier does not return Unreadable yet");
+                ctx.note_unreadable_without_filing();
+                continue;
             }
             GroupReadOutcome::Failed => {
                 ctx.note_read_error();
@@ -2606,21 +2773,11 @@ fn drain_loop(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take(),
     );
-    // Exiting past the join bound means the engine already gave up the
-    // join: count the join timeout with the other loss sources before
-    // the final line, which always prints the run's totals.
-    let late = state
-        .stop
-        .lock()
-        .ok()
-        .and_then(|guard| *guard)
-        .is_some_and(|at| std::time::Instant::now() > at + LEARN_WORKER_BOUND);
-    if late {
-        state.loss_join_timeout.fetch_add(1, Ordering::Relaxed);
-    }
-    if crate::run::capture_diagnostics_on() {
-        print_drain_telemetry(&ctx, &state);
-    }
+    // The join prints the final line (after reaping, so its panic and
+    // timeout bumps appear): store the exit counters for it. A drain
+    // that exits past the join bound stores late — the join already
+    // printed from the last tick — which is harmless.
+    store_final_stats(&state, &ctx.stats);
 }
 
 #[cfg(test)]
@@ -4060,7 +4217,9 @@ mod tests {
         // SAFETY: fresh owned fds from the pipe above.
         let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
         let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
-        let payload = [7u8; 128];
+        // One event owed: the failed head is consumed and accounted, so
+        // the tail finishes without needing another read.
+        let payload = [7u8; 24];
         // SAFETY: libc write of a live buffer to the pipe.
         let written = unsafe {
             libc::write(
@@ -4479,10 +4638,11 @@ mod tests {
     /// A re-mark spawn never waits for the pass: with an injected
     /// mark slower than any bound, the spawn returns at once with the
     /// pass in flight and nothing adopted; ticks while it runs adopt
-    /// nothing and start nothing; when it lands, the next adopt
-    /// collects it without spawning. A pass that dies keeps the
-    /// previous coverage with one uncovered. (Unprivileged: the mark is
-    /// injected and the group is a dummy fd behind the shared slot.)
+    /// nothing, start nothing, and file the gap (unproven coverage);
+    /// when it lands, the next adopt collects it without spawning. A
+    /// pass that dies keeps the previous coverage with one uncovered.
+    /// (Unprivileged: the mark is injected and the group is a dummy fd
+    /// behind the shared slot.)
     #[test]
     fn learn_remark_spawn_never_waits_and_later_tick_adopts() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4520,14 +4680,15 @@ mod tests {
             None,
             "a running pass adopts nothing"
         );
-        // An immediate second spawn starts nothing while it runs.
+        // An immediate second spawn starts nothing while it runs, but
+        // the tick files the gap instead of silently skipping.
         let second = std::sync::Arc::clone(&calls);
         assert!(
-            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+            !super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
                 second.fetch_add(1, Ordering::SeqCst);
                 (std::collections::BTreeSet::new(), 0)
             }),
-            "a tick while a pass runs is skipped, not failed"
+            "a tick while a pass runs files the gap, not silently skipped"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -5575,19 +5736,34 @@ mod tests {
         assert!(!super::check_elf_provider(&file).unwrap());
     }
 
-    /// Duplicates `fd` onto the first free number at or above 1024
-    /// and closes the original: the kernel allocates the lowest free
-    /// fd, so a just-closed low number can be reused by another test
-    /// thread's open before the assert below observes it (flaked under
-    /// load: `fcntl` read back 1, a reused CLOEXEC file, instead of
-    /// `EBADF`). Test fds live below 1024, so a high probe number is
-    /// never reused and the close assert observes only this test.
+    /// Duplicates `fd` onto the first free number at or above a high
+    /// floor and closes the original: the kernel allocates the lowest
+    /// free fd, so a just-closed low number can be reused by another
+    /// test thread's open before the assert below observes it (flaked
+    /// under load: `fcntl` read back 1, a reused CLOEXEC file, instead
+    /// of `EBADF`). Test fds live low, so a high probe number is never
+    /// reused and the close assert observes only this test. The floor
+    /// derives from the soft `RLIMIT_NOFILE` (1024 where the limit
+    /// allows, 16 below it where it does not), so the dup works under
+    /// the common soft limit of 1024 as well as higher ones.
     fn dup_fd_high(fd: std::os::unix::io::RawFd) -> std::os::unix::io::RawFd {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the struct on success.
+        let floor: libc::c_int = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            // Below 1024 the floor must clear the soft limit (fd numbers
+            // run below it), while staying high enough to avoid test fds.
+            1024u64.min(lim.rlim_cur.saturating_sub(16)) as libc::c_int
+        } else {
+            1024
+        };
         // SAFETY: fcntl dup of a live fd; the floor is within limits.
-        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 1024) };
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
         assert!(
-            high >= 1024,
-            "the probe dup must clear the test fd range, got {high}"
+            high >= floor,
+            "the probe dup must clear the test fd range, got {high} for floor {floor}"
         );
         // SAFETY: close of the original, now duplicated, fd.
         unsafe {

@@ -107,6 +107,8 @@ pub(crate) const TABLE_WINDOW_CEILING_REASON: &str =
     "discovery window table decode allowance reached; remaining table data was not decoded";
 pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
     "discovery window interface decode allowance reached; remaining interface data was not decoded";
+pub(crate) const COLLECTION_STOP_REASON: &str =
+    "cgroup collection stopped or shared work allowance exhausted";
 /// Stable marker inside the scan's own verified-absence vocabulary. The
 /// scan-to-live-candidate completeness boundary (`scan_skip_truncates`)
 /// matches these markers — the push sites below must keep using them.
@@ -1342,7 +1344,7 @@ impl CaptureWorkBudget {
             return false;
         }
         if !(work.0)(units) {
-            self.set_scan_stop("cgroup collection stopped or shared work allowance exhausted");
+            self.set_scan_stop(COLLECTION_STOP_REASON);
             return false;
         }
         true
@@ -5495,6 +5497,27 @@ fn capture_scan_reason(reason: &str) -> bool {
     )
 }
 
+/// Budget-exhaustion stops that keep decoded modules past a failed final
+/// bracket (owner data-always rule 2026-11-09, controller R1): the budget
+/// bought a full allowance of decode work and only the re-validation ran
+/// dry, so the decoded modules publish with the failure named — never an
+/// empty view. Every other bracket failure (a proven mapping change, an
+/// unreadable maps snapshot, a lost generation) keeps the fail-closed
+/// clear. Maps byte/entry ceilings are truncated snapshots, not an
+/// exhausted allowance, so they stay out of this set.
+fn bracket_budget_exhaustion(reason: &str) -> bool {
+    matches!(
+        reason,
+        WORK_CEILING_REASON
+            | SCAN_DEADLINE_REASON
+            | SCAN_CLOCK_REASON
+            | IO_CEILING_REASON
+            | TABLE_WINDOW_CEILING_REASON
+            | INTERFACE_WINDOW_CEILING_REASON
+            | COLLECTION_STOP_REASON
+    )
+}
+
 fn scan_skip(subject: &str, reason: String) -> Skipped {
     Skipped {
         subject: if capture_scan_reason(&reason) {
@@ -5562,6 +5585,12 @@ fn undecoded_cause(budget: &CaptureWorkBudget) -> &'static str {
         "table decode ceiling reached"
     }
 }
+
+/// Subject of the counted undecoded gap: the decode stage that refused
+/// the files — deliberately not `capture discovery`, which the empty-plan
+/// classifier reads as "discovery stopped early" even when the bracket
+/// passed and nothing stopped.
+const UNDECODED_GAP_SUBJECT: &str = "table decode";
 
 /// The counted remainder gap for provider files a table-decode ceiling
 /// left with no decoded table.
@@ -7784,15 +7813,17 @@ fn scan_view_examined_mode(
         // A ceiling-refused file gets the plain ceiling row instead: no
         // disappearance is proven, and the no-table manifest remedy cannot
         // help a ceiling. The row stays even when mapping reads exhausted
-        // — the counted gap below names the file (data-always) — matching
-        // the stop-break site above.
-        if module.tables.is_empty() && !budget.scan_stopped() {
+        // or the scan stopped mid-module — the counted gap below names the
+        // file (data-always) — matching the stop-break site above. Only
+        // the genuine no-table row needs an unstopped scan: a stop proves
+        // no absence.
+        if module.tables.is_empty() {
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
                 skipped.push(Skipped {
                     subject: module.path.clone(),
                     reason: undecoded_file_reason(budget),
                 });
-            } else if !io_exhausted {
+            } else if !io_exhausted && !budget.scan_stopped() {
                 skipped.push(Skipped {
                     subject: module.path.clone(),
                     reason: no_table_found_reason(&module.path, hinted),
@@ -7825,7 +7856,7 @@ fn scan_view_examined_mode(
     // instead — the scan cannot know whether they are providers.
     if undecoded_ceiling_files > 0 {
         skipped.push(scan_skip(
-            "capture discovery",
+            UNDECODED_GAP_SUBJECT,
             undecoded_files_reason(undecoded_ceiling_files, budget),
         ));
     }
@@ -7844,21 +7875,26 @@ fn scan_view_examined_mode(
     // No pending module escapes until the second complete snapshot, dependency
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
-    // The one exception is a work- or deadline-starved bracket over a
-    // live view (below): decoded modules publish with the failure named,
-    // never silently dropped.
+    // The one exception is a budget-starved bracket over a live view
+    // (below): decoded modules publish with the failure named, never
+    // silently dropped.
+    // Each module's check verdict, outside the closure so a later starved
+    // step cannot throw a proven change away: `Some(false)` is a module
+    // the check itself proved changed, `Some(true)` passed, `None` never
+    // ran (the bracket starved first).
+    let mut bracket_verdicts: Vec<Option<bool>> = vec![None; modules.len()];
     let validation = (|| {
         let maps_b = acquire_scan_maps(view, budget, io).map_err(|error| error.reason)?;
         let index_b = index_maps_or_refuse(&maps_b, budget)?;
         budget.spend(maps_b.len() as u64).map_err(str::to_owned)?;
         let groups_b = candidate_groups(&maps_b);
         let mut accepted = Vec::with_capacity(modules.len());
-        for module in &modules {
-            accepted.push(
-                dependencies[&module.key]
-                    .validate(module, &index_b, &groups_b, budget)
-                    .map_err(str::to_owned)?,
-            );
+        for (index, module) in modules.iter().enumerate() {
+            let verdict = dependencies[&module.key]
+                .validate(module, &index_b, &groups_b, budget)
+                .map_err(str::to_owned)?;
+            bracket_verdicts[index] = Some(verdict);
+            accepted.push(verdict);
         }
         if let Some(reason) = budget.stopped_now() {
             return Err(reason.into());
@@ -7882,31 +7918,50 @@ fn scan_view_examined_mode(
                 .collect();
         }
         (validation, generation) => {
-            if let Err(reason) = validation {
+            if let Err(ref reason) = validation {
                 skipped.push(scan_skip(
                     "capture discovery",
                     format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {reason}"),
                 ));
             }
-            if let Err(reason) = generation {
+            if let Err(ref reason) = generation {
                 skipped.push(scan_skip(
                     "capture discovery",
                     format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
                 ));
             }
-            // A work- or deadline-starved bracket keeps what the scan
-            // decoded: the budget bought a full allowance of decode work
-            // and only the re-validation ran dry, so the decoded modules
-            // publish with the bracket failure named above — never an
-            // empty view (owner data-always rule 2026-11-09). The live
-            // pin must still hold (a dead pin is a proven change);
-            // every other bracket failure keeps the fail-closed clear.
+            // A budget-starved bracket keeps what the scan decoded: the
+            // budget bought a full allowance of decode work and only the
+            // re-validation ran dry, so the decoded modules publish with
+            // the bracket failure named above — never an empty view (owner
+            // data-always rule 2026-11-09). The live pin must still hold
+            // (a dead pin is a proven change); every other bracket failure
+            // keeps the fail-closed clear. The check's own failure reasons
+            // count as well as the sticky stop: DetailedLegacy IO
+            // exhaustion names its ceiling without setting a stop.
             // Absence evidence always needs the full bracket.
-            let resource_starved = matches!(
-                budget.stopped_reason(),
-                Some(WORK_CEILING_REASON | SCAN_DEADLINE_REASON)
-            );
-            if !(resource_starved && view.still_the_same()) {
+            let resource_starved = budget
+                .stopped_reason()
+                .is_some_and(bracket_budget_exhaustion)
+                || matches!(&validation, Err(reason) if bracket_budget_exhaustion(reason))
+                || matches!(&generation, Err(reason) if bracket_budget_exhaustion(reason));
+            if resource_starved && view.still_the_same() {
+                // A module the check PROVED changed is dropped with its
+                // mapping-changed row, like the healthy arm; only passed
+                // and never-validated modules keep. Kept modules never
+                // claim a finished tables scan: the sole-complete-table
+                // grant needs the full check.
+                let mut kept = Vec::with_capacity(modules.len());
+                for (mut module, verdict) in modules.into_iter().zip(bracket_verdicts) {
+                    if verdict == Some(false) {
+                        skipped.push(scan_skip(&module.path, MAPPING_CHANGED_REASON.into()));
+                    } else {
+                        module.tables_scan_finished = false;
+                        kept.push(module);
+                    }
+                }
+                modules = kept;
+            } else {
                 modules.clear();
             }
             examined.clear();
@@ -9636,7 +9691,6 @@ mod tests {
         let mut control = changed_first();
         let hints = control.provider_paths();
         let changed_path = hints[0].display().to_string();
-        let kept_path = hints[1].display().to_string();
         let mut measured = CaptureWorkBudget::default();
         let control_outcome = control.run_with_hints(&hints, &mut measured).unwrap();
         assert!(

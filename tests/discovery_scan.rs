@@ -1491,9 +1491,18 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
         outcome.modules()
     );
     assert!(
-        !outcome.modules()[0].tables.is_empty(),
-        "the table decoded before exhaustion: {:?}",
+        outcome.modules()[0].tables.is_empty(),
+        "the one-byte-short snapshot decoded no table: {:?}",
         outcome.modules()
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject == outcome.modules()[0].path
+                && skip.reason.contains("capture attempted-I/O ceiling")),
+        "the short data read stays named on its module: {:?}",
+        outcome.skipped()
     );
     assert!(
         !outcome.modules()[0].tables_scan_finished,

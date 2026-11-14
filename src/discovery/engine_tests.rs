@@ -5589,8 +5589,8 @@ fn exit_tap_overflow_keeps_newest_same_pid_generation() {
         task_cookie: 91,
         exec_id: 0,
     };
-    let (old, _) = registry.admit(1, 100, old_image, 10);
-    let (successor, _) = registry.admit(1, 100, new_image, 30);
+    let (old, _, _) = registry.admit(1, 100, old_image, 10);
+    let (successor, _, _) = registry.admit(1, 100, new_image, 30);
     let old = old.unwrap();
     let successor = successor.unwrap();
     let kept: Vec<_> = taps.into_iter().filter(|tap| tap.pid == 100).collect();

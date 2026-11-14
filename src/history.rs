@@ -48,6 +48,11 @@ struct Task {
     /// never matches while this is set. Cleared by the upgrade above.
     /// Only ever set with `first_ts_ns == 0`.
     birth_unknown_from_exec: bool,
+    /// The process's last live session-pseudonym counter, stashed at
+    /// every increment. The task is never freed, so a reopen or exec
+    /// bump reseeds from this instead of relabeling from `#1` (which
+    /// would reuse a retired session's label). Zero means never stashed.
+    next_pseudonym: u64,
     /// Exit hook time recorded by exit-retire, never the `closed`
     /// flag (a closed task would refuse the reopened generation's
     /// next event). Cleared only by a reopen: a later event on this
@@ -180,21 +185,29 @@ impl Registry {
     /// an exit-retired cookie reopens the task when timestamped after
     /// the exit (clearing the exit timestamp, counted) or counts late
     /// when at or before it — the exit path never sets `closed`, so
-    /// both still admit.
+    /// both still admit. The third return tells the caller to reseed
+    /// per-process continuity from the task's sticky copy (reopen, late
+    /// or bump only).
     pub(crate) fn admit(
         &mut self,
         domain: u64,
         pid: u32,
         image: ImageIdentity,
         event_ts_ns: u64,
-    ) -> (Option<ProcessKey>, Vec<ProcessKey>) {
+    ) -> (Option<ProcessKey>, Vec<ProcessKey>, bool) {
         let mut retired = Vec::new();
+        // Continuity reseed: the admitted key continues an exit-retired
+        // (reopen/late) or exec-superseded (bump) generation, so the
+        // caller reseeds per-process continuity (the pseudonym counter)
+        // from the task's sticky copy. False for fresh, steady and
+        // refused admits, which never need it.
+        let mut reseed = false;
         if domain == 0 || domain != self.domain() || image.task_cookie == 0 || pid == 0 {
-            return (None, retired);
+            return (None, retired, reseed);
         }
         if let Some(task) = self.tasks.get_mut(&image.task_cookie) {
             if task.closed || image.exec_id < task.key.exec_id {
-                return (None, retired);
+                return (None, retired, reseed);
             }
             if image.exec_id > task.key.exec_id {
                 retired.push(task.key);
@@ -204,6 +217,7 @@ impl Registry {
                 task.first_ts_ns = event_ts_ns;
                 task.birth_unknown_from_exec = event_ts_ns == 0;
                 task.exit_ts_ns = None;
+                reseed = true;
             } else if let Some(exit) = task.exit_ts_ns {
                 // A live thread on a retired cookie: after the exit the
                 // task reopens (the timestamp clears, the event admits);
@@ -215,6 +229,7 @@ impl Registry {
                 } else {
                     self.exit_retire_late = self.exit_retire_late.saturating_add(1);
                 }
+                reseed = true;
                 // A birth-unknown generation provably lived to this
                 // event: upgrade, so a pre-birth exit can no longer
                 // match it while a later real exit still can.
@@ -229,10 +244,10 @@ impl Registry {
                 task.first_ts_ns = event_ts_ns;
                 task.birth_unknown_from_exec = false;
             }
-            return (Some(task.key), retired);
+            return (Some(task.key), retired, reseed);
         }
         if self.tasks.len() >= self.limit {
-            return (None, retired);
+            return (None, retired, reseed);
         }
         let key = ProcessKey::history(domain, image.task_cookie, image.exec_id, pid);
         self.tasks.insert(
@@ -245,6 +260,7 @@ impl Registry {
                 root_positive: false,
                 first_ts_ns: event_ts_ns,
                 birth_unknown_from_exec: false,
+                next_pseudonym: 0,
                 exit_ts_ns: None,
             },
         );
@@ -252,7 +268,30 @@ impl Registry {
             .entry(pid)
             .or_default()
             .insert(image.task_cookie);
-        (Some(key), retired)
+        (Some(key), retired, reseed)
+    }
+
+    /// Stashes the live session-pseudonym counter on the task, which is
+    /// never freed: a later reopen or exec bump of the same cookie
+    /// reseeds from it. Exact-key like every other mutator, so a stale
+    /// key can never clobber the live generation's stash. Called at
+    /// every counter increment (rare), never on the steady CALL path.
+    pub(crate) fn save_pseudonym_counter(&mut self, key: ProcessKey, counter: u64) {
+        if let Some(task) = self.tasks.get_mut(&key.generation)
+            && task.key == key
+        {
+            task.next_pseudonym = counter;
+        }
+    }
+
+    /// The stashed counter for `key`'s task, if any was ever stashed.
+    /// Exact-key: only the live generation reseeds from its own stash.
+    pub(crate) fn sticky_pseudonym_counter(&self, key: ProcessKey) -> Option<u64> {
+        self.tasks
+            .get(&key.generation)
+            .filter(|task| task.key == key)
+            .map(|task| task.next_pseudonym)
+            .filter(|counter| *counter > 0)
     }
     /// Exact-key like every other mutator: a retired generation's CALL must
     /// never mark the successor generation as called.

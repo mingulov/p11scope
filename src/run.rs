@@ -7412,7 +7412,7 @@ fn identify_tracked(
         state.reject_history(ev);
         return None;
     }
-    let (key, retired) =
+    let (key, retired, reseed) =
         tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
     // An exec bump retires its superseded generation through the batch
     // path: the old key's R10 entry is freed with the refund landing only
@@ -7424,10 +7424,38 @@ fn identify_tracked(
     if let Some(key) = key {
         tracker.history_call(key);
         tracker.history_root(key, ev.root_affiliation);
+        if reseed {
+            reseed_reopened_pseudonym(tracker, state, key);
+        }
     } else {
         state.reject_unadmitted(ev);
     }
     key
+}
+/// Reseeds a reopened, late or exec-bumped generation's session-pseudonym
+/// counter from the history task's sticky copy: the counter was freed at
+/// retire, and numbering must continue instead of reusing a retired
+/// session's label. Seeds only when absent; a live counter always wins.
+fn reseed_reopened_pseudonym(
+    tracker: &process::Tracker,
+    state: &mut semantics::State,
+    key: semantics::ProcessKey,
+) {
+    if let Some(counter) = tracker.sticky_pseudonym_counter(key) {
+        state.seed_next_pseudonym(key, counter);
+    }
+}
+/// Stashes the process's just-moved pseudonym counter on its never-freed
+/// history task. Called only when reduction reports an increment (a
+/// session opened or inherited), never on the steady CALL path.
+fn stash_pseudonym_counter(
+    tracker: &mut process::Tracker,
+    state: &semantics::State,
+    key: semantics::ProcessKey,
+) {
+    if let Some(counter) = state.next_pseudonym_value(key) {
+        tracker.save_pseudonym_counter(key, counter);
+    }
 }
 /// Legacy test-only injected retirement. Production requires the non-cloneable
 /// completed root-tail token below.
@@ -7642,7 +7670,7 @@ fn observe_fork(
         state.reject_history(ev);
         return true;
     }
-    let (parent, retired) =
+    let (parent, retired, reseed_parent) =
         tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
     // Batch retire, as in `identify_tracked`: a FORK can be the first
     // post-exec event, and its superseded generation must free R10 too.
@@ -7651,21 +7679,31 @@ fn observe_fork(
     }
     if let Some(parent) = parent {
         tracker.history_root(parent, ev.root_affiliation);
+        if reseed_parent {
+            reseed_reopened_pseudonym(tracker, state, parent);
+        }
     }
     if ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope {
         return true;
     }
-    let (child, retired) =
+    let (child, retired, reseed_child) =
         tracker.admit_history(domain, ev.session as u32, ev.child_image, ev.ts_ns);
     // Batch retire, as in `identify_tracked`: the child side of a FORK
     // can equally carry an exec bump.
     if !retired.is_empty() {
         state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
     }
+    if let Some(child) = child
+        && reseed_child
+    {
+        reseed_reopened_pseudonym(tracker, state, child);
+    }
     if let (Some(parent), Some(child)) = (parent, child)
         && tracker.history_birth(parent, child)
     {
-        state.fork_process(parent, child);
+        if state.fork_process(parent, child) {
+            stash_pseudonym_counter(tracker, state, child);
+        }
         return true;
     }
     state.reject_history(ev);
@@ -13520,8 +13558,9 @@ fn reduce_profile_event(
     tracker.check_root_event(domain, ev.root_affiliation)?;
     if !observe_fork(domain, tracker, state, scope, &ev)
         && let Some(process) = identify_tracked(domain, tracker, state, &ev)
+        && state.observe_process(process, &ev)
     {
-        state.observe_process(process, &ev);
+        stash_pseudonym_counter(tracker, state, process);
     }
     Ok(())
 }
@@ -13914,8 +13953,10 @@ fn reduce_trace_event_with_identities<W: Write>(
         {
             diag.trace_observation(process.is_some(), false, true, false, *stdout_open);
         }
-        if let Some(process) = process {
-            state.observe_process(process, &ev);
+        if let Some(process) = process
+            && state.observe_process(process, &ev)
+        {
+            stash_pseudonym_counter(tracker, state, process);
         }
     } else {
         let (attempted, error) = emit_bounded_trace_event(
@@ -13950,8 +13991,11 @@ fn reduce_trace_event_with_identities<W: Write>(
             );
         }
         *write_error = error;
-        if !attempted && let Some(process) = process {
-            state.observe_process(process, &ev);
+        if !attempted
+            && let Some(process) = process
+            && state.observe_process(process, &ev)
+        {
+            stash_pseudonym_counter(tracker, state, process);
         }
     }
     Ok(())
@@ -32077,7 +32121,7 @@ int main(int argc, char **argv) {
             task_cookie: 90,
             exec_id: 0,
         };
-        let (parent, _) = tracker.admit_history(domain, 100, parent_image, 0);
+        let (parent, _, _) = tracker.admit_history(domain, 100, parent_image, 0);
         let parent = parent.expect("parent generation admits");
         // Parent opens one session before forking.
         let mut call: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };

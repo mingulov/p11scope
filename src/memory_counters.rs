@@ -194,6 +194,7 @@ pub(crate) struct StateLens {
     pub pending: CounterRow,
     pub detached: CounterRow,
     pub inherited_ambiguous: CounterRow,
+    pub retired_sessions: CounterRow,
 }
 
 /// Dead-owned ROW counts per R10/R12 map (Blocker 2): rows whose
@@ -211,6 +212,7 @@ pub(crate) struct StateDeadLens {
     pub pending_dead: CounterRow,
     pub detached_dead: CounterRow,
     pub inherited_ambiguous_dead: CounterRow,
+    pub retired_sessions_dead: CounterRow,
 }
 
 /// R11 lens: the trace `CallerReasons` sizes, read only through the
@@ -352,6 +354,7 @@ pub(crate) struct MemorySnapshot {
     r12_pending: Option<CounterRow>,
     r12_detached: Option<CounterRow>,
     r12_inherited_ambiguous: Option<CounterRow>,
+    r12_retired_sessions: Option<CounterRow>,
     r10_r12_live_processes: Option<u64>,
     r10_r12_dead_processes: Option<u64>,
     r10_reduced_dead: Option<CounterRow>,
@@ -362,6 +365,7 @@ pub(crate) struct MemorySnapshot {
     r12_pending_dead: Option<CounterRow>,
     r12_detached_dead: Option<CounterRow>,
     r12_inherited_ambiguous_dead: Option<CounterRow>,
+    r12_retired_sessions_dead: Option<CounterRow>,
     sample_us: Option<u64>,
     caller_metadata_rows: Option<CounterRow>,
     floor_discovery_baseline_kb: Option<u64>,
@@ -505,6 +509,7 @@ impl MemorySnapshot {
             r12_pending: Some(state.pending),
             r12_detached: Some(state.detached),
             r12_inherited_ambiguous: Some(state.inherited_ambiguous),
+            r12_retired_sessions: Some(state.retired_sessions),
             r10_r12_live_processes: Some(lens.live_processes),
             r10_r12_dead_processes: Some(lens.dead_processes),
             r10_reduced_dead: Some(dead.reduced_dead),
@@ -515,6 +520,7 @@ impl MemorySnapshot {
             r12_pending_dead: Some(dead.pending_dead),
             r12_detached_dead: Some(dead.detached_dead),
             r12_inherited_ambiguous_dead: Some(dead.inherited_ambiguous_dead),
+            r12_retired_sessions_dead: Some(dead.retired_sessions_dead),
             sample_us: Some(lens.sample_us),
             caller_metadata_rows: None,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
@@ -589,6 +595,7 @@ impl MemorySnapshot {
             r12_pending: None,
             r12_detached: None,
             r12_inherited_ambiguous: None,
+            r12_retired_sessions: None,
             r10_r12_live_processes: None,
             r10_r12_dead_processes: None,
             r10_reduced_dead: None,
@@ -599,6 +606,7 @@ impl MemorySnapshot {
             r12_pending_dead: None,
             r12_detached_dead: None,
             r12_inherited_ambiguous_dead: None,
+            r12_retired_sessions_dead: None,
             sample_us: None,
             caller_metadata_rows: lens.metadata_rows,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
@@ -807,6 +815,7 @@ mod tests {
             pending: row(13),
             detached: row(14),
             inherited_ambiguous: row(15),
+            retired_sessions: row(27),
         }
     }
 
@@ -820,6 +829,7 @@ mod tests {
             pending_dead: row(24),
             detached_dead: row(25),
             inherited_ambiguous_dead: row(26),
+            retired_sessions_dead: row(28),
         }
     }
 
@@ -899,6 +909,7 @@ mod tests {
         assert_eq!(profile.r10_reduced.expect("R10").len, 8);
         assert_eq!(profile.r12_open.expect("R12").len, 9);
         assert_eq!(profile.r12_inherited_ambiguous.expect("R12").len, 15);
+        assert_eq!(profile.r12_retired_sessions.expect("R12").len, 27);
         assert_eq!(profile.r10_r12_live_processes, Some(1));
         assert_eq!(profile.r10_r12_dead_processes, Some(1));
         assert_eq!(profile.r10_reduced_dead.expect("R10 dead").len, 19);
@@ -907,6 +918,7 @@ mod tests {
             profile.r12_inherited_ambiguous_dead.expect("R12 dead").len,
             26
         );
+        assert_eq!(profile.r12_retired_sessions_dead.expect("R12 dead").len, 28);
         assert_eq!(profile.sample_us, Some(123));
         assert_eq!(profile.self_rss_kb, Some(1111));
         assert_eq!(profile.self_hwm_kb, Some(2222));
@@ -1032,6 +1044,7 @@ mod tests {
         assert!(inventory.r12_pending.is_none());
         assert!(inventory.r12_detached.is_none());
         assert!(inventory.r12_inherited_ambiguous.is_none());
+        assert!(inventory.r12_retired_sessions.is_none());
         assert!(inventory.r10_r12_live_processes.is_none());
         assert!(inventory.r10_r12_dead_processes.is_none());
         assert!(inventory.r10_reduced_dead.is_none());

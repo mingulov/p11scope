@@ -2900,6 +2900,14 @@ pub(crate) const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_ENCAPSULATE
     | CKF_DECAPSULATE;
 pub(crate) const MAX_PENDING: usize = 16_384;
+
+/// Cap on exit-retired session tombstones: the live-thread bursts they
+/// bridge are small (a leader exit with surviving threads is rare, and
+/// each holds few sessions), while dead processes never consume. Past
+/// the cap the lowest entry evicts with a counted eviction and its
+/// late close degrades to `unmatched_closes` — still named, never
+/// silent. Sized for bursts, not for remembering every dead session.
+pub(crate) const MAX_RETIRED_SESSIONS: usize = 1024;
 pub(crate) const MAX_STATE_KEYS: usize = 262_144;
 /// Distinct mechanism ids the capture-wide per-id table holds: the same
 /// 256 as the per-edge reducer's [`crate::semantics_edge::MAX_EDGE_MECHANISMS`].
@@ -3057,6 +3065,18 @@ pub struct State {
     /// unfinished async calls left behind. Only the exit path feeds
     /// this; the history path predates it and is unchanged.
     exit_retired_pending: u64,
+    /// Sessions an exit retire counted closed, kept as tombstones for
+    /// their late closes: a leader exit can precede live threads, and
+    /// their closes must match (already counted) rather than count
+    /// unmatched or double-close. Consumed by matching closes and by
+    /// re-opens of the same handle; capped (dead processes never
+    /// consume), with evictions counted for the A0 sampler. Never live
+    /// state: excluded from scope queries, owner samples and purges.
+    retired_sessions: BTreeSet<(ProcessKey, SessionRef)>,
+    /// Retired tombstones evicted past [`MAX_RETIRED_SESSIONS`]. Their
+    /// late closes degrade to `unmatched_closes` (still named); the
+    /// count itself rides the A0 sampler, never the report.
+    retired_session_evictions: u64,
     evidence: SemanticEvidence,
     mech_shapes: BTreeMap<u64, u32>,
     state_key_limit: usize,
@@ -3170,6 +3190,8 @@ impl State {
             orphan_ops: 0,
             unmatched_closes: 0,
             exit_retired_pending: 0,
+            retired_sessions: BTreeSet::new(),
+            retired_session_evictions: 0,
             evidence: SemanticEvidence::default(),
             mech_shapes: BTreeMap::new(),
             state_key_limit,
@@ -3247,6 +3269,13 @@ impl State {
                 changed |= self.clear_scope(process, Some(*module), false) != 0;
             }
         }
+        // Tombstones are per-session facts like the open rows: drop the
+        // purged modules' share (a post-purge close must not match a
+        // pre-purge tombstone once the aggregates below reset).
+        let tombstones_before = self.retired_sessions.len();
+        self.retired_sessions
+            .retain(|(_, session)| !modules.contains(&session.module));
+        changed |= self.retired_sessions.len() != tombstones_before;
         changed |= !self.mechanisms.is_empty()
             || !self.templates.is_empty()
             || !self.logins.is_empty()
@@ -3265,6 +3294,9 @@ impl State {
         self.sessions = SessionStats::default();
         self.orphan_ops = 0;
         self.unmatched_closes = 0;
+        // The retired gap count names pre-purge rows, like the aggregates
+        // above; the purge's reconciliation names the reset.
+        self.exit_retired_pending = 0;
         self.evidence.state_reconciliations = self
             .evidence
             .state_reconciliations
@@ -3451,10 +3483,14 @@ impl State {
         }
     }
 
-    pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
+    /// Reduces one admitted CALL. Returns whether this call opened a
+    /// session (moved the process's pseudonym counter): the caller
+    /// stashes the new counter on the never-freed history task, so a
+    /// later reopen reseeds from it instead of relabeling from `#1`.
+    pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) -> bool {
         if !self.accepts_domain(process.domain) {
             self.reject_history(ev);
-            return;
+            return false;
         }
         if !self.reduced_histories.contains(&process) && self.admit(1) {
             self.reduced_histories.insert(process);
@@ -3484,9 +3520,9 @@ impl State {
                 cg.errors += 1;
             }
         }
-        let Some(meta) = meta else { return };
+        let Some(meta) = meta else { return false };
         if meta.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY {
-            return;
+            return false;
         }
 
         if ev.session != SESSION_NONE
@@ -3503,13 +3539,13 @@ impl State {
             lifecycle::ASYNC_COMPLETE | lifecycle::ASYNC_GET_ID | lifecycle::ASYNC_JOIN
         ) {
             self.observe_async(process, ev);
-            return;
+            return false;
         }
         if ev.rv == CkRv::PENDING.0 {
             self.queue_pending(process, ev, meta);
-            return;
+            return false;
         }
-        self.apply_completed(process, ev, &meta, false);
+        self.apply_completed(process, ev, &meta, false)
     }
 
     fn apply_completed(
@@ -3518,7 +3554,7 @@ impl State {
         ev: &Event,
         meta: &SlotMeta,
         was_pending: bool,
-    ) {
+    ) -> bool {
         self.observe_templates(ev, meta);
         if (meta.semantics.transition == transition::INITIALIZE
             || meta.semantics.direct != direct::NONE)
@@ -3540,14 +3576,15 @@ impl State {
             }
         }
         if self.reconcile_conclusive(process, ev, meta) {
-            return;
+            return false;
         }
-        self.apply_lifecycle(process, ev, meta);
+        let opened = self.apply_lifecycle(process, ev, meta);
         if meta.semantics.transition == transition::INITIALIZE {
             self.apply_init(process, ev, meta);
         } else if meta.semantics.direct == direct::NONE && meta.semantics.operations != 0 {
             self.apply_operations(process, ev, meta);
         }
+        opened
     }
 
     fn record_requested_mechanism(&mut self, ev: &Event, meta: &SlotMeta) {
@@ -3835,7 +3872,9 @@ impl State {
         false
     }
 
-    fn apply_lifecycle(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+    /// Returns whether this call opened a session (moved the
+    /// process's pseudonym counter), for the history-task stash.
+    fn apply_lifecycle(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) -> bool {
         let session = meta.session(ev.session);
         match meta.semantics.lifecycle {
             lifecycle::OPEN_SESSION if ev.rv == CkRv::OK.0 && ev.session != SESSION_NONE => {
@@ -3843,6 +3882,11 @@ impl State {
                     self.evidence.state_reconciliations =
                         self.evidence.state_reconciliations.saturating_add(1);
                 }
+                // A re-opened handle is a new session: drop any retired
+                // tombstone, so a later duplicate close cannot match stale
+                // state. Not a reconciliation — the old one already
+                // counted closed at retire.
+                self.retired_sessions.remove(&(process, session));
                 let async_session = ev.capture & capture::ASYNC_SESSION != 0;
                 self.sessions.opened = self.sessions.opened.saturating_add(1);
                 self.sessions.async_opened = self
@@ -3862,12 +3906,22 @@ impl State {
                         },
                     );
                     self.update_peak();
+                    true
+                } else {
+                    false
                 }
             }
             lifecycle::CLOSE_SESSION if ev.rv == CkRv::OK.0 => {
-                if !self.retire_session(process, session) {
+                if !self.retire_session(process, session)
+                    && !self.retired_sessions.remove(&(process, session))
+                {
+                    // Neither open nor exit-retired: genuinely unmatched.
+                    // A retired tombstone matches silently instead — its
+                    // close was already counted at retire, and recounting
+                    // either side would double-count one session.
                     self.unmatched_closes += 1;
                 }
+                false
             }
             lifecycle::CLOSE_ALL_SESSIONS if ev.rv == CkRv::OK.0 => {
                 // Only this module's sessions on that PKCS#11 slot id: another
@@ -3882,32 +3936,46 @@ impl State {
                 for session in sessions {
                     self.retire_session(process, session);
                 }
+                false
             }
             lifecycle::FINALIZE if ev.rv == CkRv::OK.0 => {
                 // C_Finalize ends this module's Cryptoki. Another module in the
                 // same process keeps its own sessions and operations.
                 self.retire_scope(process, Some(meta.module));
+                false
             }
-            lifecycle::LOGIN => self.apply_auth(process, ev, meta),
-            lifecycle::LOGOUT => self.apply_auth(process, ev, meta),
+            lifecycle::LOGIN => {
+                self.apply_auth(process, ev, meta);
+                false
+            }
+            lifecycle::LOGOUT => {
+                self.apply_auth(process, ev, meta);
+                false
+            }
             lifecycle::FIND_INIT if ev.rv == CkRv::OK.0 => {
                 let key = (process, session);
                 if self.find_active.contains(&key) || self.admit(1) {
                     self.find_active.insert(key);
                 }
+                false
             }
             lifecycle::FIND_FINAL if ev.rv == CkRv::OK.0 => {
                 if self.find_active.remove(&(process, session)) {
                     self.release_keys(1);
                 }
+                false
             }
-            lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev, session),
+            lifecycle::SESSION_CANCEL => {
+                self.apply_session_cancel(process, ev, session);
+                false
+            }
             lifecycle::SET_OPERATION_STATE if ev.rv == CkRv::OK.0 => {
                 self.clear_operations(process, session, u16::MAX);
                 self.evidence.operation_state_imports =
                     self.evidence.operation_state_imports.saturating_add(1);
+                false
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -4456,6 +4524,15 @@ impl State {
             if existed {
                 self.release_keys(1);
                 touched.insert(*process);
+                // A counted close leaves a tombstone for its late close
+                // (live threads can outlive the leader exit); past the
+                // cap the lowest entry evicts with its counted eviction.
+                self.retired_sessions.insert((*process, *session));
+                if self.retired_sessions.len() > MAX_RETIRED_SESSIONS {
+                    self.retired_sessions.pop_first();
+                    self.retired_session_evictions =
+                        self.retired_session_evictions.saturating_add(1);
+                }
             }
             self.clear_session_state(*process, *session);
             if existed {
@@ -4604,13 +4681,17 @@ impl State {
         self.clear_scope(process, module, true)
     }
 
-    pub fn fork_process(&mut self, parent: ProcessKey, child: ProcessKey) {
+    /// Inherits the parent's sessions into the fork child. Returns
+    /// whether the child's pseudonym counter moved (any session
+    /// inherited): the caller stashes it on the never-freed history
+    /// task, as for [`Self::observe_process`].
+    pub fn fork_process(&mut self, parent: ProcessKey, child: ProcessKey) -> bool {
         if parent.domain != child.domain || !self.accepts_domain(parent.domain) {
-            return;
+            return false;
         }
         // A birth FORK is one-shot and precedes every child's own CALL.
         if self.reduced_histories.contains(&child) || !self.admit(1) {
-            return;
+            return false;
         }
         #[cfg(test)]
         self.fork_op_visits.set(0);
@@ -4636,6 +4717,7 @@ impl State {
                     .push((*operation, *binding));
             }
         }
+        let mut inherited_any = false;
         for (session, info) in sessions {
             if !info.fork_safe {
                 let key = (child, session);
@@ -4652,6 +4734,7 @@ impl State {
             }
             let counter = self.next_pseudonym.entry(child).or_default();
             *counter += 1;
+            inherited_any = true;
             self.open.insert(
                 open_key,
                 SessionInfo {
@@ -4685,6 +4768,30 @@ impl State {
             }
         }
         self.update_peak();
+        inherited_any
+    }
+
+    /// The process's live pseudonym counter, if it opened or inherited
+    /// any session since its last retire. Read by the caller right after
+    /// [`Self::observe_process`] or [`Self::fork_process`] reports an
+    /// increment, for the history-task stash.
+    pub(crate) fn next_pseudonym_value(&self, process: ProcessKey) -> Option<u64> {
+        self.next_pseudonym.get(&process).copied()
+    }
+
+    /// Reseeds a reopened or exec-bumped generation's counter from the
+    /// history task's sticky copy. Seeds only when absent, so a live
+    /// counter is never overwritten; budget-gated like every insert, so
+    /// a spent budget degrades to relabeling (counted by `admit`).
+    pub(crate) fn seed_next_pseudonym(&mut self, process: ProcessKey, counter: u64) {
+        if !self.next_pseudonym.contains_key(&process) && self.admit(1) {
+            self.next_pseudonym.insert(process, counter);
+        }
+    }
+
+    /// Retired tombstones evicted past the cap, for the A0 sampler.
+    pub(crate) fn retired_session_evictions(&self) -> u64 {
+        self.retired_session_evictions
     }
 
     fn update_peak(&mut self) {
@@ -4840,6 +4947,11 @@ impl State {
                 size_of::<(ProcessKey, SessionRef)>(),
                 HEAP_MAP_ENTRY,
             ),
+            retired_sessions: counter_row(
+                self.retired_sessions.len(),
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
         }
     }
     /// A0 sample: distinct processes owning R12 rows, for the 60 s
@@ -4941,6 +5053,14 @@ impl State {
             .iter()
             .filter(|(process, _)| is_dead(process.pid))
             .count();
+        // Tombstones are not owners (`memory_process_pids` excludes
+        // them), so a live process's entries split by its own liveness
+        // through the other maps' pids, exactly as its rows do.
+        let retired_sessions_dead = self
+            .retired_sessions
+            .iter()
+            .filter(|(process, _)| is_dead(process.pid))
+            .count();
         let sample_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         let dead = StateDeadLens {
             reduced_dead: counter_row(reduced_dead, size_of::<ProcessKey>(), HEAP_MAP_ENTRY),
@@ -4976,6 +5096,11 @@ impl State {
             ),
             inherited_ambiguous_dead: counter_row(
                 inherited_ambiguous_dead,
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            retired_sessions_dead: counter_row(
+                retired_sessions_dead,
                 size_of::<(ProcessKey, SessionRef)>(),
                 HEAP_MAP_ENTRY,
             ),

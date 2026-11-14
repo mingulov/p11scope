@@ -152,8 +152,17 @@ impl Tracker {
         pid: u32,
         image: p11scope_ebpf_common::ImageIdentity,
         event_ts_ns: u64,
-    ) -> (Option<ProcessKey>, Vec<ProcessKey>) {
+    ) -> (Option<ProcessKey>, Vec<ProcessKey>, bool) {
         self.history.admit(domain, pid, image, event_ts_ns)
+    }
+    /// Stashes the live session-pseudonym counter on the task, which is
+    /// never freed (see [`crate::history::Registry::save_pseudonym_counter`]).
+    pub(crate) fn save_pseudonym_counter(&mut self, key: ProcessKey, counter: u64) {
+        self.history.save_pseudonym_counter(key, counter);
+    }
+    /// The stashed counter for `key`'s task, if any was ever stashed.
+    pub(crate) fn sticky_pseudonym_counter(&self, key: ProcessKey) -> Option<u64> {
+        self.history.sticky_pseudonym_counter(key)
     }
     /// Free slots in the tracker's pending-exit queue (transfer cap).
     pub(crate) fn exit_tap_space(&self) -> usize {

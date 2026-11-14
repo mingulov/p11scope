@@ -253,17 +253,19 @@ fn history_same_cookie_exec_closes_before_open_and_late_old_never_reduces() {
     feed(&mut s, &mut t, [pending]);
     assert_eq!(vector(&s), (1, 0, 0, 1, 1, 1));
     feed(&mut s, &mut t, [ev(100, 90, 1, 0)]);
-    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 0));
+    // The bump retires through the batch path, so the old generation's
+    // pending call stays named in the end gap instead of vanishing.
+    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 1));
     feed(
         &mut s,
         &mut t,
         [ev(100, 90, 0, 1), pending, ev(100, 90, 0, 0)],
     );
-    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 0));
+    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 1));
     assert_eq!(s.semantic_evidence().semantic_history_drops, 3);
     assert!(s.session_pseudonym_process(key(90, 1), 0, 7).is_some());
     feed(&mut s, &mut t, [ev(100, 90, 1, 3), ev(100, 90, 1, 0)]);
-    assert_eq!(vector(&s), (3, 0, 2, 1, 1, 0));
+    assert_eq!(vector(&s), (3, 0, 2, 1, 1, 1));
 }
 
 #[test]
@@ -499,7 +501,7 @@ fn exec_bump_resets_exit_matching_generation() {
         task_cookie: 90,
         exec_id: 1,
     };
-    let (current, retired) = registry.admit(1, 100, image1, 250);
+    let (current, retired, _) = registry.admit(1, 100, image1, 250);
     assert!(current.is_some());
     assert_eq!(retired.len(), 1);
     // An exit hooked between the original admit and the exec matches
@@ -1180,7 +1182,9 @@ fn history_old_init_and_detached_state_cannot_enrich_successor_or_late_fork() {
     assert_eq!(s.pending_at_end(), 1);
     assert_eq!(s.mechanisms()[&1].calls, 1);
     feed(&mut s, &mut t, [ev(100, 90, 1, 0), ev(100, 90, 1, 2)]);
-    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 0));
+    // The bump-retired detached id stays named in the end gap; the
+    // successor still adopts nothing from it.
+    assert_eq!(vector(&s), (2, 0, 1, 1, 1, 1));
     assert_eq!(s.mechanisms()[&1].calls, 1);
     feed(&mut s, &mut t, [init]);
     assert_eq!(s.mechanisms()[&1].calls, 1);
@@ -2628,7 +2632,8 @@ fn e20_exec_reuse_cannot_adopt_pre_exec_async() {
         1,
         "post-exec completion cannot adopt the retired record"
     );
-    assert_eq!(s.pending_at_end(), 0);
+    // The bump-retired detached id stays named in the end gap.
+    assert_eq!(s.pending_at_end(), 1);
     assert!(!s.has_process_state(old), "exec retired the old key");
     assert_eq!(s.sessions().closed, 1, "the old open retired with it");
     assert!(s.mechanisms().is_empty(), "nothing published");
@@ -2646,7 +2651,8 @@ fn e20_exec_reuse_cannot_adopt_pre_exec_async() {
     get.target_function = target;
     get.async_value = 42;
     feed(&mut s, &mut t, [get]);
-    assert_eq!(s.pending_at_end(), 1);
+    // One live detached id plus the retired one, both named.
+    assert_eq!(s.pending_at_end(), 2);
     assert_eq!(s.semantic_evidence().async_duplicates, 0);
     let mut join = ev(100, 90, 1, 5);
     join.target_function = target;
@@ -2656,7 +2662,8 @@ fn e20_exec_reuse_cannot_adopt_pre_exec_async() {
     complete.target_function = target;
     complete.async_value = pkcs11_types::CkRv::OK.0;
     feed(&mut s, &mut t, [complete]);
-    assert_eq!(s.pending_at_end(), 0);
+    // The live id completed; the retired one stays named.
+    assert_eq!(s.pending_at_end(), 1);
     assert_eq!(
         s.semantic_evidence().async_orphans,
         1,
@@ -2808,7 +2815,7 @@ fn producer_tracker_admits_past_16384_to_the_wide_budget() {
         };
         #[allow(clippy::cast_possible_truncation)]
         let pid = cookie as u32;
-        let (key, retired) = tracker.admit_history(1, pid, image, 0);
+        let (key, retired, _) = tracker.admit_history(1, pid, image, 0);
         assert!(retired.is_empty(), "cookie={cookie}");
         if key.is_some() {
             admitted += 1;

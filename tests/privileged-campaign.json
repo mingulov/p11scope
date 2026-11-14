@@ -356,5 +356,18 @@
       "semantics_objects::journal::root_proof_tests::private_root_class_array_uses_the_frozen_endpoint_classifier",
       "semantics_objects::journal::root_proof_tests::private_root_native_records_keep_real_results_and_terminal_custody"
     ]
+  },
+  "pkcs11_check": {
+    "note": "External pkcs11-check suite under p11scope (scripts/ci/pkcs11-check-cell.sh, not lib tests). SMOKE (--marker smoke) on every push, FULL (no marker) nightly plus dispatch; FULL green on the exact SHA gates release tags. Inventoried here for the version/marker/cell/floor pins the workflow and the cell script must match.",
+    "version": "0.2.3",
+    "smoke_marker": "smoke",
+    "cells": [
+      "pkcs11-check-identical-results",
+      "pkcs11-check-observer-clean",
+      "pkcs11-check-manifest-exact",
+      "pkcs11-check-default-coverage"
+    ],
+    "default_coverage_floor": 0.5,
+    "default_coverage_expected_failure": "pkcs11-check-default-coverage"
   }
 }

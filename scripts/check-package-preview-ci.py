@@ -20,6 +20,8 @@ REQUIRED_JOBS = {
     "coverage (rest)", *(f"coverage (contracts:{index}/6)" for index in range(1, 7)),
     "coverage-report",
 }
+PRIV_WORKFLOW = ".github/workflows/privileged-tests.yml"
+PRIV_FULL_JOB = "pkcs11-check-full"
 
 
 def require(condition, message):
@@ -76,6 +78,25 @@ def check_run(run, repository, run_id, workflow_id, sha, tree):
             "CI run does not match the checkout commit and tree")
     attempt = run.get("run_attempt")
     require(positive(attempt), "invalid CI run attempt")
+    return attempt
+
+
+def check_priv_run(run, repository, run_id, workflow_id, sha, tree):
+    require(type(run.get("id")) is int and run["id"] == run_id, "wrong FULL run")
+    require(type(run.get("workflow_id")) is int and run["workflow_id"] == workflow_id
+            and run.get("path") == PRIV_WORKFLOW, "wrong FULL workflow")
+    require(run.get("status") == "completed" and run.get("conclusion") == "success",
+            "selected FULL run is not completed successfully")
+    require(run.get("head_sha") == sha, "FULL run is on a different SHA")
+    for key in ("repository", "head_repository"):
+        value = run.get(key)
+        require(isinstance(value, dict) and value.get("full_name") == repository,
+                "FULL run is from a different repository")
+    commit = run.get("head_commit")
+    require(isinstance(commit, dict) and commit.get("id") == sha and commit.get("tree_id") == tree,
+            "FULL run does not match the checkout commit and tree")
+    attempt = run.get("run_attempt")
+    require(positive(attempt), "invalid FULL run attempt")
     return attempt
 
 
@@ -140,6 +161,37 @@ def check_jobs(repository, run_id, attempt, sha):
         check_gate(jobs[name])
 
 
+def check_full_job(repository, run_id, attempt, sha):
+    endpoint = f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+    jobs = {}
+    identifiers = set()
+    count = None
+    page = 1
+    while count is None or len(jobs) < count:
+        response = api(f"{endpoint}?per_page=100&page={page}")
+        total = response.get("total_count")
+        require(type(total) is int and total >= 0, "invalid FULL job count")
+        require(count is None or total == count, "FULL job count changed while paging")
+        count = total
+        batch = response.get("jobs")
+        require(isinstance(batch, list) and len(batch) == min(100, count - len(jobs)),
+                "incomplete FULL jobs page")
+        for job in batch:
+            require(isinstance(job, dict), "invalid FULL job")
+            name = job.get("name")
+            identifier = job.get("id")
+            require(isinstance(name, str) and name and name not in jobs
+                    and positive(identifier) and identifier not in identifiers, "duplicate or invalid FULL job")
+            require(type(job.get("run_id")) is int and job["run_id"] == run_id
+                    and type(job.get("run_attempt")) is int and job["run_attempt"] == attempt
+                    and job.get("head_sha") == sha, "stale FULL job identity")
+            jobs[name] = job
+            identifiers.add(identifier)
+        page += 1
+    require(PRIV_FULL_JOB in jobs, "FULL job is missing from the run")
+    check_gate(jobs[PRIV_FULL_JOB])
+
+
 def canonical(pattern, description):
     def parse(value):
         if not re.fullmatch(pattern, value):
@@ -156,6 +208,10 @@ def main():
     parser.add_argument("--sha", required=True, type=canonical(r"[0-9a-f]{40}", "expected a full commit SHA"))
     parser.add_argument("--accepted-ci-run-id", required=True,
                         type=canonical(r"[1-9][0-9]*", "expected a positive decimal CI run ID"))
+    parser.add_argument("--accepted-pkcs11-full-run-id", default="",
+                        type=canonical(r"(|[1-9][0-9]*)", "expected empty or a positive decimal FULL run ID"))
+    parser.add_argument("--require-pkcs11-full", action="store_true",
+                        help="refuse when no FULL run ID validates (release tags)")
     parser.add_argument("--capture-mode", choices=("full", "p0", "both"), default="both")
     parser.add_argument("--jobs", default="2", type=canonical(r"[1-9]|1[0-6]", "expected jobs 1 through 16"))
     args = parser.parse_args()
@@ -171,6 +227,22 @@ def main():
         # Refuse an attempt that was superseded by a rerun during pagination.
         require(check_run(api(run_endpoint), args.repository, run_id, workflow_id, args.sha, tree) == attempt,
                 "CI run attempt changed while validating")
+        full_id = args.accepted_pkcs11_full_run_id
+        if args.require_pkcs11_full and not full_id:
+            raise ValueError("a release tag needs a FULL pkcs11-check run ID")
+        if full_id:
+            priv_workflow = api(f"repos/{args.repository}/actions/workflows/privileged-tests.yml")
+            priv_id = priv_workflow.get("id")
+            require(positive(priv_id) and priv_workflow.get("path") == PRIV_WORKFLOW,
+                    "invalid FULL workflow identity")
+            full_run_id = int(full_id)
+            full_endpoint = f"repos/{args.repository}/actions/runs/{full_run_id}"
+            full_attempt = check_priv_run(api(full_endpoint), args.repository, full_run_id,
+                                          priv_id, args.sha, tree)
+            check_full_job(args.repository, full_run_id, full_attempt, args.sha)
+            require(check_priv_run(api(full_endpoint), args.repository, full_run_id,
+                                   priv_id, args.sha, tree) == full_attempt,
+                    "FULL run attempt changed while validating")
         modes = ("full", "p0") if args.capture_mode == "both" else (args.capture_mode,)
         matrix = {"include": [
             {"mode": mode, "artifact": "release-preview-public-assets" + ("-p0" if mode == "p0" else ""),

@@ -337,10 +337,19 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("[default, long, all]", self.yml)
         self.assertIn("long|all", self.yml)
         self.assertIn("--include-long", self.yml)
-        # Schedules run only on the default branch, so the weekly campaign is
-        # a dispatch, never a schedule trigger.
+        # Schedules run only on the default branch, so the weekly lib
+        # campaign is a dispatch on the dev tip. The nightly schedule here
+        # (owner 2026-11-14) runs only release-build plus pkcs11-check-full
+        # on main; every other job skips on schedule.
         self.assertIn("schedules run only on the default branch", self.yml.lower())
-        self.assertNotIn("schedule:", self.yml)
+        self.assertIn("schedule:", self.yml)
+        self.assertIn("- cron: '17 3 * * *'", self.yml)
+        self.assertIn("pkcs11_check_full:", self.yml)
+        full = job_body(self.yml, "pkcs11-check-full")
+        self.assertIn("github.event_name == 'schedule'", full)
+        self.assertIn("inputs.pkcs11_check_full", full)
+        smoke = job_body(self.yml, "pkcs11-check-smoke")
+        self.assertIn("github.event_name != 'schedule'", smoke)
 
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], _BPF.check_no_tag_triggers(self.yml))
@@ -840,6 +849,82 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                                  f"workflow judge must not excuse {cell}")
         self.assertIn("--require counter-latency-mt", host_leg,
                       "host template leg must require the mt counter cell")
+
+    def test_pkcs11_check_campaign_pins_match_the_cell_script(self):
+        # The external suite pins live in privileged-campaign.json (not lib
+        # tests) and the cell script plus both workflow jobs must match
+        # them: exact version, exact smoke marker, four cells, floor, and
+        # the named default-coverage expected failure.
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        check = campaign["pkcs11_check"]
+        self.assertEqual(check["version"], "0.2.3")
+        self.assertEqual(check["smoke_marker"], "smoke")
+        self.assertEqual(check["cells"], [
+            "pkcs11-check-identical-results",
+            "pkcs11-check-observer-clean",
+            "pkcs11-check-manifest-exact",
+            "pkcs11-check-default-coverage",
+        ])
+        self.assertEqual(check["default_coverage_floor"], 0.5)
+        self.assertEqual(check["default_coverage_expected_failure"],
+                         "pkcs11-check-default-coverage")
+        script = (ROOT / "scripts" / "ci" / "pkcs11-check-cell.sh").read_text(encoding="utf-8")
+        self.assertIn("pkcs11-check==0.2.3", self.yml)
+        self.assertIn("--marker smoke", script)
+        # DEFAULT crash isolation: the suite invocations never pass
+        # --isolation (comments and state-file names may mention it).
+        invocations = [line for line in script.splitlines()
+                       if 'echo "test --module' in line]
+        self.assertEqual(len(invocations), 2)
+        for line in invocations:
+            self.assertNotIn("--isolation", line)
+        self.assertIn("FLOOR=0.50", script)
+        helper = (ROOT / "scripts" / "ci" / "pkcs11_check_cell_compare.py").read_text(encoding="utf-8")
+        self.assertIn('PINNED_VERSION = "0.2.3"', helper)
+
+    def test_pkcs11_check_jobs_use_the_template_with_exact_cells(self):
+        for job_name, mode, timeout in (("pkcs11-check-smoke", "smoke", "30"),
+                                        ("pkcs11-check-full", "full", "180")):
+            with self.subTest(job=job_name):
+                job = job_body(self.yml, job_name)
+                self.assertIn("needs: release-build", job)
+                self.assertIn("runs-on: ubuntu-26.04", job)
+                self.assertIn(f"timeout-minutes: {timeout}", job)
+                self.assertIn("pkcs11-check==0.2.3", job)
+                self.assertIn(f"P11CHECK_MODE={mode}", job)
+                self.assertIn("scripts/ci/run-cell-script.sh pkcs11-check-cell", job)
+                for cell in ("pkcs11-check-identical-results",
+                             "pkcs11-check-observer-clean",
+                             "pkcs11-check-manifest-exact",
+                             "pkcs11-check-default-coverage"):
+                    self.assertIn(f"--require {cell}", job)
+                self.assertIn("--expected-failure pkcs11-check-default-coverage", job)
+                self.assertIn("P11TEST_PIN=1234", job)
+                self.assertIn("rm -rf", job)
+                self.assertIn("tokens", job)
+
+    def test_schedule_runs_only_release_build_and_full(self):
+        # Every job except release-build and pkcs11-check-full skips on
+        # schedule, so the nightly runs only the FULL suite on main.
+        names = [match.group(1) for match in
+                 re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", self.yml, re.M)]
+        jobs = [name for name in names
+                if name not in ("push", "pull_request", "schedule", "workflow_dispatch")]
+        # Top-level keys that are not jobs (permissions, env, etc.) never
+        # match the job pattern above because they carry values.
+        self.assertIn("release-build", jobs)
+        self.assertIn("pkcs11-check-smoke", jobs)
+        self.assertIn("pkcs11-check-full", jobs)
+        for name in jobs:
+            body = job_body(self.yml, name)
+            with self.subTest(job=name):
+                if name in ("release-build", "pkcs11-check-full"):
+                    continue
+                self.assertIn("github.event_name != 'schedule'", body,
+                              f"{name} must skip on schedule")
+        release = job_body(self.yml, "release-build")
+        self.assertNotIn("github.event_name", release,
+                         "release-build must run on schedule for FULL")
 
 
 if __name__ == "__main__":

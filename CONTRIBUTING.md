@@ -90,7 +90,7 @@ target at V3. Do not reduce final required test membership.
 Remote CI can satisfy equivalent V3 checks without a second local full run.
 Verify the tested SHA, flags and every required job/shard. A prior successful
 run does not qualify changed behavior; rerun affected checks. Privileged/live
-acceptance has its own environment and authorization requirements.
+acceptance has its own environment and authorization requirements. The privileged campaign also runs pkcs11-check 0.2.3 under `p11scope run` (smoke on every push, full nightly and as a release-tag gate) with identical-result and oracle-subset checks (`scripts/ci/pkcs11-check-cell.sh`).
 
 After integrating worker commits, check intervening changes to shared interfaces
 and run the appropriate affected checks on the combined revision. Clean textual

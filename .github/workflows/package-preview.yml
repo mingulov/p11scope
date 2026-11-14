@@ -8,6 +8,11 @@ on:
         description: Completed successful ci.yml run on this exact commit (positive decimal ID)
         type: string
         required: true
+      accepted_pkcs11_full_run_id:
+        description: Completed successful pkcs11-check-full run on this exact commit (positive decimal ID); required when the commit carries a release tag
+        type: string
+        required: false
+        default: ''
       capture_mode:
         description: Official package modes to build
         type: choice
@@ -23,6 +28,11 @@ on:
         description: Completed successful ci.yml run on this exact commit (positive decimal ID)
         type: string
         required: true
+      accepted_pkcs11_full_run_id:
+        description: Completed successful pkcs11-check-full run on this exact commit (positive decimal ID); required when the commit carries a release tag
+        type: string
+        required: false
+        default: ''
       capture_mode:
         description: Official package modes to build
         type: string
@@ -57,14 +67,26 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_SHA: ${{ github.sha }}
           ACCEPTED_CI_RUN_ID: ${{ inputs.accepted_ci_run_id }}
+          ACCEPTED_PKCS11_FULL_RUN_ID: ${{ inputs.accepted_pkcs11_full_run_id }}
           CAPTURE_MODE: ${{ inputs.capture_mode }}
           BUILD_JOBS: ${{ inputs.jobs }}
         shell: bash
         run: |
           set -euo pipefail
+          full_args=()
+          if [ -n "$ACCEPTED_PKCS11_FULL_RUN_ID" ]; then
+            full_args+=(--accepted-pkcs11-full-run-id "$ACCEPTED_PKCS11_FULL_RUN_ID")
+          fi
+          # A release tag needs the FULL pkcs11-check green on this exact
+          # commit; untagged previews validate it only when an ID is given.
+          if git tag --points-at HEAD | grep -Eq '^v[0-9]'; then
+            echo "release tag on HEAD: requiring FULL pkcs11-check green"
+            full_args+=(--require-pkcs11-full)
+          fi
           accepted=$(python3 -I scripts/check-package-preview-ci.py \
             --repository "$EXPECTED_REPOSITORY" --sha "$EXPECTED_SHA" \
             --accepted-ci-run-id "$ACCEPTED_CI_RUN_ID" \
+            "${full_args[@]}" \
             --capture-mode "$CAPTURE_MODE" --jobs "$BUILD_JOBS")
           printf '%s\n' "$accepted" >>"$GITHUB_OUTPUT"
   package:

@@ -46,16 +46,23 @@ name: privileged-tests
 #   positive arms from the same FULL-512 journal build with exact
 #   selectors; the default shards run the same names on the wide binary
 #   as exact-refusal twins. A SKIP fails the job;
-# - system-scale, public-cli and browser-cells run the installed-behavior
-#   jobs from the release observer. New scripts/ci/<name>.sh cells run
-#   through scripts/ci/run-cell-script.sh (which validates results.jsonl
-#   with scripts/ci/check-cell-results.py) packed into these existing jobs,
-#   never as new jobs: WP-3 real-providers and WP-7 stop-races in
-#   system-scale, WP-4 breadth and WP-5 legacy32 in public-cli.
-# Weekly campaign: workflow_dispatch input campaign selects default, long
-# (--include-long) or all (long plus the fixture-skip groups once WP-2 adds
-# them). GitHub schedules run only on the default branch, so the weekly run
-# is a dispatch on the dev tip, never a schedule trigger here.
+# - system-scale, public-cli, browser-cells and the pkcs11-check pair run
+#   the installed-behavior jobs from the release observer. WP-3/WP-7 cells
+#   pack into system-scale and WP-4/WP-5 into public-cli through
+#   scripts/ci/run-cell-script.sh (which validates results.jsonl with
+#   scripts/ci/check-cell-results.py); the pkcs11-check external suite
+#   keeps its own jobs because the FULL suite has its own nightly
+#   schedule: pkcs11-check-smoke (--marker smoke, few minutes) on every
+#   push, pkcs11-check-full (no marker, ~45 min per leg) nightly plus
+#   manual dispatch, both with identical-result, observer-clean,
+#   oracle-subset and default-coverage checks. The FULL green on the exact
+#   SHA gates release tags (package-preview validates it).
+# Weekly lib campaign: workflow_dispatch input campaign selects default,
+# long (--include-long) or all (long plus the fixture-skip groups once
+# WP-2 adds them). GitHub schedules run only on the default branch, so the
+# weekly lib run is a dispatch on the dev tip; the nightly schedule here
+# runs only release-build plus pkcs11-check-full on main (every other job
+# skips on schedule).
 on:
   # Release tags ride the commit a branch push already ran (RELEASING.md
   # pushes main and the tag together): tag pushes trigger nothing, so a
@@ -68,6 +75,10 @@ on:
     tags-ignore:
       - '**'
   pull_request:
+  schedule:
+    # Nightly FULL pkcs11-check on main (schedules run only on the default
+    # branch): release-build plus pkcs11-check-full; every other job skips.
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       campaign:
@@ -75,6 +86,10 @@ on:
         type: choice
         options: [default, long, all]
         default: default
+      pkcs11_check_full:
+        description: Also run the FULL pkcs11-check suite (~2.5 h) in addition to smoke
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -89,6 +104,7 @@ env:
 jobs:
   privileged-build:
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -214,6 +230,7 @@ jobs:
   # becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0.
   privileged-build-journal:
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -299,6 +316,7 @@ jobs:
   privileged-shard:
     needs: privileged-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -380,7 +398,7 @@ jobs:
   # which dual-outcome arm each cell took.
   privileged-summary:
     needs: [privileged-build, privileged-shard]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name != 'schedule' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -483,6 +501,7 @@ jobs:
   privileged-second-flavor:
     needs: privileged-build-journal
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -574,6 +593,7 @@ jobs:
   privileged-counter-flavor:
     needs: privileged-build-journal
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -664,6 +684,7 @@ jobs:
   privileged-btrfs:
     needs: privileged-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -767,6 +788,7 @@ jobs:
   privileged-overlay:
     needs: privileged-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -901,6 +923,7 @@ jobs:
   system-scale:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1060,6 +1083,7 @@ jobs:
   public-cli:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -1309,6 +1333,7 @@ jobs:
   public-cli-ia32:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1355,6 +1380,7 @@ jobs:
   legacy32-shape:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1424,6 +1450,7 @@ jobs:
   root-integration:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1546,6 +1573,7 @@ jobs:
   # guest legs run the same host-built test binary inside vng.
   witness-cli:
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -1678,6 +1706,7 @@ jobs:
   # binary inside vng.
   run-tree:
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -1805,6 +1834,7 @@ jobs:
   browser-cells:
     needs: release-build
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1855,6 +1885,7 @@ jobs:
   # harness provides.
   container-image:
     runs-on: ubuntu-26.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1924,3 +1955,116 @@ jobs:
           path: ${{ github.workspace }}/container-image-out/
           if-no-files-found: warn
           retention-days: 7
+  # pkcs11-check SMOKE under p11scope: the owner's public suite (PyPI,
+  # pinned 0.2.3, DEFAULT crash isolation, never --isolation none) against
+  # SoftHSM in three legs (alone, under run, under run --manifest) with
+  # identical-result, observer-clean, oracle-subset and default-coverage
+  # checks (scripts/ci/pkcs11-check-cell.sh). Exact selector --marker
+  # smoke (four files, ~133 tests, few minutes); no blanket skips. Runs on
+  # every push (host kernel) as a required cell; skips on schedule (the
+  # FULL job owns the nightly).
+  pkcs11-check-smoke:
+    needs: release-build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y python3 python3-venv softhsm2 util-linux
+      - name: Install pinned pkcs11-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/p11check"
+          "$RUNNER_TEMP/p11check/bin/pip" install --quiet 'pkcs11-check==0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the smoke cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/pkcs11-check-smoke-out"
+          # Throwaway token PINs (same values as qualify-public-cli.sh).
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11TEST_PIN=1234 P11TEST_SO_PIN=5678 \
+            P11CHECK_MODE=smoke P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
+            scripts/ci/run-cell-script.sh pkcs11-check-cell "$in/p11scope" "$out/cells" \
+            --expected-failure pkcs11-check-default-coverage \
+            --require pkcs11-check-identical-results \
+            --require pkcs11-check-observer-clean \
+            --require pkcs11-check-manifest-exact \
+            --require pkcs11-check-default-coverage
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          rm -rf "$out/cells/leg-a/tokens" "$out/cells/leg-b/tokens" "$out/cells/leg-c/tokens"
+      - name: Upload the smoke results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkcs11-check-smoke
+          path: ${{ github.workspace }}/pkcs11-check-smoke-out/
+          if-no-files-found: warn
+          retention-days: 7
+  # pkcs11-check FULL under p11scope: the same three legs with the full
+  # default suite (no --marker, ~45 min per leg, ~2.5 h total). Runs
+  # nightly on main plus manual dispatch (pkcs11_check_full input); never
+  # on push. Its green on the exact SHA gates release tags
+  # (package-preview validates accepted_pkcs11_full_run_id).
+  pkcs11-check-full:
+    needs: release-build
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y python3 python3-venv softhsm2 util-linux
+      - name: Install pinned pkcs11-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/p11check"
+          "$RUNNER_TEMP/p11check/bin/pip" install --quiet 'pkcs11-check==0.2.3'
+          test "$("$RUNNER_TEMP/p11check/bin/pkcs11-check" version)" = 'pkcs11-check 0.2.3'
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the full cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/pkcs11-check-full-out"
+          # Throwaway token PINs (same values as qualify-public-cli.sh).
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11TEST_PIN=1234 P11TEST_SO_PIN=5678 \
+            P11CHECK_MODE=full P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
+            scripts/ci/run-cell-script.sh pkcs11-check-cell "$in/p11scope" "$out/cells" \
+            --expected-failure pkcs11-check-default-coverage \
+            --require pkcs11-check-identical-results \
+            --require pkcs11-check-observer-clean \
+            --require pkcs11-check-manifest-exact \
+            --require pkcs11-check-default-coverage
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          rm -rf "$out/cells/leg-a/tokens" "$out/cells/leg-b/tokens" "$out/cells/leg-c/tokens"
+      - name: Upload the full results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkcs11-check-full
+          path: ${{ github.workspace }}/pkcs11-check-full-out/
+          if-no-files-found: warn
+          retention-days: 30

@@ -23,6 +23,9 @@ REPOSITORY = "example/p11scope"
 RUN_ID = 42
 WORKFLOW_ID = 71
 ATTEMPT = 2
+FULL_RUN_ID = 43
+PRIV_WORKFLOW_ID = 72
+FULL_JOB = "pkcs11-check-full"
 REQUIRED = (
     "dedupe", "lint", "audit", "tests", "bpf-noninterference", "scripts", "archive-log",
     "contracts-1", "contracts-2", "contracts-3", "contracts-4",
@@ -75,6 +78,15 @@ class PackagePreviewTests(unittest.TestCase):
             "head_commit": {"id": self.sha, "tree_id": self.tree},
         }
         self.jobs = [self.job(index, name) for index, name in enumerate(REQUIRED, 1)]
+        self.full_run = {
+            "id": FULL_RUN_ID, "workflow_id": PRIV_WORKFLOW_ID,
+            "path": ".github/workflows/privileged-tests.yml",
+            "status": "completed", "conclusion": "success", "head_sha": self.sha,
+            "run_attempt": ATTEMPT, "repository": {"full_name": REPOSITORY},
+            "head_repository": {"full_name": REPOSITORY},
+            "head_commit": {"id": self.sha, "tree_id": self.tree},
+        }
+        self.full_jobs = [self.job(500, FULL_JOB, run_id=FULL_RUN_ID)]
         (self.bin / "gh").write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
 api = pathlib.Path(os.environ["FAKE_API"])
@@ -82,9 +94,14 @@ with open(os.environ["FAKE_REQUESTS"], "a") as out:
     out.write(json.dumps(sys.argv[1:]) + "\\n")
 path = sys.argv[-1]
 if "/attempts/" in path:
-    name = "jobs-" + path.rsplit("page=", 1)[1]
+    page = path.rsplit("page=", 1)[1]
+    name = ("full-jobs-" if f"/runs/{FULL_RUN_ID}/" in path else "jobs-") + page
+elif path.endswith("/workflows/privileged-tests.yml"):
+    name = "priv-workflow"
 elif "/workflows/" in path:
     name = "workflow"
+elif f"/runs/{FULL_RUN_ID}" in path and "/attempts/" not in path:
+    name = "full-run"
 else:
     count = api / "run-count"
     number = int(count.read_text()) + 1 if count.exists() else 1
@@ -93,16 +110,16 @@ else:
 if (api / (name + ".fail")).exists():
     sys.exit(29)
 sys.stdout.write((api / name).read_text())
-''')
+'''.replace("FULL_RUN_ID", str(FULL_RUN_ID)))
         (self.bin / "gh").chmod(0o700)
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", *args],
                                        cwd=self.repo, env=self.env, text=True)
 
-    def job(self, index, name):
+    def job(self, index, name, run_id=RUN_ID):
         return {
-            "id": index, "name": name, "run_id": RUN_ID, "run_attempt": ATTEMPT,
+            "id": index, "name": name, "run_id": run_id, "run_attempt": ATTEMPT,
             "head_sha": self.sha, "status": "completed", "conclusion": "success",
             "started_at": "2026-10-29T00:00:00Z", "completed_at": "2026-10-29T00:01:00Z",
             "steps": [{"name": "Run actual gate", "number": 1,
@@ -116,6 +133,12 @@ sys.stdout.write((api / name).read_text())
             (self.api / f"jobs-{index // 100 + 1}").write_text(json.dumps({
                 "total_count": len(self.jobs), "jobs": self.jobs[index:index + 100],
             }))
+        (self.api / "priv-workflow").write_text(json.dumps(
+            {"id": PRIV_WORKFLOW_ID, "path": ".github/workflows/privileged-tests.yml"}))
+        (self.api / "full-run").write_text(json.dumps(self.full_run))
+        (self.api / "full-jobs-1").write_text(json.dumps({
+            "total_count": len(self.full_jobs), "jobs": self.full_jobs,
+        }))
 
     def validate(self, *extra):
         self.assertTrue(HELPER.is_file(), "the package CI validation helper is missing")
@@ -157,9 +180,62 @@ sys.stdout.write((api / name).read_text())
                 self.assertEqual(output["jobs"], jobs)
                 self.assertEqual([item["mode"] for item in json.loads(output["matrix"])["include"]], [mode])
 
+    def test_full_run_validates_on_the_exact_sha(self):
+        output = self.outputs(self.validate("--accepted-pkcs11-full-run-id", str(FULL_RUN_ID)))
+        self.assertEqual(output["sha"], self.sha)
+        calls = [json.loads(line) for line in self.requests.read_text().splitlines()]
+        self.assertEqual([call[-1] for call in calls], [
+            f"repos/{REPOSITORY}/actions/workflows/ci.yml",
+            f"repos/{REPOSITORY}/actions/runs/42",
+            f"repos/{REPOSITORY}/actions/runs/42/attempts/2/jobs?per_page=100&page=1",
+            f"repos/{REPOSITORY}/actions/runs/42",
+            f"repos/{REPOSITORY}/actions/workflows/privileged-tests.yml",
+            f"repos/{REPOSITORY}/actions/runs/43",
+            f"repos/{REPOSITORY}/actions/runs/43/attempts/2/jobs?per_page=100&page=1",
+            f"repos/{REPOSITORY}/actions/runs/43",
+        ])
+
+    def test_full_required_but_missing_refuses_after_ci(self):
+        result = self.validate("--require-pkcs11-full")
+        self.assert_refused(result)
+        calls = [json.loads(line) for line in self.requests.read_text().splitlines()]
+        # CI validated first (four calls), then the missing FULL ID refused
+        # before any FULL API call.
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all("privileged-tests" not in call[-1] for call in calls))
+
+    def test_full_wrong_run_job_or_sha_refuses(self):
+        baseline_run = copy.deepcopy(self.full_run)
+        baseline_jobs = copy.deepcopy(self.full_jobs)
+        mutations = (
+            ("run", {"id": 44}),
+            ("run", {"workflow_id": 73}),
+            ("run", {"path": ".github/workflows/ci.yml"}),
+            ("run", {"conclusion": "failure"}),
+            ("run", {"head_sha": "a" * 40}),
+            ("run", {"head_commit": {"id": self.sha, "tree_id": "b" * 40}}),
+        )
+        for kind, mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.full_run = {**baseline_run, **mutation}
+                self.full_jobs = copy.deepcopy(baseline_jobs)
+                self.assert_refused(self.validate(
+                    "--accepted-pkcs11-full-run-id", str(FULL_RUN_ID)))
+        self.full_run = copy.deepcopy(baseline_run)
+        for change in ("missing", "failure", "skipped"):
+            with self.subTest(change=change):
+                if change == "missing":
+                    self.full_jobs = []
+                else:
+                    self.full_jobs = copy.deepcopy(baseline_jobs)
+                    self.full_jobs[0]["conclusion"] = change
+                self.assert_refused(self.validate(
+                    "--accepted-pkcs11-full-run-id", str(FULL_RUN_ID)))
+
     def test_invalid_inputs_refuse_before_api_or_outputs(self):
         cases = [["--jobs", value] for value in ("", "0", "17", "01", "+2", "2\n", "2.0")]
         cases += [["--accepted-ci-run-id", value] for value in ("", "0", "-1", "01", "1\n")]
+        cases += [["--accepted-pkcs11-full-run-id", value] for value in ("0", "-1", "01", "1\n", "abc")]
         cases += [["--capture-mode", "unknown"], ["--sha", "a" * 39],
                   ["--repository", "owner/repo?query=1"], ["--repository", "../repo"],
                   ["--repository", "owner/.."]]
@@ -285,7 +361,8 @@ sys.stdout.write((api / name).read_text())
         self.write_api()
         output = self.base / "github-output"
         env = {**self.env, "EXPECTED_REPOSITORY": REPOSITORY, "EXPECTED_SHA": self.sha,
-               "ACCEPTED_CI_RUN_ID": "42", "CAPTURE_MODE": "p0", "BUILD_JOBS": "3",
+               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PKCS11_FULL_RUN_ID": "",
+               "CAPTURE_MODE": "p0", "BUILD_JOBS": "3",
                "GITHUB_OUTPUT": str(output)}
         command = ["bash", "--noprofile", "--norc", "-c", step("Validate accepted ordinary CI", "validate")["run"]]
         accepted = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
@@ -299,6 +376,43 @@ sys.stdout.write((api / name).read_text())
         refused = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse(output.exists(), "failed validation published matrix outputs")
+
+    def test_tagged_checkout_requires_full_while_untagged_skips(self):
+        self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
+        scripts = self.repo / "scripts"
+        scripts.mkdir()
+        shutil.copyfile(HELPER, scripts / HELPER.name)
+        self.git("add", "scripts")
+        self.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "-qm", "fixture: validation helper")
+        self.sha = self.git("rev-parse", "HEAD").strip()
+        self.tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        self.run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        self.full_run.update(head_sha=self.sha, head_commit={"id": self.sha, "tree_id": self.tree})
+        for job in self.jobs + self.full_jobs:
+            job["head_sha"] = self.sha
+        self.write_api()
+        output = self.base / "github-output-tag"
+        command = ["bash", "--noprofile", "--norc", "-c", step("Validate accepted ordinary CI", "validate")["run"]]
+        # Untagged without a FULL ID: CI alone validates.
+        env = {**self.env, "EXPECTED_REPOSITORY": REPOSITORY, "EXPECTED_SHA": self.sha,
+               "ACCEPTED_CI_RUN_ID": "42", "ACCEPTED_PKCS11_FULL_RUN_ID": "",
+               "CAPTURE_MODE": "both", "BUILD_JOBS": "2",
+               "GITHUB_OUTPUT": str(output)}
+        untagged = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(untagged.returncode, 0, untagged.stderr)
+        output.unlink()
+        # Tag the checkout: the same empty ID must now refuse.
+        self.git("tag", "v9.9.9")
+        refused = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse(output.exists())
+        # With a valid FULL ID the tagged checkout validates.
+        env["ACCEPTED_PKCS11_FULL_RUN_ID"] = str(FULL_RUN_ID)
+        accepted = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        self.assertEqual(values["sha"], self.sha)
 
     def test_package_runner_rechecks_sha_tree_and_cleanliness_before_setup(self):
         self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
@@ -422,8 +536,14 @@ else:
         trigger = document.get("on", document.get(True))
         self.assertEqual(set(trigger), {"workflow_dispatch", "workflow_call"})
         inputs = trigger["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(inputs), {"accepted_ci_run_id", "capture_mode", "jobs"})
+        self.assertEqual(set(inputs), {"accepted_ci_run_id", "accepted_pkcs11_full_run_id",
+                                       "capture_mode", "jobs"})
         self.assertTrue(inputs["accepted_ci_run_id"]["required"])
+        self.assertFalse(inputs["accepted_pkcs11_full_run_id"].get("required", False))
+        self.assertEqual(str(inputs["accepted_pkcs11_full_run_id"].get("default", "")), "")
+        call_inputs = trigger["workflow_call"]["inputs"]
+        self.assertEqual(set(call_inputs), {"accepted_ci_run_id", "accepted_pkcs11_full_run_id",
+                                            "capture_mode", "jobs"})
         self.assertEqual(inputs["capture_mode"]["options"], ["full", "p0", "both"])
         self.assertEqual(inputs["capture_mode"]["default"], "both")
         self.assertEqual(str(inputs["jobs"]["default"]), "2")

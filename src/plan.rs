@@ -19220,9 +19220,14 @@ pub(crate) mod tests {
         assert_eq!(delta.new.len(), 0, "no fresh slots on semantic migration");
         assert_eq!(plan.slots.len(), 68, "lifetime stays 68 via migration");
         assert_eq!(plan.active_slot_count(), 68, "stays active");
-        assert_eq!(plan.module_ambiguous, 0, "no false ambiguity via stable IDs");
+        assert_eq!(
+            plan.module_ambiguous, 0,
+            "no false ambiguity via stable IDs"
+        );
         assert!(
-            plan.slots.iter().all(|slot| slot.object == PinnedObjectId(83)),
+            plan.slots
+                .iter()
+                .all(|slot| slot.object == PinnedObjectId(83)),
             "object IDs migrate to new pin"
         );
     }

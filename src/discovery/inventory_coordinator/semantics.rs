@@ -2309,8 +2309,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_finalizer = None;
         self.refused_semantic_domains.insert(domain);
         // Diagnostic-only (Task 0): the void counters are run-global
-        // and never reset, so the replacement owner adopts them.
-        let carried = self.joint_capture.adapter().joint_void_diagnosis();
+        // and never reset, so the replacement owner adopts them. The
+        // snapshot copies the five counters directly, without the
+        // per-key gauge scan the full diagnosis runs.
+        let carried = self.joint_capture.adapter().joint_void_counts();
         self.joint_capture =
             crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
                 crate::semantics_objects::journal::JournalLimits::policy(),
@@ -7286,16 +7288,12 @@ mod promotion_lifecycle_tests {
         let mut coordinator = coordinator();
         let a = domain();
         coordinator.semantic_finalizer = Some(SessionFinalizerState::new(a));
-        let carried = crate::semantics_objects::journal::JointVoidDiagnosis {
+        let carried = crate::semantics_objects::journal::JointVoidCounts {
             break_dispose: 3,
             break_ingest: 5,
             void_audit: 7,
             void_resync: 11,
             seal_below_fence: 13,
-            keys_total: 0,
-            keys_refused: 0,
-            keys_tainted: 0,
-            keys_pending: 0,
         };
         coordinator
             .joint_capture_mut()

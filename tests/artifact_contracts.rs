@@ -11736,7 +11736,8 @@ fn observer_image_runs_p11scope_by_default() {
         "test -f /usr/share/licenses/p11scope/LICENSE",
         "only effective for uid 0",
         // The image marker `doctor` reads to name `docker run` flags
-        // instead of `setcap` (with a `/.dockerenv` fallback).
+        // instead of `setcap` (with `/.dockerenv` and
+        // `/run/.containerenv` fallbacks).
         "ENV P11SCOPE_IMAGE=1",
     ] {
         require_contract_marker(&dockerfile, marker, "observer image")
@@ -11771,7 +11772,8 @@ fn observer_image_runs_p11scope_by_default() {
         "org.opencontainers.image.source",
         "only effective for uid 0",
         // The image marker `doctor` reads to name `docker run` flags
-        // instead of `setcap` (with a `/.dockerenv` fallback).
+        // instead of `setcap` (with `/.dockerenv` and
+        // `/run/.containerenv` fallbacks).
         "ENV P11SCOPE_IMAGE=1",
     ] {
         require_contract_marker(&release, marker, "observer release image")

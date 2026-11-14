@@ -1028,16 +1028,22 @@ fn setcap_check() -> Check {
 
 /// Whether the observer runs inside a container: `P11SCOPE_IMAGE=1`
 /// in the image environment (set by both observer Dockerfiles), with
-/// `/.dockerenv` as the fallback for hand-rolled containers. Pure
-/// over the two signals for tests; the probe reads the live values.
-fn in_container(image_env: Option<&str>, dockerenv_present: bool) -> bool {
-    image_env == Some("1") || dockerenv_present
+/// `/.dockerenv` (Docker) and `/run/.containerenv` (Podman) as the
+/// fallbacks for hand-rolled containers. Pure over the three signals
+/// for tests; the probe reads the live values.
+fn in_container(
+    image_env: Option<&str>,
+    dockerenv_present: bool,
+    containerenv_present: bool,
+) -> bool {
+    image_env == Some("1") || dockerenv_present || containerenv_present
 }
 
 fn running_in_container() -> bool {
     in_container(
         std::env::var("P11SCOPE_IMAGE").ok().as_deref(),
         std::path::Path::new("/.dockerenv").exists(),
+        std::path::Path::new("/run/.containerenv").exists(),
     )
 }
 
@@ -1046,6 +1052,11 @@ fn running_in_container() -> bool {
 /// setcap-able host binary, so doctor never suggests `setcap` here —
 /// it names these flags instead.
 const CONTAINER_FLAGS: &str = "--cap-drop ALL --cap-add BPF --cap-add PERFMON --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH";
+
+/// The file grants `-o` into a host-owned mount needs on top of the
+/// live set: the live flags alone cannot create or hand over files
+/// there. Named by the container recipe row in both shapes.
+const CONTAINER_FILE_GRANTS_NOTE: &str = "; report files into a host-owned mount also need --cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add FOWNER";
 
 /// The recipe row inside a container: the same missing-set shape as
 /// [`setcap_status`], with the docker flags as the remedy. The
@@ -1068,12 +1079,12 @@ fn container_flags_status(read: Result<u64, String>, init_user_ns: Option<bool>)
                 crate::caps::missing_for_live(live_mask_with_admin_cover(mask, init_user_ns));
             if missing.is_empty() {
                 Status::Ok(format!(
-                    "the container flags grant the minimal set ({CONTAINER_FLAGS})"
+                    "the container flags grant the minimal set ({CONTAINER_FLAGS}){CONTAINER_FILE_GRANTS_NOTE}"
                 ))
             } else {
                 let names: Vec<&str> = missing.iter().map(|cap| cap.name).collect();
                 Status::Warn(format!(
-                    "missing {}: run the image with {CONTAINER_FLAGS}",
+                    "missing {}: run the image with {CONTAINER_FLAGS}{CONTAINER_FILE_GRANTS_NOTE}",
                     names.join(", ")
                 ))
             }
@@ -5970,13 +5981,25 @@ mod tests {
     /// the host path.
     #[test]
     fn container_detection_prefers_the_image_env_with_dockerenv_fallback() {
-        assert!(in_container(Some("1"), false));
-        assert!(in_container(Some("1"), true));
-        assert!(in_container(None, true));
-        assert!(!in_container(None, false));
-        assert!(!in_container(Some("0"), false));
-        assert!(!in_container(Some("yes"), false));
-        assert!(!in_container(Some(""), false));
+        assert!(in_container(Some("1"), false, false));
+        assert!(in_container(Some("1"), true, false));
+        assert!(in_container(None, true, false));
+        assert!(!in_container(None, false, false));
+        assert!(!in_container(Some("0"), false, false));
+        assert!(!in_container(Some("yes"), false, false));
+        assert!(!in_container(Some(""), false, false));
+    }
+
+    /// Podman containers carry `/run/.containerenv` instead of
+    /// `/.dockerenv`: either marker runs the container path.
+    #[test]
+    fn container_detection_honors_podmans_containerenv() {
+        assert!(in_container(None, false, true));
+        assert!(in_container(Some("0"), false, true));
+        assert!(in_container(Some("1"), false, true));
+        assert!(in_container(None, true, true));
+        assert!(!in_container(None, false, false));
+        assert!(!in_container(Some("0"), false, false));
     }
 
     /// The file-learning row follows the `CAP_SYS_ADMIN` bit: held it

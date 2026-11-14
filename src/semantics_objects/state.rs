@@ -916,12 +916,16 @@ impl ModelState {
             }
             self.domains.remove(&domain);
             self.pruned_domains = self.pruned_domains.saturating_add(1);
-            if self.recently_pruned.len() >= self.limits.instances
-                && let Some(oldest) = self.recently_pruned.pop_front()
-            {
-                self.recently_pruned_set.remove(&oldest);
-            }
-            if self.limits.instances > 0 {
+            // Minor 6: never push a duplicate. A re-pruned domain must
+            // not sit in the deque twice while the set holds it once
+            // (lengths would diverge and an eviction could drop the set
+            // entry while a copy remains). Skip when already present.
+            if self.limits.instances > 0 && !self.recently_pruned_set.contains(&domain) {
+                if self.recently_pruned.len() >= self.limits.instances
+                    && let Some(oldest) = self.recently_pruned.pop_front()
+                {
+                    self.recently_pruned_set.remove(&oldest);
+                }
                 self.recently_pruned.push_back(domain);
                 self.recently_pruned_set.insert(domain);
             }
@@ -4863,6 +4867,40 @@ mod tests {
         assert_eq!(lens.recently_pruned.len, 1);
         assert_eq!(lens.gaps.len, 1);
         assert!(lens.gaps.bytes > 0);
+    }
+
+    /// Minor 6 twin: a re-pruned domain must not sit in the deque twice
+    /// while the set holds it once. The bypass insert simulates a
+    /// domain that returned to `domains` while still in pruned memory
+    /// (production `register_domain` refuses this; the guard keeps the
+    /// deque/set lengths in sync regardless).
+    #[test]
+    fn prune_skips_duplicate_recently_pruned_domain() {
+        let mut state = ModelState::new(ObjectLimits::policy());
+        let domain = ObjectDomain::reference(7, 7, 7, 7, 7);
+        state.recently_pruned.push_back(domain);
+        state.recently_pruned_set.insert(domain);
+        let ended = DomainState {
+            ended: Some(ObjectGap::BootstrapUnproven),
+            ..Default::default()
+        };
+        state.domains.insert(domain, ended);
+        state.prune_domains();
+        assert!(!state.domains.contains_key(&domain));
+        assert_eq!(
+            state
+                .recently_pruned
+                .iter()
+                .filter(|d| **d == domain)
+                .count(),
+            1,
+            "no duplicate deque entry"
+        );
+        assert_eq!(
+            state.recently_pruned.len(),
+            state.recently_pruned_set.len(),
+            "deque and set stay in sync"
+        );
     }
 
     fn scalar(value: u16) -> FieldState {

@@ -3821,6 +3821,658 @@ fn candidate_publication_is_not_repeated_by_unchanged_batch_tail() {
     assert_eq!(engine.published_facts_revision, engine.facts_revision);
 }
 
+/// Three live sleep children, one System engine retaining a view on
+/// each, and each view's `[accepted, peer]` provider modules. The accepted
+/// providers are committed by one accepted candidate; each peer is what a
+/// later retiring candidate allocates before its child's generation is
+/// lost mid-apply. Modeled on `engine_with_one_accepted_provider`.
+/// Three copies of `sleep` as distinct files (one per subdir, each
+/// still named `sleep`: multicall binaries dispatch on argv[0]). Distinct
+/// files, so the plan admits one provider per view instead of deduping.
+fn three_sleep_copies() -> (tempfile::TempDir, [std::path::PathBuf; 3]) {
+    let dir = tempfile::TempDir::with_prefix("v080-perf-stop-storm").unwrap();
+    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("a sleep binary to copy");
+    let mut copies = Vec::new();
+    for name in ["a", "b", "c"] {
+        let subdir = dir.path().join(name);
+        std::fs::create_dir(&subdir).unwrap();
+        let dest = subdir.join("sleep");
+        std::fs::copy(&sleep, &dest).unwrap();
+        copies.push(dest);
+    }
+    (dir, copies.try_into().unwrap())
+}
+
+fn engine_with_three_live_views() -> (
+    Vec<std::process::Child>,
+    Engine,
+    Vec<Vec<ScannedModule>>,
+    tempfile::TempDir,
+) {
+    let mut children = Vec::new();
+    let mut per_view = Vec::new();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let mut accepted = Vec::new();
+    let mut pins = PinnedObjects::empty();
+    // Distinct provider files per view: identical binaries would share
+    // one file and the plan would admit it once, not per view.
+    let (sleep_dir, programs) = three_sleep_copies();
+    for (view_id, program) in [3u32, 4, 5].into_iter().zip(programs) {
+        let child = std::process::Command::new(&program)
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(view_id), child.id()).unwrap();
+        let modules = child_provider_modules(&view);
+        let step = pin_test_modules(&view, &modules[..1]);
+        assert!(pins.absorb(step).is_empty());
+        accepted.push(modules[0].clone());
+        engine.views.push(view);
+        children.push(child);
+        per_view.push(modules);
+    }
+    engine.next_view_id = 6;
+    let candidate = engine
+        .live_candidate(pins, accepted.clone(), Vec::new())
+        .unwrap();
+    assert_eq!(candidate.delta.new.len(), 3);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "the first candidate is accepted whole");
+    (children, engine, per_view, sleep_dir)
+}
+
+/// Kills and reaps every child, ignoring already-reaped ones (the losing
+/// session reaps its victim mid-apply).
+fn reap_children(children: &mut [std::process::Child]) {
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Applies one candidate allocating the victim view's peer provider while
+/// the victim child's generation is lost mid-apply (the stop-phase shape:
+/// preflight passes on fresh views, the loss lands during link mutation,
+/// finalization retires). Returns the merge/project op counts.
+fn apply_mid_apply_loss_candidate(
+    engine: &mut Engine,
+    victim_pid: u32,
+    peer: ScannedModule,
+) -> (ApplyOutcome, (u64, u64)) {
+    let mut pins = engine.pinned.clone();
+    let victim_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == victim_pid)
+        .expect("the victim view is still retained at preflight");
+    let skipped = pins.absorb(pin_test_modules(victim_view, std::slice::from_ref(&peer)));
+    let mut raws: Vec<ScannedModule> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    raws.push(peer);
+    let candidate = engine.live_candidate(pins, raws, skipped).unwrap();
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "the peer must allocate, or no link mutation runs and the loss never lands"
+    );
+    let mut session = ScriptedSession::losing_generation_at_attach(victim_pid);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.stale_views.is_empty(),
+        "the victim generation was lost mid-apply"
+    );
+    (outcome, publication_operation_counts(engine))
+}
+
+/// Stop-phase publication storm (§8.1): each retiring candidate publishes
+/// its own full merge, because finalization marks the retirement (a new
+/// publication skip) and exit-driven candidates carry no loader-transaction
+/// proof, so the deferral gate cannot fire. Three mid-apply-loss
+/// retirements = three merges. The batching fix must collapse the merges
+/// (see the terminal twin) without changing any published output.
+#[test]
+fn each_retiring_candidate_publishes_its_own_merge() {
+    let (mut children, mut engine, per_view, _sleep_dir) = engine_with_three_live_views();
+    let before = publication_operation_counts(&engine);
+    assert_eq!(engine.views.len(), 3);
+
+    for (index, modules) in per_view.iter().enumerate() {
+        let victim_pid = children[index].id();
+        let (_, counts) =
+            apply_mid_apply_loss_candidate(&mut engine, victim_pid, modules[1].clone());
+        assert_eq!(
+            counts,
+            (before.0 + index as u64 + 1, before.1 + index as u64 + 1),
+            "retirement {index} must publish exactly one merge+projection"
+        );
+    }
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+    reap_children(&mut children);
+}
+
+/// RED (§8.1 instrumentation): the deferral-gate stats must name which
+/// conjuncts fail for a retiring candidate. A generation lost mid-apply
+/// reads stale at finalization, and the exit-driven candidate carries no
+/// loader-transaction proof so leg 2 cannot reproduce: those two legs fail.
+/// The revision leg passes (the retirement marker lands after the leg-1
+/// snapshot) and the skips leg passes (the leg-2 counter fold absorbs the
+/// marker into the candidate plan before the commit, so the gate's own
+/// fold is a no-op by design).
+#[test]
+fn retiring_candidate_gate_stats_name_the_failing_conjuncts() {
+    let (mut children, mut engine, per_view, _sleep_dir) = engine_with_three_live_views();
+    let victim_pid = children[0].id();
+    let before = engine.deferral_gate_stats();
+    let _ = apply_mid_apply_loss_candidate(&mut engine, victim_pid, per_view[0][1].clone());
+
+    let stats = engine.deferral_gate_stats();
+    let delta = |after: u64, field_before: u64| after - field_before;
+    assert_eq!(delta(stats.evaluated, before.evaluated), 1, "{stats:?}");
+    assert_eq!(delta(stats.deferred, before.deferred), 0, "{stats:?}");
+    assert_eq!(
+        delta(stats.fail_commit_reproduced, before.fail_commit_reproduced),
+        1,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.fail_stale_views, before.fail_stale_views),
+        1,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.fail_skips_changed, before.fail_skips_changed),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.fail_revision, before.fail_revision),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(delta(stats.fail_staged, before.fail_staged), 0, "{stats:?}");
+    assert_eq!(
+        delta(stats.fail_unpublished_views, before.fail_unpublished_views),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.fail_targets_attached, before.fail_targets_attached),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(
+            stats.fail_resolve_merge_inputs,
+            before.fail_resolve_merge_inputs
+        ),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.fail_deferral_disabled, before.fail_deferral_disabled),
+        0,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.retired_evaluated, before.retired_evaluated),
+        1,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.retired_published, before.retired_published),
+        1,
+        "{stats:?}"
+    );
+    assert_eq!(
+        delta(stats.terminal_evaluated, before.terminal_evaluated),
+        0,
+        "{stats:?}"
+    );
+    reap_children(&mut children);
+}
+
+/// The env-gated defer-stats line names every counter group, so live
+/// `P11SCOPE_DEFER_STATS=1` runs stay greppable.
+#[test]
+fn defer_stats_line_names_every_counter() {
+    let engine = Engine::empty();
+    let line = engine.defer_stats_line();
+    assert!(line.starts_with("p11scope: timing: defer: "), "{line}");
+    for token in [
+        "evaluated",
+        "deferred",
+        "commit",
+        "revision",
+        "staged",
+        "stale",
+        "unpublished",
+        "attached",
+        "skips",
+        "resolve",
+        "disabled",
+        "retired",
+        "terminal",
+        "proof",
+        "batch",
+        "refusal",
+        "changed",
+    ] {
+        assert!(line.contains(token), "{line}");
+    }
+}
+
+/// Growth flushes (§8.1 batching): candidates that change merge inputs
+/// must still publish per candidate — intermediate shapes (surfaces,
+/// tables) are occurrence-keyed history a single tail merge cannot
+/// reconstruct. Three growths in batch context publish three merges
+/// with outputs identical to three immediate merges.
+#[test]
+fn batch_growth_candidates_flush_per_candidate() {
+    // Pins are built once and cloned per engine so both engines share
+    // the same opened files, exactly like the proof-deferral twins.
+    let mut raw0 = overlay_module(overlay_key(210));
+    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
+    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
+    let build = || {
+        let mut pins = base_pins.clone();
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .views
+            .push(ProcessView::open(raw0.view, std::process::id()).unwrap());
+        engine
+    };
+    // Control: today's shape — each apply publishes, each batch tail
+    // skips as redundant.
+    let mut full = build();
+    let full_before = publication_operation_counts(&full);
+    for endpoints in [2u32, 3, 4] {
+        let mut raw = overlay_module(overlay_key(210));
+        raw.tables[0].entries = overlay_entries(&raw, first_offsets(endpoints));
+        let outcome = apply_publication_candidate(&mut full, &raw);
+        full.publish_batch_tail(outcome.changed).unwrap();
+    }
+    let full_counts = publication_operation_counts(&full);
+    assert_eq!(
+        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
+        (3, 3),
+        "control: one merge+projection per growth candidate"
+    );
+    // Batched: growth still publishes per candidate; the tail then skips.
+    let mut batched = build();
+    let batched_before = publication_operation_counts(&batched);
+    batched.defer_candidate_publication = true;
+    for endpoints in [2u32, 3, 4] {
+        let mut raw = overlay_module(overlay_key(210));
+        raw.tables[0].entries = overlay_entries(&raw, first_offsets(endpoints));
+        let outcome = apply_publication_candidate(&mut batched, &raw);
+        assert!(outcome.changed);
+    }
+    batched.publish_batch_tail(true).unwrap();
+    batched.defer_candidate_publication = false;
+    let batched_counts = publication_operation_counts(&batched);
+    assert_eq!(
+        (
+            batched_counts.0 - batched_before.0,
+            batched_counts.1 - batched_before.1
+        ),
+        (3, 3),
+        "batched: growth flushes per candidate (shape history is per merge)"
+    );
+    let stats = batched.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred, 0);
+    assert_eq!(stats.batch_flushed_changed, 3);
+    assert_publish_deferral_evidence_equal(&batched, &full);
+}
+
+/// Twin (§8.1 batching): three no-op candidates (identical inputs) in
+/// batch context defer to one tail merge with outputs identical to three
+/// immediate merges.
+#[test]
+fn batch_noop_candidates_defer_to_one_tail_merge() {
+    let mut raw0 = overlay_module(overlay_key(210));
+    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
+    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
+    let build = || {
+        let mut pins = base_pins.clone();
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .views
+            .push(ProcessView::open(raw0.view, std::process::id()).unwrap());
+        engine
+    };
+    let mut full = build();
+    // Warm up: the first live rebuild converges the setup-built plan;
+    // the measured no-ops start from the converged shape.
+    apply_publication_candidate(&mut full, &raw0);
+    full.publish_batch_tail(true).unwrap();
+    let full_before = publication_operation_counts(&full);
+    for _ in 0..3 {
+        let outcome = apply_publication_candidate(&mut full, &raw0);
+        full.publish_batch_tail(outcome.changed).unwrap();
+    }
+    let full_counts = publication_operation_counts(&full);
+    assert_eq!(
+        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
+        (3, 3),
+        "control: one merge+projection per candidate even with no changes"
+    );
+    let mut batched = build();
+    apply_publication_candidate(&mut batched, &raw0);
+    batched.publish_batch_tail(true).unwrap();
+    let batched_before = publication_operation_counts(&batched);
+    batched.defer_candidate_publication = true;
+    for _ in 0..3 {
+        apply_publication_candidate(&mut batched, &raw0);
+    }
+    batched.publish_batch_tail(true).unwrap();
+    batched.defer_candidate_publication = false;
+    let batched_counts = publication_operation_counts(&batched);
+    assert_eq!(
+        (
+            batched_counts.0 - batched_before.0,
+            batched_counts.1 - batched_before.1
+        ),
+        (1, 1),
+        "batched: three no-op candidates publish once, at the tail"
+    );
+    let stats = batched.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred, 3);
+    assert_publish_deferral_evidence_equal(&batched, &full);
+}
+
+/// Twin (§8.1 batching): marker-only candidates (same shapes, new loss
+/// markers between applies) defer to one tail merge: the markers are
+/// cumulative counters the tail folds whole. Identical outputs to three
+/// immediate merges.
+#[test]
+fn batch_marker_only_candidates_defer_to_one_tail_merge() {
+    let mut raw0 = overlay_module(overlay_key(210));
+    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
+    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
+    let build = || {
+        let mut pins = base_pins.clone();
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .views
+            .push(ProcessView::open(raw0.view, std::process::id()).unwrap());
+        engine
+    };
+    let mut full = build();
+    // Warm up: the first live rebuild converges the setup-built plan.
+    apply_publication_candidate(&mut full, &raw0);
+    full.publish_batch_tail(true).unwrap();
+    let full_before = publication_operation_counts(&full);
+    for index in 0..3 {
+        apply_publication_candidate(&mut full, &raw0);
+        full.mark_partial("twin marker", &format!("marker-only candidate {index}"));
+        full.publish_batch_tail(true).unwrap();
+    }
+    let full_counts = publication_operation_counts(&full);
+    assert_eq!(
+        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
+        (6, 6),
+        "control: each candidate and each marker publishes"
+    );
+    let mut batched = build();
+    apply_publication_candidate(&mut batched, &raw0);
+    batched.publish_batch_tail(true).unwrap();
+    let batched_before = publication_operation_counts(&batched);
+    batched.defer_candidate_publication = true;
+    for index in 0..3 {
+        apply_publication_candidate(&mut batched, &raw0);
+        batched.mark_partial("twin marker", &format!("marker-only candidate {index}"));
+    }
+    batched.publish_batch_tail(true).unwrap();
+    batched.defer_candidate_publication = false;
+    let batched_counts = publication_operation_counts(&batched);
+    assert_eq!(
+        (
+            batched_counts.0 - batched_before.0,
+            batched_counts.1 - batched_before.1
+        ),
+        (1, 1),
+        "batched: three marker-only candidates publish once, at the tail"
+    );
+    let stats = batched.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred, 3);
+    assert_publish_deferral_evidence_equal(&batched, &full);
+}
+
+/// A retiring candidate flushes (§8.1 batching): removals must publish
+/// per candidate, never defer past a later retirement. One mid-apply-loss
+/// retirement in batch context still publishes exactly one merge.
+#[test]
+fn batch_retiring_candidate_flushes_per_candidate() {
+    let (mut children, mut engine, per_view, _sleep_dir) = engine_with_three_live_views();
+    let before = publication_operation_counts(&engine);
+    let stats_before = engine.deferral_gate_stats();
+    engine.defer_candidate_publication = true;
+    let victim_pid = children[0].id();
+    let (_, counts) =
+        apply_mid_apply_loss_candidate(&mut engine, victim_pid, per_view[0][1].clone());
+    engine.defer_candidate_publication = false;
+    assert_eq!(
+        (counts.0 - before.0, counts.1 - before.1),
+        (1, 1),
+        "a retiring candidate flushes: removals publish per candidate"
+    );
+    let stats = engine.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 0);
+    assert_eq!(
+        stats.batch_flushed_retired - stats_before.batch_flushed_retired,
+        1
+    );
+    reap_children(&mut children);
+}
+
+/// The batch-deferral disable flag restores full per-candidate
+/// publication: three no-ops with the flag set publish three merges with
+/// outputs identical to the unflagged control.
+#[test]
+fn batch_deferral_disabled_publishes_per_candidate() {
+    let mut raw0 = overlay_module(overlay_key(210));
+    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
+    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
+    let build = || {
+        let mut pins = base_pins.clone();
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .views
+            .push(ProcessView::open(raw0.view, std::process::id()).unwrap());
+        engine
+    };
+    let mut full = build();
+    apply_publication_candidate(&mut full, &raw0);
+    full.publish_batch_tail(true).unwrap();
+    let mut disabled = build();
+    apply_publication_candidate(&mut disabled, &raw0);
+    disabled.publish_batch_tail(true).unwrap();
+    disabled.defer_candidate_publication = true;
+    disabled.set_disable_batch_publication_deferral_for_test(true);
+    let disabled_before = publication_operation_counts(&disabled);
+    for _ in 0..3 {
+        apply_publication_candidate(&mut disabled, &raw0);
+    }
+    disabled.publish_batch_tail(true).unwrap();
+    let disabled_counts = publication_operation_counts(&disabled);
+    assert_eq!(
+        (
+            disabled_counts.0 - disabled_before.0,
+            disabled_counts.1 - disabled_before.1
+        ),
+        (3, 3),
+        "disabled: no-op candidates publish per candidate, then the tail skips"
+    );
+    let full_before = publication_operation_counts(&full);
+    for _ in 0..3 {
+        let outcome = apply_publication_candidate(&mut full, &raw0);
+        full.publish_batch_tail(outcome.changed).unwrap();
+    }
+    let full_counts = publication_operation_counts(&full);
+    assert_eq!(
+        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
+        (3, 3)
+    );
+    assert_publish_deferral_evidence_equal(&disabled, &full);
+}
+
+/// A refusing candidate flushes (§8.1 batching): plan refusals are
+/// per-merge high-water evidence, so a candidate carrying any refusal
+/// publishes per candidate. An over-ceiling module beside an admitted
+/// one, in batch context, publishes exactly one merge.
+#[test]
+fn batch_refusing_candidate_flushes_per_candidate() {
+    let (mut engine, admitted) = retained_publication_engine(210, 1);
+    let mut big = overlay_module(overlay_key(211));
+    engine
+        .views
+        .push(ProcessView::open(big.view, std::process::id()).unwrap());
+    big.tables[0].entries = overlay_entries(&big, first_offsets(100_000));
+    let mut pins = engine.pinned.clone();
+    let absorb_skips = pins.absorb(overlay_pins(&[(big.key, OVERLAY_SHA, 1)]));
+    assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
+    let before = publication_operation_counts(&engine);
+    let stats_before = engine.deferral_gate_stats();
+    engine.defer_candidate_publication = true;
+    let candidate = engine
+        .live_candidate(pins, vec![admitted, big], Vec::new())
+        .unwrap();
+    assert!(
+        candidate.plan.refused_modules().next().is_some(),
+        "the over-ceiling module must refuse"
+    );
+    let mut additions_allowed = true;
+    // Preflighted, like the inventory tick: an unpreflighted refusing
+    // candidate is refused before finalization and never publishes.
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            true,
+            &[],
+        )
+        .unwrap();
+    assert!(outcome.changed);
+    engine.defer_candidate_publication = false;
+    let counts = publication_operation_counts(&engine);
+    assert_eq!(
+        (counts.0 - before.0, counts.1 - before.1),
+        (1, 1),
+        "a refusing candidate flushes: refusals publish per candidate"
+    );
+    let stats = engine.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 0);
+    assert_eq!(
+        stats.batch_flushed_refusal - stats_before.batch_flushed_refusal,
+        1
+    );
+    assert!(
+        !engine.plan.modules_skipped.is_empty(),
+        "the refusal reaches the published plan"
+    );
+}
+
+/// A loader transaction flushes (§8.1 batching): proof-carrying
+/// candidates always publish per candidate, so the loader path stays
+/// bit-identical (including its planning-cache reseeds) with batch
+/// deferral active. A marker-only loader transaction in batch context
+/// publishes instead of batch-deferring.
+#[test]
+fn batch_loader_transaction_flushes_per_candidate() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    // Settle loader stationarity first: the proof attaches once loader
+    // inputs are unchanged since the previous loader candidate. The
+    // proof needs a clean revision at build time, so the input change
+    // that fails the proof gate lands after the build: a synthetic skip
+    // fails full plan equality while the batch comparison (which ignores
+    // the skip list) still reproduces — isolating the proof flush.
+    let (first, _) = fixture.candidate(&mut engine, false);
+    apply_loader_planning_candidate(&mut engine, first);
+    let before = publication_operation_counts(&engine);
+    let stats_before = engine.deferral_gate_stats();
+    engine.defer_candidate_publication = true;
+    let (mut candidate, _) = fixture.candidate(&mut engine, false);
+    assert!(
+        candidate.loader_plan_proof.is_some(),
+        "loader transactions carry proof once stationary"
+    );
+    candidate.plan.skipped.push(Skipped {
+        subject: "twin".into(),
+        reason: "proof flush".into(),
+    });
+    apply_loader_planning_candidate(&mut engine, candidate);
+    engine.defer_candidate_publication = false;
+    let counts = publication_operation_counts(&engine);
+    assert_eq!(
+        (counts.0 - before.0, counts.1 - before.1),
+        (1, 1),
+        "a loader transaction flushes per candidate despite reproducing shapes"
+    );
+    let stats = engine.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 0);
+    assert_eq!(
+        stats.batch_flushed_proof - stats_before.batch_flushed_proof,
+        1
+    );
+}
+
 #[test]
 fn publication_reuse_preserves_later_dirty_inputs() {
     // This existing overlay fixture's mount ID is minor + 1. Minor 6

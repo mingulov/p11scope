@@ -403,6 +403,48 @@ pub(crate) struct WitnessProof {
     pub(crate) pin: Pin,
 }
 
+/// Per-conjunct publication-deferral gate outcomes (§8.1): which leg
+/// of the `finalize_candidate` gate fails each evaluation. Counters only;
+/// default output is unchanged and the env-gated
+/// `p11scope: timing: defer:` line reads them. Every failing conjunct of
+/// an evaluation counts (no short-circuit), so the fails rank the legs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DeferralGateStats {
+    /// Gate evaluations (one per finalized candidate).
+    pub evaluated: u64,
+    /// Evaluations that deferred (skipped the merge as provably redundant).
+    pub deferred: u64,
+    /// Evaluations failing each conjunct, in gate order.
+    pub fail_commit_reproduced: u64,
+    pub fail_revision: u64,
+    pub fail_staged: u64,
+    pub fail_stale_views: u64,
+    pub fail_unpublished_views: u64,
+    pub fail_targets_attached: u64,
+    pub fail_skips_changed: u64,
+    pub fail_resolve_merge_inputs: u64,
+    pub fail_deferral_disabled: u64,
+    /// Evaluations retiring at least one view, and their publications.
+    pub retired_evaluated: u64,
+    pub retired_published: u64,
+    /// Evaluations inside a terminal discovery drain, and their publications.
+    pub terminal_evaluated: u64,
+    pub terminal_published: u64,
+    /// Evaluations whose candidate carries a loader-transaction proof
+    /// (the loader/inventory split behind the commit leg).
+    pub proof_present_evaluated: u64,
+    /// Batch-deferred merges (published once at the batch tail instead).
+    pub batch_deferred: u64,
+    /// Batch-context evaluations that flushed (published per candidate)
+    /// by forcing leg: loader proof, retirement, plan refusals, changed
+    /// merge inputs, or anything else (unresolvable or staged inputs).
+    pub batch_flushed_proof: u64,
+    pub batch_flushed_retired: u64,
+    pub batch_flushed_refusal: u64,
+    pub batch_flushed_changed: u64,
+    pub batch_flushed_other: u64,
+}
+
 pub struct Engine {
     return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     plan: plan::AttachPlan,
@@ -828,6 +870,20 @@ pub struct Engine {
     tail_publishes: u64,
     /// Batch-tail publications skipped as provably redundant (same proof).
     tail_skips: u64,
+    /// Per-conjunct deferral-gate outcomes (§8.1 instrumentation).
+    deferral_gate_stats: DeferralGateStats,
+    /// True while a terminal discovery drain applies batches: attributes
+    /// gate evaluations (and their publications) to the stop phase.
+    in_terminal_drain: bool,
+    /// True while a discovery batch applies candidates: per-candidate
+    /// merges defer to the batch tail (§8.1). Set only by
+    /// `apply_discovery_batch_with`, restored on return; direct applies
+    /// publish per candidate as before.
+    defer_candidate_publication: bool,
+    /// Tests only: disables batch publication deferral (the twin runs
+    /// full per-candidate publication). Production always defers.
+    #[cfg(test)]
+    disable_batch_publication_deferral_for_test: bool,
     discovery_truncated: u64,
     /// Loader scans and loader rejects settled at a proven process
     /// exit (a subset of `discovery_truncated`). K0's
@@ -12399,6 +12455,11 @@ impl Engine {
             loader_plan_cache: None,
             tail_publishes: 0,
             tail_skips: 0,
+            deferral_gate_stats: DeferralGateStats::default(),
+            in_terminal_drain: false,
+            defer_candidate_publication: false,
+            #[cfg(test)]
+            disable_batch_publication_deferral_for_test: false,
             discovery_truncated: 0,
             exit_ended_truncations: 0,
             exit_ended_by_route: [0, 0, 0],
@@ -18647,38 +18708,54 @@ impl Engine {
         // (retirement, selection, manifest rollback, withdrawal and the
         // counter fold above) so none of them can escape the gate. The
         // plan comparison is full equality, synced fields included.
-        // The deep comparisons are shared with the stability check
-        // below; each side's provenance short-circuits first so plain
-        // inventory candidates skip them entirely.
+        // The deep comparisons are pure, so they run unconditionally
+        // and each gate applies its own provenance: stability and the
+        // proof gate keep theirs (a loader-transaction proof), while
+        // batch deferral compares without provenance (it never advances
+        // the published marker, so it needs no tripwire).
         let stabilizes_provenance = candidate.built_by_full_rebuild
             && !withdrew
             && candidate.plan.matches_for_stability(&self.plan);
         let commit_provenance = loader_plan.is_some();
-        let (
-            modules_reproduced,
-            corroboration_reproduced,
-            fallbacks_reproduced,
-            claims_reproduced,
-            tables_reproduced,
-        ) = if stabilizes_provenance || commit_provenance {
-            (
-                candidate.modules == self.modules,
-                candidate.corroboration == self.counters.corroboration,
-                candidate.manifest_fallbacks == self.counters.manifest_fallbacks,
-                candidate.selection_claims == self.selection_claims,
-                candidate.selection_tables == self.selection_tables,
-            )
-        } else {
-            (false, false, false, false, false)
-        };
+        let leg2_provenance = stabilizes_provenance || commit_provenance;
+        let modules_compared = candidate.modules == self.modules;
+        let corroboration_compared = candidate.corroboration == self.counters.corroboration;
+        let fallbacks_compared = candidate.manifest_fallbacks == self.counters.manifest_fallbacks;
+        let claims_compared = candidate.selection_claims == self.selection_claims;
+        let tables_compared = candidate.selection_tables == self.selection_tables;
+        let modules_reproduced = leg2_provenance && modules_compared;
+        let corroboration_reproduced = leg2_provenance && corroboration_compared;
+        let fallbacks_reproduced = leg2_provenance && fallbacks_compared;
+        let claims_reproduced = leg2_provenance && claims_compared;
+        let tables_reproduced = leg2_provenance && tables_compared;
         // The pin walks differ: stability needs the whole store to
         // match, deferral only the committed pins (the derivation
-        // retains merge-invisible extras). Each runs under its own
-        // provenance so neither side pays for the other.
-        let pins_reproduced =
-            commit_provenance && Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
-        let table_flags_reproduced = commit_provenance
-            && Self::table_flags_match_for_deferral(&candidate.modules, &self.modules);
+        // retains merge-invisible extras). Stability keeps its own
+        // provenance short-circuit below; the deferral walk runs
+        // unconditionally for the proof gate and batch deferral alike.
+        let pins_compared = Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
+        let pins_reproduced = commit_provenance && pins_compared;
+        let table_flags_compared =
+            Self::table_flags_match_for_deferral(&candidate.modules, &self.modules);
+        let table_flags_reproduced = commit_provenance && table_flags_compared;
+        // Batch deferral compares the plan ignoring its skip list: skips
+        // derive from the cumulative counters, which the tail folds from
+        // the same cumulative state — a marker-only candidate carries no
+        // new shape. The take/restore dance compares full plans minus
+        // skips without cloning, so a future plan field stays compared.
+        let candidate_skipped = std::mem::take(&mut candidate.plan.skipped);
+        let committed_skipped = std::mem::take(&mut self.plan.skipped);
+        let plan_compared_ignoring_skips = candidate.plan == self.plan;
+        candidate.plan.skipped = candidate_skipped;
+        self.plan.skipped = committed_skipped;
+        let batch_inputs_reproduce = plan_compared_ignoring_skips
+            && modules_compared
+            && corroboration_compared
+            && fallbacks_compared
+            && claims_compared
+            && tables_compared
+            && pins_compared
+            && table_flags_compared;
         let commit_reproduced = commit_provenance
             && plan_reproduced
             && modules_reproduced
@@ -18738,24 +18815,89 @@ impl Engine {
         let deferral_disabled = false;
         #[cfg(test)]
         let deferral_disabled = self.publish_deferral_disabled();
-        let defer_publication = commit_reproduced
-            && revision_before_commit == self.published_facts_revision
-            && self.capture_facts.staged.is_none()
-            && outcome.stale_views.is_empty()
-            && outcome.unpublished_views.is_empty()
-            && new_targets_attached
-            && !skips_changed
-            && self
-                .capture_facts
-                .resolve_merge_inputs(
-                    &self.plan,
-                    &self.pinned,
-                    &self.modules,
-                    &self.manifests,
-                    &self.manifest_ordinals,
-                )
-                .is_ok()
-            && !deferral_disabled;
+        // One boolean per conjunct so the §8.1 stats rank the failing
+        // legs. Same conjunction as before: `resolve_merge_inputs` is
+        // pure (no side effects), so evaluating every leg instead of
+        // short-circuiting changes nothing but the counters.
+        let defer_commit = commit_reproduced;
+        let defer_revision = revision_before_commit == self.published_facts_revision;
+        let defer_staged = self.capture_facts.staged.is_none();
+        let defer_stale = outcome.stale_views.is_empty();
+        let defer_unpublished = outcome.unpublished_views.is_empty();
+        let defer_attached = new_targets_attached;
+        let defer_skips = !skips_changed;
+        let defer_resolve = self
+            .capture_facts
+            .resolve_merge_inputs(
+                &self.plan,
+                &self.pinned,
+                &self.modules,
+                &self.manifests,
+                &self.manifest_ordinals,
+            )
+            .is_ok();
+        let defer_enabled = !deferral_disabled;
+        self.note_deferral_gate_outcome(
+            defer_commit,
+            defer_revision,
+            defer_staged,
+            defer_stale,
+            defer_unpublished,
+            defer_attached,
+            defer_skips,
+            defer_resolve,
+            defer_enabled,
+        );
+        let defer_publication = defer_commit
+            && defer_revision
+            && defer_staged
+            && defer_stale
+            && defer_unpublished
+            && defer_attached
+            && defer_skips
+            && defer_resolve
+            && defer_enabled;
+        if commit_provenance {
+            self.deferral_gate_stats.proof_present_evaluated = self
+                .deferral_gate_stats
+                .proof_present_evaluated
+                .saturating_add(1);
+        }
+        // Batch publication deferral (§8.1): inside a discovery batch, a
+        // candidate the proof gate above would publish defers its merge
+        // to the batch tail instead — but only when its commit reproduces
+        // every merge input (plan modulo its skip list, pins, modules,
+        // corroboration, fallbacks, claims, tables, table flags), so the
+        // skipped merge re-folded nothing the tail does not fold whole.
+        // Growth, retirements, loader proofs, refusals, staged inputs
+        // and unresolvable inputs all flush per candidate as before.
+        // The commit always dirtied the revision, so the revision-equal
+        // tail gate still publishes once per batch. Direct applies (no
+        // batch) publish per candidate exactly as before.
+        #[cfg(not(test))]
+        let batch_deferral_disabled = false;
+        #[cfg(test)]
+        let batch_deferral_disabled = self.batch_publication_deferral_disabled();
+        let has_refusals = self.plan.refused_modules().next().is_some();
+        let batch_context =
+            self.defer_candidate_publication && defer_enabled && !batch_deferral_disabled;
+        let batch_defer = !defer_publication
+            && batch_context
+            && defer_resolve
+            && defer_staged
+            && defer_stale
+            && !commit_provenance
+            && !has_refusals
+            && batch_inputs_reproduce;
+        if batch_context && !defer_publication {
+            self.note_batch_deferral_outcome(
+                batch_defer,
+                commit_provenance,
+                retired,
+                has_refusals,
+                !batch_inputs_reproduce,
+            );
+        }
         // A failed or staged publication cannot keep an earlier planning
         // proof alive. Successful stationary loader finalization may reseed.
         self.loader_plan_cache = None;
@@ -18766,6 +18908,11 @@ impl Engine {
             // dirtied inputs.
             debug_assert_eq!(self.facts_revision, revision_before_commit + 1);
             self.published_facts_revision = self.facts_revision;
+            Ok(())
+        } else if batch_defer {
+            // The batch tail publishes: the revision stays dirty so its
+            // gate sees it. No merge, no projection, no error possible —
+            // exactly a successful merge for the disposition below.
             Ok(())
         } else {
             self.merge_and_project_capture_facts()
@@ -26779,6 +26926,22 @@ impl Engine {
         self.disable_publish_deferral_for_test = disabled;
     }
 
+    /// Whether batch publication deferral is disabled. Tests only:
+    /// production always defers in-batch merges to the batch tail. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against full publication.
+    #[cfg(test)]
+    fn batch_publication_deferral_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_BATCH_DEFERRAL").is_some())
+            || self.disable_batch_publication_deferral_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_batch_publication_deferral_for_test(&mut self, disabled: bool) {
+        self.disable_batch_publication_deferral_for_test = disabled;
+    }
+
     /// Whether the Final candidate may reuse the tick's First build when
     /// every input and state fence still matches. Tests only as a gate:
     /// production always reuses. The per-engine flag drives the
@@ -30185,6 +30348,7 @@ impl Engine {
         self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
+        let terminal_drain_before = std::mem::replace(&mut self.in_terminal_drain, true);
         let result = self.drain_discovery_terminal_to_position_inner(
             session,
             stop,
@@ -30192,6 +30356,7 @@ impl Engine {
             &mut observe_record,
             &mut observe_malformed,
         );
+        self.in_terminal_drain = terminal_drain_before;
         self.span_terminal_overhead("terminal_q_overhead", wall_start, &totals_before);
         result
     }
@@ -30274,7 +30439,9 @@ impl Engine {
         self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
+        let terminal_drain_before = std::mem::replace(&mut self.in_terminal_drain, true);
         let result = self.drain_discovery_terminal_from_inner(session);
+        self.in_terminal_drain = terminal_drain_before;
         self.span_terminal_overhead("terminal_overhead", wall_start, &totals_before);
         result
     }
@@ -34694,6 +34861,10 @@ impl Engine {
         self.note_graph_inputs_mutated();
         self.continuity_deferred = false;
         self.budget.set_deadline(deadline);
+        // Batch publication deferral (§8.1): candidates applied inside
+        // this batch defer their merges to its tail. Save/restore like
+        // the deadline above: no early return skips the restore.
+        let defer_before = std::mem::replace(&mut self.defer_candidate_publication, true);
         let result = self.apply_discovery_batch_inner(
             session,
             records,
@@ -34702,6 +34873,7 @@ impl Engine {
             terminal_dispatch,
             collect,
         );
+        self.defer_candidate_publication = defer_before;
         self.budget.set_deadline(None);
         result
     }
@@ -35768,6 +35940,136 @@ impl Engine {
 
     pub(crate) fn tail_stats(&self) -> (u64, u64) {
         (self.tail_publishes, self.tail_skips)
+    }
+
+    /// Counts one deferral-gate evaluation (§8.1): every failing conjunct
+    /// counts, so the fails rank the legs. Called only from
+    /// `finalize_candidate`, with the gate's own conjunct values.
+    #[allow(clippy::too_many_arguments)]
+    fn note_deferral_gate_outcome(
+        &mut self,
+        defer_commit: bool,
+        defer_revision: bool,
+        defer_staged: bool,
+        defer_stale: bool,
+        defer_unpublished: bool,
+        defer_attached: bool,
+        defer_skips: bool,
+        defer_resolve: bool,
+        defer_enabled: bool,
+    ) {
+        let stats = &mut self.deferral_gate_stats;
+        stats.evaluated = stats.evaluated.saturating_add(1);
+        let deferred = defer_commit
+            && defer_revision
+            && defer_staged
+            && defer_stale
+            && defer_unpublished
+            && defer_attached
+            && defer_skips
+            && defer_resolve
+            && defer_enabled;
+        if deferred {
+            stats.deferred = stats.deferred.saturating_add(1);
+        }
+        for (passed, fail) in [
+            (defer_commit, &mut stats.fail_commit_reproduced),
+            (defer_revision, &mut stats.fail_revision),
+            (defer_staged, &mut stats.fail_staged),
+            (defer_stale, &mut stats.fail_stale_views),
+            (defer_unpublished, &mut stats.fail_unpublished_views),
+            (defer_attached, &mut stats.fail_targets_attached),
+            (defer_skips, &mut stats.fail_skips_changed),
+            (defer_resolve, &mut stats.fail_resolve_merge_inputs),
+            (defer_enabled, &mut stats.fail_deferral_disabled),
+        ] {
+            if !passed {
+                *fail = fail.saturating_add(1);
+            }
+        }
+        if !defer_stale {
+            stats.retired_evaluated = stats.retired_evaluated.saturating_add(1);
+            if !deferred {
+                stats.retired_published = stats.retired_published.saturating_add(1);
+            }
+        }
+        if self.in_terminal_drain {
+            stats.terminal_evaluated = stats.terminal_evaluated.saturating_add(1);
+            if !deferred {
+                stats.terminal_published = stats.terminal_published.saturating_add(1);
+            }
+        }
+    }
+
+    /// Counts one batch-deferral decision (§8.1): a deferred merge,
+    /// or every leg that forced a per-candidate flush. Called only from
+    /// `finalize_candidate`, in batch context, when the proof gate failed.
+    fn note_batch_deferral_outcome(
+        &mut self,
+        deferred: bool,
+        proof_present: bool,
+        retired: bool,
+        has_refusals: bool,
+        inputs_changed: bool,
+    ) {
+        let stats = &mut self.deferral_gate_stats;
+        if deferred {
+            stats.batch_deferred = stats.batch_deferred.saturating_add(1);
+            return;
+        }
+        if proof_present {
+            stats.batch_flushed_proof = stats.batch_flushed_proof.saturating_add(1);
+        }
+        if retired {
+            stats.batch_flushed_retired = stats.batch_flushed_retired.saturating_add(1);
+        }
+        if has_refusals {
+            stats.batch_flushed_refusal = stats.batch_flushed_refusal.saturating_add(1);
+        }
+        if inputs_changed {
+            stats.batch_flushed_changed = stats.batch_flushed_changed.saturating_add(1);
+        }
+        if !proof_present && !retired && !has_refusals && !inputs_changed {
+            stats.batch_flushed_other = stats.batch_flushed_other.saturating_add(1);
+        }
+    }
+
+    /// Deferral-gate outcome counters (§8.1 instrumentation). Tests
+    /// only; production reads the formatted line.
+    #[cfg(test)]
+    pub(crate) fn deferral_gate_stats(&self) -> DeferralGateStats {
+        self.deferral_gate_stats
+    }
+
+    /// `p11scope: timing: defer: ...` stderr line. Emitted only when
+    /// `P11SCOPE_DEFER_STATS=1`; default output is unchanged.
+    pub(crate) fn defer_stats_line(&self) -> String {
+        let stats = &self.deferral_gate_stats;
+        format!(
+            "p11scope: timing: defer: {} evaluated, {} deferred; fails: commit {} revision {} staged {} stale {} unpublished {} attached {} skips {} resolve {} disabled {}; retired {} evaluated {} published; terminal {} evaluated {} published; proof {}; batch deferred {} flushed proof {} retired {} refusal {} changed {} other {}",
+            stats.evaluated,
+            stats.deferred,
+            stats.fail_commit_reproduced,
+            stats.fail_revision,
+            stats.fail_staged,
+            stats.fail_stale_views,
+            stats.fail_unpublished_views,
+            stats.fail_targets_attached,
+            stats.fail_skips_changed,
+            stats.fail_resolve_merge_inputs,
+            stats.fail_deferral_disabled,
+            stats.retired_evaluated,
+            stats.retired_published,
+            stats.terminal_evaluated,
+            stats.terminal_published,
+            stats.proof_present_evaluated,
+            stats.batch_deferred,
+            stats.batch_flushed_proof,
+            stats.batch_flushed_retired,
+            stats.batch_flushed_refusal,
+            stats.batch_flushed_changed,
+            stats.batch_flushed_other,
+        )
     }
 
     /// Private-loader transport failures as finite aggregate counters only.

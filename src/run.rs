@@ -10741,6 +10741,7 @@ fn capture_profile(
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
         emit_timing_summaries(&ev.scheduling, &summaries);
+        emit_defer_stats(context.0);
 
         poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
@@ -12166,6 +12167,7 @@ fn capture_trace(
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
                     emit_timing_summaries(&evidence.scheduling, &summaries);
+                    emit_defer_stats(context.0);
                     if let Some(error) = terminal_error {
                         return Err(error);
                     }
@@ -13143,6 +13145,14 @@ fn resource_evidence_of(
 /// Emits the Phase-2 timing summary: the newcomer-queue line always
 /// (the stop-race oracle cross-checks stderr pending against the
 /// report), the rest verbose-only.
+/// Emits the §8.1 deferral-gate breakdown, only when
+/// `P11SCOPE_DEFER_STATS=1`: default stderr is unchanged.
+fn emit_defer_stats(engine: &crate::discovery::engine::Engine) {
+    if std::env::var("P11SCOPE_DEFER_STATS").as_deref() == Ok("1") {
+        let _ = crate::sink::try_stderr_line(&engine.defer_stats_line());
+    }
+}
+
 fn emit_timing_summaries(scheduling: &render::SchedulingEvidence, summaries: &[String]) {
     let queue = &scheduling.newcomer_queue;
     let drops = queue.dropped + queue.dropped_unknown;

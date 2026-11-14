@@ -7833,8 +7833,9 @@ fn inspect_count_manifest_file(
     }
     // v0.8.0: no per-object size gate here; the chunked reads below
     // enforce the capture allowances and the batch allowance
-    // incrementally.
-    let mut operation_bytes = 0u64;
+    // incrementally. Identity hashing charges the window only: a
+    // partial digest is never trusted, so the per-object allowance must
+    // not refuse a large provider the window still admits.
     let inspected = inspect_file_with_reader_exporting(
         file,
         |file, bytes, offset| {
@@ -7842,7 +7843,7 @@ fn inspect_count_manifest_file(
                 return Err(std::io::Error::other(reason));
             }
             let batch_allowed = batch_byte_allowance(*batch_spent, bytes.len());
-            let capture_allowed = budget.allowed_io(operation_bytes, bytes.len());
+            let capture_allowed = budget.allowed_capture_io(bytes.len());
             let allowed = match batch_allowed {
                 Ok(batch) => capture_allowed.min(batch),
                 // Batch exhausted; the branch below reports its gap.
@@ -7856,7 +7857,6 @@ fn inspect_count_manifest_file(
             }
             let read = file.read_at(&mut bytes[..allowed], offset)?;
             budget.record_io(read);
-            operation_bytes = operation_bytes.saturating_add(read as u64);
             *batch_spent = batch_spent.saturating_add(read as u64);
             Ok(read)
         },
@@ -9874,7 +9874,8 @@ fn pin_scanned_object(
     }
     let mapped = mapped.ok();
     // v0.8.0: no per-file size gate here. Admission happens incrementally
-    // at the reader below (capture allowances plus deadline), and a
+    // at the reader below (the window allowance plus deadline — never the
+    // per-object leg, which cannot refuse a hash the window admits), and a
     // partial digest is never trusted.
     #[cfg(test)]
     tests::run_before_hash_test_hook(budget);
@@ -9905,20 +9906,21 @@ fn pin_scanned_object(
             .map_err(PinFailure::from);
         }
     }
-    let mut operation_bytes = 0u64;
+    // Identity hashing charges the window only: a partial digest is
+    // never trusted, so the per-object allowance must not refuse a
+    // large provider the window still admits.
     let inspected = inspect_file_with_reader_exporting(
         &file,
         |file, bytes, offset| {
             if let Some(reason) = budget.check_deadline_now() {
                 return Err(std::io::Error::other(reason));
             }
-            let allowed = budget.allowed_io(operation_bytes, bytes.len());
+            let allowed = budget.allowed_capture_io(bytes.len());
             if allowed == 0 {
                 return Err(std::io::Error::other(IO_CEILING_REASON));
             }
             let read = file.read_at(&mut bytes[..allowed], offset)?;
             budget.record_io(read);
-            operation_bytes = operation_bytes.saturating_add(read as u64);
             Ok(read)
         },
         &standard_function_names(),

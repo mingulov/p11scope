@@ -83,6 +83,11 @@ const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 pub(crate) const INVENTORY_WINDOW_IO_BYTES: u64 = 64 << 20;
 pub(crate) const IO_CEILING_REASON: &str =
     "capture attempted-I/O ceiling reached; remaining provider bytes were not read";
+/// A single object outgrew its own allowance while the capture window
+/// still admits: the object is refused, never the pass. Stays distinct
+/// from [`IO_CEILING_REASON`], which stops the whole pass.
+pub(crate) const PER_OBJECT_ALLOWANCE_REASON: &str =
+    "per-object I/O allowance reached; remaining bytes of this object were not read";
 pub(crate) const WORK_CEILING_REASON: &str =
     "capture discovery work ceiling reached; remaining provider bytes were not scanned";
 pub(crate) const SCAN_DEADLINE_REASON: &str =
@@ -194,7 +199,8 @@ fn read_elf_snapshot_with(
         }
         let allowed = budget.allowed_io(operation_bytes, bytes.len());
         if allowed == 0 {
-            return Err(std::io::Error::other(IO_CEILING_REASON));
+            let reason = budget.io_shortfall_reason(operation_bytes);
+            return Err(std::io::Error::other(reason));
         }
         let read = reader(file, &mut bytes[..allowed], offset)?;
         budget.record_io(read);
@@ -1542,10 +1548,28 @@ impl CaptureWorkBudget {
                 .try_into()
                 .unwrap_or(usize::MAX),
         );
-        if allowed == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+        // Only a spent window stops the pass: a per-object shortfall
+        // refuses its own object (named by `io_shortfall_reason`) while
+        // the window still admits the rest of the scan.
+        if capture_left == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_))
+        {
             self.set_scan_stop(IO_CEILING_REASON);
         }
         allowed
+    }
+
+    /// The named gap for a zero allowance at this operation position:
+    /// the per-object reason when only the per-object leg is spent,
+    /// else the capture I/O ceiling. Agrees with `allowed_io`'s stop:
+    /// the ceiling stops the pass, the per-object shortfall never does.
+    pub(crate) fn io_shortfall_reason(&self, operation_bytes: u64) -> &'static str {
+        let operation_left = self.limits.per_object_bytes.saturating_sub(operation_bytes);
+        let capture_left = self.remaining_window_io().unwrap_or(0);
+        if operation_left == 0 && capture_left > 0 {
+            PER_OBJECT_ALLOWANCE_REASON
+        } else {
+            IO_CEILING_REASON
+        }
     }
 
     /// A metadata reader could not obtain its complete proof within the
@@ -1703,7 +1727,11 @@ impl CaptureWorkBudget {
         self.scan_stop_reason.is_some()
     }
 
-    fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+    /// Window-only allowance for identity hashing: a partial digest is
+    /// never trusted, so the per-object leg must not refuse a large
+    /// provider the window still admits. A spent window still stops the
+    /// pass with the I/O ceiling, like `allowed_io`.
+    pub(crate) fn allowed_capture_io(&mut self, wanted: usize) -> usize {
         if !self.collection_checkpoint(1) {
             return 0;
         }
@@ -4016,7 +4044,7 @@ fn read_mapping(
         let requested = READ_CHUNK.min(len - done);
         let want = budget.allowed_io(*operation_bytes, requested);
         if want == 0 {
-            short = Some(IO_CEILING_REASON.to_string());
+            short = Some(budget.io_shortfall_reason(*operation_bytes).to_string());
             exhausted = true;
             break;
         }

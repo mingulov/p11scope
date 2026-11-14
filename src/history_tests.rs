@@ -3518,3 +3518,193 @@ fn terminal_retire_loop_reaps_past_the_per_drain_budget() {
     assert_eq!(lens.open.len, 0);
     assert_eq!(lens.next_pseudonym.len, 0);
 }
+
+#[test]
+fn rv3_terminal_loop_reaps_past_unmatched_front_block() {
+    // End-of-run realism: most tapped exits belong to processes that
+    // never called PKCS#11 (no task, unmatched). 1024 of them sit ahead
+    // of 10 tracked ones; all are due at terminal. The terminal loop
+    // must reap past the unmatched block: every tracked session closed,
+    // nothing pending, and the dropped unmatched exits counted, never
+    // silent. Fails while the loop quits after a pass that only touches
+    // requeued unmatched exits: closed stays 0 with 1034 pending.
+    const N: u32 = 10;
+    let (mut s, mut t, _) = setup(2048);
+    let mut events = Vec::new();
+    for i in 0..N {
+        let mut open = ev(1000 + i, u64::from(100 + i), 0, 0);
+        open.ts_ns = 100;
+        events.push(open);
+    }
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(s.sessions().opened, u64::from(N));
+    let producer = crate::events::event_drain_positions(&drain).producer;
+    t.note_exit_taps(
+        (0..1024u32).map(|i| crate::history::ExitTap {
+            pid: 50_000 + i,
+            hook_ts_ns: 200,
+        }),
+        producer,
+    );
+    t.note_exit_taps(
+        (0..N).map(|i| crate::history::ExitTap {
+            pid: 1000 + i,
+            hook_ts_ns: 200,
+        }),
+        producer,
+    );
+    retire_due_exits_until_quiescent(&drain, &mut s, &mut t);
+    eprintln!(
+        "RV3-B closed={} pending={} gaps={:?}",
+        s.sessions().closed,
+        t.pending_exit_taps_for_test(),
+        t.exit_counters_for_test()
+    );
+    assert_eq!(
+        s.sessions().closed,
+        u64::from(N),
+        "tracked exits stranded behind a block of unmatched exits"
+    );
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    assert_eq!(
+        t.exit_counters_for_test().1,
+        1024,
+        "final drain must count dropped unmatched exits"
+    );
+}
+
+#[test]
+fn rv3_synthetic_exit_spares_pid_reuse_successor() {
+    // A late event and a successor's event in one drain: the synthetic
+    // exit reaps only the dead task's late rows and spares the pid-reuse
+    // successor's state and label.
+    let (mut s, mut t, _) = setup(64);
+    let mut a = ev(100, 90, 0, 0);
+    a.ts_ns = 100;
+    feed(&mut s, &mut t, [a]);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    let mut b = ev(100, 91, 0, 0);
+    b.session = 9;
+    b.ts_ns = 300;
+    let mut late = ev(100, 90, 0, 7);
+    late.ts_ns = 150;
+    feed(&mut s, &mut t, [b, late]);
+    feed(&mut s, &mut t, std::iter::empty::<Event>());
+    let succ = semantics::ProcessKey::history(1, 91, 0, 100);
+    eprintln!(
+        "RV3-A1 succ_state={} succ_label={:?} gaps={:?} pending={}",
+        s.has_process_state(succ),
+        s.session_pseudonym_process(succ, 0, 9),
+        t.exit_counters_for_test(),
+        t.pending_exit_taps_for_test()
+    );
+    assert_eq!(t.exit_counters_for_test().3, 1, "late counted");
+    assert!(
+        s.has_process_state(succ),
+        "synthetic exit retired the pid-reuse successor"
+    );
+    assert_eq!(s.session_pseudonym_process(succ, 0, 9), Some(1));
+    assert!(
+        !s.has_process_state(key(90, 0)),
+        "late rows of the dead task leaked"
+    );
+}
+
+#[test]
+fn rv3_synthetic_exit_spares_reopened_live_task() {
+    // Leader exit with a live thread: a late event and a post-exit event
+    // land in one drain. The post-exit event reopens the task, so the
+    // synthetic exit must not reap its rows.
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let k = key(90, 0);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    let mut late = ev(100, 90, 0, 0);
+    late.session = 8;
+    late.ts_ns = 150;
+    let mut post = ev(100, 90, 0, 0);
+    post.session = 9;
+    post.ts_ns = 250;
+    feed(&mut s, &mut t, [late, post]);
+    feed(&mut s, &mut t, std::iter::empty::<Event>());
+    eprintln!(
+        "RV3-A2 state={} l8={:?} l9={:?} gaps={:?} pending={}",
+        s.has_process_state(k),
+        s.session_pseudonym_process(k, 0, 8),
+        s.session_pseudonym_process(k, 0, 9),
+        t.exit_counters_for_test(),
+        t.pending_exit_taps_for_test()
+    );
+    assert!(
+        s.has_process_state(k),
+        "synthetic exit reaped a reopened live task"
+    );
+    assert_eq!(s.session_pseudonym_process(k, 0, 8), Some(2));
+    assert_eq!(s.session_pseudonym_process(k, 0, 9), Some(3));
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 1));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+}
+
+#[test]
+fn trace_open_event_skips_retired_label() {
+    // A thread survives the leader exit, calls C_Finalize (which keeps
+    // the retired tombstone — neither it nor C_CloseAllSessions clears
+    // those records), then reopens and gets the same handle back. The
+    // C_OpenSession trace line must show the fresh label (#2), never the
+    // retired one (#1). Fails while the trace pre-lookup falls back to
+    // the retired record: the line prints sess#1.
+    let (mut s, mut t, _) = setup(64);
+    let mut tracer = trace::Tracer::new(&plan());
+    let mut out = Vec::new();
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let k = key(90, 0);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
+    let mut fin = ev(100, 90, 0, 3);
+    fin.session = p11scope_ebpf_common::SESSION_NONE;
+    fin.ts_ns = 250;
+    feed(&mut s, &mut t, [fin]);
+    assert_eq!(
+        s.session_pseudonym_process(k, 0, 7),
+        Some(1),
+        "finalize cleared the retired tombstone"
+    );
+    let mut reopen7 = ev(100, 90, 0, 0);
+    reopen7.ts_ns = 300;
+    rv2_trace(&mut s, &mut t, &mut tracer, &mut out, vec![reopen7]);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(2));
+    let lines = String::from_utf8(out).unwrap();
+    eprintln!("M1 lines={lines:?}");
+    assert!(lines.contains("sess#2 C_OpenSession"), "{lines}");
+    assert!(!lines.contains("sess#1"), "{lines}");
+}

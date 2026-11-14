@@ -5975,6 +5975,33 @@ mod tests {
     }
 
     #[test]
+    fn staged_count_manifest_defers_to_the_next_pass() {
+        // A count manifest deferred by a full collector table waits
+        // for the next pass (retried every pass), never "skipped
+        // permanently": the row carries the count-manifest wait text.
+        // The zero-cap table defers every Trusted filing, so no
+        // prefill can mask the row text.
+        let (_dir, doc) = count_manifest_doc();
+        let mut collection = empty_collection();
+        let mut bound = super::bind_collection(&mut collection);
+        let mut table = crate::discovery::handle_table::HandleTable::new(0);
+        let staged = super::parse_and_reserve_count_manifests(
+            &mut table,
+            std::slice::from_ref(&doc),
+            &mut collection.budget,
+        );
+        super::prepare_count_manifests(&mut collection, &mut bound, staged, 0, 0, &mut table);
+        assert_eq!(collection.scope_gaps.len(), 1);
+        assert!(
+            collection.scope_gaps[0]
+                .reason
+                .contains("count manifest object deferred to the next pass"),
+            "the deferral waits for the next pass: {:?}",
+            collection.scope_gaps[0].reason
+        );
+    }
+
+    #[test]
     fn prepare_count_manifests_charges_retained_prearm_prior() {
         // Packet 6.13 round-3 (re-audit finding 3): per-pass count pins
         // charge already-retained pre-arm usage against the shared cap —

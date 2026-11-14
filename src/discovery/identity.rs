@@ -21613,6 +21613,71 @@ mod tests {
         );
     }
 
+    /// One-shot wording twin: a one-shot lane never retries, so its
+    /// budget stop says the run does not retry instead of waiting
+    /// for a next tick that never comes.
+    #[test]
+    fn handle_table_inspect_stop_names_no_retry() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), 1, &mut budget);
+        let mut table = HandleTable::new(1);
+        // One live row at the cap: the Held is kept, so no prune can
+        // free room and the fresh pin must stop.
+        let fill = dir.path().join("fill.so");
+        std::fs::write(&fill, b"fill-bytes").unwrap();
+        let metadata = std::fs::metadata(&fill).unwrap();
+        let maps = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let proved = ProvedEntry::for_test(
+            std::fs::File::open(&fill).unwrap(),
+            maps,
+            "fill-digest",
+            None,
+        );
+        let ProvedEntry { file, meta } = proved;
+        let held = match table.acquire(file, &meta, DeferredReason::Live) {
+            AcquireOutcome::Held(held) => held,
+            AcquireOutcome::Deferred(reason) => {
+                panic!("prefill admits: deferred with {reason:?}")
+            }
+        };
+        assert!(held.inserted);
+        let (pins, skipped) = pin_scanned_view_objects_with_table(
+            &view,
+            &modules,
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert_eq!(
+            pins.entry_count_for_test(),
+            0,
+            "the pin stops at the full table: {skipped:?}"
+        );
+        assert!(
+            !skipped.iter().any(|skip| skip.reason.contains("next tick")),
+            "no next tick in a one-shot lane: {skipped:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("the run does not retry")),
+            "the stop names the terminal wait: {skipped:?}"
+        );
+        drop(held);
+    }
+
     /// Handle-table twin (script B, file replaced between two acquires
     /// of one maps key) of
     /// `review_one_scan_must_not_hold_more_than_a_thousand_libraries`:

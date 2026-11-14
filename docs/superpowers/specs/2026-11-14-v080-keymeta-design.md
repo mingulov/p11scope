@@ -50,7 +50,10 @@ first, ia32 claims require actual ABI cells.
   lengths, §5) and lands R2 with source-carrying provenance (D4, §6).
 - `tmp/muse-jobs/rv2-v070-keysize-browser-design.review.md` F1–F4/N5/N6:
   F1 (per-family new-site path incl. X25519/X448/Ed25519/Ed448/PQC)
-  is carried by the R2 land (§6); F2 (separate Sign pointer vs Verify
+  is carried by the R2 land (§6), except ChaCha20/Poly1305 creation:
+  R2's KeyType set has no `0x55`/`0x57`, so that corner is closed by
+  the §6 ChaCha20/Poly1305 creation row (fact-only promotion, no
+  label), not by R2's type set; F2 (separate Sign pointer vs Verify
   scalar protocols, SignFinal/VerifyFinal, LP64/ia32 widths,
   retention/failure/PENDING/length-query rules) is specified in §5.1;
   F3 (octet length gives a size CLASS, never exact bits, with the
@@ -187,7 +190,12 @@ count; a second distinct family flips status to `conflicting` and
 both families stay listed with counts (a compliant provider cannot
 use one key object under two families successfully, so conflict
 names provider non-compliance or hostile aliasing — visible, never
-resolved by first-wins). Against token-reported/creation-success
+resolved by first-wins). A third and further distinct values are
+counted, never listed: the first two values stay pinned in
+`detail`/`conflict_detail` (families: `value`/`conflict_value`) and
+`further_conflicts: u64` counts the extra distinct values (omitted
+when 0, §10.2). The same keep-first-two-count-extras rule applies
+to `inferred_size`. Against token-reported/creation-success
 facts, mismatch shows `conflicting` on the inferred side while the
 established label stands (§3).
 
@@ -219,11 +227,32 @@ retains the cell pointer; return reads one target word.
 | `C_WrapKey` | 5 | RSA wrap = wrapping-key modulus octets; AES-KW = wrapped material + 8 (§5.2) |
 | `C_EncapsulateKey` | 6 | Ciphertext length; extends the existing KEM descriptor (T0 length lift, §11) |
 
+Per-function output-buffer bases for the wholly-below guard (the
+call's own output-buffer pointer arg; the descriptor carries the
+cell/scalar position, this table carries the base):
+
+| Call | Base arg | Notes |
+| --- | --- | --- |
+| `C_Sign` | 3 (`pSignature`) | NULL in query shapes |
+| `C_SignRecover` | 3 (`pSignature`) | NULL in query shapes |
+| `C_SignFinal` | 1 (`pSignature`) | NULL in query shapes |
+| `C_Encrypt` | 3 (`pEncryptedData`) | NULL in query shapes |
+| `C_WrapKey` | 4 (`pWrappedKey`) | NULL in query shapes |
+| `C_EncapsulateKey` | 5 (`pCiphertext`) | NULL in query shapes |
+
+Explicit null-base rule: a NULL base skips the below-check and the
+cell still reads (query shapes read). This diverges deliberately
+from the KEM T0 path, which withholds on null ciphertext
+(`object_flow.rs` KEM guard): T0 needs the ciphertext extent as a
+bound, while the length cell needs only disjointness from a base
+that a query shape does not pass. Copying the T0 withhold here
+would fail the §12.1 length-query positives.
+
 Entry guards: null cell → no retention (`length_query_no_cell`
 unavailable); cell full-span validation; cell overlapping the call's
-own output-buffer base span (wholly-below ordering vs the buffer
-base exactly like the KEM ciphertext guard, where a base exists) →
-unavailable, never a guessed bound. Return guards: owned
+own output-buffer base span (wholly-below ordering vs the tabled
+buffer base; skipped under the null-base rule above) → unavailable,
+never a guessed bound. Return guards: owned
 entry/return lifetime match (image/owner/descriptor, unchanged);
 `CKR_OK` → read; `CKR_BUFFER_TOO_SMALL` → read (the provider wrote
 the required length — the same authoritative value, and the
@@ -233,8 +262,11 @@ unavailable, as v3:281-283); every other return → never. No retry
 after return.
 
 **V-protocol (input length scalar, `CK_ULONG` in):** entry snapshots
-the register/stack word; no dereference, no retention beyond the
-completed-call record.
+the register/stack word; no dereference, no pointer retention. The
+scalar snapshot is held in the side row until the matching return
+and cleared on every terminal path (the same retention the
+S-protocol cell gets: private in-flight + completed-call
+transport, §8.3).
 
 | Call | Scalar arg | Notes |
 | --- | --- | --- |
@@ -358,6 +390,17 @@ Labels derived from promoted facts render identically to
 query-established labels, but the objects[] view shows the source,
 and CBOM qualifies them as established (§10.4 decision K4).
 
+ChaCha20/Poly1305 creation row (beyond R2's KeyType set): R2's
+finite KeyType set has no `0x55`/`0x57`, so a creation template
+carrying either type promotes only the value-length fact (source
+`creation_success`, e.g. the 32-octet ChaCha20 key length) and
+never a label. The use-side family for such keys still comes from
+the §4.2 `chacha20`/`poly1305` mechanism sets on successful
+operations. Twins (§12.1, Task 1): a `0x55` creation promotes the
+value-length fact with no label; a `0x57` creation likewise; a
+`0x55`-created key used under `CKM_CHACHA20` infers family
+`chacha20` while its established block stays label-free.
+
 R2's measured non-yield (R2-doc §7.3: derive results never retained,
 session pooling vs (session,handle) bindings) is re-proven on the
 new base in Task 1: the entry-evidence gap belongs to keyrows/void
@@ -411,30 +454,40 @@ around it here.
 
 ## 8. BPF design
 
-### 8.1 New descriptors (9 new, 2 extended)
+### 8.1 Descriptors (7 new, 4 extended — no action migrates)
 
-New `ObjectAction::OperationLength` (wire value 15,
-`OBJECT_ACTION_MAX` 14 → 15) with descriptors:
+Existing actions are kept; no function migrates to a new action. New
+`ObjectAction::OperationLength` (wire value 15, `OBJECT_ACTION_MAX`
+14 → 15) is carried by 7 NEW descriptors only. Four EXISTING
+descriptors keep their actions, adapters and pins, and gain length
+positions that the new length adapters (§8.2) compose onto them:
 
-| Function | input_args | length positions |
-| --- | --- | --- |
-| `C_Sign` | none (key comes from the Init receipt, §9) | S-cell arg 4 |
-| `C_SignRecover` | none | S-cell arg 4 |
-| `C_SignFinal` | none | S-cell arg 2 |
-| `C_Verify` | none | V-scalar arg 4 |
-| `C_VerifyFinal` | none | V-scalar arg 2 |
-| `C_Encrypt` | none | S-cell arg 4 |
-| `C_Decrypt` | none | V-scalar arg 2 |
-| `C_WrapKey` | wrapping 2, wrapped 3 (existing Access inputs stay) | S-cell arg 5 |
-| `C_UnwrapKey` | unwrapping 2 (existing) | V-scalar arg 4 |
-| `C_EncapsulateKey` | 2 (existing KEM) | S-cell arg 6 (descriptor EXTENDED) |
-| `C_DecapsulateKey` | 2 (existing KEM) | V-scalar arg 6 (descriptor EXTENDED) |
+| Function | Action (unchanged or new) | Existing positions (kept, still acquired by the existing adapter) | Length positions (new) |
+| --- | --- | --- | --- |
+| `C_Sign` | OperationLength (new) | none (key comes from the Init receipt, §9) | S-cell arg 4 |
+| `C_SignRecover` | OperationLength (new) | none | S-cell arg 4 |
+| `C_SignFinal` | OperationLength (new) | none | S-cell arg 2 |
+| `C_Verify` | OperationLength (new) | none | V-scalar arg 4 |
+| `C_VerifyFinal` | OperationLength (new) | none | V-scalar arg 2 |
+| `C_Encrypt` | OperationLength (new) | none | S-cell arg 4 |
+| `C_Decrypt` | OperationLength (new) | none | V-scalar arg 2 |
+| `C_WrapKey` | Access (kept) | inputs 2 (wrapping), 3 (wrapped) | S-cell arg 5 |
+| `C_UnwrapKey` | Unwrap (kept) | input 2 (unwrapping), result pointer 7, template (5, 6) | V-scalar arg 4 |
+| `C_EncapsulateKey` | Encapsulate (kept) | input 2, result pointer 7 | S-cell arg 6 |
+| `C_DecapsulateKey` | Decapsulate (kept) | input 2, result pointer 7 | V-scalar arg 6 |
+
+The `C_UnwrapKey` creation template (5, 6) stays acquired by the
+existing Unwrap adapter and stays authorized exactly as today
+(allowlist-v3 unwrap row): it is an R2 promotion source (Task 1),
+and nothing in this design removes or re-gates it. The 7 new
+OperationLength descriptors carry no template pairs (T0-style:
+never authorized) — that sentence scopes to the 7 new descriptors
+only, never to the 4 extended ones.
 
 `ObjectDescriptorWire` (frozen 16 bytes) gains `length_cell_arg: u8`
 and `length_scalar_arg: u8` (`ARG_NONE` when unused) — layout change,
-gated by the wire version bump (§8.3). `C_WrapKey` keeps its Access
-inputs AND gains the cell: one descriptor, both roles. Operation
-calls carry no template pairs (T0-style: never authorized).
+gated by the wire version bump (§8.3); all 11 descriptor rows (7 new
++ 4 extended) carry the new fields.
 
 ### 8.2 Adapters
 
@@ -444,13 +497,20 @@ BPF bindings only in `crates/ebpf/src/main.rs` beside
 nothing); V-scalars snapshot via `arg_u64` (LP64 regs / ia32 stack /
 LP64 arg 6 via the existing SP+8 helper); S-cells retained with the
 §5.1 entry guards (null → no retention; full-span; wholly-below vs
-the output-buffer base where one exists; overlap → unavailable).
+the §5.1 per-function buffer base, with the explicit null-base rule:
+a NULL base skips the below-check and the cell still reads —
+query shapes read; overlap → unavailable).
 `adapter_length_return`: owned-lifetime match, then the §5.1 return
 rules (OK / BUFFER_TOO_SMALL-on-cells / query-shape → one word;
 PENDING and all else → no read, no retry). Both adapters live in
-`crates/ebpf-common/src/object_flow.rs`; the KEM entry adapter is
-NOT forked — encapsulate/decapsulate length positions ride the same
-new adapters with their extended descriptors.
+`crates/ebpf-common/src/object_flow.rs`. No existing adapter is
+forked: the Wrap (Access), Unwrap, Encapsulate and Decapsulate
+entry adapters still acquire their §8.1 existing positions
+(inputs, result pointers, the unwrap template), and the length
+adapters compose onto the same calls for the length positions only
+(the KEM entry adapter is NOT forked either — encapsulate/
+decapsulate length positions ride the same new adapters with their
+extended descriptors).
 
 ### 8.3 Wire and side-row changes
 
@@ -467,11 +527,13 @@ new adapters with their extended descriptors.
   (`object_wire.rs:363`) rejects v1 tails after the bump; old
   readers refuse v2 tails loudly (no silent misparse).
 - No new maps. No new arg-7 exception (all indices ≤ 6, §5.1).
-- Attach/plan: 9 newly probed functions = new endpoints per
-  provider instance. Slots stay per {object, offset}; the inventory
-  8192 budget is unchanged, but per-provider footprint grows (~+9
-  offsets × instances) — Task 2 measures the delta on the
-  scale4097-style recipe and reports it; no budget change.
+- Attach/plan: 7 newly probed functions = new endpoints per
+  provider instance (Wrap/Unwrap/KEM offsets are already probed;
+  their descriptors extend in place). Slots stay per {object,
+  offset}; the inventory 8192 budget is unchanged, but
+  per-provider footprint grows (~+7 offsets × instances) — Task 2
+  measures the delta on the scale4097-style recipe and reports it;
+  no budget change.
 
 ### 8.4 Authority-text delta (part of the §11 amendment)
 
@@ -550,7 +612,8 @@ On every `key_operations[]` row (absent below v7):
   "value": "rsa | ec | eddsa | dsa | dh | aes | generic_secret | hkdf | ml_kem | ml_dsa | slh_dsa | chacha20 | poly1305 | des | des3 | camellia | aria | seed | gost | null",
   "completions": 10,
   "conflict_value": "same enum | omitted",
-  "conflict_completions": "u64 | omitted"
+  "conflict_completions": "u64 | omitted",
+  "further_conflicts": "u64 | omitted"
 },
 "inferred_size": {
   "status": "inferred | unknown | conflicting | unsupported",
@@ -561,7 +624,8 @@ On every `key_operations[]` row (absent below v7):
                   | { "kind": "pqc_set", "parameter_set": "ml_kem_512 | ml_kem_768 | ml_kem_1024 | ml_dsa_44 | ml_dsa_65 | ml_dsa_87 | slh_dsa_128s | slh_dsa_128f | slh_dsa_192s | slh_dsa_192f | slh_dsa_256s | slh_dsa_256f", "octets": 1088, "evidence": "encapsulate_output | decapsulate_input | sign_output | verify_input" }
                   | { "kind": "wrapped_material", "material_octets": 24, "octets": 32, "evidence": "wrap_output | unwrap_input", "about": "wrapped" },
   "completions": 10,
-  "conflict_detail": "same shape | omitted"
+  "conflict_detail": "same shape | omitted",
+  "further_conflicts": "u64 | omitted"
 }
 ```
 
@@ -571,6 +635,9 @@ named reason in `-v`/JSONL detail, not in this closed shape).
 first, the second rides `conflict_detail` (same shape; omitted when
 absent); for families the second rides `conflict_value` +
 `conflict_completions` (§4.4: both sides stay listed with counts).
+A third and further distinct values are counted in
+`further_conflicts` (omitted when 0); the first two stay pinned and
+no third value is ever listed.
 `unsupported`: evidence exists but the family has no map
 (legacy ciphers, padded wraps). `metadata_at_use` semantics are
 unchanged; `unknown` there beside valued inferred keys is the normal
@@ -606,6 +673,9 @@ as a parenthetical where they add information (rows whose
   `wrapped material 24 bytes (from 32-byte wrap output, about wrapped key)`
 - Conflicts: `family conflicting (RSA: 9, EC: 1)`; unknown reasons:
   `size unknown (variable-length encoding)`, `size unknown (padding ambiguity)`.
+  Further distinct values append `, +N more` (`family conflicting
+  (RSA: 9, EC: 1, +2 more)`); sizes likewise (`RSA 2048-bit class
+  (from 256-byte signature), +1 more conflicting size`).
 
 ### 10.4 CBOM and profile
 
@@ -668,9 +738,13 @@ New section body (normative):
 > `inferred_family`/`inferred_size` row keys, the per-field `source`
 > on established/requested blocks, and the finite family/length
 > vocabulary below. It partially supersedes "requested metadata
-> never labels" only via the R2 promotion (§6, v6); inferred facts
-> never label `metadata_at_use` and never overwrite established
-> facts. KEM T0 stays except the length lift above; terminal states,
+> never labels" only via the R2 promotion (§6, v6); it partially
+> supersedes the F16 rule "a code alone, a type alone, or a
+> recognized mechanism never labels" for inferred facts only: a
+> recognized mechanism infers a family (§4.2, display
+> "probably …"), never an established label. Inferred facts never
+> label `metadata_at_use` and never overwrite established facts.
+> KEM T0 stays except the length lift above; terminal states,
 > `CKA_ID`/payload/PIN prohibitions and every other exclusion stay
 > in force. Allowlist-v1 bytes are unchanged.
 >
@@ -704,9 +778,13 @@ Per §5.1 shape (S-cell and V-scalar, LP64 + ia32 widths): positive
 (CKR_OK reads), length-query positive (NULL buffer + OK reads),
 BUFFER_TOO_SMALL positive on cells, PENDING negative, NULL-cell
 negative, failure-RV negative, SIGNATURE_INVALID negative for
-verify scalars, owner-mismatch negative, overlap/alias negatives
-(cell on/inside the output buffer → unavailable; sentinel payload
-word behind the cell classifies to nothing outside its map).
+verify scalars, owner-mismatch negative, null-base positive per
+S-shape (NULL base + CKR_OK reads — the §5.1 null-base rule, one
+twin per each of the 6 S-shapes, including encapsulate where it
+diverges from the T0 null-ciphertext withhold), overlap/alias
+negatives (cell on/inside the output buffer → unavailable;
+sentinel payload word behind the cell classifies to nothing
+outside its map).
 Per §5.2 map: RSA 256→2048-class (and NOT `rsa_2048`: the 2041-bit
 control), ECDSA 64/96/132 → field classes, 70-byte ECDSA → unknown
 `variable_length_encoding`, EdDSA 64/114, KEM 768/1088/1568,
@@ -715,10 +793,15 @@ DSA 40/56/64, AES-KW L→L−8 about-wrapped, KWP → `padding_ambiguity`,
 HMAC/GCM/digest/ECDH-output lengths → unknown (each pinned: the
 length is captured, the class is refused). Family: every §4.2
 listed id infers; vendor/unlisted/keygen ids infer nothing;
-two-family conflict; family-vs-established mismatch → inferred
-side conflicting, label stands. Join (§9): same-key/two-mechanism,
-session/handle reuse, failed-Init, no-backfill pins re-run.
-R2 port (§6): RED→GREEN twins + finite-set twins on the new base.
+two-family conflict; three-family `further_conflicts` count
+(first two pinned, third counted, never listed); same
+keep-first-two-count-extras twin for sizes; family-vs-established
+mismatch → inferred side conflicting, label stands. Join (§9):
+same-key/two-mechanism, session/handle reuse, failed-Init,
+no-backfill pins re-run.
+R2 port (§6): RED→GREEN twins + finite-set twins on the new base;
+ChaCha20/Poly1305 fact-only twins (`0x55`/`0x57` promote the
+value-length fact with no label; use-side family still infers).
 
 ### 12.2 Canaries (proving no payload/key bytes captured)
 
@@ -762,7 +845,11 @@ guessed rows, no void/fence/birth/seal contact).
 
 Order: keyrows Task 1 (fenced voids, RUNNING) → keyrows Task 3
 (re-selection, after Task 1) → keyrows Task 4 (per-key publication)
-→ keymeta Task 3 integrates on the merged base. Keymeta Tasks
+→ keymeta Task 3 integrates on the merged base. Keymeta-internal
+order: Task 2 runs after Task 1 (the three shared files
+`object_policy.rs`/`object_flow.rs`/`object_wire.rs` take one
+writer at a time; Task 2 consumes the Task 1 base — never
+dispatched in parallel). Keymeta Tasks
 0/1/2/4 run in parallel with keyrows (disjoint files: keymeta
 touches descriptors/adapters/wire/schema/projection; keyrows owns
 void/fence/birth/seal/present plumbing — the projection overlap
@@ -788,26 +875,26 @@ AND facts). Schema version allocation is the integrator's (§10.1).
   reason (no yield loss vs today, which is 0 typed).
 - Section-version collision with keyrows gap subjects: mitigated by
   integrator allocation (§10.1).
-- Slot growth (~+9 endpoints/provider) pressures the 8192 budget on
+- Slot growth (~+7 endpoints/provider) pressures the 8192 budget on
   dense hosts: measured in Task 2, reported, no silent budget change.
 
-## 15. Open decisions (recommendations)
+## 15. Open decisions (DECIDED by controller rulings)
 
-- K1: BUFFER_TOO_SMALL lengths accepted (same authoritative value).
-  Recommend YES (pins the `too_small` arm; conservative alternative
-  costs yield for query-style callers).
-- K2: SIGNATURE_INVALID verify lengths excluded. Recommend YES
+- K1: BUFFER_TOO_SMALL lengths accepted. DECIDED YES (same
+  authoritative value; pins the `too_small` arm; conservative
+  alternative costs yield for query-style callers).
+- K2: SIGNATURE_INVALID verify lengths excluded. DECIDED YES
   (ambiguous evidence; revisit only with per-provider proof that a
   provider length-checks before crypto-failing).
-- K3: RSA range 64..=2048 with arithmetic class vs finite octet set.
-  Recommend RANGE (real odd sizes like 192-byte/1536-bit stay
+- K3: RSA range 64..=2048 with arithmetic class vs finite octet
+  set. DECIDED RANGE (real odd sizes like 192-byte/1536-bit stay
   classed; bound is anti-aliasing, documented).
 - K4: CBOM qualifies `creation_success` facts as established.
-  Recommend YES (§10.4); fallback query-only is one predicate.
+  DECIDED YES (§10.4); fallback query-only is one predicate.
 - K5: v6 amended pre-approval with per-field `source` (vs v6 as R2
-  wrote it + source only in v7). Recommend AMEND (v6 unshipped;
+  wrote it + source only in v7). DECIDED AMEND (v6 unshipped;
   one coherent version; R2 re-review covers it).
-- K6: Live matrix 5 runs/app (20) vs 5 total. Recommend 5/APP
+- K6: Live matrix 5 runs/app (20) vs 5 total. DECIDED 5/APP
   (per-app mechanism yields differ; a 5-total matrix cannot prove
   both Chromium-RSA and Firefox-new-site).
 
@@ -817,3 +904,127 @@ Round 1 (this document): dispositions of rv2 F1–F4/N5/N6 in §2;
 Codex re-review + Opus privacy review required on the §11 text
 before any BPF change (F2 fix line). No implementation, no capture
 change, no assertion change in this lane.
+Round 2: spark-review findings 1–9 fixed in place (§8.1 action
+table + counts, Task 1→2 order, §5.1 base table + null-base rule,
+§6 ChaCha20/Poly1305 row, §11 F16 rule naming, V-protocol
+retention wording, keep-first-two-count-extras conflicts, Task 5
+executable PQC pointer); K1–K6 recorded as decided (§15); §17
+added (optional provider/token/mechanism info, owner question
+pending, droppable).
+
+## 17. Optional: provider, token and mechanism info (Task 7, droppable)
+
+Owner question pending: whether v0.8.0 also captures `C_GetInfo`,
+`C_GetTokenInfo` and `C_GetMechanismInfo` results for the inventory
+and CBOM. This section designs that capture as optional plan Task 7;
+dropping Task 7 changes nothing in Tasks 0–6 (no shared wire
+version, no shared schema section, separate amendment rows).
+
+### 17.1 Read set (fixed-size struct reads at return)
+
+Arguments are zero-based; all indices ≤ 2 (no arg-7 exception).
+Struct layouts below are pinned against cryptoki-sys
+(`CK_INFO`/`CK_TOKEN_INFO`/`CK_MECHANISM_INFO` + static offset
+asserts); the lane pins both LP64 and ia32 layouts (ia32 differs
+only in `CK_ULONG`/`CK_FLAGS` width: 4 vs 8 bytes).
+
+| Call | Args | Struct | Bytes read (LP64) |
+| --- | --- | --- | --- |
+| `C_GetInfo` | 0: `pInfo` | `CK_INFO` (88 B) | whole struct: cryptokiVersion@0 (major, minor), manufacturerID@2[32], flags@40, libraryDescription@48[32], libraryVersion@80 — all provider build metadata, no identifiers |
+| `C_GetTokenInfo` | 0: slotID (scalar), 1: `pTokenInfo` | `CK_TOKEN_INFO` (208 B) | three ranges, 60 bytes: manufacturerID@32[32] + model@64[16] ([32..80)), flags@96 (8 B), hardwareVersion@184 + firmwareVersion@186 ([184..188)) |
+| `C_GetMechanismInfo` | 0: slotID (scalar), 1: mechanism type (scalar), 2: `pInfo` | `CK_MECHANISM_INFO` (24 B) | whole struct: ulMinKeySize@0, ulMaxKeySize@8, flags@16 |
+
+Protocol: entry retains the `pInfo` pointer with full-span
+validation of the fixed struct size and snapshots the slot/mechanism
+scalars; return reads the fixed bytes on `CKR_OK` only. NULL
+pointer → unavailable; any other return → never (no
+BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
+Every terminal/loss path clears the retained pointer, exactly like
+the S-protocol cell. FULL builds only; P0 reports explicit
+unavailability.
+
+### 17.2 Excluded fields (never read, not read-and-scrubbed)
+
+`CK_TOKEN_INFO` excluded ranges are never fetched from the target
+(the BPF read list is the three §17.1 ranges only):
+
+- `serialNumber`@80[16]: an identifier — EXCLUDED by default, and
+  this design provides no opt-in flag to capture it in v0.8.0.
+  Reintroducing it needs its own amendment + owner/Opus review.
+- `label`@0[32]: operator-set, identifier-ish — excluded (not
+  requested, same treatment as the serial).
+- `ulMaxPinLen`/`ulMinPinLen`: PIN-adjacent — never (hard line).
+- Session counts, memory sizes: not requested — excluded.
+- `utcTime`: a clock reading (environment) — excluded.
+
+The schema (§17.5) has no serial/label/PIN/count/clock keys, so the
+exclusion is structural: there is nowhere to publish them even by
+accident.
+
+### 17.3 Privacy rows (PROPOSED, separate block)
+
+Task 7 ships its own allowlist-v3 amendment block (same Task 0
+review gate: no BPF change before owner/Opus + Codex approval;
+PROPOSED until then). Rows: `Provider info struct (C_GetInfo)`
+(whole `CK_INFO`, entry retention, full-span guard, CKR_OK return
+read, private in-flight + completed-call transport; public parsed
+fields only); `Token info ranges (C_GetTokenInfo)` (the three
+§17.1 ranges + slot scalar; §17.2 bytes never read); `Mechanism
+info struct (C_GetMechanismInfo)` (whole `CK_MECHANISM_INFO` +
+slot/mechanism scalars). Authority: per-entry optional (NULL/
+foreign/degraded entry → that entry count-only, provider still
+admitted — the §8.4 rule, never provider-gating).
+
+### 17.4 BPF design and budget
+
+New `ObjectAction::ProviderInfo` (next wire value after Task 2's
+15) on 3 descriptors; no inputs, no templates (never authorized).
+Up to +3 endpoints per provider instance — Task 7 measures the
+delta (these calls may already be probed for counting; worst case
++3). No new maps. Largest single read is 88 bytes (`CK_INFO`);
+the 512-byte frame test must pass unmodified in limit. Verifier:
+same §8.5 gates (≥5% headroom on the 6.6 floor, `bpf loads` on vng
+6.6/6.12 + host 7.x, LP64 + ia32). Wire: a new fixed 128-byte
+`ProviderInfoWire` completed-call record (action, slot, mechanism,
+kind, status, ≤96 payload bytes) with an exact version+length
+check like §8.3; old readers refuse it loudly. Task 7 runs after
+Task 2 and consumes the Task 2 wire base (shared files, one writer
+at a time — the §13 rule).
+
+### 17.5 Schema, output and CBOM
+
+New schema section, next free number after v7 (suggest v8;
+integrator allocates per §10.1), emitted exactly when Task 7
+content is present; v1–v7 stay frozen and byte-stable:
+
+- per instance `provider_info`: cryptoki/library major+minor,
+  manufacturer, library description, flags;
+- per (instance, slot) `tokens[]`: manufacturer, model,
+  hardware/firmware version, flags;
+- per (instance, slot, mechanism) `mechanisms[]`: type,
+  min/max key size, flags — capped at 128 mechanisms per
+  (instance, slot); extras refuse with a named
+  `mechanism_info_refused: too_many` counter, never silently.
+
+Join: completed-call record → owning instance; no `AggKey`
+contact (these are not key rows) and no `metadata_at_use` contact.
+Text: concise gains one provider line only where Task 7 content
+exists (byte-stable otherwise); `-v`/JSON carry tokens and
+mechanisms. CBOM (re-projection only): provider component
+supplier/name/version from `provider_info`, token facts as
+component properties; serials never appear (no such key exists).
+
+### 17.6 Tests
+
+Host twins per call (LP64 + ia32 layouts): CKR_OK positive
+(exact parsed fields), NULL-pointer negative, failure-RV
+negative, owner-mismatch negative; sentinel twin: a provider
+returning sentinel serial/label/PIN-lens/utcTime publishes none
+of those bytes anywhere (JSON/logs/maps scanned); cap twin: the
+129th mechanism on a slot refuses with the named reason while
+the first 128 stand; CBOM twin: no serial key in any CBOM
+output. Canary lane: Task 7 positions join the Task 4 workload
+only if Task 7 ships. Live (conditional, inside the Task 5
+matrix): SoftHSM `C_GetInfo`/`C_GetTokenInfo`/
+`C_GetMechanismInfo` positives with parsed fields matching the
+provider's own reports.

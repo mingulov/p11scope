@@ -1134,7 +1134,9 @@ fn handle_table_owner_scan_holds_len_within_cap() {
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
-                && skip.reason == crate::discovery::identity::PIN_BUDGET_STOP_DETAIL
+                && skip
+                    .reason
+                    .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL)
         }),
         "the stop files its named budget gap: {:?}",
         engine.counters.object_skips

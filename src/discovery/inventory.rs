@@ -970,6 +970,11 @@ impl Engine {
             .expect("checked retained view");
         let before_refusals = self.budget.refusal_counts();
         let mut counters = DiscoveryCounters::default();
+        // Owner scans file through the single acquire step like every
+        // other scan site: past the cap the scan stops with the rest
+        // pending under the named budget gap, the receipt stays
+        // partial, and the next pass rescans — never a silent over-cap
+        // adoption.
         let result = scan_and_pin_with(
             view,
             &self.module_hints,
@@ -980,12 +985,22 @@ impl Engine {
             &mut self.stage_timings,
             scan,
             None,
-            Filing::Adopt(&mut self.handle_table),
+            Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
         );
         let pinning_complete = self.budget.stopped_reason().is_none()
             && before_refusals == self.budget.refusal_counts()
             && counters.object_skips.is_empty();
-        self.absorb_scan_counters(counters);
+        // File the scan's pin skips into the capture skip list (deduped
+        // by exact row, like any mark): a stopped or failed pin is a
+        // named loss row in the committed plan, never a silent drop.
+        // The receipt's partiality below carries the coverage verdict
+        // beside it. (Attribution already noted each row at the scan
+        // loop, so this files without re-noting.)
+        for skipped in self.absorb_scan_counters(counters) {
+            if !self.counters.object_skips.contains(&skipped) {
+                self.counters.object_skips.push(skipped);
+            }
+        }
         self.check_inventory_image(&identity, guard)?;
         match result {
             Ok((modules, pins, complete)) => {

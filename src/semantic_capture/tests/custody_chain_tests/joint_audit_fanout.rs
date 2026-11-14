@@ -2095,6 +2095,7 @@ impl MachineScene {
             .map(|record| record.feed.reduced())
             .collect()
     }
+
 }
 
 /// Same decoded DISCOVERY transport as the production reader, scoped to an
@@ -10649,21 +10650,18 @@ fn joint_pending_frame_delivers_carried_void_before_retiring() {
     );
 }
 
-/// Keyrows T1 N1 pin: a Joint feed holds a staged call across a
-/// pending frame whose floor is stash-owned (capture floors block
-/// ingestion; the machine expires them pre-audit), then an idle
-/// break happens. The idle drop disposes the stranded staging as
-/// counted history, but the stashed pre-void outcome loses its H8
-/// to the void while its wire is already consumed, so the
-/// post-void quantum still latches at claiming — before any audit
-/// or fallback delivery runs — and stops the semantic lane (re-arm
-/// rejects `Claiming` with `WrongPhase` rather than spending a
-/// continuation). This pin records the premise, the drop, and the
-/// latch site; if claiming ever soft-routes the orphaned outcome,
-/// the publish below fails and N1 must be revisited. See the
-/// idle-site comment.
+/// Keyrows N1 twin: a Joint feed holds a staged call across a pending
+/// frame whose floor is stash-owned (capture floors block ingestion;
+/// the machine expires them pre-audit), then an idle break happens.
+/// The idle drop disposes the stranded staging as counted history,
+/// and the stashed pre-void outcome loses its H8 to the void while
+/// its wire is already consumed. Claiming must route that orphaned
+/// admission to plain S1 with a counted named gap instead of
+/// latching `Claiming` and removing the whole semantic lane; the
+/// post-void call then claims and publishes, and the lane keeps
+/// publishing later calls. See the idle-site comment.
 #[test]
-fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
+fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
     use crate::inventory_semantics::JointServiceProgress;
     use crate::semantics_key_use::FeedMode;
     use crate::semantics_objects::journal::JournalGap;
@@ -10854,9 +10852,12 @@ fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
     );
     // The idle break: the machine's own idle tick voids the lane
     // (disposing the stranded staging) and the post-void quantum
-    // latches at claiming (the orphaned stash outcome lost its H8)
-    // before any audit or fallback delivery runs.
+    // carries the orphaned stash outcome plus a fresh call. The
+    // orphan's H8 was voided, so claiming must retain it as plain
+    // S1 with a counted gap instead of latching the whole lane.
     let disposed_before = fixture.disposed_total();
+    let api_before = fixture.api_returns_total();
+    let mut reduced_before = fixture.reduced();
     fixture
         .scene
         .real
@@ -10866,34 +10867,50 @@ fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
         .adapter_mut()
         .break_stream_for_test();
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
-    let mut latched = None;
+    let mut published = false;
     for _ in 0..512 {
         match fixture.service(1) {
             Ok(JointServiceProgress::Published) => {
-                panic!(
-                    "the post-void quantum publishes despite the orphaned stash: the claiming latch is gone, revisit N1"
-                )
-            }
-            Ok(_) => {}
-            Err(reason) => {
-                latched = Some(reason);
+                published = true;
                 break;
             }
+            Ok(_) => {}
+            Err(reason) => panic!(
+                "the post-void quantum stopped the lane at {reason:?}; the voided pre-void claim must be retained as plain S1"
+            ),
         }
     }
-    assert_eq!(
-        latched,
-        Some(SemanticRefusal::Unavailable),
-        "the post-void quantum latches on the orphaned stash"
+    assert!(
+        published,
+        "the post-void quantum publishes with the orphaned stash retained as S1"
     );
-    assert_eq!(
-        fixture.machine.latched_phase_label(),
-        Some("Claiming"),
-        "the latch lands at claiming, before audit and delivery"
+    assert!(
+        fixture.machine.disposition_reason().is_none()
+            && fixture.machine.latched_phase_label().is_none(),
+        "the lane never latches: {:?} / {:?}",
+        fixture.machine.disposition_reason(),
+        fixture.machine.latched_phase_label()
     );
-    // Nothing audited, nothing delivered: the idle drop disposed
-    // the stranded staging as counted history, the void still
-    // pends, and no feed closed.
+    // Both calls were applied: the orphaned pre-void call as plain
+    // S1 (its observed return is kept) and the fresh post-void call
+    // on its feed.
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_before + 2,
+        "the orphaned call is kept as plain S1 and the post-void call is delivered"
+    );
+    // The post-void call still stages on the Joint feed and replays
+    // when the pending void closes its segment; the plain S1 orphan
+    // never enters Joint staging.
+    reduced_before[0] += 1;
+    assert_eq!(
+        fixture.reduced(),
+        reduced_before,
+        "the post-void call replays once when the void rides"
+    );
+    // The idle drop still disposed the stranded staging as counted
+    // history, and the void rode the published frame, closing the
+    // feed's segment at its fence.
     let stranded_after: Vec<_> = fixture
         .scene
         .real
@@ -10911,9 +10928,7 @@ fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
         .collect();
     assert_eq!(stranded_after.len(), 1);
     assert!(
-        stranded_after[0].0 == 0
-            && stranded_after[0].1 == FeedMode::Joint
-            && stranded_after[0].2.is_none(),
+        stranded_after[0].0 == 0,
         "the idle drop disposed the stranded staging: {stranded_after:?}"
     );
     assert_eq!(
@@ -10929,13 +10944,72 @@ fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
             .coordinator
             .joint_capture()
             .pending_void_for_test()
-            .is_some(),
-        "the void never rode: the latch is pre-audit"
+            .is_none(),
+        "the void rode the post-void frame"
+    );
+    assert!(
+        stranded_after[0].1 == FeedMode::S1Only && stranded_after[0].2.is_some(),
+        "the void closed the feed's segment at its fence: {stranded_after:?}"
+    );
+    // The lost per-key detail is one counted named gap, not a
+    // stopped view.
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let retained: Vec<_> = registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats())
+        .filter(|(gap, _)| {
+            gap.reason
+                .starts_with("joint_void_stashed_claim_history_loss")
+        })
+        .collect();
+    assert_eq!(
+        retained.len(),
+        1,
+        "one counted gap names the retained call: {:?}",
+        registry
+            .gaps()
+            .iter()
+            .map(|gap| (&gap.subject, &gap.reason))
+            .collect::<Vec<_>>()
+    );
+    let (gap, repeats) = retained[0];
+    assert_eq!(
+        gap.subject,
+        "Joint key operations unavailable; retained S1",
+        "the gap keeps the Joint-unavailable subject"
+    );
+    assert!(
+        gap.reason.contains("1 call(s) retained S1"),
+        "the gap counts the retained call: {}",
+        gap.reason
+    );
+    assert_eq!(*repeats, 1, "one retained call, counted once");
+    // The lane keeps running: a later call still applies and
+    // publishes after the void.
+    let api_after_publish = fixture.api_returns_total();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    let mut published_again = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published_again = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the lane stopped after the void: {reason:?}"),
+        }
+    }
+    assert!(
+        published_again,
+        "the semantic lane keeps publishing after the void"
     );
     assert_eq!(
-        fixture.machine.disposition_reason(),
-        Some(SemanticRefusal::Unavailable)
+        fixture.api_returns_total(),
+        api_after_publish + 1,
+        "the later call still applies"
     );
+    assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
 /// Keyrows T1 fix4 B1 twin: a Joint feed's seal waits (BoundNotReady)

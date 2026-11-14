@@ -944,10 +944,11 @@ impl JournalContradictionDiagnosis {
     }
 }
 
-/// Diagnostic-only Joint void counters (Task 0): the five run-global
-/// event counts, without the per-key gauges. Copying this snapshot
-/// touches no key state, so retirement adopts it without the full
-/// diagnosis scan. Counts only; instrumentation only, never authority.
+/// Diagnostic-only Joint void counters (Task 0 plus the scope-round
+/// split): the run-global event counts, without the per-key gauges.
+/// Copying this snapshot touches no key state, so retirement adopts
+/// it without the full diagnosis scan. Counts only; instrumentation
+/// only, never authority.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct JointVoidCounts {
     /// Breaks recorded through dispose_without_ingest (non-contiguous
@@ -2392,6 +2393,14 @@ impl JournalAdapter {
         }
     }
 
+    /// Diagnostic-only (scope round): count a void that ended at least
+    /// one Joint feed. The frame calls this once per void (deduped by
+    /// fence and gap). Saturating; instrumentation only, never
+    /// authority.
+    fn note_void_ended_joint_feed(&mut self) {
+        self.voids_ended_joint_feed = self.voids_ended_joint_feed.saturating_add(1);
+    }
+
     /// Diagnostic-only (Task 0): adopt a retired owner's event counters
     /// across joint-owner replacement. Global counters never reset; the
     /// per-key gauges are not carried (they recompute from this owner's
@@ -2403,12 +2412,21 @@ impl JournalAdapter {
         self.void_audit = carried.void_audit;
         self.void_resync = carried.void_resync;
         self.seal_below_fence = carried.seal_below_fence;
+        self.audit_fault_changed_chain = carried.audit_fault_changed_chain;
+        self.audit_fault_changed_reread = carried.audit_fault_changed_reread;
+        self.audit_h3_loss = carried.audit_h3_loss;
+        self.audit_discarded = carried.audit_discarded;
+        self.audit_malformed = carried.audit_malformed;
+        self.audit_counter_unprovable = carried.audit_counter_unprovable;
+        self.audit_fault_unreadable = carried.audit_fault_unreadable;
+        self.audit_resource_unavailable = carried.audit_resource_unavailable;
+        self.voids_ended_joint_feed = carried.voids_ended_joint_feed;
     }
 
-    /// Diagnostic-only (Task 0): snapshot the five run-global event
-    /// counters without scanning any key. Retirement adopts this;
-    /// verbose diagnostics read the full diagnosis below.
-    /// Instrumentation only, never authority.
+    /// Diagnostic-only (Task 0 plus the scope-round split): snapshot
+    /// the run-global event counters without scanning any key.
+    /// Retirement adopts this; verbose diagnostics read the full
+    /// diagnosis below. Instrumentation only, never authority.
     pub(crate) fn joint_void_counts(&self) -> JointVoidCounts {
         JointVoidCounts {
             break_dispose: self.break_dispose,
@@ -6082,6 +6100,49 @@ impl JournalAdapter {
                 // Diagnostic-only (Task 0): the audit above voided the
                 // seal. The refusal below is unchanged.
                 self.void_audit = self.void_audit.saturating_add(1);
+                // Diagnostic-only (scope round): the audit-void split by
+                // sub-cause. The FaultChanged site (chain check vs
+                // seal-time re-read) is reconstructed from the audit plus
+                // the pinned baseline BEFORE the re-baseline below
+                // overwrites it: a move the collection audit itself saw
+                // (within one collection or between two) is chain, a move
+                // only the seal-time cell saw is reread.
+                match gap {
+                    JournalGap::FaultChanged => {
+                        if audit.fault_before != audit.fault_after
+                            || self
+                                .last_fault
+                                .is_some_and(|last| audit.fault_before != last)
+                        {
+                            self.audit_fault_changed_chain =
+                                self.audit_fault_changed_chain.saturating_add(1);
+                        } else {
+                            self.audit_fault_changed_reread =
+                                self.audit_fault_changed_reread.saturating_add(1);
+                        }
+                    }
+                    JournalGap::H3Loss => {
+                        self.audit_h3_loss = self.audit_h3_loss.saturating_add(1);
+                    }
+                    JournalGap::Discarded => {
+                        self.audit_discarded = self.audit_discarded.saturating_add(1);
+                    }
+                    JournalGap::Malformed => {
+                        self.audit_malformed = self.audit_malformed.saturating_add(1);
+                    }
+                    JournalGap::CounterUnprovable => {
+                        self.audit_counter_unprovable =
+                            self.audit_counter_unprovable.saturating_add(1);
+                    }
+                    JournalGap::FaultUnreadable => {
+                        self.audit_fault_unreadable = self.audit_fault_unreadable.saturating_add(1);
+                    }
+                    JournalGap::ResourceUnavailable => {
+                        self.audit_resource_unavailable =
+                            self.audit_resource_unavailable.saturating_add(1);
+                    }
+                    _ => {}
+                }
                 // The voided consumption interval binds future keys too:
                 // births naming a cut below it refuse even when their key
                 // did not exist at the void.
@@ -13330,22 +13391,20 @@ pub(crate) mod tests {
         }
         // (gap, craft): craft mutates a clean scene audit into this gap's
         // evidence. FaultChanged moves within one collection (chain).
-        let cases: [(JournalGap, fn(&mut JournalAuditReceipt)); 6] = [
+        type AuditCraft = fn(&mut JournalAuditReceipt);
+        let cases: [(JournalGap, AuditCraft); 6] = [
             (JournalGap::FaultChanged, |audit| audit.fault_after = 8),
             (JournalGap::Malformed, |audit| audit.malformed_delta = 1),
             (JournalGap::Discarded, |audit| audit.discarded_delta = 1),
-            (
-                JournalGap::CounterUnprovable,
-                |audit| audit.counter_error = true,
-            ),
-            (
-                JournalGap::FaultUnreadable,
-                |audit| audit.fault_error = Some(FaultReadError::Unreadable),
-            ),
-            (
-                JournalGap::ResourceUnavailable,
-                |audit| audit.resource_refused = true,
-            ),
+            (JournalGap::CounterUnprovable, |audit| {
+                audit.counter_error = true
+            }),
+            (JournalGap::FaultUnreadable, |audit| {
+                audit.fault_error = Some(FaultReadError::Unreadable)
+            }),
+            (JournalGap::ResourceUnavailable, |audit| {
+                audit.resource_refused = true
+            }),
         ];
         for (gap, craft) in cases {
             let mut scene = Scene::new(image_default());
@@ -13447,7 +13506,9 @@ pub(crate) mod tests {
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap = scene.bootstrap(proof, 0);
-        scene.seal(&bootstrap).expect("clean seal pins the baseline");
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
         assert_eq!(scene.adapter.last_fault, Some(7));
         // Chain between collections: the audit opens where the last seal did
         // not close.

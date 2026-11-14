@@ -2664,9 +2664,9 @@ impl AttestedSemanticLane {
     /// Lifetime skip-only fault eras (zero without a live lane), for the
     /// Joint-void line. Counts only.
     pub(crate) fn semantic_skip_eras(&self) -> u64 {
-        self.live.as_ref().map_or(0, |live| {
-            live.capture.router().counters().skip_eras
-        })
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.capture.router().counters().skip_eras)
     }
 
     /// Lifetime per-reason scan-refusal counts (zeros without a live

@@ -9480,8 +9480,9 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
     // Second round on the same fixture: the feeds are already S1Only, so
     // the next void ends none. The finisher below is ingress-agnostic: it
     // drives any failure-carrying frame (here an ingested collection void)
-    // through delivery to completion.
-    fixture.push_two("C_SignUpdate", 2);
+    // through delivery to completion. The call reuses an endpoint the
+    // fixture was built with, at a fresh sequence.
+    fixture.push_two("C_SignInit", 2);
     fault.epoch.set(2);
     let round = fixture.audited(2, 2, &fault);
     finish_disposed_negative_frame(&mut fixture, round, &fault);
@@ -9505,6 +9506,42 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
     assert_eq!(
         diagnosis.voids_ended_joint_feed, 1,
         "a void ending no Joint feed counts no new ending"
+    );
+    // Third scene: a broad but fenceless ending (fault saturation stops
+    // the adapter without voiding) ends Joint feeds yet counts no
+    // void-ended feed — only fenced failures are voids.
+    let (mut saturated, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let mut frame = Some(original);
+    let stuck = FrameFault::clean();
+    stuck.epoch.set(u64::from(u32::MAX) + 1);
+    let old_revision = saturated
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    saturated.complete_publication(&mut frame, &stuck, old_revision);
+    let diagnosis = saturated
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        (diagnosis.void_audit, diagnosis.voids_ended_joint_feed),
+        (0, 0),
+        "saturation ends feeds without voiding or counting one"
+    );
+    assert!(
+        saturated.feeds().iter().all(|feed| feed.degraded),
+        "the saturation ended every Joint feed"
     );
 }
 

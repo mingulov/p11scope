@@ -1511,6 +1511,9 @@ impl InstanceRouter {
             self.miss_latched = false;
             self.counters.eras = self.counters.eras.saturating_add(1);
             if std::mem::take(&mut self.miss_era_pending) {
+                // Diagnostic-only (scope round): the fault moved for hook
+                // misses only. Instrumentation only, never authority.
+                self.counters.skip_eras = self.counters.skip_eras.saturating_add(1);
                 self.carry_observations();
             } else {
                 self.clear_carry();

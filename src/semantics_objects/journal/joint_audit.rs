@@ -1889,6 +1889,11 @@ impl IngestedJointQuantum {
             return Ok(QuantumSealProgress::LocalPending);
         };
         diagnosis.note_failure_visit(audited.failure().gap);
+        // Diagnostic-only (scope round): whether this delivery can end a
+        // Joint feed with a void (read before delivery changes the mode).
+        // Only a fenced failure is a void; only a Joint feed can end.
+        let void_ending = audited.failure().fence.is_some()
+            && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint);
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)
             && matches!(
@@ -1944,6 +1949,17 @@ impl IngestedJointQuantum {
             ) => {
                 if batch.negative_delivered().is_none() {
                     return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                // Diagnostic-only (scope round): the void above ended a
+                // Joint feed. One void fanning out to many feeds counts
+                // once (deduped by fence and gap).
+                if void_ending {
+                    let ended = batch.audited().failure();
+                    let key = (ended.fence, ended.gap);
+                    if !self.void_feed_ends_counted.contains(&key) {
+                        self.void_feed_ends_counted.push(key);
+                        adapter.note_void_ended_joint_feed();
+                    }
                 }
                 self.active = None;
                 self.advance_consumer(ConsumerState::LossDelivered);

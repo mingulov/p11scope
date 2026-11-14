@@ -367,7 +367,9 @@ fn joint_voids_line_format_is_exact() {
          audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0"
     );
     assert_eq!(
-        joint_voids_line(3, 5, 7, 11, 13, 17, 2, 4, 6, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59),
+        joint_voids_line(
+            3, 5, 7, 11, 13, 17, 2, 4, 6, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59
+        ),
         "p11scope: joint voids: break_dispose=3 break_ingest=5 void_audit=7 \
          void_resync=11 seal_below_fence=13 keys_total=17 keys_refused=2 \
          keys_tainted=4 keys_pending=6 audit_fault_changed_chain=19 \

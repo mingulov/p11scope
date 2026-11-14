@@ -5,6 +5,12 @@
 //! content mismatch). Whole-file SHA-256 is authoritative; a GNU build ID is
 //! retained as producer-supplied evidence. Non-ELF/unreadable input is
 //! explicitly not reusable.
+//!
+//! v0.8.0: no per-object size cap remains. Identity reads the file once
+//! through the caller's reader and parses from those bytes (never a
+//! mapping: watched files must not be mapped); any remaining allowance
+//! is enforced incrementally by the caller's reader as a time/progress
+//! budget with a named gap, never as a size refusal.
 
 #[cfg(feature = "identify")]
 use object::Object as _;
@@ -22,12 +28,6 @@ use std::path::Path;
 use crate::elf::{ElfAbi, ExportWalk, classified_validated_object, exports_matching_in_object};
 #[cfg(feature = "identify")]
 use crate::maps::{Device, ObjectKey};
-
-/// v0.8.0: no per-object size cap remains. Identity reads the file
-/// once through the caller's reader and parses from those bytes (never
-/// a mapping: watched files must not be mapped); any remaining
-/// allowance is enforced incrementally by the caller's reader as a
-/// time/progress budget with a named gap, never as a size refusal.
 
 #[cfg(feature = "identify")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

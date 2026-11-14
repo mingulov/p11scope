@@ -5302,13 +5302,12 @@ fn provider_facts_for(
     };
     // A cached table-cap refusal reuses the same pin discipline: only
     // the still-unchanged file may skip its header re-probe.
-    if cacheable {
-        if let Some(reason) = budget
+    if cacheable
+        && let Some(reason) = budget
             .table_cap_refusal_for(&cache_key)
             .filter(|_| pin_of(file).is_ok_and(|after| after == before))
-        {
-            return Err(reason);
-        }
+    {
+        return Err(reason);
     }
     match cached {
         Some(facts) => Ok(facts),

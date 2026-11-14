@@ -25,6 +25,7 @@ Run: python3 -I tests/python/test_provider_matrix_cell.py -v
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import sys
 import tempfile
@@ -35,6 +36,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts" / "ci" / "provider_matrix_cell_compare.py"
 SCRIPT = ROOT / "scripts" / "ci" / "provider-matrix-cell.sh"
+REMOTE_SCRIPT = ROOT / "scripts" / "provider-matrix" / "remote-cell.sh"
 
 _SPEC = importlib.util.spec_from_file_location(
     "provider_matrix_cell_compare", HELPER)
@@ -161,6 +163,20 @@ def leg_prep_source():
     return f"leg_prep() {{\n{matches[0]}\n}}"
 
 
+def preflight_block_source():
+    """The verbatim optional-preflight block from the shipped cell script."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    matches = re.findall(
+        r'(?ms)^  if \[ -n "\$PROVIDER_PREFLIGHT" \]; then$'
+        r"\n(.*?)\n  fi$", text)
+    assert len(matches) == 1, (
+        f"expected exactly one PROVIDER_PREFLIGHT block in {SCRIPT}, "
+        f"found {len(matches)}; the preflight tests cannot run against "
+        "a refactored script")
+    return ("if [ -n \"$PROVIDER_PREFLIGHT\" ]; then\n"
+            + matches[0] + "\nfi")
+
+
 class RunObservedTests(unittest.TestCase):
     def test_attributed_calls_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +274,56 @@ class InventoryPidTests(unittest.TestCase):
                 str(module), 4242)
             self.assertFalse(ok, "gap-only pid passed as observed")
             self.assertIn("caller_custody_unproven", detail)
+
+    def test_same_basename_different_bytes_never_joins(self):
+        # A module that merely shares the basename with different bytes
+        # must not satisfy the inventory row: a basename substring is
+        # not an identity proof.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"provider-bytes")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            decoy = make_module(elsewhere, content=b"other-bytes")
+            ok, detail = _COMPARE.judge_inventory_pid(
+                inventory_doc(decoy, 4242, 656), str(module), 4242)
+            self.assertFalse(
+                ok, "same-basename different-bytes module joined")
+            self.assertIn("not observed", detail)
+            self.assertIn("absent", detail)
+
+    def test_unpinned_identity_dev_ino_fallback_joins(self):
+        # sha256 null (unpinned object) still joins on the recorded
+        # device/inode identity, like the observed-functions join.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp)
+            doc = inventory_doc(module, 4242, 656)
+            doc["modules"][0]["identity"]["sha256"] = None
+            ok, detail = _COMPARE.judge_inventory_pid(doc, str(module), 4242)
+            self.assertTrue(ok, detail)
+            self.assertIn("dev-ino", detail)
+
+    def test_exact_path_without_digest_joins(self):
+        # No identity recorded at all: an exact path match is a
+        # same-file proof the cell may rely on.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp)
+            doc = inventory_doc(module, 4242, 656)
+            del doc["modules"][0]["identity"]
+            ok, detail = _COMPARE.judge_inventory_pid(doc, str(module), 4242)
+            self.assertTrue(ok, detail)
+            self.assertIn("path", detail)
+
+    def test_recorded_conflicting_digest_never_joins(self):
+        # Same path, but the recorded sha256 belongs to different
+        # bytes: the file changed under the path; refuse, never guess.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"provider-bytes")
+            doc = inventory_doc(module, 4242, 656)
+            doc["modules"][0]["identity"]["sha256"] = hashlib.sha256(
+                b"other-bytes").hexdigest()
+            ok, detail = _COMPARE.judge_inventory_pid(doc, str(module), 4242)
+            self.assertFalse(ok, "conflicting recorded digest joined")
+            self.assertIn("absent", detail)
 
 
 class DiscoverTests(unittest.TestCase):
@@ -685,6 +751,138 @@ class LegPrepTests(unittest.TestCase):
             for name in KEEPERS:
                 self.assertTrue((leg / name).is_file(),
                                 f"keeper deleted: {name}")
+
+
+class PreflightDropTests(unittest.TestCase):
+    # The preflight probe dlopens provider code: in root mode it must
+    # run under the same setpriv drop as the cell's suite, never as
+    # root. A setpriv shim on PATH records the drop the block uses.
+
+    def run_block(self, tmp, rootmode, preflight_on_path=False):
+        import subprocess
+        base = Path(tmp)
+        bin_dir = base / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        setpriv = bin_dir / "setpriv"
+        setpriv.write_text(
+            "#!/bin/bash\n"
+            "echo \"setpriv-shim $*\"\n"
+            "exec \"$@\"\n", encoding="utf-8")
+        setpriv.chmod(0o755)
+        env_file = base / "probe.env"
+        env_file.write_text(
+            "probe() { echo \"probe-ran $(id -un)\"; }\n", encoding="utf-8")
+        if preflight_on_path:
+            probe = bin_dir / "probe"
+            probe.write_text("#!/bin/sh\necho probe-exec-ran\n",
+                             encoding="utf-8")
+            probe.chmod(0o755)
+        out = base / "out"
+        out.mkdir(exist_ok=True)
+        env = {
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "PROVIDER_PREFLIGHT": "probe", "ROOTMODE": rootmode,
+            "RUNUID": "4242", "RUNGID": "4242",
+            "ENV_FILE": str(env_file), "OUT": str(out),
+            "TASK_DIR": str(base / "task"), "PKCS11_MODULE": "/x.so",
+            "PKCS11_TOOL": "pkcs11-tool",
+            "PROVIDER_MATRIX_DIR": "/m",
+        }
+        script = preflight_block_source() + "\nexit 0\n"
+        proc = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=env, timeout=60)
+        log_path = out / "preflight.log"
+        log = (log_path.read_text(encoding="utf-8")
+               if log_path.exists() else "")
+        return proc, log
+
+    def test_root_mode_preflight_runs_under_the_setpriv_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, log = self.run_block(tmp, "yes")
+            self.assertEqual(
+                0, proc.returncode, f"{proc.stderr}\npreflight.log={log}")
+            self.assertIn(
+                "setpriv-shim --reuid=4242 --regid=4242 --clear-groups",
+                log)
+            self.assertIn("probe-ran", log)
+
+    def test_user_mode_preflight_runs_direct(self):
+        # User mode keeps running the preflight directly (no setpriv
+        # wrapper): behavior unchanged by the root-mode fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, log = self.run_block(tmp, "no", preflight_on_path=True)
+            self.assertEqual(
+                0, proc.returncode, f"{proc.stderr}\npreflight.log={log}")
+            self.assertIn("probe-exec-ran", log)
+            self.assertNotIn("setpriv-shim", log)
+
+
+class ProviderNameValidationTests(unittest.TestCase):
+    # A provider name containing any whitespace must be rejected at the
+    # name check itself, not later at env-file lookup with a vaguer
+    # error.
+    WHITESPACE_NAMES = ("a b", "a\tb", "a\nb", " a")
+
+    def run_cell(self, provider, task_dir):
+        import subprocess
+        fake = Path(task_dir) / "p11scope"
+        fake.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake.chmod(0o755)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "PROVIDER": provider, "TASK_DIR": task_dir}
+        return subprocess.run(
+            ["bash", str(SCRIPT), str(fake), str(Path(task_dir) / "out")],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def test_cell_rejects_names_with_any_whitespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for provider in self.WHITESPACE_NAMES:
+                with self.subTest(provider=repr(provider)):
+                    proc = self.run_cell(provider, tmp)
+                    self.assertEqual(2, proc.returncode, proc.stderr)
+                    self.assertIn("bare provider name", proc.stderr)
+
+    def test_cell_still_accepts_a_bare_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.run_cell("no-such-provider", tmp)
+            self.assertEqual(2, proc.returncode, proc.stderr)
+            self.assertIn("no such provider env", proc.stderr)
+            self.assertNotIn("bare provider name", proc.stderr)
+
+    def run_remote(self, provider, task_dir, repo=None):
+        import subprocess
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if repo is not None:
+            pins = Path(task_dir) / "pins.env"
+            pins.write_text("P11TEST_PIN=1234\n", encoding="utf-8")
+            cell = Path(repo) / "scripts" / "ci" / "provider-matrix-cell.sh"
+            cell.parent.mkdir(parents=True, exist_ok=True)
+            cell.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+            cell.chmod(0o755)
+            env.update({"TASK_DIR": task_dir, "REPO": str(repo),
+                        "OUT": str(Path(task_dir) / "out"),
+                        "P11SCOPE": "/x/p11scope", "DISCOVER": "/x/discover",
+                        "P11CHECK": "/x/pkcs11-check", "PINS": str(pins)})
+        return subprocess.run(
+            ["bash", str(REMOTE_SCRIPT), provider],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def test_remote_rejects_names_with_any_whitespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for provider in self.WHITESPACE_NAMES:
+                with self.subTest(provider=repr(provider)):
+                    proc = self.run_remote(provider, tmp)
+                    self.assertEqual(2, proc.returncode, proc.stderr)
+                    self.assertIn("remote-cell: bad provider name",
+                                  proc.stderr)
+
+    def test_remote_still_accepts_a_bare_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            proc = self.run_remote("x", tmp, repo=repo)
+            self.assertEqual(3, proc.returncode, proc.stderr)
+            self.assertNotIn("bad provider name", proc.stderr)
 
 
 STATIC_EMBED_HELPER = (ROOT / "scripts" / "provider-matrix"

@@ -16338,6 +16338,104 @@ mod tests {
         budget.finish_window(window).unwrap();
     }
 
+    /// A budget with a 1 MiB per-object allowance under an 8 MiB
+    /// window: per-object shortfalls name themselves while the window
+    /// still admits.
+    fn small_object_inventory_limits() -> InventoryDiscoveryLimits {
+        let window = InventoryWindowLimits::new(8 << 20, 1 << 20, 4096, 32768, 4096).unwrap();
+        let retained = InventoryRetainedLimits::new(512, 512, 512, 4, 4, 64 * 1024).unwrap();
+        InventoryDiscoveryLimits::new(1 << 20, window, retained).unwrap()
+    }
+
+    /// Important-2: a spent per-object allowance with window room left
+    /// refuses reads without stopping the pass; only a spent window
+    /// stops it.
+    #[test]
+    fn per_object_shortfall_refuses_reads_without_stopping_the_pass() {
+        let mut budget = CaptureWorkBudget::for_inventory(small_object_inventory_limits());
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert_eq!(
+            budget.allowed_io(1 << 20, 5),
+            0,
+            "the per-object leg is spent"
+        );
+        assert_eq!(
+            budget.stopped_reason(),
+            None,
+            "a per-object shortfall stops nothing"
+        );
+        assert_eq!(budget.allowed_io(0, 5), 5, "window room still admits");
+        budget.record_io(8 << 20);
+        assert_eq!(budget.allowed_io(0, 5), 0, "the window is spent");
+        assert_eq!(
+            budget.stopped_reason(),
+            Some(IO_CEILING_REASON),
+            "a spent window still stops the pass"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// Important-2: a snapshot past the per-object allowance names the
+    /// per-object shortfall and leaves the pass running.
+    #[test]
+    fn snapshot_past_the_per_object_allowance_names_it_without_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two-mb.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(2 << 20)
+            .unwrap();
+        let file = File::open(&path).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(small_object_inventory_limits());
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let error = read_elf_snapshot(&file, &mut budget).unwrap_err();
+        assert!(
+            error.contains("per-object I/O allowance reached"),
+            "got {error:?}"
+        );
+        assert_eq!(budget.stopped_reason(), None);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// Important-2: a memory mapping past the per-object allowance
+    /// reports the per-object shortfall without stopping the pass.
+    #[test]
+    fn mapping_past_the_per_object_allowance_names_it_without_stopping() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7u8; 2 << 20]).unwrap();
+        let mem = File::open(file.path()).unwrap();
+        let entry = &parse_maps(b"0-200000 rw-p 00000000 08:01 7 /lib/provider.so\n").unwrap()[0];
+        let mut budget = CaptureWorkBudget::for_inventory(small_object_inventory_limits());
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let mut operation_bytes = 0u64;
+        let (bytes, short, exhausted) =
+            read_mapping(&mem, entry, &mut budget, &mut operation_bytes);
+        assert_eq!(
+            bytes.len(),
+            1 << 20,
+            "the per-object allowance bounds one mapping"
+        );
+        assert!(exhausted);
+        assert!(
+            short
+                .as_deref()
+                .unwrap_or("")
+                .contains("per-object I/O allowance reached"),
+            "got {short:?}"
+        );
+        assert_eq!(budget.stopped_reason(), None);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
     #[test]
     fn production_inventory_window_fits_a_measured_real_world_closure() {
         // The trivial nodata harness maps 16.3 MiB of sub-8-MiB objects on

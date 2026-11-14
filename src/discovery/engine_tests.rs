@@ -39990,6 +39990,107 @@ fn pinned_owned_fixture() -> (Vec<ScannedModule>, PinnedObjects) {
     (modules, pinned)
 }
 
+/// A valid hook-exporting provider padded to 2 MiB: past a 1 MiB
+/// per-object allowance, inside an 8 MiB window. The appended zeros
+/// sit past every table, so the image still parses.
+fn large_pinnable_provider() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("large-provider.c");
+    let path = dir.path().join("large-provider.so");
+    std::fs::write(
+        &source,
+        "unsigned long C_GetFunctionList(void **p){(void)p;return 0;}\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&path)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(2 << 20)
+        .unwrap();
+    (dir, path)
+}
+
+fn scanned_module_for(view: &ProcessView, path: &std::path::Path) -> ScannedModule {
+    let key = object_facts(path).0;
+    ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path: path.display().to_string(),
+        tables_scan_finished: false,
+        decoder_abi: Some(if usize::BITS == 64 {
+            ElfAbi::Lp64
+        } else {
+            ElfAbi::Ilp32
+        }),
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    }
+}
+
+/// Important-2: identity hashing charges the window only, never the
+/// per-object allowance: a 2 MiB provider pins under a 1 MiB
+/// per-object allowance with an 8 MiB window.
+#[test]
+fn provider_pin_charges_hashing_to_the_window_not_the_object() {
+    let (_dir, path) = large_pinnable_provider();
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let modules = vec![scanned_module_for(&view, &path)];
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 1 << 20,
+        total_bytes: 8 << 20,
+    });
+    let (pinned, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(pinned.pinned().count(), 1);
+    assert!(
+        budget.attempted_io_bytes() >= 2 << 20,
+        "the full 2 MiB hash must be charged, got {}",
+        budget.attempted_io_bytes()
+    );
+}
+
+/// Important-2: the same window-only hashing under Inventory, and the
+/// pin neither stops the pass nor misnames its (absent) ceiling.
+#[test]
+fn inventory_provider_pin_charges_hashing_to_the_window_not_the_object() {
+    use crate::discovery::scan::{
+        InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
+    };
+    let (_dir, path) = large_pinnable_provider();
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let modules = vec![scanned_module_for(&view, &path)];
+    let window = InventoryWindowLimits::new(8 << 20, 1 << 20, 4096, 32768, 4096).unwrap();
+    let retained = InventoryRetainedLimits::new(512, 512, 512, 4, 4, 64 * 1024).unwrap();
+    let limits = InventoryDiscoveryLimits::new(1 << 20, window, retained).unwrap();
+    let mut budget = CaptureWorkBudget::for_inventory(limits);
+    let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+    let scan = budget.checkpoint(token.clone()).unwrap();
+    let (pinned, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(pinned.pinned().count(), 1);
+    assert_eq!(budget.stopped_reason(), None);
+    budget.finish_scan(scan).unwrap();
+    budget.finish_window(token).unwrap();
+}
+
 #[test]
 fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     use std::os::unix::fs::MetadataExt as _;
@@ -72714,7 +72815,7 @@ int main(int argc, char **argv) {
             .skipped()
             .iter()
             .any(|skip| skip.subject.ends_with("provider.so")
-                && skip.reason.contains("attempted-I/O ceiling")),
+                && skip.reason.contains("per-object I/O allowance reached")),
         "the starved allowance keeps the named gap: {:?}",
         outcome.skipped()
     );

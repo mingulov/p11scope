@@ -1404,7 +1404,8 @@ fn per_operation_allowance_degrades_as_a_named_gap_not_a_size_refusal() {
     );
     assert!(
         skipped.iter().any(|skip| {
-            skip.subject.ends_with("capped.so") && skip.reason.contains("attempted-I/O ceiling")
+            skip.subject.ends_with("capped.so")
+                && skip.reason.contains("per-object I/O allowance reached")
         }),
         "the exhausted allowance keeps its named gap: {skipped:?}"
     );

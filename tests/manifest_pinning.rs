@@ -2488,7 +2488,7 @@ fn an_object_over_the_byte_budget_is_skipped_with_the_named_gap() {
     // Extend `hold` with a sparse tail past the absolute 64 MiB mount-table
     // ceiling: the allowance then never binds the table before the product's
     // own ceiling does, on any host. Bytes past the ELF's segments are never
-    // loaded. v0.8.0: the hash streams to the allowance, then degrades
+    // loaded. v0.8.0: the hash reads to the window allowance, then degrades
     // through the I/O ceiling's named gap (never a size refusal, and the
     // partial digest is never trusted).
     const MOUNT_TABLE_CEILING: u64 = 64 * 1024 * 1024;
@@ -2507,8 +2507,8 @@ fn an_object_over_the_byte_budget_is_skipped_with_the_named_gap() {
         "hold was not extended: {len}"
     );
     let limits = ScanLimits {
-        per_object_bytes: len - 1,
-        total_bytes: u64::MAX,
+        per_object_bytes: u64::MAX,
+        total_bytes: len - 1,
     };
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
         child.pid(),

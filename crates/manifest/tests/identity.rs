@@ -307,3 +307,168 @@ fn inspect_matches_snapshot_on_valid_image() {
         );
     }
 }
+
+/// v0.8.0: no object is refused for its own size. A sparse 2 GiB file
+/// (opening stats only, so this stays instant) opens exactly like a
+/// small one.
+#[test]
+fn open_object_accepts_files_past_the_old_size_cap() {
+    let d = tmpdir("open-large");
+    let path = d.join("large.bin");
+    let file = std::fs::File::create(&path).unwrap();
+    let len = 2 * 1024 * 1024 * 1024u64;
+    file.set_len(len).unwrap();
+    drop(file);
+    let opened = open_object(&path).unwrap();
+    assert_eq!(opened.metadata().unwrap().len(), len);
+}
+
+/// v0.8.0: inspect streams a sparse provider one chunk past the old
+/// 512 MiB cap instead of refusing it: same exports/ABI as the
+/// unextended image, reads in bounded chunks covering the whole file
+/// (never one whole-file read), and a whole-file SHA-256 matching the
+/// system `sha256sum` oracle (one debug hash pass; the oracle is instant).
+#[test]
+fn inspect_streams_a_large_sparse_provider() {
+    use std::cell::Cell;
+
+    let d = tmpdir("inspect-large");
+    let provider = cc_provider(&d, "provider.so");
+    let small = open_object(&provider).unwrap();
+    let small_inspected = inspect_file_with_reader_exporting(
+        &small,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        INSPECT_REGISTRY,
+    )
+    .unwrap();
+    let len = 512 * 1024 * 1024 + 1024 * 1024u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&provider)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+    assert_eq!(std::fs::metadata(&provider).unwrap().len(), len);
+
+    let file = open_object(&provider).unwrap();
+    let max_chunk = Cell::new(0usize);
+    let calls = Cell::new(0u64);
+    let mut covered = 0u64;
+    let inspected = inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| {
+            calls.set(calls.get() + 1);
+            max_chunk.set(max_chunk.get().max(bytes.len()));
+            let read = file.read_at(bytes, offset)?;
+            if read != 0 {
+                assert_eq!(
+                    offset, covered,
+                    "hash reads must cover 0..{len} contiguously, gap at {offset}"
+                );
+                covered += read as u64;
+            }
+            Ok(read)
+        },
+        INSPECT_REGISTRY,
+    )
+    .unwrap();
+    assert!(inspected.identity.reusable);
+    assert_eq!(inspected.abi, small_inspected.abi);
+    assert_eq!(inspected.exports, small_inspected.exports);
+    assert_eq!(
+        inspected.executable_ranges,
+        small_inspected.executable_ranges
+    );
+    assert!(
+        calls.get() > 1,
+        "one read cannot cover {len} bytes in bounded chunks"
+    );
+    assert!(
+        max_chunk.get() <= 1024 * 1024,
+        "chunk {} exceeds the 1 MiB streaming bound",
+        max_chunk.get()
+    );
+    assert_eq!(covered, len, "the hash must cover the whole file");
+
+    let output = Command::new("sha256sum").arg(&provider).output().unwrap();
+    assert!(output.status.success(), "sha256sum failed");
+    let expected = String::from_utf8(output.stdout).unwrap();
+    let expected = expected.split_whitespace().next().unwrap().to_string();
+    assert_eq!(
+        inspected.identity.sha256.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+/// Healthy twin: the same streaming shape on a small file, with the
+/// digest checked against an independent in-test hash.
+#[test]
+fn inspect_streams_a_small_provider_in_bounded_chunks() {
+    use sha2::Digest as _;
+    use std::cell::Cell;
+
+    let d = tmpdir("inspect-small-stream");
+    let provider = cc_provider(&d, "provider.so");
+    // Three chunks plus a tail, so chunking is observable.
+    let pad = 2 * 1024 * 1024 + 3;
+    let mut bytes = std::fs::read(&provider).unwrap();
+    bytes.resize(bytes.len() + pad, 0xA5);
+    // Padding past EOF keeps the image parseable (segments stay in range).
+    std::fs::write(&provider, &bytes).unwrap();
+    let len = bytes.len() as u64;
+
+    let file = open_object(&provider).unwrap();
+    let max_chunk = Cell::new(0usize);
+    let calls = Cell::new(0u64);
+    let mut oracle = sha2::Sha256::new();
+    let mut covered = 0u64;
+    let inspected = inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| {
+            calls.set(calls.get() + 1);
+            max_chunk.set(max_chunk.get().max(bytes.len()));
+            let read = file.read_at(bytes, offset)?;
+            if read != 0 {
+                assert_eq!(offset, covered, "gap at {offset}");
+                oracle.update(&bytes[..read]);
+                covered += read as u64;
+            }
+            Ok(read)
+        },
+        INSPECT_REGISTRY,
+    )
+    .unwrap();
+    assert!(inspected.identity.reusable);
+    assert!(calls.get() > 1, "small file must still stream");
+    assert!(max_chunk.get() <= 1024 * 1024);
+    assert_eq!(covered, len);
+    let expected: String = oracle
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        inspected.identity.sha256.as_deref(),
+        Some(expected.as_str())
+    );
+    let oracle_hex: String = sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(expected, oracle_hex);
+}
+
+/// Healthy twin: an empty file still refuses as non-ELF (never a mapping
+/// failure), before and after the streaming inspect.
+#[test]
+fn inspect_empty_file_reports_not_parseable() {
+    let d = tmpdir("inspect-empty");
+    let path = d.join("empty.so");
+    std::fs::write(&path, b"").unwrap();
+    let file = open_object(&path).unwrap();
+    let error = inspect_file(&file).unwrap_err();
+    assert!(
+        error.contains("not parseable"),
+        "empty file must refuse as non-ELF, got {error:?}"
+    );
+}

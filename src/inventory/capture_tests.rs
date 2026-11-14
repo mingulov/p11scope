@@ -3816,16 +3816,17 @@ fn detach_lines_for(backend: LaneBackend, attached: usize) -> Vec<String> {
     lines
 }
 
-/// The unsettled Singles detach line estimates the remaining wait in
-/// plain English and offers the immediate exit: the reference run's
-/// 4683 links read "about 6 minutes".
+/// The unsettled Singles detach line states the remaining wait as an
+/// upper bound in plain English and offers the stop-waiting exit: the
+/// reference run's 4683 links read "up to about 6 minutes".
 #[test]
 fn unsettled_singles_detach_line_estimates_remaining_minutes() {
     assert_eq!(
         detach_lines_for(LaneBackend::singles(), 4683),
         [
             "p11scope: output attempts finished; detaching the remaining native probes of \
-             4683 endpoints, about 6 minutes remaining (press Ctrl-C again to exit now)",
+             4683 endpoints, up to about 6 minutes remaining (press Ctrl-C again to stop waiting; \
+             the kernel may still take this long to release the probes)",
             "p11scope: native probes detached",
         ]
     );
@@ -3852,8 +3853,9 @@ fn unsettled_singles_detach_estimate_renders_plain_durations() {
     }
 }
 
-/// Multi detaches fast enough that no estimate is meaningful: the
-/// unsettled line keeps the endpoint count and the immediate exit.
+/// Multi carries no estimate for lack of a measured per-link rate
+/// (its detach can still outlast the report under load): the unsettled
+/// line keeps the endpoint count and the stop-waiting exit.
 #[test]
 fn unsettled_multi_detach_line_carries_no_estimate() {
     assert_eq!(
@@ -3868,7 +3870,8 @@ fn unsettled_multi_detach_line_carries_no_estimate() {
         ),
         [
             "p11scope: output attempts finished; detaching the remaining native probes of \
-             20167 endpoints (press Ctrl-C again to exit now)",
+             20167 endpoints (press Ctrl-C again to stop waiting; \
+             the kernel releases the remaining probes on exit)",
             "p11scope: native probes detached",
         ]
     );

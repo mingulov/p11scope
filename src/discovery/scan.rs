@@ -8485,7 +8485,6 @@ mod tests {
         _dir: tempfile::TempDir,
         path: PathBuf,
         extra: Vec<PathBuf>,
-        width: usize,
         view: ProcessView,
         maps_a: String,
         maps_b: String,
@@ -8627,10 +8626,8 @@ mod tests {
     }
 
     impl BracketFixture {
-        fn new(width: usize, populated: bool) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("provider.so");
-            // Minimal independent x86 ELF header; the real ELF reader selects ABI.
+        /// Minimal independent x86 ELF header; the real ELF reader selects ABI.
+        fn minimal_provider_elf(width: usize) -> Vec<u8> {
             let mut elf = vec![0u8; 64];
             elf[..7].copy_from_slice(&[
                 0x7f,
@@ -8653,60 +8650,133 @@ mod tests {
                 elf[42..44].copy_from_slice(&32u16.to_le_bytes());
                 elf[46..48].copy_from_slice(&40u16.to_le_bytes());
             }
-            std::fs::write(&path, elf).unwrap();
-            let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
-            let file = File::open(&path).unwrap();
-            let key = crate::discovery::identity::retained_object_key(
-                &view,
-                &file,
-                &mut CaptureWorkBudget::default(),
-            )
-            .unwrap();
-            let identity = format!(
-                "{:x}:{:x} {} {}",
-                key.device.major,
-                key.device.minor,
-                key.inode,
-                path.display()
-            );
-            let maps_a = format!(
-                "1000-2000 r-xp 00000000 {identity}\n\
-                 4000-6000 rw-p 00002000 {identity}\n\
-                 7000-8000 r--p 00004000 {identity}\n\
-                 9000-a000 r-xp 00000000 08:01 999 /dependency.so\n\
-                 b000-c000 r-xp 00005000 {identity}\n"
-            );
-            let mem = tempfile::tempfile().unwrap();
-            mem.set_len(0xc000).unwrap();
-            if populated {
-                let mut table = vec![0u8; 69 * width];
-                table[..2].copy_from_slice(&[2, 40]);
-                for slot in 0..68 {
-                    // Null slot plus both provider and dependency function targets.
-                    let pointer: u64 = match slot {
-                        0 => 0x1100,
-                        1 => 0,
-                        _ => 0x9100,
-                    };
-                    table[(slot + 1) * width..(slot + 2) * width]
-                        .copy_from_slice(&pointer.to_le_bytes()[..width]);
-                }
-                mem.write_all_at(&table, 0x4800).unwrap();
-                for (slot, value) in [0xb100u64, 0x4800, 0].into_iter().enumerate() {
-                    mem.write_all_at(
-                        &value.to_le_bytes()[..width],
-                        0x7100 + (slot * width) as u64,
-                    )
-                    .unwrap();
-                }
-                mem.write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", 0xb100)
-                    .unwrap();
+            elf
+        }
+
+        fn populate_provider_memory(mem: &File, base: u64, width: usize) {
+            let mut table = vec![0u8; 69 * width];
+            table[..2].copy_from_slice(&[2, 40]);
+            for slot in 0..68 {
+                // Null slot plus own and dependency function targets.
+                let pointer: u64 = match slot {
+                    0 => base + 0x1100,
+                    1 => 0,
+                    _ => 0x9100,
+                };
+                table[(slot + 1) * width..(slot + 2) * width]
+                    .copy_from_slice(&pointer.to_le_bytes()[..width]);
             }
+            mem.write_all_at(&table, base + 0x4800).unwrap();
+            for (slot, value) in [base + 0xb100, base + 0x4800, 0].into_iter().enumerate() {
+                mem.write_all_at(
+                    &value.to_le_bytes()[..width],
+                    base + 0x7100 + (slot * width) as u64,
+                )
+                .unwrap();
+            }
+            mem.write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", base + 0xb100)
+                .unwrap();
+        }
+
+        fn new(width: usize, populated: bool) -> Self {
+            Self::with_providers(width, populated, &[])
+        }
+
+        /// Build `provider.so` plus `extra_names` at `0x10000 * index` ranges,
+        /// creating all backing files up front and assigning names in strictly
+        /// ascending `ObjectKey` order so `candidate_groups` visits
+        /// `provider.so` then `extra_names` deterministically even when
+        /// concurrent tempdir churn reuses freed lower inodes.
+        fn with_providers(width: usize, populated: bool, extra_names: &[&str]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let view = ProcessView::open(ProcessViewId(71), std::process::id()).unwrap();
+            let elf = Self::minimal_provider_elf(width);
+            let total = 1 + extra_names.len();
+            let mut staged = Vec::with_capacity(total);
+            for index in 0..total {
+                let stage_path = dir.path().join(format!(".stage-{index}"));
+                std::fs::write(&stage_path, &elf).unwrap();
+                let file = File::open(&stage_path).unwrap();
+                let key = crate::discovery::identity::retained_object_key(
+                    &view,
+                    &file,
+                    &mut CaptureWorkBudget::default(),
+                )
+                .unwrap();
+                staged.push((key, stage_path));
+            }
+            staged.sort_by_key(|(key, _)| *key);
+
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(if total == 1 {
+                0xc000
+            } else {
+                0x10000u64 * total as u64
+            })
+            .unwrap();
+
+            let mut maps_a = String::new();
+            let mut ordered_keys = Vec::with_capacity(total);
+            let mut paths = Vec::with_capacity(total);
+            for (index, ((expected_key, stage_path), final_name)) in staged
+                .into_iter()
+                .zip(std::iter::once("provider.so").chain(extra_names.iter().copied()))
+                .enumerate()
+            {
+                let final_path = dir.path().join(final_name);
+                std::fs::rename(&stage_path, &final_path).unwrap();
+                let file = File::open(&final_path).unwrap();
+                let key = crate::discovery::identity::retained_object_key(
+                    &view,
+                    &file,
+                    &mut CaptureWorkBudget::default(),
+                )
+                .unwrap();
+                assert_eq!(key, expected_key);
+                let identity = format!(
+                    "{:x}:{:x} {} {}",
+                    key.device.major,
+                    key.device.minor,
+                    key.inode,
+                    final_path.display()
+                );
+                let base = 0x10000u64 * index as u64;
+                maps_a.push_str(&format!(
+                    "{:x}-{:x} r-xp 00000000 {identity}\n\
+                     {:x}-{:x} rw-p 00002000 {identity}\n\
+                     {:x}-{:x} r--p 00004000 {identity}\n",
+                    base + 0x1000,
+                    base + 0x2000,
+                    base + 0x4000,
+                    base + 0x6000,
+                    base + 0x7000,
+                    base + 0x8000,
+                ));
+                if index == 0 {
+                    maps_a.push_str("9000-a000 r-xp 00000000 08:01 999 /dependency.so\n");
+                }
+                maps_a.push_str(&format!(
+                    "{:x}-{:x} r-xp 00005000 {identity}\n",
+                    base + 0xb000,
+                    base + 0xc000,
+                ));
+                if populated {
+                    Self::populate_provider_memory(&mem, base, width);
+                }
+                ordered_keys.push(key);
+                paths.push(final_path);
+            }
+            assert!(
+                ordered_keys.windows(2).all(|w| w[0] < w[1]),
+                "provider ObjectKeys must be strictly ascending: {ordered_keys:?}"
+            );
+            let mut paths = paths.into_iter();
+            let path = paths.next().unwrap();
+            let extra = paths.collect();
             Self {
                 _dir: dir,
                 path,
-                extra: Vec::new(),
-                width,
+                extra,
                 view,
                 maps_b: maps_a.clone(),
                 maps_a,
@@ -8777,98 +8847,6 @@ mod tests {
             .unwrap();
             self.log.borrow_mut().push("publication".into());
             (outcome, examined)
-        }
-
-        /// A further populated provider file in fresh address ranges, for
-        /// ceiling tests: the first provider keeps its layout, each added
-        /// one mirrors it (executable, writable data with the table,
-        /// readable interface triple, executable name bytes) at
-        /// `0x10000` per addition. Both maps snapshots gain the ranges,
-        /// so the bracket passes unless the test mutates it.
-        fn add_provider(&mut self, name: &str) {
-            let base = 0x10000u64 * (self.extra.len() as u64 + 1);
-            let width = self.width;
-            // Minimal independent ELF header, mirroring `new`.
-            let mut elf = vec![0u8; 64];
-            elf[..7].copy_from_slice(&[
-                0x7f,
-                b'E',
-                b'L',
-                b'F',
-                if width == 8 { 2 } else { 1 },
-                1,
-                1,
-            ]);
-            elf[16..18].copy_from_slice(&3u16.to_le_bytes());
-            elf[18..20].copy_from_slice(&(if width == 8 { 62u16 } else { 3 }).to_le_bytes());
-            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
-            if width == 8 {
-                elf[52..54].copy_from_slice(&64u16.to_le_bytes());
-                elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-                elf[58..60].copy_from_slice(&64u16.to_le_bytes());
-            } else {
-                elf[40..42].copy_from_slice(&52u16.to_le_bytes());
-                elf[42..44].copy_from_slice(&32u16.to_le_bytes());
-                elf[46..48].copy_from_slice(&40u16.to_le_bytes());
-            }
-            let path = self._dir.path().join(name);
-            std::fs::write(&path, elf).unwrap();
-            let file = File::open(&path).unwrap();
-            let key = crate::discovery::identity::retained_object_key(
-                &self.view,
-                &file,
-                &mut CaptureWorkBudget::default(),
-            )
-            .unwrap();
-            let identity = format!(
-                "{:x}:{:x} {} {}",
-                key.device.major,
-                key.device.minor,
-                key.inode,
-                path.display()
-            );
-            let lines = format!(
-                "{:x}-{:x} r-xp 00000000 {identity}\n\
-                 {:x}-{:x} rw-p 00002000 {identity}\n\
-                 {:x}-{:x} r--p 00004000 {identity}\n\
-                 {:x}-{:x} r-xp 00005000 {identity}\n",
-                base + 0x1000,
-                base + 0x2000,
-                base + 0x4000,
-                base + 0x6000,
-                base + 0x7000,
-                base + 0x8000,
-                base + 0xb000,
-                base + 0xc000,
-            );
-            self.maps_a.push_str(&lines);
-            self.maps_b.push_str(&lines);
-            self.mem.set_len(base + 0x10000).unwrap();
-            let mut table = vec![0u8; 69 * width];
-            table[..2].copy_from_slice(&[2, 40]);
-            for slot in 0..68 {
-                // Null slot plus own and dependency function targets.
-                let pointer: u64 = match slot {
-                    0 => base + 0x1100,
-                    1 => 0,
-                    _ => 0x9100,
-                };
-                table[(slot + 1) * width..(slot + 2) * width]
-                    .copy_from_slice(&pointer.to_le_bytes()[..width]);
-            }
-            self.mem.write_all_at(&table, base + 0x4800).unwrap();
-            for (slot, value) in [base + 0xb100, base + 0x4800, 0].into_iter().enumerate() {
-                self.mem
-                    .write_all_at(
-                        &value.to_le_bytes()[..width],
-                        base + 0x7100 + (slot * width) as u64,
-                    )
-                    .unwrap();
-            }
-            self.mem
-                .write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", base + 0xb100)
-                .unwrap();
-            self.extra.push(path);
         }
 
         fn assert_refused(&mut self, budget: &mut CaptureWorkBudget, reason: &str) {
@@ -9309,9 +9287,8 @@ mod tests {
         // sizes the test ceiling so exactly the bracket starves: refused
         // files break their sweep early, so a fully-decoding control
         // would oversize the ceiling and the bracket would pass.
-        let mut control = BracketFixture::new(8, true);
-        control.add_provider("provider2.so");
-        control.add_provider("provider3.so");
+        let mut control =
+            BracketFixture::with_providers(8, true, &["provider2.so", "provider3.so"]);
         let mut control_budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut control_budget, MAX_TABLE_CANDIDATES - 1);
         let control_sat_work = control_budget.work_units_count();
@@ -9332,9 +9309,7 @@ mod tests {
             "the control bracket passes: {control_outcome:?}"
         );
 
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
-        f.add_provider("provider3.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so", "provider3.so"]);
         let mut budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES - 1);
         let scan_work =
@@ -9412,9 +9387,7 @@ mod tests {
     /// the bracket passes, and no undecoded gap is invented.
     #[test]
     fn healthy_scan_decodes_all_providers_without_an_undecoded_gap() {
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
-        f.add_provider("provider3.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so", "provider3.so"]);
         let mut budget = CaptureWorkBudget::default();
         let hints = f.provider_paths();
         let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
@@ -9592,8 +9565,7 @@ mod tests {
     /// one, and the passing bracket validates the decoded module.
     #[test]
     fn table_ceiling_counts_refused_files_when_the_bracket_passes() {
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
         let mut budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES - 1);
         let hints = f.provider_paths();
@@ -9635,6 +9607,45 @@ mod tests {
         );
     }
 
+    /// Regression test: multi-provider bracket fixtures must assign
+    /// `provider.so` and subsequent providers strictly ascending
+    /// `ObjectKey`s even after directory churn frees lower inodes, so
+    /// `candidate_groups` (`BTreeMap<ObjectKey, _>`) visits `hints[0]`
+    /// before `hints[1]`.
+    #[test]
+    fn bracket_fixture_orders_provider_object_keys_ascending() {
+        for _ in 0..16 {
+            let churn = tempfile::tempdir().unwrap();
+            let mut scratch = Vec::new();
+            for i in 0..6 {
+                let p = churn.path().join(format!("churn-{i}"));
+                std::fs::write(&p, b"churn").unwrap();
+                scratch.push(p);
+            }
+            for p in scratch.into_iter().step_by(2) {
+                std::fs::remove_file(p).unwrap();
+            }
+            let f = BracketFixture::with_providers(8, true, &["provider2.so", "provider3.so"]);
+            let hints = f.provider_paths();
+            let keys: Vec<_> = hints
+                .iter()
+                .map(|path| {
+                    let file = File::open(path).unwrap();
+                    crate::discovery::identity::retained_object_key(
+                        &f.view,
+                        &file,
+                        &mut CaptureWorkBudget::default(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(
+                keys.windows(2).all(|w| w[0] < w[1]),
+                "fixture provider ObjectKeys must stay ascending: {keys:?}"
+            );
+        }
+    }
+
     /// The stop-break site carries the same plain row: with the table
     /// ceiling fully saturated and the work budget sized to stop inside
     /// the first provider's tables scan, the refused module breaks the
@@ -9645,8 +9656,7 @@ mod tests {
     #[test]
     fn refused_file_stopped_mid_scan_keeps_its_plain_ceiling_row() {
         fn break_shape(delta: u64) -> Option<ScanOutcome> {
-            let mut probe = BracketFixture::new(8, true);
-            probe.add_provider("provider2.so");
+            let mut probe = BracketFixture::with_providers(8, true, &["provider2.so"]);
             let mut budget = CaptureWorkBudget::default();
             saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
             budget.work_ceiling = budget.work_units_count() + delta;
@@ -9665,8 +9675,7 @@ mod tests {
             .find(|delta| break_shape(*delta).is_some())
             .expect("a probe ceiling stops inside the first refused scan");
 
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
         let mut budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
         budget.work_ceiling = budget.work_units_count() + delta;
@@ -9832,8 +9841,7 @@ mod tests {
     #[test]
     fn starved_bracket_drops_a_proven_changed_module_and_keeps_the_later_unproven_one() {
         fn changed_first() -> BracketFixture {
-            let mut fixture = BracketFixture::new(8, true);
-            fixture.add_provider("provider2.so");
+            let mut fixture = BracketFixture::with_providers(8, true, &["provider2.so"]);
             fixture.maps_b = fixture
                 .maps_b
                 .replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
@@ -9984,8 +9992,7 @@ mod tests {
     /// other file WAS decoded.
     #[test]
     fn window_stop_keeps_decoded_modules_with_a_true_undecoded_count() {
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
         let mut budget =
             CaptureWorkBudget::for_inventory(inventory_limits(1 << 26, 1 << 24, 1, 4096, 64, 64));
         let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
@@ -10047,8 +10054,7 @@ mod tests {
     /// decoded tables keep with the bracket failure named.
     #[test]
     fn interface_window_stop_keeps_decoded_tables() {
-        let mut f = BracketFixture::new(8, true);
-        f.add_provider("provider2.so");
+        let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
         let mut budget =
             CaptureWorkBudget::for_inventory(inventory_limits(1 << 26, 1 << 24, 64, 4096, 1, 64));
         let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
@@ -10094,8 +10100,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
         fn changed_first() -> BracketFixture {
-            let mut fixture = BracketFixture::new(8, true);
-            fixture.add_provider("provider2.so");
+            let mut fixture = BracketFixture::with_providers(8, true, &["provider2.so"]);
             fixture.maps_b = fixture
                 .maps_b
                 .replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
@@ -10266,8 +10271,7 @@ mod tests {
         let mut mismatches = Vec::new();
         let mut shapes = std::collections::BTreeMap::new();
         for delta in 1u64..=3000 {
-            let mut f = BracketFixture::new(8, true);
-            f.add_provider("provider2.so");
+            let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
             let mut budget = CaptureWorkBudget::default();
             budget.table_candidates = MAX_TABLE_CANDIDATES;
             budget.work_ceiling = budget.work_units_count() + delta;

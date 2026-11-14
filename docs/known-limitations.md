@@ -483,18 +483,30 @@ inventory keeps running to the end of the window with exact counts
 and no lost calls. Workaround: rerun the capture, or narrow the
 scope (`--pid`).
 
-### A call caught mid-flight by a tracking interruption can spend one continuation
+### A call caught mid-flight by a tracking interruption can still stop per-key tracking
 
 When per-key tracking hits a transient interruption, a call that was
-admitted just before the interruption but never joined to its key —
-or a slow call, such as key generation or smart-card signing, that
-returns after the interruption — can stall the recovery's first
-step: the recovery cannot match the orphaned call to its proof, so
-it refuses that step loudly and the lane continues past it on one of
-its 32 continuations per run. The orphaned call is still counted,
-tracking resumes afterwards, and nothing is silently dropped. Each
-such coincidence spends one continuation; repeated coincidences
-spend one each.
+already staged on a feed behind a still-running call from the same
+process is disposed as counted history with its unfinished operation
+kept in the unknown-key bucket, and tracking continues for new
+work. However, a call that was admitted into the lane stash just
+before the interruption but never joined to its key — or a slow
+call, such as key generation or smart-card signing, that returns
+after the interruption — cannot be matched to its proof at the
+recovery's claiming step: claiming refuses loudly and latches
+there. Because automatic continuation only admits transient refusals
+at the audited step, a refusal at claiming is rejected (`WrongPhase`)
+and stops the per-key lane rather than spending a continuation.
+
+When continuations do apply (at the audited step, up to 32 per
+run), once all 32 continuations are spent the next interruption
+refuses to re-arm (`BoundSpent`): the per-key lane stops for the
+rest of the run, semantic coverage is marked `PARTIAL`, stderr
+prints the semantic stop counts, and the `semantic lane stopped`
+gap reports that the lane stopped at `Audited` because it already
+continued past 32 interruptions (the per-run limit). In both stop
+cases, the broad inventory keeps running to the end of the window
+with exact call counts and semantic probes stay attached until exit.
 
 ### Calls through the p11-kit proxy can publish no mechanism names
 

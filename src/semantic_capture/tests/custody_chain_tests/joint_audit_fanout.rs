@@ -10944,7 +10944,7 @@ fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
 /// Future and the frame finishes normally — no failure, no floor. When
 /// that frame's ingest broke the stream, the idle void wipes the held
 /// call's H8 and claims; the idle drop disposes it as counted history
-/// (its observed completion kept as an unknown-key row) so the next
+/// (its closed, unfinished operation kept in the last unknown bucket) so the next
 /// frame publishes instead of tripping the recovery's fallback
 /// verification ("Joint delivery refused"). Pins the held call counted
 /// lost with its row kept, the post-void call replayed, and the void

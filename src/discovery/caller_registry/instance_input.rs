@@ -2831,17 +2831,18 @@ impl CallerRegistry {
         }
     }
 
-    /// Dispose the abandoned quantum's stranded staged Joint calls
-    /// on every retained feed (running-rearm and idle-void recovery
-    /// only): an applied abandon — or an idle ingest-break void —
-    /// strands staged-but-unreduced calls whose history the void
-    /// fenced, and the recovery's fallback verification would trip
-    /// over them. Staged calls are
-    /// per-quantum transient — a finished quantum delivers all of
-    /// them — so everything staged here is the abandoned
-    /// quantum's. Joint feeds dispose through the counted
-    /// preservation helper (their observed completions stand as
-    /// unknown-key rows beside the `record_lost` count, as on the
+    /// Dispose stranded staged Joint calls on every retained feed
+    /// (running-rearm and idle-void recovery only): an applied
+    /// abandon — or an idle ingest-break void — strands
+    /// staged-but-unreduced calls whose history the void fenced, and
+    /// the recovery's fallback verification would trip over them. In
+    /// the running-rearm case those calls come from the abandoned
+    /// quantum (or earlier calls still awaiting a seal); in the idle
+    /// case they are calls held behind a still-running same-process
+    /// call that survived a finished frame and are dropped here
+    /// before the next collect. Joint feeds dispose through the
+    /// counted preservation helper (their observed completions stand
+    /// as unknown-key rows beside the `record_lost` count, as on the
     /// loss path); any other feed's leftovers dispose as counted
     /// history. Feed modes are untouched.
     pub(crate) fn drop_abandoned_joint_staged(

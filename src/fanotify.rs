@@ -944,15 +944,17 @@ pub(crate) struct FileLearner {
 /// The armed learner between `start()` and `begin_drain`: the group,
 /// the drain channel, the startup mark coverage, whether the startup
 /// pass left a visible filesystem uncovered (filed as the finite
-/// unavailable-learning gap once the drain runs), and this kernel's
+/// unavailable-learning gap once the drain runs), this kernel's
 /// measured `FIONREAD` bytes per event (which the drain's tail and
-/// shed divide their snapshots by).
+/// shed divide their snapshots by), and whether that unit was exactly
+/// measured (`true`) or fell back (`false`).
 struct PendingArming {
     group: OwnedFd,
     tx: SyncSender<LearnMsg>,
     covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
     fionread_unit: usize,
+    fionread_exact: bool,
 }
 
 /// Opens the fanotify group for learning: the kernel queue is
@@ -1006,7 +1008,7 @@ impl FileLearner {
         // The FIONREAD unit before any filesystem mark exists: the
         // probe inode is the only marked object, so one open queues
         // exactly one event and the snapshot is the unit.
-        let fionread_unit = measure_fionread_unit(&group);
+        let (fionread_unit, fionread_exact) = measure_fionread_unit(&group);
         // The mark pass opens every visible mount: on a hung mount
         // (unreachable NFS/CIFS, dead FUSE) an open can block
         // indefinitely, which would wedge `--system` start before
@@ -1050,6 +1052,7 @@ impl FileLearner {
                     covered,
                     initial_gap_owed: uncovered > 0,
                     fionread_unit,
+                    fionread_exact,
                 }),
             },
             rx,
@@ -1082,6 +1085,7 @@ impl FileLearner {
                     arming.covered,
                     arming.initial_gap_owed,
                     arming.fionread_unit,
+                    arming.fionread_exact,
                 );
                 let _ = done_tx.send(());
             }) {
@@ -1757,6 +1761,11 @@ struct DrainCtx<'a> {
     /// `start()`: the tail and the shed owe `snapshot / unit` events.
     /// 24 before upstream `68615158c12d`, 32 after.
     fionread_unit: usize,
+    /// Whether the unit above was exactly measured (`true`) or fell back
+    /// to the header (`false`): with an exact unit the snapshot divides
+    /// evenly, so leftover owed with an empty queue is a lease-blocked
+    /// head, not over-count.
+    fionread_exact: bool,
     cache: LearnCache,
     stats: DrainStats,
     /// Inode ignore marks placed so far (bounded by
@@ -1983,11 +1992,12 @@ impl DrainCtx<'_> {
     /// Counts one device-node miss (`EBUSY`/`ENXIO`/`ENODEV`) as
     /// unreadable without filing it: the head event named a file the
     /// observer could never open (a single-open device held by its
-    /// owner, a vanished node), not a lost learning event. The 1 ms
-    /// pacing matches `note_read_error`.
+    /// owner, a vanished node), not a lost learning event. No pacing:
+    /// each miss consumes a head, so it cannot spin, and a 1 ms sleep
+    /// per miss would turn a burst of device events into a tail-deadline
+    /// loss.
     fn note_unreadable_without_filing(&mut self) {
         self.stats.unreadable = self.stats.unreadable.saturating_add(1);
-        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     fn process_event(&mut self, event: ParsedFanotifyEvent, window: SendWindow) -> bool {
@@ -2130,20 +2140,17 @@ fn queued_event_bytes(raw: std::os::unix::io::RawFd) -> Option<usize> {
 /// unit. Never fails `start()`: any measurement doubt falls back to
 /// the 24-byte header, the smaller unit, which only ever over-counts
 /// the owed events — and over-draining ends at `EAGAIN` instead of
-/// abandoning a tail.
-fn measure_fionread_unit(group: &OwnedFd) -> usize {
+/// abandoning a tail. Returns the unit and whether it was exactly
+/// measured (`true`) or fell back (`false`): with an exact unit the
+/// snapshot divides evenly, so leftover owed with an empty queue is a
+/// lease-blocked head, not over-count.
+fn measure_fionread_unit(group: &OwnedFd) -> (usize, bool) {
     // A probe file nobody else opens: created unmarked (so no event),
     // unlinked at once (no pathname left to swap for a FIFO or to go
     // stale on SIGKILL), inode-marked, opened once through
     // `/proc/self/fd` (exactly one event), drained, unmarked.
     // `tempfile` is a dev-dependency, so plain stdio it is.
     static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    struct ProbeGuard(std::path::PathBuf);
-    impl Drop for ProbeGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
     let mut probe = None;
     for _ in 0..8 {
         let id = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2156,18 +2163,20 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
             .open(&path)
         {
             Ok(file) => {
-                probe = Some((file, ProbeGuard(path)));
+                probe = Some((file, path));
                 break;
             }
             Err(_) => continue,
         }
     }
-    let Some((probe, guard)) = probe else {
-        return FANOTIFY_META_LEN;
+    let Some((probe, path)) = probe else {
+        return (FANOTIFY_META_LEN, false);
     };
     // Unlink while open: the inode stays alive behind the fd for the
-    // mark and the fd reopen below, but no pathname remains.
-    let _ = std::fs::remove_file(&guard.0);
+    // mark and the fd reopen below, but no pathname remains. Unlinked
+    // once, with no guard: a second unlink could delete a file someone
+    // else created at that name since.
+    let _ = std::fs::remove_file(&path);
     // SAFETY: libc call; the group and probe descriptors are valid, and
     // a NULL pathname marks the probe's inode (the default mark type).
     let marked = 0
@@ -2181,7 +2190,7 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
             )
         };
     if !marked {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     }
     // Reopen through the fd, never the pathname: a pathname reopen in a
     // caller-owned TMPDIR could be swapped for a FIFO (blocking `start`)
@@ -2226,23 +2235,29 @@ fn measure_fionread_unit(group: &OwnedFd) -> usize {
 /// (24-in-32 on an old kernel, 32-in-32 on a new one). Anything else —
 /// no snapshot, no record, several records, a near-miss or oversized
 /// snapshot — falls back to the 24-byte header (over-counts, safe).
-fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[u8]) -> usize {
+/// Returns the unit and whether it was exactly measured (`true`) or
+/// fell back (`false`).
+fn fionread_unit_from_probe(
+    snapshot: Option<usize>,
+    got: libc::ssize_t,
+    buf: &[u8],
+) -> (usize, bool) {
     let Ok(got) = usize::try_from(got) else {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     };
     let Some(snapshot) = snapshot else {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     };
     if snapshot != FANOTIFY_META_LEN && snapshot != got {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     }
     if buf.len() < got {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     }
     if count_parsed_records(&buf[..got]) != 1 {
-        return FANOTIFY_META_LEN;
+        return (FANOTIFY_META_LEN, false);
     }
-    snapshot
+    (snapshot, true)
 }
 
 /// One meaning for group reads in the live loop and the tail: data to
@@ -2410,18 +2425,23 @@ fn drain_final_tail_with(
                 }
             }
             GroupReadOutcome::Empty => {
-                if owed == 0 {
-                    return true;
-                }
                 // Owed events remain but the read says empty: the empty
                 // could be a conflicting-lease `EWOULDBLOCK` (the same
                 // errno as `EAGAIN`) that consumed the head with more
                 // queued behind it. Re-check the queue: more bytes means
-                // continue, an empty queue means the ceiling over-counted
-                // by less than one event (harmless, decided), and an
-                // unreadable queue gives up.
+                // continue, and an unreadable queue gives up. An empty
+                // queue with an exact unit means the last event was
+                // lease-blocked (the snapshot divides evenly, so leftover
+                // owed is a consumed head): count it, decided. An empty
+                // queue after a fallback is the ceiling over-count
+                // (harmless, decided).
                 match queued_event_bytes(raw) {
-                    Some(0) => return true,
+                    Some(0) => {
+                        if ctx.fionread_exact {
+                            ctx.note_unreadable_without_filing();
+                        }
+                        return true;
+                    }
                     Some(_) => continue,
                     None => {
                         ctx.state.loss_other.fetch_add(1, Ordering::Relaxed);
@@ -2591,6 +2611,7 @@ fn drain_loop(
     mut covered: BTreeSet<MountIdentity>,
     initial_gap_owed: bool,
     fionread_unit: usize,
+    fionread_exact: bool,
 ) {
     // Scheduling note: loader processes live ~15 ms, so the drain
     // wants prompt scheduling to name them (files still stage via
@@ -2612,6 +2633,7 @@ fn drain_loop(
         state: &state,
         self_pid: std::process::id(),
         fionread_unit,
+        fionread_exact,
         cache: LearnCache::new(),
         stats: DrainStats::default(),
         ignore_marks: 0,
@@ -2691,6 +2713,21 @@ fn drain_loop(
             // unproven, which files the unavailable-learning gap. A
             // pending pass starts nothing (never stacks another), but
             // the tick is a gap, not a silent skip.
+            // A pass that finished between this iteration's adopt above
+            // and the tick would otherwise file a false gap (the spawn
+            // sees it still pending): adopt again before spawning, so
+            // only a pass still running after ~30 s is unproven.
+            if let Some((next_covered, uncovered)) =
+                adopt_remark_result(&covered, &mut pending_remark)
+            {
+                covered = next_covered;
+                if uncovered > 0 && !unavailable_sent {
+                    unavailable_sent = true;
+                    if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+                        break 'drain;
+                    }
+                }
+            }
             if !spawn_remark_pass(
                 &shared_group,
                 &covered,
@@ -4188,6 +4225,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4237,6 +4275,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4343,6 +4382,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4378,6 +4418,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4480,12 +4521,12 @@ mod tests {
         two.extend_from_slice(&one);
         assert_eq!(
             super::fionread_unit_from_probe(Some(24), 32, &one),
-            24,
+            (24, true),
             "a 24-byte snapshot for one 32-byte record is the old unit"
         );
         assert_eq!(
             super::fionread_unit_from_probe(Some(32), 32, &one),
-            32,
+            (32, true),
             "a 32-byte snapshot for one 32-byte record is the new unit"
         );
         for (snapshot, got, buf, why) in [
@@ -4521,7 +4562,7 @@ mod tests {
         ] {
             assert_eq!(
                 super::fionread_unit_from_probe(snapshot, got, buf),
-                super::FANOTIFY_META_LEN,
+                (super::FANOTIFY_META_LEN, false),
                 "measurement doubt falls back to the header: {why}"
             );
         }
@@ -4565,6 +4606,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: UNIT,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -4602,6 +4644,162 @@ mod tests {
         );
     }
 
+    /// A tail that reads empty with events still owed and an empty queue
+    /// counts the lease-blocked last event instead of dropping it silently
+    /// when the unit is exact: with an exactly measured unit the snapshot
+    /// divides evenly, so leftover owed means a conflicting-lease
+    /// `EWOULDBLOCK` consumed the head. After a fallback the same empty
+    /// queue is the ceiling over-count (harmless, no count). (Unprivileged:
+    /// the pipe provides the snapshot; the injected read drains it, so the
+    /// re-check sees empty.)
+    #[test]
+    fn learn_tail_empty_with_no_bytes_counts_lease_last_event() {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        use std::sync::atomic::Ordering;
+        for (exact, want_unreadable, why) in [
+            (true, 1u64, "an exact unit counts the lease-blocked head"),
+            (false, 0u64, "a fallback over-count stays silent"),
+        ] {
+            let mut fds = [0; 2];
+            // SAFETY: libc pipe into a live array; checked before use.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: fresh owned fds from the pipe above.
+            let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+            let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+            // One event owed.
+            let payload = [7u8; 24];
+            // SAFETY: libc write of a live buffer to the pipe.
+            let written = unsafe {
+                libc::write(
+                    writer.as_raw_fd(),
+                    payload.as_ptr() as *const libc::c_void,
+                    payload.len(),
+                )
+            };
+            assert_eq!(written, payload.len() as libc::ssize_t);
+            let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+            let state = std::sync::Arc::new(super::LearnShutdownState::default());
+            let mut ctx = super::DrainCtx {
+                group: reader.as_raw_fd(),
+                tx: &tx,
+                state: &state,
+                self_pid: std::process::id(),
+                fionread_unit: super::FANOTIFY_META_LEN,
+                fionread_exact: exact,
+                cache: super::LearnCache::new(),
+                stats: super::DrainStats::default(),
+                ignore_marks: 0,
+                marked_this_period: std::collections::HashSet::new(),
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            let done =
+                super::drain_final_tail_with(reader.as_raw_fd(), &mut ctx, &mut buf, |fd, into| {
+                    // Drain the pipe (the lease consumed the head), then report
+                    // empty: the re-check sees no bytes left.
+                    // SAFETY: libc read into a live buffer; the pipe has one payload.
+                    let _ = unsafe {
+                        libc::read(fd, into.as_mut_ptr() as *mut libc::c_void, into.len())
+                    };
+                    // SAFETY: test-only errno for the injected lease block.
+                    unsafe {
+                        *libc::__errno_location() = libc::EAGAIN;
+                    }
+                    -1
+                });
+            assert!(done, "the tail decides the drained snapshot: {why}");
+            assert_eq!(
+                ctx.stats.unreadable, want_unreadable,
+                "the empty queue with owed counts once when exact: {why}"
+            );
+            assert!(
+                !state.lost_tail.load(Ordering::Acquire),
+                "a counted lease is not a lost tail: {why}"
+            );
+        }
+    }
+
+    /// A tail that reads empty with events still owed and bytes still queued
+    /// continues past the lease block instead of deciding early: the next
+    /// read's events are still decided. (Unprivileged: the pipe provides the
+    /// snapshot; the injected reads drain it, so the re-check sees bytes.)
+    #[test]
+    fn learn_tail_empty_with_bytes_continues_past_lease() {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        // Two events owed.
+        let payload = [7u8; 48];
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        };
+        assert_eq!(written, payload.len() as libc::ssize_t);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: reader.as_raw_fd(),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut calls = 0;
+        let record = synthetic_open_record();
+        let done =
+            super::drain_final_tail_with(reader.as_raw_fd(), &mut ctx, &mut buf, |fd, into| {
+                calls += 1;
+                if calls == 1 {
+                    // The lease consumes one head: drain one unit, report empty.
+                    // The re-check still sees the second event's bytes.
+                    // SAFETY: libc read into a live buffer; the pipe has two payloads.
+                    let mut dummy = [0u8; 24];
+                    let _ = unsafe {
+                        libc::read(fd, dummy.as_mut_ptr() as *mut libc::c_void, dummy.len())
+                    };
+                    // SAFETY: test-only errno for the injected lease block.
+                    unsafe {
+                        *libc::__errno_location() = libc::EAGAIN;
+                    }
+                    return -1;
+                }
+                if calls == 2 {
+                    // The next event decides: drain the second unit, serve one record.
+                    // SAFETY: libc read into a live buffer; one payload remains.
+                    let mut dummy = [0u8; 24];
+                    let _ = unsafe {
+                        libc::read(fd, dummy.as_mut_ptr() as *mut libc::c_void, dummy.len())
+                    };
+                    into[..record.len()].copy_from_slice(&record);
+                    return record.len() as libc::ssize_t;
+                }
+                // The queue is drained: empty with nothing left.
+                // SAFETY: test-only errno for the injected drain end.
+                unsafe {
+                    *libc::__errno_location() = libc::EAGAIN;
+                }
+                -1
+            });
+        assert!(done, "the tail continues past the lease and decides");
+        assert_eq!(
+            ctx.stats.events, 1,
+            "the event after the lease is decided, not skipped"
+        );
+    }
+
     /// The period mark state clears only after a successful flush: a
     /// failed flush keeps the counter and the per-period set, so the
     /// cap keeps bounding new marks instead of undercounting past it.
@@ -4615,6 +4813,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 5,
@@ -5267,6 +5466,7 @@ mod tests {
             group,
             tx,
             fionread_unit,
+            fionread_exact,
             ..
         } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
@@ -5298,6 +5498,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit,
+            fionread_exact,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -5399,6 +5600,7 @@ mod tests {
             group,
             tx,
             fionread_unit,
+            fionread_exact,
             ..
         } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
@@ -5426,6 +5628,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit,
+            fionread_exact,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,
@@ -5537,6 +5740,7 @@ mod tests {
             state: &state,
             self_pid: std::process::id(),
             fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
             cache: super::LearnCache::new(),
             stats: super::DrainStats::default(),
             ignore_marks: 0,

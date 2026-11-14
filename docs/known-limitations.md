@@ -256,6 +256,10 @@ already for process churn. There is no per-filesystem workaround;
 wrapping the tool in `run` or passing `--prearm-module` covers a
 known provider regardless of learning.
 
+### A PKCS#11 module copied into /dev is not learned
+
+A PKCS#11 module copied into /dev (devtmpfs) is not learned by file learning.
+
 ### A provider installed through a writable mapping re-proves at the next 30 s flush
 
 File learning suppresses repeat opens of a proved-negative file with a

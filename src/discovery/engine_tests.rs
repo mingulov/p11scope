@@ -4069,6 +4069,7 @@ fn defer_stats_line_names_every_counter() {
         "terminal",
         "proof",
         "batch",
+        "refusal",
         "changed",
     ] {
         assert!(line.contains(token), "{line}");
@@ -4418,136 +4419,13 @@ fn batch_refusing_candidate_flushes_per_candidate() {
     let stats = engine.deferral_gate_stats();
     assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 0);
     assert_eq!(
-        stats.batch_flushed_changed - stats_before.batch_flushed_changed,
-        1,
-        "a new refusal changes merge inputs, so the candidate flushes"
+        stats.batch_flushed_refusal - stats_before.batch_flushed_refusal,
+        1
     );
     assert!(
         !engine.plan.modules_skipped.is_empty(),
         "the refusal reaches the published plan"
     );
-}
-
-/// Twin (§8.1 batching): steady refusals defer. A candidate whose
-/// refusals reproduce the committed refusals exactly carries no new
-/// refusal evidence (high-waters are idempotent), so it defers to the
-/// tail merge with outputs identical to an immediate merge.
-#[test]
-fn batch_steady_refusals_defer_to_one_tail_merge() {
-    let mut raw0 = overlay_module(overlay_key(210));
-    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
-    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
-    let mut big = overlay_module(overlay_key(211));
-    big.tables[0].entries = overlay_entries(&big, first_offsets(100_000));
-    let build = || {
-        let mut pins = base_pins.clone();
-        let absorb_skips = pins.absorb(overlay_pins(&[(big.key, OVERLAY_SHA, 1)]));
-        assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
-        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
-        assert!(skipped.is_empty(), "{skipped:?}");
-        let mut engine = Engine::empty();
-        engine.plan = plan::build_from_reconciled_modules(&modules);
-        engine.pinned = pins;
-        engine.modules = modules;
-        engine
-            .capture_facts
-            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
-            .unwrap();
-        engine.publish_current_capture_facts().unwrap();
-        for raw in [&raw0, &big] {
-            engine
-                .views
-                .push(ProcessView::open(raw.view, std::process::id()).unwrap());
-        }
-        // Commit the refusal once, preflighted like the inventory tick.
-        let candidate = engine
-            .live_candidate(
-                engine.pinned.clone(),
-                vec![raw0.clone(), big.clone()],
-                Vec::new(),
-            )
-            .unwrap();
-        assert!(candidate.plan.refused_modules().next().is_some());
-        let mut additions_allowed = true;
-        engine
-            .apply_candidate(
-                &mut ScriptedSession::default(),
-                candidate,
-                &mut additions_allowed,
-                true,
-                &[],
-            )
-            .unwrap();
-        engine.publish_batch_tail(true).unwrap();
-        assert!(engine.plan.refused_modules().next().is_some());
-        engine
-    };
-    // Control: identical refusing candidates publish immediately.
-    let mut full = build();
-    let full_before = publication_operation_counts(&full);
-    for _ in 0..2 {
-        let candidate = full
-            .live_candidate(
-                full.pinned.clone(),
-                vec![raw0.clone(), big.clone()],
-                Vec::new(),
-            )
-            .unwrap();
-        let mut additions_allowed = true;
-        full.apply_candidate(
-            &mut ScriptedSession::default(),
-            candidate,
-            &mut additions_allowed,
-            true,
-            &[],
-        )
-        .unwrap();
-        full.publish_batch_tail(true).unwrap();
-    }
-    let full_counts = publication_operation_counts(&full);
-    assert_eq!(
-        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
-        (2, 2),
-        "control: each steady refusing candidate publishes"
-    );
-    // Batched: identical refusals defer to one tail merge.
-    let mut batched = build();
-    let batched_before = publication_operation_counts(&batched);
-    let stats_before = batched.deferral_gate_stats();
-    batched.defer_candidate_publication = true;
-    for _ in 0..2 {
-        let candidate = batched
-            .live_candidate(
-                batched.pinned.clone(),
-                vec![raw0.clone(), big.clone()],
-                Vec::new(),
-            )
-            .unwrap();
-        let mut additions_allowed = true;
-        batched
-            .apply_candidate(
-                &mut ScriptedSession::default(),
-                candidate,
-                &mut additions_allowed,
-                true,
-                &[],
-            )
-            .unwrap();
-    }
-    batched.publish_batch_tail(true).unwrap();
-    batched.defer_candidate_publication = false;
-    let batched_counts = publication_operation_counts(&batched);
-    assert_eq!(
-        (
-            batched_counts.0 - batched_before.0,
-            batched_counts.1 - batched_before.1
-        ),
-        (1, 1),
-        "batched: steady refusals publish once, at the tail"
-    );
-    let stats = batched.deferral_gate_stats();
-    assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 2);
-    assert_publish_deferral_evidence_equal(&batched, &full);
 }
 
 /// Characterization (§8.3): the merge assigns occurrence indices per

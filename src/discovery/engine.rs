@@ -436,11 +436,11 @@ pub(crate) struct DeferralGateStats {
     /// Batch-deferred merges (published once at the batch tail instead).
     pub batch_deferred: u64,
     /// Batch-context evaluations that flushed (published per candidate)
-    /// by forcing leg: loader proof, retirement, changed merge inputs
-    /// (growth, new refusals), or anything else (unresolvable or staged
-    /// inputs).
+    /// by forcing leg: loader proof, retirement, plan refusals, changed
+    /// merge inputs, or anything else (unresolvable or staged inputs).
     pub batch_flushed_proof: u64,
     pub batch_flushed_retired: u64,
+    pub batch_flushed_refusal: u64,
     pub batch_flushed_changed: u64,
     pub batch_flushed_other: u64,
 }
@@ -19356,17 +19356,16 @@ impl Engine {
         // every merge input (plan modulo its skip list, pins, modules,
         // corroboration, fallbacks, claims, tables, table flags), so the
         // skipped merge re-folded nothing the tail does not fold whole.
-        // Changed inputs (growth, new refusals), retirements, loader
-        // proofs, staged inputs and unresolvable inputs all flush per
-        // candidate as before; steady refusals are idempotent
-        // high-waters the tail folds whole. The commit always dirtied
-        // the revision, so the revision-equal tail gate still publishes
-        // once per batch. Direct applies (no batch) publish per
-        // candidate exactly as before.
+        // Growth, retirements, loader proofs, refusals, staged inputs
+        // and unresolvable inputs all flush per candidate as before.
+        // The commit always dirtied the revision, so the revision-equal
+        // tail gate still publishes once per batch. Direct applies (no
+        // batch) publish per candidate exactly as before.
         #[cfg(not(test))]
         let batch_deferral_disabled = false;
         #[cfg(test)]
         let batch_deferral_disabled = self.batch_publication_deferral_disabled();
+        let has_refusals = self.plan.refused_modules().next().is_some();
         let batch_context =
             self.defer_candidate_publication && defer_enabled && !batch_deferral_disabled;
         let batch_defer = !defer_publication
@@ -19375,12 +19374,14 @@ impl Engine {
             && defer_staged
             && defer_stale
             && !commit_provenance
+            && !has_refusals
             && batch_inputs_reproduce;
         if batch_context && !defer_publication {
             self.note_batch_deferral_outcome(
                 batch_defer,
                 commit_provenance,
                 retired,
+                has_refusals,
                 !batch_inputs_reproduce,
             );
         }
@@ -36499,6 +36500,7 @@ impl Engine {
         deferred: bool,
         proof_present: bool,
         retired: bool,
+        has_refusals: bool,
         inputs_changed: bool,
     ) {
         let stats = &mut self.deferral_gate_stats;
@@ -36512,10 +36514,13 @@ impl Engine {
         if retired {
             stats.batch_flushed_retired = stats.batch_flushed_retired.saturating_add(1);
         }
+        if has_refusals {
+            stats.batch_flushed_refusal = stats.batch_flushed_refusal.saturating_add(1);
+        }
         if inputs_changed {
             stats.batch_flushed_changed = stats.batch_flushed_changed.saturating_add(1);
         }
-        if !proof_present && !retired && !inputs_changed {
+        if !proof_present && !retired && !has_refusals && !inputs_changed {
             stats.batch_flushed_other = stats.batch_flushed_other.saturating_add(1);
         }
     }
@@ -36532,7 +36537,7 @@ impl Engine {
     pub(crate) fn defer_stats_line(&self) -> String {
         let stats = &self.deferral_gate_stats;
         format!(
-            "p11scope: timing: defer: {} evaluated, {} deferred; fails: commit {} revision {} staged {} stale {} unpublished {} attached {} skips {} resolve {} disabled {}; retired {} evaluated {} published; terminal {} evaluated {} published; proof {}; batch deferred {} flushed proof {} retired {} changed {} other {}",
+            "p11scope: timing: defer: {} evaluated, {} deferred; fails: commit {} revision {} staged {} stale {} unpublished {} attached {} skips {} resolve {} disabled {}; retired {} evaluated {} published; terminal {} evaluated {} published; proof {}; batch deferred {} flushed proof {} retired {} refusal {} changed {} other {}",
             stats.evaluated,
             stats.deferred,
             stats.fail_commit_reproduced,
@@ -36552,6 +36557,7 @@ impl Engine {
             stats.batch_deferred,
             stats.batch_flushed_proof,
             stats.batch_flushed_retired,
+            stats.batch_flushed_refusal,
             stats.batch_flushed_changed,
             stats.batch_flushed_other,
         )

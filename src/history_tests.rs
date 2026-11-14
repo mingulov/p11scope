@@ -346,7 +346,8 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     assert_eq!(t.pending_exit_taps_for_test(), 0);
     assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
     // Repeating a retire is safe: a duplicate tap for the same exit
-    // re-collects the same key and the batch frees nothing twice.
+    // re-collects nothing — the matched generation pruned from the pid
+    // index on the first retire — so the batch frees nothing twice.
     t.note_exit_taps(
         vec![crate::history::ExitTap {
             pid: 100,
@@ -355,7 +356,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
         1000,
     );
     let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
-    assert_eq!(due, std::collections::BTreeSet::from([old]));
+    assert!(due.is_empty(), "pruned generations never re-collect");
     let closed = s.sessions().closed;
     s.retire_processes(&due);
     assert_eq!(s.sessions().closed, closed, "no double close");
@@ -515,6 +516,55 @@ fn exec_bump_resets_exit_matching_generation() {
     );
     let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert!(due.is_empty(), "the post-exec generation is spared");
+}
+
+#[test]
+fn pid_index_prune_shrinks_the_task_lens_bytes() {
+    // Flat-index twin: matched exits prune their cookies from the pid
+    // index and the index bytes ride the R9 row, so retiring tasks
+    // shrinks the row's bytes while the task count itself never
+    // shrinks; a reopen re-inserts and the bytes return. Direct
+    // registry drive: admission, matching and lens only.
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut registry = crate::history::Registry::new(domain, 16);
+    for cookie in [90u64, 91] {
+        let image = ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 0,
+        };
+        assert!(registry.admit(1, 100, image, 100).0.is_some());
+    }
+    let before = registry.memory_tasks_row();
+    assert_eq!(before.len, 2);
+    registry.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        8,
+    );
+    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert_eq!(due.len(), 2);
+    let after = registry.memory_tasks_row();
+    assert_eq!(after.len, 2, "tasks never evict");
+    assert!(
+        after.bytes < before.bytes,
+        "pruned index bytes leave the row: {} -> {}",
+        before.bytes,
+        after.bytes
+    );
+    let image = ImageIdentity {
+        task_cookie: 90,
+        exec_id: 0,
+    };
+    assert!(registry.admit(1, 100, image, 250).0.is_some());
+    assert_eq!(registry.exit_counters_for_test(), (0, 0, 1, 0));
+    let reopened = registry.memory_tasks_row();
+    assert_eq!(reopened.len, 2);
+    assert!(
+        reopened.bytes > after.bytes && reopened.bytes < before.bytes,
+        "re-insert restores one entry's bytes: {after:?} -> {reopened:?} -> {before:?}"
+    );
 }
 
 #[test]

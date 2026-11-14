@@ -107,10 +107,13 @@ pub(crate) struct Registry {
     // Keep map identity retained through destruction of the indexed tasks.
     domain: Option<crate::events::EventsDomain>,
     root_completed: bool,
-    /// pid -> admitted task cookies. Exit matching walks only this
-    /// pid's cookies instead of scanning all tasks. Grows only (tasks
-    /// are never evicted), bounded by the same task limit.
-    pid_index: BTreeMap<u32, BTreeSet<u64>>,
+    /// Admitted `(pid, task cookie)` pairs, queried by pid range. Exit
+    /// matching walks only this pid's cookies instead of scanning all
+    /// tasks. Flat (one entry per open task, no per-pid set shells):
+    /// matched exits prune their cookies, and reopen/late/exec-bump
+    /// events re-insert, so only matchable tasks stay indexed. Bounded
+    /// by the task limit; counted in the A0 lens.
+    pid_index: BTreeSet<(u32, u64)>,
     /// Transferred exits not yet retired, in tap order (tap-time
     /// producer stamps are non-decreasing down the queue).
     pending_exits: VecDeque<PendingExit>,
@@ -140,7 +143,7 @@ impl Registry {
             limit: 0,
             tasks: BTreeMap::new(),
             root_completed: false,
-            pid_index: BTreeMap::new(),
+            pid_index: BTreeSet::new(),
             pending_exits: VecDeque::new(),
             exit_tie_skipped: 0,
             exit_retire_unmatched: 0,
@@ -154,7 +157,7 @@ impl Registry {
             limit,
             tasks: BTreeMap::new(),
             root_completed: false,
-            pid_index: BTreeMap::new(),
+            pid_index: BTreeSet::new(),
             pending_exits: VecDeque::new(),
             exit_tie_skipped: 0,
             exit_retire_unmatched: 0,
@@ -167,14 +170,26 @@ impl Registry {
             .as_ref()
             .map_or(0, crate::events::EventsDomain::id)
     }
-    /// A0 lens (R9): admitted task cookies ever. Read-only; the
-    /// registry never evicts (the 262,144 cliff), so this only grows.
+    /// A0 lens (R9): admitted task cookies ever, plus the pid index
+    /// that finds them. Read-only; the registry never evicts (the
+    /// 262,144 cliff), so the task count only grows, while the index
+    /// entry count follows prunes and re-inserts. `len` counts tasks;
+    /// `bytes` covers both maps, so per-task bytes explain the index.
     pub(crate) fn memory_tasks_row(&self) -> crate::memory_counters::CounterRow {
-        crate::memory_counters::counter_row(
+        let tasks = crate::memory_counters::counter_row(
             self.tasks.len(),
             std::mem::size_of::<(u64, Task)>(),
             crate::memory_counters::HEAP_MAP_ENTRY,
-        )
+        );
+        let index = crate::memory_counters::counter_row(
+            self.pid_index.len(),
+            std::mem::size_of::<(u32, u64)>(),
+            crate::memory_counters::HEAP_MAP_ENTRY,
+        );
+        crate::memory_counters::CounterRow {
+            len: tasks.len,
+            bytes: tasks.bytes.saturating_add(index.bytes),
+        }
     }
     /// The domain comes from the sole retained EVENTS consumer, never a wire
     /// field or a live process lookup. The producer authenticates the tuple.
@@ -218,6 +233,9 @@ impl Registry {
                 task.birth_unknown_from_exec = event_ts_ns == 0;
                 task.exit_ts_ns = None;
                 reseed = true;
+                // A pruned-then-bumped task is matchable again under its
+                // new generation: re-insert (idempotent when present).
+                self.pid_index.insert((pid, image.task_cookie));
             } else if let Some(exit) = task.exit_ts_ns {
                 // A live thread on a retired cookie: after the exit the
                 // task reopens (the timestamp clears, the event admits);
@@ -230,6 +248,9 @@ impl Registry {
                     self.exit_retire_late = self.exit_retire_late.saturating_add(1);
                 }
                 reseed = true;
+                // A reopened or late event proves the pruned cookie live
+                // again: re-insert, so a later exit can match it.
+                self.pid_index.insert((pid, image.task_cookie));
                 // A birth-unknown generation provably lived to this
                 // event: upgrade, so a pre-birth exit can no longer
                 // match it while a later real exit still can.
@@ -264,10 +285,7 @@ impl Registry {
                 exit_ts_ns: None,
             },
         );
-        self.pid_index
-            .entry(pid)
-            .or_default()
-            .insert(image.task_cookie);
+        self.pid_index.insert((pid, image.task_cookie));
         (Some(key), retired, reseed)
     }
 
@@ -465,15 +483,17 @@ impl Registry {
     /// caller drops tied-but-unmatched exits immediately). Matched
     /// tasks record the exit hook time — the earliest observed, so any
     /// post-exit event reopens — never the `closed` flag, so the next
-    /// event is never refused.
+    /// event is never refused; their index entries prune, so a repeated
+    /// exit never re-collects them.
     fn match_exit_tap(&mut self, tap: &ExitTap) -> (Vec<ProcessKey>, bool) {
         let mut matched = Vec::new();
         let mut tie_seen = false;
-        let Some(cookies) = self.pid_index.get(&tap.pid) else {
-            return (matched, tie_seen);
-        };
-        // The cookie set is copied: matching mutates tasks below.
-        let cookies = cookies.iter().copied().collect::<Vec<_>>();
+        // The pid's cookies, copied: matching mutates tasks below.
+        let cookies: Vec<u64> = self
+            .pid_index
+            .range((tap.pid, 0)..=(tap.pid, u64::MAX))
+            .map(|(_, cookie)| *cookie)
+            .collect();
         let open = cookies
             .iter()
             .filter(|cookie| self.tasks.get(cookie).is_some_and(|task| !task.closed))
@@ -499,6 +519,11 @@ impl Registry {
                         .map_or(tap.hook_ts_ns, |exit| exit.min(tap.hook_ts_ns)),
                 );
                 matched.push(task.key);
+                // A matched generation is retired: prune its index entry
+                // so later exits never re-collect it. A reopen, late
+                // event or exec bump re-inserts when the cookie proves
+                // live again.
+                self.pid_index.remove(&(tap.pid, cookie));
             } else if task.first_ts_ns == tap.hook_ts_ns {
                 self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
                 tie_seen = true;

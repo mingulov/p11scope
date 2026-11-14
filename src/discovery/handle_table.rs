@@ -441,6 +441,18 @@ impl HandleTable {
             )
     }
 
+    /// The pruning pre-open check: on a hit, reap dead rows and
+    /// recheck (like [`HandleTable::acquire`]'s prune-then-retry), so
+    /// a table that only *looks* full never files a false budget
+    /// stop. A `Deferred` is filed only against a pruned table.
+    pub(crate) fn preopen_defers_pruned(&mut self, maps: &ObjectKey) -> bool {
+        if !self.preopen_defers(maps) {
+            return false;
+        }
+        self.prune(usize::MAX);
+        self.preopen_defers(maps)
+    }
+
     /// Route one proven pin: its table key plus whether it may share.
     /// Empty-digest, non-unique, `pre_copy_up` and `collapsed` pins
     /// take a fresh nonzero nonce, skip the lookup and insert-or-defer

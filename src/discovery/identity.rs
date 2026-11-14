@@ -9258,10 +9258,12 @@ fn pin_scanned_view_objects_with(
         }
         // Pre-open fast path (acquire filings only): when the table
         // is full with no row under this maps key, the pin cannot
-        // share, so it stops the scan before paying for the open. A
-        // routed key may still share; only the acquire below decides.
-        if let Filing::Acquire(table, _) = &filing
-            && table.preopen_defers(&raw.key)
+        // share, so it stops the scan before paying for the open. The
+        // check prunes and rechecks first, so dead rows never file a
+        // false stop. A routed key may still share; only the acquire
+        // below decides.
+        if let Filing::Acquire(table, _) = &mut filing
+            && table.preopen_defers_pruned(&raw.key)
         {
             record_pin_stop(
                 &mut pinned,

@@ -30511,13 +30511,18 @@ fn joint_machine_flood_buried_call_balances_only_at_drain_quiescence() {
     let txns = crate::events::drive_until_idle(6, || {
         let mut published = false;
         for _ in 0..64 {
-            let progress = fixture.service(1024).expect("scripted services never refuse");
+            let progress = fixture
+                .service(1024)
+                .expect("scripted services never refuse");
             if progress == crate::inventory_semantics::JointServiceProgress::Published {
                 published = true;
                 break;
             }
         }
-        assert!(published, "one scripted transaction publishes within 64 services");
+        assert!(
+            published,
+            "one scripted transaction publishes within 64 services"
+        );
         Ok::<bool, std::convert::Infallible>(!crate::events::events_head_pending(
             &fixture.scene.drain,
         ))

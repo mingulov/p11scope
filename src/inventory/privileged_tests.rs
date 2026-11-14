@@ -9648,7 +9648,41 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         h_bad == 0 && h_total == 2,
         "H made exactly SignInit plus its held Sign"
     );
-    let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16b-q2")?;
+    // Drain to quiescence before reading the checkpoint: each transaction
+    // delivers at most one H0 quantum, so under a fork flood fixture
+    // calls buried behind ambient records surface only after several
+    // transactions. Idle (ring consumer at producer with nothing staged)
+    // proves every submitted record reached a quantum, hence H0, hence
+    // the same transaction's finalize; with H released and DONE waited,
+    // no new call can arrive after. The bound (15 transactions cover a
+    // ~15k-record backlog; the heaviest observed flood needed 8) fails
+    // loudly, never passes partial. Quiet runs pay nothing: the first
+    // check already reads idle.
+    let q2_polls = {
+        let polls = std::cell::Cell::new(0u64);
+        let txns = crate::events::drive_until_idle(15, || {
+            let tag = if polls.get() == 0 {
+                "r16b-q2"
+            } else {
+                "r16b-q2drain"
+            };
+            let taken = service_to_published(&mut lane, &mut coordinator, false, tag)?;
+            polls.set(polls.get() + taken);
+            Ok::<bool, anyhow::Error>(lane.events_drain_idle_for_test().is_some_and(|idle| idle))
+        })?;
+        let Some(txns) = txns else {
+            bail!(
+                "r16b-q2: EVENTS backlog never drained within 15 transactions \
+                 (collected {:?})",
+                lane.semantic_stop_call_counts()
+            );
+        };
+        eprintln!(
+            "JOINT_R16 r16b-q2 drained txns={txns} polls={}",
+            polls.get()
+        );
+        polls.get()
+    };
     s1_feed_check(
         &coordinator,
         "r16b-q2",
@@ -9962,9 +9996,11 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // Each transaction Binding sweeps at most 4 consecutive (caller,
     // object) pairs past the persistent refresh cursor
     // (src/discovery/inventory_coordinator/semantics.rs:1301 `for _ in 0..4`),
-    // and q1, q2 and q3 sweep once each, so S's refusal floor follows from
-    // this cell's actual pair count: full coverage while the universe fits
-    // the limit, rotation coverage beyond it. The probe below runs the real
+    // and q1, the q2 drain transactions and q3 sweep at least once each,
+    // so S's refusal floor follows from this cell's actual pair count:
+    // full coverage while the universe fits the limit, rotation coverage
+    // beyond it. Extra drain transactions only add refusals, so the floor
+    // below holds a fortiori. The probe below runs the real
     // sweep (same function, same always-true charge as the Binding path) to
     // measure the universe instead of assuming it; a new fixture pair then
     // lowers the floor instead of failing opaquely. Probing advances the

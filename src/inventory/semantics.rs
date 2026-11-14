@@ -2647,6 +2647,20 @@ impl AttestedSemanticLane {
         self.disclosed_calls_shed
     }
 
+    /// Tests-only EVENTS quiescence: the retained drain holds no
+    /// undelivered record. The positions are staging-aware (the logical
+    /// consumer moves only on consumption), so staged-but-undelivered
+    /// records still read pending. `None` without a live lane or drain
+    /// reads as unknown, never idle.
+    #[cfg(test)]
+    pub(crate) fn events_drain_idle_for_test(&self) -> Option<bool> {
+        let live = self.live.as_deref()?;
+        live.session
+            .ring_positions()
+            .events
+            .map(|(producer, consumer)| producer == consumer)
+    }
+
     /// Cumulative disclosed EVENTS ring loss in records: the stop
     /// line's `lost` term and the report's event-loss account.
     pub(crate) fn events_ring_loss_disclosed(&self) -> u64 {

@@ -1617,15 +1617,17 @@ pub(crate) fn events_head_pending<S: BoundedRecordSource>(drain: &EventDrain<S>)
 /// submitted record reached a quantum). Returns transactions driven, or
 /// `None` when the bound hit first: the caller fails loudly on `None`
 /// (backlog never drained is not a pass), never treats it as quiescent.
-/// STUB for the RED twin: a single transaction (today's checkpoint
-/// behavior). The fix loops to quiescence.
 #[cfg(test)]
 pub(crate) fn drive_until_idle<E>(
-    _bound: usize,
+    bound: usize,
     mut step: impl FnMut() -> Result<bool, E>,
 ) -> Result<Option<usize>, E> {
-    step()?;
-    Ok(Some(1))
+    for txn in 1..=bound {
+        if step()? {
+            return Ok(Some(txn));
+        }
+    }
+    Ok(None)
 }
 
 /// Drains one bounded EVENTS quantum up to the producer `stop` position

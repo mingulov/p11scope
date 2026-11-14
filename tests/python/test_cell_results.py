@@ -53,12 +53,52 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_public_cli_qualified_kinds_accepted(self):
-        result = run_checker([row("run-prearm", True, "prearm-exactness", "held [] with 3/3 ledger"),
+        result = run_checker([row("doctor", True, "command-contract", "rc=0"),
+                              row("names-pid", True, "semantic-names",
+                                  "six independent physical targets carry expected semantic names"),
+                              row("verdict-pid", True, "verdict-consistency",
+                                  "clean owned target verdict is consistent"),
+                              row("run-prearm", True, "prearm-exactness", "held [] with 3/3 ledger"),
                               row("system", True, "owned-provider-counts-with-runner-noise",
                                   "counts match; disclosed runner noise"),
                               row("mt-system", True, "owned-provider-counts-with-ambient-gap",
                                   "counts match; disclosed honest ambient gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_owned_edge_usage_counts_accepted_with_proof_fields(self):
+        result = run_checker([
+            row("inventory-mt-pid", True, "owned-edge-usage-counts",
+                "owned per-edge usage and streamed edge totals match the independent ledger "
+                "total 64017 over 1 workload callers; per-caller attribution is by caller pid"),
+            row("inventory-mt-system", True, "owned-edge-usage-counts",
+                "owned per-edge usage and streamed edge totals match the independent ledger "
+                "total 64065 over 5 workload callers; per-caller attribution is by caller pid"),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_owned_edge_usage_counts_rejects_missing_proof_fields(self):
+        cases = [
+            "ok",
+            "",
+            "owned per-edge usage match independent ledger total 64017 over 1 workload callers; per-caller attribution is by caller pid",
+            "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 1 workload callers; per-caller attribution is not established",
+            "owned per-edge usage and streamed edge totals match the independent ledger total 0 over 1 workload callers; per-caller attribution is by caller pid",
+            "owned per-edge usage and streamed edge totals match the independent ledger total 64017 over 0 workload callers; per-caller attribution is by caller pid",
+        ]
+        for detail in cases:
+            with self.subTest(detail=detail):
+                result = run_checker([row("inventory-mt-pid", True, "owned-edge-usage-counts", detail)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing owned-edge-usage-counts proof fields", result.stderr)
+
+    def test_owned_edge_usage_counts_failure_rejected(self):
+        result = run_checker([
+            row("inventory-mt-pid", False, "owned-edge-usage-counts",
+                "owned per-edge usage and streamed edge totals match the independent ledger "
+                "total 64017 over 1 workload callers; per-caller attribution is by caller pid"),
+        ])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed qualified cell inventory-mt-pid", result.stderr)
 
     def test_66_discovery_gap_qualification_accepted(self):
         result = run_checker([row("select-endpoint-system", True,

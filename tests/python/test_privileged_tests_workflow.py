@@ -718,6 +718,19 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("inventory-cgroup", need.group(1),
                       "the gate must still require the inventory-cgroup cell")
 
+    def test_public_cli_does_not_swallow_qualify_rc(self):
+        job = job_body(self.yml, "public-cli")
+        run_step = job.split("- name: Run the public CLI cells", 1)[1].split("- name: ", 1)[0]
+        # Host leg tracks qualify + minimal-setcap separately and fails on any
+        # nonzero exit (never swallowed after chown/tail); guest legs accept
+        # only 0 or documented-smoke 2 from qualify-public-cli-vng.sh, and
+        # every leg runs check-cell-results.py over cells/results.jsonl.
+        self.assertIn("qual_rc=0", run_step)
+        self.assertIn("minimal_rc=0", run_step)
+        self.assertIn('test "$rc" -eq 0', run_step)
+        self.assertRegex(run_step, r'case "\$rc" in\s+0\|2\)')
+        self.assertIn('check-cell-results.py "$out/cells/results.jsonl"', run_step)
+
     def test_minimal_setcap_leg_runs_on_host_and_guests(self):
         job = job_body(self.yml, "public-cli")
         # Host leg through the template; guests inside the vng wrapper.

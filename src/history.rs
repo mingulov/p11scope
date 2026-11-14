@@ -162,7 +162,10 @@ impl Registry {
     /// field or a live process lookup. The producer authenticates the tuple.
     /// `event_ts_ns` is the admitting event's kernel time, recorded as
     /// the task generation's `first_ts_ns` for exit matching (reset on
-    /// exec-id bump).
+    /// exec-id bump). An event on an exit-retired cookie reopens the
+    /// task when timestamped after the exit (clearing the exit
+    /// timestamp, counted) or counts late when at or before it — the
+    /// exit path never sets `closed`, so both still admit.
     pub(crate) fn admit(
         &mut self,
         domain: u64,
@@ -185,6 +188,17 @@ impl Registry {
                 task.forked = false;
                 task.first_ts_ns = event_ts_ns;
                 task.exit_ts_ns = None;
+            } else if let Some(exit) = task.exit_ts_ns {
+                // A live thread on a retired cookie: after the exit the
+                // task reopens (the timestamp clears, the event admits);
+                // at or before it the event is late (admitted too, the
+                // timestamp stays). Never refused either way.
+                if event_ts_ns > exit {
+                    task.exit_ts_ns = None;
+                    self.exit_retire_reopened = self.exit_retire_reopened.saturating_add(1);
+                } else {
+                    self.exit_retire_late = self.exit_retire_late.saturating_add(1);
+                }
             }
             return (Some(task.key), retired);
         }

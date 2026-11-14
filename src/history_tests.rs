@@ -448,7 +448,7 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
     s.retire_processes(&due);
     assert!(!s.has_process_state(cookie));
     for ts in [250, 260] {
-        let mut late = ev(100, 90, 0, 2);
+        let mut late = ev(100, 90, 0, 0);
         late.ts_ns = ts;
         feed(&mut s, &mut t, [late]);
     }

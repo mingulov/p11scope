@@ -504,6 +504,134 @@ int main(int argc, char **argv)
 }
 "#;
 
+/// Twin-local short-lived workload: WORKLOAD_C with a millisecond
+/// linger (`workload-ms MODULE LEDGER_FILE ITERATIONS [SLEEP_MS]`).
+/// Same call pattern and ledger; the linger keeps the mapper alive
+/// briefly after its calls so the observer can prove the file.
+const TWIN_WORKLOAD_C: &str = r#"
+#define _POSIX_C_SOURCE 200809L
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef unsigned long ck_ulong_t;
+typedef ck_ulong_t ck_rv_t;
+typedef ck_ulong_t ck_slot_id_t;
+typedef ck_ulong_t ck_mechanism_type_t;
+
+typedef ck_rv_t (*c_initialize_t)(void *);
+typedef ck_rv_t (*c_finalize_t)(void *);
+typedef ck_rv_t (*c_get_info_t)(unsigned char *);
+typedef ck_rv_t (*c_get_slot_list_t)(unsigned char, ck_slot_id_t *, ck_ulong_t *);
+typedef ck_rv_t (*c_get_slot_info_t)(ck_slot_id_t, unsigned char *);
+typedef ck_rv_t (*c_get_token_info_t)(ck_slot_id_t, unsigned char *);
+
+static void *need_symbol(void *handle, const char *name)
+{
+    dlerror();
+    void *symbol = dlsym(handle, name);
+    const char *error = dlerror();
+    if (error != NULL || symbol == NULL) {
+        fprintf(stderr, "workload: missing %s\n", name);
+        exit(3);
+    }
+    return symbol;
+}
+
+int main(int argc, char **argv)
+{
+    if (sizeof(unsigned long) != 8 || sizeof(void *) != 8) {
+        fprintf(stderr, "workload: LP64 only\n");
+        return 3;
+    }
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr, "usage: %s MODULE LEDGER_FILE ITERATIONS [SLEEP_MS]\n", argv[0]);
+        return 2;
+    }
+    const char *module = argv[1];
+    const char *ledger_file = argv[2];
+    long iterations = strtol(argv[3], NULL, 10);
+    long sleep_ms = argc == 5 ? strtol(argv[4], NULL, 10) : 0;
+    if (iterations < 1 || iterations > 1000 || sleep_ms < 0 || sleep_ms > 300000) {
+        fprintf(stderr, "workload: bad counts\n");
+        return 2;
+    }
+    void *handle = dlopen(module, RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+        fprintf(stderr, "workload: cannot open %s: %s\n", module, dlerror());
+        return 3;
+    }
+    c_initialize_t c_initialize = need_symbol(handle, "C_Initialize");
+    c_finalize_t c_finalize = need_symbol(handle, "C_Finalize");
+    c_get_info_t c_get_info = need_symbol(handle, "C_GetInfo");
+    c_get_slot_list_t c_get_slot_list = need_symbol(handle, "C_GetSlotList");
+    c_get_slot_info_t c_get_slot_info = need_symbol(handle, "C_GetSlotInfo");
+    c_get_token_info_t c_get_token_info = need_symbol(handle, "C_GetTokenInfo");
+    ck_rv_t rv = c_initialize(NULL);
+    if (rv != 0) {
+        fprintf(stderr, "workload: C_Initialize failed: 0x%lx\n", rv);
+        return 3;
+    }
+    unsigned char info[256];
+    unsigned char slot_info[256];
+    unsigned char token_info[512];
+    ck_slot_id_t slots[64];
+    long get_info = 0, get_slot_list = 0, get_slot_info = 0, get_token_info = 0;
+    for (long i = 0; i < iterations; i++) {
+        memset(info, 0, sizeof info);
+        c_get_info(info);
+        get_info++;
+        ck_ulong_t count = 0;
+        c_get_slot_list(0, NULL, &count);
+        get_slot_list++;
+        if (count > 64)
+            count = 64;
+        if (count > 0) {
+            ck_ulong_t have = count;
+            c_get_slot_list(0, slots, &have);
+            get_slot_list++;
+            if (have > count)
+                have = count;
+            for (ck_ulong_t s = 0; s < have; s++) {
+                memset(slot_info, 0, sizeof slot_info);
+                c_get_slot_info(slots[s], slot_info);
+                get_slot_info++;
+                memset(token_info, 0, sizeof token_info);
+                c_get_token_info(slots[s], token_info);
+                get_token_info++;
+            }
+        }
+    }
+    rv = c_finalize(NULL);
+    if (rv != 0) {
+        fprintf(stderr, "workload: C_Finalize failed: 0x%lx\n", rv);
+        return 3;
+    }
+    FILE *ledger = fopen(ledger_file, "w");
+    if (!ledger) {
+        fprintf(stderr, "workload: cannot write ledger\n");
+        return 3;
+    }
+    fprintf(ledger,
+            "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo=%ld C_GetSlotList=%ld "
+            "C_GetSlotInfo=%ld C_GetTokenInfo=%ld\n",
+            get_info, get_slot_list, get_slot_info, get_token_info);
+    fclose(ledger);
+    if (get_info != iterations || get_slot_list < iterations) {
+        fprintf(stderr, "workload: hot counts drifted\n");
+        return 3;
+    }
+    if (sleep_ms > 0) {
+        struct timespec req = { sleep_ms / 1000, (sleep_ms % 1000) * 1000000L };
+        nanosleep(&req, NULL);
+    }
+    return 0;
+}
+"#;
+
 /// Double-fork fixture. Usage:
 /// `doublefork WORKLOAD MODULE LEDGER_FILE PID_FILE`.
 /// The middle generation forks the leaf, records its pid, and exits
@@ -903,16 +1031,19 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
 }
 
 /// Unprearmed short-lived descendants: 32 sequential grandchildren that
-/// each dlopen SoftHSM, make a few calls and exit within tens of
-/// milliseconds, with NO `--module`/`--prearm-module` hint. The run owns
-/// the whole tree, so the first live mapper must teach it the provider
-/// file: probes attach by file identity and every later grandchild's
-/// calls land. The first worker's calls may be missed honestly (PARTIAL
-/// with descendant gaps), and one attach pipeline (~tens of ms) may
-/// cost a second worker on these ~15 ms children (harsher than the
-/// 50 ms operator shape the smoke leg covers at >= 95%), so coverage
-/// of the oracle after the first worker must clear 90%. Without the
-/// fix this cell sees 0 probes and 0.0 coverage (scan-only discovery
+/// each dlopen SoftHSM, make a few calls, linger 150 ms and exit, with
+/// NO `--module`/`--prearm-module` hint. The run owns the whole tree,
+/// so the first live mapper must teach it the provider file: probes
+/// attach by file identity and every later grandchild's calls land.
+/// The first worker's calls may be missed honestly (PARTIAL with
+/// descendant gaps), so coverage of the oracle after the first worker
+/// must clear 90% (measured ~100%: the linger keeps every mapper
+/// provable). The linger is load-bearing, not padding: at ~15 ms
+/// without it the debug observer under test cannot complete a proof
+/// scan inside one lifetime, so the cell would test build-profile
+/// speed instead of the fix; the release-measured 50 ms operator
+/// shape and the smoke leg cover the faster workers. Without the fix
+/// this cell sees 0 probes and 0.0 coverage (scan-only discovery
 /// never lands an attach for short-lived mappers).
 #[test]
 #[ignore = "privileged: run-tree unprearmed shortlived cell (root BPF capture, runtime SoftHSM workload + token)"]
@@ -921,7 +1052,7 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     let dir = tempfile::tempdir().expect("cell dir");
     let module = softhsm_path();
     let conf = init_token(dir.path());
-    let workload = build_c(dir.path(), "rt-workload", WORKLOAD_C);
+    let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
     open_cell_dir(dir.path());
     let (_outdir, out) = out_dir();
     let mut ledgers = Vec::new();
@@ -929,7 +1060,7 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     for i in 0..CHILDREN {
         let ledger = dir.path().join(format!("l{i}"));
         script.push_str(&format!(
-            "{} {} {} 1; ",
+            "{} {} {} 1 150; ",
             workload.display(),
             module.display(),
             ledger.display()

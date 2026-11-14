@@ -110,6 +110,11 @@ pub(crate) struct LearnedCandidate {
     /// `/proc/<loader>/exe` at first sight, or the finite reason below.
     pub(crate) loader_exe: Option<String>,
     pub(crate) loader_unknown_reason: Option<&'static str>,
+    /// Synthesized by owned-run scan learning (E1) rather than the
+    /// fanotify drain: the proving mapper is a transient descendant,
+    /// so transient scan coverage does not exempt the file from
+    /// staging (the drain's exemption assumes a stable mapper).
+    pub(crate) run_learned: bool,
 }
 
 /// Drain-to-engine messages. `Load` tallies post-send opens so the staged
@@ -2097,6 +2102,7 @@ impl DrainCtx<'_> {
             display_path,
             loader_exe,
             loader_unknown_reason,
+            run_learned: false,
         };
         if !self.send(LearnMsg::Candidate(candidate), window) {
             return false;
@@ -4185,6 +4191,7 @@ mod tests {
                 display_path: "/bin/sh".to_string(),
                 loader_exe: None,
                 loader_unknown_reason: Some(super::LOADER_EXE_UNREADABLE_REASON),
+                run_learned: false,
             }),
         );
         assert!(!ok);

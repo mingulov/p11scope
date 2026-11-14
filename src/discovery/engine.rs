@@ -471,6 +471,26 @@ pub struct Engine {
     /// A learned staging owes an expedited discovery frame so attach
     /// lands promptly instead of at the next cadence boundary.
     learned_frame_owed: bool,
+    /// Unproven owned-tree members for the watch rescan rotation (E1).
+    /// Members join at notice and leave once a scan proves a provider
+    /// (then the file stages), they exit, or the rescan horizon
+    /// passes. Bounded by `OWNED_WATCH_UNPROVEN_CAP`; overflow members
+    /// stay for the ordinary frame path with their honest gaps.
+    owned_watch_unproven: BTreeMap<u32, OwnedWatchEntry>,
+    /// First-seen mono-ns per noticed owned-tree pid, for the rescan
+    /// horizon. Pruned by liveness every run (an exit forgets, so a
+    /// later pid reuse notices fresh); entries outlive rotation
+    /// membership, so an aged-out live member is not re-noticed.
+    /// Bounded by live-tree membership. Deliberately separate from
+    /// the newcomer arrival marks, which the frames own (the watch
+    /// never marks: unpruned marks would risk ledger overflow while
+    /// an armed pause holds frames back, and exits already gap
+    /// never-admitted members exactly).
+    owned_watch_seen: BTreeMap<u32, u64>,
+    /// Last mono-ns the owned-tree watch ran: bounds watch work to
+    /// two scans per `OWNED_WATCH_SCAN_MIN_NS`. `None` before the
+    /// first run.
+    owned_watch_last_ns: Option<u64>,
     /// A learned staging mutated the pre-arm inputs since the last
     /// inventory refresh consumed them: shallow-idle frames must not
     /// skip the apply that attaches the new file.
@@ -522,11 +542,11 @@ pub struct Engine {
     loader_registry: LoaderRegistry,
     owned_initial_exec: Option<OwnedInitialExec>,
     /// The owned run child's PID once `start_owned_session` binds this
-    /// engine to an owned run. Its view is the one named generation:
-    /// it always arms its loader, even under the run-tree cgroup
-    /// scope, so the pause follows the direct target's exec chain as
-    /// it did when runs were exact-PID captures. Other member views
-    /// stay exploratory under the ownership gate.
+    /// engine to an owned run. Under the run-tree cgroup scope every
+    /// member view arms its loader (E1), so the pause follows the
+    /// direct target's exec chain as it did when runs were exact-PID
+    /// captures and short-lived descendants catch first use. Scopes
+    /// the run does not own keep exploration.
     owned_run_pid: Option<u32>,
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
@@ -4767,6 +4787,26 @@ struct PrearmInput {
     inputs: Vec<PrearmPinnedInput>,
 }
 
+/// One file-identity proof for owned run-tree learning (E1): a
+/// provider module's owning view, loader pid, display path and
+/// resolved pin object. Both proof paths (the watch's synchronous
+/// scans and the live apply path) lower to this before staging.
+struct OwnedLearnProof {
+    view: ProcessViewId,
+    pid: u32,
+    path: String,
+    object: PinnedObjectId,
+}
+
+/// Scan attempts per unproven owned-tree member under watch (E1),
+/// for rotation diagnostics. First-seen times live in
+/// `owned_watch_seen`, which outlives rotation entries so aged-out
+/// members are not re-noticed. Views are opened fresh per scan (an
+/// exec between scans must not read as an exit).
+struct OwnedWatchEntry {
+    scans: u32,
+}
+
 struct LiveCandidate {
     pinned: PinnedObjects,
     modules: Vec<ReconciledModule>,
@@ -6391,6 +6431,29 @@ struct BoundFallbackProof {
 /// behind `--max-scan-pids`. The unmatched-leader-exit event buffer
 /// shares this bound (kept at 1024 with the raise).
 pub(crate) const MAX_SCAN_PIDS: usize = 1024;
+
+/// Minimum gap between owned-tree watch runs, in nanoseconds: the
+/// watch enumerates and scans at most this often, so a fork burst in
+/// the owned tree is noticed within milliseconds without scanning on
+/// every tick. 10 ms notices tens-of-ms workers early in their lives
+/// while bounding watch scans to two per 10 ms.
+/// Provisional — ratify by measurement.
+pub(crate) const OWNED_WATCH_SCAN_MIN_NS: u64 = 10_000_000;
+
+/// How many unproven members the owned-tree watch tracks at once:
+/// overflow members stay for the ordinary frame path (no fast-path
+/// scan, honest gaps as today), so a fork bomb cannot grow watch
+/// state without bound.
+/// Provisional — ratify by measurement.
+pub(crate) const OWNED_WATCH_UNPROVEN_CAP: usize = 64;
+
+/// How long the owned-tree watch rescans an unproven member, in
+/// nanoseconds: slow starters (a worker that dlopens seconds after
+/// birth) stay in rotation this long, then drop so a stable tree of
+/// never-mapping members costs no steady-state scans. Members that
+/// prove a provider leave at once, however young.
+/// Provisional — ratify by measurement.
+pub(crate) const OWNED_WATCH_RESCAN_HORIZON_NS: u64 = 5_000_000_000;
 
 /// How a marked newcomer generation's descendant gap was counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12789,6 +12852,9 @@ impl Engine {
             learned_event_loss: 0,
             learned_cap_skipped: 0,
             learned_frame_owed: false,
+            owned_watch_unproven: BTreeMap::new(),
+            owned_watch_seen: BTreeMap::new(),
+            owned_watch_last_ns: None,
             learned_unapplied: false,
             handles_deferred: BTreeMap::new(),
             handles_last_retry_delay_ns: None,
@@ -17524,6 +17590,40 @@ impl Engine {
             );
             return Ok(outcome);
         }
+        // Owned run-tree file learning (E1) runs before the generation
+        // check below: the candidate's pins and modules are proven scan
+        // facts, and a mapper that exits before mutation must still
+        // teach the run its provider file (attach by file identity
+        // covers every later mapper). No-op outside owned runs.
+        let proofs: Vec<OwnedLearnProof> = candidate
+            .modules
+            .iter()
+            .filter(|module| {
+                !module.scanned.tables.is_empty() || !module.scanned.interfaces.is_empty()
+            })
+            .filter_map(|module| {
+                let pid = self
+                    .views
+                    .iter()
+                    .find(|view| view.id() == module.scanned.view)
+                    .map(ProcessView::pid)
+                    .or_else(|| {
+                        extra_views
+                            .iter()
+                            .find(|view| view.id() == module.scanned.view)
+                            .map(|view| view.pid())
+                    })?;
+                Some(OwnedLearnProof {
+                    view: module.scanned.view,
+                    pid,
+                    path: module.scanned.path.clone(),
+                    object: module.object,
+                })
+            })
+            .collect();
+        if !proofs.is_empty() {
+            self.learn_owned_proofs(&candidate.pinned, &proofs);
+        }
         if generation_stale {
             outcome.static_failures = target_modules;
             *additions_allowed = false;
@@ -20964,6 +21064,233 @@ impl Engine {
         }
     }
 
+    /// Owned run-tree membership watch (E1): notice short-lived
+    /// descendants within milliseconds and prove their provider files
+    /// by direct scan, without waiting for frame admission (which an
+    /// armed pause holds back) or loader arming (which a millisecond
+    /// dlopen beats). The loops call this every tick; it runs at most
+    /// every `OWNED_WATCH_SCAN_MIN_NS`, notices unseen user members,
+    /// and scans two unproven members per run — the newest (promptness
+    /// for newborns) and the oldest (fair rotation) — until a scan
+    /// proves a provider (then the file stages), the member leaves, or
+    /// the rescan horizon passes.
+    /// Scans open a fresh transient view per attempt (released right
+    /// after, never retained) and charge the capture budget like frame
+    /// scans. No-op outside owned `run` captures on their cgroup scope
+    /// (a degraded exact-PID run has no tree to watch). Files no gaps
+    /// of its own: the frames stay the authoritative membership and
+    /// gap proof, so members the watch never proves keep their honest
+    /// descendant gaps. Kernel threads never join the rotation.
+    pub(crate) fn owned_tree_watch(&mut self, now_ns: Option<u64>) {
+        if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
+            return;
+        };
+        if self
+            .owned_watch_last_ns
+            .is_some_and(|last| now_ns.saturating_sub(last) < OWNED_WATCH_SCAN_MIN_NS)
+        {
+            return;
+        }
+        self.owned_watch_last_ns = Some(now_ns);
+        let (pids, _) = scope_pids(&self.scope);
+        let live: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).collect();
+        // Forget departed members, so a later pid reuse notices fresh.
+        // (An exit and reuse inside one watch interval inherits the old
+        // first-seen time; the frames still own that generation and its
+        // gaps stay honest.)
+        self.owned_watch_seen.retain(|pid, _| live.contains(pid));
+        let horizon_aged = |seen: &BTreeMap<u32, u64>, pid: u32| {
+            seen.get(&pid)
+                .is_some_and(|first| now_ns.saturating_sub(*first) >= OWNED_WATCH_RESCAN_HORIZON_NS)
+        };
+        // Drop members that left or aged past the rescan horizon, so
+        // a stable tree costs no steady-state scans. An exec is not an
+        // exit: views open fresh per scan below, so a replaced image
+        // is simply rescanned.
+        self.owned_watch_unproven
+            .retain(|pid, _| live.contains(pid) && !horizon_aged(&self.owned_watch_seen, *pid));
+        // Notice unseen user members that never aged out. Retained
+        // views are owned by the frames (admission scans and loader
+        // hooks prove them); kernel threads never join.
+        let unseen: Vec<u32> = live
+            .iter()
+            .copied()
+            .filter(|pid| {
+                !self.views.iter().any(|view| view.pid() == *pid)
+                    && !self.owned_watch_unproven.contains_key(pid)
+                    && !horizon_aged(&self.owned_watch_seen, *pid)
+            })
+            .collect();
+        if !unseen.is_empty() {
+            let room = OWNED_WATCH_UNPROVEN_CAP.saturating_sub(self.owned_watch_unproven.len());
+            for pid in user_process_pids(&unseen, &self.proc_root)
+                .into_iter()
+                .take(room)
+            {
+                self.owned_watch_unproven
+                    .insert(pid, OwnedWatchEntry { scans: 0 });
+                self.owned_watch_seen.insert(pid, now_ns);
+            }
+        }
+        // Scan two members per run: the newest unproven member
+        // (promptness for newborns, whose dlopen may be milliseconds
+        // away) and the oldest one (fair rotation, so continuous
+        // newborns cannot starve a rescan forever). One member scans
+        // once when newest and oldest coincide. Deterministic pid
+        // order breaks first-seen ties.
+        let newest = self
+            .owned_watch_unproven
+            .iter()
+            .max_by_key(|(pid, _)| self.owned_watch_seen.get(pid).copied())
+            .map(|(pid, _)| *pid);
+        let oldest = self
+            .owned_watch_unproven
+            .iter()
+            .min_by_key(|(pid, _)| self.owned_watch_seen.get(pid).copied())
+            .map(|(pid, _)| *pid);
+        for pid in newest.into_iter().chain(oldest).collect::<BTreeSet<_>>() {
+            self.scan_owned_watch_member(pid);
+        }
+    }
+
+    /// Scans one watched member through a fresh transient view and
+    /// stages any provider file the scan proves; the member then leaves
+    /// rotation (its file is learned). A view that cannot be opened
+    /// means the member left (dropped at once, not at the next
+    /// enumeration); any other outcome keeps it in rotation until a
+    /// proof, an exit, or the horizon drops it. The view opens fresh
+    /// per scan so an exec between scans reads as a new image to
+    /// prove, never a generation failure. The scan never feeds
+    /// eviction bookkeeping: transient views retain nothing, and the
+    /// frames' own scans mark what they retain.
+    fn scan_owned_watch_member(&mut self, pid: u32) {
+        let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
+            return;
+        };
+        entry.scans = entry.scans.saturating_add(1);
+        let Ok(id) = self.allocate_view_id() else {
+            return;
+        };
+        let view = match ProcessView::open(id, pid) {
+            Ok(view) => view,
+            Err(_) => {
+                self.release_view_id(id);
+                self.owned_watch_unproven.remove(&pid);
+                return;
+            }
+        };
+        let broad_admit = self.broad_admit;
+        let (scan_result, scan_counters) = Self::scan_retained_view(
+            &view,
+            &self.module_hints,
+            &self.hooks,
+            &mut self.budget,
+            broad_admit,
+            &mut self.stage_timings,
+            None,
+            None,
+        );
+        // Honest work accounting; the returned skips stay with the
+        // frames (the watch files no gaps of its own).
+        let _skipped = self.absorb_scan_counters(scan_counters);
+        self.deep_scans = self.deep_scans.saturating_add(1);
+        let (modules, pins, _complete) = match scan_result {
+            Ok(scan) => scan,
+            Err(_) => {
+                self.release_view_id(id);
+                return;
+            }
+        };
+        let proofs: Vec<OwnedLearnProof> = modules
+            .iter()
+            .filter(|module| !module.tables.is_empty() || !module.interfaces.is_empty())
+            .filter_map(|module| {
+                pins.id_for_scanned(module, module.key, &module.path)
+                    .map(|object| OwnedLearnProof {
+                        view: view.id(),
+                        pid,
+                        path: module.path.clone(),
+                        object,
+                    })
+            })
+            .collect();
+        self.release_view_id(id);
+        if proofs.is_empty() {
+            return;
+        }
+        self.learn_owned_proofs(&pins, &proofs);
+        self.owned_watch_unproven.remove(&pid);
+    }
+
+    /// Owned run-tree file learning (E1): stage scan-proven provider
+    /// files as run-persistent attach roots. Callers prove files two
+    /// ways: the watch's synchronous scans (members the frames never
+    /// admitted) and the live apply path before its generation check
+    /// (a short-lived mapper that exits after its scan proved the
+    /// file). Either way attach by file identity then covers every
+    /// later mapper, while the proving mapper's own unobserved calls
+    /// keep their honest descendant gap. Each file stages at most once
+    /// per run (settled identities and pending candidates are
+    /// skipped); the shared learned machinery below pins, classifies,
+    /// caps, gaps and attaches exactly like a fanotify-learned file,
+    /// including the fixed first-use gap row and the loader note.
+    /// No-op outside owned `run` captures on their cgroup scope.
+    fn learn_owned_proofs(&mut self, pins: &PinnedObjects, proofs: &[OwnedLearnProof]) {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        for proof in proofs {
+            // The direct child's own files need no learning: its view
+            // spans the run, so its scan-owned slots never retire
+            // mid-run, and staging them would file a first-use gap for
+            // calls the scan already observes. Learning is for
+            // transient descendants only.
+            if self.owned_run_view(proof.view) {
+                continue;
+            }
+            let Some(file) = pins.file_for(proof.object) else {
+                continue;
+            };
+            let Ok(held) = file.try_clone() else {
+                continue;
+            };
+            let Ok(meta) = held.metadata() else {
+                continue;
+            };
+            let identity = (meta.dev(), meta.ino());
+            if self.learned_settled.contains(&identity) {
+                continue;
+            }
+            if self
+                .pending_learned
+                .iter()
+                .any(|queued| (queued.dev, queued.ino) == identity)
+            {
+                continue;
+            }
+            let (loader_exe, loader_unknown_reason) =
+                crate::fanotify::resolve_loader_exe(proof.pid);
+            let learned = crate::fanotify::LearnedCandidate {
+                file: held,
+                dev: identity.0,
+                ino: identity.1,
+                display_path: proof.path.clone(),
+                loader_exe,
+                loader_unknown_reason,
+                run_learned: true,
+            };
+            if self.pending_learned.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+                self.refuse_learned_candidate(learned);
+            } else {
+                self.pending_learned.push(learned);
+            }
+        }
+    }
+
     /// Drains the learn channel once per tick, before the discovery pass:
     /// tallies loads, stages provider candidates through the pre-arm pin
     /// path, and files the learned gaps. Pins are bounded per tick (the
@@ -21369,7 +21696,14 @@ impl Engine {
                     }
                     continue;
                 }
-                if scan_covered.contains_key(&input.key) {
+                // Run-synthesized candidates (E1) stage despite transient
+                // scan coverage: the proving mapper is a short-lived
+                // descendant whose scan-owned slots retire with it, so
+                // only the persistent piece covers later mappers. The
+                // drain's exemption below assumes a stable mapper whose
+                // calls stay observed; it still applies to fanotify
+                // candidates.
+                if !candidate.run_learned && scan_covered.contains_key(&input.key) {
                     if crate::run::capture_diagnostics_on() {
                         eprintln!(
                             "p11scope: learned provider {} already scan-covered; not staged",
@@ -23865,6 +24199,16 @@ impl Engine {
         // exact-PID captures. Every other provider-free member view
         // stays exploratory.
         if self.owned_run_view(view_id) {
+            return false;
+        }
+        // Owned run-tree members all arm (E1): the run owns the whole
+        // tree and short-lived descendants dlopen between frame passes,
+        // so every member's loader hook must be live to catch first
+        // use; the hook's record then drives the rescan that learns the
+        // file. Contexts stay finite (256 lifetime IDs with their
+        // honest exhaustion gap); user cgroup and system scopes keep
+        // exploration.
+        if self.owned_run_pid.is_some() && matches!(self.scope, Scope::Cgroup { .. }) {
             return false;
         }
         self.admits_generations()

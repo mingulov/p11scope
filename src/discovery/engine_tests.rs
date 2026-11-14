@@ -19859,17 +19859,267 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
     // Provider-free under a generation-admitting scope: both gate.
     assert!(engine.loader_arming_gated(ProcessViewId(0)));
     assert!(engine.loader_arming_gated(ProcessViewId(1)));
-    // The owned run child is the one named generation: it always
-    // arms, so the pause follows its exec chain; other members stay
-    // exploratory.
+    // Owned run tree (E1): every member arms so short-lived
+    // descendants catch first use, not just the named child.
     engine.owned_run_pid = Some(std::process::id());
     assert!(!engine.loader_arming_gated(ProcessViewId(0)));
+    assert!(!engine.loader_arming_gated(ProcessViewId(1)));
+    // Scopes the run does not own keep exploration: the same
+    // provider-free members gate once ownership clears.
+    engine.owned_run_pid = None;
+    assert!(engine.loader_arming_gated(ProcessViewId(0)));
     assert!(engine.loader_arming_gated(ProcessViewId(1)));
     // Exact-PID scope never gates (base behavior, unaffected).
     engine.scope = Scope::Pid(1);
     engine.owned_run_pid = None;
     assert!(!engine.loader_arming_gated(ProcessViewId(0)));
     assert!(!engine.loader_arming_gated(ProcessViewId(1)));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
+fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.owned_tree_watch(Some(1_000));
+    assert_eq!(
+        engine.owned_watch_unproven.len(),
+        2,
+        "unseen members join the rescan rotation"
+    );
+    assert!(
+        engine.owned_watch_seen.contains_key(&me)
+            && engine.owned_watch_seen.contains_key(&sleeper.id()),
+        "noticed members take first-seen times"
+    );
+    assert!(
+        engine.refresh_requested.is_empty() && engine.newcomer_first_seen.is_empty(),
+        "the watch never queues frame work nor marks (exits gap exactly)"
+    );
+    // Newest plus oldest scan per run (neither maps a provider, so
+    // both stay unproven for the rotation).
+    let scanned: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scanned, 2, "newest plus oldest scan per watch run");
+    assert!(engine.pending_learned.is_empty(), "no proof, no staging");
+    // Within the throttle window nothing reruns.
+    engine.owned_tree_watch(Some(1_000 + 1_000_000));
+    let rerun: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(rerun, 2, "watch work throttles across ticks");
+    // Past the window the rotation scans both members again.
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    let rotated: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(rotated, 4, "the rotation advances past the throttle");
+    assert!(
+        engine
+            .owned_watch_unproven
+            .values()
+            .all(|entry| entry.scans == 2),
+        "fair rotation reaches every member"
+    );
+    // Scopes the run does not own stay quiet (increasing clocks so
+    // the throttle cannot vacate the gate assertions).
+    engine.owned_run_pid = None;
+    engine.owned_watch_unproven.clear();
+    engine.owned_tree_watch(Some(100_000_000));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "an unowned cgroup scope stays quiet"
+    );
+    engine.owned_run_pid = Some(me);
+    engine.scope = Scope::Pid(me);
+    engine.owned_tree_watch(Some(200_000_000));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "a degraded exact-PID run has no tree to watch"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
+fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&me),
+        "a retained member stays with the frames"
+    );
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "an unretained member joins the rotation"
+    );
+    assert_eq!(
+        engine.owned_watch_unproven[&sleeper.id()].scans,
+        1,
+        "one member scans once when newest and oldest coincide"
+    );
+    assert!(
+        !engine.owned_watch_seen.contains_key(&me),
+        "a retained member is never noticed"
+    );
+    // A member that leaves the tree drops at the next run.
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{me}\n"))
+        .expect("rewrite cgroup.procs");
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "a departed member leaves the rotation"
+    );
+    // A member that never proves a provider ages out at the horizon,
+    // so a stable tree costs no steady-state scans.
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("rewrite cgroup.procs");
+    let rejoined = 1_000 + 2 * OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(rejoined));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "the member rejoins while live"
+    );
+    engine.owned_tree_watch(Some(rejoined + OWNED_WATCH_RESCAN_HORIZON_NS));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "an unproven member ages out at the horizon"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
+fn learn_owned_proofs_stages_a_scan_proven_file_once() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libprov.so");
+    std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
+    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    // The proving view is a descendant (the sleeper), not the owned
+    // child: only transient descendants teach the run their files.
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        pid: sleeper.id(),
+        path: backing.to_string_lossy().into_owned(),
+        object,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file stages exactly once"
+    );
+    assert_eq!(
+        engine.pending_learned[0].display_path,
+        backing.to_string_lossy(),
+        "the staging carries the scanned spelling"
+    );
+    // A second proof of the same file stages nothing more.
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "a pending identity never duplicates"
+    );
+    // Settled identities stay silent even with an empty pending queue.
+    let staged = engine.pending_learned.pop().expect("one staged");
+    engine.learned_settled.insert((staged.dev, staged.ino));
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "a settled identity never re-stages"
+    );
+    // Scopes the run does not own stage nothing.
+    engine.owned_run_pid = None;
+    engine.learned_settled.clear();
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "an unowned scope stages nothing"
+    );
+    // The direct child's own files stage nothing either: its view
+    // spans the run, so its scan-owned slots never need learning.
+    engine.owned_run_pid = Some(me);
+    let child_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(0),
+        pid: me,
+        path: backing.to_string_lossy().into_owned(),
+        object,
+    }];
+    engine.learn_owned_proofs(&pins, &child_proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "the direct child's files need no learning"
+    );
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
 }
@@ -79576,6 +79826,7 @@ fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -79706,6 +79957,7 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -79748,6 +80000,7 @@ fn learned_cap_names_the_excess_once() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -79828,6 +80081,7 @@ fn learned_service_bounds_pins_per_tick() {
                 display_path: so.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
             },
         ))
         .unwrap();
@@ -79889,6 +80143,7 @@ fn learned_capture_end_flushes_pending_candidates() {
                 display_path: so.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
             },
         ))
         .unwrap();
@@ -79946,6 +80201,7 @@ fn learned_shutdown_stages_unserviced_channel() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -79999,6 +80255,7 @@ fn learned_clean_shutdown_after_drain_join_files_no_loss() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80054,6 +80311,7 @@ fn learned_terminal_record_publishes_unserviced_file() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80124,6 +80382,7 @@ fn learned_pin_refusal_after_proof_settles_without_staging() {
             display_path: bogus.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80175,6 +80434,7 @@ fn learned_staging_invalidates_a_stable_plan() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80263,6 +80523,7 @@ fn learned_replaced_file_at_same_path_stages_fresh() {
                 display_path: display.clone(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
             },
         ))
         .unwrap();
@@ -80323,6 +80584,7 @@ fn learned_deleted_held_file_is_refused_not_staged() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80398,6 +80660,7 @@ fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80487,6 +80750,7 @@ fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();
@@ -80574,6 +80838,7 @@ fn learned_staging_applies_without_a_discovery_batch() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
         },
     ))
     .unwrap();

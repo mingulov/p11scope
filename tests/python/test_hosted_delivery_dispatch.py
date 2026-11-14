@@ -114,7 +114,7 @@ sys.stdout.write(answer.stdout)
                 self.assertFalse({"needs", "steps", "runs-on", "secrets"} & job.keys())
 
     def test_reusable_inputs_use_supported_types_and_preserve_direct_dispatch(self):
-        expected = {"package-preview": {"accepted_ci_run_id": "string", "capture_mode": "string", "jobs": "string"},
+        expected = {"package-preview": {"accepted_ci_run_id": "string", "accepted_pkcs11_full_run_id": "string", "capture_mode": "string", "jobs": "string"},
                     "docker-runtime": {"preview_run_id": "string"},
                     "kubernetes-runtime": {"candidate_sha": "string", "artifact_run_id": "string", "run_k2": "boolean"}}
         for name, types in expected.items():

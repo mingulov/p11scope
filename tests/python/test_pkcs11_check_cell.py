@@ -194,6 +194,7 @@ class CompareHelperTests(unittest.TestCase):
             row = rows["pkcs11-check-identical-results"]
             self.assertFalse(row["pass"], row["detail"])
             self.assertIn("test_interface.py", row["detail"])
+            self.assertIn("137", row["detail"])
 
     def test_end_to_end_matching_inputs_pass_the_identical_row(self):
         # The empty reports leave the oracle rows vacuously failing, so the

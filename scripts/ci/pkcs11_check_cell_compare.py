@@ -151,7 +151,10 @@ def compare_results(base_path, other_path, label):
         f"child_timeout base={base_summary.get('child_timeout')} "
         f"other={other_summary.get('child_timeout')} (informational)"
     )
-    detail = info if not problems else info + "; " + "; ".join(problems[:5])
+    # Problems first: main() shows only the first 200 chars of this detail,
+    # so the unit tuples (with their return codes) must lead, not trail the
+    # ~150-char info preamble.
+    detail = info if not problems else "; ".join(problems[:5]) + " | " + info
     return not problems, detail
 
 

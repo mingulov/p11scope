@@ -720,10 +720,11 @@ pub(crate) fn self_rss_hwm_kb() -> Option<(u64, u64)> {
     Some((rss?, hwm?))
 }
 
-/// R5 estimate: the sealed report `Value`'s heap in bytes. One node
-/// counts `size_of::<Value>()`, strings count their bytes, and map
-/// entries carry a node-share allowance. A documented approximation,
-/// pinned by the twin below; Phase B removes the tree it measures.
+/// R5 estimate: heap bytes of one report section `Value` (envelope or
+/// largest section). One node counts `size_of::<Value>()`, strings
+/// count their bytes, and map entries carry a node-share allowance. A
+/// documented approximation, pinned by the twin below; the seal reports
+/// envelope + largest section, never the whole tree.
 pub(crate) fn json_value_bytes(value: &serde_json::Value) -> u64 {
     const NODE: u64 = 32;
     debug_assert_eq!(NODE as usize, std::mem::size_of::<serde_json::Value>());

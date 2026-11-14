@@ -19792,7 +19792,7 @@ pub(crate) mod tests {
             );
             let inner =
                 super::StreamedMetricsReport::new(&large_reports, &large_ev, &envelope, &capture);
-            let streamed = super::StreamedMetricsReportWithDelivery::new(inner, delivery);
+            let streamed = super::StreamedMetricsReportWithDelivery::new(inner, delivery.clone());
             let mut tree_bytes = Vec::new();
             serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
             let mut streamed_bytes = Vec::new();
@@ -19800,6 +19800,86 @@ pub(crate) mod tests {
             assert_eq!(
                 streamed_bytes, tree_bytes,
                 "metrics-large rescue: streamed bytes must equal tree bytes"
+            );
+        }
+        // Rescue without the ledger (main seal without
+        // `--select-endpoint`, `-o` write failed): the same comparison
+        // with `None` on both sides, one large case per lane.
+        {
+            let versioned = VersionedEvidence::wrap(&large_ev);
+            let mut tree = profile_json(
+                &large_reports,
+                VersionedEvidence::wrap(&large_ev),
+                &large_state,
+                &capture,
+            );
+            tree = with_counter_snapshot(tree, &snapshot_with_collection);
+            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
+            // No ledger transform: the `None` arm must not carry
+            // `selected_detail`.
+            tree.as_object_mut()
+                .expect("profile tree has an object")
+                .insert("delivery".into(), delivery.clone());
+            assert!(
+                tree["evidence"].get("counter_collection").is_some(),
+                "profile rescue without ledger must run the counter transform"
+            );
+            assert!(
+                tree["evidence"].get("selected_detail").is_none(),
+                "profile rescue without ledger must not carry selected_detail"
+            );
+            assert!(
+                tree.get("delivery").is_some(),
+                "profile rescue without ledger must carry delivery"
+            );
+            let envelope =
+                super::profile_evidence_envelope(&versioned, Some(&snapshot_with_collection), None);
+            let inner = super::StreamedProfileReport::new(
+                &large_reports,
+                &large_ev,
+                &envelope,
+                &large_state,
+                &capture,
+            );
+            let streamed = super::StreamedProfileReportWithDelivery::new(inner, delivery.clone());
+            let mut tree_bytes = Vec::new();
+            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
+            let mut streamed_bytes = Vec::new();
+            serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
+            assert_eq!(
+                streamed_bytes, tree_bytes,
+                "profile-large rescue without ledger: streamed bytes must equal tree bytes"
+            );
+        }
+        {
+            let mut tree = json(&large_reports, &large_ev, &capture);
+            tree = with_counter_snapshot(tree, &snapshot_with_collection);
+            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
+            // No ledger transform: the `None` arm must not carry
+            // `selected_detail`.
+            tree.as_object_mut()
+                .expect("metrics tree has an object")
+                .insert("delivery".into(), delivery.clone());
+            assert!(
+                tree["evidence"].get("counter_collection").is_some(),
+                "metrics rescue without ledger must run the counter transform"
+            );
+            assert!(
+                tree["evidence"].get("selected_detail").is_none(),
+                "metrics rescue without ledger must not carry selected_detail"
+            );
+            let envelope =
+                super::metrics_evidence_envelope(&large_ev, Some(&snapshot_with_collection), None);
+            let inner =
+                super::StreamedMetricsReport::new(&large_reports, &large_ev, &envelope, &capture);
+            let streamed = super::StreamedMetricsReportWithDelivery::new(inner, delivery.clone());
+            let mut tree_bytes = Vec::new();
+            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
+            let mut streamed_bytes = Vec::new();
+            serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
+            assert_eq!(
+                streamed_bytes, tree_bytes,
+                "metrics-large rescue without ledger: streamed bytes must equal tree bytes"
             );
         }
     }

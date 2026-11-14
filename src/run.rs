@@ -24220,9 +24220,31 @@ int main(int argc, char **argv) {
                 && profile.contains("metrics_evidence_envelope("),
             "capture_profile must compose the additive ledger via the streamed envelopes"
         );
+        // The ledger must reach each envelope call: slice each call
+        // (`envelope(` … `);`) and require the forwarding inside it, so
+        // switching either site to `None` fails even though the `-v`
+        // text-frame use keeps a file-wide marker green.
+        let profile_span = profile
+            .split_once("profile_evidence_envelope(")
+            .expect("profile envelope call")
+            .1
+            .split_once(");")
+            .expect("profile envelope call end")
+            .0;
         assert!(
-            profile.contains("selection_ledger.as_deref()"),
-            "capture_profile must forward the ledger option to the envelopes"
+            profile_span.contains("selection_ledger.as_deref()"),
+            "capture_profile must forward the ledger option to the profile envelope"
+        );
+        let metrics_span = profile
+            .split_once("metrics_evidence_envelope(")
+            .expect("metrics envelope call")
+            .1
+            .split_once(");")
+            .expect("metrics envelope call end")
+            .0;
+        assert!(
+            metrics_span.contains("selection_ledger.as_deref()"),
+            "capture_profile must forward the ledger option to the metrics envelope"
         );
         // K0: the close witness snapshot precedes quiescence, which
         // invalidates the PID lifecycle tap; a snapshot past it would

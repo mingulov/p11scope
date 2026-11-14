@@ -1928,6 +1928,7 @@ const STATIC_GAP_RECOVERED: &str = "static probes detached and exact pairs reatt
 const PROCESS_VIEW_CAPACITY_EXHAUSTED: &str =
     "capture process-view capacity was exhausted; remaining generations were not scanned";
 const LOADER_CONTEXT_CAPACITY_EXHAUSTED: &str = "loader context capacity 256 is exhausted";
+const LOADER_CONTEXT_CHILD_RESERVE: &str = "loader contexts 249-256 are reserved for the run's own command; a descendant arm past 248 was refused";
 const LOADER_SCAN_LEDGER_EXCEEDED: &str =
     "a deferred loader memory scan exceeded the bounded loader-context ledger";
 const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was full";
@@ -2053,6 +2054,9 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
         && reason == LOADER_CONTEXT_CAPACITY_EXHAUSTED
     {
         return Some(LOADER_CONTEXT_CAPACITY_EXHAUSTED);
+    }
+    if subject == "live loader arming" && reason == LOADER_CONTEXT_CHILD_RESERVE {
+        return Some(LOADER_CONTEXT_CHILD_RESERVE);
     }
     if subject == "live loader memory discovery" && reason == LOADER_SCAN_LEDGER_EXCEEDED {
         return Some(LOADER_SCAN_LEDGER_EXCEEDED);
@@ -4565,6 +4569,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     PROCESS_VIEW_CAPACITY_EXHAUSTED,
                     DEEP_SCAN_SELECTION_CAPPED,
                     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+                    LOADER_CONTEXT_CHILD_RESERVE,
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
                     LEARNED_FIRST_RUN_REASON,
@@ -18558,6 +18563,25 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// An owned run's reserve refusal keeps its own finite reason in the
+    /// public projection: it is not the total-exhaustion sentence, and it
+    /// passes through the closed vocabulary unredacted.
+    #[test]
+    fn loader_child_reserve_refusal_projects_its_own_reason() {
+        let reason = crate::discovery::loader::LOADER_CHILD_RESERVE_REASON;
+        let live = format!("{:#}", anyhow::anyhow!(reason));
+        assert_eq!(
+            limit_skip_reason("live loader arming", &live),
+            Some(LOADER_CONTEXT_CHILD_RESERVE)
+        );
+        assert_eq!(LOADER_CONTEXT_CHILD_RESERVE, reason);
+        assert_ne!(
+            LOADER_CONTEXT_CHILD_RESERVE,
+            LOADER_CONTEXT_CAPACITY_EXHAUSTED
+        );
+        assert_eq!(limit_skip_reason("some other subject", &live), None);
     }
 
     /// The fixed loader-limit skips name their limit too: both 256-context

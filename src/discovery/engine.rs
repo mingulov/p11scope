@@ -24405,7 +24405,7 @@ impl Engine {
         // Owned-child reserve: non-child members refuse once the
         // registry reaches the reserve line, so the direct child's own
         // re-arms never lose the last contexts to descendant churn. The
-        // refusal names the capacity reason, like exhaustion.
+        // refusal names the reserve (its own finite reason).
         if let Some(refusal) = self.loader_reserve_refusal(view_id) {
             self.loader_registry.record_preflight_failure();
             return Err(LoaderArmFailure::ordinary(anyhow!(refusal)));
@@ -25049,11 +25049,11 @@ impl Engine {
     /// non-child members stop at 248 so the direct child's exec chain
     /// keeps 8 for its own re-arms. `None` for the child itself and
     /// outside owned runs (they draw to 256). The refusal names the
-    /// capacity reason, like exhaustion: from the member's view no
-    /// context is available.
+    /// reserve, distinct from total exhaustion: contexts remain, held
+    /// for the child.
     fn loader_reserve_refusal(&self, view_id: ProcessViewId) -> Option<String> {
         use crate::discovery::loader::{
-            LOADER_CAPACITY_EXHAUSTED_REASON, MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE,
+            LOADER_CHILD_RESERVE_REASON, MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE,
         };
         if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
             return None;
@@ -25064,7 +25064,7 @@ impl Engine {
         if self.loader_registry.allocated_contexts()
             >= MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE
         {
-            return Some(LOADER_CAPACITY_EXHAUSTED_REASON.into());
+            return Some(LOADER_CHILD_RESERVE_REASON.into());
         }
         None
     }

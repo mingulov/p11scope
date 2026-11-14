@@ -136,6 +136,12 @@ obs() {
 }
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd) || exit 2
+# Root mode: the wrapper creates $OUT as root, while discover and the
+# paced workload create files directly in $OUT as the suite user
+# (manifest.json, workload.ready). Hand the directory itself to
+# RUNUID:RUNGID like make_leg does for the leg directories, or both
+# dropped writers fail EACCES and the cell dies as a harness error.
+if [ "$ROOTMODE" = yes ]; then chown "$RUNUID:$RUNGID" "$OUT" || exit 2; fi
 COMPARE=$HERE/provider_matrix_cell_compare.py
 [ -f "$COMPARE" ] || { echo "provider-matrix-cell: missing helper: $COMPARE" >&2; exit 2; }
 WORKLOAD=$MATRIX_DIR/workload-pace.py

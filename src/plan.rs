@@ -2674,6 +2674,54 @@ impl AttachPlan {
             if rebuilt.slot_by_key.contains_key(key) {
                 continue;
             }
+            // Pin migration (coverage): same-file new pin (same offset+path+
+            // names/descriptor, same file identity when both sides carry it)
+            // reuses the active index in place with no retire/new delta, so
+            // file-based links stay attached and counts continue with no blind
+            // gap. Every mismatch fails closed to retire+admit as before.
+            // Count-only tolerates the new pin's fresh module IDs (Ambiguous);
+            // new ambiguity on a semantic descriptor refuses migration.
+            let migrated = rebuilt.slot_by_key.iter().find_map(|(new_key, new_position)| {
+                if new_key.file_offset != key.file_offset {
+                    return None;
+                }
+                let new_slot = rebuilt.slots.get(*new_position)?;
+                let old_slot = slots.get(*position)?;
+                if new_slot.object_path != old_slot.object_path {
+                    return None;
+                }
+                if new_slot.descriptor_index != old_slot.descriptor_index
+                    || new_slot.names != old_slot.names
+                {
+                    return None;
+                }
+                if let (Some(old_identity), Some(new_identity)) = (
+                    self.object_identities.get(&old_slot.object),
+                    rebuilt.object_identities.get(&new_slot.object),
+                ) && old_identity != new_identity
+                {
+                    return None;
+                }
+                let previous = aggregate_owners.get(*position).copied()?;
+                let candidate = if rebuilt.slot_is_module_ambiguous(new_slot.index) {
+                    AggregateOwner::Ambiguous
+                } else {
+                    AggregateOwner::from_module_ids(&new_slot.module_ids)
+                };
+                if previous.merge(candidate) != previous && new_slot.descriptor_index != 0 {
+                    return None;
+                }
+                Some((*new_key, new_slot.clone(), previous.merge(candidate)))
+            });
+            if let Some((new_key, new_slot, merged_owner)) = migrated {
+                let mut updated = new_slot;
+                updated.index = *position as u32;
+                aggregate_owners[*position] = merged_owner;
+                slots[*position] = updated;
+                slot_by_key.remove(key);
+                slot_by_key.insert(new_key, *position);
+                continue;
+            }
             retired_slots.insert(*position);
             retired_keys.insert(*key, *position);
             slot_by_key.remove(key);
@@ -2685,7 +2733,10 @@ impl AttachPlan {
                 continue;
             }
             let key = AttachKey::of(slot);
-            if let Some(position) = self.slot_by_key.get(&key).copied() {
+            // Pin-migrated new keys (same-file new pin IDs updated in place
+            // in the retire loop above, no delta) read back here like kept
+            // keys, so they stay active with no fresh slots and no gap.
+            if let Some(position) = slot_by_key.get(&key).copied() {
                 let old = slots[position].clone();
                 let mut updated = slot.clone();
                 updated.index = old.index;

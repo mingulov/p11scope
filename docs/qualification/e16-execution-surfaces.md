@@ -270,7 +270,9 @@ None of the E16 shapes adds scan work to unhinted `--system`:
   unhinted. Their cost is one cached `.dynsym` read per object. The cost is
   coverage, not time.
 - A hinted object, including a static executable, has all of its data
-  mappings read (up to 256 MiB per mapping, under the global scan budget).
+  mappings read in bounded chunks under the 256 MiB per-operation allowance
+  and the global scan budget (no whole-size gate; exhaustion keeps the I/O
+  ceiling's named gap).
   Per-surface `inspect --pid` stays at 4 to 6 ms for these fixtures.
 - The binding constraint at scale is the 512 attach slots, not scan time.
   A full 3.x table takes 104 slots, so one `--system` capture admits about

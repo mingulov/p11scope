@@ -2768,17 +2768,19 @@ offsets must land in executable ELF segments.
 `fstat` (inode, size, ctime) is re-checked before and after attach — attach is
 refused on a mismatch — and during capture, where a change sets
 `evidence.provider_changed` and forces `PARTIAL`. Inputs are capped at a 16 MiB
-manifest, 256 MiB per manifest object, and 512 MiB across one manifest's
-objects. Separately, one capture-wide 512 MiB attempted-I/O budget covers
-memory scanning and scan-sourced file hashing across every selected process,
-retry, and failed pin, with 256 MiB per scan/hash operation (measured
-2026-09-17 against libxul.so at 183 MB on disk / 61 MiB readable data, the
-largest known real-world object; matches the manifest per-object cap).
-Provider export
+manifest document, and one manifest's objects share a 512 MiB batch byte
+allowance enforced incrementally as identify reads stream (no object is
+refused for its own size). Separately, one capture-wide 512 MiB attempted-I/O
+budget covers memory scanning and scan-sourced file hashing across every
+selected process, retry, and failed pin, with 256 MiB per scan/hash operation
+enforced incrementally as bytes stream (measured 2026-09-17 against libxul.so
+at 183 MB on disk / 61 MiB readable data, the largest known real-world
+object). Provider export
 checks read only the object's ELF tables via demand paging (bounded), so a
-large provider costs kilobytes of table reads; the per-object gate no longer
-applies to that check, though it still guards memory snapshots and identity
-hashing. Decoding stops at
+large provider costs kilobytes of table reads; identity hashing streams the
+whole file in bounded chunks, and memory snapshots read in bounded chunks —
+a large object degrades through the I/O ceiling's named gap when an
+allowance runs out, never through a size refusal. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
 cgroup discovery considers at most 1024 members by default (`--max-scan-pids`)
 and planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;

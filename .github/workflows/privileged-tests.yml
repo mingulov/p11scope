@@ -1176,6 +1176,7 @@ jobs:
             # guest leg below).
             # Template proof: the host leg runs through run-cell-script.sh,
             # which validates with check-cell-results.py (smoke allow-listed).
+            qual_rc=0
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \
               --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
               --expected-failure profile-cgroup --expected-failure trace-cgroup \
@@ -1187,22 +1188,36 @@ jobs:
               --require mt-trace --require counter-latency-mt --require mt-system \
               --require inventory-mt-pid --require inventory-mt-system \
               --require fifo-refused --require inventory-event-stdout \
-              >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
+              >"$RUNNER_TEMP/qual.log" 2>&1 || qual_rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
             # Least-privilege leg on the host kernel: the observer as
             # `nobody` with exactly the minimal setcap set. Guests run
             # the same leg inside qualify-public-cli-vng.sh.
+            minimal_rc=0
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" scripts/ci/run-cell-script.sh minimal-setcap "$in/p11scope" "$out/minimal-cells" \
-              >"$RUNNER_TEMP/minimal.log" 2>&1 || rc=$?
+              >"$RUNNER_TEMP/minimal.log" 2>&1 || minimal_rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -20 "$RUNNER_TEMP/minimal.log"
+            if [ "$qual_rc" -ne 0 ]; then
+              rc="$qual_rc"
+            elif [ "$minimal_rc" -ne 0 ]; then
+              rc="$minimal_rc"
+            fi
           else
             scripts/qualify-public-cli-vng.sh "${{ matrix.kernel }}" "$in/p11scope" "$out" || rc=$?
             tail -40 "$out/qual.log" || true
             cat "$out/uname.txt" || true
           fi
           echo "qualify rc=$rc"
+          if [ "${{ matrix.kernel }}" = host ]; then
+            test "$rc" -eq 0
+          else
+            case "$rc" in
+              0|2) ;;
+              *) exit 1 ;;
+            esac
+          fi
           # The minimal-setcap gate, uniform for the host and guest
           # legs: every row must pass qualified (the paranoid-parametric
           # names always cover 3 and 4; the current value adds bonus
@@ -1227,6 +1242,19 @@ jobs:
             --require inventory-sudo-stderr-fifo \
             --require daemonset-doctor --require daemonset-profile \
             --require daemonset-inventory
+          # Closed-set qualification and proof check uniformly over every
+          # host and guest public CLI run before the full 40-cell gate.
+          python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
+            --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
+            --expected-failure profile-cgroup --expected-failure trace-cgroup \
+            --expected-failure profile-pid-ia32 --expected-failure run-ia32 \
+            --require doctor --require profile-pid --require names-pid --require verdict-pid \
+            --require metrics-pid --require trace-pid --require run-short --require run-cover \
+            --require mt-exact --require system --require sigint --require second-sigint \
+            --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
+            --require mt-trace --require counter-latency-mt --require mt-system \
+            --require inventory-mt-pid --require inventory-mt-system \
+            --require fifo-refused --require inventory-event-stdout
           # The wrapper translates the documented nonqualifying-smoke exit 2
           # to 0 when results exist; the per-cell checks below still decide.
           python3 -I - "$out/cells/results.jsonl" <<'PY'

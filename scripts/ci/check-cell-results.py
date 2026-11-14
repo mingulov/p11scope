@@ -8,19 +8,21 @@ qualification and detail. Qualification is a closed set: qualified,
 command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
-owned-provider-counts-with-ambient-gap, prearm-exactness,
-verdict-consistency, semantic-names and failed are qualified and every
-qualified row must pass; nonqualifying smoke may pass or fail but every
-nonqualifying row must be allow-listed and the allow-list must equal
-the nonqualifying set; expected-failure must equal its declared list
-and an expected failure that passes is a failure. Every --require cell
-must appear, so a dropped row fails.
+owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
+prearm-exactness, verdict-consistency, semantic-names and failed are
+qualified and every qualified row must pass (with owned-edge-usage-counts
+requiring its proof fields in detail); nonqualifying smoke may pass or
+fail but every nonqualifying row must be allow-listed and the allow-list
+must equal the nonqualifying set; expected-failure must equal its
+declared list and an expected failure that passes is a failure. Every
+--require cell must appear, so a dropped row fails.
 
 Usage:
   python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -33,9 +35,20 @@ def fail(message):
 QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
              "owned-provider-counts-with-runner-noise",
              "owned-provider-counts-with-66-discovery-gap",
-             "owned-provider-counts-with-ambient-gap", "prearm-exactness",
+             "owned-provider-counts-with-ambient-gap",
+             "owned-edge-usage-counts", "prearm-exactness",
              "verdict-consistency", "semantic-names", "failed"}
 VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
+OWNED_EDGE_USAGE_DETAIL = re.compile(
+    r"owned per-edge usage and streamed edge totals match the independent ledger "
+    r"total ([0-9]+) over ([0-9]+) workload callers; "
+    r"per-caller attribution is by caller pid"
+)
+
+
+def has_owned_edge_usage_proof(detail):
+    match = OWNED_EDGE_USAGE_DETAIL.search(detail)
+    return match is not None and int(match.group(1)) > 0 and int(match.group(2)) > 0
 
 
 def main(argv):
@@ -132,12 +145,18 @@ def main(argv):
             if cell not in set(allowed_smoke):
                 problems.append(f"nonqualifying cell not in allow list: {cell}")
         else:
-            status = "PASS" if passed else "FAIL"
+            missing_proof = (
+                qualification == "owned-edge-usage-counts"
+                and not has_owned_edge_usage_proof(row["detail"])
+            )
+            status = "PASS" if (passed and not missing_proof) else "FAIL"
             print(f"{status} {cell} {detail}")
             if not passed:
                 problems.append(f"failed qualified cell {cell}")
             if qualification == "failed" and passed:
                 problems.append(f"inconsistent row for {cell}: pass with failed qualification")
+            if missing_proof:
+                problems.append(f"missing owned-edge-usage-counts proof fields for {cell}")
     actual = sorted(row["cell"] for row in rows if row["qualification"] == "expected-failure")
     wanted = sorted(set(expected))
     if len(wanted) != len(expected):

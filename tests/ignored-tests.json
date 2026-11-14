@@ -875,6 +875,16 @@
     },
     {
       "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::chrome_sized_object_pins_without_a_size_gate",
+      "reason": "scale: heavy 300 MiB sparse-file hash without a size gate; 2/1 MiB twins prove the point, run explicitly for scale",
+      "cell": "performance",
+      "until": {
+        "item": "permanent: hand-run 300 MiB scale pin, not a campaign cell",
+        "owner": "maintainer"
+      }
+    },
+    {
+      "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
       "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
       "cell": "performance",

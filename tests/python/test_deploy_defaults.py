@@ -86,11 +86,13 @@ class DeployDefaultsTests(unittest.TestCase):
                          "the kind-table citation no longer applies")
 
     def test_output_mount_names_the_root_owned_rule(self):
-        text = DEPLOY_README.read_text()
+        text = " ".join(DEPLOY_README.read_text().split())
         self.assertIn("is untrusted: owned by uid", text,
                       "the -o note quotes the user-owned-mount refusal")
-        self.assertIn("planned for 0.8.0", text,
-                      "the -o note names the easier-ownership plan")
+        self.assertIn("--output-owner UID[:GID]", text,
+                      "the -o note documents the --output-owner option")
+        self.assertIn("--output-owner 1000", text,
+                      "the -o note shows the --output-owner recipe")
 
     def test_rebuild_recipe_keeps_full_features(self):
         self.assertNotIn("--no-default-features", DEPLOY_README.read_text(),

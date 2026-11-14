@@ -230,8 +230,17 @@ class SelfPinGuardTests(unittest.TestCase):
         source = (ROOT / "scripts" / "ci-test-partition.py").read_text()
         self.assertNotIn("scanner limit", source)
         manifest = (ROOT / "crates" / "manifest" / "src" / "identity.rs").read_text()
-        self.assertIn("pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;",
-                      manifest)
+        self.assertNotIn("MAX_OBJECT_BYTES", manifest)
+        self.assertIn("no per-object size cap", manifest)
+        self.assertIn("read_object_bytes_with(file, reader)?", manifest)
+        self.assertIn("time/progress\n//! budget with a named gap", manifest)
+        discovery_id = (ROOT / "src" / "discovery" / "identity.rs").read_text()
+        self.assertIn("budget.check_deadline_now()", discovery_id)
+        self.assertIn("budget.allowed_capture_io(bytes.len())", discovery_id)
+        self.assertIn("IO_CEILING_REASON", discovery_id)
+        scan = (ROOT / "src" / "discovery" / "scan.rs").read_text()
+        self.assertIn("pub(crate) const IO_CEILING_REASON", scan)
+        self.assertIn("pub(crate) const SCAN_DEADLINE_REASON", scan)
 
 
 if __name__ == "__main__":

@@ -24209,9 +24209,20 @@ int main(int argc, char **argv) {
             profile.contains("run_metrics_selection_stage("),
             "capture_profile must resolve the selection before the loop"
         );
+        // B2 streams the report: the main seal composes the ledger via the
+        // streamed envelopes (profile plus metrics, each with the ledger
+        // option), and the envelopes call with_selected_detail on a minimal
+        // doc in render.rs (proven by streamed_report_is_byte_identical
+        // asserting selected_detail). The direct j-ledger call no longer
+        // lives here by design.
         assert!(
-            profile.contains("with_selected_detail(j, ledger)"),
-            "capture_profile must compose the additive ledger"
+            profile.contains("profile_evidence_envelope(")
+                && profile.contains("metrics_evidence_envelope("),
+            "capture_profile must compose the additive ledger via the streamed envelopes"
+        );
+        assert!(
+            profile.contains("selection_ledger.as_deref()"),
+            "capture_profile must forward the ledger option to the envelopes"
         );
         // K0: the close witness snapshot precedes quiescence, which
         // invalidates the PID lifecycle tap; a snapshot past it would
@@ -25697,10 +25708,15 @@ int main(int argc, char **argv) {
         assert!(observed.longrun_line(true).contains("max gap n/a"));
         let mut control = SchedulingAccumulator::default();
         control.note_loop_end(0, 6, Some(300), render::LOOP_END_EXPIRY);
-        assert_eq!(
-            serde_json::to_value(observed.snapshot(65536)).unwrap(),
-            serde_json::to_value(control.snapshot(65536)).unwrap()
-        );
+        let mut observed_value = serde_json::to_value(observed.snapshot(65536)).unwrap();
+        let mut control_value = serde_json::to_value(control.snapshot(65536)).unwrap();
+        // VmHWM is sampled sequentially with the first Value heap live
+        // between, so exact RSS equality is timing-dependent, not
+        // behavioral. This test pins longrun metrics plus report fields
+        // (asserted above and via every other snapshot key here); mask RSS.
+        observed_value["resource"]["max_rss_kb"] = serde_json::json!(0);
+        control_value["resource"]["max_rss_kb"] = serde_json::json!(0);
+        assert_eq!(observed_value, control_value);
     }
 
     /// T2/G-14: a fresh accumulator snapshots unreached phases as null with

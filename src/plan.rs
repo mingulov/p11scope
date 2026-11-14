@@ -19066,6 +19066,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// Pin migration RED (coverage): same-file pin churn without quiescence
+    /// must not retire gap. Gen1 active (68, pin 82, same file), then Gen2
+    /// same file new pin (83, same ObjectKey/path/offsets/names) arrives with
+    /// Gen1 still active (no rebuild-empty retire, no revivable set — links
+    /// still attached, file-based shared). It must migrate in place (lifetime
+    /// stays 68, active 68, no retire/new delta, object IDs update to new pin,
+    /// counts continue), not retire+admit fresh (136 lifetime, 68 retire + 68
+    /// new, blind gap with detach/attach).
+    #[test]
+    fn slot_reclaim_pin_migration_same_file_no_gap() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        assert_eq!(plan.active_slot_count(), 68, "gen1 active");
+        let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        gen2.object = PinnedObjectId(83);
+        gen2.entry_objects = vec![vec![PinnedObjectId(83); 68]];
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&gen2), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "gen2 same-file admits: {:?}",
+            rebuilt.modules_skipped
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.retire.len(), 0, "no retire gap on pin migration");
+        assert_eq!(delta.new.len(), 0, "no fresh slots on pin migration");
+        assert_eq!(plan.slots.len(), 68, "lifetime stays 68 via migration");
+        assert_eq!(plan.active_slot_count(), 68, "stays active, calls countable");
+        assert!(
+            plan.slots.iter().all(|slot| slot.object == PinnedObjectId(83)),
+            "object IDs migrate to new pin"
+        );
+    }
+
     /// Same-target revival: a provider that leaves and returns while its
     /// retired slots are cleared reoccupies its old indices — the slot
     /// count does not grow, so churn stops burning the lifetime budget.

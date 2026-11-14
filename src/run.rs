@@ -325,14 +325,25 @@ impl FileIdentity {
     }
 }
 
+/// Launch binaries over this size are never snapshotted whole: preparation
+/// declines (ordinary live discovery runs instead) and classification
+/// verifies from bounded sniffs. Restores the retired 256 MiB object
+/// bound for these operator-chosen reads only — scanned objects stay
+/// size-gate-free.
+const MAX_LAUNCH_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+
 impl PreparedExecutable {
     /// Resolves normal PATH spelling in the parent, then accepts only a direct
     /// conventional x86 ELF with one same-ABI absolute PT_INTERP. Shebang and non-ELF forms
-    /// deliberately return `None` and use ordinary live discovery.
+    /// deliberately return `None` and use ordinary live discovery, as do
+    /// binaries past the launch snapshot cap.
     pub(crate) fn resolve(program: &OsStr) -> io::Result<Option<Self>> {
         let path = resolve_program(program)?;
         let file = File::open(&path)?;
         let metadata = file.metadata()?;
+        if metadata.len() > MAX_LAUNCH_SNAPSHOT_BYTES {
+            return Ok(None);
+        }
         let snapshot = match ElfSnapshot::read(&file) {
             Ok(snapshot) => snapshot,
             Err(_) => return Ok(None),
@@ -346,6 +357,9 @@ impl PreparedExecutable {
         }
         let interpreter_file = File::open(&interpreter)?;
         let interpreter_metadata = interpreter_file.metadata()?;
+        if interpreter_metadata.len() > MAX_LAUNCH_SNAPSHOT_BYTES {
+            return Ok(None);
+        }
         let interpreter_snapshot = match ElfSnapshot::read(&interpreter_file) {
             Ok(snapshot) => snapshot,
             Err(_) => return Ok(None),
@@ -458,6 +472,25 @@ fn is_script_launch(launch_file: &File) -> bool {
     launch_file.read_at(&mut magic, 0).is_ok() && magic == *b"#!"
 }
 
+/// Whether `launch_file` plausibly starts a conventional x86 ELF: magic,
+/// 32/64-bit class, little-endian, i386/x86-64 machine — the structural
+/// gate without the table walk, read from the first 20 bytes. Used only
+/// past the launch snapshot cap, where a whole read is refused: the
+/// kernel decides the rest at exec.
+fn is_elf_launch(launch_file: &File) -> bool {
+    use std::os::unix::fs::FileExt as _;
+    let mut header = [0u8; 20];
+    if launch_file.read_at(&mut header, 0).unwrap_or(0) != 20 {
+        return false;
+    }
+    let class = header[4];
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    header.starts_with(b"\x7fELF")
+        && (class == 1 || class == 2)
+        && header[5] == 1
+        && (machine == 3 || machine == 62)
+}
+
 /// The launch-file checks: a regular executable file, and either ELF
 /// or a `#!` script. The single metadata read also yields the opened
 /// identity a script exec re-verifies at the barrier, so the kind and
@@ -473,6 +506,21 @@ fn classify_launch_file(launch_file: &File) -> io::Result<(LaunchKind, FileIdent
         ));
     }
     let identity = FileIdentity::of(&metadata);
+    if metadata.len() > MAX_LAUNCH_SNAPSHOT_BYTES {
+        // Past the cap no whole read runs: classify from bounded
+        // sniffs (the kernel decides the rest at exec), refusing only
+        // files with neither magic.
+        if is_script_launch(launch_file) {
+            return Ok((LaunchKind::Script, identity));
+        }
+        if is_elf_launch(launch_file) {
+            return Ok((LaunchKind::Elf, identity));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "owned command must be an ELF executable or a #! script",
+        ));
+    }
     match ElfSnapshot::read(launch_file) {
         Ok(_) => Ok((LaunchKind::Elf, identity)),
         Err(_) if is_script_launch(launch_file) => Ok((LaunchKind::Script, identity)),

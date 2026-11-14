@@ -82733,10 +82733,10 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
     drop(live);
 }
 
-/// Learned subject-dedupe twin: two distinct files whose display
-/// spellings normalize to one subject defer under exactly one wait
-/// row — the prove path files deduped, so same-subject deferrals
-/// never multiply the gap list.
+/// Learned subject-dedupe twin: a replaced file (same display
+/// path, new identity) defers under the same wait row as the
+/// generation it replaced — the prove path files deduped by exact
+/// row, so same-subject deferrals never multiply the gap list.
 #[test]
 fn handle_table_learned_same_subject_defers_file_once() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -82747,28 +82747,33 @@ fn handle_table_learned_same_subject_defers_file_once() {
     let dir = tempfile::tempdir().unwrap();
     let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
     let gaps_before = engine.counters.object_skips.len();
-    // Two distinct identities (hard links share one) staged under
-    // two spellings of one subject: the prove path must file the
-    // shared wait row once.
-    let first = dir.path().join("twin-a.so");
-    std::fs::write(&first, &bytes).unwrap();
-    let second = dir.path().join("twin-b.so");
-    std::fs::write(&second, &bytes).unwrap();
-    let shared = format!("{}/shared.so", dir.path().to_string_lossy());
-    let displays = [shared.clone(), shared.replace("/shared.so", "//shared.so")];
-    assert_ne!(displays[0], displays[1], "the test needs two spellings");
-    for (path, display) in [&first, &second].into_iter().zip(displays) {
-        let file = std::fs::File::open(path).unwrap();
+    // Two generations of one path: the rename-over guarantees a new
+    // inode (a remove-plus-create could reuse the old one).
+    let path = dir.path().join("twin.so");
+    std::fs::write(&path, &bytes).unwrap();
+    let display = path.to_string_lossy().into_owned();
+    let stage = |engine: &mut Engine| {
+        let file = std::fs::File::open(&path).unwrap();
         let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
         engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
             file,
             dev,
             ino,
-            display_path: display,
+            display_path: display.clone(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
         });
-    }
+        (dev, ino)
+    };
+    let first = stage(&mut engine);
+    let fresh = dir.path().join("twin.so.next");
+    std::fs::write(&fresh, &bytes).unwrap();
+    std::fs::rename(&fresh, &path).unwrap();
+    let second = stage(&mut engine);
+    assert_ne!(
+        first, second,
+        "the test needs two identities under one display path"
+    );
     let new_rows = &engine.counters.object_skips[gaps_before..];
     assert_eq!(
         new_rows.len(),

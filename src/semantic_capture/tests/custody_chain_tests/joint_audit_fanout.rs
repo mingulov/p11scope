@@ -12200,6 +12200,74 @@ fn joint_machine_finished_lane_refusal_names_the_lane() {
     );
 }
 
+/// Outside-pass twin: the unlinked discovery reader stops the lane
+/// without an eligibility check, so its refusal can latch at Audited
+/// with the frame held; the re-arm is refused and the stop names the
+/// outside pass instead of a spent re-arm.
+#[test]
+fn joint_machine_unlinked_discovery_refusal_names_the_outside_pass() {
+    let mut fixture = MachineScene::unlinked(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    fixture.machine.pose_no_progress_poll_for_test(true);
+    fixture.reach_phase("Audited");
+    assert!(
+        fixture
+            .machine
+            .retained_consumer_progress_for_test()
+            .is_some(),
+        "the Audited phase holds its frame before the reader fails"
+    );
+    let mut discovery = LiveMachineDiscovery::bytes(vec![vec![0; 17]]);
+    discovery.fail_read = true;
+    fixture.live_discovery = Some(discovery);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the failed reader latches the running machine"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Audited",
+        "the outside refusal latches at Audited"
+    );
+    assert!(
+        fixture
+            .machine
+            .retained_consumer_progress_for_test()
+            .is_some(),
+        "the frame stays held across the outside stop"
+    );
+    assert_eq!(
+        fixture.live_discovery.as_ref().unwrap().calls,
+        1,
+        "the stop comes from the discovery reader"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "an outside-pass refusal never re-arms"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::Consumed),
+        "the stop names the refusal from outside the audited pass"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        0,
+        "no re-arm is spent"
+    );
+}
+
 #[test]
 fn joint_machine_empty_disposition_requires_actual_quiet_original() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;

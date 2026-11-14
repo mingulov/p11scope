@@ -21003,7 +21003,7 @@ mod tests {
         for (refusal, clause) in [
             (
                 RunningRearmRefusal::Consumed,
-                "this refusal already spent its re-arm",
+                "the refusal came from outside the audited pass",
             ),
             (
                 RunningRearmRefusal::NotTransient,

@@ -10091,7 +10091,7 @@ pub(crate) mod tests {
         assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
         assert!(
             out.contains(
-                "3 p11-kit files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+                "3 p11-kit files not attached (forwarding layer; calls it forwards count at attached providers)"
             ),
             "{out}"
         );
@@ -10131,13 +10131,13 @@ pub(crate) mod tests {
         assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
         assert!(
             out.contains(
-                "2 a files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+                "2 a files not attached (forwarding layer; calls it forwards count at attached providers)"
             ),
             "{out}"
         );
         assert!(
             out.contains(
-                "/opt/libb.so: not attached (forwarding layer; the calls it forwards are counted at the providers)"
+                "/opt/libb.so: not attached (forwarding layer; calls it forwards count at attached providers)"
             ),
             "{out}"
         );
@@ -10165,7 +10165,7 @@ pub(crate) mod tests {
         assert!(out.contains("Module gaps (showing 3 of 3):"), "{out}");
         assert!(
             out.contains(
-                "2 a files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+                "2 a files not attached (forwarding layer; calls it forwards count at attached providers)"
             ),
             "{out}"
         );
@@ -10195,7 +10195,7 @@ pub(crate) mod tests {
         assert!(out.contains("Module gaps (showing 2 of 2):"), "{out}");
         assert!(
             out.contains(
-                "2 provider files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+                "2 provider files not attached (forwarding layer; calls it forwards count at attached providers)"
             ),
             "{out}"
         );

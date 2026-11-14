@@ -2430,15 +2430,15 @@ fn drain_final_tail_with(
                 // errno as `EAGAIN`) that consumed the head with more
                 // queued behind it. Re-check the queue: more bytes means
                 // continue, and an unreadable queue gives up. An empty
-                // queue with an exact unit means the last event was
+                // queue with an exact unit means the tail events were
                 // lease-blocked (the snapshot divides evenly, so leftover
-                // owed is a consumed head): count it, decided. An empty
-                // queue after a fallback is the ceiling over-count
+                // owed is the consumed-head count): count them, decided.
+                // An empty queue after a fallback is the ceiling over-count
                 // (harmless, decided).
                 match queued_event_bytes(raw) {
                     Some(0) => {
                         if ctx.fionread_exact {
-                            ctx.note_unreadable_without_filing();
+                            ctx.stats.unreadable = ctx.stats.unreadable.saturating_add(owed as u64);
                         }
                         return true;
                     }

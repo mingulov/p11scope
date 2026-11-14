@@ -282,14 +282,15 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     let old = key(90, 0);
     assert!(s.has_process_state(old));
     assert_eq!(s.memory_lens().reduced.len, 1);
-    // The old generation exits at hook 200; the transfer stamps the
-    // EVENTS producer position the drain must read past.
+    // The old generation exits at hook 200; the transfer stamps a
+    // future EVENTS producer position, so this twin drives the retire
+    // mechanism directly (drain-driven retire is the step-3 twin).
     t.note_exit_taps(
         vec![crate::history::ExitTap {
             pid: 100,
             hook_ts_ns: 200,
         }],
-        8,
+        1000,
     );
     assert_eq!(t.pending_exit_taps_for_test(), 1);
     // The pid is reused before the exit retires: the successor's
@@ -303,7 +304,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     // The drain reads past the tap position: the old generation's
     // maps are freed and its R10 entry is gone, while the successor's
     // rows are intact.
-    let due = t.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert_eq!(due, std::collections::BTreeSet::from([old]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(old));
@@ -325,9 +326,9 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
             pid: 101,
             hook_ts_ns: 200,
         }],
-        8,
+        1000,
     );
-    let due = t.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert!(due.is_empty(), "ties never retire");
     assert!(s.has_process_state(tied_key));
     assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));

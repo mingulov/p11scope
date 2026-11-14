@@ -9771,6 +9771,18 @@ fn capture_profile(
                 },
                 |context, consumers| {
                     if profile {
+                        // Exit transfer ahead of the EVENTS drain: exits
+                        // the discovery pass just tapped stamp the
+                        // current producer position, and the drain below
+                        // retires what is due. A positions failure skips
+                        // the transfer; the drain below fails loudly.
+                        if let Ok(positions) = context.1.event_drain_positions() {
+                            transfer_exit_taps(
+                                context.0,
+                                consumers.tracker,
+                                positions.producer,
+                            );
+                        }
                         *consumers.malformed_records += drain_events(
                             context.1,
                             consumers.state,
@@ -10408,6 +10420,13 @@ fn capture_profile(
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
                     if profile {
+                        // Terminal exit transfer: exits the terminal
+                        // discovery drain tapped stamp the current
+                        // producer position ahead of the terminal EVENTS
+                        // drain, which retires what is due.
+                        if let Ok(positions) = context.1.event_drain_positions() {
+                            transfer_exit_taps(context.0, consumers.tracker, positions.producer);
+                        }
                         *consumers.malformed_records += drain_events(
                             context.1,
                             consumers.state,
@@ -13490,7 +13509,27 @@ fn transfer_exit_taps(engine: &mut Engine, tracker: &mut process::Tracker, event
     tracker.note_exit_taps(taps, events_producer);
 }
 
-fn drain_profile_events<S: crate::events::RecordSource>(
+/// Retires transferred exits due at the drain's current EVENTS ring
+/// positions: past-tap exits free their processes' semantic rows in
+/// one batch. Runs at the end of every profile/trace EVENTS drain,
+/// live and terminal alike.
+fn retire_due_exits<S: crate::events::BoundedRecordSource>(
+    drain: &crate::events::EventDrain<S>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+) {
+    let positions = crate::events::event_drain_positions(drain);
+    let due = tracker.retire_exits_due(
+        positions.consumer,
+        positions.producer,
+        EXIT_RETIRE_PER_DRAIN_BUDGET,
+    );
+    if !due.is_empty() {
+        state.retire_processes(&due);
+    }
+}
+
+fn drain_profile_events<S: crate::events::BoundedRecordSource>(
     drain: &mut crate::events::EventDrain<S>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
@@ -13510,6 +13549,7 @@ fn drain_profile_events<S: crate::events::RecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
+    retire_due_exits(drain, state, tracker);
     Ok((drain.take_malformed_delta(), may_remain))
 }
 
@@ -13548,6 +13588,7 @@ fn drain_profile_events_to_position<S: crate::events::BoundedRecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
+    retire_due_exits(drain, state, tracker);
     Ok((drain.take_malformed_delta(), post_q_record))
 }
 
@@ -13789,7 +13830,7 @@ fn reduce_trace_event<W: Write>(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
+fn drain_trace_events_from<S: crate::events::BoundedRecordSource, W: Write>(
     drain: &mut crate::events::EventDrain<S>,
     remaining: &mut Option<u64>,
     state: &mut semantics::State,
@@ -13885,7 +13926,7 @@ fn reduce_trace_event_with_identities<W: Write>(
     Ok(())
 }
 
-fn drain_trace_events_from_with_identities<S: crate::events::RecordSource, W: Write>(
+fn drain_trace_events_from_with_identities<S: crate::events::BoundedRecordSource, W: Write>(
     drain: &mut crate::events::EventDrain<S>,
     (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
     identities: Option<&crate::trace_identity::TraceIdentityStore>,

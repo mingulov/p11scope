@@ -7930,18 +7930,20 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
 /// documented residual edge). A readdir race may still list a just-reaped
 /// pid after its view settled; the retained admission tells it apart from a
 /// true arrival.
-/// `admitted_pids` carries every admitted pid, open or closed;
+/// `admitted_pid_counts` carries every admitted pid with its admission
+/// count, open or closed; the tick reads the incrementally kept map
+/// instead of rebuilding the set from every admission on record.
 /// `proc_root` is `/proc` live, a fixture tree in tests.
 pub(crate) fn newcomer_arrival_possible(
     proc_root: &Path,
     pid: u32,
-    admitted_pids: &BTreeSet<u32>,
+    admitted_pid_counts: &BTreeMap<u32, usize>,
 ) -> bool {
     let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
-        return !admitted_pids.contains(&pid);
+        return !admitted_pid_counts.contains_key(&pid);
     };
     let Some(end) = stat.rfind(')') else {
-        return !admitted_pids.contains(&pid);
+        return !admitted_pid_counts.contains_key(&pid);
     };
     let mut fields = stat[end + 1..].split_whitespace();
     if !fields
@@ -14443,10 +14445,50 @@ impl Engine {
         }
     }
 
+    /// Record one admission, keeping the pid-count map in step with
+    /// `admitted_cgroup_views`: overwriting an id moves its count from the
+    /// old pid to the new one, so a re-seed never double-counts. Returns
+    /// the displaced admission, like `BTreeMap::insert`.
+    fn insert_cgroup_admission(
+        &mut self,
+        view: ProcessViewId,
+        admission: CgroupAdmission,
+    ) -> Option<CgroupAdmission> {
+        let pid = admission.pid;
+        let old = self.admitted_cgroup_views.insert(view, admission);
+        match old.as_ref().map(|previous| previous.pid) {
+            Some(previous) if previous == pid => {}
+            Some(previous) => {
+                self.note_cgroup_admission_removed(previous);
+                self.note_cgroup_admission_added(pid);
+            }
+            None => self.note_cgroup_admission_added(pid),
+        }
+        old
+    }
+
+    /// Bump the admitted-pid count for one fresh admission.
+    fn note_cgroup_admission_added(&mut self, pid: u32) {
+        *self.admitted_cgroup_pid_counts.entry(pid).or_insert(0) += 1;
+    }
+
+    /// Drop the admitted-pid count for one removed admission; the pid
+    /// leaves the map only when its last admission goes, so a reused pid
+    /// keeps its older retained admission on record.
+    fn note_cgroup_admission_removed(&mut self, pid: u32) {
+        let count = self.admitted_cgroup_pid_counts.entry(pid).or_insert(0);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.admitted_cgroup_pid_counts.remove(&pid);
+        }
+    }
+
     fn seed_initial_cgroup_views(&mut self) {
         if self.admits_generations() {
-            self.admitted_cgroup_views
-                .extend(self.views.iter().map(|view| {
+            let seeds: Vec<(ProcessViewId, CgroupAdmission)> = self
+                .views
+                .iter()
+                .map(|view| {
                     (
                         view.id(),
                         CgroupAdmission {
@@ -14455,7 +14497,11 @@ impl Engine {
                             closed_ns: None,
                         },
                     )
-                }));
+                })
+                .collect();
+            for (view, admission) in seeds {
+                self.insert_cgroup_admission(view, admission);
+            }
         }
     }
 
@@ -14477,7 +14523,7 @@ impl Engine {
                 continue;
             };
             let pid = view_data.pid;
-            if self.admitted_cgroup_views.insert(view, view_data).is_none() {
+            if self.insert_cgroup_admission(view, view_data).is_none() {
                 self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
             }
             // 6.14 Option B: an admitted PID's exits match its
@@ -14621,8 +14667,19 @@ impl Engine {
             return;
         }
         let before = self.admitted_cgroup_views.len();
+        // The complement of the retain predicate below: open admissions
+        // for the removed views. Their pids leave the count map with them.
+        let uncounted_pids: Vec<u32> = self
+            .admitted_cgroup_views
+            .iter()
+            .filter(|(view, admission)| views.contains(*view) && admission.closed_ns.is_none())
+            .map(|(_, admission)| admission.pid)
+            .collect();
         self.admitted_cgroup_views
             .retain(|view, admission| !views.contains(view) || admission.closed_ns.is_some());
+        for pid in uncounted_pids {
+            self.note_cgroup_admission_removed(pid);
+        }
         if self.admitted_cgroup_views.len() == before {
             return;
         }
@@ -29430,20 +29487,18 @@ impl Engine {
                             crate::process::process_start_time(*pid).ok() == Some(time)
                         })))
         });
-        // Admitted pids, open or closed: a still-listed one is the same
-        // lingering generation, never a newcomer (see newcomer_arrival_possible).
-        // Closed admissions stay on record after their views settle, so a
-        // readdir race relisting a just-reaped pid cannot re-mark it.
-        let admitted_pids: BTreeSet<u32> = self
-            .admitted_cgroup_views
-            .values()
-            .map(|admission| admission.pid)
-            .collect();
+        // Admitted pids, open or closed, from the incrementally kept
+        // count map: a still-listed one is the same lingering generation,
+        // never a newcomer (see newcomer_arrival_possible). Closed
+        // admissions stay on record after their views settle, so a readdir
+        // race relisting a just-reaped pid cannot re-mark it.
         let new_pids: Vec<_> = desired
             .difference(&known_pids)
             .copied()
             .filter(|pid| !self.held_back_waiting(*pid))
-            .filter(|pid| newcomer_arrival_possible(&self.proc_root, *pid, &admitted_pids))
+            .filter(|pid| {
+                newcomer_arrival_possible(&self.proc_root, *pid, &self.admitted_cgroup_pid_counts)
+            })
             .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Scan,

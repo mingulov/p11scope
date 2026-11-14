@@ -6053,9 +6053,9 @@ fn admitted_pid_counts_match_views_after_admit_close_churn() {
     );
     assert_mirrored(&engine, "re-seed");
     // One more admission through the record path.
-    engine.views.push(
-        ProcessView::open(ProcessViewId(7104), pid_b).expect("track the sleeper"),
-    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7104), pid_b).expect("track the sleeper"));
     engine.next_view_id = 7105;
     engine.record_cgroup_view_admissions([ProcessViewId(7104)]);
     assert_eq!(

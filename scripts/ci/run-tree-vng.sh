@@ -172,7 +172,7 @@ want={'privileged_run_tree_shell_wrapper_shows_grandchild_calls',
       'privileged_run_tree_many_children_land_exact',
       'privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage',
       'privileged_run_tree_unprearmed_shortlived_never_pause_still_learns',
-      'privileged_run_tree_many_shortlived_workers_stage_and_count',
+      'privileged_run_tree_arming_exhaustion_still_stages_and_counts',
       'privileged_run_tree_non_member_provider_is_never_staged'}
 ids=[row['cell'] for row in rows]
 if len(ids) != len(set(ids)) or set(ids) != want:

@@ -1224,53 +1224,59 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
     );
 }
 
-/// Many short-lived workers: 270 grandchildren in 9 waves of 30 concurrent
-/// workers (each 1 iteration, 1500 ms linger) under `--pause never`, with NO
-/// prearm hint. Short-lived workers retire before admission (measured: ~50
-/// admitted, ~270 gaps), so they never spend the 256 loader contexts and
-/// never exhaust: the capture names NO exhaustion gap (0, not 1 —
-/// exhaustion requires 256+ ADMITTED members, not merely spawned; the E1
-/// arming lift is safe for exactly the suite workloads it targets). The
-/// watch still stages the provider by scan (first wave) and later waves'
-/// calls still land via the file-identity probes (which need no loader
-/// context): probes > 0, learned >= 1, coverage >= 90%. The
-/// exhaustion-once gap logic itself (mark dedupes, exactly one row when 256
-/// ARE spent) is pinned by the unit twin
-/// `loader_exhaustion_names_once_and_watch_still_stages` (direct registry
-/// fill, like the pressure tests); this cell pins the privileged safe
-/// behavior under high churn. Without the watch staging this cell would see
-/// 0 probes. Waves (not one burst) are load-bearing for coverage: a single
-/// 270-wide burst makes all calls before the ~100 ms stage+attach lands
-/// (0.0 coverage), while waves let later mappers land after the first
-/// wave stages.
+/// Arming-exhaustion run: 260 short-lived sleepers in 13 waves of 20
+/// (each `sleep 5`, ~65 s total) to spend all 256 loader contexts, then 32
+/// sequential SoftHSM grandchildren (each 1 iteration, 150 ms linger) with
+/// NO prearm hint — all under `--pause never`. Every owned member arms a
+/// loader context (E1, even provider-free sleepers), and contexts are 256
+/// lifetime IDs never reused, so the 257th admission exhausts: the capture
+/// names `loader context capacity 256 is exhausted` exactly once (mark
+/// dedupes), stays PARTIAL, yet the watch still stages the provider by scan
+/// (staging needs no loader context) and the later SoftHSM mappers' calls
+/// still land via the file-identity probes (coverage after the first
+/// provider worker >= 0.95, like the twin cells). Without the watch staging
+/// this cell would see 0 probes; without the honest gap the exhaustion
+/// would be silent. Small waves (20, not 30+) are load-bearing for
+/// admission: 30-wide waves admit ~50 total regardless of count (frames
+/// miss retirements under fork load), while 20-wide waves admit all 260
+/// (measured admitted 260, gaps 20, exhaustion 1). The unit twin
+/// `loader_exhaustion_names_once_and_watch_still_stages` pins the same
+/// once-naming + staging logic via direct registry fill.
 #[test]
-#[ignore = "privileged: run-tree many-shortlived cell (root BPF capture, runtime SoftHSM workload + token)"]
-fn privileged_run_tree_many_shortlived_workers_stage_and_count() {
-    const WAVES: u32 = 9;
-    const PER_WAVE: u32 = 30;
+#[ignore = "privileged: run-tree arming-exhaustion cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
+    const SLEEPER_WAVES: u32 = 13;
+    const SLEEPERS_PER_WAVE: u32 = 20;
+    const PROVIDER_WORKERS: u32 = 32;
     let dir = tempfile::tempdir().expect("cell dir");
     let module = softhsm_path();
     let conf = init_token(dir.path());
     let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
     open_cell_dir(dir.path());
     let (_outdir, out) = out_dir();
-    let mut ledgers = Vec::new();
     let mut script = String::new();
-    for wave in 0..WAVES {
-        for i in 0..PER_WAVE {
-            let ledger = dir.path().join(format!("w{wave}l{i}"));
-            script.push_str(&format!(
-                "{} {} {} 1 1500 & ",
-                workload.display(),
-                module.display(),
-                ledger.display()
-            ));
-            ledgers.push(ledger);
+    // Phase 1: 260 sleepers to spend every loader context. Each wave's 20
+    // sleepers run concurrently for ~5 s (light load, fast frames, all
+    // admit), then join: 13 waves admit 260 members and exhaust mid-run.
+    for _ in 0..SLEEPER_WAVES {
+        for _ in 0..SLEEPERS_PER_WAVE {
+            script.push_str("sleep 5 & ");
         }
-        // Each wave's 30 workers run concurrently for ~1.5 s, then join:
-        // the first wave stages the provider, later waves land via the
-        // file-identity probes.
         script.push_str("wait; ");
+    }
+    // Phase 2: 32 sequential provider workers AFTER exhaustion. The first
+    // stages via the watch (no context needed); later ones land via the
+    // file-identity probes.
+    let mut ledgers = Vec::new();
+    for i in 0..PROVIDER_WORKERS {
+        let ledger = dir.path().join(format!("p{i}"));
+        script.push_str(&format!(
+            "{} {} {} 1 150; ",
+            workload.display(),
+            module.display(),
+            ledger.display()
+        ));
+        ledgers.push(ledger);
     }
     script.push_str("exec sleep 2");
     let mut args = vec![
@@ -1287,25 +1293,18 @@ fn privileged_run_tree_many_shortlived_workers_stage_and_count() {
     assert!(status.success(), "run exits with the shell's status");
     let profile = read_profile(&out);
     let evidence = profile.get("evidence").expect("evidence");
-    // The watch staged the provider (exhaustion or not, staging needs no
-    // loader context).
-    let probes = evidence
-        .get("attached_probes")
-        .and_then(|probes| probes.as_u64())
-        .expect("attached_probes");
-    assert!(probes > 0, "the run attached probes: {profile}");
-    let learned = evidence
-        .get("learned_staged_files")
-        .and_then(|learned| learned.as_u64())
-        .expect("learned_staged_files");
+    // Exhaustion named exactly once (non-vacuous: admitted >= 256 proves
+    // the contexts were really spent, not merely spawned).
+    let admitted = evidence
+        .get("scheduling")
+        .and_then(|scheduling| scheduling.get("newcomer_queue"))
+        .and_then(|queue| queue.get("admitted"))
+        .and_then(|admitted| admitted.as_u64())
+        .expect("newcomer_queue.admitted");
     assert!(
-        learned >= 1,
-        "the run staged the learned provider file: {profile}"
+        admitted >= 256,
+        "the run admitted 256+ members to spend every context: admitted={admitted}"
     );
-    // No exhaustion: short-lived workers retire before admission (they
-    // never spend loader contexts), so the 256-capacity gap must NOT fire.
-    // (The once-naming logic when 256 ARE spent is unit-pinned; see the
-    // cell doc above.)
     let skipped = evidence
         .get("skipped")
         .and_then(|skipped| skipped.as_array())
@@ -1320,16 +1319,28 @@ fn privileged_run_tree_many_shortlived_workers_stage_and_count() {
         })
         .count();
     assert_eq!(
-        exhaustion, 0,
-        "short-lived churn must not exhaust loader contexts: {skipped:?}"
+        exhaustion, 1,
+        "the 256-context exhaustion names itself once: {skipped:?}"
     );
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
-    // Later calls still counted: coverage after the first wave clears 90%
-    // (270 workers in 9 waves; the first wave's 30 workers may be missed
-    // honestly before the stage+attach lands ~100 ms in, like the first
-    // worker in the twin cells; file-identity probes need no loader
-    // context, so later waves still land).
-    let oracle_rest = sum_ledgers(&ledgers[(PER_WAVE as usize)..]);
+    // The watch still stages the provider despite exhaustion.
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    // Later calls still counted: coverage after the first provider worker
+    // clears 95% (the first may be missed honestly before the stage+attach
+    // lands; file-identity probes need no loader context).
+    let oracle_rest = sum_ledgers(&ledgers[1..]);
     let oracle_rest_total: u64 = oracle_rest.values().sum();
     assert!(oracle_rest_total > 0, "the oracle is non-empty");
     let sha = record_sha256(&profile, &module);
@@ -1339,12 +1350,12 @@ fn privileged_run_tree_many_shortlived_workers_stage_and_count() {
     let oracle_all_total: u64 = oracle_all.values().sum();
     assert!(
         observed_total <= oracle_all_total,
-        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle"
+        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
     );
     let coverage = observed_total as f64 / oracle_rest_total as f64;
     assert!(
-        coverage >= 0.90,
-        "coverage after the first wave is {coverage:.4} ({observed_total}/{oracle_rest_total})"
+        coverage >= 0.95,
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
     );
 }
 

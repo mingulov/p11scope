@@ -17,7 +17,7 @@
 #   privileged_run_tree_many_children_land_exact
 #   privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
 #   privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
-#   privileged_run_tree_many_shortlived_workers_stage_and_count
+#   privileged_run_tree_arming_exhaustion_still_stages_and_counts
 #   privileged_run_tree_non_member_provider_is_never_staged
 #
 # Each results.jsonl row carries exactly cell/pass/qualification/detail
@@ -54,7 +54,7 @@ privileged_run_tree_outliving_child_is_disclosed
 privileged_run_tree_many_children_land_exact
 privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
-privileged_run_tree_many_shortlived_workers_stage_and_count
+privileged_run_tree_arming_exhaustion_still_stages_and_counts
 privileged_run_tree_non_member_provider_is_never_staged
 )
 

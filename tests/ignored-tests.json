@@ -2222,8 +2222,8 @@
     },
     {
       "file": "tests/run_tree.rs",
-      "path": "privileged_run_tree_many_shortlived_workers_stage_and_count",
-      "reason": "privileged: run-tree many-shortlived cell (root BPF capture, runtime SoftHSM workload + token)",
+      "path": "privileged_run_tree_arming_exhaustion_still_stages_and_counts",
+      "reason": "privileged: run-tree arming-exhaustion cell (root BPF capture, runtime SoftHSM workload + token)",
       "cell": "live-kernel"
     },
     {

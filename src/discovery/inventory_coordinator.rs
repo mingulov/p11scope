@@ -3134,12 +3134,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Disclose audit voids as counted scope gaps (scope round): one
     /// `joint_void_<subcause>_history_loss` gap per void since the last
     /// drain, like ingest-break voids. Scope-wide (not per process).
-    /// Linked lanes only: an S1-only lane re-syncs without fencing
-    /// voids (breaks and re-syncs never count there), so its audit
-    /// counters name no Joint history loss — with zero feeds there is
-    /// none to lose, and the quiet cells fail on any `loss` reason.
-    /// An unlinked drain still advances its baseline, swallowing its
-    /// counters, so a later linked void discloses only itself.
+    /// Linked lanes only: S1-only lanes still count audit voids from
+    /// S1 sheds; those name no Joint history loss and S1's own shed
+    /// gaps already disclose them, so unlinked lanes advance the
+    /// baseline without emitting a gap. With zero feeds there is no
+    /// Joint history to lose, the quiet cells fail on any `loss`
+    /// reason, and swallowing those counters ensures a later linked
+    /// void discloses only itself.
     /// Idempotent: the baseline tracks the adapter's run-global
     /// counters, which retirement carries, so retries and repeated
     /// stop disclosures neither repeat nor lose a void. A replaced

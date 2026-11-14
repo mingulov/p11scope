@@ -1773,7 +1773,7 @@ pub(crate) fn process_is_kthread(pid: u32) -> bool {
 /// True when a `/proc/<pid>/stat` state word proves the generation dead:
 /// zombie (`Z`) or dead (`X`, `x`). A live, sleeping, stopped, or parked
 /// task never carries these words, so the verdict is reuse-safe.
-fn stat_state_is_dead(state: &str) -> bool {
+pub(crate) fn stat_state_is_dead(state: &str) -> bool {
     state == "Z" || state == "X" || state == "x"
 }
 

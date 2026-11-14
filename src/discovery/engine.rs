@@ -7904,6 +7904,34 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
     matches!(std::io::Read::read(&mut file, &mut byte), Ok(0))
 }
 
+/// True when `pid` may arrive as a newcomer this tick: its task is provably
+/// running, or it is unreadable without a tracked generation pending removal
+/// (a reaped racer or a transient glitch — fail-closed, as before).
+/// A zombie/dying task is an ended generation whose exit the ledger already
+/// handles: re-marking it as a newcomer files a spurious prune gap at reap
+/// for a fully-tracked generation. An unreadable pid whose view pends removal
+/// is the same dying generation, never a running newcomer — a new generation
+/// is always stat-readable, so reuse always stays markable.
+/// `pending_pids` carries the pids whose views retire this tick;
+/// `proc_root` is `/proc` live, a fixture tree in tests.
+pub(crate) fn newcomer_arrival_possible(
+    proc_root: &Path,
+    pid: u32,
+    pending_pids: &BTreeSet<u32>,
+) -> bool {
+    let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
+        return !pending_pids.contains(&pid);
+    };
+    let Some(end) = stat.rfind(')') else {
+        return !pending_pids.contains(&pid);
+    };
+    let dead = stat[end + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(crate::process::stat_state_is_dead);
+    !dead
+}
+
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
@@ -29352,10 +29380,19 @@ impl Engine {
                             crate::process::process_start_time(*pid).ok() == Some(time)
                         })))
         });
+        // Pids whose views retire this tick: a still-listed one is the same
+        // lingering generation, never a newcomer (see newcomer_arrival_possible).
+        let pending_pids: BTreeSet<u32> = self
+            .views
+            .iter()
+            .filter(|view| removed.contains(&view.id()))
+            .map(ProcessView::pid)
+            .collect();
         let new_pids: Vec<_> = desired
             .difference(&known_pids)
             .copied()
             .filter(|pid| !self.held_back_waiting(*pid))
+            .filter(|pid| newcomer_arrival_possible(&self.proc_root, *pid, &pending_pids))
             .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Scan,

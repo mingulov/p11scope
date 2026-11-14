@@ -8,6 +8,13 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+### Fixed
+
+- System and cgroup captures no longer file a `pid_descendant_gaps`
+  gap for a tracked process that exits but lingers unreaped: a
+  still-listed zombie is the same ended generation, not a newcomer
+  (was: re-marked on the next tick, then a prune gap at reap).
+
 ### Known limitations
 
 - On a busy host, a long `inventory --system --key-operations`

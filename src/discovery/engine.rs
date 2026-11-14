@@ -15092,11 +15092,11 @@ impl Engine {
         attribution::note(&skipped);
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
-            // Only a new row dirties the publication inputs: a repeated
-            // marker (a second wait under a still-full table) changes
-            // nothing, so it must not force a republish.
-            self.note_facts_mutated();
         }
+        // The batch-tail merge folds `object_skips` into the published
+        // history: any marker (even a dedup hit after a real mutation, like
+        // a repeated eviction message) dirties the publication inputs.
+        self.note_facts_mutated();
     }
 
     /// Pass containment (P1-5): one tick's candidate or apply failing
@@ -26992,14 +26992,16 @@ impl Engine {
     /// The live-tail library-handle wait gap: one counted row per
     /// capture (never per record, never per deferral). Live tails share
     /// the live budget reason: the operative clause — budget exhausted,
-    /// deferred to the next tick — is what the retry honors. The mark
-    /// dedupes by exact row and dirties the publication inputs, so a
-    /// full table over many ticks cannot grow the gap list.
+    /// deferred to the next tick — is what the retry honors. Routed
+    /// through `note_object_skips`, which dedupes by exact row and
+    /// dirties the publication inputs only when the row is new, so a
+    /// full table over many ticks neither grows the gap list nor forces
+    /// a republish.
     fn file_handles_wait_gap(&mut self) {
-        self.mark_partial(
-            crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT,
-            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE,
-        );
+        self.note_object_skips(vec![Skipped {
+            subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
+            reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into(),
+        }]);
     }
 
     /// Restore a handles-deferred record plus the unprocessed rest at

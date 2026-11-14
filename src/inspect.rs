@@ -755,9 +755,7 @@ fn run_with_view(
             )
         },
     );
-    if crate::cli::text_is_verbose() {
-        eprintln!("p11scope: {}", handles.diagnostic_line());
-    }
+    progress!("p11scope: {}", handles.diagnostic_line());
     let (excluded, unmatched) =
         crate::render::aggregate_excluded(context.1.excluded(), context.1.excludes());
     emit_application_diagnosis(pid, json, out, result, &excluded, &unmatched)

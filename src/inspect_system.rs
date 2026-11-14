@@ -154,17 +154,11 @@ pub(crate) fn set_progress_lines(on: bool) -> bool {
     PROGRESS_LINES.swap(on, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Best-effort bounded stderr for a scan progress line. Formatting and
-/// argument evaluation stay inside the enabled branch (see [`set_progress_lines`]).
-macro_rules! progress {
-    ($($arg:tt)*) => {
-        if $crate::cli::text_is_verbose()
-            && PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let line = format!($($arg)*);
-            let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&line));
-        }
-    };
+/// Whether scan progress lines currently print: the `progress!`
+/// gate (defined crate-wide in `lib.rs`), read through this instead
+/// of reaching the dashboard-owned flag directly.
+pub(crate) fn progress_lines_on() -> bool {
+    PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// `P11SCOPE_STAGE_TIMINGS=1` prints each pass's per-stage wall time to
@@ -1719,9 +1713,7 @@ fn collect_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
-    if crate::cli::text_is_verbose() {
-        eprintln!("p11scope: {}", handles.diagnostic_line());
-    }
+    progress!("p11scope: {}", handles.diagnostic_line());
     Ok((catalog, custody))
 }
 
@@ -1852,9 +1844,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_bytes,
         &mut handles,
     );
-    if crate::cli::text_is_verbose() {
-        eprintln!("p11scope: {}", handles.diagnostic_line());
-    }
+    progress!("p11scope: {}", handles.diagnostic_line());
     Ok(assemble(
         collection,
         bound,
@@ -5211,9 +5201,7 @@ pub(crate) fn collect_system_with_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
-    if crate::cli::text_is_verbose() {
-        eprintln!("p11scope: {}", handles.diagnostic_line());
-    }
+    progress!("p11scope: {}", handles.diagnostic_line());
     Ok(catalog)
 }
 
@@ -5695,6 +5683,19 @@ mod tests {
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn progress_gate_tracks_the_dashboard_switch() {
+        // The `progress!` gate (and the census lines routed through
+        // it) reads this switch: off while the dashboard owns the
+        // terminal, restored after. Output-only while flipped; the
+        // previous setting is restored before return.
+        let was = super::set_progress_lines(false);
+        assert!(!super::progress_lines_on());
+        super::set_progress_lines(true);
+        assert!(super::progress_lines_on());
+        super::set_progress_lines(was);
+    }
 
     #[test]
     fn no_route_userspace_pass_takes_the_witness() {

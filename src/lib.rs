@@ -36,6 +36,21 @@ macro_rules! eprint {
     }};
 }
 
+/// Best-effort bounded stderr for a scan progress line. Formatting and
+/// argument evaluation stay inside the enabled branch: verbose-only,
+/// and off while the dashboard owns the terminal (see
+/// [`inspect_system::set_progress_lines`]). Defined before every
+/// `mod`, so every module routes its progress through this one gate
+/// instead of raw `eprintln!`.
+macro_rules! progress {
+    ($($arg:tt)*) => {
+        if $crate::cli::text_is_verbose() && $crate::inspect_system::progress_lines_on() {
+            let line = format!($($arg)*);
+            let _ = $crate::sink::try_stderr_line(&$crate::render::escape_controls(&line));
+        }
+    };
+}
+
 pub(crate) mod app_hint;
 pub mod attach;
 // DR04's private parser/acquisition packet is staged; the opt-in coordinator

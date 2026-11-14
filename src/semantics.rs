@@ -3059,20 +3059,22 @@ pub struct State {
     cgroup_retained_paths: BTreeMap<u64, String>,
     orphan_ops: u64,
     unmatched_closes: u64,
-    /// Pending and detached rows an exit retire swept while still
+    /// Pending and detached rows a batch retire swept while still
     /// unresolved: `pending_at_end` keeps naming them, so a freed
     /// process never silently clears the session-tracking gap its
-    /// unfinished async calls left behind. Only the exit path feeds
-    /// this; the history path predates it and is unchanged.
+    /// unfinished async calls left behind. Both the exit path and the
+    /// exec-bump path feed this (the bump retires through the same
+    /// batch sweep); only the history path predates it and is unchanged.
     exit_retired_pending: u64,
-    /// Sessions an exit retire counted closed, kept as tombstones for
-    /// their late closes: a leader exit can precede live threads, and
-    /// their closes must match (already counted) rather than count
-    /// unmatched or double-close. Consumed by matching closes and by
-    /// re-opens of the same handle; capped (dead processes never
-    /// consume), with evictions counted for the A0 sampler. Never live
-    /// state: excluded from scope queries, owner samples and purges.
-    retired_sessions: BTreeSet<(ProcessKey, SessionRef)>,
+    /// Sessions an exit retire counted closed, kept as tombstones with
+    /// their pseudonyms: a leader exit can precede live threads, and
+    /// their late calls must still print `sess#N` while their closes
+    /// must match (already counted) rather than count unmatched or
+    /// double-close. Consumed by matching closes and by re-opens of the
+    /// same handle; capped (dead processes never consume), with
+    /// evictions counted for the A0 sampler. Never live state: excluded
+    /// from scope queries, owner samples and purges.
+    retired_sessions: BTreeMap<(ProcessKey, SessionRef), u64>,
     /// Retired tombstones evicted past [`MAX_RETIRED_SESSIONS`]. Their
     /// late closes degrade to `unmatched_closes` (still named); the
     /// count itself rides the A0 sampler, never the report.
@@ -3190,7 +3192,7 @@ impl State {
             orphan_ops: 0,
             unmatched_closes: 0,
             exit_retired_pending: 0,
-            retired_sessions: BTreeSet::new(),
+            retired_sessions: BTreeMap::new(),
             retired_session_evictions: 0,
             evidence: SemanticEvidence::default(),
             mech_shapes: BTreeMap::new(),
@@ -3274,7 +3276,7 @@ impl State {
         // pre-purge tombstone once the aggregates below reset).
         let tombstones_before = self.retired_sessions.len();
         self.retired_sessions
-            .retain(|(_, session)| !modules.contains(&session.module));
+            .retain(|(_, session), _| !modules.contains(&session.module));
         changed |= self.retired_sessions.len() != tombstones_before;
         changed |= !self.mechanisms.is_empty()
             || !self.templates.is_empty()
@@ -3913,7 +3915,7 @@ impl State {
             }
             lifecycle::CLOSE_SESSION if ev.rv == CkRv::OK.0 => {
                 if !self.retire_session(process, session)
-                    && !self.retired_sessions.remove(&(process, session))
+                    && self.retired_sessions.remove(&(process, session)).is_none()
                 {
                     // Neither open nor exit-retired: genuinely unmatched.
                     // A retired tombstone matches silently instead — its
@@ -4494,15 +4496,33 @@ impl State {
 
     /// Retires whole processes in one pass per map: the exit path's
     /// batch form of [`Self::retire_process`]. The session loop removes
-    /// open sessions (each counts closed and leaves a retired tombstone);
-    /// one retain pass per remaining map then sweeps every listed
-    /// process's rows — the per-session clears would only revisit rows
-    /// these passes already remove, so the loop skips them. Each
-    /// process's `reduced_histories` entry is removed with the key
-    /// refunded only on actual removal — so an exit retire plus a
-    /// history retire of the same key refunds once. Returns how many
-    /// input processes lost any swept entry.
+    /// open sessions (each counts closed and leaves a retired tombstone
+    /// keeping its pseudonym for late calls and closes); one retain
+    /// pass per remaining map then sweeps every listed process's rows —
+    /// the per-session clears would only revisit rows these passes
+    /// already remove, so the loop skips them. Each process's
+    /// `reduced_histories` entry is removed with the key refunded only
+    /// on actual removal — so an exit retire plus a history retire of
+    /// the same key refunds once. Returns how many input processes lost
+    /// any swept entry.
     pub fn retire_processes(&mut self, processes: &BTreeSet<ProcessKey>) -> u64 {
+        self.retire_processes_inner(processes, true)
+    }
+
+    /// Batch retire for exec bumps: identical to [`Self::retire_processes`]
+    /// except no tombstones are kept — the retired key carries the old
+    /// exec id, so they could never match a late close and would only
+    /// spend the cap. The swept pending/detached rows still feed the end
+    /// gap, exactly as for exits.
+    pub fn retire_processes_for_exec(&mut self, processes: &BTreeSet<ProcessKey>) -> u64 {
+        self.retire_processes_inner(processes, false)
+    }
+
+    fn retire_processes_inner(
+        &mut self,
+        processes: &BTreeSet<ProcessKey>,
+        tombstones: bool,
+    ) -> u64 {
         if processes.is_empty() {
             return 0;
         }
@@ -4520,25 +4540,31 @@ impl State {
             .map(|(owner, session)| (*owner, *session))
             .collect();
         for (process, session) in &sessions {
-            let existed = self.open.remove(&(*process, *session)).is_some();
-            if existed {
+            let info = self.open.remove(&(*process, *session));
+            if let Some(info) = info {
                 self.release_keys(1);
                 touched.insert(*process);
-                // A counted close leaves a tombstone for its late close
-                // (live threads can outlive the leader exit); past the
-                // cap the lowest entry evicts with its counted eviction.
-                self.retired_sessions.insert((*process, *session));
-                if self.retired_sessions.len() > MAX_RETIRED_SESSIONS {
-                    self.retired_sessions.pop_first();
-                    self.retired_session_evictions =
-                        self.retired_session_evictions.saturating_add(1);
+                // A counted close leaves a tombstone keeping its
+                // pseudonym for late calls and closes (live threads can
+                // outlive the leader exit); past the cap the lowest
+                // entry evicts with its counted eviction. Exec bumps
+                // skip this: their keys carry the old exec id and could
+                // never match.
+                if tombstones {
+                    self.retired_sessions
+                        .insert((*process, *session), info.pseudonym);
+                    if self.retired_sessions.len() > MAX_RETIRED_SESSIONS {
+                        self.retired_sessions.pop_first();
+                        self.retired_session_evictions =
+                            self.retired_session_evictions.saturating_add(1);
+                    }
                 }
             }
             // No per-session clear: the retain passes below sweep the
             // same rows by owner in one pass each (a detached record's
             // owner names its own process, so owner-clears are subsumed
             // by the process-keyed removal too).
-            if existed {
+            if info.is_some() {
                 self.sessions.closed = self.sessions.closed.saturating_add(1);
             }
         }
@@ -4782,10 +4808,11 @@ impl State {
         self.next_pseudonym.get(&process).copied()
     }
 
-    /// Reseeds a reopened or exec-bumped generation's counter from the
-    /// history task's sticky copy. Seeds only when absent, so a live
-    /// counter is never overwritten; budget-gated like every insert, so
-    /// a spent budget degrades to relabeling (counted by `admit`).
+    /// Reseeds a reopened generation's counter from the history
+    /// task's sticky copy. Seeds only when absent, so a live counter is
+    /// never overwritten; budget-gated like every insert, so a spent
+    /// budget degrades to relabeling (counted by `admit`). Never called
+    /// for exec bumps: the new image restarts numbering at #1.
     pub(crate) fn seed_next_pseudonym(&mut self, process: ProcessKey, counter: u64) {
         if !self.next_pseudonym.contains_key(&process) && self.admit(1) {
             self.next_pseudonym.insert(process, counter);
@@ -4821,15 +4848,19 @@ impl State {
             .get(slot as usize)
             .and_then(Option::as_ref)
             .map_or(MODULE_UNRESOLVED, |meta| meta.module);
+        let key = (
+            process,
+            SessionRef {
+                module,
+                handle: raw,
+            },
+        );
         self.open
-            .get(&(
-                process,
-                SessionRef {
-                    module,
-                    handle: raw,
-                },
-            ))
+            .get(&key)
             .map(|info| info.pseudonym)
+            // Exit-retired sessions keep their label in the tombstone,
+            // so surviving threads' late calls still print `sess#N`.
+            .or_else(|| self.retired_sessions.get(&key).copied())
     }
 
     pub fn mechanisms(&self) -> &BTreeMap<u64, MechStat> {
@@ -4952,7 +4983,7 @@ impl State {
             ),
             retired_sessions: counter_row(
                 self.retired_sessions.len(),
-                size_of::<(ProcessKey, SessionRef)>(),
+                size_of::<((ProcessKey, SessionRef), u64)>(),
                 HEAP_MAP_ENTRY,
             ),
         }
@@ -5062,7 +5093,7 @@ impl State {
         let retired_sessions_dead = self
             .retired_sessions
             .iter()
-            .filter(|(process, _)| is_dead(process.pid))
+            .filter(|((process, _), _)| is_dead(process.pid))
             .count();
         let sample_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         let dead = StateDeadLens {
@@ -5104,7 +5135,7 @@ impl State {
             ),
             retired_sessions_dead: counter_row(
                 retired_sessions_dead,
-                size_of::<(ProcessKey, SessionRef)>(),
+                size_of::<((ProcessKey, SessionRef), u64)>(),
                 HEAP_MAP_ENTRY,
             ),
         };

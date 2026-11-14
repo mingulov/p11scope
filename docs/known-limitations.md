@@ -116,11 +116,16 @@ The observer learns of an exit from the leader thread, so a process
 whose leader exits first (for example `pthread_exit` in `main`) has
 its sessions counted closed at that point even though worker threads
 keep calling. Their later events reopen the process: session numbering
-continues where it left off, and closes of the retired sessions match
+continues where it left off, calls on the retired sessions still print
+their `sess#N` label, and closes of the retired sessions match
 silently instead of counting unmatched, because the close was already
 counted at retire. At most 1024 retired sessions are remembered for
 this; past the cap entries evict (lowest key first) and their late
-closes read as `unmatched closes` again.
+calls lose the label while their late closes read as
+`unmatched closes` again. Operations still in flight at the retire are
+dropped with the retire, so a surviving thread's later operational
+call on a retired session counts an orphan operation rather than
+attributing a mechanism.
 
 ### Long captures go blind to new processes once the 262,144 identity budget is spent
 

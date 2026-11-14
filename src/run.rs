@@ -7417,9 +7417,11 @@ fn identify_tracked(
     // An exec bump retires its superseded generation through the batch
     // path: the old key's R10 entry is freed with the refund landing only
     // on actual removal, so a later exit of the final generation cannot
-    // strand it. Admit and birth already refuse old-key events and FORKs.
+    // strand it. No tombstones: the old key carries the superseded exec
+    // id and could never match. Admit and birth already refuse old-key
+    // events and FORKs.
     if !retired.is_empty() {
-        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
+        state.retire_processes_for_exec(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let Some(key) = key {
         tracker.history_call(key);
@@ -7432,10 +7434,11 @@ fn identify_tracked(
     }
     key
 }
-/// Reseeds a reopened, late or exec-bumped generation's session-pseudonym
-/// counter from the history task's sticky copy: the counter was freed at
+/// Reseeds a reopened or late generation's session-pseudonym counter
+/// from the history task's sticky copy: the counter was freed at
 /// retire, and numbering must continue instead of reusing a retired
 /// session's label. Seeds only when absent; a live counter always wins.
+/// Never called for exec bumps: the new image restarts at #1.
 fn reseed_reopened_pseudonym(
     tracker: &process::Tracker,
     state: &mut semantics::State,
@@ -7674,8 +7677,9 @@ fn observe_fork(
         tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
     // Batch retire, as in `identify_tracked`: a FORK can be the first
     // post-exec event, and its superseded generation must free R10 too.
+    // No tombstones, as in `identify_tracked`.
     if !retired.is_empty() {
-        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
+        state.retire_processes_for_exec(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let Some(parent) = parent {
         tracker.history_root(parent, ev.root_affiliation);
@@ -7689,9 +7693,10 @@ fn observe_fork(
     let (child, retired, reseed_child) =
         tracker.admit_history(domain, ev.session as u32, ev.child_image, ev.ts_ns);
     // Batch retire, as in `identify_tracked`: the child side of a FORK
-    // can equally carry an exec bump.
+    // can equally carry an exec bump. No tombstones, as in
+    // `identify_tracked`.
     if !retired.is_empty() {
-        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
+        state.retire_processes_for_exec(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let Some(child) = child
         && reseed_child
@@ -10511,6 +10516,15 @@ fn capture_profile(
                             "EVENTS",
                             post_q_record,
                         );
+                        // End-of-run reap: transfer+retire until nothing
+                        // is due — one budget would strand the rest with
+                        // no later drain to carry them.
+                        terminal_exit_reap(
+                            context.0,
+                            context.1,
+                            consumers.state,
+                            consumers.tracker,
+                        );
                     }
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
@@ -12139,6 +12153,10 @@ fn capture_trace(
                         "EVENTS",
                         post_q_record,
                     );
+                    // End-of-run reap: transfer+retire until nothing is
+                    // due — one budget would strand the rest with no
+                    // later drain to carry them.
+                    terminal_exit_reap(context.0, context.1, consumers.state, consumers.tracker);
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
@@ -13613,6 +13631,76 @@ fn retire_due_exits<S: crate::events::BoundedRecordSource>(
     }
 }
 
+/// End-of-run retire: retires due exits until nothing is due. A single
+/// 1024-budget pass would strand the rest with no later drain to carry
+/// them, leaving dead processes "still open". Stops early only when a
+/// pass makes no progress (only not-yet-due exits remain). Terminal
+/// drains only; live drains carry over to the next tick by design.
+fn retire_due_exits_until_quiescent<S: crate::events::BoundedRecordSource>(
+    drain: &crate::events::EventDrain<S>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+) {
+    loop {
+        let before = (
+            tracker.pending_exit_taps(),
+            tracker.pending_exit_marks(),
+            tracker.exit_gap_counts(),
+        );
+        retire_due_exits(drain, state, tracker);
+        let after = (
+            tracker.pending_exit_taps(),
+            tracker.pending_exit_marks(),
+            tracker.exit_gap_counts(),
+        );
+        if after.0 == 0 && after.1 == 0 {
+            break;
+        }
+        // No progress: only not-yet-due exits remain (a later drain
+        // owns them — at terminal, a giant backlog's; never spin).
+        if after == before {
+            break;
+        }
+    }
+}
+
+/// Terminal exit reap: after the terminal EVENTS drain, moves every
+/// remaining engine-tapped exit into the tracker and retires until
+/// nothing is due. Loops transfer+retire because one transfer only
+/// moves what fits the tracker's free space and one retire only
+/// examines one budget — with no later drain, either leftover would
+/// strand dead processes "still open". Stops early only when a round
+/// makes no progress (only not-yet-due exits remain). Terminal only.
+fn terminal_exit_reap(
+    engine: &mut Engine,
+    session: &mut Session,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+) {
+    loop {
+        let Ok(positions) = session.event_drain_positions() else {
+            break;
+        };
+        let engine_before = engine.exit_tap_stats().0;
+        transfer_exit_taps(engine, tracker, positions.producer);
+        let Ok(drain) = session.event_drain() else {
+            break;
+        };
+        retire_due_exits_until_quiescent(drain, state, tracker);
+        if engine.exit_tap_stats().0 == 0
+            && tracker.pending_exit_taps() == 0
+            && tracker.pending_exit_marks() == 0
+        {
+            break;
+        }
+        // The transfer moved nothing and the retire quiesced: the
+        // tracker is full of not-yet-due exits. Never spin.
+        if engine.exit_tap_stats().0 == engine_before {
+            break;
+        }
+    }
+}
+
 fn drain_profile_events<S: crate::events::BoundedRecordSource>(
     drain: &mut crate::events::EventDrain<S>,
     state: &mut semantics::State,
@@ -13974,6 +14062,7 @@ fn reduce_trace_event_with_identities<W: Write>(
             stash_pseudonym_counter(tracker, state, process);
         }
     } else {
+        let mut moved = false;
         let (attempted, error) = emit_bounded_trace_event(
             remaining,
             || match process {
@@ -13985,7 +14074,10 @@ fn reduce_trace_event_with_identities<W: Write>(
                                 crate::trace_identity::TraceIdentityUnknown::NotSeeded,
                             )
                         });
-                    tracer.on_event_process_with_executable(&ev, process, state, executable)
+                    let (line, counter_moved) =
+                        tracer.on_event_process_with_executable(&ev, process, state, executable);
+                    moved = counter_moved;
+                    line
                 }
                 None => tracer.on_rejected_history(&ev),
             },
@@ -14006,11 +14098,15 @@ fn reduce_trace_event_with_identities<W: Write>(
             );
         }
         *write_error = error;
-        if !attempted
-            && let Some(process) = process
-            && state.observe_process(process, &ev)
-        {
-            stash_pseudonym_counter(tracker, state, process);
+        if let Some(process) = process {
+            // A printed line already reduced inside the render closure
+            // (`moved` reports whether its counter moved); an
+            // unattempted line reduces here instead.
+            let counter_moved =
+                (attempted && moved) || (!attempted && state.observe_process(process, &ev));
+            if counter_moved {
+                stash_pseudonym_counter(tracker, state, process);
+            }
         }
     }
     Ok(())

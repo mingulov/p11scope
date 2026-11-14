@@ -46,12 +46,16 @@ struct Task {
     /// post-exec event was an unstamped FORK): the pre-exec leader exit
     /// must never retire the live post-exec generation, so an exit
     /// never matches while this is set. Cleared by the upgrade above.
-    /// Only ever set with `first_ts_ns == 0`.
+    /// Only ever set with `first_ts_ns == 0`. Defence in depth: with
+    /// the BPF fork stamp in place the producer never emits an
+    /// unstamped FORK, so this path is test-only unless the stamp is
+    /// ever lost — and then it still spares the live generation.
     birth_unknown_from_exec: bool,
     /// The process's last live session-pseudonym counter, stashed at
-    /// every increment. The task is never freed, so a reopen or exec
-    /// bump reseeds from this instead of relabeling from `#1` (which
-    /// would reuse a retired session's label). Zero means never stashed.
+    /// every increment. The task is never freed, so a reopen or late
+    /// event reseeds from this instead of relabeling from `#1` (which
+    /// would reuse a retired session's label). An exec bump clears it:
+    /// the new image restarts numbering at #1. Zero means never stashed.
     next_pseudonym: u64,
     /// Exit hook time recorded by exit-retire, never the `closed`
     /// flag (a closed task would refuse the reopened generation's
@@ -74,11 +78,14 @@ pub(crate) struct ExitTap {
 /// A transferred tap waiting for the EVENTS drain to read past its
 /// tap-time producer position. `passes` counts position-passing
 /// drains that matched no task; past two, the exit drops with a
-/// counted gap.
+/// counted gap. `synthetic` marks a late-event re-arm (see
+/// `late_reap`): it matches only still-retired tasks and drops
+/// silently when it matches nothing — never unmatched, never retried.
 struct PendingExit {
     tap: ExitTap,
     tap_producer: usize,
     passes: u8,
+    synthetic: bool,
 }
 
 /// Bound on tapped exits held anywhere: the engine tap queue and the
@@ -117,6 +124,14 @@ pub(crate) struct Registry {
     /// Transferred exits not yet retired, in tap order (tap-time
     /// producer stamps are non-decreasing down the queue).
     pending_exits: VecDeque<PendingExit>,
+    /// `(pid, exit hook)` pairs armed by late events: a late event
+    /// re-creates State rows for an exit-retired task, and with no
+    /// later real exit those rows would leak. Each pair becomes one
+    /// synthetic exit stamped with the producer position current at
+    /// the next retire (see `retire_exits_due`), which reaps exactly
+    /// those rows once the drain reads past it. A set: any number of
+    /// late events on one retired task arm a single re-arm.
+    late_reap: BTreeSet<(u32, u64)>,
     /// Exit-matched tasks skipped on a `first_ts_ns == hook_ts_ns`
     /// tie: neither generation is provably older, so neither retires.
     /// The exit drops immediately with this counted outcome — no retry,
@@ -145,6 +160,7 @@ impl Registry {
             root_completed: false,
             pid_index: BTreeSet::new(),
             pending_exits: VecDeque::new(),
+            late_reap: BTreeSet::new(),
             exit_tie_skipped: 0,
             exit_retire_unmatched: 0,
             exit_retire_reopened: 0,
@@ -159,6 +175,7 @@ impl Registry {
             root_completed: false,
             pid_index: BTreeSet::new(),
             pending_exits: VecDeque::new(),
+            late_reap: BTreeSet::new(),
             exit_tie_skipped: 0,
             exit_retire_unmatched: 0,
             exit_retire_reopened: 0,
@@ -201,8 +218,8 @@ impl Registry {
     /// the exit (clearing the exit timestamp, counted) or counts late
     /// when at or before it — the exit path never sets `closed`, so
     /// both still admit. The third return tells the caller to reseed
-    /// per-process continuity from the task's sticky copy (reopen, late
-    /// or bump only).
+    /// per-process continuity from the task's sticky copy (reopen or
+    /// late only; an exec bump restarts numbering at #1).
     pub(crate) fn admit(
         &mut self,
         domain: u64,
@@ -212,10 +229,10 @@ impl Registry {
     ) -> (Option<ProcessKey>, Vec<ProcessKey>, bool) {
         let mut retired = Vec::new();
         // Continuity reseed: the admitted key continues an exit-retired
-        // (reopen/late) or exec-superseded (bump) generation, so the
-        // caller reseeds per-process continuity (the pseudonym counter)
-        // from the task's sticky copy. False for fresh, steady and
-        // refused admits, which never need it.
+        // (reopen/late) generation, so the caller reseeds per-process
+        // continuity (the pseudonym counter) from the task's sticky
+        // copy. False for fresh, steady, exec-bump and refused admits,
+        // which never need it (a bump restarts numbering at #1).
         let mut reseed = false;
         if domain == 0 || domain != self.domain() || image.task_cookie == 0 || pid == 0 {
             return (None, retired, reseed);
@@ -232,7 +249,11 @@ impl Registry {
                 task.first_ts_ns = event_ts_ns;
                 task.birth_unknown_from_exec = event_ts_ns == 0;
                 task.exit_ts_ns = None;
-                reseed = true;
+                // Pre-B1: an exec restarts session numbering at #1. The
+                // bump never reseeds, and the old image's stash is
+                // cleared so a later reopen of the new generation cannot
+                // seed from it (the new image's own increments re-stash).
+                task.next_pseudonym = 0;
                 // A pruned-then-bumped task is matchable again under its
                 // new generation: re-insert (idempotent when present).
                 self.pid_index.insert((pid, image.task_cookie));
@@ -246,6 +267,10 @@ impl Registry {
                     self.exit_retire_reopened = self.exit_retire_reopened.saturating_add(1);
                 } else {
                     self.exit_retire_late = self.exit_retire_late.saturating_add(1);
+                    // The late event re-creates State rows with no later
+                    // real exit to free them: re-arm a synthetic exit so
+                    // the next retire reaps them (see `late_reap`).
+                    self.late_reap.insert((pid, exit));
                 }
                 reseed = true;
                 // A reopened or late event proves the pruned cookie live
@@ -290,7 +315,7 @@ impl Registry {
     }
 
     /// Stashes the live session-pseudonym counter on the task, which is
-    /// never freed: a later reopen or exec bump of the same cookie
+    /// never freed: a later reopen or late event on the same cookie
     /// reseeds from it. Exact-key like every other mutator, so a stale
     /// key can never clobber the live generation's stash. Called at
     /// every counter increment (rare), never on the steady CALL path.
@@ -416,23 +441,44 @@ impl Registry {
                 tap,
                 tap_producer,
                 passes: 0,
+                synthetic: false,
             });
         }
     }
 
     /// Collects the process keys whose exits are due: the drain has
     /// read past the tap-time producer position with no uncommitted
-    /// record before it. Examines at most `budget` exits per call;
-    /// the rest carry over to the next drain. Matched tasks record
-    /// the exit hook time (never `closed`); ties drop immediately with
-    /// their own counted outcome (no retry, never unmatched); other
-    /// unmatched exits retry, then drop with a counted gap.
+    /// record before it. Late-event re-arms convert first, each stamped
+    /// with the current producer position (only what fits; the rest
+    /// waits for the next retire). Examines at most `budget` exits per
+    /// call; the rest carry over to the next drain. Matched tasks
+    /// record the exit hook time (never `closed`); ties drop
+    /// immediately with their own counted outcome (no retry, never
+    /// unmatched); other unmatched exits retry, then drop with a
+    /// counted gap. Synthetic re-arms that match nothing drop silently.
     pub(crate) fn retire_exits_due(
         &mut self,
         consumer_now: usize,
         producer_now: usize,
         budget: usize,
     ) -> BTreeSet<ProcessKey> {
+        // Late-event re-arms become synthetic exits stamped with the
+        // current producer position (the producer only grows, so the
+        // queue's non-decreasing stamp order is preserved).
+        while self.pending_exits.len() < EXIT_TAP_QUEUE_LIMIT {
+            let Some((pid, hook)) = self.late_reap.pop_first() else {
+                break;
+            };
+            self.pending_exits.push_back(PendingExit {
+                tap: ExitTap {
+                    pid,
+                    hook_ts_ns: hook,
+                },
+                tap_producer: producer_now,
+                passes: 0,
+                synthetic: true,
+            });
+        }
         let mut due = BTreeSet::new();
         let mut keep = Vec::new();
         let mut examined = 0usize;
@@ -447,9 +493,14 @@ impl Registry {
                 break;
             }
             examined += 1;
-            let (matched, tie_seen) = self.match_exit_tap(&pending.tap);
+            let (matched, tie_seen) = self.match_exit_tap(&pending.tap, pending.synthetic);
             if !matched.is_empty() {
                 due.extend(matched);
+            } else if pending.synthetic {
+                // A synthetic re-arm that matches nothing reaps
+                // nothing: the task reopened (live) or a sibling
+                // re-arm already reaped it. Drop silently — never
+                // unmatched, never retried.
             } else if tie_seen {
                 // A tie can never match on retry: the tied task's
                 // `first_ts` never becomes `< hook`, and any later admit
@@ -484,8 +535,12 @@ impl Registry {
     /// tasks record the exit hook time — the earliest observed, so any
     /// post-exit event reopens — never the `closed` flag, so the next
     /// event is never refused; their index entries prune, so a repeated
-    /// exit never re-collects them.
-    fn match_exit_tap(&mut self, tap: &ExitTap) -> (Vec<ProcessKey>, bool) {
+    /// exit never re-collects them. A synthetic re-arm matches only
+    /// still-retired tasks (its late rows exist only while the exit
+    /// timestamp stands): live and reopened tasks are spared silently,
+    /// and ties are not recounted (the original exit already counted
+    /// them).
+    fn match_exit_tap(&mut self, tap: &ExitTap, synthetic: bool) -> (Vec<ProcessKey>, bool) {
         let mut matched = Vec::new();
         let mut tie_seen = false;
         // The pid's cookies, copied: matching mutates tasks below.
@@ -499,11 +554,23 @@ impl Registry {
             .filter(|cookie| self.tasks.get(cookie).is_some_and(|task| !task.closed))
             .count();
         for cookie in cookies {
+            // A synthetic re-arm reaps only still-retired tasks: a
+            // live or reopened task's rows are legitimately held.
+            if synthetic
+                && self
+                    .tasks
+                    .get(&cookie)
+                    .is_none_or(|task| task.exit_ts_ns.is_none())
+            {
+                continue;
+            }
             let unknown_ambiguous = self.tasks.get(&cookie).is_some_and(|task| {
                 !task.closed && task.first_ts_ns == 0 && (task.birth_unknown_from_exec || open >= 2)
             });
             if unknown_ambiguous {
-                self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                if !synthetic {
+                    self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                }
                 tie_seen = true;
                 continue;
             }
@@ -525,7 +592,9 @@ impl Registry {
                 // live again.
                 self.pid_index.remove(&(tap.pid, cookie));
             } else if task.first_ts_ns == tap.hook_ts_ns {
-                self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                if !synthetic {
+                    self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                }
                 tie_seen = true;
             }
         }
@@ -552,5 +621,12 @@ impl Registry {
     /// Pending (transferred, not yet retired) exit taps, for the A0 sampler.
     pub(crate) fn pending_exit_taps(&self) -> usize {
         self.pending_exits.len()
+    }
+
+    /// Late-event re-arms not yet converted to synthetic exits. The
+    /// terminal reap loops while either this or the pending queue is
+    /// non-empty.
+    pub(crate) fn pending_exit_marks(&self) -> usize {
+        self.late_reap.len()
     }
 }

@@ -881,6 +881,7 @@ impl Tracer {
                 crate::trace_identity::TraceIdentityUnknown::NotSeeded,
             ),
         )
+        .0
     }
 
     pub(crate) fn on_event_process_with_executable(
@@ -889,7 +890,7 @@ impl Tracer {
         process: ProcessKey,
         state: &mut State,
         executable: crate::trace_identity::TraceExecutableView<'_>,
-    ) -> String {
+    ) -> (String, bool) {
         let slot = self
             .slots
             .get(ev.slot as usize)
@@ -901,7 +902,7 @@ impl Tracer {
         let pre = (semantic && ev.session != SESSION_NONE)
             .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
             .flatten();
-        state.observe_process(process, ev);
+        let moved = state.observe_process(process, ev);
         let session = pre.or_else(|| {
             (semantic && ev.session != SESSION_NONE)
                 .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
@@ -939,9 +940,15 @@ impl Tracer {
         if executable.path().is_none()
             && let Some(path) = self.owned_label(ev)
         {
-            return format_line_with_owned(&rendered, wall_ns, &function, session, path);
+            return (
+                format_line_with_owned(&rendered, wall_ns, &function, session, path),
+                moved,
+            );
         }
-        format_line_with_executable(&rendered, wall_ns, &function, session, executable)
+        (
+            format_line_with_executable(&rendered, wall_ns, &function, session, executable),
+            moved,
+        )
     }
 }
 
@@ -2372,7 +2379,7 @@ mod tests {
         tracer.set_owned_command(key.pid, "/other/binary".to_string());
         let mut ev = call_event(key.pid, 0, pkcs11_types::CkRv::DEVICE_ERROR.0);
         ev.ts_ns = 20;
-        let line =
+        let (line, _) =
             tracer.on_event_process_with_executable(&ev, key, &mut state, store.lookup(key, 20));
         assert!(line.contains("exe=\"/usr/bin/firefox\""), "{line}");
         assert!(!line.contains("other"), "{line}");

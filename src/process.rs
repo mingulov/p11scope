@@ -202,6 +202,10 @@ impl Tracker {
     pub(crate) fn pending_exit_taps(&self) -> usize {
         self.history.pending_exit_taps()
     }
+    /// Late-event re-arms not yet converted to synthetic exits.
+    pub(crate) fn pending_exit_marks(&self) -> usize {
+        self.history.pending_exit_marks()
+    }
     /// Pending (transferred, not yet retired) exit taps.
     #[cfg(test)]
     pub(crate) fn pending_exit_taps_for_test(&self) -> usize {

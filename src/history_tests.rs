@@ -3481,3 +3481,40 @@ fn synthetic_exit_waits_for_drain_past_its_stamp() {
     assert_eq!(lens.next_pseudonym.len, 0);
     assert_eq!(t.pending_exit_taps_for_test(), 0);
 }
+
+#[test]
+fn terminal_retire_loop_reaps_past_the_per_drain_budget() {
+    // Gemini B: 1500 due exits at the end of a run — more than one
+    // 1024 budget retires. The end-of-run loop retires until nothing
+    // is due: every process freed, every session counted closed,
+    // nothing pending. Fails while the terminal path retires once:
+    // 476 processes stay "still open" with their rows.
+    const N: u32 = 1500;
+    let (mut s, mut t, _) = setup(2048);
+    let mut events = Vec::new();
+    for i in 0..N {
+        let mut open = ev(1000 + i, u64::from(100 + i), 0, 0);
+        open.ts_ns = 100;
+        events.push(open);
+    }
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(s.sessions().opened, u64::from(N));
+    // All exit at hook 200, transferred at the current producer like
+    // the terminal transfer; the end-of-run loop reaps them all.
+    t.note_exit_taps(
+        (0..N).map(|i| crate::history::ExitTap {
+            pid: 1000 + i,
+            hook_ts_ns: 200,
+        }),
+        crate::events::event_drain_positions(&drain).producer,
+    );
+    retire_due_exits_until_quiescent(&drain, &mut s, &mut t);
+    assert_eq!(s.sessions().closed, u64::from(N));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
+    let lens = s.memory_lens();
+    assert_eq!(lens.reduced.len, 0);
+    assert_eq!(lens.open.len, 0);
+    assert_eq!(lens.next_pseudonym.len, 0);
+}

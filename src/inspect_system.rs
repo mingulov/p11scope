@@ -4007,32 +4007,6 @@ fn is_unexamined_maps_reason(reason: &str) -> bool {
         && reason.contains("no deep scan examined")
 }
 
-/// The per-object cap behind an over-capacity skip, for folding sizes
-/// that would otherwise split concise groups. Handles both producer
-/// formats (`too_large (SIZE bytes; per-object cap is CAP)` from the
-/// scan budget and `object is SIZE bytes; limit is LIMIT` from the view
-/// filesystem). `None` for any other reason or an unparsable cap.
-fn too_large_cap(reason: &str) -> Option<u64> {
-    if let Some(rest) = reason.strip_prefix("too_large (") {
-        let (_, rest) = rest.split_once("per-object cap is ")?;
-        return parse_leading_u64(rest);
-    }
-    if let Some(rest) = reason.strip_prefix("object is ") {
-        let (_, rest) = rest.split_once("; limit is ")?;
-        return parse_leading_u64(rest);
-    }
-    None
-}
-
-/// Leading ASCII digits as u64, for cap parsing with a graceful fallback.
-fn parse_leading_u64(text: &str) -> Option<u64> {
-    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
 /// Skipped records and notes in text. Verbose lists every record —
 /// the full per-gap detail `-v` promises. Concise folds member records
 /// by reason — a lone record keeps its pid and subject, a repeated
@@ -4063,17 +4037,14 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
         }
         return;
     }
-    // Plain folds first: reasons with per-record numbers (unexamined-maps
-    // counts, over-cap sizes) fold by kind with a process/file count,
+    // Plain folds first: reasons with per-record numbers
+    // (unexamined-maps counts) fold by kind with a process count,
     // instead of splitting one group per number.
     let mut plain_maps: Vec<&PidGap> = Vec::new();
-    let mut plain_large: BTreeMap<u64, Vec<&PidGap>> = BTreeMap::new();
     let mut rest: Vec<&PidGap> = Vec::new();
     for gap in gaps.iter().filter(|gap| gap.pid.is_some()) {
         if is_unexamined_maps_reason(&gap.reason) {
             plain_maps.push(gap);
-        } else if let Some(cap) = too_large_cap(&gap.reason) {
-            plain_large.entry(cap).or_default().push(gap);
         } else {
             rest.push(gap);
         }
@@ -4087,15 +4058,6 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
             out,
             "{title}: {count} {noun} {verb} libraries that were not deep-scanned (may hide \
              providers) (--json lists each)",
-        );
-    }
-    for (cap, group) in &plain_large {
-        let mib = cap / (1024 * 1024);
-        let count = group.len();
-        let noun = if count == 1 { "file" } else { "files" };
-        let _ = writeln!(
-            out,
-            "{title}: {count} {noun} over {mib} MiB not read (--json lists each)",
         );
     }
     let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();

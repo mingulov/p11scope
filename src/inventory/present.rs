@@ -2525,28 +2525,9 @@ fn loss_gap_count(gaps: &[GapView]) -> usize {
     gaps.len()
 }
 
-/// True for an object-size-cap refusal: the scan's exact `object is
-/// {size} bytes; limit is {limit}` sentence with ASCII-digit values,
-/// whole string consumed. Only these fold in the verbose Details tail;
-/// anything appended, prepended or non-numeric renders per row.
-fn is_object_size_cap_reason(reason: &str) -> bool {
-    const PREFIX: &str = "object is ";
-    const MIDDLE: &str = " bytes; limit is ";
-    let Some(rest) = reason.strip_prefix(PREFIX) else {
-        return false;
-    };
-    let Some((size, limit)) = rest.split_once(MIDDLE) else {
-        return false;
-    };
-    !size.is_empty()
-        && size.bytes().all(|byte| byte.is_ascii_digit())
-        && !limit.is_empty()
-        && limit.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 /// True for a foreign-root open failure: the retained-root prefix plus
 /// the target-root suffix the scan appends. Only these fold by reason;
-/// size-cap and precondition refusals never match.
+/// precondition refusals never match.
 fn is_foreign_root_reason(reason: &str) -> bool {
     reason.starts_with("opening object within retained target root:")
         && reason.contains("(target root ")
@@ -4688,24 +4669,8 @@ fn render_snapshot_inner(
             );
         }
     }
-    // Identical object-size-cap rows fold into one line with the
-    // process count below (one row per examining process); every other
-    // row renders on its own. Totals key on the plain subject and
-    // reason, exactly as the row renders them.
-    let mut size_cap_totals: std::collections::BTreeMap<(&str, &str), usize> =
-        std::collections::BTreeMap::new();
-    for gap in &presentation.gaps {
-        if gap.budget.is_none() && is_object_size_cap_reason(&gap.reason) {
-            *size_cap_totals
-                .entry((
-                    gap_plain_subject(&gap.subject),
-                    gap_plain_reason(&gap.subject, &gap.reason),
-                ))
-                .or_insert(0) += 1;
-        }
-    }
-    let mut size_cap_rendered: std::collections::BTreeSet<(&str, &str)> =
-        std::collections::BTreeSet::new();
+    // Every row renders on its own line below; no size wording
+    // remains to fold.
     for gap in &presentation.gaps {
         // Subjects and reasons carry target-controlled strings (paths,
         // error text): escaped like every other snapshot field (DR-11).
@@ -4720,21 +4685,6 @@ fn render_snapshot_inner(
         let mut reason = escape_controls(plain_reason).into_owned();
         if plain_reason != gap.reason {
             reason = format!("{reason} ({})", escape_controls(&gap.reason));
-        }
-        // The fold: the first of identical object-size-cap rows renders
-        // with the process count, the rest stay silent. Singletons and
-        // budget rows render exactly as before.
-        if gap.budget.is_none() && is_object_size_cap_reason(&gap.reason) {
-            let total = size_cap_totals
-                .get(&(plain_subject, plain_reason))
-                .copied()
-                .unwrap_or(1);
-            if total > 1 {
-                if !size_cap_rendered.insert((plain_subject, plain_reason)) {
-                    continue;
-                }
-                reason = format!("{reason} ({total} processes)");
-            }
         }
         match gap.budget {
             Some(refusal) => {

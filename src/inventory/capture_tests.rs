@@ -3785,6 +3785,95 @@ fn a_closed_retirement_reports_without_a_detach_phase() {
     assert_eq!(entries(&log), ["report", "armed", "drop"]);
 }
 
+/// The post-report progress lines for an unsettled retirement with
+/// `attached` endpoints on `backend`.
+fn detach_lines_for(backend: LaneBackend, attached: usize) -> Vec<String> {
+    let log = Log::default();
+    let stopped = Stopped {
+        events: Vec::new(),
+        summary: LaneSummary {
+            retirement: Retirement::Unsettled("the probes did not detach within 10000 ms".into()),
+            backend,
+            passes: 2,
+            attached,
+            failed: 0,
+            lifecycle: LifecycleTally::default(),
+            lifecycle_high_water_bytes: None,
+        },
+        capture: ScriptedLane::new(&log),
+    };
+    let mut lines = Vec::new();
+    finish_native(
+        Some(stopped),
+        |_| {},
+        &|| {},
+        &mut |line| lines.push(line),
+        |stopped| {
+            drop(stopped);
+            ExitRelease::Reclaimed
+        },
+    );
+    lines
+}
+
+/// The unsettled Singles detach line estimates the remaining wait in
+/// plain English and offers the immediate exit: the reference run's
+/// 4683 links read "about 6 minutes".
+#[test]
+fn unsettled_singles_detach_line_estimates_remaining_minutes() {
+    assert_eq!(
+        detach_lines_for(LaneBackend::singles(), 4683),
+        [
+            "p11scope: output attempts finished; detaching the remaining native probes of \
+             4683 endpoints, about 6 minutes remaining (press Ctrl-C again to exit now)",
+            "p11scope: native probes detached",
+        ]
+    );
+}
+
+/// The estimate renders seconds below a minute and a half, minutes
+/// below an hour and a half, and hours past that, with singulars.
+#[test]
+fn unsettled_singles_detach_estimate_renders_plain_durations() {
+    for (attached, duration) in [
+        (0, "about 0 seconds"),
+        (1, "about 1 second"),
+        (1101, "about 89 seconds"),
+        (1125, "about 2 minutes"),
+        (4683, "about 6 minutes"),
+        (67125, "about 2 hours"),
+    ] {
+        let lines = detach_lines_for(LaneBackend::singles(), attached);
+        assert_eq!(lines.len(), 2, "attached={attached}: {lines:?}");
+        assert!(
+            lines[0].contains(&format!("{duration} remaining")),
+            "attached={attached}: {lines:?}"
+        );
+    }
+}
+
+/// Multi detaches fast enough that no estimate is meaningful: the
+/// unsettled line keeps the endpoint count and the immediate exit.
+#[test]
+fn unsettled_multi_detach_line_carries_no_estimate() {
+    assert_eq!(
+        detach_lines_for(
+            LaneBackend {
+                selection: BackendSelection::Multi,
+                backend: AttachBackend::Multi,
+                fallback: None,
+                scope_filter: ScopeFilter::None,
+            },
+            20167,
+        ),
+        [
+            "p11scope: output attempts finished; detaching the remaining native probes of \
+             20167 endpoints (press Ctrl-C again to exit now)",
+            "p11scope: native probes detached",
+        ]
+    );
+}
+
 /// The child half of the second-signal test: inert unless its parent sets
 /// the environment.
 #[test]

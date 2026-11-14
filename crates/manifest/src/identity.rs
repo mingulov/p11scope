@@ -23,13 +23,11 @@ use crate::elf::{ElfAbi, ExportWalk, classified_validated_object, exports_matchi
 #[cfg(feature = "identify")]
 use crate::maps::{Device, ObjectKey};
 
-/// v0.8.0: no per-object size cap remains. Identity reads stream the file
-/// in [`INSPECT_HASH_CHUNK_BYTES`] chunks (bounded memory) and parse from a
-/// read-only mapping (table pages only); any remaining allowance is enforced
-/// incrementally by the caller's reader as a time/progress budget with a
-/// named gap, never as a size refusal.
-#[cfg(feature = "identify")]
-const INSPECT_HASH_CHUNK_BYTES: usize = 1024 * 1024;
+/// v0.8.0: no per-object size cap remains. Identity reads the file
+/// once through the caller's reader and parses from those bytes (never
+/// a mapping: watched files must not be mapped); any remaining
+/// allowance is enforced incrementally by the caller's reader as a
+/// time/progress budget with a named gap, never as a size refusal.
 
 #[cfg(feature = "identify")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -260,39 +258,22 @@ pub fn inspect_file_with_reader(
 #[cfg(feature = "identify")]
 pub fn inspect_file_with_reader_exporting(
     file: &std::fs::File,
-    mut reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
+    reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
     wanted: &[&str],
 ) -> Result<InspectedObject, String> {
-    // The whole-file digest streams first, in bounded chunks through the
-    // caller's reader (which charges its own time/progress budget and
-    // reports read failures), so read errors keep their historical
-    // precedence over parse errors below.
-    let (sha256, len) = stream_file_hash(file, &mut reader)?;
-    // The ELF parse then runs over a read-only mapping, touching table
-    // pages only: the same shared validated core the snapshot oracle
-    // uses, so corrupt segment ranges refuse here byte-identically,
-    // before the export walk below.
-    //
-    // SAFETY: a read-only shared mapping of the file; the bytes are only
-    // read through the parser's checked accessors, never written or
-    // retained. This relies on memmap2's no-concurrent-modification
-    // contract, the same residual exposure documented on
-    // [`crate::elf::read_export_facts`]: a truncation landing mid-parse
-    // raises SIGBUS rather than surfacing a catchable error. Callers keep
-    // their pin-before/after discipline around this call.
-    let empty;
-    let mapped;
-    let image: &[u8] = if len == 0 {
-        // Mapping an empty file fails; parse the empty image directly so
-        // it refuses as non-ELF exactly as before.
-        empty = Vec::new();
-        &empty
-    } else {
-        mapped =
-            unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
-        &mapped
-    };
-    let (object, abi, executable_ranges) = classified_validated_object(image)?;
+    // One bounded read through the caller's reader (which charges its
+    // own time/progress budget and reports read failures): the digest
+    // and the parse share these bytes, so read errors keep their
+    // historical precedence over parse errors below. Never a mapping:
+    // files the instance hooks already watch must not be mapped by the
+    // observer, and a truncation landing mid-parse must surface a
+    // catchable error, never SIGBUS. Callers keep their pin-before/after
+    // discipline around this call.
+    let data = read_object_bytes_with(file, reader)?;
+    // The shared validated parse: corrupt segment ranges refuse here, before
+    // the export walk below; the executable ranges arrive validated with it.
+    let (object, abi, executable_ranges) = classified_validated_object(&data)?;
+    let sha256 = hex(&Sha256::digest(&data));
     let mut note = None;
     // object reads the build-id from PT_NOTE program headers too, so a
     // stripped section table does not lose it (review finding, 2026-08-11).
@@ -335,43 +316,6 @@ pub fn inspect_file_with_reader_exporting(
         getter_present: walk.getter_present,
         witness_fault: walk.witness_fault,
     })
-}
-
-/// Whole-file SHA-256 as hex plus the hashed length, streaming the file
-/// in [`INSPECT_HASH_CHUNK_BYTES`] chunks through `reader` (bounded
-/// memory at any file size). Read failures and short reads keep the
-/// historical whole-read wording; the caller's reader enforces its own
-/// time/progress budget incrementally.
-#[cfg(feature = "identify")]
-fn stream_file_hash(
-    file: &std::fs::File,
-    reader: &mut impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
-) -> Result<(String, u64), String> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("metadata failed: {error}"))?;
-    if !metadata.file_type().is_file() {
-        return Err("not a regular file".into());
-    }
-    let len = metadata.len();
-    let mut hash = Sha256::new();
-    let chunk_len = usize::try_from(len.min(INSPECT_HASH_CHUNK_BYTES as u64))
-        .map_err(|_| "object length does not fit usize")?;
-    let mut chunk = vec![0u8; chunk_len];
-    let mut done = 0u64;
-    while done < len {
-        let want = (len - done).min(chunk.len() as u64) as usize;
-        let read = match reader(file, &mut chunk[..want], done) {
-            Ok(read) => read,
-            Err(error) => return Err(format!("read failed: {error}")),
-        };
-        if read == 0 {
-            return Err(format!("short read: {done} of {len} bytes"));
-        }
-        hash.update(&chunk[..read]);
-        done = done.saturating_add(read as u64);
-    }
-    Ok((hex(&hash.finalize()), len))
 }
 
 #[cfg(feature = "identify")]
@@ -858,8 +802,8 @@ mod tests {
     }
 
     /// The identity pin parses from bounded reads, never a mapping:
-    /// files the instance hooks already watch must never be mapped by the
-    /// observer (the mapping bumps the file's epoch and fails
+    /// files the instance hooks already watch must never be mapped by
+    /// the observer (the mapping bumps the file's epoch and fails
     /// in-flight joins in every target process), and a truncation
     /// landing mid-parse would raise SIGBUS instead of a catchable
     /// error. Pins the `inspect_file_with_reader_exporting` body, like

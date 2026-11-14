@@ -2440,10 +2440,9 @@ impl AttachPlan {
             if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
                 continue;
             }
-            if let (Some(old_identity), Some(new_identity)) = (
-                self.object_identities.get(&retired.object),
-                new_identity,
-            ) && old_identity != new_identity
+            if let (Some(old_identity), Some(new_identity)) =
+                (self.object_identities.get(&retired.object), new_identity)
+                && old_identity != new_identity
             {
                 continue;
             }
@@ -4693,8 +4692,7 @@ fn merge(
                             revived.extend(
                                 keys.iter()
                                     .filter(|key| {
-                                        (revivable.contains_key(key)
-                                            || cross_reclaimable(key))
+                                        (revivable.contains_key(key) || cross_reclaimable(key))
                                             && partial_pick
                                                 .as_ref()
                                                 .is_none_or(|(chosen, _, _)| chosen.contains(key))
@@ -18976,8 +18974,7 @@ pub(crate) mod tests {
             let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
             plan.extend_exact(rebuilt).unwrap();
             plan.revivable.clone_from(&plan.retired_keys);
-            let mut churn =
-                provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+            let mut churn = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
             let pin = PinnedObjectId(100 + generation);
             churn.object = pin;
             churn.entry_objects = vec![vec![pin; 68]];

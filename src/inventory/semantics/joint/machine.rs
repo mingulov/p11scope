@@ -1391,6 +1391,15 @@ pub(crate) struct LiveJointMachine {
     /// stop gap. A success clears it; a call with no latched
     /// disposition attempts nothing and leaves it alone.
     rearm_refusal: Option<RunningRearmRefusal>,
+    /// The audit step's internal preflight refusal code, if the
+    /// latched refusal came from the audit itself refusing before it
+    /// ran (`Resource`, `H3Undisposed`, ...). Retained for the
+    /// verbose-only diagnostic line, so a soak can tell a full pool
+    /// from an undisposed slot; never a captured field and never in
+    /// the default output. Set only on the audit-refused path; a
+    /// later audit success or re-arm clears it, so no later stop can
+    /// show a stale code.
+    audit_refusal: Option<&'static str>,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1474,6 +1483,7 @@ impl LiveJointMachine {
             rearm_eligible: false,
             running_rearms: 0,
             rearm_refusal: None,
+            audit_refusal: None,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1784,6 +1794,8 @@ impl LiveJointMachine {
         self.unpaid_void_yields = 0;
         self.running_rearms += 1;
         self.rearm_refusal = None;
+        // The re-arm consumed the latch; a later stop must not show its code.
+        self.audit_refusal = None;
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
@@ -1851,6 +1863,13 @@ impl LiveJointMachine {
         } else {
             None
         }
+    }
+
+    /// The audit step's internal preflight refusal code, if the
+    /// machine latched on the audit itself refusing before it ran.
+    /// The driver discloses it on the verbose-only diagnostic line.
+    pub(crate) fn audit_refusal(&self) -> Option<&'static str> {
+        self.audit_refusal
     }
 
     /// Whether a Finish began and still owns its control.
@@ -3968,22 +3987,28 @@ impl LiveJointMachine {
                     )
                 });
                 match result {
-                    Ok(Ok(frame)) => (
-                        Phase::Audited {
-                            frame: Some(frame),
-                            identity,
-                            base,
-                        },
-                        Ok(Step::Continue),
-                    ),
-                    Ok(Err((ingested, _))) => (
-                        Phase::Auditing {
-                            original: ingested,
-                            identity,
-                            base,
-                        },
-                        Err(SemanticRefusal::Unavailable),
-                    ),
+                    Ok(Ok(frame)) => {
+                        self.audit_refusal = None;
+                        (
+                            Phase::Audited {
+                                frame: Some(frame),
+                                identity,
+                                base,
+                            },
+                            Ok(Step::Continue),
+                        )
+                    }
+                    Ok(Err((ingested, reason))) => {
+                        self.audit_refusal = Some(reason.code());
+                        (
+                            Phase::Auditing {
+                                original: ingested,
+                                identity,
+                                base,
+                            },
+                            Err(SemanticRefusal::Unavailable),
+                        )
+                    }
                     Err(reason) => (
                         Phase::Auditing {
                             original: original
@@ -5207,6 +5232,17 @@ impl AttestedSemanticLane {
             .as_deref()
             .and_then(|live| live.joint_machine.as_ref())
             .and_then(|machine| machine.rearm_refusal)
+    }
+
+    /// This lane's machine's retained audit-step preflight refusal
+    /// code, if it latched on the audit itself refusing before it
+    /// ran. The driver discloses it on the verbose-only diagnostic
+    /// line.
+    pub(crate) fn joint_audit_refusal(&self) -> Option<&'static str> {
+        self.live
+            .as_deref()
+            .and_then(|live| live.joint_machine.as_ref())
+            .and_then(LiveJointMachine::audit_refusal)
     }
 
     /// Re-arm this lane's latched running machine past one transient

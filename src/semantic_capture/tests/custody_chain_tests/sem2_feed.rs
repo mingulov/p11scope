@@ -15,8 +15,8 @@ use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
-    image_query_refusal_label, joint_births_line, joint_seals_line, joint_taints_line,
-    joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
+    image_query_refusal_label, joint_audit_refusal_line, joint_births_line, joint_seals_line,
+    joint_taints_line, joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -368,5 +368,17 @@ fn joint_voids_line_format_is_exact() {
         "p11scope: joint voids: break_dispose=3 break_ingest=5 void_audit=7 \
          void_resync=11 seal_below_fence=13 keys_total=17 keys_refused=2 \
          keys_tainted=4 keys_pending=6"
+    );
+}
+
+#[test]
+fn joint_audit_refusal_line_format_is_exact() {
+    assert_eq!(
+        joint_audit_refusal_line("Resource", "Auditing"),
+        "p11scope: joint audit refusal: code=Resource at Auditing"
+    );
+    assert_eq!(
+        joint_audit_refusal_line("H3Undisposed", "Auditing"),
+        "p11scope: joint audit refusal: code=H3Undisposed at Auditing"
     );
 }

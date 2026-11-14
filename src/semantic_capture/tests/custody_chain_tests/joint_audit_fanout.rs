@@ -11743,6 +11743,67 @@ fn joint_machine_auditing_pool_refusal_rearms_bound_demand_as_published() {
     assert_eq!(fixture.api_returns_total(), baseline_returns + 2);
 }
 
+/// Retention twin for the verbose-only audit diagnostic: an audit
+/// preflight refusal keeps its internal code (`Resource` under pool
+/// pressure) for the diagnostic line, while a native-construction
+/// refusal keeps none; each re-arm consumes its latch and clears the
+/// code, so no later stop can show a stale one. One recovery closes
+/// both re-arms: a service-path publish leaves the demand for the
+/// commit-poll path to take, so a second `begin_commit` would refuse.
+#[test]
+fn joint_machine_auditing_preflight_refusal_retains_its_code() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_auditing();
+    assert_eq!(
+        fixture.machine.audit_refusal(),
+        None,
+        "no refusal yet, no code"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let snapshot = registry.semantic_resource_snapshot();
+    let hog = registry
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .expect("the test fills the remaining pool");
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the audit's refused reservation latches the running machine"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert_eq!(
+        fixture.machine.audit_refusal(),
+        Some("Resource"),
+        "the preflight refusal keeps its internal code"
+    );
+    drop(hog);
+    assert_eq!(fixture.rearm("semantic_unavailable"), Some(false));
+    assert_eq!(
+        fixture.machine.audit_refusal(),
+        None,
+        "the re-arm consumed the latch it names"
+    );
+    // The other Auditing source: the native construction refused, so
+    // no audit code exists.
+    fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 3);
+    assert_eq!(
+        fixture.machine.audit_refusal(),
+        None,
+        "a native-construction refusal carries no audit code"
+    );
+    assert_eq!(fixture.rearm("semantic_unavailable"), Some(false));
+    assert_eq!(fixture.machine.audit_refusal(), None);
+    fixture.assert_recovers("after retained-code re-arms", 4);
+    assert_eq!(
+        fixture.machine.audit_refusal(),
+        None,
+        "the recovery shows no stale code"
+    );
+}
+
 /// Failure twin at the audit step: a permanent refusal keeps the
 /// latch and disposes nothing (raw quantum and H3 slot still held for
 /// the hold). The eligibility comes from the latch itself, so an

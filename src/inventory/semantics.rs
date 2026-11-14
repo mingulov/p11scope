@@ -1877,6 +1877,18 @@ pub(crate) fn joint_voids_line(
     )
 }
 
+/// One stderr line for the diagnostic audit-refusal code: the audit
+/// step's internal preflight refusal (`Resource`, `H3Undisposed`,
+/// ...) at the latched phase. One frozen code plus one frozen phase
+/// label only; no identities, paths or payloads. Diagnostic-only:
+/// printed beside the re-arm note or the stop gap only when verbose
+/// text or capture diagnostics are requested, never a contract and
+/// never in reports. Absent when the refusal came from the native
+/// construction instead of the audit itself.
+pub(crate) fn joint_audit_refusal_line(code: &str, phase: &str) -> String {
+    format!("p11scope: joint audit refusal: code={code} at {phase}")
+}
+
 /// One stderr line for the diagnostic ingest-taint summary:
 /// contradiction counts by kind, other taint causes, total
 /// events, and the first taint's cause. Counts and one frozen

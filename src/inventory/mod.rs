@@ -4885,6 +4885,28 @@ impl ClassicDriver<'_> {
         }
     }
 
+    /// Verbose-only audit-refusal disclosure for a latched Joint
+    /// lane: when the audit step itself refused, name its internal
+    /// preflight code (`Resource`, `H3Undisposed`, ...) so a soak can
+    /// tell a full pool from an undisposed slot. Stderr only (never a
+    /// gap or report field) and only under verbose text or capture
+    /// diagnostics; silent when the refusal came from the native
+    /// construction instead of the audit.
+    fn disclose_joint_audit_refusal(
+        warn: &mut WarnSink<'_>,
+        code: Option<&str>,
+        phase: Option<&str>,
+    ) {
+        let (Some(code), Some(phase)) = (code, phase) else {
+            return;
+        };
+        if crate::run::capture_diagnostics_on() {
+            warn.emit(&crate::inventory_semantics::joint_audit_refusal_line(
+                code, phase,
+            ));
+        }
+    }
+
     /// The stop gap's suffix for a held Joint lane, shared by the
     /// Poll path and the terminal not-begun step: the latched phase,
     /// past re-arms, and why the last re-arm was refused. The limit
@@ -4970,6 +4992,12 @@ impl ClassicDriver<'_> {
         // Bounded by the machine's per-run re-arm limit; every other
         // latch holds the lane below as before.
         let coordinator = &mut *self.coordinator;
+        // The verbose-only audit code, read before the re-arm attempt:
+        // a success clears the latch it names.
+        let (audit_code, audit_phase) = match self.semantic.as_ref() {
+            Some(lane) => (lane.joint_audit_refusal(), lane.joint_latched_phase()),
+            None => (None, None),
+        };
         let rearmed = self
             .semantic
             .as_mut()
@@ -4984,6 +5012,12 @@ impl ClassicDriver<'_> {
                     "p11scope: abandoned one unfinished live publication ({reason}); the semantic lane continues, coverage is partial"
                 ));
             }
+            {
+                let mut warn = WarnSink {
+                    display: &mut self.display,
+                };
+                Self::disclose_joint_audit_refusal(&mut warn, audit_code, audit_phase);
+            }
             if published {
                 self.joint_commit_pending = false;
                 return Ok(PassCommitProgress::Published);
@@ -4994,6 +5028,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
+        Self::disclose_joint_audit_refusal(&mut warn, audit_code, audit_phase);
         let lane = self.semantic.take().expect("a joint lane is seated");
         let rearms = lane.joint_running_rearms();
         let latched_at = lane.joint_latched_phase();
@@ -5175,6 +5210,11 @@ impl ClassicDriver<'_> {
                         inner.joint_latched_phase(),
                         inner.joint_running_rearms(),
                         inner.joint_rearm_refusal(),
+                    );
+                    Self::disclose_joint_audit_refusal(
+                        &mut *warn,
+                        inner.joint_audit_refusal(),
+                        inner.joint_latched_phase(),
                     );
                     let live = lane.take().expect("a failed lane holds");
                     let (_, summary) = Self::hold_joint_lane_for_exit(

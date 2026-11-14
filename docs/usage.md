@@ -2802,9 +2802,10 @@ checks read only the object's ELF tables via demand paging, so a large
 provider costs kilobytes of table reads rather than its file length.
 Header tables over the parse bounds (64 KiB program headers, 1 MiB
 section headers, each with its named gap) and dynamic spans or walked
-totals larger than the whole 64 MiB production read window
+totals larger than the whole production read window
 (`ELF dynamic-symbol table is...`, `ELF tables are...`) are refused as
-guards against crafted files. Under `--cgroup`, one inventory pass
+guards against crafted files — 64 MiB for an inventory pass, 512 MiB
+for a `profile`/`trace` capture. Under `--cgroup`, one inventory pass
 shares that single 64 MiB attempted-read window across every member and
 every file it examines. The pass carries its file-derived inspection,
 export, loader and table-refusal facts into the next pass, keyed and

@@ -21101,7 +21101,11 @@ impl Engine {
                 crate::fanotify::LearnMsg::Unavailable => {
                     // A live drain sent this: startup marks are active
                     // (the drain runs), so learning is partly —
-                    // never totally — unavailable. Only the
+                    // never totally — unavailable. The drain sends it
+                    // both for filesystems no pass ever marked and
+                    // when a periodic re-mark pass is still pending
+                    // or cannot start (coverage unproven, not
+                    // unmarked); the reason covers both. Only the
                     // never-started shapes file the unavailable row.
                     self.mark_partial(
                         crate::render::LEARNED_SKIP_SUBJECT,

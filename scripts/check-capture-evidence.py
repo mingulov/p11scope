@@ -704,8 +704,9 @@ LEARNED_MOUNT_NAMESPACE_REASON = (
     "namespace; provider files opened only there were not learned"
 )
 LEARNED_UNMARKED_REASON = (
-    "some filesystems were not marked for file learning; short-lived "
-    "first loads of new provider files opened only there were not learned"
+    "some filesystems were not marked for file learning, or a re-mark "
+    "pass was still pending or could not start; short-lived first loads "
+    "of new provider files opened only there were not learned"
 )
 LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,

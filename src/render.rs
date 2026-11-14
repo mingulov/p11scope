@@ -1914,7 +1914,7 @@ pub(crate) const LEARNED_REPLACED_DELETED_REASON: &str =
     "a provider file was replaced or deleted before staging; it was not learned";
 pub(crate) const LEARNED_DISABLED_REASON: &str = "file learning was disabled by the operator; short-lived first loads of new provider files were not learned";
 pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned";
-pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning; short-lived first loads of new provider files opened only there were not learned";
+pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";

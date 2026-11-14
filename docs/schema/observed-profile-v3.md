@@ -1093,14 +1093,17 @@ Learned-file gaps file under their own subject. Each record is
   drain thread could not spawn, or no filesystem could be marked —
   learning never ran. Ordinary discovery still ran; this names only
   the learning loss.
-- `some filesystems were not marked for file learning; short-lived
-  first loads of new provider files opened only there were not
-  learned`: the drain runs with active marks, but a visible
-  filesystem could never be marked — including one mounted,
+- `some filesystems were not marked for file learning, or a re-mark
+  pass was still pending or could not start; short-lived first
+  loads of new provider files opened only there were not learned`:
+  the drain runs with active marks, but coverage was partial: a
+  visible filesystem could never be marked — including one mounted,
   remounted or replaced at an already covered path after startup,
-  whose earlier mark died with the old mount — so first loads from
-  unmarked filesystems were not learned. Ordinary discovery still
-  ran; this names only the learning loss.
+  whose earlier mark died with the old mount — or a periodic
+  re-mark pass was still running from the previous period (over
+  ~30 s) or could not start, leaving coverage unproven. First
+  loads from the uncovered filesystems were not learned. Ordinary
+  discovery still ran; this names only the learning loss.
 - `a provider file was replaced or deleted before staging; it was not
   learned`: the drain proved a provider on held bytes, but the held
   file was unlinked (deleted, or replaced by a rename over its path)

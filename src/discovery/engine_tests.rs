@@ -5600,15 +5600,22 @@ fn wait_until_zombie(pid: u32) {
     }
 }
 
-/// One fixture `{proc_root}/{pid}/stat` line: `sleep` comm, `state`, user
-/// flags (never `PF_KTHREAD`), `starttime`. Mirrors a real stat line field
-/// for field so the user-process and liveness filters parse it like live
-/// input; ppid is synthetic (nothing on this path reads parentage).
-fn write_proc_stat_fixture(dir: &std::path::Path, pid: u32, state: &str, starttime: u64) {
+/// One fixture `{proc_root}/{pid}/stat` line: `sleep` comm, `state`, `flags`,
+/// `starttime`. Mirrors a real stat line field for field so the user-process,
+/// kthread, and liveness filters parse it like live input; ppid is synthetic
+/// (nothing on this path reads parentage). User fixtures pass `4194304`
+/// (never `PF_KTHREAD`); kthread fixtures OR in `0x200000`.
+fn write_proc_stat_fixture(
+    dir: &std::path::Path,
+    pid: u32,
+    state: &str,
+    flags: u32,
+    starttime: u64,
+) {
     let pid_dir = dir.join(pid.to_string());
     std::fs::create_dir_all(&pid_dir).expect("fixture pid dir");
     let line = format!(
-        "{pid} (sleep) {state} 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0\n"
+        "{pid} (sleep) {state} 1 1 1 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0\n"
     );
     std::fs::write(pid_dir.join("stat"), line).expect("fixture stat");
 }
@@ -5634,7 +5641,7 @@ fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
     wait_until_zombie(pid);
     let procdir = tempfile::tempdir().expect("fixture proc root");
     let starttime = crate::process::process_start_time(pid).expect("zombie keeps starttime");
-    write_proc_stat_fixture(procdir.path(), pid, "Z", starttime);
+    write_proc_stat_fixture(procdir.path(), pid, "Z", 4194304, starttime);
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
     assert!(
@@ -5705,7 +5712,7 @@ fn tick_still_marks_running_newcomer_without_view() {
         !stat.contains(" Z "),
         "sleeper must be running, got: {stat}"
     );
-    write_proc_stat_fixture(procdir.path(), pid, "S", starttime);
+    write_proc_stat_fixture(procdir.path(), pid, "S", 4194304, starttime);
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
     // Marked, then possibly admitted in the same tick (admission consumes
@@ -5777,6 +5784,58 @@ fn tick_does_not_remark_unreadable_pid_with_settled_view() {
     );
 }
 
+/// A pre-existing kernel thread that exits before the first live-tick walk
+/// must still skip the gap ledger: initial discovery already listed it, so
+/// its exit is proved like a walk-listed one. (Without the seed, early
+/// kthread-idle bursts gap once each on wide scopes.)
+#[test]
+fn pre_walk_kthread_exit_skips_after_initial_seed() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 100);
+    std::fs::write(procdir.path().join("4242").join("maps"), "").expect("empty maps");
+    engine.seed_initial_kernel_threads(procdir.path(), &[4242]);
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(4242u32) << 32;
+    exit.hook_ts_ns = 200;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "seeded kthread exit must skip the gap ledger"
+    );
+}
+
+/// Without the seed, an unproved exit still gaps (fail-closed): the seed
+/// only exempts generations initial discovery actually listed.
+#[test]
+fn unseeded_unknown_exit_still_gaps() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(4242u32) << 32;
+    exit.hook_ts_ns = 200;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "unproved exit must still gap (fail-closed)"
+    );
+}
+
 /// A REUSED pid (new running generation, different start_time) while the old
 /// view pends removal still marks: only the same lingering generation skips.
 #[test]
@@ -5801,6 +5860,7 @@ fn tick_still_marks_reused_pid_with_pending_view() {
         procdir.path(),
         pid,
         "R",
+        4194304,
         old_start.unwrap_or(0).wrapping_add(100),
     );
     engine.proc_root = procdir.path().to_path_buf();

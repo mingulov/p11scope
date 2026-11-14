@@ -5,12 +5,13 @@
 //! fixture under `run` against SoftHSM and asserts the descendants'
 //! calls land in the profile with ledger-exact counts. The direct
 //! child never maps the provider itself, so every observed provider
-//! call proves a descendant was followed. All cells pre-arm SoftHSM:
-//! unprearmed cold-grandchild exactness is frame-racy by design (the
-//! documented short-lived limitation), so committed cells pin the
-//! deterministic shape and the operator-shaped unprearmed runs stay
-//! manual live proofs. Workloads are runtime-generated C (P2-7
-//! `TARGET_C` precedent), so no committed fixtures and no license row.
+//! call proves a descendant was followed. Most cells pre-arm SoftHSM
+//! and pin the deterministic ledger-exact shape; the unprearmed
+//! shortlived cell instead proves the run learns the provider file
+//! from its own short-lived descendants (high coverage after the
+//! first worker, never exact: the first mapper's calls may be missed
+//! honestly). Workloads are runtime-generated C (P2-7 `TARGET_C`
+//! precedent), so no committed fixtures and no license row.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -899,6 +900,84 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
         assert!(Instant::now() < deadline, "the leaf would not die");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Unprearmed short-lived descendants: 32 sequential grandchildren that
+/// each dlopen SoftHSM, make a few calls and exit within tens of
+/// milliseconds, with NO `--module`/`--prearm-module` hint. The run owns
+/// the whole tree, so the first live mapper must teach it the provider
+/// file: probes attach by file identity and every later grandchild's
+/// calls land. The first worker's calls may be missed honestly (PARTIAL
+/// with descendant gaps), and one attach pipeline (~tens of ms) may
+/// cost a second worker on these ~15 ms children (harsher than the
+/// 50 ms operator shape the smoke leg covers at >= 95%), so coverage
+/// of the oracle after the first worker must clear 90%. Without the
+/// fix this cell sees 0 probes and 0.0 coverage (scan-only discovery
+/// never lands an attach for short-lived mappers).
+#[test]
+#[ignore = "privileged: run-tree unprearmed shortlived cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
+    const CHILDREN: u32 = 32;
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload", WORKLOAD_C);
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    let mut ledgers = Vec::new();
+    let mut script = String::new();
+    for i in 0..CHILDREN {
+        let ledger = dir.path().join(format!("l{i}"));
+        script.push_str(&format!(
+            "{} {} {} 1; ",
+            workload.display(),
+            module.display(),
+            ledger.display()
+        ));
+        ledgers.push(ledger);
+    }
+    // Drain settle (see the shell-wrapper cell): two seconds between the
+    // last grandchild and loop end, same PID via `exec`.
+    script.push_str("exec sleep 2");
+    // No --module/--prearm-module: the run must learn the provider file
+    // from its own short-lived descendants.
+    let mut args = vec![
+        "run".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+        "--".to_string(),
+    ];
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    let profile = read_profile(&out);
+    let evidence = profile.get("evidence").expect("evidence");
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    // The oracle after the first worker: every later grandchild ran
+    // under attached file-identity probes, so its calls must land.
+    let oracle_rest = sum_ledgers(&ledgers[1..]);
+    let oracle_rest_total: u64 = oracle_rest.values().sum();
+    assert!(oracle_rest_total > 0, "the oracle is non-empty");
+    let sha = record_sha256(&profile, &module);
+    let observed = function_calls(&profile, &sha);
+    let observed_total: u64 = observed.values().sum();
+    // Exactness still holds upward: no observed call is invented.
+    let oracle_all = sum_ledgers(&ledgers);
+    let oracle_all_total: u64 = oracle_all.values().sum();
+    assert!(
+        observed_total <= oracle_all_total,
+        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
+    );
+    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    assert!(
+        coverage >= 0.90,
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+    );
 }
 
 /// Many children: 32 sequential grandchildren through one shell loop

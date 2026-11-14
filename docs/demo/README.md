@@ -85,18 +85,32 @@ install it with `sudo dnf install ./p11scope-0.7.0-1.x86_64.rpm`.
 ## Saving a report
 
 `-o` writes inside the container, and `--rm` discards it with the
-container, so mount a folder for the report. Today the output
-directory must be root-owned: a user-owned mount is refused
-(`output directory ancestor /out is untrusted: owned by uid 1000`).
-Make a root-owned directory once, then add `-v ~/p11out:/out` to the
-`docker run` line and `-o /out/report.json` to the p11scope command:
+container, so mount a folder for the report and name its owner:
+`-o` alone into your own directory is refused, because the mount
+belongs to you while the image runs as root. Add the mount, three
+file grants, and `--output-owner $(id -u)` to the `docker run` line
+and `-o /out/report.json` to the p11scope command:
 
 ```sh
-sudo install -d -m 0755 -o root -g root ~/p11out
+mkdir -p out
+docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
+  --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE \
+  --cap-add DAC_READ_SEARCH --cap-add DAC_OVERRIDE --cap-add CHOWN \
+  --cap-add FOWNER -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  --security-opt apparmor=unconfined -v $PWD/out:/out \
+  ghcr.io/mingulov/p11scope:latest inventory --system --duration 15s \
+  -o /out/report.json --output-owner $(id -u)
 ```
 
-The file lands root-owned (`0600`; read it with `sudo`). Easier
-output ownership is planned for 0.8.0.
+`--output-owner UID[:GID]` (root only) trusts output directories
+owned by UID and hands newly created files to UID:GID — here your
+own id, so the report lands readable by you instead of
+root-owned. GID defaults to UID. The three file grants
+(`DAC_OVERRIDE` to create, `CHOWN` to hand over, `FOWNER` for
+streams) are what let the dropped-privilege container write into
+your directory; without them the trusted write fails with
+permission denied. See [Deployment
+artifacts](../../deploy/README.md).
 
 ## Learn more
 

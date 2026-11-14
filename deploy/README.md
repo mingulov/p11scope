@@ -114,23 +114,33 @@ needs a quiet host.
 
 Saving a report: `-o` writes inside the container, and `--rm`
 discards it with the container, so mount a folder for the report.
-Today the output directory must be root-owned: a user-owned mount is
-refused (`output directory ancestor /out is untrusted: owned by uid
-1000`). Make a root-owned directory once, then mount it:
+`-o` into a bind-mounted host directory is refused — the mount
+belongs to the host user while the image runs as root, so the trust
+check names it untrusted (`output directory ancestor /out is
+untrusted: owned by uid 1000`). Name the mount's owner explicitly
+and the report is both written and handed over (measured 2026-11-14
+on lu26, Ubuntu 26.04, Docker 29.8.1, local image from this tree):
 
 ```sh
-sudo install -d -m 0755 -o root -g root ~/p11out
-docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
-  --cap-add CHECKPOINT_RESTORE --cap-add SYS_PTRACE \
+mkdir -p out
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
   --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-  -v ~/p11out:/out ghcr.io/mingulov/p11scope:latest inventory --system \
-  -o /out/report.json
+  -v $PWD/out:/out ghcr.io/mingulov/p11scope:latest \
+  inventory --system --duration 15s -o /out/inventory.json --output-owner 1000
 ```
 
-The file lands root-owned (`0600`; read it with `sudo`). Measured on
-Docker 29.8.1 with the five-cap set: `inventory --system -o` into a
-root-owned mount exits 0 with the file written. Easier output
-ownership is planned for 0.8.0.
+`--output-owner UID[:GID]` (root only) trusts output directories
+owned by UID and hands newly created files to UID:GID (GID defaults
+to UID), still private `0600` — the file above lands `1000:1000`
+instead of root-owned. The mode, type and symlink checks are
+unchanged, and without the flag the refusal names the exact fix.
+Under `--cap-drop ALL` the five-capability set alone cannot write
+into a host-owned mount (the trusted create fails with permission
+denied): add `--cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add
+FOWNER` (`/proc/self/status` then reads `CapEff:
+000001c00008000f`, the five plus the three file grants), and the
+same `-o` succeeds. `trace -o` streams and `--event-log` rotation
+(including retention eviction) follow the same handover.
 
 ## Rootless containers
 

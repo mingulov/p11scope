@@ -1348,7 +1348,14 @@ Limits that matter in pods:
   readable without `sudo cat`; pre-existing files keep their owner,
   and anywhere else the files stay root-owned as before. A second run
   reuses and truncates an invoker-owned stream file it previously
-  refused. If the profile or metrics report cannot be written to
+  refused. `sudo` cannot help inside a container (the host owner has
+  no account there), so root runs take `--output-owner UID[:GID]`
+  instead: output directories owned by UID are trusted, and newly
+  created files are handed to UID:GID (GID defaults to UID), still
+  private `0600`. The mode, type and symlink checks are unchanged,
+  and without the flag a foreign-owned directory is refused naming
+  the exact `--output-owner` fix. If the profile or metrics report
+  cannot be written to
   `-o` (a full disk, a quota, a read-only remount), the
   already-rendered JSON document is rescued to stdout instead of
   being lost: one stderr line names the failed path and says the
@@ -1364,6 +1371,21 @@ Limits that matter in pods:
   the live frame likewise never skips the `-o` write: the file is
   still attempted and any failures combine. The `-o` file itself
   stays atomic — a failed run never leaves a partial file.
+- `--output-owner UID[:GID]` — with `-o` (or, for `inventory`,
+  `--event-log` or `--diagnostics`): trust output directories owned by
+  UID and hand newly created files to UID:GID, still private `0600`.
+  Root only, refused without a file sink and away from root. GID
+  defaults to UID; neither id needs an account. This is the container
+  bind-mount case: the image runs as root while the mounted directory
+  belongs to the host user, so `-o /out/report.json` alone is refused
+  as untrusted and `--output-owner $(id -u)` both trusts the mount and
+  leaves the report readable by its owner. The explicit flag wins over
+  the `sudo` handover when both apply; the mode, type and symlink
+  checks are unchanged. Writing into another user's directory also
+  needs the file capabilities (`DAC_OVERRIDE` to create, `CHOWN` to
+  hand over, `FOWNER` for streams), which the observer keeps when `-o`
+  is given — under `--cap-drop ALL` grant them explicitly (see
+  [Deployment artifacts](../deploy/README.md)).
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

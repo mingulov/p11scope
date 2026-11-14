@@ -1893,7 +1893,7 @@ fn multi_lane_tick_cadence_drains_backlog_within_wall_budget() {
     );
     for _ in 0..200 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert!(
         lane.backlog.endpoints.is_empty(),
@@ -1941,7 +1941,7 @@ fn multi_lane_raised_bound_carries_owner_demand_in_one_pass() {
     );
     for _ in 0..10 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     lane.after_pass(&mut host);
     assert_eq!(host.receipts.last().copied().unwrap(), (0, 0));
@@ -1984,7 +1984,7 @@ fn multi_lane_ticks_keep_a_whole_provider_attached() {
     let receipts_before = host.receipts.len();
     for _ in 0..10 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert_eq!(
         host.receipts.len(),
@@ -2021,7 +2021,7 @@ fn multi_lane_over_ceiling_demand_still_defers_honestly() {
     );
     for _ in 0..10 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert_eq!(
         lane.backlog.endpoints.len(),
@@ -2068,7 +2068,7 @@ fn multi_lane_stop_after_tick_cadence_reports_zero_deferred() {
     lane.after_pass(&mut host);
     for _ in 0..200 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert!(
         lane.backlog.endpoints.is_empty(),
@@ -2121,7 +2121,7 @@ fn singles_lane_tick_cadence_drains_backlog() {
     );
     for _ in 0..200 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert!(
         lane.backlog.endpoints.is_empty(),
@@ -2141,6 +2141,64 @@ fn singles_lane_tick_cadence_drains_backlog() {
         "the buffered tick progress forwards as its own receipt ahead of the \
          pass receipt: {:?}",
         host.receipts,
+    );
+}
+
+/// Drain-only collection ticks (F9): with `extend` false the tick still
+/// drains the ring but starts no extend, so a 1488-endpoint backlog sits
+/// untouched until an extending tick runs.
+#[test]
+fn collection_tick_without_extend_drains_but_leaves_the_backlog() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_absorbed_provider(2000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Singles),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (512, 1488));
+    assert_eq!(extend_calls(&log), 2, "activation plus one pass");
+    let services = || {
+        entries(&log)
+            .iter()
+            .filter(|entry| *entry == "service")
+            .count()
+    };
+    let drained_before = services();
+    for _ in 0..3 {
+        lane.collecting_tick(false);
+    }
+    assert_eq!(
+        extend_calls(&log),
+        2,
+        "drain-only ticks start no extends: {:?}",
+        entries(&log)
+    );
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        1488,
+        "the backlog sits untouched while the stop pends"
+    );
+    assert_eq!(
+        services(),
+        drained_before + 3,
+        "each drain-only tick still drains the ring: {:?}",
+        entries(&log)
+    );
+    lane.collecting_tick(true);
+    assert_eq!(
+        extend_calls(&log),
+        3,
+        "an extending tick resumes the cadence"
+    );
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        1424,
+        "one 64-entry Singles tick drains the backlog head"
     );
 }
 
@@ -2165,7 +2223,7 @@ fn multi_lane_tick_refusal_skips_later_ticks_and_reports_one_gap() {
     assert_eq!(host.receipts[1], (32768, 7232));
     for _ in 0..2 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert_eq!(
         lane.backlog.endpoints.len(),
@@ -2175,7 +2233,7 @@ fn multi_lane_tick_refusal_skips_later_ticks_and_reports_one_gap() {
     lane.capture.refuse_extends = true;
     for _ in 0..10 {
         lane.tick(&mut host);
-        lane.collecting_tick();
+        lane.collecting_tick(true);
     }
     assert_eq!(
         lane.backlog.endpoints.len(),
@@ -4422,7 +4480,7 @@ fn collection_ticks_hold_at_most_the_record_bound() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     for _ in 0..5 {
-        started.collecting_tick();
+        started.collecting_tick(true);
         assert!(started.held_records <= 3, "{}", started.held_records);
     }
     let services = |log: &Log| {
@@ -4438,7 +4496,7 @@ fn collection_ticks_hold_at_most_the_record_bound() {
     started.after_pass(&mut scene);
     assert_eq!(scene.staged_lifecycle.len(), 3, "two held, one serviced");
     // Staging frees the bound.
-    started.collecting_tick();
+    started.collecting_tick(true);
     assert_eq!(services(&log), 4);
 }
 
@@ -4458,7 +4516,7 @@ fn quiet_collection_holds_at_most_the_batch_bound() {
         .unwrap();
     let bound = windows().held_batches;
     for _ in 0..20_000 {
-        started.collecting_tick();
+        started.collecting_tick(true);
         assert!(
             started.held.len() <= bound,
             "quiet collection holds {} batches",
@@ -4488,7 +4546,7 @@ fn collection_ticks_hold_at_most_the_batch_bound() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     for _ in 0..5 {
-        started.collecting_tick();
+        started.collecting_tick(true);
         assert!(started.held.len() <= 3, "{}", started.held.len());
     }
     let services = |log: &Log| {
@@ -4505,7 +4563,7 @@ fn collection_ticks_hold_at_most_the_batch_bound() {
     started.after_pass(&mut scene);
     assert_eq!(scene.staged_lifecycle.len(), 4, "three held, one serviced");
     // Staging frees the bound.
-    started.collecting_tick();
+    started.collecting_tick(true);
     assert_eq!(services(&log), 5);
 }
 
@@ -4525,7 +4583,7 @@ fn a_collection_tick_drains_full_quanta_until_the_held_bound() {
     let mut started = NativeLane::start(lane, &mut scene, windows, None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    started.collecting_tick();
+    started.collecting_tick(true);
     // 256 + 256 + the 88 records of room left.
     let services = entries(&log)
         .iter()
@@ -4551,9 +4609,9 @@ fn collection_time_drains_are_counted_and_a_failed_one_grants_a_rescan() {
         .unwrap();
     // Service 1 drains 3 records; service 2 fails (its 3 records still
     // count as dequeued) and ends the tick; service 3 drains 3 more.
-    started.collecting_tick();
-    started.collecting_tick();
-    started.collecting_tick();
+    started.collecting_tick(true);
+    started.collecting_tick(true);
+    started.collecting_tick(true);
     assert_eq!(
         started.tally,
         LifecycleTally {

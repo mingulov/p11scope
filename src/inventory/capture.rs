@@ -1204,21 +1204,25 @@ impl<L> NativeLane<L> {
 
     /// One service tick while the pass's collection runs on its worker
     /// (C5.7): drain up to `pass_quanta` quanta and hold them, in drain
-    /// order, for `after_pass`, then one bounded backlog extend (buffered
-    /// for `after_pass` to forward). Nothing reaches the host while the
-    /// catalog is collected: the drain holds (no staging), and the extend
-    /// uses only lane-owned backlog plus shared pins cloned at the last
-    /// pass — no host method runs, no receipt is noted, nothing is
-    /// staged — so the coordinator sees every call in the order it saw
-    /// when the ring was serviced only between passes; only the ring
-    /// empties sooner and the backlog drains sooner. At `held_records`
-    /// records or `held_batches` batches the tick drains nothing more
-    /// (the batch bound covers empty quanta, which charge zero records
-    /// but still cost a shell); the backlog extend still runs (it is
-    /// bounded by its own tick window, not the held bounds). Ordering
-    /// stays `sort_drain_order`: the backlog keeps the last pass's sorted
-    /// order, ticks take its prefix, no re-sort.
-    pub(crate) fn collecting_tick<Pin>(&mut self)
+    /// order, for `after_pass`, then — when `extend` — one bounded
+    /// backlog extend (buffered for `after_pass` to forward). The caller
+    /// passes `extend` false once a stop, deadline, or collection
+    /// cancellation pends (F9: no NEW target extension starts after the
+    /// stop); the drain still runs either way. Nothing reaches the host
+    /// while the catalog is collected: the drain holds (no staging), and
+    /// the extend uses only lane-owned backlog plus shared pins cloned
+    /// at the last pass — no host method runs, no receipt is noted,
+    /// nothing is staged — so the coordinator sees every call in the
+    /// order it saw when the ring was serviced only between passes; only
+    /// the ring empties sooner and the backlog drains sooner. At
+    /// `held_records` records or `held_batches` batches the tick drains
+    /// nothing more (the batch bound covers empty quanta, which charge
+    /// zero records but still cost a shell); the backlog extend still
+    /// runs when asked (it is bounded by its own tick window, not the
+    /// held bounds). Ordering stays `sort_drain_order`: the backlog
+    /// keeps the last pass's sorted order, ticks take its prefix, no
+    /// re-sort.
+    pub(crate) fn collecting_tick<Pin>(&mut self, extend: bool)
     where
         L: CaptureLane<Pin>,
     {
@@ -1235,7 +1239,9 @@ impl<L> NativeLane<L> {
                 break;
             }
         }
-        self.tick_extend_cached();
+        if extend {
+            self.tick_extend_cached();
+        }
     }
 
     /// Stages the held quanta in drain order, never rebuilt.
@@ -3514,7 +3520,11 @@ where
             return Ok(PublicationWait::Stopped(cause));
         }
         if let Some(lane) = lane.as_mut() {
-            lane.collecting_tick();
+            // The stop was checked immediately above (a pending stop
+            // returns before the tick), so this tick still extends. A
+            // stop landing mid-tick is one bounded quantum by
+            // construction — check-then-act without a lock.
+            lane.collecting_tick(true);
         }
         if let Some(cause) = publication_stop_cause(control, clock) {
             return Ok(PublicationWait::Stopped(cause));
@@ -3657,7 +3667,16 @@ where
                     clock.collection_tick,
                     &mut || {
                         if let Some(lane) = lane.as_mut() {
-                            lane.collecting_tick();
+                            // F9: a stop or deadline latches below, after
+                            // the tick — so the tick itself must not start
+                            // new work once either pends. The drain still
+                            // runs; only the extend is gated.
+                            let extend = collection_tick_may_extend(
+                                clock,
+                                control.as_ref(),
+                                worker_control.as_ref(),
+                            );
+                            lane.collecting_tick(extend);
                         }
                         driver.on_native_service(
                             lane.as_mut()
@@ -4026,6 +4045,17 @@ where
                         cancelled_in_sleep = true;
                         break;
                     }
+                    // A scoped cancellation that landed during the sleep ends
+                    // the wait before the tick: no attach or staging starts
+                    // after cancellation (F9). The run then ends through
+                    // the cancelled-collection path, as when the top of
+                    // the loop observes it.
+                    if control
+                        .as_ref()
+                        .is_some_and(|control| control.check().is_err())
+                    {
+                        break;
+                    }
                     // The ring first, then the display; the schedule is fixed-rate,
                     // so the draw never delays the next ring service.
                     if let Some(lane) = lane.as_mut() {
@@ -4269,6 +4299,20 @@ fn latch_collection_stop(control: &CollectionControl, clock: &LoopClock<'_>) -> 
         control.cancel();
     }
     control.check().is_err()
+}
+
+/// Whether a collection tick may extend the backlog (F9): only while no
+/// stop or deadline pends on the run clock and neither the run control
+/// nor the worker control reports a cancellation. A returned worker's
+/// collection has its stop state frozen, so it never blocks the extend.
+fn collection_tick_may_extend(
+    clock: &LoopClock<'_>,
+    control: Option<&CollectionControl>,
+    worker_control: Option<&CollectionControl>,
+) -> bool {
+    clock.stop_cause().is_none()
+        && control.is_none_or(|control| control.check().is_ok())
+        && worker_control.is_none_or(|worker| worker.worker_returned() || worker.check().is_ok())
 }
 
 /// The production lane: the owned facade across its typestates.
@@ -5222,6 +5266,64 @@ mod stop_latch_tests {
         );
         assert!(driver.host.stages > 0, "the terminal sweep still stages");
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn collection_tick_extend_gate_truth_table() {
+        // The collection-tick extend gate (F9): a stop, a passed
+        // deadline, or a cancelled run/worker control each forbid the
+        // extend; a returned worker's collection is frozen, so it never
+        // blocks. Each arm is pinned, so a dropped condition fails here.
+        let stop_flag = Rc::new(Cell::new(false));
+        let stop = || stop_flag.get();
+        let healthy = probe_clock(&stop);
+        assert!(
+            collection_tick_may_extend(&healthy, None, None),
+            "a healthy tick extends"
+        );
+        let run = CollectionControl::new(None);
+        let worker = CollectionControl::new(None);
+        assert!(
+            collection_tick_may_extend(&healthy, Some(&run), Some(&worker)),
+            "healthy controls extend"
+        );
+        stop_flag.set(true);
+        assert!(
+            !collection_tick_may_extend(&healthy, None, None),
+            "an operator stop forbids the extend"
+        );
+        assert!(
+            !collection_tick_may_extend(&healthy, Some(&run), Some(&worker)),
+            "an operator stop forbids the extend even with healthy controls"
+        );
+        stop_flag.set(false);
+        let past = LoopClock {
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            stop: &stop,
+            now: &Instant::now,
+            interval: Duration::from_secs(60),
+            tick: Duration::from_millis(10),
+            collection_tick: Duration::from_millis(10),
+        };
+        assert!(
+            !collection_tick_may_extend(&past, None, None),
+            "a passed deadline forbids the extend"
+        );
+        run.cancel();
+        assert!(
+            !collection_tick_may_extend(&healthy, Some(&run), None),
+            "a cancelled run control forbids the extend"
+        );
+        worker.cancel();
+        assert!(
+            !collection_tick_may_extend(&healthy, None, Some(&worker)),
+            "a cancelled worker control forbids the extend while it runs"
+        );
+        worker.mark_worker_returned();
+        assert!(
+            collection_tick_may_extend(&healthy, None, Some(&worker)),
+            "a returned worker's frozen collection never blocks the extend"
+        );
     }
 
     #[test]

@@ -5780,9 +5780,10 @@ fn note_semantic_lane_sealed() {
 /// Run `start` (the semantic lane's seconds-long BPF load) while a worker
 /// keeps draining the native lane's lifecycle ring. The lifecycle
 /// producers are already live, and the ring is sized for non-draining
-/// spans of at most 350 ms. The worker only drains and holds, exactly as
-/// during a pass's collection: nothing reaches the coordinator until the
-/// first pass stages the held quanta in drain order, bounded by the same
+/// spans of at most 350 ms. The worker drains and holds, exactly as
+/// during a pass's collection, plus bounded backlog extends buffered for
+/// the first pass: nothing reaches the coordinator until the first pass
+/// stages the held quanta in drain order, bounded by the same
 /// held-record and held-batch caps (past them the ring fills and its loss
 /// is counted as before). Those caps are shared with pass 0's own
 /// collection: what the drainer holds is no longer free there, so the
@@ -5810,11 +5811,11 @@ where
             .name("p11scope-lifecycle-drain".into())
             .spawn_scoped(threads, || {
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
-                    lane.collecting_tick::<Pin>();
+                    lane.collecting_tick::<Pin>(true);
                     std::thread::sleep(SERVICE_TICK);
                 }
                 // One last quantum after the load: the first pass follows.
-                lane.collecting_tick::<Pin>();
+                lane.collecting_tick::<Pin>(true);
             });
         // No drainer thread: the load runs undrained, exactly as before
         // the startup drain (the ring keeps what it can and counts the

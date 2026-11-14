@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -378,6 +379,30 @@ class RecordedLauncherTests(unittest.TestCase):
         record = json.loads(self.wait_path(path).read_text())
         self.assertEqual(record["pid"], proc.pid)
         return record
+
+    def test_wait_path_waits_for_complete_file_before_returning(self):
+        # A fixture writer creates the boundary file before its content
+        # lands (truncate-then-write). wait_path must not hand out the
+        # still-empty file: delayed_phase parses the returned path as JSON.
+        path = self.work / "slow.json"
+        path.write_text("")
+        expected = {"phase": "launcher", "pid": 4242}
+        writer = threading.Thread(
+            target=lambda: (time.sleep(0.5), path.write_text(json.dumps(expected))))
+        writer.start()
+        self.addCleanup(writer.join)
+        self.assertEqual(json.loads(self.wait_path(path).read_text()), expected)
+
+    def test_wait_path_returns_complete_but_unexpected_content_promptly(self):
+        # wait_path waits for completeness, never for correctness: complete
+        # content the test does not expect must be returned as-is (so the
+        # test's own assertions fail on it), not retried until the deadline.
+        path = self.work / "wrong.json"
+        path.write_text('{"wrong": true}')
+        started = time.monotonic()
+        self.assertEqual(json.loads(self.wait_path(path, timeout=3).read_text()),
+                         {"wrong": True})
+        self.assertLess(time.monotonic() - started, 5)
 
     def shim(self):
         shutil.copyfile(FIXTURES / "python3", self.bin / "python3")

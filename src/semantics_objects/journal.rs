@@ -1048,6 +1048,11 @@ pub(crate) enum JournalGap {
     /// position was disposed (clean H3 coverage) without a claim. The
     /// image is tainted; the seal ends named instead of waiting.
     ClaimUnmatched,
+    /// A linked stream broke while ingesting: the void fenced the
+    /// consumed history as an explicitly lost interval (no key
+    /// refused) and dropped staged custody. Later seals re-prove
+    /// above the recorded fence; nothing re-covers fenced history.
+    IngestBreakLoss,
 }
 
 impl JournalGap {
@@ -1079,6 +1084,7 @@ impl JournalGap {
             Self::Discarded => "discarded",
             Self::CutExhausted => "cut_exhausted",
             Self::ClaimUnmatched => "claim_unmatched",
+            Self::IngestBreakLoss => "ingest_break_loss",
         }
     }
 }
@@ -2653,7 +2659,18 @@ impl JournalAdapter {
             gap,
             effects,
             h3_voided: None,
+            fence: None,
         }
+    }
+
+    /// RED-first shell (keyrows C1): the fenced ingest-break void.
+    /// The twin tests pin its contract; the real chain lands next.
+    pub(crate) fn void_ingest_break_inner(
+        &mut self,
+        model: &mut ObjectSemantics,
+        gap: JournalGap,
+    ) -> SealFailure {
+        self.refuse_disposed_raw(model, std::iter::empty(), true, gap)
     }
 
     fn has_s1only_subjects(&self) -> bool {
@@ -2877,6 +2894,7 @@ impl JournalAdapter {
             },
             effects,
             h3_voided: None,
+            fence: None,
         })
     }
 }
@@ -4700,6 +4718,11 @@ pub(crate) struct SealFailure {
     /// finalizer (`acknowledge_h3_void`); `None` when this seal voided
     /// no H3 loss.
     pub(crate) h3_voided: Option<u64>,
+    /// The void's recorded fence: the consumed-history upper cut the
+    /// void fenced, when this failure IS a void. Feeds store it at
+    /// their loss close and refuse below-fence receipts; `None` for
+    /// every non-void refusal.
+    pub(crate) fence: Option<u64>,
 }
 
 /// Identity of an existing adapter refusal, never positive authority.
@@ -5954,6 +5977,9 @@ impl JournalAdapter {
             effects,
             h3_voided,
             scope,
+            // Keyrows B1 records the void arm's fence here; until then
+            // no failure carries one.
+            fence: None,
         }
     }
 
@@ -6739,6 +6765,7 @@ impl JournalAdapter {
             gap,
             effects: ObjectEffects::default(),
             h3_voided: None,
+            fence: None,
             scope: SealFailureScope::Unqualified,
         }
     }
@@ -6808,6 +6835,7 @@ impl JournalAdapter {
                 gap: JournalGap::DomainTainted,
                 effects,
                 h3_voided: None,
+                fence: None,
                 scope: SealFailureScope::Unqualified,
             });
         }
@@ -6954,6 +6982,7 @@ impl JournalAdapter {
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
+                fence: None,
                 scope: SealFailureScope::Unqualified,
             });
         }
@@ -7025,6 +7054,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        fence: None,
                         scope: SealFailureScope::Unqualified,
                     });
                 }
@@ -7074,6 +7104,7 @@ impl JournalAdapter {
                     gap: JournalGap::ModelRefused,
                     effects,
                     h3_voided: None,
+                    fence: None,
                     scope: SealFailureScope::Unqualified,
                 });
             };
@@ -7089,6 +7120,7 @@ impl JournalAdapter {
                     gap: JournalGap::ResourceUnavailable,
                     effects,
                     h3_voided: None,
+                    fence: None,
                     scope: SealFailureScope::Unqualified,
                 });
             };
@@ -7130,6 +7162,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        fence: None,
                         scope: SealFailureScope::Unqualified,
                     });
                 }
@@ -7261,6 +7294,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        fence: None,
                         scope: SealFailureScope::Unqualified,
                     });
                 };
@@ -7358,6 +7392,7 @@ impl JournalAdapter {
                 gap: JournalGap::DomainEnded,
                 effects,
                 h3_voided: None,
+                fence: None,
                 scope: SealFailureScope::Unqualified,
             });
         }
@@ -7366,6 +7401,7 @@ impl JournalAdapter {
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
+                fence: None,
                 scope: SealFailureScope::Unqualified,
             });
         }
@@ -17946,6 +17982,313 @@ pub(crate) mod tests {
             Err(AttestationRefusal::ImageTainted),
             "the abandoned frame never rebirths"
         );
+    }
+
+    #[test]
+    fn object_journal_ingest_break_void_preserves_unbounded_abandonment() {
+        // Keyrows C1 twin 1 (N1 on the reshaped path): BEGIN ->
+        // collision ABANDON -> ingest-break void. The reshaped void
+        // (preserve -> fence -> staged-clear, refusing no key) must
+        // still preserve the staged unbounded abandonment first: with
+        // no key to account it, the abandoned image is tainted, so
+        // the frame never rebirths.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let outer = begin_bytes(1, 1, create, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let consumed = scene.adapter.consumed_through;
+        let failure = scene
+            .adapter
+            .void_ingest_break_inner(&mut scene.model, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.gap, JournalGap::IngestBreakLoss);
+        assert_eq!(
+            failure.fence,
+            Some(consumed),
+            "the reshaped void records its fence"
+        );
+        assert!(
+            scene.adapter.image_tainted_for_test((COOKIE, EXEC)),
+            "the unaccounted abandonment taints its image on the reshaped path"
+        );
+        assert!(
+            scene.adapter.invalidated,
+            "the reshaped void still invalidates the stream"
+        );
+        // The taint survives the re-sync above the void fence, so the
+        // abandoned frame never rebirths past the loss.
+        let producers = scene.producers();
+        assert!(producers.journal_linked());
+        assert!(scene.adapter.bind_resource_producers(&producers));
+        let cut = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+            scene.retained_events.clone(),
+        )
+        .consumption_cut()
+        .expect("an idle drain names its cut");
+        let resolved = scene.adapter.resolve_birth_cut(&cut, &producers);
+        assert!(
+            resolved.is_ok(),
+            "the linked lane re-syncs: {:?}",
+            resolved.err()
+        );
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "the abandoned frame never rebirths"
+        );
+    }
+
+    #[test]
+    fn object_journal_ingest_break_void_fences_every_domain() {
+        // Keyrows C1 twin 2: the reshaped void fences the consumed
+        // history on EVERY key — registered and unregistered — and
+        // records the loss on every model-held domain, without
+        // refusing any key. Old proofs stay dead across the re-sync:
+        // a seal on the pre-void birth refuses below the fence.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        // A second provider instance on the same image: its own
+        // admission authority, hence a distinct key. It attests
+        // before any seal converts (a later attestation would meet
+        // a sealed image) and never seals (unregistered).
+        let mut other = AttestationFixture::new(image_default());
+        let unregistered = scene
+            .adapter
+            .attest_key(&other.admit_session(0x2222_2222_2222_2222))
+            .expect("second key attests");
+        assert_ne!(
+            proof.key, unregistered.key,
+            "the twin covers two distinct keys"
+        );
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal registers");
+        let consumed = scene.adapter.consumed_through;
+        let failure = scene
+            .adapter
+            .void_ingest_break_inner(&mut scene.model, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.gap, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.fence, Some(consumed));
+        for (who, key) in [
+            ("registered", proof.key),
+            ("unregistered", unregistered.key),
+        ] {
+            let state = scene.adapter.keys.get(&key).expect("fenced key");
+            assert_eq!(state.void_fence, consumed, "{who} key fenced");
+            assert!(!state.refused, "{who} key not refused");
+        }
+        assert!(
+            scene.adapter.keys[&proof.key].bootstraps.is_empty(),
+            "the void clears pinned bootstraps"
+        );
+        let producers = scene.producers();
+        assert!(scene.adapter.bind_resource_producers(&producers));
+        let cut = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+            scene.retained_events.clone(),
+        )
+        .consumption_cut()
+        .expect("an idle drain names its cut");
+        scene
+            .adapter
+            .resolve_birth_cut(&cut, &producers)
+            .expect("the linked lane re-syncs");
+        assert_eq!(
+            scene.adapter.keys[&proof.key].void_fence, consumed,
+            "the fence survives the re-sync"
+        );
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("the pre-void birth refuses below the fence");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+    }
+
+    #[test]
+    fn object_journal_ingest_break_void_drops_pre_break_begin() {
+        // Keyrows C1 twin 3: an END ingested after the re-sync whose
+        // BEGIN came before the void never converts: the void dropped
+        // staged custody, so the terminal meets no open entry.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        assert!(!scene.adapter.open.is_empty(), "the BEGIN stages");
+        let failure = scene
+            .adapter
+            .void_ingest_break_inner(&mut scene.model, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.gap, JournalGap::IngestBreakLoss);
+        assert!(
+            scene.adapter.open.is_empty(),
+            "the void drops staged custody"
+        );
+        let producers = scene.producers();
+        assert!(scene.adapter.bind_resource_producers(&producers));
+        let cut = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+            scene.retained_events.clone(),
+        )
+        .consumption_cut()
+        .expect("an idle drain names its cut");
+        scene
+            .adapter
+            .resolve_birth_cut(&cut, &producers)
+            .expect("the linked lane re-syncs");
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin),
+            "the pre-void BEGIN is gone: the END never converts"
+        );
+        assert!(scene.adapter.open.is_empty(), "no entry is recreated");
+    }
+
+    #[test]
+    fn object_journal_ingest_break_prepaid_storage_covers_fenced_void() {
+        // Keyrows C1 twin 4: the void's prepaid bound covers the fenced
+        // void's actual failure buffers (scope plus preserve/fence
+        // effects) with a full second failure share to spare, and the
+        // preserve step refuses the doomed live key before the fence
+        // lands.
+        use crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal registers");
+        // A second call abandoned unboundedly on the live image: the
+        // preserve step dooms the live key (a key accounts the image,
+        // so the taint path does not apply).
+        let outer = begin_bytes(1, 2, create, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bound = crate::semantics_objects::journal::joint_audit::raw_disposition_storage_bound(
+            &scene.adapter,
+            &scene.model,
+        )
+        .expect("finite void bound");
+        let failure = scene
+            .adapter
+            .void_ingest_break_inner(&mut scene.model, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.gap, JournalGap::IngestBreakLoss);
+        assert_eq!(
+            failure.fence,
+            Some(scene.adapter.consumed_through),
+            "the void records its fence"
+        );
+        let state = scene.adapter.keys.get(&proof.key).expect("live key");
+        assert!(
+            state.refused,
+            "the preserved abandonment refuses its live key"
+        );
+        let keys_total = scene.adapter.joint_void_diagnosis().keys_total as usize;
+        assert_eq!(keys_total, 1);
+        // Same accounting as the frame's `failure_storage`: capacity
+        // bytes plus one allocation pad per non-empty buffer.
+        let padded = |count: usize, unit: usize| {
+            count.checked_mul(unit).expect("bounded test sizes")
+                + if count == 0 {
+                    0
+                } else {
+                    OWNED_ALLOCATION_PADDING
+                }
+        };
+        let actual = padded(keys_total, std::mem::size_of::<ObjectDomain>())
+            + padded(
+                failure.effects.effects.capacity(),
+                std::mem::size_of::<ObjectEffect>(),
+            );
+        assert!(
+            bound
+                >= std::mem::size_of::<
+                    crate::semantics_objects::journal::joint_driver::RawDisposition,
+                >() + std::mem::size_of::<
+                    crate::semantics_objects::journal::joint_audit::IngestedJointQuantum,
+                >() + 2 * actual,
+            "prepaid {bound} covers the fenced void's actual {actual} twice over"
+        );
+    }
+
+    #[test]
+    fn object_journal_audit_void_records_fence_on_failure() {
+        // Keyrows B1 twin: a seal voided through a failed audit records
+        // the void's fence on its failure; a proof-only refusal below
+        // the fence records none.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let malformed = JournalAuditReceipt::scripted(
+            7,
+            7,
+            None,
+            1,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &malformed,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("malformed tick refuses");
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        assert_eq!(
+            failure.fence,
+            Some(scene.adapter.consumed_through),
+            "an audit void records its fence"
+        );
+        let fence = scene.adapter.consumed_through;
+        let below = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence - 1,
+            scene.closure_generation(),
+        );
+        let audit = scene.audit();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &below,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&below),
+            )
+            .expect_err("birth below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(refused.fence, None, "a proof-only refusal records no fence");
     }
 
     #[test]

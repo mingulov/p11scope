@@ -348,12 +348,9 @@ impl JointCaptureOwner {
             .ok_or(RawQuantumRefusal::ForeignLedger)?
             .reserve(bytes)
             .map_err(RawQuantumRefusal::Resource)?;
-        let failure = self.adapter.refuse_disposed_raw(
-            &mut self.model,
-            std::iter::empty(),
-            true,
-            INGEST_BREAK_VOID_GAP,
-        );
+        let failure = self
+            .adapter
+            .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP);
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
         // Keep the abandonment (sessions Uncertain(Loss), views and objects
         // retired, bootstrap voided) for the next audit frame's consumers.
@@ -392,6 +389,12 @@ impl JointCaptureOwner {
     #[cfg(test)]
     pub(crate) fn pending_void_for_test(&self) -> Option<&SealFailure> {
         self.pending_void.as_ref().map(|pending| &pending.failure)
+    }
+
+    /// The bytes the pending void prepaid for its failure buffers.
+    #[cfg(test)]
+    pub(crate) fn pending_void_bytes_for_test(&self) -> Option<usize> {
+        self.pending_void.as_ref().map(|pending| pending.bytes)
     }
 
     /// The capture's one object model, with its retained history (read

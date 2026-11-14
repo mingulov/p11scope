@@ -753,6 +753,35 @@ fn joint_linked_ingest_break_voids_then_resyncs_above_a_fence() {
 }
 
 #[test]
+fn joint_ingest_break_prepaid_storage_covers_fenced_void() {
+    // Keyrows C1 twin 4 (owner level): the ingest-break void prepays
+    // exactly the bound it computed, names IngestBreakLoss, records
+    // its fence, and charges the pool only the prepaid bytes.
+    let events = EventsDomain::test_standin(0xf11c);
+    let retained = producers(&events);
+    assert!(retained.journal_linked());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.adapter.stream_broken = true;
+    owner.adapter.consumed_through = 7;
+    let bound = owner
+        .void_storage_bound_for_test()
+        .expect("finite void bound");
+    let before = pool.snapshot().charged_bytes;
+    assert_eq!(owner.void_ingest_break(), Ok(true));
+    let pending = owner.pending_void_for_test().expect("pending void");
+    assert_eq!(pending.gap, JournalGap::IngestBreakLoss);
+    assert_eq!(pending.fence, Some(7), "the void records its fence");
+    let bytes = owner.pending_void_bytes_for_test().expect("prepaid bytes");
+    assert_eq!(bytes, bound, "the void prepaid the bound it computed");
+    assert_eq!(
+        pool.snapshot().charged_bytes,
+        before + bytes,
+        "only the prepaid lease is charged"
+    );
+}
+
+#[test]
 fn joint_ingest_break_void_keeps_stopped_and_exhausted_lanes_fail_closed() {
     let events = EventsDomain::test_standin(0x61ad);
     let pool = SemanticResourcePool::default();

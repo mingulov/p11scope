@@ -21917,6 +21917,118 @@ fn key_operation_clean_resume_clears_loss_latch() {
     );
 }
 
+/// Keyrows B3: the ingest-break void names a resumable history-loss
+/// gap; AdapterInvalidated stays non-resumable Fallback on its own
+/// paths.
+#[test]
+fn joint_ingest_break_loss_is_resumable_history_loss() {
+    assert!(crate::semantics_key_use::segment_resumable_after(
+        JournalGap::IngestBreakLoss
+    ));
+    assert_eq!(
+        crate::semantics_key_use::disposition_of(JournalGap::IngestBreakLoss),
+        crate::semantics_key_use::SealFailureDisposition::HistoryLoss
+    );
+}
+
+/// Keyrows B1 twin: a voided feed stores the void's fence at its loss
+/// close, and a receipt cut below that fence never resumes Joint —
+/// re-selection (Task 3) is the only way back.
+#[test]
+fn key_operation_below_fence_receipt_never_resumes() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    assert_eq!(
+        bootstrap.birth_cut(),
+        0,
+        "the scripted receipt cuts at zero"
+    );
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::IngestBreakLoss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert!(
+        !staging.resume_joint(),
+        "a receipt cut below the recorded fence never resumes"
+    );
+    assert_eq!(staging.mode(), crate::semantics_key_use::FeedMode::S1Only);
+}
+
+/// Healthy twin: a receipt cut AT the recorded fence resumes — the
+/// fence covers strictly below it, like the seal and attestation
+/// checks.
+#[test]
+fn key_operation_at_fence_receipt_resumes() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::IngestBreakLoss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(0);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert!(
+        staging.resume_joint(),
+        "a receipt cut at the recorded fence resumes"
+    );
+}
+
 /// v0.7.0 issue 3 (fallback twin): a clean resume clears the
 /// `proof_refused_fallback` latch the same way — the replayed calls
 /// stay counted, the section reads populated. JK-22: the pre-resume

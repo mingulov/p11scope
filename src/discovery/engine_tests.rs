@@ -82662,10 +82662,12 @@ fn handle_table_live_wait_gap_files_once_across_deferrals() {
     );
 }
 
-/// Learned retry twin: two consecutive stagings of one file under a
-/// full table prove nothing — no re-hash, no mountinfo re-read — so
-/// the capture-wide I/O ceiling stands still; both candidates ride
-/// the next drain under exactly one wait row, never settled.
+/// Learned retry twin: the first staging of one file under a full
+/// table proves once, defers, and files the one wait row; the retry
+/// under the still-full table proves nothing — no re-hash, no
+/// mountinfo re-read — so the capture-wide I/O ceiling stands still
+/// across retries. Both candidates ride the next drain, never
+/// settled.
 #[test]
 fn handle_table_learned_retry_under_full_table_proves_nothing() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -82674,13 +82676,11 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
     engine.scope = Scope::System;
     let dir = tempfile::tempdir().unwrap();
     let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
-    let io_before = engine.budget.attempted_io_bytes();
-    let window_before = engine.budget.remaining_window_io().unwrap();
     let gaps_before = engine.counters.object_skips.len();
     let held = std::fs::File::open(&library).unwrap();
     let (dev, ino) = crate::fanotify::file_identity(&held).unwrap();
     drop(held);
-    for _ in 0..2 {
+    let stage = |engine: &mut Engine| {
         let file = std::fs::File::open(&library).unwrap();
         engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
             file,
@@ -82690,22 +82690,31 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
         });
-    }
+    };
+    let io_before = engine.budget.attempted_io_bytes();
+    stage(&mut engine);
+    let io_after_first = engine.budget.attempted_io_bytes();
+    assert!(
+        io_after_first > io_before,
+        "the first staging proves (the wait row comes from the prove path)"
+    );
+    let window_after_first = engine.budget.remaining_window_io().unwrap();
+    stage(&mut engine);
     assert_eq!(
         engine.budget.attempted_io_bytes(),
-        io_before,
-        "no re-hash and no mountinfo re-read while the table is full"
+        io_after_first,
+        "the retry re-hashes nothing and re-reads no mountinfo while full"
     );
     assert_eq!(
         engine.budget.remaining_window_io().unwrap(),
-        window_before,
+        window_after_first,
         "retries consume none of the capture-wide I/O ceiling"
     );
     let new_rows = &engine.counters.object_skips[gaps_before..];
     assert_eq!(
         new_rows.len(),
         1,
-        "two consecutive deferrals file exactly one row: {new_rows:?}"
+        "first deferral plus retry file exactly one row: {new_rows:?}"
     );
     assert_eq!(
         new_rows[0].reason,
@@ -82720,6 +82729,61 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
     assert!(
         !engine.learned_settled.contains(&(dev, ino)),
         "a wait never settles"
+    );
+    drop(live);
+}
+
+/// Learned subject-dedupe twin: two distinct files whose display
+/// spellings normalize to one subject defer under exactly one wait
+/// row — the prove path files deduped, so same-subject deferrals
+/// never multiply the gap list.
+#[test]
+fn handle_table_learned_same_subject_defers_file_once() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let bytes = std::fs::read(&library).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let gaps_before = engine.counters.object_skips.len();
+    // Two distinct identities (hard links share one) staged under
+    // two spellings of one subject: the prove path must file the
+    // shared wait row once.
+    let first = dir.path().join("twin-a.so");
+    std::fs::write(&first, &bytes).unwrap();
+    let second = dir.path().join("twin-b.so");
+    std::fs::write(&second, &bytes).unwrap();
+    let shared = format!("{}/shared.so", dir.path().to_string_lossy());
+    let displays = [shared.clone(), shared.replace("/shared.so", "//shared.so")];
+    assert_ne!(displays[0], displays[1], "the test needs two spellings");
+    for (path, display) in [&first, &second].into_iter().zip(displays) {
+        let file = std::fs::File::open(path).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: display,
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        });
+    }
+    let new_rows = &engine.counters.object_skips[gaps_before..];
+    assert_eq!(
+        new_rows.len(),
+        1,
+        "same-subject deferrals file exactly one row: {new_rows:?}"
+    );
+    assert_eq!(
+        new_rows[0].reason,
+        crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
+        "the one row is the learned wait: {new_rows:?}"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "both candidates ride the next drain"
     );
     drop(live);
 }

@@ -345,6 +345,18 @@ impl AuditedFailure<'_> {
     pub(crate) fn failure(&self) -> &SealFailure {
         self.failure
     }
+    /// The largest void fence among the failures that apply to this
+    /// domain. The selected failure wins by rank, which need not
+    /// carry the largest fence (a fenceless failure can outrank a
+    /// fenced void), so feeds record this maximum instead: every
+    /// void's fence joins the running maximum.
+    pub(crate) fn fence(&self) -> Option<u64> {
+        self.originals
+            .iter()
+            .flatten()
+            .filter_map(|failure| failure.fence)
+            .max()
+    }
     pub(crate) fn h3(&self) -> &H3DispositionEvidence {
         &self.audit.h3
     }
@@ -1892,7 +1904,9 @@ impl IngestedJointQuantum {
         // Diagnostic-only (scope round): whether this delivery can end a
         // Joint feed with a void (read before delivery changes the mode).
         // Only a fenced failure is a void; only a Joint feed can end.
-        let void_ending = audited.failure().fence.is_some()
+        // The fence is the maximum over the failures that apply: the
+        // selected failure's rank need not carry it.
+        let void_ending = audited.fence().is_some()
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint);
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)

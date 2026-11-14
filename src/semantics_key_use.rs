@@ -1204,7 +1204,7 @@ impl JointStaging {
         }
         let disposition = audited.disposition();
         let gap = audited.failure().gap;
-        let fence = audited.failure().fence;
+        let fence = audited.fence();
         let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
             staged_max, pending_floor: None,
         } if self.covered_by(*staged_max));

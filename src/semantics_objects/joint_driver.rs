@@ -358,18 +358,26 @@ impl JointCaptureOwner {
             .adapter
             .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP);
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
-        // Keep the abandonment (sessions Uncertain(Loss), views and objects
-        // retired, bootstrap voided) for the next audit frame's consumers.
-        // The next audit frame (ingested or disposed) takes the void in a
-        // slot of its own, and every void needs a re-sync and an ingest
-        // first, so an older void is always delivered before a newer one
-        // can apply. The guard keeps the first should that ever change.
-        if self.pending_void.is_none() {
-            self.pending_void = Some(PendingVoid {
-                failure,
-                bytes,
-                lease,
-            });
+        // Keep the abandonment (sessions Uncertain(OutcomeLost), views
+        // and objects retired, bootstrap voided) for the next audit
+        // frame's consumers. The next audit frame (ingested or
+        // disposed) takes the void in a slot of its own, and every
+        // void needs a re-sync and an ingest first, so an older void
+        // is always delivered before a newer one can apply. Should
+        // that ever change, the guard below keeps the first void's
+        // failure but raises its fence to the larger one, so the
+        // delivered void covers both breaks.
+        match self.pending_void.as_mut() {
+            Some(pending) => {
+                pending.failure.fence = pending.failure.fence.max(failure.fence);
+            }
+            None => {
+                self.pending_void = Some(PendingVoid {
+                    failure,
+                    bytes,
+                    lease,
+                });
+            }
         }
         Ok(true)
     }

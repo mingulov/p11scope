@@ -20849,6 +20849,9 @@ fn owned_tree_watch_backs_off_unproductive_members() {
     // Unbounded run budget: this test pins exact per-run scan counts,
     // and a wall budget is inherently load-sensitive.
     engine.owned_watch_run_budget_ns = u64::MAX;
+    // Every member counts as expensive here: this test pins the backoff
+    // itself (cheap members keep the cadence, pinned separately).
+    engine.owned_watch_cheap_scan_bytes = 0;
     let scans = |engine: &Engine| {
         engine
             .owned_watch_unproven
@@ -86381,4 +86384,192 @@ fn member_stop_attaches_and_resumes_a_provider_mapper_in_one_pass() {
     assert!(io.cleared.contains(&key));
     assert!(member_resumed_for_test(pid));
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
+}
+
+/// One watch member in a scratch run cgroup beside the test process,
+/// for the cadence and exec twins below.
+fn watch_engine_with_member(member: u32) -> (tempfile::TempDir, Engine) {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{me}\n{member}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    (dir, engine)
+}
+
+/// Scans `member` got over `runs` watch runs 10 ms apart (synthetic
+/// clock): the first 300 ms of a worker that loads its provider late.
+fn watch_scans_over(engine: &mut Engine, member: u32, runs: u64) -> u32 {
+    for run in 0..runs {
+        engine.owned_tree_watch(Some(1_000 + run * OWNED_WATCH_SCAN_MIN_NS));
+    }
+    engine
+        .owned_watch_unproven
+        .get(&member)
+        .map(|entry| entry.scans)
+        .unwrap_or(0)
+}
+
+/// A cheap unproductive member (a small worker that has not loaded its
+/// provider yet) keeps the 10 ms watch cadence for its first 300 ms, so
+/// a provider it loads 100-200 ms after birth is proven within about
+/// one watch interval. Its scan cost is measured, and sits under the
+/// cheap bound.
+#[test]
+fn owned_tree_watch_keeps_cheap_members_at_the_watch_cadence() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .expect("spawn sleeper");
+    let member = sleeper.id();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (_dir, mut engine) = watch_engine_with_member(member);
+    let scans = watch_scans_over(&mut engine, member, 30);
+    assert!(
+        scans >= 25,
+        "a cheap member rescans every watch run, got {scans} of 30"
+    );
+    // Its own scan cost, for the bound.
+    let before = engine.budget.attempted_io_bytes();
+    if let Some(entry) = engine.owned_watch_unproven.get_mut(&member) {
+        entry.next_eligible_ns = 0;
+    }
+    engine.scan_owned_watch_member(member, 2_000_000_000);
+    let cost = engine.budget.attempted_io_bytes().saturating_sub(before);
+    eprintln!("owned watch scan of a sleep member: {cost} attempted I/O bytes");
+    assert!(cost > 0 && cost < OWNED_WATCH_CHEAP_SCAN_BYTES, "{cost}");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Twin: the same member counted expensive backs off to a handful of
+/// scans in the same 300 ms (the pre-fix behavior for every member,
+/// which proved a 200 ms-late load only after a 250 ms delay).
+#[test]
+fn owned_tree_watch_backs_off_expensive_members_over_the_same_window() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .expect("spawn sleeper");
+    let member = sleeper.id();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (_dir, mut engine) = watch_engine_with_member(member);
+    engine.owned_watch_cheap_scan_bytes = 0;
+    let scans = watch_scans_over(&mut engine, member, 30);
+    assert!(
+        (4..=7).contains(&scans),
+        "an expensive member backs off, got {scans} of 30"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// An exec restarts a backed-off member's streak: the new image is
+/// noticed by one stat while the old image's backoff still runs, and
+/// scans at once instead of after it.
+#[test]
+fn owned_tree_watch_exec_restarts_the_backoff_streak() {
+    use std::io::Write as _;
+    let mut member = std::process::Command::new("sh")
+        .args(["-c", "read line; exec sleep 30"])
+        .stdin(std::process::Stdio::piped())
+        .die_with_parent()
+        .spawn()
+        .expect("spawn member");
+    let pid = member.id();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (_dir, mut engine) = watch_engine_with_member(pid);
+    engine.owned_watch_cheap_scan_bytes = 0;
+    watch_scans_over(&mut engine, pid, 10);
+    let streak = engine.owned_watch_unproven[&pid].unproductive;
+    assert!(streak >= 3, "the shell backed off first: {streak}");
+    let scans_before = engine.owned_watch_unproven[&pid].scans;
+    let image_before = engine.owned_watch_unproven[&pid].image;
+    member.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    for _ in 0..500 {
+        if owned_watch_member_image(&engine.proc_root, pid) != image_before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // One run later (well inside the old backoff) the new image scans.
+    let deadline = engine.owned_watch_unproven[&pid].next_eligible_ns;
+    let now = 1_000 + 10 * OWNED_WATCH_SCAN_MIN_NS;
+    assert!(deadline > now, "the old backoff still runs");
+    engine.owned_tree_watch(Some(now));
+    let entry = &engine.owned_watch_unproven[&pid];
+    assert_eq!(entry.scans, scans_before + 1, "the new image scans at once");
+    assert_eq!(
+        entry.unproductive, 1,
+        "the streak restarted for the new image"
+    );
+    member.kill().expect("kill member");
+    member.wait().expect("reap member");
+}
+
+/// A mapping-heavy member (thousands of maps rows, like the 345 KB-maps
+/// shape) costs more than the cheap bound per scan and still backs off
+/// under the default bound: only small members keep the cadence.
+#[test]
+fn owned_tree_watch_backs_off_mapping_heavy_members_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many-maps.c");
+    let binary = dir.path().join("many-maps");
+    std::fs::write(
+        &source,
+        r#"
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    char *base = mmap(0, 4000 * page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return 2;
+    for (int i = 0; i < 4000; i += 2)
+        if (mprotect(base + i * page, page, PROT_READ | PROT_WRITE)) return 3;
+    write(1, "r", 1);
+    for (;;) pause();
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut heavy = std::process::Command::new(&binary)
+        .stdout(std::process::Stdio::piped())
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    use std::io::Read as _;
+    let mut ready = [0u8; 1];
+    heavy.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+    let member = heavy.id();
+    let maps = std::fs::read(format!("/proc/{member}/maps")).unwrap().len() as u64;
+    assert!(
+        maps > OWNED_WATCH_CHEAP_SCAN_BYTES,
+        "the fixture is mapping-heavy: {maps}"
+    );
+    let (_watch_dir, mut engine) = watch_engine_with_member(member);
+    let scans = watch_scans_over(&mut engine, member, 30);
+    assert!(
+        (4..=7).contains(&scans),
+        "a mapping-heavy member backs off by default, got {scans} of 30"
+    );
+    heavy.kill().unwrap();
+    heavy.wait().unwrap();
 }

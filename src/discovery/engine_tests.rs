@@ -42201,11 +42201,21 @@ fn pid_cache_fixture(proc_root: &std::path::Path, entries: &[(u32, &str, u32, u6
     }
 }
 
+/// Pins a fixture pid dir's mtime without any timing assumption:
+/// fixture filesystems may quantize timestamps coarsely, so twins
+/// set the mtime they need instead of sleeping between writes.
+fn set_pid_dir_mtime(dir: &std::path::Path, mtime: std::time::SystemTime) {
+    std::fs::File::open(dir)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
 /// RED (§8.2): the per-refresh pid filter caches classifications across
 /// refreshes. A second refresh over unchanged pids re-reads nothing:
 /// revoking read permission on the fixture stats between refreshes proves
-/// no re-read (chmod touches ctime, not the directory mtime the guard
-/// compares), yet filtering stays identical.
+/// no re-read (chmod touches ctime, neither the inode nor the directory
+/// mtime the guard compares), yet filtering stays identical.
 #[test]
 fn cached_pid_filter_reuses_classification_across_refreshes() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -42259,12 +42269,18 @@ fn cached_pid_filter_reclassifies_on_pid_reuse() {
     let pids = vec![101u32, 102, 103];
     assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
     // Reuse destroys and recreates the pid directory (as procfs does),
-    // so the guard mtime changes. The sleep keeps the mtimes distinct
-    // deterministically: fixture writes land microseconds apart and
-    // guard mtimes are nanosecond-granular.
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    // and the new generation's directory mtime is set explicitly
+    // distinct: no sleep, no timestamp-granularity assumption.
+    let old_mtime = std::fs::metadata(proc_root.join("101"))
+        .unwrap()
+        .modified()
+        .unwrap();
     std::fs::remove_dir_all(proc_root.join("101")).unwrap();
     pid_cache_fixture(&proc_root, &[(101, "reused", 0, 400)]);
+    set_pid_dir_mtime(
+        &proc_root.join("101"),
+        old_mtime + std::time::Duration::from_secs(3600),
+    );
     assert_eq!(
         engine.cached_user_process_pids(&pids),
         vec![101, 102],
@@ -42274,12 +42290,11 @@ fn cached_pid_filter_reclassifies_on_pid_reuse() {
 }
 
 /// RED (§8.2 fix1): pid reuse within one jiffy re-classifies. Stat
-/// start time (field 22) has 10 ms resolution while the directory
-/// mtime is nanosecond, so an exit+realloc inside one jiffy presents
-/// as "new mtime, same start" — which must still re-read the class,
-/// never keep the cached one. Here a cached kernel thread is reused
-/// by a user process with the identical start time; it must rejoin
-/// the filtered set.
+/// start time (field 22) has 10 ms resolution, so an exit+realloc
+/// inside one jiffy presents as "new directory identity, same start"
+/// — which must still re-read the class, never keep the cached one.
+/// Here a cached kernel thread is reused by a user process with the
+/// identical start time; it must rejoin the filtered set.
 #[test]
 fn cached_pid_filter_reclassifies_same_jiffy_reuse_kthread_to_user() {
     let proc_root = std::env::temp_dir().join(format!("perf-pidrejiffy-{}", std::process::id()));
@@ -42296,11 +42311,20 @@ fn cached_pid_filter_reclassifies_same_jiffy_reuse_kthread_to_user() {
     let pids = vec![101u32, 102];
     assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
     // Same-jiffy reuse: procfs destroys and recreates the directory
-    // (new mtime) but the new generation starts in the same jiffy,
-    // so field 22 is unchanged while the flags flip to user.
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    // but the new generation starts in the same jiffy, so field 22
+    // is unchanged while the flags flip to user. The new directory
+    // mtime is set explicitly distinct: no sleep, no
+    // timestamp-granularity assumption.
+    let old_mtime = std::fs::metadata(proc_root.join("101"))
+        .unwrap()
+        .modified()
+        .unwrap();
     std::fs::remove_dir_all(proc_root.join("101")).unwrap();
     pid_cache_fixture(&proc_root, &[(101, "reused", 0, 3135074)]);
+    set_pid_dir_mtime(
+        &proc_root.join("101"),
+        old_mtime + std::time::Duration::from_secs(3600),
+    );
     assert_eq!(
         engine.cached_user_process_pids(&pids),
         vec![101, 102],
@@ -42311,7 +42335,7 @@ fn cached_pid_filter_reclassifies_same_jiffy_reuse_kthread_to_user() {
 
 /// RED (§8.2 fix1): the reverse direction. A cached user process
 /// reused within one jiffy by a kernel thread (same start time, new
-/// mtime, flipped flags) must leave the filtered set.
+/// directory identity, flipped flags) must leave the filtered set.
 #[test]
 fn cached_pid_filter_reclassifies_same_jiffy_reuse_user_to_kthread() {
     let proc_root =
@@ -42325,11 +42349,20 @@ fn cached_pid_filter_reclassifies_same_jiffy_reuse_user_to_kthread() {
     engine.proc_root = proc_root.clone();
     let pids = vec![101u32, 102];
     assert_eq!(engine.cached_user_process_pids(&pids), vec![101, 102]);
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    // The new directory mtime is set explicitly distinct: no sleep,
+    // no timestamp-granularity assumption.
+    let old_mtime = std::fs::metadata(proc_root.join("101"))
+        .unwrap()
+        .modified()
+        .unwrap();
     std::fs::remove_dir_all(proc_root.join("101")).unwrap();
     pid_cache_fixture(
         &proc_root,
         &[(101, "kworker", crate::process::PF_KTHREAD, 3135074)],
+    );
+    set_pid_dir_mtime(
+        &proc_root.join("101"),
+        old_mtime + std::time::Duration::from_secs(3600),
     );
     assert_eq!(
         engine.cached_user_process_pids(&pids),
@@ -42385,6 +42418,147 @@ fn cached_pid_filter_leaves_unreadable_pids_eligible_and_uncached() {
     );
     assert_eq!(
         engine.cached_user_process_pids(&[999999u32]),
+        Vec::<u32>::new(),
+        "the next refresh re-reads and excludes the kernel thread"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2 fix2): reuse with a colliding directory mtime still
+/// re-classifies. The directory mtime is coarse (tick granularity,
+/// set when the inode is created), so two generations can share one;
+/// only the inode number tells them apart. Here a cached kernel
+/// thread is reused by a user process under the identical mtime; it
+/// must rejoin the filtered set. Both mtimes are whole seconds, so
+/// any filesystem granularity preserves the collision, and the
+/// fixture retries until the recreated directory has a fresh inode
+/// (a just-freed inode may be reused immediately).
+#[test]
+fn cached_pid_filter_reclassifies_on_inode_change_with_same_mtime() {
+    use std::os::unix::fs::MetadataExt as _;
+    let proc_root = std::env::temp_dir().join(format!("perf-pidinocollide-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 100),
+            (102, "worker", 0, 200),
+        ],
+    );
+    let generation_mtime =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    set_pid_dir_mtime(&proc_root.join("101"), generation_mtime);
+    let old_ino = std::fs::metadata(proc_root.join("101")).unwrap().ino();
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
+    let mut new_ino = old_ino;
+    for attempt in 0..64 {
+        std::fs::remove_dir_all(proc_root.join("101")).unwrap();
+        // Occupy one fresh inode per attempt: retries alone could
+        // spin on a lifo-reused inode forever.
+        std::fs::create_dir_all(proc_root.join(format!("filler-{attempt}"))).unwrap();
+        pid_cache_fixture(&proc_root, &[(101, "reused", 0, 400)]);
+        set_pid_dir_mtime(&proc_root.join("101"), generation_mtime);
+        new_ino = std::fs::metadata(proc_root.join("101")).unwrap().ino();
+        if new_ino != old_ino {
+            break;
+        }
+    }
+    assert_ne!(
+        new_ino, old_ino,
+        "the fixture needs a fresh inode for the reused pid"
+    );
+    assert_eq!(
+        std::fs::metadata(proc_root.join("101"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        generation_mtime,
+        "precondition: the mtimes collide exactly"
+    );
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![101, 102],
+        "same mtime with a new inode is reuse, not the same generation"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2 fix2): the mtime half of the guard. A changed directory
+/// mtime on the same inode re-reads the class: here the flags flip
+/// kthread→user under an explicitly bumped mtime with no recreate,
+/// so the pid must rejoin the filtered set.
+#[test]
+fn cached_pid_filter_reclassifies_on_mtime_change_with_same_inode() {
+    use std::os::unix::fs::MetadataExt as _;
+    let proc_root = std::env::temp_dir().join(format!("perf-pidmtimeleg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 100),
+            (102, "worker", 0, 200),
+        ],
+    );
+    let mtime_before =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    set_pid_dir_mtime(&proc_root.join("101"), mtime_before);
+    let ino_before = std::fs::metadata(proc_root.join("101")).unwrap().ino();
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
+    std::fs::write(
+        proc_root.join("101").join("stat"),
+        pid_cache_stat_line(101, "reused", 0, 100),
+    )
+    .unwrap();
+    let mtime_after = mtime_before + std::time::Duration::from_secs(3600);
+    set_pid_dir_mtime(&proc_root.join("101"), mtime_after);
+    assert_eq!(
+        std::fs::metadata(proc_root.join("101")).unwrap().ino(),
+        ino_before,
+        "precondition: no recreate, the inode is unchanged"
+    );
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![101, 102],
+        "a changed mtime re-reads the class even on the same inode"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2 fix2): unparsable stats stay eligible (fail-closed) and
+/// uncached, like unreadable ones: a garbage stat line is re-read on
+/// the next refresh, so a later well-formed kernel-thread stat still
+/// excludes.
+#[test]
+fn cached_pid_filter_leaves_unparsable_stats_eligible_and_uncached() {
+    let proc_root = std::env::temp_dir().join(format!("perf-pidgarbage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    let dir = proc_root.join("101");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("stat"), "not a stat line\n").unwrap();
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    assert_eq!(
+        engine.cached_user_process_pids(&[101u32]),
+        vec![101],
+        "an unparsable pid stays eligible"
+    );
+    assert_eq!(
+        engine.pid_class_cache_len_for_test(),
+        0,
+        "an unparsable stat is never cached"
+    );
+    pid_cache_fixture(
+        &proc_root,
+        &[(101, "kworker", crate::process::PF_KTHREAD, 100)],
+    );
+    assert_eq!(
+        engine.cached_user_process_pids(&[101u32]),
         Vec::<u32>::new(),
         "the next refresh re-reads and excludes the kernel thread"
     );

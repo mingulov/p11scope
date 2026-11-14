@@ -29,6 +29,12 @@
 #                line; `-v` always on), exactly 0 on base. This doubles
 #                as the arm-identity check: a base that emits counter
 #                lines (or a cand that emits none) fails the sample.
+#   mem_live/dead  R10+R12 live/dead owner processes from the cand end
+#                memory line (cand SAMPLE rows only; the sample refuses
+#                when the line is missing, unparsable, or stale-named).
+#   mem_dead_rows/bytes  dead-owned row counts/bytes summed over the
+#                eight R10/R12 maps (cand rows only).
+#   mem_sample_us  the 60 s sample cost in microseconds (cand rows only).
 #
 # Per-sample gates (any failure fails the campaign immediately; nothing
 # is excluded silently): quiet-host load gate (load1 < MAX_LOAD1 AND
@@ -248,6 +254,59 @@ cleanup_sample() {
     fi
 }
 
+# parse_mem_line JSON: validate one `p11scope: memory {...}` object
+# against the A0 wire keys and print the A1 attribution fields:
+# "mem_live=<n> mem_dead=<n> mem_dead_rows=<n> mem_dead_bytes=<n>
+# mem_sample_us=<n>". Requires the round-4 names (r10_r12_live/dead,
+# the eight *_dead rows, sample_us) as uints; a null or missing key
+# fails, as does an exact stale key (r12_live_processes,
+# r12_dead_processes). The stale check runs on parsed keys, never on
+# substrings: "r10_r12_live_processes" contains "r12_live_processes".
+# Fails loudly (nonzero + message); run_sample refuses the sample.
+parse_mem_line() {
+    python3 -I - "$1" <<'EOF'
+import json, sys
+
+try:
+    obj = json.loads(sys.argv[1])
+except ValueError as exc:
+    sys.exit(f"parse_mem_line: invalid JSON: {exc}")
+if not isinstance(obj, dict):
+    sys.exit("parse_mem_line: memory line is not a JSON object")
+for stale in ("r12_live_processes", "r12_dead_processes"):
+    if stale in obj:
+        sys.exit(f"parse_mem_line: stale key {stale} (pre-round-4 build?)")
+
+
+def uint(key):
+    value = obj.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        sys.exit(f"parse_mem_line: {key} is not a uint ({value!r})")
+    return value
+
+
+dead_keys = ("r10_reduced_dead", "r12_open_dead", "r12_active_ops_dead",
+             "r12_next_pseudonym_dead", "r12_find_active_dead",
+             "r12_pending_dead", "r12_detached_dead",
+             "r12_inherited_ambiguous_dead")
+rows = bytes_ = 0
+for key in dead_keys:
+    row = obj.get(key)
+    if not isinstance(row, dict):
+        sys.exit(f"parse_mem_line: {key} is not a row ({row!r})")
+    for field in ("len", "bytes"):
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            sys.exit(f"parse_mem_line: {key}.{field} is not a uint ({value!r})")
+    rows += row["len"]
+    bytes_ += row["bytes"]
+print(f"mem_live={uint('r10_r12_live_processes')} "
+      f"mem_dead={uint('r10_r12_dead_processes')} "
+      f"mem_dead_rows={rows} mem_dead_bytes={bytes_} "
+      f"mem_sample_us={uint('sample_us')}")
+EOF
+}
+
 # run_sample DIR ARM BIN: one measured sample. Starts the observer,
 # waits for the `capturing:` line, runs the churn window, waits for the
 # observer to end, then gates and records. Prints the SAMPLE line on
@@ -334,8 +393,18 @@ run_sample() {
     rate=$(echo "$done_line" | sed -n 's/.* rate=\([0-9.]*\)\/s.*/\1/p')
     [ -n "$iters" ] && [ -n "$rate" ] || refuse "sample $arm: unparsable done line"
     mem_lines=$(grep -c "p11scope: memory " "$dir/stderr.txt" || true)
+    mem_fields=
     if [ "$arm" = "cand" ]; then
         [ "$mem_lines" -ge 1 ] || refuse "sample cand: no memory line (not an A0 build?)"
+        # The end-of-capture line carries the full attribution: it must
+        # parse against the round-4 keys, else the sample refuses (a
+        # stale cand that counts lines but names old keys is no soak
+        # input).
+        mem_json=$(grep -F "p11scope: memory " "$dir/stderr.txt" | tail -n 1)
+        mem_json=${mem_json#*p11scope: memory }
+        if ! mem_fields=$(parse_mem_line "$mem_json" 2>"$dir/mem-err.txt"); then
+            refuse "sample cand: memory line has no A0 keys ($(cat "$dir/mem-err.txt"))"
+        fi
     else
         [ "$mem_lines" -eq 0 ] || refuse "sample base: $mem_lines memory lines (not a pre-A0 build?)"
     fi
@@ -343,12 +412,17 @@ run_sample() {
     peak_rss=$(awk '$1 == "rss" {if ($2 > max) max = $2} END{print max + 0}' "$dir/rss.txt")
     obs_wall=$(( obs_end - obs_start ))
     line="SAMPLE arm=$arm iters=$iters rate=$rate obs_wall=$obs_wall attach_secs=$attach_secs peak_rss_kb=$peak_rss mem_lines=$mem_lines dir=$(basename "$dir")"
+    if [ -n "$mem_fields" ]; then
+        line="$line $mem_fields"
+    fi
     say "$line"
 }
 
 # analyze LOG: per-arm medians and cand-vs-base deltas over the SAMPLE
-# lines. Prints the DELTA summary (also appended to the log). No verdict:
-# the < 1% / 3% gate runs in A1 and B4.
+# lines. Prints the DELTA summary plus the cand-only MEM medians over
+# the mem_* fields (also appended to the log). A log whose cand rows
+# carry no mem_* fields (pre-round-5) prints no MEM line; a mixed log
+# refuses. No verdict: the < 1% / 3% gate runs in A1 and B4.
 analyze() {
     # No pipe: the pipeline exit would be tee's and mask a python
     # failure. A failed analysis refuses loudly instead.
@@ -376,6 +450,19 @@ for key in ("rate", "obs_wall", "peak_rss_kb"):
     b, c = med(base, key), med(cand, key)
     delta = (c - b) / b * 100 if b else float("nan")
     print(f"DELTA {key}: base_med={b:.1f} cand_med={c:.1f} delta_pct={delta:+.2f} n={len(base)}")
+
+mem = [r for r in cand if "mem_sample_us" in r]
+if mem:
+    if len(mem) != len(cand):
+        sys.exit("analyze: mixed SAMPLE lines (some cand rows lack mem_* fields)")
+
+    def mmed(key):
+        return statistics.median(float(r[key]) for r in mem)
+
+    print(f"MEM live_med={mmed('mem_live'):.1f} dead_med={mmed('mem_dead'):.1f} "
+          f"dead_rows_med={mmed('mem_dead_rows'):.1f} "
+          f"dead_bytes_med={mmed('mem_dead_bytes'):.1f} "
+          f"sample_us_med={mmed('mem_sample_us'):.1f} n={len(mem)}")
 EOF
     ); then
         refuse "analysis failed"
@@ -393,10 +480,18 @@ self_test() {
     trap 'rm -rf "$tmp"' EXIT
     cat > "$tmp/log" <<'EOF'
 SAMPLE arm=base rate=1000.0 obs_wall=200 attach_secs=10 peak_rss_kb=100000 mem_lines=0 dir=r1s1 iters=60000
-SAMPLE arm=cand rate=990.0 obs_wall=202 attach_secs=11 peak_rss_kb=101000 mem_lines=1 dir=r1s2 iters=59400
-SAMPLE arm=cand rate=1010.0 obs_wall=198 attach_secs=9 peak_rss_kb=99000 mem_lines=1 dir=r1s3 iters=60600
+SAMPLE arm=cand rate=990.0 obs_wall=202 attach_secs=11 peak_rss_kb=101000 mem_lines=1 dir=r1s2 iters=59400 mem_live=3 mem_dead=12 mem_dead_rows=36 mem_dead_bytes=360 mem_sample_us=400
+SAMPLE arm=cand rate=1010.0 obs_wall=198 attach_secs=9 peak_rss_kb=99000 mem_lines=1 dir=r1s3 iters=60600 mem_live=5 mem_dead=10 mem_dead_rows=30 mem_dead_bytes=300 mem_sample_us=600
 SAMPLE arm=base rate=1000.0 obs_wall=200 attach_secs=10 peak_rss_kb=100000 mem_lines=0 dir=r1s4 iters=60000
 EOF
+    # Derived fixtures come first: analyze appends to the log it reads,
+    # so anything derived after the first call would carry DELTA/MEM lines.
+    strip_mem() {
+        sed 's/ mem_live=[^ ]* mem_dead=[^ ]* mem_dead_rows=[^ ]* mem_dead_bytes=[^ ]* mem_sample_us=[^ ]*//'
+    }
+    strip_mem < "$tmp/log" > "$tmp/oldlog"
+    head -n 2 "$tmp/log" > "$tmp/mixed"
+    strip_mem < "$tmp/log" | tail -n 2 >> "$tmp/mixed"
     out=$(analyze "$tmp/log")
     echo "$out" | grep -q "DELTA rate: base_med=1000.0 cand_med=1000.0 delta_pct=+0.00" \
         || { echo "self-test: rate delta wrong: $out" >&2; return 1; }
@@ -404,6 +499,39 @@ EOF
         || { echo "self-test: wall delta wrong: $out" >&2; return 1; }
     echo "$out" | grep -q "DELTA peak_rss_kb: base_med=100000.0 cand_med=100000.0 delta_pct=+0.00" \
         || { echo "self-test: rss delta wrong: $out" >&2; return 1; }
+    echo "$out" | grep -q "MEM live_med=4.0 dead_med=11.0 dead_rows_med=33.0 dead_bytes_med=330.0 sample_us_med=500.0 n=2" \
+        || { echo "self-test: MEM medians wrong: $out" >&2; return 1; }
+    # A pre-round-5 log (cand rows without mem_* fields) still analyzes,
+    # with no MEM line; a mixed log (some cand rows with, some without)
+    # refuses instead of summarizing half the rows.
+    old_out=$(analyze "$tmp/oldlog")
+    if echo "$old_out" | grep -q "^MEM "; then
+        echo "self-test: old log gained a MEM line: $old_out" >&2; return 1
+    fi
+    rc=0
+    mixed_out=$(analyze "$tmp/mixed" 2>/dev/null) || rc=$?
+    [ "$rc" -eq 3 ] || { echo "self-test: mixed log analyzed (rc=$rc, must refuse): $mixed_out" >&2; return 1; }
+    # Round 5: the end memory line parses against the round-4 keys.
+    mem_json='{"command":"profile","elapsed_secs":210,"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r10_reduced_dead":{"len":1,"bytes":10},"r12_open_dead":{"len":2,"bytes":20},"r12_active_ops_dead":{"len":3,"bytes":30},"r12_next_pseudonym_dead":{"len":4,"bytes":40},"r12_find_active_dead":{"len":5,"bytes":50},"r12_pending_dead":{"len":6,"bytes":60},"r12_detached_dead":{"len":7,"bytes":70},"r12_inherited_ambiguous_dead":{"len":8,"bytes":80},"sample_us":456}'
+    [ "$(parse_mem_line "$mem_json")" = "mem_live=3 mem_dead=12 mem_dead_rows=36 mem_dead_bytes=360 mem_sample_us=456" ] \
+        || { echo "self-test: mem line parsed wrong" >&2; return 1; }
+    # Stale key names (pre-round-4) fail even on an otherwise valid line;
+    # the exact-key check must not trip on the "r10_r12_" prefix.
+    stale_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r12_live_processes":3,"r12_dead_processes":12,"r10_reduced_dead":{"len":0,"bytes":0},"r12_open_dead":{"len":0,"bytes":0},"r12_active_ops_dead":{"len":0,"bytes":0},"r12_next_pseudonym_dead":{"len":0,"bytes":0},"r12_find_active_dead":{"len":0,"bytes":0},"r12_pending_dead":{"len":0,"bytes":0},"r12_detached_dead":{"len":0,"bytes":0},"r12_inherited_ambiguous_dead":{"len":0,"bytes":0},"sample_us":1}'
+    if parse_mem_line "$stale_json" >/dev/null 2>&1; then
+        echo "self-test: stale keys parsed (must fail)" >&2; return 1
+    fi
+    # Null, short, and truncated shapes fail too.
+    null_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":0,"r10_reduced_dead":{"len":0,"bytes":0},"r12_open_dead":{"len":0,"bytes":0},"r12_active_ops_dead":{"len":0,"bytes":0},"r12_next_pseudonym_dead":{"len":0,"bytes":0},"r12_find_active_dead":{"len":0,"bytes":0},"r12_pending_dead":{"len":0,"bytes":0},"r12_detached_dead":{"len":0,"bytes":0},"r12_inherited_ambiguous_dead":{"len":0,"bytes":0},"sample_us":null}'
+    if parse_mem_line "$null_json" >/dev/null 2>&1; then
+        echo "self-test: null sample_us parsed (must fail)" >&2; return 1
+    fi
+    if parse_mem_line '{"r10_r12_live_processes":3}' >/dev/null 2>&1; then
+        echo "self-test: short line parsed (must fail)" >&2; return 1
+    fi
+    if parse_mem_line '{"r10_r12_live_processes": 3' >/dev/null 2>&1; then
+        echo "self-test: truncated JSON parsed (must fail)" >&2; return 1
+    fi
     [ "$(round_arms 1)" = "base cand cand base" ] || return 1
     [ "$(round_arms 2)" = "cand base base cand" ] || return 1
     # The refuse-path trap reaps the in-flight sample pids: a subshell

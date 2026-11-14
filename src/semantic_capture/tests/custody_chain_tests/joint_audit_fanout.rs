@@ -11247,6 +11247,29 @@ impl MachineScene {
             )
             .collect()
     }
+
+    /// The re-arm drain's load-bearing premise: a published quantum
+    /// leaves no staged seals on any retained feed, so everything
+    /// the drain drops is the abandoned quantum's.
+    fn assert_no_staged_seals(&self, when: &str) {
+        let staged: Vec<usize> = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.staged_len())
+            .collect();
+        assert!(
+            !staged.is_empty(),
+            "no retained feed exists after {when}: the premise check would be vacuous"
+        );
+        assert!(
+            staged.iter().all(|len| *len == 0),
+            "a published quantum leaves no staged seals ({when}): {staged:?}"
+        );
+    }
 }
 
 /// Owner rule "partial, never stop": a transient whole-quantum native
@@ -11615,6 +11638,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
     use crate::inventory_semantics::JointServiceProgress;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
+    fixture.assert_no_staged_seals("the prime publish");
     let api_returns = |fixture: &MachineScene| -> u64 {
         fixture
             .scene
@@ -11705,6 +11729,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         .published_revision();
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
     fixture.published_labeled("post-apply recovery", None);
+    fixture.assert_no_staged_seals("the post-apply recovery publish");
     assert!(
         fixture.machine.disposition_reason().is_none(),
         "the recovered lane never latches"

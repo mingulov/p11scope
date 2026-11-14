@@ -470,9 +470,10 @@ can stop recording key operations partway through (measured on
 v0.7.0: about 5 minutes into a 20-minute capture): later operations
 never get per-key rows, the report reads PARTIAL with the stop named
 as a gap, and a stderr note says coverage is partial. Since 0.8.0
-the lane continues past a transient interruption at the audited step
-(up to 32 interruptions per run, each named as a gap), so the stop
-is narrower. Processes already running when that happens keep exact
+the lane continues past a transient interruption at the audit step,
+whether it strikes while a batch of calls is being checked or right
+after (up to 32 interruptions per run, each named as a gap), so the
+stop is narrower. Processes already running when that happens keep exact
 call counts but lose per-key rows for the rest of the run, while
 processes started later are tracked. A refusal at any other step,
 or past the continuation limit, still stops the lane, and the stop

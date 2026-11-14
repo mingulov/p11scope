@@ -9,7 +9,7 @@ use crate::events::{
 };
 use crate::semantics_edge::resources::SemanticResourcePool;
 use crate::semantics_objects::journal::tests::{
-    COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes_absent, function_id,
+    COOKIE, ENTRY_NS, EXEC, abandon_bytes, begin_bytes, end_bytes_absent, function_id,
 };
 use p11scope_ebpf_common::object_wire::publish_object_descriptors;
 
@@ -1008,5 +1008,57 @@ fn joint_void_unlinked_break_counts_no_void() {
         ),
         (0, 0, 0, 0),
         "an unlinked break fences nothing, so it counts no void"
+    );
+}
+
+#[test]
+fn joint_raw_disposed_quantum_preserves_unbounded_abandonment() {
+    // Disposed-quantum twin of the unlocalized-void preservation
+    // (keyrows C1's wider scope): the abandonment preservation
+    // inside `refuse_disposed_raw` also runs for an unlocalized
+    // disposed quantum, not only the ingest-break void. BEGIN ->
+    // collision ABANDON stages, then a stopped adapter disposes the
+    // next quantum unlocalized. The staged unbounded abandonment
+    // still refuses its incarnation permanently before the void
+    // refuses every key: with no key to account it, the abandoned
+    // image is tainted, so the frame never rebirths.
+    use crate::semantics_objects::journal::{JournalDisposition, JournalIngestItem};
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+    let events = EventsDomain::test_standin(0xd150);
+    let retained = producers(&events);
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.ledger_mut().prepare_capacity().unwrap();
+    let descriptors = publish_object_descriptors();
+    let decode = |bytes: &[u8]| {
+        p11scope_ebpf_common::object_journal::decode_journal_record(bytes, &descriptors)
+            .expect("test bytes decode")
+    };
+    let create = function_id("C_CreateObject");
+    let outer = begin_bytes(1, 1, create, 0);
+    assert_eq!(
+        owner
+            .adapter_mut()
+            .ingest_any(JournalIngestItem::Journal(decode(&outer))),
+        JournalDisposition::BeginAdmitted,
+    );
+    let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+    assert_eq!(
+        owner
+            .adapter_mut()
+            .ingest_any(JournalIngestItem::Journal(decode(&abandon))),
+        JournalDisposition::AbandonStaged,
+        "the collision abandonment stages"
+    );
+    owner.adapter_mut().stop_for_test();
+    let raw = collect(&mut owner, &pool, &retained, &events, []);
+    let disposed = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Empty)
+        .unwrap_or_else(|(_, reason)| panic!("stopped disposal: {reason:?}"));
+    assert_eq!(disposed.reason(), RawDisposeReason::Empty);
+    assert!(
+        owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
+        "the unaccounted abandonment taints its image on the disposed-quantum path"
     );
 }

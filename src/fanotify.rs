@@ -4718,6 +4718,81 @@ mod tests {
         }
     }
 
+    /// A tail that reads empty twice with two events owed and an empty
+    /// queue counts each lease-blocked head instead of one: with an
+    /// exactly measured unit the snapshot divides evenly, so leftover
+    /// owed is the consumed-head count. (Unprivileged: the pipe provides
+    /// the snapshot; each injected read drains one unit, so the first
+    /// re-check sees bytes and the second sees empty.)
+    #[test]
+    fn learn_tail_empty_with_no_bytes_counts_each_lease_blocked_head() {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        use std::sync::atomic::Ordering;
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        // Two events owed.
+        let payload = [7u8; 48];
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        };
+        assert_eq!(written, payload.len() as libc::ssize_t);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: reader.as_raw_fd(),
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
+            fionread_exact: true,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut calls = 0;
+        let done =
+            super::drain_final_tail_with(reader.as_raw_fd(), &mut ctx, &mut buf, |fd, into| {
+                calls += 1;
+                // Each lease consumes one head: drain one unit, report
+                // empty. The first re-check still sees the second event's
+                // bytes; the second sees an empty queue with two owed.
+                // SAFETY: libc read of one unit into a live buffer.
+                let _ = unsafe {
+                    libc::read(
+                        fd,
+                        into.as_mut_ptr() as *mut libc::c_void,
+                        super::FANOTIFY_META_LEN,
+                    )
+                };
+                // SAFETY: test-only errno for the injected lease block.
+                unsafe {
+                    *libc::__errno_location() = libc::EAGAIN;
+                }
+                -1
+            });
+        assert!(done, "the tail decides the drained snapshot");
+        assert_eq!(calls, 2, "each lease-blocked head takes one empty read");
+        assert_eq!(
+            ctx.stats.unreadable, 2,
+            "two lease-blocked heads count two, not one"
+        );
+        assert!(
+            !state.lost_tail.load(Ordering::Acquire),
+            "counted leases are not a lost tail"
+        );
+    }
+
     /// A tail that reads empty with events still owed and bytes still queued
     /// continues past the lease block instead of deciding early: the next
     /// read's events are still decided. (Unprivileged: the pipe provides the

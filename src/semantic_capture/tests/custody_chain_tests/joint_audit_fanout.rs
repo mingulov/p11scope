@@ -11274,10 +11274,12 @@ impl MachineScene {
     }
 
     /// Summed unknown-key terminal outcomes preserved into joint
-    /// key-use: the drain's preservation (not pure counts) lands
-    /// here.
-    fn unknown_terminals_total(&self) -> u64 {
-        self.scene
+    /// key-use, as completed/failed/cancelled/unknown: the drain's
+    /// preservation (not pure counts) lands here.
+    fn unknown_terminals(&self) -> [u64; 4] {
+        let mut sums = [0u64; 4];
+        for row in self
+            .scene
             .real
             .scene
             .coordinator
@@ -11285,8 +11287,13 @@ impl MachineScene {
             .keyuse_for_test()
             .unknown_counters()
             .iter()
-            .map(|row| row.completed + row.failed + row.cancelled + row.unknown)
-            .sum()
+        {
+            sums[0] += row.completed;
+            sums[1] += row.failed;
+            sums[2] += row.cancelled;
+            sums[3] += row.unknown;
+        }
+        sums
     }
 
     /// The re-arm drain's load-bearing premise: a published quantum
@@ -11753,7 +11760,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         disposed_before, disposed_prime,
         "nothing disposes between the prime publish and the re-arm"
     );
-    let unknown_before = fixture.unknown_terminals_total();
+    let unknown_before = fixture.unknown_terminals();
     let preparations = fixture.native.preparations.len();
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
@@ -11774,9 +11781,22 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         staged_before as u64,
         "disposed history rises by exactly the staged depth"
     );
-    assert!(
-        fixture.unknown_terminals_total() > unknown_before,
-        "the drain preserves observed completions as unknown-key rows"
+    // The abandoned Init/Update/Final is one session-7 sign
+    // operation, preserved as exactly one unknown-key completion.
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        unknown_after[0] - unknown_before[0],
+        1,
+        "the drain preserves the abandoned operation as one unknown-key completion"
+    );
+    assert_eq!(
+        (
+            unknown_after[1] - unknown_before[1],
+            unknown_after[2] - unknown_before[2],
+            unknown_after[3] - unknown_before[3],
+        ),
+        (0, 0, 0),
+        "preservation adds no failed, cancelled or unknown outcomes"
     );
     assert_eq!(
         fixture.machine.disposition_reason(),

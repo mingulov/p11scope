@@ -2831,19 +2831,35 @@ impl CallerRegistry {
         }
     }
 
-    /// Drop the abandoned quantum's stranded Joint seals on every
-    /// retained feed (running-rearm recovery only): an applied
-    /// abandon strands sealed-but-undelivered seals whose keys the
-    /// void refused, and the recovery's fallback verification would
-    /// trip over them. Staged seals are per-quantum transient — a
-    /// finished quantum delivers all of them — so everything staged
-    /// here is the abandoned quantum's. Feed modes are untouched.
+    /// Dispose the abandoned quantum's stranded staged Joint calls
+    /// on every retained feed (running-rearm recovery only): an
+    /// applied abandon strands staged-but-unreduced calls whose
+    /// keys the void refused, and the recovery's fallback
+    /// verification would trip over them. Staged calls are
+    /// per-quantum transient — a finished quantum delivers all of
+    /// them — so everything staged here is the abandoned
+    /// quantum's. Joint feeds dispose through the counted
+    /// preservation helper (their observed completions stand as
+    /// unknown-key rows beside the `record_lost` count, as on the
+    /// loss path); any other feed's leftovers dispose as counted
+    /// history. Feed modes are untouched.
     pub(crate) fn drop_abandoned_joint_staged(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) {
-        for record in self.instance_state.semantics.values_mut() {
-            record.feed.drop_abandoned_staged(ledger);
+        for (id, record) in self.instance_state.semantics.iter_mut() {
+            if record.feed.mode() == FeedMode::Joint {
+                record.feed.preserve_and_dispose_below_barrier(
+                    None,
+                    Some(&mut *ledger),
+                    *id,
+                    &mut self.joint_keyuse,
+                    None,
+                    Some(&mut self.assoc_fallback),
+                );
+            } else {
+                record.feed.drop_abandoned_staged(ledger);
+            }
         }
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {

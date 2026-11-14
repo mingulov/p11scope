@@ -591,26 +591,22 @@ impl JointStaging {
         self.watchdog_tripped
     }
 
-    /// Drop every staged seal without delivery (running-rearm
-    /// recovery): the abandoned quantum's seals can never deliver —
-    /// the void refused their keys and fenced their history — so the
-    /// recovery verifies against exactly its own history. Releases
-    /// each head's ledger charge and advances the frontier, exactly
-    /// like consumption, but reduces, replays and counts nothing:
-    /// the abandoned calls already resolved S1-direct or
-    /// shed-counted through the batch abandon. The segment stays
-    /// open: the recovery's own seals stage and deliver normally.
+    /// Dispose every staged call without delivery (running-rearm
+    /// recovery): the abandoned quantum's staged calls can never
+    /// reduce — the void refused their keys and fenced their
+    /// history — so the recovery verifies against exactly its own
+    /// history. Releases each head's ledger charge, advances the
+    /// frontier and counts each once as disposed history
+    /// (`record_lost`), exactly like loss disposal: staged Joint
+    /// calls are unreduced by construction, so dropping them
+    /// uncounted would lose calls. Never reduces or replays. The
+    /// segment stays open: the recovery's own seals stage and
+    /// deliver normally.
     pub(crate) fn drop_abandoned_staged(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) {
-        while let Some(head) = self.staged.pop_front() {
-            let bytes = head.charged_bytes();
-            let (position, native) = (head.position, head.resource_native);
-            drop(head);
-            self.release_or_pend(Some(&mut *ledger), position, bytes, native);
-            self.frontier = self.frontier.max(position);
-        }
+        self.dispose_pure_below_barrier(None, Some(ledger));
     }
 
     /// End the current Joint segment: degrade to S1Only and open

@@ -10393,11 +10393,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
     }
 
-    /// Drop the abandoned quantum's stranded Joint seals (running-rearm
-    /// recovery only; the exit hold never recovers so it never needs
-    /// this): an applied abandon strands sealed-but-undelivered seals,
-    /// and the recovery's fallback verification trips over them. A
-    /// no-op unless seals were staged.
+    /// Dispose the abandoned quantum's stranded staged Joint calls
+    /// (running-rearm recovery only; the exit hold never recovers so
+    /// it never needs this): an applied abandon strands
+    /// staged-but-unreduced calls, and the recovery's fallback
+    /// verification trips over them. Every call counts as disposed
+    /// history, with observed completions preserved as
+    /// unknown-key rows. A no-op unless calls were staged.
     pub(crate) fn drop_abandoned_joint_staged(&mut self) {
         let ledger = self.joint_capture.ledger_mut();
         self.registry.drop_abandoned_joint_staged(ledger);

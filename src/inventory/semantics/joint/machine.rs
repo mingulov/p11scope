@@ -1617,10 +1617,11 @@ impl LiveJointMachine {
         if coordinator.publication_pending() {
             return None;
         }
-        // An applied abandon strands sealed-but-undelivered seals whose
-        // keys the void refused; drop them (releasing their charges)
-        // so the recovery verifies against exactly its own history. An
-        // unapplied abandon staged nothing, so this is a no-op there.
+        // An applied abandon strands staged-but-unreduced calls whose
+        // keys the void refused; dispose them as counted history
+        // (preserving their observed completions) so the recovery
+        // verifies against exactly its own history. An unapplied
+        // abandon staged nothing, so this is a no-op there.
         coordinator.drop_abandoned_joint_staged();
         if self.producers.journal_linked() {
             coordinator

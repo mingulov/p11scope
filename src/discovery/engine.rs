@@ -21573,11 +21573,11 @@ impl Engine {
         // room the wait lifts and the candidate proves below. First
         // stagings always prove: the wait row comes from the prove
         // path, and a shareable file stages at once.
-        if let Some(maps) = self.learned_waited.get(&identity).copied() {
-            if self.handle_table.learned_retry_waits(&maps) {
-                self.requeue_learned_candidate(candidate);
-                return;
-            }
+        if let Some(maps) = self.learned_waited.get(&identity).copied()
+            && self.handle_table.learned_retry_waits(&maps)
+        {
+            self.requeue_learned_candidate(candidate);
+            return;
         }
         // The candidate owns its fd for this whole call, so the pin
         // worker's `/proc/self/fd/N` open cannot dangle.

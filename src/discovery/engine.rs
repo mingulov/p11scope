@@ -855,8 +855,9 @@ pub struct Engine {
     proc_root: PathBuf,
     /// Cached per-pid kernel-thread classifications (§8.2): refreshes
     /// re-stat one directory mtime per pid instead of re-reading and
-    /// re-parsing every stat file. Guarded by the directory mtime with
-    /// a start-time confirmation, pruned to the live scope each pass.
+    /// re-parsing every stat file. Guarded by the directory mtime,
+    /// re-classifying from the fresh stat on any guard change, and
+    /// pruned to the live scope each pass.
     pid_class_cache: BTreeMap<u32, PidClassCacheEntry>,
     /// Cache guard hits (reused without a stat read) and misses (one
     /// stat read each). Read by the env-gated diagnostics line only.
@@ -29304,8 +29305,9 @@ impl Engine {
             pids.clone()
         } else {
             // Cached across refreshes (§8.2): one directory mtime per
-            // pid instead of a stat re-read each, with a start-time
-            // reuse guard and identical fail-closed semantics.
+            // pid instead of a stat re-read each, re-classifying from
+            // the fresh stat on any guard change, with identical
+            // fail-closed semantics.
             self.cached_user_process_pids(&pids)
         };
         let membership_complete = skipped.is_empty() && desired_pids.len() <= max_scan_pids;

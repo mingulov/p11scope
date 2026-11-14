@@ -792,11 +792,47 @@ fn retired_sessions_count_as_closed_declared_diff() {
     let (mut s, mut t, _) = setup(64);
     let mut first = ev(100, 90, 0, 0);
     first.ts_ns = 100;
+    // The retired process also leaves an unresolved async call behind in
+    // each gap map: a still-pending `C_Sign` on session 7, and a
+    // detached async id minted from a second pending call on session 8.
+    let mut staying = ev(100, 90, 0, 2);
+    staying.ts_ns = 101;
+    staying.rv = pkcs11_types::CkRv::PENDING.0;
+    let mut second_session = ev(100, 90, 0, 0);
+    second_session.session = 8;
+    second_session.ts_ns = 102;
+    let mut detached_call = ev(100, 90, 0, 2);
+    detached_call.session = 8;
+    detached_call.ts_ns = 103;
+    detached_call.rv = pkcs11_types::CkRv::PENDING.0;
+    let mut get_id = ev(100, 90, 0, 4);
+    get_id.session = 8;
+    get_id.ts_ns = 104;
+    get_id.target_function = crate::kinds::function_id("C_Sign").unwrap();
+    get_id.async_value = 42;
     let mut second = ev(101, 91, 0, 0);
     second.ts_ns = 100;
-    feed(&mut s, &mut t, [first, second]);
+    feed(
+        &mut s,
+        &mut t,
+        [
+            first,
+            staying,
+            second_session,
+            detached_call,
+            get_id,
+            second,
+        ],
+    );
+    assert_eq!(s.memory_lens().pending.len, 1);
+    assert_eq!(s.memory_lens().detached.len, 1);
+    assert_eq!(s.pending_at_end(), 2);
     let render_json = |state: &semantics::State| {
         let mut ev = crate::render::tests::evidence();
+        // Production wires the live gap count into the evidence
+        // (`evidence_for`); the fixture does the same so the declared
+        // diff covers it.
+        ev.pending_at_end = state.pending_at_end();
         ev.verdict();
         crate::render::profile_json(
             &[],
@@ -846,7 +882,8 @@ fn retired_sessions_count_as_closed_declared_diff() {
     let json_after = render_json(&s);
     let text_after = render_text(&s);
     // The JSON moves in exactly the two session-balance fields, by
-    // exactly the one retired session.
+    // exactly the two retired sessions — the pending and detached gaps
+    // stay named through the retire, so `pending_at_end` never appears.
     let mut diffs = Vec::new();
     json_diffs(&json_before, &json_after, String::new(), &mut diffs);
     diffs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -855,13 +892,13 @@ fn retired_sessions_count_as_closed_declared_diff() {
         vec![
             (
                 "sessions.balance".to_string(),
-                serde_json::json!(2),
+                serde_json::json!(3),
                 serde_json::json!(1),
             ),
             (
                 "sessions.closed".to_string(),
                 serde_json::json!(0),
-                serde_json::json!(1),
+                serde_json::json!(2),
             ),
         ]
     );
@@ -879,8 +916,8 @@ fn retired_sessions_count_as_closed_declared_diff() {
     assert_eq!(line_diffs.len(), 1, "only the sessions line moves");
     let (_, left, right) = line_diffs[0];
     assert!(
-        left.contains("2 still open"),
-        "before names two open sessions: {left}"
+        left.contains("3 still open"),
+        "before names three open sessions: {left}"
     );
     assert!(
         right.contains("1 still open"),

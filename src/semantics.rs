@@ -3051,6 +3051,12 @@ pub struct State {
     cgroup_retained_paths: BTreeMap<u64, String>,
     orphan_ops: u64,
     unmatched_closes: u64,
+    /// Pending and detached rows an exit retire swept while still
+    /// unresolved: `pending_at_end` keeps naming them, so a freed
+    /// process never silently clears the session-tracking gap its
+    /// unfinished async calls left behind. Only the exit path feeds
+    /// this; the history path predates it and is unchanged.
+    exit_retired_pending: u64,
     evidence: SemanticEvidence,
     mech_shapes: BTreeMap<u64, u32>,
     state_key_limit: usize,
@@ -3163,6 +3169,7 @@ impl State {
             cgroup_retained_paths: BTreeMap::new(),
             orphan_ops: 0,
             unmatched_closes: 0,
+            exit_retired_pending: 0,
             evidence: SemanticEvidence::default(),
             mech_shapes: BTreeMap::new(),
             state_key_limit,
@@ -4428,6 +4435,11 @@ impl State {
         if processes.is_empty() {
             return 0;
         }
+        // Gap baselines ahead of every sweep: the session loop below also
+        // clears per-session pending rows, so a later snapshot would miss
+        // them and the retired gap count would under-report.
+        let pending_before = self.pending.len();
+        let detached_before = self.detached.len();
         let mut touched = BTreeSet::new();
         // Open sessions first, exactly as `clear_scope` sweeps them:
         // each removed session returns its key, clears its session
@@ -4481,7 +4493,9 @@ impl State {
         });
         self.release_keys(ambiguous_before - self.inherited_ambiguous.len());
         // `pending` and `detached` never drew from the budget, so their
-        // sweep below returns nothing — same as `clear_scope`.
+        // sweep below returns nothing — same as `clear_scope`. The swept
+        // rows were still unresolved, so they move into the retired gap
+        // count instead of vanishing from `pending_at_end`.
         self.pending.retain(|(owner, _, _), _| {
             let drop = processes.contains(owner);
             if drop {
@@ -4496,6 +4510,9 @@ impl State {
             }
             !drop
         });
+        self.exit_retired_pending = self.exit_retired_pending.saturating_add(
+            (pending_before - self.pending.len() + detached_before - self.detached.len()) as u64,
+        );
         for process in processes {
             if self.next_pseudonym.remove(process).is_some() {
                 self.release_keys(1);
@@ -4966,7 +4983,8 @@ impl State {
         (live, dead_processes, dead, sample_us)
     }
     pub fn pending_at_end(&self) -> u64 {
-        (self.pending.len() + self.detached.len()) as u64
+        ((self.pending.len() + self.detached.len()) as u64)
+            .saturating_add(self.exit_retired_pending)
     }
     /// E20 test-only visit count from the last `fork_process`.
     #[cfg(test)]

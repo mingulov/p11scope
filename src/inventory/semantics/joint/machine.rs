@@ -73,10 +73,12 @@ pub(crate) const RUNNING_REARM_SUBJECT: &str = "semantic quantum abandoned; lane
 /// records nothing; a success clears the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunningRearmRefusal {
-    /// Defensive: the latch-time shape failed (or a previous
-    /// attempt consumed the flag) yet the current shape passes.
-    /// Latched state never improves toward the shape, so this
-    /// names an already-spent latch.
+    /// Defensive: the re-arm flag is already spent, yet the
+    /// current latch has the admittable shape. The refusal came
+    /// from outside the audited pass: the unlinked discovery reader
+    /// stops the lane without an eligibility check, so it can latch
+    /// at Audited with the frame held. This names that outside
+    /// refusal.
     Consumed,
     /// The latched refusal is permanent, not the transient
     /// `Unavailable` a re-arm admits.
@@ -108,7 +110,7 @@ impl RunningRearmRefusal {
     /// "the lane could not continue".
     pub(crate) fn describe(self) -> &'static str {
         match self {
-            Self::Consumed => "this refusal already spent its re-arm",
+            Self::Consumed => "the refusal came from outside the audited pass",
             Self::NotTransient => "the refusal was permanent, not transient",
             Self::FinishActive => "the lane was already finishing",
             Self::WatchdogTripped => "a no-progress trip was already standing",
@@ -1678,10 +1680,12 @@ impl LiveJointMachine {
         // Every refusal below records its cause for the stop gap;
         // the gate order is unchanged, only named.
         if !self.rearm_eligible {
-            // The latch-time shape failed, or a previous attempt
-            // spent the flag: the current shape still fails, so it
-            // names the cause; a passing shape here is defensive
-            // only (latched state never improves toward it).
+            // The latch-time shape failed, a previous attempt spent
+            // the flag, or the refusal came from outside the audited
+            // pass (the unlinked discovery reader stops the lane
+            // without an eligibility check): the current shape still
+            // fails, so it names the cause; a passing shape here is
+            // that outside refusal at Audited with the frame held.
             let refusal = self
                 .running_rearm_shape_refusal(latched)
                 .unwrap_or(RunningRearmRefusal::Consumed);

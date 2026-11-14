@@ -344,6 +344,54 @@ class DiscoverTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual("qualified", qual)
 
+    def test_nss_softokn_exact_shape_passes(self):
+        # NSS softokn (libsoftokn3.so, measured 3.120 Ubuntu + 3.131
+        # Fedora, identical): legacy 2.40 plus 3.2/3.0/2.40 interfaces.
+        manifest = {
+            "interface_list": {"status": "ok"},
+            "surfaces": [
+                {"source": {"kind": "legacy_function_list"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 2},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(104)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 0},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(92)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+            ],
+        }
+        ok, qual, detail = _COMPARE.judge_discover(
+            "nss-softokn", "system", 0, manifest, "")
+        self.assertTrue(ok, detail)
+        self.assertEqual("qualified", qual)
+
+    def test_nss_softokn_surface_drift_fails(self):
+        manifest = {
+            "interface_list": {"status": "ok"},
+            "surfaces": [
+                {"source": {"kind": "legacy_function_list"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 2},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(103)]},
+            ],
+        }
+        ok, qual, detail = _COMPARE.judge_discover(
+            "nss-softokn", "system", 0, manifest, "")
+        self.assertFalse(ok, "dropped interface + 104 -> 103 drift passed")
+        self.assertEqual("qualified", qual)
+
     def test_haskoki_exact_shape_passes(self):
         manifest = {
             "interface_list": {"status": "ok"},
@@ -370,6 +418,49 @@ class DiscoverTests(unittest.TestCase):
             "haskoki", "0.5.0.0", 0, manifest, "")
         self.assertTrue(ok, detail)
         self.assertEqual("qualified", qual)
+
+
+    def test_p11kit_managed_exact_shape_passes(self):
+        # The aggregating proxy surface is config-independent: managed
+        # and unmanaged rows pin the same 3-surface shape as p11kit-proxy.
+        manifest = {
+            "interface_list": {"status": "ok"},
+            "surfaces": [
+                {"source": {"kind": "legacy_function_list"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 2},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(104)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+            ],
+        }
+        for provider in ("p11kit-managed", "p11kit-unmanaged"):
+            ok, qual, detail = _COMPARE.judge_discover(
+                provider, "system", 0, manifest, "")
+            self.assertTrue(ok, f"{provider}: {detail}")
+            self.assertEqual("qualified", qual)
+
+    def test_p11kit_managed_surface_drift_fails(self):
+        manifest = {
+            "interface_list": {"status": "ok"},
+            "surfaces": [
+                {"source": {"kind": "legacy_function_list"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+            ],
+        }
+        for provider in ("p11kit-managed", "p11kit-unmanaged"):
+            ok, qual, _ = _COMPARE.judge_discover(
+                provider, "system", 0, manifest, "")
+            self.assertFalse(ok, f"{provider}: dropped surfaces passed")
+            self.assertEqual("qualified", qual)
 
 
 class MainTests(unittest.TestCase):
@@ -515,6 +606,60 @@ class MainTests(unittest.TestCase):
             self.assertTrue(by_cell["kryoptic-inventory-pid"]["pass"])
 
 
+PROXY_CONFIG_SNIPPET = (ROOT / "scripts" / "provider-matrix"
+                        / "providers" / "_p11kit_proxy_config.sh")
+
+
+def proxy_check_source():
+    """The shipped token-list checker plus its fixture seam."""
+    text = PROXY_CONFIG_SNIPPET.read_text(encoding="utf-8")
+    matches = re.findall(
+        r"(?ms)^p11kit_proxy_check_token_list\(\) \{$\n(.*?)\n^\}$", text)
+    assert len(matches) == 1, (
+        f"expected exactly one p11kit_proxy_check_token_list in "
+        f"{PROXY_CONFIG_SNIPPET}, found {len(matches)}")
+    return f"p11kit_proxy_check_token_list() {{\n{matches[0]}\n}}"
+
+
+class P11KitProxyConfigTests(unittest.TestCase):
+    def run_check(self, listing, label="p11matrix"):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "slots.txt"
+            out.write_text(listing, encoding="utf-8")
+            script = (proxy_check_source()
+                      + f'\np11kit_proxy_check_token_list "{out}" "{label}"\n')
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                timeout=60)
+            return proc.returncode
+
+    def test_single_expected_token_passes(self):
+        listing = ("Available slots:\n"
+                   "Slot 0 (0x1): SoftHSM slot 0\n"
+                   "  token label        : p11matrix\n")
+        self.assertEqual(0, self.run_check(listing))
+
+    def test_second_token_fails(self):
+        # user-config:only must isolate our module: a second token
+        # means system modules leaked into the proxy view.
+        listing = ("Available slots:\n"
+                   "Slot 0 (0x1): SoftHSM slot 0\n"
+                   "  token label        : p11matrix\n"
+                   "Slot 1 (0x2): System Trust\n"
+                   "  token label        : System Trust\n")
+        self.assertNotEqual(0, self.run_check(listing))
+
+    def test_wrong_label_fails(self):
+        listing = ("Available slots:\n"
+                   "Slot 0 (0x1): SoftHSM slot 0\n"
+                   "  token label        : someone-else\n")
+        self.assertNotEqual(0, self.run_check(listing))
+
+    def test_empty_listing_fails(self):
+        self.assertNotEqual(0, self.run_check("Available slots:\n"))
+
+
 class LegPrepTests(unittest.TestCase):
     def test_leg_prep_deletes_only_verdict_files(self):
         # Runs the shipped leg_prep against a fixture leg dir: every STALE
@@ -540,6 +685,157 @@ class LegPrepTests(unittest.TestCase):
             for name in KEEPERS:
                 self.assertTrue((leg / name).is_file(),
                                 f"keeper deleted: {name}")
+
+
+STATIC_EMBED_HELPER = (ROOT / "scripts" / "provider-matrix"
+                        / "static_embed_cell_compare.py")
+
+_STATIC_SPEC = importlib.util.spec_from_file_location(
+    "static_embed_cell_compare", STATIC_EMBED_HELPER)
+_STATIC = importlib.util.module_from_spec(_STATIC_SPEC)
+_STATIC_SPEC.loader.exec_module(_STATIC)
+
+
+class StaticEmbedTests(unittest.TestCase):
+    def test_calls_log_parses_the_last_count(self):
+        self.assertEqual(61, _STATIC.parse_calls_log("boot\nCALLS=61\n"))
+        self.assertEqual(7, _STATIC.parse_calls_log("CALLS=61\nCALLS=7\n"))
+        self.assertIsNone(_STATIC.parse_calls_log("no oracle here\n"))
+        self.assertIsNone(_STATIC.parse_calls_log("CALLS=many\n"))
+
+    def test_program_runs_passes_on_clean_oracle(self):
+        ok, detail, calls = _STATIC.judge_program_runs(0, "CALLS=61\n")
+        self.assertTrue(ok, detail)
+        self.assertEqual(61, calls)
+
+    def test_program_runs_fails_on_crash(self):
+        ok, detail, _ = _STATIC.judge_program_runs(1, "CALLS=61\n")
+        self.assertFalse(ok, "crashed self-test passed")
+        self.assertIn("exit=1", detail)
+
+    def test_program_runs_fails_without_oracle(self):
+        ok, detail, _ = _STATIC.judge_program_runs(0, "done\n")
+        self.assertFalse(ok, "oracle-less self-test passed")
+        self.assertIn("no CALLS oracle", detail)
+
+    def test_program_runs_fails_on_zero_calls(self):
+        ok, detail, _ = _STATIC.judge_program_runs(0, "CALLS=0\n")
+        self.assertFalse(ok, "zero-call self-test passed")
+
+    def test_static_run_observed_passes_when_attributed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            rows = [function_row(["C_Initialize"],
+                                 module_identity(binary), 61)]
+            ok, detail = _STATIC.judge_static_run_observed(
+                observed_doc(rows), str(binary), 61)
+            self.assertTrue(ok, detail)
+            self.assertIn("61", detail)
+
+    def test_static_run_observed_fails_with_the_named_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            ok, detail = _STATIC.judge_static_run_observed(
+                observed_doc([]), str(binary), 61)
+            self.assertFalse(ok, "unobserved static binary passed")
+            self.assertIn("not observed", detail)
+            self.assertIn("static-executable-unobserved", detail)
+
+    def test_static_run_observed_fails_without_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            ok, detail = _STATIC.judge_static_run_observed(
+                observed_doc([]), str(binary), None)
+            self.assertFalse(ok, "oracle-less run leg passed")
+            self.assertIn("no CALLS oracle", detail)
+
+    def test_static_discover_passes_on_a_surfaced_manifest(self):
+        manifest = {"interface_list": {"status": "ok"},
+                    "surfaces": [{"source": {"kind": "file_scan"}}]}
+        ok, detail = _STATIC.judge_static_discover(0, manifest, "")
+        self.assertTrue(ok, detail)
+
+    def test_static_discover_fails_on_empty_surfaces(self):
+        manifest = {"interface_list": {"status": "ok"}, "surfaces": []}
+        ok, detail = _STATIC.judge_static_discover(0, manifest, "")
+        self.assertFalse(ok, "surface-less manifest passed")
+
+    def test_static_discover_dlopen_refusal_names_the_gap(self):
+        ok, detail = _STATIC.judge_static_discover(
+            1, None, "p11scope-discover: cannot dlopen /x: dlopen failed")
+        self.assertFalse(ok, "dlopen refusal passed")
+        self.assertIn("static-executable-unobserved", detail)
+
+    def test_static_discover_other_refusal_quotes_stderr(self):
+        ok, detail = _STATIC.judge_static_discover(
+            1, None, "p11scope-discover: exploded: boom")
+        self.assertFalse(ok, "unexplained refusal passed")
+        self.assertIn("exploded: boom", detail)
+
+    def write_static_cell(self, tmp, selftest_rc=0, selftest_log="CALLS=61\n",
+                          run_log="CALLS=61\n", run_calls=0,
+                          discover_rc=1,
+                          discover_stderr="cannot dlopen /x: failed"):
+        base = Path(tmp)
+        binary = make_module(tmp, name="kryoptic-static-embed",
+                             content=b"fake-embed")
+        (base / "selftest.log").write_text(selftest_log, encoding="utf-8")
+        rows = [function_row(["C_Initialize"], module_identity(binary),
+                             run_calls)]
+        (base / "observed.json").write_text(
+            json.dumps(observed_doc(rows)), encoding="utf-8")
+        (base / "observer.out").write_text(run_log, encoding="utf-8")
+        (base / "discover.stderr").write_text(discover_stderr,
+                                              encoding="utf-8")
+        args = ["--binary", str(binary),
+                "--selftest-rc", str(selftest_rc),
+                "--selftest-log", str(base / "selftest.log"),
+                "--observer-out", str(base / "observer.out"),
+                "--observed", str(base / "observed.json"),
+                "--discover-rc", str(discover_rc),
+                "--discover-stderr", str(base / "discover.stderr"),
+                "--out-results", str(base / "results.jsonl"),
+                "--out-summary", str(base / "summary.txt")]
+        return base, args
+
+    def test_tip_shape_exits_one_with_two_named_gaps(self):
+        # This tip: the program runs (CALLS>0) but run and discover
+        # cannot observe a static binary: two qualified FAILs carrying
+        # the static-executable-unobserved gap, never a skip.
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_static_cell(tmp)
+            rc = _STATIC.main(args)
+            self.assertEqual(1, rc)
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            self.assertEqual(3, len(rows))
+            by_cell = {row["cell"]: row for row in rows}
+            self.assertTrue(
+                by_cell["kryoptic-static-embed-program-runs"]["pass"])
+            for name in ("kryoptic-static-embed-run-observed",
+                         "kryoptic-static-embed-discover"):
+                row = by_cell[name]
+                self.assertFalse(row["pass"])
+                self.assertEqual("qualified", row["qualification"])
+                self.assertIn("static-executable-unobserved",
+                              row["detail"])
+
+    def test_future_observed_shape_exits_zero(self):
+        manifest = {"interface_list": {"status": "ok"},
+                    "surfaces": [{"source": {"kind": "file_scan"}}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_static_cell(tmp, run_calls=61,
+                                                discover_rc=0,
+                                                discover_stderr="")
+            (base / "manifest.json").write_text(json.dumps(manifest),
+                                                encoding="utf-8")
+            args += ["--manifest", str(base / "manifest.json")]
+            rc = _STATIC.main(args)
+            self.assertEqual(0, rc)
 
 
 if __name__ == "__main__":

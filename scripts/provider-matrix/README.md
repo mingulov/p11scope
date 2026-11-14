@@ -23,6 +23,10 @@ user with `sudo -n` for the observer only.
 | `freehsm.env` | FreeHSM `libfreehsm.so` | `--extra-deliver freehsm/` |
 | `opensc.env` | OpenSC, reader-less (no suite legs) | probed system paths |
 | `p11kit-proxy.env` | p11-kit client + per-cell server over SoftHSM | probed system paths |
+| `nss-softokn.env` | NSS softokn, reader-less (no suite legs) | probed system paths |
+| `p11kit-managed.env` | real p11-kit-proxy + module `managed: yes` | probed system paths |
+| `p11kit-unmanaged.env` | real p11-kit-proxy + module `managed: no` | probed system paths |
+| `kryoptic-static-embed.env` | kryoptic statically linked in a program | `--extra-deliver kryoptic-static-embed/` |
 
 Module paths are probed from each env file's `PROVIDER_CANDIDATES`, never
 assumed; a pinned task-dir copy wins over system paths, and the winner
@@ -40,7 +44,10 @@ provider enforces a PIN policy). A setup
 with dynamic outputs (the p11-kit server address) writes `KEY=VALUE`
 lines to `$TASK_DIR/.provider-extra-env`; the cell exports them after a
 successful setup (the file is removed before setup, so nothing leaks
-across cells).
+across cells). The two proxy-config rows share
+`providers/_p11kit_proxy_config.sh` (one configured module, private
+`XDG_CONFIG_HOME` with `user-config: only`, exactly-one-token setup
+assertion); `run-matrix.sh` delivers it with the env files.
 
 ## Entry command
 
@@ -70,6 +77,22 @@ listed in the table), 1 a cell failed, 2 a harness/collect error.
   `make OPENSSL_PREFIX=/usr PROFILE=interop libfreehsm.so`;
   deliver as `--extra-deliver /path/to/freehsm` holding
   `libfreehsm.so`. Record the built commit in the run report.
+
+## Static-embed acquisition
+
+- kryoptic static-embed: `static-embed/build.sh /path/to/stagedir`
+  builds `kryoptic-embed/` (kryoptic-lib 1.5.2 from crates.io, sqlite
+  bundled, `--locked`) into a program that exports the PKCS#11 entry
+  points and self-drives the embedded token, proves the static linkage
+  (`nm` export in the image, no dynamic kryoptic), and stages the
+  binary plus `BUILD.json` (kryoptic/rustc/sha256) into the staging
+  dir; deliver it as `--extra-deliver /path/to/stagedir` with the dir
+  named `kryoptic-static-embed`. Needs a Rust toolchain, a C compiler,
+  OpenSSL headers and crates.io access. The custom
+  `static-embed-cell.sh` (3 rows, judged by
+  `static_embed_cell_compare.py`) drives it: the run/discover rows
+  fail with the `static-executable-unobserved` gap while the static
+  file-scan is unlanded.
 
 ## Legs and rows per cell
 

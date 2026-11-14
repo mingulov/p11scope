@@ -356,6 +356,33 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         providers = job_body(self.yml, "pkcs11-check-providers")
         self.assertIn("github.event_name != 'schedule'", providers)
 
+    def test_providers_matrix_runs_nss_next_to_the_pinned_providers(self):
+        # The per-push matrix runs kryoptic + Haskoki (pinned artifacts)
+        # plus NSS softokn (system libnss3, tool probe, no fetch). The
+        # nightly FULL matrix keeps only the suite providers: a suite=no
+        # row gains no FULL leg.
+        providers = job_body(self.yml, "pkcs11-check-providers")
+        for entry in ("provider: kryoptic", "provider: haskoki",
+                      "provider: nss-softokn",
+                      "discover_row: kryoptic-multi-table",
+                      "discover_row: haskoki-discover",
+                      "discover_row: nss-softokn-discover"):
+            self.assertIn(entry, providers)
+        self.assertIn("libnss3", providers)
+        # The suite flag drives the identical-results allow-list: a
+        # suite=no tool probe records that row as nonqualifying, and
+        # check-cell-results rejects a nonqualifying row outside the
+        # allow list.
+        self.assertIn('suite: "yes"', providers)
+        self.assertIn('suite: "no"', providers)
+        self.assertIn('matrix.suite', providers)
+        self.assertIn('--allow-nonqualifying "${{ matrix.provider }}-identical-results"',
+                      providers)
+        full = job_body(self.yml, "pkcs11-check-providers-full")
+        self.assertIn("provider: kryoptic", full)
+        self.assertIn("provider: haskoki", full)
+        self.assertNotIn("nss-softokn", full)
+
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], _BPF.check_no_tag_triggers(self.yml))
 

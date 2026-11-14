@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+[package]
+name = "kryoptic-static-embed"
+version = "1.5.2"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Provider-matrix fixture: a program with the kryoptic PKCS#11 provider statically linked"
+publish = false
+
+# Standalone fixture crate, not a p11scope workspace member.
+[workspace]
+
+[dependencies]
+kryoptic-lib = "=1.5.2"
+# Static sqlite: kryoptic's sqlitedb unifies onto this bundled build, so
+# the binary needs no system sqlite at build or run time.
+rusqlite = { version = "0.38", features = ["bundled"] }

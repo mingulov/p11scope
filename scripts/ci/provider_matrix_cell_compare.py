@@ -90,6 +90,13 @@ EXPECTED_SURFACES = {
          ("interface", 3, 2, 104, "full"),
          ("interface", 3, 0, 92, "full")),
     ),
+    ("nss-softokn", "system"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 3, 0, 92, "full"),
+         ("interface", 2, 40, 68, "full")),
+    ),
     ("opensc", "system"): (
         "ok",
         (("legacy_function_list", 2, 20, 68, "full"),
@@ -98,6 +105,20 @@ EXPECTED_SURFACES = {
          ("interface", 2, 20, 68, "known_prefix")),
     ),
     ("p11kit-proxy", "system"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 2, 40, 68, "full")),
+    ),
+    # The aggregating proxy surface does not depend on the module
+    # config: managed and unmanaged rows pin the p11kit-proxy shape.
+    ("p11kit-managed", "system"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 2, 40, 68, "full")),
+    ),
+    ("p11kit-unmanaged", "system"): (
         "ok",
         (("legacy_function_list", 2, 40, 68, "full"),
          ("interface", 3, 2, 104, "full"),

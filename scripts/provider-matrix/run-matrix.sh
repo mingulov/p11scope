@@ -13,7 +13,8 @@
 #   [--collect DIR] [--extra-deliver PATH...] [--keep] [--print-plan]
 #
 # Default providers: softhsm2-2.7,softhsm2-2.6,kryoptic,haskoki,bouncyhsm,
-# freehsm,opensc,p11-kit-proxy. Pinned artifacts (haskoki tarball, kryoptic
+# freehsm,opensc,p11kit-proxy,nss-softokn,p11kit-managed,p11kit-unmanaged,
+# kryoptic-static-embed. Pinned artifacts (haskoki tarball, kryoptic
 # and softhsm2.6 rpms) are fetched on the host with pinned sha256
 # (scripts/ci/fetch-provider.sh); bouncyhsm/freehsm trees ride --extra-deliver
 # (dirs named bouncyhsm/ freehsm/, see the matrix README). Smoke is
@@ -25,7 +26,7 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 REPO=$(cd "$HERE/../.." && pwd) || exit 2
 HOST=; TASK=; P11SCOPE=; DISCOVER=
 MODE=smoke
-PROVIDERS=softhsm2-2.7,softhsm2-2.6,kryoptic,haskoki,bouncyhsm,freehsm,opensc,p11kit-proxy
+PROVIDERS=softhsm2-2.7,softhsm2-2.6,kryoptic,haskoki,bouncyhsm,freehsm,opensc,p11kit-proxy,nss-softokn,p11kit-managed,p11kit-unmanaged,kryoptic-static-embed
 LANE=bpf
 COLLECT=./provider-matrix-out
 KEEP=no
@@ -97,8 +98,11 @@ cp -p "$P11SCOPE" "$DISCOVER" "$STAGE/bin/" || exit 2
 cp -p "$REPO/scripts/ci/provider-matrix-cell.sh" "$REPO/scripts/ci/provider_matrix_cell_compare.py" \
   "$REPO/scripts/ci/pkcs11_check_cell_compare.py" "$REPO/scripts/ci/fetch-provider.sh" \
   "$REPO/scripts/ci/pkcs11-check-requirements.txt" "$STAGE/repo/scripts/ci/" || exit 2
-cp -p "$HERE/workload-pace.py" "$HERE/remote-cell.sh" "$HERE/pins.sh" "$STAGE/repo/scripts/provider-matrix/" || exit 2
-cp -p "$HERE"/providers/*.env "$STAGE/repo/scripts/provider-matrix/providers/" || exit 2
+cp -p "$HERE/workload-pace.py" "$HERE/remote-cell.sh" "$HERE/pins.sh" \
+  "$HERE/static-embed-cell.sh" "$HERE/static_embed_cell_compare.py" \
+  "$STAGE/repo/scripts/provider-matrix/" || exit 2
+cp -p "$HERE"/providers/*.env "$HERE"/providers/_p11kit_proxy_config.sh \
+  "$STAGE/repo/scripts/provider-matrix/providers/" || exit 2
 rsync -a "$STAGE/bin/" "user@$HOST:$TASKDIR/bin/" || exit 2
 rsync -a "$STAGE/repo/" "user@$HOST:$TASKDIR/repo/" || exit 2
 for x in "${EXTRA[@]}"; do

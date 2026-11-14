@@ -919,22 +919,25 @@ struct LearnerThread {
 pub(crate) struct FileLearner {
     state: Arc<LearnShutdownState>,
     thread: Option<LearnerThread>,
-    /// Group + sender + startup mark coverage held between arming
-    /// and `begin_drain`: the reader thread spawns post-shed so it
-    /// never retains the transient startup `CAP_SYS_ADMIN`
-    /// (capabilities are per-thread). `None` once the drain runs.
-    /// The bool records that the startup pass left a visible
-    /// filesystem uncovered, which the drain files as the finite
-    /// unavailable-learning gap as soon as it runs. The unit is this
-    /// kernel's measured `FIONREAD` bytes per event, which the drain's
-    /// tail and shed divide their snapshots by.
-    pending: Option<(
-        OwnedFd,
-        SyncSender<LearnMsg>,
-        BTreeSet<MountIdentity>,
-        bool,
-        usize,
-    )>,
+    /// The armed learner held between arming and `begin_drain`: the
+    /// reader thread spawns post-shed so it never retains the transient
+    /// startup `CAP_SYS_ADMIN` (capabilities are per-thread). `None`
+    /// once the drain runs.
+    pending: Option<PendingArming>,
+}
+
+/// The armed learner between `start()` and `begin_drain`: the group,
+/// the drain channel, the startup mark coverage, whether the startup
+/// pass left a visible filesystem uncovered (filed as the finite
+/// unavailable-learning gap once the drain runs), and this kernel's
+/// measured `FIONREAD` bytes per event (which the drain's tail and
+/// shed divide their snapshots by).
+struct PendingArming {
+    group: OwnedFd,
+    tx: SyncSender<LearnMsg>,
+    covered: BTreeSet<MountIdentity>,
+    initial_gap_owed: bool,
+    fionread_unit: usize,
 }
 
 /// Opens the fanotify group for learning: the kernel queue is
@@ -1026,7 +1029,13 @@ impl FileLearner {
             Self {
                 state,
                 thread: None,
-                pending: Some((group, tx, covered, uncovered > 0, fionread_unit)),
+                pending: Some(PendingArming {
+                    group,
+                    tx,
+                    covered,
+                    initial_gap_owed: uncovered > 0,
+                    fionread_unit,
+                }),
             },
             rx,
         ))
@@ -1043,8 +1052,7 @@ impl FileLearner {
         if self.thread.is_some() {
             return Ok(());
         }
-        let Some((group, tx, covered, initial_gap_owed, fionread_unit)) = self.pending.take()
-        else {
+        let Some(arming) = self.pending.take() else {
             return Ok(());
         };
         let worker_state = Arc::clone(&self.state);
@@ -1053,12 +1061,12 @@ impl FileLearner {
             .name("p11scope-learn".to_string())
             .spawn(move || {
                 drain_loop(
-                    group,
-                    tx,
+                    arming.group,
+                    arming.tx,
                     worker_state,
-                    covered,
-                    initial_gap_owed,
-                    fionread_unit,
+                    arming.covered,
+                    arming.initial_gap_owed,
+                    arming.fionread_unit,
                 );
                 let _ = done_tx.send(());
             }) {
@@ -4834,7 +4842,12 @@ mod tests {
         );
         let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
         // Never begin the drain: this thread reads the group itself.
-        let (group, tx, _, _, fionread_unit) = learner.pending.take().expect("armed learner");
+        let super::PendingArming {
+            group,
+            tx,
+            fionread_unit,
+            ..
+        } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         // 26000 opens with nobody reading: past the default 16384-event
         // queue limit whether the kernel counts 24 or 32 bytes per event
@@ -4961,7 +4974,12 @@ mod tests {
         let (mut learner, rx) = super::FileLearner::start().expect("fanotify group (run as root)");
         // Never begin the drain: this thread queues the snapshot, then
         // decides exactly it through the stop-tail path.
-        let (group, tx, _, _, fionread_unit) = learner.pending.take().expect("armed learner");
+        let super::PendingArming {
+            group,
+            tx,
+            fionread_unit,
+            ..
+        } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         assert!(
             std::process::Command::new("sh")
@@ -5039,7 +5057,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let target = super::file_identity(&file).unwrap();
         let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
-        let (group, _tx, _, _, _) = learner.pending.take().expect("armed learner");
+        let super::PendingArming { group, .. } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         let open_by_child = || {
             assert!(
@@ -5089,7 +5107,7 @@ mod tests {
         let path = dir.path().join("negative.dat");
         std::fs::write(&path, b"not elf").unwrap();
         let (mut learner, _rx) = super::FileLearner::start().expect("fanotify group (run as root)");
-        let (group, tx, _, _, _) = learner.pending.take().expect("armed learner");
+        let super::PendingArming { group, tx, .. } = learner.pending.take().expect("armed learner");
         let raw = group.as_raw_fd();
         let state = std::sync::Arc::new(super::LearnShutdownState::default());
         let mut ctx = super::DrainCtx {

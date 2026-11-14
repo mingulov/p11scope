@@ -5156,21 +5156,15 @@ fn layer_totals_json(
 }
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
-    let forwarding = forwarding_module_ids(ev, reports);
-    // B2: capture and evidence come from the shared section builders
-    // (caller and 7.10b hoists included), so the tree and the streamer
-    // cannot drift. Bytes unchanged: the same map, serialized sorted.
-    serde_json::json!({
-        "schema": "p11scope/observed-profile/v3-metrics",
-        // Machine-readable lane discriminator (SYSPLAN residual F-12): the
-        // metrics lane embeds `Evidence` directly (the four profile-only
-        // fields are absent) with a selection-blind verdict.
-        "lane": "metrics",
-        "capture": capture_section_value(ev, capture, "metrics"),
-        "evidence": metrics_evidence_base_value(ev),
-        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
-        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
-    })
+    // B2: the tree is the production streamer materialized, so every unit
+    // and integration test exercises the production layout (key order,
+    // section builders). The seal sites stream the same struct without
+    // materializing. Machine-readable lane discriminator (SYSPLAN
+    // residual F-12): the metrics lane embeds `Evidence` directly (the
+    // four profile-only fields are absent) with a selection-blind verdict.
+    let envelope = evidence_envelope(metrics_evidence_base_value(ev), None, None);
+    let streamer = StreamedMetricsReport::new(reports, ev, &envelope, capture, None);
+    serde_json::to_value(&streamer).expect("the metrics streamer serializes to a value")
 }
 
 /// Only a protected accepted snapshot can supply this optional derived data.
@@ -5227,6 +5221,13 @@ impl<'a> VersionedEvidence<'a> {
 
     pub fn value(&self) -> &serde_json::Value {
         &self.value
+    }
+
+    /// Moves the versioned value out for the seal envelope, so the
+    /// envelope takes ownership instead of cloning. The borrowed
+    /// `Evidence` stays with the caller for its section builders.
+    pub fn into_value(self) -> serde_json::Value {
+        self.value
     }
 }
 
@@ -5851,30 +5852,15 @@ pub fn profile_json(
     state: &crate::semantics::State,
     capture: &CaptureMeta,
 ) -> serde_json::Value {
-    // B2: sections come from the shared builders so the tree and
-    // the streamer cannot drift. Bytes unchanged: the same map,
-    // serialized sorted.
+    // B2: the tree is the production streamer materialized, so every unit
+    // and integration test exercises the production layout. The seal sites
+    // stream the same struct without materializing. Machine-readable lane
+    // discriminator (SYSPLAN residual F-12): the profile lane carries the
+    // four versioned-only evidence fields with a selection-aware verdict.
     let ev = versioned.evidence();
-    let forwarding = forwarding_module_ids(ev, reports);
-    let mechanisms = profile_mechanisms_out(state, ev, capture.policy);
-    let sessions_out = profile_sessions_out(state);
-    let logins = profile_logins_out(state);
-    serde_json::json!({
-        "schema": "p11scope/observed-profile/v3",
-        // Machine-readable lane discriminator (SYSPLAN residual F-12): the
-        // profile lane carries the four versioned-only evidence fields with
-        // a selection-aware verdict.
-        "lane": "profile",
-        "capture": capture_section_value(ev, capture, "profile"),
-        "evidence": versioned.value().clone(),
-        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
-        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
-        "mechanisms": mechanisms,
-        "sessions": sessions_out,
-        "logins": logins,
-        "templates": profile_templates_value(state, capture.policy),
-        "cgroups": cgroups_out(state),
-    })
+    let envelope = evidence_envelope(versioned.into_value(), None, None);
+    let streamer = StreamedProfileReport::new(reports, ev, &envelope, state, capture, None);
+    serde_json::to_value(&streamer).expect("the profile streamer serializes to a value")
 }
 
 /// B2: the `capture` section as a standalone value, including the
@@ -5898,8 +5884,8 @@ fn capture_section_value(ev: &Evidence, capture: &CaptureMeta, mode: &str) -> se
 
 /// B2: the metrics-lane evidence base (direct `Evidence` plus the
 /// armed-only hoists), without snapshot or ledger transforms. Shared
-/// by the tree builder and the envelope builder.
-fn metrics_evidence_base_value(ev: &Evidence) -> serde_json::Value {
+/// by the seal sites and the envelope builder.
+pub(crate) fn metrics_evidence_base_value(ev: &Evidence) -> serde_json::Value {
     let mut evidence = serde_json::to_value(ev).expect("Evidence serializes");
     let object = evidence
         .as_object_mut()
@@ -6057,18 +6043,23 @@ fn profile_templates_value(
     serde_json::json!({"note": note, "operations": operations})
 }
 
-/// B2: the profile evidence envelope with this seal site's transforms
+/// B2: the sealed evidence envelope with this seal site's transforms
 /// applied in today's order (counter, legacy, then selected detail).
 /// The early site passes its snapshot option with no ledger; the main
-/// site passes its snapshot with its ledger option. Reuses the
+/// site passes its snapshot with its ledger option. One owner for both
+/// lanes: the caller moves its base value in (profile: the versioned
+/// value via `into_value`; metrics: `metrics_evidence_base_value`), so
+/// no clone and no `json!` re-serialization ever doubles it. Reuses the
 /// existing document transforms on a minimal document so the envelope
 /// can never drift from them.
-pub(crate) fn profile_evidence_envelope(
-    versioned: &VersionedEvidence,
+pub(crate) fn evidence_envelope(
+    base: serde_json::Value,
     snapshot_opt: Option<&crate::metrics::CaptureSnapshot>,
     ledger_opt: Option<&crate::metrics::selected_detail_driver::SelectionLedger>,
 ) -> serde_json::Value {
-    let mut document = serde_json::json!({"evidence": versioned.value().clone()});
+    let mut map = serde_json::Map::new();
+    map.insert("evidence".to_string(), base);
+    let mut document = serde_json::Value::Object(map);
     if let Some(snapshot) = snapshot_opt {
         document = with_counter_snapshot(document, snapshot);
         document = with_legacy_snapshot(document, snapshot);
@@ -6083,90 +6074,130 @@ pub(crate) fn profile_evidence_envelope(
         .expect("envelope builder emits an evidence object")
 }
 
-/// B2: the metrics evidence envelope, same transform order as the
-/// profile envelope over the metrics base.
-pub(crate) fn metrics_evidence_envelope(
-    ev: &Evidence,
-    snapshot_opt: Option<&crate::metrics::CaptureSnapshot>,
-    ledger_opt: Option<&crate::metrics::selected_detail_driver::SelectionLedger>,
-) -> serde_json::Value {
-    let mut document = serde_json::json!({"evidence": metrics_evidence_base_value(ev)});
-    if let Some(snapshot) = snapshot_opt {
-        document = with_counter_snapshot(document, snapshot);
-        document = with_legacy_snapshot(document, snapshot);
+/// Profile sections built on demand (everything except the evidence
+/// envelope, which the caller holds). An enum, not strings, so a typo
+/// in the order table is a compile error, never a seal-time panic (a
+/// panic skips the rescue, which only runs on `Err`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProfileSection {
+    Capture,
+    Cgroups,
+    Functions,
+    Lane,
+    LayerTotals,
+    Logins,
+    Mechanisms,
+    Schema,
+    Sessions,
+    Templates,
+}
+
+impl ProfileSection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Cgroups => "cgroups",
+            Self::Functions => "functions",
+            Self::Lane => "lane",
+            Self::LayerTotals => "layer_totals",
+            Self::Logins => "logins",
+            Self::Mechanisms => "mechanisms",
+            Self::Schema => "schema",
+            Self::Sessions => "sessions",
+            Self::Templates => "templates",
+        }
     }
-    if let Some(ledger) = ledger_opt {
-        document = crate::metrics::selected_detail_driver::with_selected_detail(document, ledger);
+}
+
+/// One profile top-level key: a built section or the held envelope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProfileKey {
+    Section(ProfileSection),
+    Evidence,
+}
+
+impl ProfileKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::Section(section) => section.as_str(),
+        }
     }
-    // Move (not clone) the envelope out so its peak never doubles it.
-    document
-        .get_mut("evidence")
-        .map(std::mem::take)
-        .expect("envelope builder emits an evidence object")
 }
 
 /// B2: top-level keys in sorted order for the profile lane. The
-/// streamer emits in this order; the tree serializes its map in the
-/// same order (no `preserve_order`), so bytes match. Evidence rides
-/// third of eleven, not last.
-const PROFILE_KEYS_SORTED: &[&str] = &[
-    "capture",
-    "cgroups",
-    "evidence",
-    "functions",
-    "lane",
-    "layer_totals",
-    "logins",
-    "mechanisms",
-    "schema",
-    "sessions",
-    "templates",
+/// streamer emits in this order; `to_value` collects into a sorted map
+/// (no `preserve_order`), so bytes match. Evidence rides third of
+/// eleven, not last.
+const PROFILE_KEYS_SORTED: &[ProfileKey] = &[
+    ProfileKey::Section(ProfileSection::Capture),
+    ProfileKey::Section(ProfileSection::Cgroups),
+    ProfileKey::Evidence,
+    ProfileKey::Section(ProfileSection::Functions),
+    ProfileKey::Section(ProfileSection::Lane),
+    ProfileKey::Section(ProfileSection::LayerTotals),
+    ProfileKey::Section(ProfileSection::Logins),
+    ProfileKey::Section(ProfileSection::Mechanisms),
+    ProfileKey::Section(ProfileSection::Schema),
+    ProfileKey::Section(ProfileSection::Sessions),
+    ProfileKey::Section(ProfileSection::Templates),
 ];
+
+/// Metrics sections built on demand, like the profile enum above.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MetricsSection {
+    Capture,
+    Functions,
+    Lane,
+    LayerTotals,
+    Schema,
+}
+
+impl MetricsSection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Functions => "functions",
+            Self::Lane => "lane",
+            Self::LayerTotals => "layer_totals",
+            Self::Schema => "schema",
+        }
+    }
+}
+
+/// One metrics top-level key: a built section or the held envelope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MetricsKey {
+    Section(MetricsSection),
+    Evidence,
+}
+
+impl MetricsKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::Section(section) => section.as_str(),
+        }
+    }
+}
 
 /// B2: top-level keys in sorted order for the metrics lane.
-const METRICS_KEYS_SORTED: &[&str] = &[
-    "capture",
-    "evidence",
-    "functions",
-    "lane",
-    "layer_totals",
-    "schema",
-];
-
-/// B2: profile keys plus the rescue `delivery` mark, sorted. Delivery
-/// sorts third, between `cgroups` and `evidence`.
-const PROFILE_KEYS_SORTED_WITH_DELIVERY: &[&str] = &[
-    "capture",
-    "cgroups",
-    "delivery",
-    "evidence",
-    "functions",
-    "lane",
-    "layer_totals",
-    "logins",
-    "mechanisms",
-    "schema",
-    "sessions",
-    "templates",
-];
-
-/// B2: metrics keys plus `delivery`, sorted. Delivery sorts second.
-const METRICS_KEYS_SORTED_WITH_DELIVERY: &[&str] = &[
-    "capture",
-    "delivery",
-    "evidence",
-    "functions",
-    "lane",
-    "layer_totals",
-    "schema",
+const METRICS_KEYS_SORTED: &[MetricsKey] = &[
+    MetricsKey::Section(MetricsSection::Capture),
+    MetricsKey::Evidence,
+    MetricsKey::Section(MetricsSection::Functions),
+    MetricsKey::Section(MetricsSection::Lane),
+    MetricsKey::Section(MetricsSection::LayerTotals),
+    MetricsKey::Section(MetricsSection::Schema),
 ];
 
 /// B2: one profile section's value, built on demand. The caller holds
 /// the evidence envelope and passes it separately; this builds every
-/// other top-level key. Shared by the healthy streamer, the rescue
-/// wrapper, and the R5 peak estimator so the three can never drift.
+/// other top-level key. Shared by the streamer (healthy and rescue —
+/// one struct with an optional delivery mark) so the two can never
+/// drift. Exhaustive over the section enum: no unknown key can panic.
 fn profile_section_value(
-    key: &str,
+    key: ProfileSection,
     reports: &[crate::metrics::SlotReport],
     ev: &Evidence,
     state: &crate::semantics::State,
@@ -6174,101 +6205,78 @@ fn profile_section_value(
     forwarding: &std::collections::BTreeSet<ModuleId>,
 ) -> serde_json::Value {
     match key {
-        "capture" => capture_section_value(ev, capture, "profile"),
-        "cgroups" => serde_json::to_value(cgroups_out(state)).expect("cgroups serialize"),
-        "functions" => {
+        ProfileSection::Capture => capture_section_value(ev, capture, "profile"),
+        ProfileSection::Cgroups => {
+            serde_json::to_value(cgroups_out(state)).expect("cgroups serialize")
+        }
+        ProfileSection::Functions => {
             serde_json::to_value(functions_out(reports, &ev.discovery.modules, forwarding))
                 .expect("functions serialize")
         }
-        "lane" => serde_json::Value::String("profile".to_string()),
-        "layer_totals" => layer_totals_json(reports, forwarding, &ev.discovery.modules),
-        "logins" => serde_json::to_value(profile_logins_out(state)).expect("logins serialize"),
-        "mechanisms" => serde_json::to_value(profile_mechanisms_out(state, ev, capture.policy))
-            .expect("mechanisms serialize"),
-        "schema" => serde_json::Value::String("p11scope/observed-profile/v3".to_string()),
-        "sessions" => {
+        ProfileSection::Lane => serde_json::Value::String("profile".to_string()),
+        ProfileSection::LayerTotals => {
+            layer_totals_json(reports, forwarding, &ev.discovery.modules)
+        }
+        ProfileSection::Logins => {
+            serde_json::to_value(profile_logins_out(state)).expect("logins serialize")
+        }
+        ProfileSection::Mechanisms => {
+            serde_json::to_value(profile_mechanisms_out(state, ev, capture.policy))
+                .expect("mechanisms serialize")
+        }
+        ProfileSection::Schema => {
+            serde_json::Value::String("p11scope/observed-profile/v3".to_string())
+        }
+        ProfileSection::Sessions => {
             serde_json::to_value(profile_sessions_out(state)).expect("sessions serialize")
         }
-        "templates" => profile_templates_value(state, capture.policy),
-        _ => unreachable!("profile section keys are closed"),
+        ProfileSection::Templates => profile_templates_value(state, capture.policy),
     }
 }
 
 /// B2: one metrics section's value, like the profile helper above.
 fn metrics_section_value(
-    key: &str,
+    key: MetricsSection,
     reports: &[crate::metrics::SlotReport],
     ev: &Evidence,
     capture: &CaptureMeta,
     forwarding: &std::collections::BTreeSet<ModuleId>,
 ) -> serde_json::Value {
     match key {
-        "capture" => capture_section_value(ev, capture, "metrics"),
-        "functions" => {
+        MetricsSection::Capture => capture_section_value(ev, capture, "metrics"),
+        MetricsSection::Functions => {
             serde_json::to_value(functions_out(reports, &ev.discovery.modules, forwarding))
                 .expect("functions serialize")
         }
-        "lane" => serde_json::Value::String("metrics".to_string()),
-        "layer_totals" => layer_totals_json(reports, forwarding, &ev.discovery.modules),
-        "schema" => serde_json::Value::String("p11scope/observed-profile/v3-metrics".to_string()),
-        _ => unreachable!("metrics section keys are closed"),
-    }
-}
-
-/// B2: the streamed profile peak estimate for R5 — the evidence
-/// envelope plus the largest other section, each measured via
-/// `json_value_bytes`. Builds one section at a time, so the
-/// measurement itself never materializes the tree.
-pub(crate) fn profile_streamed_peak_bytes(
-    reports: &[crate::metrics::SlotReport],
-    ev: &Evidence,
-    evidence: &serde_json::Value,
-    state: &crate::semantics::State,
-    capture: &CaptureMeta,
-) -> u64 {
-    let envelope = crate::memory_counters::json_value_bytes(evidence);
-    let forwarding = forwarding_module_ids(ev, reports);
-    let mut max_section = 0u64;
-    for key in PROFILE_KEYS_SORTED {
-        if *key == "evidence" {
-            continue;
+        MetricsSection::Lane => serde_json::Value::String("metrics".to_string()),
+        MetricsSection::LayerTotals => {
+            layer_totals_json(reports, forwarding, &ev.discovery.modules)
         }
-        let value = profile_section_value(key, reports, ev, state, capture, &forwarding);
-        max_section = max_section.max(crate::memory_counters::json_value_bytes(&value));
-    }
-    envelope.saturating_add(max_section)
-}
-
-/// B2: the streamed metrics peak estimate for R5, like above.
-pub(crate) fn metrics_streamed_peak_bytes(
-    reports: &[crate::metrics::SlotReport],
-    ev: &Evidence,
-    evidence: &serde_json::Value,
-    capture: &CaptureMeta,
-) -> u64 {
-    let envelope = crate::memory_counters::json_value_bytes(evidence);
-    let forwarding = forwarding_module_ids(ev, reports);
-    let mut max_section = 0u64;
-    for key in METRICS_KEYS_SORTED {
-        if *key == "evidence" {
-            continue;
+        MetricsSection::Schema => {
+            serde_json::Value::String("p11scope/observed-profile/v3-metrics".to_string())
         }
-        let value = metrics_section_value(key, reports, ev, capture, &forwarding);
-        max_section = max_section.max(crate::memory_counters::json_value_bytes(&value));
     }
-    envelope.saturating_add(max_section)
 }
 
 /// B2: a profile report that serializes section by section, building
 /// one section's value at a time. Only the evidence envelope is
 /// materialized up front; every other section builds on demand inside
-/// `Serialize`, so the peak is one large section plus the envelope.
+/// `Serialize`, so the peak is one large section plus the envelope. One
+/// struct for both sinks: the healthy file pass leaves `delivery` as
+/// `None`, while the stdout rescue carries `Some` mark, emitted in its
+/// sorted position (third, between `cgroups` and `evidence`). R5 is
+/// measured here, not rebuilt: each built section updates
+/// `largest_section` via `json_value_bytes` as it serializes (a
+/// `Cell`, not a lock; the seal is single-threaded), so diagnostics
+/// never pay a second section build or a second cgroup walk.
 pub(crate) struct StreamedProfileReport<'a> {
     reports: &'a [crate::metrics::SlotReport],
     ev: &'a Evidence,
     evidence: &'a serde_json::Value,
     state: &'a crate::semantics::State,
     capture: &'a CaptureMeta<'a>,
+    delivery: Option<serde_json::Value>,
+    largest_section: std::cell::Cell<u64>,
 }
 
 impl<'a> StreamedProfileReport<'a> {
@@ -6278,6 +6286,7 @@ impl<'a> StreamedProfileReport<'a> {
         evidence: &'a serde_json::Value,
         state: &'a crate::semantics::State,
         capture: &'a CaptureMeta<'a>,
+        delivery: Option<serde_json::Value>,
     ) -> Self {
         Self {
             reports,
@@ -6285,7 +6294,15 @@ impl<'a> StreamedProfileReport<'a> {
             evidence,
             state,
             capture,
+            delivery,
+            largest_section: std::cell::Cell::new(0),
         }
+    }
+
+    /// The largest non-evidence section seen while serializing, in
+    /// `json_value_bytes` units for R5. Zero until serialized.
+    pub(crate) fn largest_section_bytes(&self) -> u64 {
+        self.largest_section.get()
     }
 }
 
@@ -6293,33 +6310,54 @@ impl serde::Serialize for StreamedProfileReport<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let forwarding = forwarding_module_ids(self.ev, self.reports);
-        let mut map = serializer.serialize_map(Some(PROFILE_KEYS_SORTED.len()))?;
+        let len = PROFILE_KEYS_SORTED.len() + usize::from(self.delivery.is_some());
+        let mut map = serializer.serialize_map(Some(len))?;
+        let mut delivery_emitted = false;
         for key in PROFILE_KEYS_SORTED {
-            if *key == "evidence" {
-                map.serialize_entry(key, self.evidence)?;
-            } else {
-                let value = profile_section_value(
-                    key,
-                    self.reports,
-                    self.ev,
-                    self.state,
-                    self.capture,
-                    &forwarding,
-                );
-                map.serialize_entry(key, &value)?;
+            if !delivery_emitted
+                && let Some(delivery) = self.delivery.as_ref()
+                && key.as_str() > "delivery"
+            {
+                map.serialize_entry("delivery", delivery)?;
+                delivery_emitted = true;
             }
+            match key {
+                ProfileKey::Evidence => {
+                    map.serialize_entry("evidence", self.evidence)?;
+                }
+                ProfileKey::Section(section) => {
+                    let value = profile_section_value(
+                        *section,
+                        self.reports,
+                        self.ev,
+                        self.state,
+                        self.capture,
+                        &forwarding,
+                    );
+                    let bytes = crate::memory_counters::json_value_bytes(&value);
+                    self.largest_section
+                        .set(self.largest_section.get().max(bytes));
+                    map.serialize_entry(section.as_str(), &value)?;
+                }
+            }
+        }
+        if !delivery_emitted && let Some(delivery) = self.delivery.as_ref() {
+            map.serialize_entry("delivery", delivery)?;
         }
         map.end()
     }
 }
 
 /// B2: a metrics report that serializes section by section, like the
-/// profile streamer above.
+/// profile streamer above. `delivery` sorts second here, between
+/// `capture` and `evidence`.
 pub(crate) struct StreamedMetricsReport<'a> {
     reports: &'a [crate::metrics::SlotReport],
     ev: &'a Evidence,
     evidence: &'a serde_json::Value,
     capture: &'a CaptureMeta<'a>,
+    delivery: Option<serde_json::Value>,
+    largest_section: std::cell::Cell<u64>,
 }
 
 impl<'a> StreamedMetricsReport<'a> {
@@ -6328,13 +6366,22 @@ impl<'a> StreamedMetricsReport<'a> {
         ev: &'a Evidence,
         evidence: &'a serde_json::Value,
         capture: &'a CaptureMeta<'a>,
+        delivery: Option<serde_json::Value>,
     ) -> Self {
         Self {
             reports,
             ev,
             evidence,
             capture,
+            delivery,
+            largest_section: std::cell::Cell::new(0),
         }
+    }
+
+    /// The largest non-evidence section seen while serializing, like the
+    /// profile getter above.
+    pub(crate) fn largest_section_bytes(&self) -> u64 {
+        self.largest_section.get()
     }
 }
 
@@ -6342,90 +6389,38 @@ impl serde::Serialize for StreamedMetricsReport<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let forwarding = forwarding_module_ids(self.ev, self.reports);
-        let mut map = serializer.serialize_map(Some(METRICS_KEYS_SORTED.len()))?;
+        let len = METRICS_KEYS_SORTED.len() + usize::from(self.delivery.is_some());
+        let mut map = serializer.serialize_map(Some(len))?;
+        let mut delivery_emitted = false;
         for key in METRICS_KEYS_SORTED {
-            if *key == "evidence" {
-                map.serialize_entry(key, self.evidence)?;
-            } else {
-                let value =
-                    metrics_section_value(key, self.reports, self.ev, self.capture, &forwarding);
-                map.serialize_entry(key, &value)?;
+            if !delivery_emitted
+                && let Some(delivery) = self.delivery.as_ref()
+                && key.as_str() > "delivery"
+            {
+                map.serialize_entry("delivery", delivery)?;
+                delivery_emitted = true;
+            }
+            match key {
+                MetricsKey::Evidence => {
+                    map.serialize_entry("evidence", self.evidence)?;
+                }
+                MetricsKey::Section(section) => {
+                    let value = metrics_section_value(
+                        *section,
+                        self.reports,
+                        self.ev,
+                        self.capture,
+                        &forwarding,
+                    );
+                    let bytes = crate::memory_counters::json_value_bytes(&value);
+                    self.largest_section
+                        .set(self.largest_section.get().max(bytes));
+                    map.serialize_entry(section.as_str(), &value)?;
+                }
             }
         }
-        map.end()
-    }
-}
-
-/// B2: a profile report plus the rescue `delivery` mark, for the
-/// stdout fallback when the `-o` write fails. Streams sections like
-/// the healthy report, with delivery in its sorted position. The
-/// fallback serializes compact; the file path never uses this.
-pub(crate) struct StreamedProfileReportWithDelivery<'a> {
-    inner: StreamedProfileReport<'a>,
-    delivery: serde_json::Value,
-}
-
-impl<'a> StreamedProfileReportWithDelivery<'a> {
-    pub(crate) fn new(inner: StreamedProfileReport<'a>, delivery: serde_json::Value) -> Self {
-        Self { inner, delivery }
-    }
-}
-
-impl serde::Serialize for StreamedProfileReportWithDelivery<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let inner = &self.inner;
-        let forwarding = forwarding_module_ids(inner.ev, inner.reports);
-        let mut map = serializer.serialize_map(Some(PROFILE_KEYS_SORTED_WITH_DELIVERY.len()))?;
-        for key in PROFILE_KEYS_SORTED_WITH_DELIVERY {
-            if *key == "delivery" {
-                map.serialize_entry(key, &self.delivery)?;
-            } else if *key == "evidence" {
-                map.serialize_entry(key, inner.evidence)?;
-            } else {
-                let value = profile_section_value(
-                    key,
-                    inner.reports,
-                    inner.ev,
-                    inner.state,
-                    inner.capture,
-                    &forwarding,
-                );
-                map.serialize_entry(key, &value)?;
-            }
-        }
-        map.end()
-    }
-}
-
-/// B2: a metrics report plus `delivery`, like the profile wrapper.
-pub(crate) struct StreamedMetricsReportWithDelivery<'a> {
-    inner: StreamedMetricsReport<'a>,
-    delivery: serde_json::Value,
-}
-
-impl<'a> StreamedMetricsReportWithDelivery<'a> {
-    pub(crate) fn new(inner: StreamedMetricsReport<'a>, delivery: serde_json::Value) -> Self {
-        Self { inner, delivery }
-    }
-}
-
-impl serde::Serialize for StreamedMetricsReportWithDelivery<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let inner = &self.inner;
-        let forwarding = forwarding_module_ids(inner.ev, inner.reports);
-        let mut map = serializer.serialize_map(Some(METRICS_KEYS_SORTED_WITH_DELIVERY.len()))?;
-        for key in METRICS_KEYS_SORTED_WITH_DELIVERY {
-            if *key == "delivery" {
-                map.serialize_entry(key, &self.delivery)?;
-            } else if *key == "evidence" {
-                map.serialize_entry(key, inner.evidence)?;
-            } else {
-                let value =
-                    metrics_section_value(key, inner.reports, inner.ev, inner.capture, &forwarding);
-                map.serialize_entry(key, &value)?;
-            }
+        if !delivery_emitted && let Some(delivery) = self.delivery.as_ref() {
+            map.serialize_entry("delivery", delivery)?;
         }
         map.end()
     }
@@ -19621,9 +19616,12 @@ pub(crate) mod tests {
         ev
     }
 
-    /// B2 step 1: streamed bytes must equal tree-built bytes at both
-    /// seal sites, both snapshot arms at the early site, on small and
-    /// large fixtures. RED before the streaming writer exists.
+    /// B2 step 1: the production streamer serializes the same bytes its
+    /// materialized value does, at both seal sites, both snapshot arms at
+    /// the early site, on small and large fixtures, healthy and rescue.
+    /// `to_value` collects through a sorted map, so a key-order or
+    /// delivery-position bug in `Serialize` shows as a byte mismatch.
+    /// RED before the streaming writer exists.
     #[test]
     fn streamed_report_is_byte_identical() {
         use crate::metrics::ConsumerFixture;
@@ -19635,6 +19633,21 @@ pub(crate) mod tests {
         assert!(
             snapshot_with_collection.counter_collection().is_some(),
             "the Some arm must actually run the counter transform"
+        );
+        assert!(
+            snapshot_with_collection.legacy_collection().is_none(),
+            "counter snapshots carry no legacy gaps; the legacy arm below covers that transform"
+        );
+        // A legacy snapshot with non-clean gaps, so `with_legacy_snapshot`
+        // is not a no-op in every arm (counter snapshots never carry
+        // legacy gaps, including the BankGaps fault).
+        let legacy_snapshot = crate::metrics::CaptureSnapshot::degraded_legacy(
+            "legacy_slots",
+            "twin legacy gaps".to_string(),
+        );
+        assert!(
+            legacy_snapshot.legacy_collection().is_some(),
+            "the legacy arm must actually run the legacy transform"
         );
         let ledger = SelectionLedger::new();
         let small_reports = reports_fixture();
@@ -19660,40 +19673,44 @@ pub(crate) mod tests {
                     Some(&snapshot_with_collection),
                     Some(&ledger),
                 ),
+                ("legacy-gaps", Some(&legacy_snapshot), None),
             ] {
-                let versioned = VersionedEvidence::wrap(ev);
-                let mut tree = profile_json(reports, VersionedEvidence::wrap(ev), state, &capture);
-                if let Some(snapshot) = snapshot_opt {
-                    tree = with_counter_snapshot(tree, snapshot);
-                    tree = with_legacy_snapshot(tree, snapshot);
-                }
-                if let Some(ledger) = ledger_opt {
-                    tree =
-                        crate::metrics::selected_detail_driver::with_selected_detail(tree, ledger);
-                }
-                if snapshot_opt.is_some() {
+                let base = VersionedEvidence::wrap(ev).into_value();
+                let envelope = super::evidence_envelope(base, snapshot_opt, ledger_opt);
+                let streamed = super::StreamedProfileReport::new(
+                    reports, ev, &envelope, state, &capture, None,
+                );
+                let materialized =
+                    serde_json::to_value(&streamed).expect("the profile streamer materializes");
+                if arm == "legacy-gaps" {
                     assert!(
-                        tree["evidence"].get("counter_collection").is_some(),
+                        materialized["evidence"].get("legacy_collection").is_some(),
+                        "{label}/{arm}: the legacy transform must run"
+                    );
+                    assert!(
+                        materialized["evidence"].get("counter_collection").is_none(),
+                        "{label}/{arm}: a legacy snapshot carries no counter collection"
+                    );
+                }
+                if snapshot_opt.is_some_and(|snapshot| snapshot.counter_collection().is_some()) {
+                    assert!(
+                        materialized["evidence"].get("counter_collection").is_some(),
                         "{label}/{arm}: the counter transform must run"
                     );
                 }
                 if ledger_opt.is_some() {
                     assert!(
-                        tree["evidence"].get("selected_detail").is_some(),
+                        materialized["evidence"].get("selected_detail").is_some(),
                         "{label}/{arm}: the ledger transform must run"
                     );
                 }
-                let envelope =
-                    super::profile_evidence_envelope(&versioned, snapshot_opt, ledger_opt);
-                let streamed =
-                    super::StreamedProfileReport::new(reports, ev, &envelope, state, &capture);
-                let mut tree_bytes = Vec::new();
-                serde_json::to_writer_pretty(&mut tree_bytes, &tree).unwrap();
+                let mut materialized_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut materialized_bytes, &materialized).unwrap();
                 let mut streamed_bytes = Vec::new();
                 serde_json::to_writer_pretty(&mut streamed_bytes, &streamed).unwrap();
                 assert_eq!(
-                    streamed_bytes, tree_bytes,
-                    "{label}/{arm}: streamed bytes must equal tree bytes"
+                    streamed_bytes, materialized_bytes,
+                    "{label}/{arm}: streamed bytes must equal materialized bytes"
                 );
             }
         }
@@ -19709,179 +19726,186 @@ pub(crate) mod tests {
                     Some(&snapshot_with_collection),
                     Some(&ledger),
                 ),
+                ("legacy-gaps", Some(&legacy_snapshot), None),
             ] {
-                let mut tree = json(reports, ev, &capture);
-                if let Some(snapshot) = snapshot_opt {
-                    tree = with_counter_snapshot(tree, snapshot);
-                    tree = with_legacy_snapshot(tree, snapshot);
+                let envelope = super::evidence_envelope(
+                    super::metrics_evidence_base_value(ev),
+                    snapshot_opt,
+                    ledger_opt,
+                );
+                let streamed =
+                    super::StreamedMetricsReport::new(reports, ev, &envelope, &capture, None);
+                let materialized =
+                    serde_json::to_value(&streamed).expect("the metrics streamer materializes");
+                if arm == "legacy-gaps" {
+                    assert!(
+                        materialized["evidence"].get("legacy_collection").is_some(),
+                        "{label}/{arm}: the legacy transform must run"
+                    );
                 }
-                if let Some(ledger) = ledger_opt {
-                    tree =
-                        crate::metrics::selected_detail_driver::with_selected_detail(tree, ledger);
-                }
-                let envelope = super::metrics_evidence_envelope(ev, snapshot_opt, ledger_opt);
-                let streamed = super::StreamedMetricsReport::new(reports, ev, &envelope, &capture);
-                let mut tree_bytes = Vec::new();
-                serde_json::to_writer_pretty(&mut tree_bytes, &tree).unwrap();
+                let mut materialized_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut materialized_bytes, &materialized).unwrap();
                 let mut streamed_bytes = Vec::new();
                 serde_json::to_writer_pretty(&mut streamed_bytes, &streamed).unwrap();
                 assert_eq!(
-                    streamed_bytes, tree_bytes,
-                    "{label}/{arm}: streamed bytes must equal tree bytes"
+                    streamed_bytes, materialized_bytes,
+                    "{label}/{arm}: streamed bytes must equal materialized bytes"
                 );
             }
         }
-        // Rescue (compact + delivery): the fallback path streams the same
-        // bytes the tree rescue writes. One large case per lane.
+        // Rescue (compact + delivery): the fallback streamer carries the
+        // mark in sorted position. One large case per lane, with and
+        // without the ledger (the main seal without `--select-endpoint`
+        // passes `None` there).
         let delivery = serde_json::json!({
             "rescued_after_output_failure": "/tmp/observed.json",
             "output_error": "simulated disk-full on -o write",
         });
-        {
-            let versioned = VersionedEvidence::wrap(&large_ev);
-            let mut tree = profile_json(
-                &large_reports,
-                VersionedEvidence::wrap(&large_ev),
-                &large_state,
-                &capture,
-            );
-            tree = with_counter_snapshot(tree, &snapshot_with_collection);
-            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
-            tree = crate::metrics::selected_detail_driver::with_selected_detail(tree, &ledger);
-            tree.as_object_mut()
-                .expect("profile tree has an object")
-                .insert("delivery".into(), delivery.clone());
-            assert!(
-                tree.get("delivery").is_some(),
-                "profile rescue must carry delivery"
-            );
-            let envelope = super::profile_evidence_envelope(
-                &versioned,
-                Some(&snapshot_with_collection),
-                Some(&ledger),
-            );
-            let inner = super::StreamedProfileReport::new(
+        for (label, ledger_opt) in [
+            ("profile-large rescue", Some(&ledger)),
+            ("profile-large rescue without ledger", None),
+        ] {
+            let base = VersionedEvidence::wrap(&large_ev).into_value();
+            let envelope =
+                super::evidence_envelope(base, Some(&snapshot_with_collection), ledger_opt);
+            let streamed = super::StreamedProfileReport::new(
                 &large_reports,
                 &large_ev,
                 &envelope,
                 &large_state,
                 &capture,
+                Some(delivery.clone()),
             );
-            let streamed = super::StreamedProfileReportWithDelivery::new(inner, delivery.clone());
-            let mut tree_bytes = Vec::new();
-            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
+            let materialized =
+                serde_json::to_value(&streamed).expect("the profile rescue materializes");
+            assert!(
+                materialized.get("delivery").is_some(),
+                "{label}: the rescue must carry delivery"
+            );
+            assert!(
+                materialized["evidence"].get("counter_collection").is_some(),
+                "{label}: the rescue must run the counter transform"
+            );
+            assert_eq!(
+                materialized["evidence"].get("selected_detail").is_some(),
+                ledger_opt.is_some(),
+                "{label}: selected_detail follows the ledger option"
+            );
+            let mut materialized_bytes = Vec::new();
+            serde_json::to_writer(&mut materialized_bytes, &materialized).unwrap();
             let mut streamed_bytes = Vec::new();
             serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
             assert_eq!(
-                streamed_bytes, tree_bytes,
-                "profile-large rescue: streamed bytes must equal tree bytes"
+                streamed_bytes, materialized_bytes,
+                "{label}: streamed bytes must equal materialized bytes"
+            );
+            // Delivery sorts third, between `cgroups` and `evidence`.
+            let text = String::from_utf8(streamed_bytes).expect("rescue bytes are UTF-8");
+            let cgroups = text.find("\"cgroups\"").expect("rescue carries cgroups");
+            let marked = text.find("\"delivery\"").expect("rescue carries delivery");
+            let evidence = text.find("\"evidence\"").expect("rescue carries evidence");
+            assert!(
+                cgroups < marked && marked < evidence,
+                "{label}: delivery must sort between cgroups and evidence"
             );
         }
-        {
-            let mut tree = json(&large_reports, &large_ev, &capture);
-            tree = with_counter_snapshot(tree, &snapshot_with_collection);
-            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
-            tree = crate::metrics::selected_detail_driver::with_selected_detail(tree, &ledger);
-            tree.as_object_mut()
-                .expect("metrics tree has an object")
-                .insert("delivery".into(), delivery.clone());
-            let envelope = super::metrics_evidence_envelope(
-                &large_ev,
+        for (label, ledger_opt) in [
+            ("metrics-large rescue", Some(&ledger)),
+            ("metrics-large rescue without ledger", None),
+        ] {
+            let envelope = super::evidence_envelope(
+                super::metrics_evidence_base_value(&large_ev),
                 Some(&snapshot_with_collection),
-                Some(&ledger),
+                ledger_opt,
             );
-            let inner =
-                super::StreamedMetricsReport::new(&large_reports, &large_ev, &envelope, &capture);
-            let streamed = super::StreamedMetricsReportWithDelivery::new(inner, delivery.clone());
-            let mut tree_bytes = Vec::new();
-            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
-            let mut streamed_bytes = Vec::new();
-            serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
-            assert_eq!(
-                streamed_bytes, tree_bytes,
-                "metrics-large rescue: streamed bytes must equal tree bytes"
-            );
-        }
-        // Rescue without the ledger (main seal without
-        // `--select-endpoint`, `-o` write failed): the same comparison
-        // with `None` on both sides, one large case per lane.
-        {
-            let versioned = VersionedEvidence::wrap(&large_ev);
-            let mut tree = profile_json(
-                &large_reports,
-                VersionedEvidence::wrap(&large_ev),
-                &large_state,
-                &capture,
-            );
-            tree = with_counter_snapshot(tree, &snapshot_with_collection);
-            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
-            // No ledger transform: the `None` arm must not carry
-            // `selected_detail`.
-            tree.as_object_mut()
-                .expect("profile tree has an object")
-                .insert("delivery".into(), delivery.clone());
-            assert!(
-                tree["evidence"].get("counter_collection").is_some(),
-                "profile rescue without ledger must run the counter transform"
-            );
-            assert!(
-                tree["evidence"].get("selected_detail").is_none(),
-                "profile rescue without ledger must not carry selected_detail"
-            );
-            assert!(
-                tree.get("delivery").is_some(),
-                "profile rescue without ledger must carry delivery"
-            );
-            let envelope =
-                super::profile_evidence_envelope(&versioned, Some(&snapshot_with_collection), None);
-            let inner = super::StreamedProfileReport::new(
+            let streamed = super::StreamedMetricsReport::new(
                 &large_reports,
                 &large_ev,
                 &envelope,
-                &large_state,
                 &capture,
+                Some(delivery.clone()),
             );
-            let streamed = super::StreamedProfileReportWithDelivery::new(inner, delivery.clone());
-            let mut tree_bytes = Vec::new();
-            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
+            let materialized =
+                serde_json::to_value(&streamed).expect("the metrics rescue materializes");
+            assert!(
+                materialized.get("delivery").is_some(),
+                "{label}: the rescue must carry delivery"
+            );
+            assert!(
+                materialized["evidence"].get("counter_collection").is_some(),
+                "{label}: the rescue must run the counter transform"
+            );
+            assert_eq!(
+                materialized["evidence"].get("selected_detail").is_some(),
+                ledger_opt.is_some(),
+                "{label}: selected_detail follows the ledger option"
+            );
+            let mut materialized_bytes = Vec::new();
+            serde_json::to_writer(&mut materialized_bytes, &materialized).unwrap();
             let mut streamed_bytes = Vec::new();
             serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
             assert_eq!(
-                streamed_bytes, tree_bytes,
-                "profile-large rescue without ledger: streamed bytes must equal tree bytes"
+                streamed_bytes, materialized_bytes,
+                "{label}: streamed bytes must equal materialized bytes"
+            );
+            // Delivery sorts second, between `capture` and `evidence`.
+            let text = String::from_utf8(streamed_bytes).expect("rescue bytes are UTF-8");
+            let capture_pos = text.find("\"capture\"").expect("rescue carries capture");
+            let marked = text.find("\"delivery\"").expect("rescue carries delivery");
+            let evidence = text.find("\"evidence\"").expect("rescue carries evidence");
+            assert!(
+                capture_pos < marked && marked < evidence,
+                "{label}: delivery must sort between capture and evidence"
             );
         }
-        {
-            let mut tree = json(&large_reports, &large_ev, &capture);
-            tree = with_counter_snapshot(tree, &snapshot_with_collection);
-            tree = with_legacy_snapshot(tree, &snapshot_with_collection);
-            // No ledger transform: the `None` arm must not carry
-            // `selected_detail`.
-            tree.as_object_mut()
-                .expect("metrics tree has an object")
-                .insert("delivery".into(), delivery.clone());
-            assert!(
-                tree["evidence"].get("counter_collection").is_some(),
-                "metrics rescue without ledger must run the counter transform"
-            );
-            assert!(
-                tree["evidence"].get("selected_detail").is_none(),
-                "metrics rescue without ledger must not carry selected_detail"
-            );
-            let envelope =
-                super::metrics_evidence_envelope(&large_ev, Some(&snapshot_with_collection), None);
-            let inner =
-                super::StreamedMetricsReport::new(&large_reports, &large_ev, &envelope, &capture);
-            let streamed = super::StreamedMetricsReportWithDelivery::new(inner, delivery.clone());
-            let mut tree_bytes = Vec::new();
-            serde_json::to_writer(&mut tree_bytes, &tree).unwrap();
-            let mut streamed_bytes = Vec::new();
-            serde_json::to_writer(&mut streamed_bytes, &streamed).unwrap();
-            assert_eq!(
-                streamed_bytes, tree_bytes,
-                "metrics-large rescue without ledger: streamed bytes must equal tree bytes"
-            );
-        }
+    }
+
+    /// The section key tables are byte-sorted and match the report key
+    /// sets exactly (11 profile, 6 metrics). The twin above would catch a
+    /// misorder as a byte mismatch; this names the table directly.
+    #[test]
+    fn section_key_tables_are_sorted() {
+        let profile: Vec<&str> = super::PROFILE_KEYS_SORTED
+            .iter()
+            .map(|key| key.as_str())
+            .collect();
+        assert_eq!(
+            profile,
+            [
+                "capture",
+                "cgroups",
+                "evidence",
+                "functions",
+                "lane",
+                "layer_totals",
+                "logins",
+                "mechanisms",
+                "schema",
+                "sessions",
+                "templates",
+            ]
+        );
+        let mut sorted = profile.clone();
+        sorted.sort_unstable();
+        assert_eq!(profile, sorted, "the profile key table must be sorted");
+        let metrics: Vec<&str> = super::METRICS_KEYS_SORTED
+            .iter()
+            .map(|key| key.as_str())
+            .collect();
+        assert_eq!(
+            metrics,
+            [
+                "capture",
+                "evidence",
+                "functions",
+                "lane",
+                "layer_totals",
+                "schema",
+            ]
+        );
+        let mut sorted = metrics.clone();
+        sorted.sort_unstable();
+        assert_eq!(metrics, sorted, "the metrics key table must be sorted");
     }
 
     /// B2 step 3: render adds at most one large section plus the evidence
@@ -19891,10 +19915,11 @@ pub(crate) mod tests {
     /// lanes (the envelope build peaks at its live bytes plus a small
     /// constant, so no hidden copy; the streamed peak is envelope live
     /// plus the largest section peak plus a small constant; the tree peak
-    /// must violate that bound for non-vacuity), and R5-estimate wins on
-    /// the large fixture for both lanes (no peak tracker there, so no
-    /// block limit; both use the same `json_value_bytes` estimator R5
-    /// publishes).
+    /// must violate that bound for non-vacuity), and an R5 definition pin
+    /// on the large fixture for both lanes (the recorded envelope plus
+    /// largest section wins over the tree by a pinned margin; not an
+    /// allocator peak — the large shape exceeds the tracker's block
+    /// limit, and its live spike is measured in B4).
     #[test]
     fn report_render_peak_stays_section_bounded() {
         use crate::metrics::ConsumerFixture;
@@ -19939,8 +19964,11 @@ pub(crate) mod tests {
             // Envelope build: the versioned value is built inside the
             // probe, so a hidden clone shows as peak far above live.
             let (envelope, envelope_peak) = crate::test_alloc::requested_peak_during(|| {
-                let versioned = VersionedEvidence::wrap(&ev);
-                super::profile_evidence_envelope(&versioned, Some(&snapshot), Some(&ledger))
+                super::evidence_envelope(
+                    VersionedEvidence::wrap(&ev).into_value(),
+                    Some(&snapshot),
+                    Some(&ledger),
+                )
             });
             assert!(
                 !envelope_peak.incomplete,
@@ -19964,12 +19992,12 @@ pub(crate) mod tests {
             let forwarding = super::forwarding_module_ids(&ev, &reports);
             let mut largest_section_peak = 0u64;
             for key in super::PROFILE_KEYS_SORTED {
-                if *key == "evidence" {
+                let super::ProfileKey::Section(section) = key else {
                     continue;
-                }
+                };
                 let (_, section_peak) = crate::test_alloc::requested_peak_during(|| {
                     let value = super::profile_section_value(
-                        key,
+                        *section,
                         &reports,
                         &ev,
                         &state,
@@ -19982,12 +20010,14 @@ pub(crate) mod tests {
                 });
                 assert!(
                     !section_peak.incomplete,
-                    "profile section {key} peak report must be complete"
+                    "profile section {} peak report must be complete",
+                    section.as_str(),
                 );
                 assert_eq!(
                     (section_peak.live_bytes, section_peak.live_blocks),
                     (0, 0),
-                    "profile section {key} probe must not leak"
+                    "profile section {} probe must not leak",
+                    section.as_str(),
                 );
                 largest_section_peak = largest_section_peak.max(section_peak.peak_bytes as u64);
             }
@@ -20028,11 +20058,14 @@ pub(crate) mod tests {
                 SMALL,
             );
             let (streamed_bytes, streamed_peak) = crate::test_alloc::requested_peak_during(|| {
-                let versioned = VersionedEvidence::wrap(&ev);
-                let envelope =
-                    super::profile_evidence_envelope(&versioned, Some(&snapshot), Some(&ledger));
-                let streamed =
-                    super::StreamedProfileReport::new(&reports, &ev, &envelope, &state, &capture);
+                let envelope = super::evidence_envelope(
+                    VersionedEvidence::wrap(&ev).into_value(),
+                    Some(&snapshot),
+                    Some(&ledger),
+                );
+                let streamed = super::StreamedProfileReport::new(
+                    &reports, &ev, &envelope, &state, &capture, None,
+                );
                 let mut writer = CountingWriter { bytes: 0 };
                 serde_json::to_writer_pretty(&mut writer, &streamed).unwrap();
                 writer.bytes
@@ -20068,7 +20101,11 @@ pub(crate) mod tests {
         // Metrics lane: the same tight bound on its envelope and stream.
         {
             let (envelope, envelope_peak) = crate::test_alloc::requested_peak_during(|| {
-                super::metrics_evidence_envelope(&ev, Some(&snapshot), Some(&ledger))
+                super::evidence_envelope(
+                    super::metrics_evidence_base_value(&ev),
+                    Some(&snapshot),
+                    Some(&ledger),
+                )
             });
             assert!(
                 !envelope_peak.incomplete,
@@ -20090,24 +20127,31 @@ pub(crate) mod tests {
             let forwarding = super::forwarding_module_ids(&ev, &reports);
             let mut largest_section_peak = 0u64;
             for key in super::METRICS_KEYS_SORTED {
-                if *key == "evidence" {
+                let super::MetricsKey::Section(section) = key else {
                     continue;
-                }
+                };
                 let (_, section_peak) = crate::test_alloc::requested_peak_during(|| {
-                    let value =
-                        super::metrics_section_value(key, &reports, &ev, &capture, &forwarding);
+                    let value = super::metrics_section_value(
+                        *section,
+                        &reports,
+                        &ev,
+                        &capture,
+                        &forwarding,
+                    );
                     let mut writer = CountingWriter { bytes: 0 };
                     serde_json::to_writer(&mut writer, &value).unwrap();
                     writer.bytes
                 });
                 assert!(
                     !section_peak.incomplete,
-                    "metrics section {key} peak report must be complete"
+                    "metrics section {} peak report must be complete",
+                    section.as_str(),
                 );
                 assert_eq!(
                     (section_peak.live_bytes, section_peak.live_blocks),
                     (0, 0),
-                    "metrics section {key} probe must not leak"
+                    "metrics section {} probe must not leak",
+                    section.as_str(),
                 );
                 largest_section_peak = largest_section_peak.max(section_peak.peak_bytes as u64);
             }
@@ -20147,10 +20191,13 @@ pub(crate) mod tests {
                 SMALL,
             );
             let (streamed_bytes, streamed_peak) = crate::test_alloc::requested_peak_during(|| {
-                let envelope =
-                    super::metrics_evidence_envelope(&ev, Some(&snapshot), Some(&ledger));
+                let envelope = super::evidence_envelope(
+                    super::metrics_evidence_base_value(&ev),
+                    Some(&snapshot),
+                    Some(&ledger),
+                );
                 let streamed =
-                    super::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture);
+                    super::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture, None);
                 let mut writer = CountingWriter { bytes: 0 };
                 serde_json::to_writer_pretty(&mut writer, &streamed).unwrap();
                 writer.bytes
@@ -20183,21 +20230,21 @@ pub(crate) mod tests {
                 tree_peak.peak_bytes,
             );
         }
-        // Estimate half (both lanes, large fixture, no peak tracker):
-        // the R5 win on the byte-diff large shape with many discovery
-        // modules, so the capture section joins functions and mechanisms
-        // as a third large. No block limit here (no peak probe), so the
-        // fixture stays at 500/200/500 like the byte-diff twin. The win is
-        // the tree estimate minus the streamed estimate (envelope plus
-        // largest section); both use `json_value_bytes`, the same estimator
-        // R5 publishes, so intermediates and allocator overhead never enter
-        // it. Thresholds sit far below the measured win (see failure text
-        // for actuals).
+        // R5 definition pin (both lanes, large fixture, no peak
+        // tracker): this half pins how R5 is defined — the envelope plus
+        // the largest section, both in `json_value_bytes` units, with the
+        // largest section taken from the production streamer's own
+        // recording during serialization — not an allocator peak (the
+        // large shape exceeds the peak tracker's block limit; its live
+        // spike is measured in B4). The fixture stays at 500/200/500 like
+        // the byte-diff twin, with many discovery modules so the capture
+        // section joins functions and mechanisms as a third large. The win
+        // is the tree estimate minus the recorded R5; thresholds sit far
+        // below the measured win (see failure text for actuals).
         {
             let big_reports = large_reports(500);
             let big_state = large_state(200);
             let big_ev = large_evidence_many_modules(500, 200);
-            let versioned = VersionedEvidence::wrap(&big_ev);
             let mut tree = profile_json(
                 &big_reports,
                 VersionedEvidence::wrap(&big_ev),
@@ -20208,20 +20255,33 @@ pub(crate) mod tests {
             tree = with_legacy_snapshot(tree, &snapshot);
             tree = crate::metrics::selected_detail_driver::with_selected_detail(tree, &ledger);
             let tree_estimate = crate::memory_counters::json_value_bytes(&tree);
-            let envelope =
-                super::profile_evidence_envelope(&versioned, Some(&snapshot), Some(&ledger));
-            let streamed_estimate = super::profile_streamed_peak_bytes(
+            let envelope = super::evidence_envelope(
+                VersionedEvidence::wrap(&big_ev).into_value(),
+                Some(&snapshot),
+                Some(&ledger),
+            );
+            let streamer = super::StreamedProfileReport::new(
                 &big_reports,
                 &big_ev,
                 &envelope,
                 &big_state,
                 &capture,
+                None,
             );
+            let mut writer = CountingWriter { bytes: 0 };
+            serde_json::to_writer_pretty(&mut writer, &streamer).unwrap();
+            assert!(writer.bytes > 0, "profile R5 pin must serialize");
+            let largest = streamer.largest_section_bytes();
             assert!(
-                tree_estimate > streamed_estimate.saturating_add(100 * 1024),
-                "profile estimate win must exceed 100 KiB: tree={} streamed={}",
+                largest > 0,
+                "profile R5 pin must record a largest section (non-vacuous)"
+            );
+            let r5 = crate::memory_counters::json_value_bytes(&envelope).saturating_add(largest);
+            assert!(
+                tree_estimate > r5.saturating_add(100 * 1024),
+                "profile R5 win must exceed 100 KiB: tree={} r5={}",
                 tree_estimate,
-                streamed_estimate,
+                r5,
             );
         }
         {
@@ -20232,15 +20292,27 @@ pub(crate) mod tests {
             tree = with_legacy_snapshot(tree, &snapshot);
             tree = crate::metrics::selected_detail_driver::with_selected_detail(tree, &ledger);
             let tree_estimate = crate::memory_counters::json_value_bytes(&tree);
-            let envelope =
-                super::metrics_evidence_envelope(&big_ev, Some(&snapshot), Some(&ledger));
-            let streamed_estimate =
-                super::metrics_streamed_peak_bytes(&big_reports, &big_ev, &envelope, &capture);
+            let envelope = super::evidence_envelope(
+                super::metrics_evidence_base_value(&big_ev),
+                Some(&snapshot),
+                Some(&ledger),
+            );
+            let streamer =
+                super::StreamedMetricsReport::new(&big_reports, &big_ev, &envelope, &capture, None);
+            let mut writer = CountingWriter { bytes: 0 };
+            serde_json::to_writer_pretty(&mut writer, &streamer).unwrap();
+            assert!(writer.bytes > 0, "metrics R5 pin must serialize");
+            let largest = streamer.largest_section_bytes();
             assert!(
-                tree_estimate > streamed_estimate.saturating_add(20 * 1024),
-                "metrics estimate win must exceed 20 KiB: tree={} streamed={}",
+                largest > 0,
+                "metrics R5 pin must record a largest section (non-vacuous)"
+            );
+            let r5 = crate::memory_counters::json_value_bytes(&envelope).saturating_add(largest);
+            assert!(
+                tree_estimate > r5.saturating_add(20 * 1024),
+                "metrics R5 win must exceed 20 KiB: tree={} r5={}",
                 tree_estimate,
-                streamed_estimate,
+                r5,
             );
         }
     }

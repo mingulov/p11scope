@@ -541,10 +541,11 @@ fn check_stream_file(
     }
     let owner = metadata.uid();
     if let Some(target) = handover_owner {
-        // A handover is armed: reuse only the target's own single-linked
-        // file. Anything else — a root-owned file the flag would
+        // A handover is armed: reuse only the target's own file with no
+        // aliases. Anything else — a root-owned file the flag would
         // truncate and hand away, or a hard-linked file whose truncation
-        // would reach shared bytes — is refused.
+        // would reach shared bytes — is refused. Zero links is the
+        // sink's own unnamed create, not yet linked into place.
         if owner != target {
             return Err(format!(
                 "output {} exists and is owned by uid {}, not the handover target uid {}; refusing to overwrite it",
@@ -553,7 +554,7 @@ fn check_stream_file(
                 target
             ));
         }
-        if metadata.nlink() != 1 {
+        if metadata.nlink() > 1 {
             return Err(format!(
                 "output {} exists with {} hard links; refusing to truncate it",
                 final_path.display(),
@@ -2008,9 +2009,10 @@ mod tests {
     }
 
     /// An existing stream file under an armed handover reuses only
-    /// for its target owner with a single link: a root-owned file
-    /// must not truncate-and-hand-over, and a hard-linked file must
-    /// not truncate shared bytes.
+    /// for its target owner with no aliases: a root-owned file must
+    /// not truncate-and-hand-over, and a hard-linked file must not
+    /// truncate shared bytes. Zero links is the sink's own unnamed
+    /// create, which must pass.
     #[test]
     fn handover_stream_reuse_needs_the_target_owner_and_one_link() {
         use std::os::unix::fs::MetadataExt as _;
@@ -2054,6 +2056,15 @@ mod tests {
         let owner = file.metadata().unwrap().uid();
         assert_eq!(file.metadata().unwrap().nlink(), 1);
         assert!(check_stream_file(&file, &solo, Some(owner)).is_ok());
+        // Unnamed (O_TMPFILE) sink files have no links yet: the create
+        // path hands over before linking, so zero links must pass.
+        let dir_raw = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let raw = unsafe { libc::open(dir_raw.as_ptr(), libc::O_TMPFILE | libc::O_RDWR, 0o600) };
+        assert!(raw >= 0, "O_TMPFILE unavailable for the unnamed case");
+        let unnamed = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(raw) };
+        assert_eq!(unnamed.metadata().unwrap().nlink(), 0);
+        let owner = unnamed.metadata().unwrap().uid();
+        assert!(check_stream_file(&unnamed, &solo, Some(owner)).is_ok());
     }
 
     /// The overflow uid is never suggested: handing a report to uid

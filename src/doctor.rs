@@ -5944,6 +5944,27 @@ mod tests {
         ));
     }
 
+    /// The container recipe names the file grants a host-owned mount
+    /// needs for `-o`: the live set alone cannot create or hand over
+    /// files there.
+    #[test]
+    fn container_recipe_names_the_file_grants_for_host_mounts() {
+        let Status::Ok(detail) =
+            container_flags_status(Ok(crate::caps::minimal_live_mask()), Some(true))
+        else {
+            panic!("a complete set must read Ok");
+        };
+        for grant in ["DAC_OVERRIDE", "CHOWN", "FOWNER"] {
+            assert!(detail.contains(grant), "{detail}");
+        }
+        let Status::Warn(detail) = container_flags_status(Ok(0), Some(true)) else {
+            panic!("empty capabilities must warn the flags");
+        };
+        for grant in ["DAC_OVERRIDE", "CHOWN", "FOWNER"] {
+            assert!(detail.contains(grant), "{detail}");
+        }
+    }
+
     /// Container detection: the image environment wins, `/.dockerenv`
     /// is the fallback for hand-rolled containers, anything else runs
     /// the host path.

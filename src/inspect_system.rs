@@ -9712,11 +9712,12 @@ mod tests {
         assert!(verbose.contains("maps 14 shared objects"), "{verbose}");
     }
 
-    /// Item 10: over-capacity file skips with different sizes fold to one
-    /// plain concise line; verbose lists each record. Both producer
-    /// formats fold together.
+    /// Item 10 retired: over-capacity file skips no longer fold by
+    /// cap — the size wording is retired, so each record renders on
+    /// its own concise line like any other reason. Verbose lists each
+    /// record, as before.
     #[test]
-    fn concise_folds_too_large_gaps_to_one_plain_line() {
+    fn concise_lists_size_gaps_per_row_without_a_cap_fold() {
         let mut catalog = catalog_with(Vec::new());
         for (pid, size) in [(21u32, 619346888u64), (22, 600000000)] {
             catalog.skipped.push(PidGap::member(
@@ -9735,16 +9736,13 @@ mod tests {
             },
         ));
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
-        assert!(
-            concise.contains("3 files over 512 MiB not read"),
-            "{concise}"
-        );
+        assert!(!concise.contains("MiB not read"), "{concise}");
         assert_eq!(
             concise
                 .lines()
                 .filter(|line| line.starts_with("skipped"))
                 .count(),
-            1,
+            3,
             "{concise}"
         );
         let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
@@ -9755,11 +9753,12 @@ mod tests {
         );
     }
 
-    /// A too-large object in a foreign-root view keeps its `too_large`
-    /// concise record: the size-cap reason folds by cap beside — never
-    /// inside — the foreign-root fold, and JSON keeps every object.
+    /// A too-large object in a foreign-root view keeps its own
+    /// concise record: the size-cap reason renders per-row beside —
+    /// never inside — the foreign-root fold, and JSON keeps every
+    /// object.
     #[test]
-    fn foreign_view_too_large_gap_keeps_its_too_large_fold() {
+    fn foreign_view_size_gap_renders_beside_the_foreign_fold() {
         let mut catalog = catalog_with(Vec::new());
         let foreign = "opening object within retained target root: No such file or directory (os error 2) (target root /etc/avahi differs from the observer root)";
         for (pid, subject) in [(31u32, "/lib/a.so"), (31, "/lib/b.so")] {
@@ -9778,14 +9777,12 @@ mod tests {
                 reason: "object is 578755480 bytes; limit is 536870912".into(),
             },
         ));
-        assert_eq!(
-            too_large_cap("object is 578755480 bytes; limit is 536870912"),
-            Some(536870912)
-        );
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(
-            concise.contains("1 file over 512 MiB not read"),
-            "the size-cap refusal keeps its too_large fold: {concise}"
+            concise.contains(
+                "skipped: pid 31 /lib/big.so - object is 578755480 bytes; limit is 536870912"
+            ),
+            "the size-cap refusal renders per-row: {concise}"
         );
         assert!(
             concise.contains("/etc/avahi"),

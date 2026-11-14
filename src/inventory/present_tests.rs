@@ -2157,11 +2157,11 @@ fn snapshot_gap_lines_escape_target_controlled_control_characters() {
     );
 }
 
-/// Verbose Details folds identical object-size-cap gaps — one examining
-/// process per row — into one line with the process count, instead of
-/// one identical line per process. JSON keeps every row.
+/// Verbose Details renders identical object-size-cap gaps one line
+/// each: the size fold is retired with the size wording, so no
+/// process count is appended. JSON keeps every row.
 #[test]
-fn verbose_details_folds_identical_object_size_gaps_with_process_count() {
+fn verbose_details_renders_identical_size_gaps_unfolded() {
     let (mut harness, _caller) = single_caller_harness("present-size-fold", 1);
     for pid in [1001u32, 1002, 1003] {
         harness
@@ -2188,11 +2188,14 @@ fn verbose_details_folds_identical_object_size_gaps_with_process_count() {
     assert_eq!(
         gap_lines,
         vec![
-            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912 (3 processes)"
+            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
+            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
+            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
         ],
-        "one folded line, not three identical ones:\n{snapshot}"
+        "three unfolded lines, never a folded count:\n{snapshot}"
     );
-    // JSON keeps every row: the fold is text-only.
+    assert!(!snapshot.contains("processes)"), "{snapshot}");
+    // JSON keeps every row.
     assert_eq!(document["gaps"].as_array().unwrap().len(), 3);
 }
 

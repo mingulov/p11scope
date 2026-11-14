@@ -1976,6 +1976,68 @@ mod tests {
         assert_eq!(handover_target(1000, Some((1000, 1000)), 1000, None), None);
     }
 
+    /// An existing stream file under an armed handover reuses only
+    /// for its target owner with a single link: a root-owned file
+    /// must not truncate-and-hand-over, and a hard-linked file must
+    /// not truncate shared bytes.
+    #[test]
+    fn handover_stream_reuse_needs_the_target_owner_and_one_link() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = private_tempdir();
+        let target = 424242u32;
+        // Owned by someone else: refused even though the caller owns it.
+        let other = dir.path().join("other.log");
+        std::fs::write(&other, b"do not touch\n").unwrap();
+        let file = std::fs::File::open(&other).unwrap();
+        assert_eq!(file.metadata().unwrap().uid(), unsafe { libc::geteuid() });
+        let Err(refusal) = check_stream_file(&file, &other, Some(target)) else {
+            panic!("a non-target-owned file must be refused under handover");
+        };
+        assert!(
+            refusal.contains(&format!("not the handover target uid {target}")),
+            "got: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read(&other).unwrap(),
+            b"do not touch\n",
+            "a refused file keeps its bytes"
+        );
+        // Owned by the target but hard-linked: refused.
+        let linked = dir.path().join("linked.log");
+        std::fs::write(&linked, b"do not touch\n").unwrap();
+        std::fs::hard_link(&linked, dir.path().join("alias.log")).unwrap();
+        let file = std::fs::File::open(&linked).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        assert_eq!(file.metadata().unwrap().nlink(), 2);
+        let Err(refusal) = check_stream_file(&file, &linked, Some(owner)) else {
+            panic!("a hard-linked file must be refused under handover");
+        };
+        assert!(
+            refusal.contains("hard links"),
+            "a linked file must be refused, got: {refusal}"
+        );
+        // Owned by the target with one link: reused.
+        let solo = dir.path().join("solo.log");
+        std::fs::write(&solo, b"reuse me\n").unwrap();
+        let file = std::fs::File::open(&solo).unwrap();
+        let owner = file.metadata().unwrap().uid();
+        assert_eq!(file.metadata().unwrap().nlink(), 1);
+        assert!(check_stream_file(&file, &solo, Some(owner)).is_ok());
+    }
+
+    /// The overflow uid is never suggested: handing a report to uid
+    /// 65534 fails, so the refusal names the real remedy instead.
+    /// Other owners keep the exact `--output-owner <uid>` fix.
+    #[test]
+    fn owner_refusal_never_suggests_the_overflow_uid() {
+        let path = Path::new("/out");
+        let hint = owner_refusal_message(path, 65534, 0);
+        assert!(!hint.contains("--output-owner 65534"), "{hint}");
+        assert!(hint.contains("overflow"), "{hint}");
+        let hint = owner_refusal_message(path, 1000, 0);
+        assert!(hint.contains("--output-owner 1000"), "{hint}");
+    }
+
     #[test]
     fn owner_refusal_names_the_flag_and_fix_only_for_root() {
         let path = Path::new("/out");

@@ -20270,6 +20270,87 @@ int main(int argc, char **argv) {
         chain.terminate_and_reap().unwrap();
     }
 
+    /// Launch reads are capped: a binary past the launch snapshot cap
+    /// declines preparation (ordinary live discovery runs instead)
+    /// rather than reading the whole file into memory.
+    #[test]
+    fn oversized_launch_binary_declines_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let huge = directory.path().join("huge");
+        std::fs::copy("/bin/true", &huge).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&huge)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            PreparedExecutable::resolve(huge.as_os_str())
+                .unwrap()
+                .is_none(),
+            "a 300 MiB launch file must fall back to ordinary discovery"
+        );
+    }
+
+    /// The launch classifier verifies huge files from bounded sniffs,
+    /// never a whole read: valid magic classifies (the kernel decides
+    /// the rest at exec), garbage refuses fast.
+    #[test]
+    fn oversized_launch_file_classifies_from_bounded_sniffs() {
+        use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
+        let directory = tempfile::tempdir().unwrap();
+        let huge = directory.path().join("huge");
+        std::fs::copy("/bin/true", &huge).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&huge)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let file = std::fs::File::open(&huge).unwrap();
+        assert_eq!(
+            classify_launch_file(&file).unwrap().0,
+            LaunchKind::Elf,
+            "a huge valid binary still launches"
+        );
+        // Valid ELF magic with garbage tables: the bounded sniff
+        // classifies ELF (exec decides), where a whole read refuses.
+        let garbage = directory.path().join("garbage");
+        std::fs::copy("/bin/true", &garbage).unwrap();
+        {
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&garbage)
+                .unwrap();
+            writer.set_len(300 * 1024 * 1024).unwrap();
+            // e_phoff past the end: no full parse could validate this.
+            writer.write_at(&u64::MAX.to_le_bytes(), 32).unwrap();
+            let mut permissions = std::fs::metadata(&garbage).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&garbage, permissions).unwrap();
+        }
+        let file = std::fs::File::open(&garbage).unwrap();
+        assert_eq!(
+            classify_launch_file(&file).unwrap().0,
+            LaunchKind::Elf,
+            "magic-bearing huge files defer to exec"
+        );
+        // No magic at all still refuses fast.
+        let text = directory.path().join("text");
+        std::fs::write(&text, b"not an executable at all\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&text)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let mut permissions = std::fs::metadata(&text).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&text, permissions).unwrap();
+        let file = std::fs::File::open(&text).unwrap();
+        assert!(classify_launch_file(&file).is_err());
+    }
+
     /// Hermetic long-running child: this host's `/bin/sleep` is a uutils
     /// multicall shim that dispatches on AT_EXECFN, which fd-pinned exec
     /// (`execveat` + `AT_EMPTY_PATH`) leaves as an fd-based name — so it

@@ -6818,14 +6818,7 @@ fn validate_runtime_maps(ebpf: &Ebpf, discovery_bytes: u32) -> Result<()> {
         8,
         p11scope_ebpf_common::PRODUCED_CELLS,
     )?;
-    validate_runtime_map(
-        ebpf,
-        "PAUSE_PIDS",
-        MapType::Hash,
-        16,
-        8,
-        p11scope_ebpf_common::MAX_PAUSE_PIDS,
-    )
+    validate_runtime_map(ebpf, "PAUSE_PIDS", MapType::Hash, 16, 8, 1)
 }
 
 fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
@@ -11181,101 +11174,6 @@ impl Session {
                 .context("removing PAUSE_PIDS authorization")?;
         }
         Ok(state)
-    }
-
-    /// Publishes one run-tree member's pause authorization: the
-    /// `PID_FILTER` generation row that names the member's current
-    /// generation plus the `PAUSE_PIDS` row in the ARMED state, both
-    /// read back exactly. The row makes the member's own loader and
-    /// export-discovery events stop-protected exactly like the owned
-    /// chain's.
-    pub(crate) fn member_pause_publish(&mut self, pid: u32, token: u64) -> Result<()> {
-        let mut pids: HashMap<_, u32, u64> =
-            HashMap::try_from(self.ebpf.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
-        pids.insert(pid, token, 0)
-            .context("publishing member PID_FILTER row")?;
-        if pids.get(&pid, 0).context("reading back member PID_FILTER row")? != token {
-            bail!("member PID_FILTER readback differs from the published token");
-        }
-        let key = PauseKey {
-            tgid: pid,
-            pad: 0,
-            generation_token: token,
-        };
-        let mut pauses: HashMap<_, PauseKey, u64> =
-            HashMap::try_from(self.ebpf.map_mut("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
-        pauses.insert(key, p11scope_ebpf_common::PAUSE_ARMED, 0)?;
-        if pauses.get(&key, 0)? != p11scope_ebpf_common::PAUSE_ARMED {
-            bail!("member PAUSE_PIDS readback differs from ARMED");
-        }
-        Ok(())
-    }
-
-    /// The member row's current state: `None` when no row exists.
-    pub(crate) fn member_pause_state(&self, pid: u32, token: u64) -> Result<Option<u64>> {
-        let key = PauseKey {
-            tgid: pid,
-            pad: 0,
-            generation_token: token,
-        };
-        let pauses: HashMap<_, PauseKey, u64> =
-            HashMap::try_from(self.ebpf.map("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
-        match pauses.get(&key, 0) {
-            Ok(state) => Ok(Some(state)),
-            Err(MapError::KeyNotFound) => Ok(None),
-            Err(error) => Err(error).context("reading member PAUSE_PIDS authorization"),
-        }
-    }
-
-    /// Re-arms the member row to ARMED (a fresh cycle after a serviced
-    /// stop), with the exact readback.
-    pub(crate) fn member_pause_rearm(&mut self, pid: u32, token: u64) -> Result<()> {
-        let key = PauseKey {
-            tgid: pid,
-            pad: 0,
-            generation_token: token,
-        };
-        let mut pauses: HashMap<_, PauseKey, u64> =
-            HashMap::try_from(self.ebpf.map_mut("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
-        pauses.insert(key, p11scope_ebpf_common::PAUSE_ARMED, 0)?;
-        if pauses.get(&key, 0)? != p11scope_ebpf_common::PAUSE_ARMED {
-            bail!("member PAUSE_PIDS re-arm readback differs from ARMED");
-        }
-        Ok(())
-    }
-
-    /// Removes one member's rows. The `PID_FILTER` row is dropped only
-    /// while it still holds this member's token, so a pid the kernel
-    /// already reused never loses its successor's row.
-    pub(crate) fn member_pause_remove(&mut self, pid: u32, token: u64) -> Result<()> {
-        let key = PauseKey {
-            tgid: pid,
-            pad: 0,
-            generation_token: token,
-        };
-        let mut pauses: HashMap<_, PauseKey, u64> =
-            HashMap::try_from(self.ebpf.map_mut("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
-        match pauses.get(&key, 0) {
-            Ok(_) => {
-                pauses
-                    .remove(&key)
-                    .context("removing member PAUSE_PIDS authorization")?;
-            }
-            Err(MapError::KeyNotFound) => {}
-            Err(error) => return Err(error).context("reading member PAUSE_PIDS before removal"),
-        }
-        let mut pids: HashMap<_, u32, u64> =
-            HashMap::try_from(self.ebpf.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
-        match pids.get(&pid, 0) {
-            Ok(current) if current == token => {
-                pids.remove(&pid)
-                    .context("removing member PID_FILTER row")?;
-            }
-            Ok(_) => {}
-            Err(MapError::KeyNotFound) => {}
-            Err(error) => return Err(error).context("reading member PID_FILTER before removal"),
-        }
-        Ok(())
     }
 
     /// Attach points that failed — reported as an evidence gap, never

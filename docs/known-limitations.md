@@ -249,16 +249,30 @@ pass `--prearm-module PATH`) when first-run coverage matters.
 `run` learns the same way from its own tree, without fanotify: the
 observer watches its owned descendants, proves a mapped provider
 file from a live scan, and attaches it by file identity for every
-later mapper. The learned provider lists with its path,
-`first_loaded_by`, and its missed first use as an unobserved window;
-the capture stays `PARTIAL` with the same fixed learned-file gap row
-plus descendant gaps for members that retired before admission. The
-first mapper's own calls may be missed (measured: a 16-worker
-fixture at ~55 ms per worker observes 75 of 80 calls, missing exactly
-the first worker; the pkcs11-check smoke suite reaches oracle recall
-1.0); members too short-lived to scan at all (a few milliseconds)
-stay counted in `pid_descendant_gaps` like the other never-admitted
-members. The 32-file per-capture cap is shared with system file
+later mapper. With the pause chain armed (the default) a run member
+is also stopped the first time it maps an executable file the
+capture has not seen yet: the observer proves the file, attaches a
+provider's probes, and resumes the member before it runs any of that
+file's code, so the first mapper's calls are observed too. Each
+distinct executable file costs one short stop for the first member
+that maps it (measured: 12 stops for ten python workers); a hold
+that cannot attach within 1 s resumes the member and files the
+learned first-use gap row. Measured on the local host under 8 extra
+CPU burners: ten sequential python workers loading SoftHSM observe
+60 of 60 calls in 5 of 5 runs (0 of 60 before), five workers with a
+2 s hold 30 of 30 in 5 of 5 (29 of 30 before), and the pkcs11-check
+smoke suite under plain `run` reaches default call recall 1.0 (42 of
+42 oracle calls; 0.81 before). Without the stop (`--pause never`, or
+the stop object refused by the kernel) the first mapper's own calls
+may still be missed and the learned provider lists its missed first
+use as an unobserved window; the capture stays `PARTIAL` with the
+same fixed learned-file gap row plus descendant gaps for members
+that retired before admission. Members too short-lived to scan at all
+(a few milliseconds) stay counted in `pid_descendant_gaps` like the
+other never-admitted members. A job-control shell in the run tree
+can see its child briefly stopped (`CLD_STOPPED`), and an observer
+killed with SIGKILL can leave a stopped member stopped (send it
+SIGCONT). The 32-file per-capture cap is shared with system file
 learning. Of the 256 loader contexts, 8 stay reserved for the direct
 child's exec chain: member arms past 248 refuse with the named reserve gap
 (their later calls still land via file-identity probes once the file

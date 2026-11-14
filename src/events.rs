@@ -1601,11 +1601,31 @@ pub(crate) fn event_drain_positions<S: BoundedRecordSource>(
 /// not drain the ring. Only the drain advances `consumer` and `producer`
 /// only grows, so `consumer == producer` proves the ring was empty at the
 /// read. (The completion mint's backlog verdict; DISCOVERY's counterpart
-/// is `discovery_head_pending`.)
-#[allow(dead_code)] // Only the unwired completion mint consumes it so far.
+/// is `discovery_head_pending`. Drain-until-idle quiescence loops also
+/// poll it between transactions: on a staged drain the logical consumer
+/// moves only on consumption, so staged-but-undelivered records still
+/// read pending.)
+#[allow(dead_code)] // Only tests and the unwired completion mint consume it so far.
 pub(crate) fn events_head_pending<S: BoundedRecordSource>(drain: &EventDrain<S>) -> bool {
     let positions = drain.source.positions();
     positions.producer != positions.consumer
+}
+
+/// Drive `step` until it reports idle, at most `bound` times: one bounded
+/// transaction per call, quiescence proven by the step itself (usually
+/// `!events_head_pending` read after the transaction published, so every
+/// submitted record reached a quantum). Returns transactions driven, or
+/// `None` when the bound hit first: the caller fails loudly on `None`
+/// (backlog never drained is not a pass), never treats it as quiescent.
+/// STUB for the RED twin: a single transaction (today's checkpoint
+/// behavior). The fix loops to quiescence.
+#[cfg(test)]
+pub(crate) fn drive_until_idle<E>(
+    _bound: usize,
+    mut step: impl FnMut() -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
+    step()?;
+    Ok(Some(1))
 }
 
 /// Drains one bounded EVENTS quantum up to the producer `stop` position

@@ -30455,3 +30455,93 @@ fn joint_birth_per_key_resource_skips_healthy_joint_duplicate() {
         assert_eq!(fresh_trial.loss_ids, 1, "room {room} fresh: one lost id");
     }
 }
+
+/// SHED-COUNT twin: one call buried behind a full H0 quantum of ambient
+/// FORK records is in no counter after a single transaction (the loaded
+/// cell's `entered 25 vs shed 24` shape, without load and without root);
+/// draining to quiescence settles the equation. Deterministic: 1,025
+/// forks fill the first 1,024-record quantum, so the straddling call at
+/// position 1,026 sheds only in the second transaction.
+#[test]
+fn joint_machine_flood_buried_call_balances_only_at_drain_quiescence() {
+    use p11scope_ebpf_common::{Event, event_type};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    for index in 0..1025u32 {
+        let child = 2000 + index;
+        let fork = Event {
+            event_type: event_type::FORK,
+            pid_tgid: (u64::from(child) << 32) | u64::from(child),
+            session: u64::from(child),
+            ts_ns: 2_000_000 + u64::from(index),
+            ..Event::default()
+        };
+        fixture
+            .scene
+            .drain
+            .source_mut()
+            .push_record(crate::events::event_bytes(&fork));
+    }
+    // One straddling CALL: a valid entry whose epoch moved at return (the
+    // live held-sign shape). It sheds at route time without any scan or
+    // binding, so the twin pins the backlog alone.
+    {
+        let pid = std::process::id();
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        held.io.enqueue(pid, 0, "C_SignInit", 0, 0);
+        let mut record = held.io.script.records.pop_back().unwrap();
+        record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+        record.base.event.duration_ns = 1;
+        record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        record.base.continuity.return_stamp.epoch += 1;
+        let bytes = crate::events::record_bytes(&record.base);
+        drop(held);
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    let shed_before = fixture.scene.real.lane.shed_calls_disclosed();
+    let api_before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.api_returns)
+        .sum();
+    let txns = crate::events::drive_until_idle(6, || {
+        let mut published = false;
+        for _ in 0..64 {
+            let progress = fixture.service(1024).expect("scripted services never refuse");
+            if progress == crate::inventory_semantics::JointServiceProgress::Published {
+                published = true;
+                break;
+            }
+        }
+        assert!(published, "one scripted transaction publishes within 64 services");
+        Ok::<bool, std::convert::Infallible>(!crate::events::events_head_pending(
+            &fixture.scene.drain,
+        ))
+    })
+    .unwrap()
+    .expect("the flood drains within the bound");
+    let shed_after = fixture.scene.real.lane.shed_calls_disclosed();
+    let api_after: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|row| row.api_returns)
+        .sum();
+    let counted = shed_after.saturating_sub(shed_before);
+    assert_eq!(
+        1, counted,
+        "every entered call is counted: entered 1 vs shed {counted}"
+    );
+    assert_eq!(
+        api_after, api_before,
+        "the flood and the shed call attribute nothing"
+    );
+    assert_eq!(txns, 2, "one quantum for the forks, one for the call");
+}

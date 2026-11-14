@@ -9594,6 +9594,81 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
     );
 }
 
+/// Scope-round feed-ended twin for the resource void: a
+/// resource-refused collection void ends Joint feeds and counts
+/// once per void, like the FaultChanged twin. A genuine duplicate
+/// START for an unclaimed image refuses collection resources
+/// without adding an H0 call or tainting a claimed feed; the audit
+/// voids as ResourceUnavailable (HistoryLoss after the
+/// original-audit upgrade) and the shared delivery path counts it.
+#[test]
+fn joint_audit_resource_void_ending_joint_feeds_counts_once() {
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        2,
+        "two Joint feeds from the clean first publication"
+    );
+    // An unclaimed image: bound for encoding, never admitted, so its
+    // duplicate STARTs refuse resources without tainting a claim.
+    let fresh = OwnedStoppedChild::new();
+    fixture.scene.real.bind(
+        fresh.id(),
+        ImageIdentity {
+            task_cookie: 75,
+            exec_id: 0,
+        },
+        0,
+    );
+    let (dup, _) = fixture.scene.encoded(fresh.id(), 0, "C_SignInit", 1);
+    fixture.scene.drain.source_mut().push_record(dup.to_vec());
+    fixture.scene.drain.source_mut().push_record(dup.to_vec());
+    fixture.push_two("C_SignInit", 2);
+    let round = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        round.audit_for_test().resource_refused_for_test(),
+        "the duplicate START refused collection resources"
+    );
+    let gaps: Vec<_> = round
+        .original_failures_for_test()
+        .map(|failure| failure.gap)
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![JournalGap::ResourceUnavailable],
+        "the refused collection voids as resource-only: {gaps:?}"
+    );
+    finish_disposed_negative_frame(&mut fixture, round, &BirthFault);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 1, "the refused collection voids once");
+    assert_eq!(
+        diagnosis.audit_resource_unavailable, 1,
+        "the void counts in the resource bucket"
+    );
+    assert_eq!(
+        diagnosis.voids_ended_joint_feed, 1,
+        "one resource void ending two Joint feeds counts one ending"
+    );
+    assert!(
+        fixture.feeds().iter().all(|feed| feed.degraded),
+        "the resource void ended every Joint feed"
+    );
+}
+
 /// Scope-round drain twin: each audit void discloses one counted scope
 /// gap for its sub-cause (`joint_void_<subcause>_history_loss`), like
 /// ingest-break voids do — staged exactly once by the voiding

@@ -452,6 +452,13 @@ impl JointStaging {
         self.segment_fence
     }
 
+    /// Record a void fence for re-arm tests (running maximum, like
+    /// frame delivery does for a later void on a degraded feed).
+    #[cfg(test)]
+    pub(crate) fn record_fence_for_test(&mut self, fence: Option<u64>) {
+        self.record_fence(fence);
+    }
+
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,

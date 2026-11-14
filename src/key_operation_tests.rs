@@ -22139,6 +22139,24 @@ fn key_operation_below_fence_deferral_takes_once_per_fence() {
         !staging.take_below_fence_deferral(),
         "later refusals stay silent on the same fence"
     );
+    // Re-arm leg: a later void raising the fence discloses again.
+    // The feed seam ignores failures once S1Only (frame delivery
+    // records the running maximum there — pinned by the S1 twin),
+    // so the test drives the recorded fence directly.
+    staging.record_fence_for_test(Some(2));
+    assert_eq!(
+        staging.segment_fence_for_test(),
+        Some(2),
+        "the later void raises the recorded fence"
+    );
+    assert!(
+        staging.take_below_fence_deferral(),
+        "the raised fence re-arms disclosure"
+    );
+    assert!(
+        !staging.take_below_fence_deferral(),
+        "the new fence latches again"
+    );
     // A healthy feed (no recorded fence) offers no deferral.
     let mut fresh = JointStaging::select_joint(Some(&bootstrap));
     assert!(

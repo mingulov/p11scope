@@ -1852,7 +1852,7 @@ pub(crate) fn joint_births_line(
 /// One stderr line for the diagnostic Joint-void summary (Task 0 plus
 /// the scope-round split): stream breaks by recording side (dispose vs
 /// ingest), seals voided through a failed audit, the re-sync total they
-/// add up to, seal endings refused at the void-fence check, per-key
+/// should match, seal endings refused at the void-fence check, per-key
 /// gauges (total, refused, tainted, pending), the audit-void split by
 /// sub-cause (the eight buckets sum to `void_audit`), the router's
 /// skip-only fault eras, and the voids that ended at least one Joint

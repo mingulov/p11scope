@@ -10936,6 +10936,209 @@ fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
     );
 }
 
+/// Keyrows T1 fix4 B1 twin: a Joint feed's seal waits (BoundNotReady)
+/// behind a long call from the same process that is still running, so
+/// the frame's completed call stays staged while its consumer goes
+/// Future and the frame finishes normally — no failure, no floor. When
+/// that frame's ingest broke the stream, the idle void wipes the held
+/// call's H8 and claims; the idle drop disposes it as counted history
+/// (its observed completion kept as an unknown-key row) so the next
+/// frame publishes instead of tripping the recovery's fallback
+/// verification ("Joint delivery refused"). Pins the held call counted
+/// lost with its row kept, the post-void call replayed, and the void
+/// fence recorded. See the idle-site comment.
+#[test]
+fn joint_machine_idle_void_drops_call_held_behind_running_call() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let reduced_before = fixture.reduced();
+    let pid = std::process::id();
+    // A (file 0) stays running: only its BEGIN lands. B (file 1) is a
+    // complete call from the same process.
+    let (begin_a, _end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.reach_phase("Audited");
+    let progress = fixture.service(1);
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((1, 1, 1)),
+        "the seal waits behind the running call: one consumer Future, one Pending"
+    );
+    assert_eq!(progress, Ok(JointServiceProgress::Pending));
+    fixture.published_labeled("held-behind-running-call", None);
+    assert_eq!(
+        fixture.reduced(),
+        reduced_before,
+        "nothing reduces while the seal waits behind the running call"
+    );
+    let feed_state = |fixture: &MachineScene, file: usize| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let module = registry
+            .modules()
+            .find(|module| module.key == fixture.scene.real.modules[file].0)
+            .unwrap()
+            .id;
+        let edges: Vec<_> = registry
+            .instance_semantic_edges()
+            .filter(|record| record.module == module)
+            .collect();
+        assert_eq!(edges.len(), 1, "one incarnation per provider");
+        let feed = &edges[0].feed;
+        (
+            feed.mode(),
+            feed.staged_len(),
+            feed.reduced(),
+            feed.fallback_replayed(),
+            feed.fell_back(),
+            feed.degraded_loss(),
+            feed.history_disposed(),
+            feed.segment_fence_for_test(),
+        )
+    };
+    let premise = feed_state(&fixture, 1);
+    assert_eq!(
+        premise.0,
+        FeedMode::Joint,
+        "the completed call stays on a Joint feed"
+    );
+    assert_eq!(
+        premise.1, 1,
+        "the completed call stays staged while the seal waits"
+    );
+    assert_eq!(premise.3, 0, "nothing replayed yet");
+    assert!(!premise.4, "no fallback ending yet");
+    assert!(!premise.5, "no loss ending yet");
+    assert_eq!(premise.6, 0, "nothing disposed yet");
+    assert_eq!(premise.7, None, "no fence yet");
+    let held_reduced_before = premise.2;
+    assert_eq!(
+        feed_state(&fixture, 0).1,
+        0,
+        "the running call stages nothing: it never completed"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    let join_lost_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .keyuse_for_test()
+        .evidence()
+        .join_lost;
+    let unknown_before = fixture.unknown_terminals();
+    let disposed_before = fixture.disposed_total();
+    // The idle break: the machine's own idle tick voids the lane,
+    // then the post-void quantum carries one fresh call.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(pid, 1, "C_SignInit", 5);
+    let mut published = false;
+    let mut latched = None;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                latched = Some(reason);
+                break;
+            }
+        }
+    }
+    assert!(
+        published,
+        "the post-void frame publishes instead of tripping fallback verification: latched={latched:?} phase={:?} snapshot={:?}",
+        fixture.machine.latched_phase_label(),
+        fixture.machine.diagnostic_snapshot_for_test(),
+    );
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed_before + 1,
+        "the idle drop counts the held call as disposed history"
+    );
+    let join_lost_after = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .keyuse_for_test()
+        .evidence()
+        .join_lost;
+    assert_eq!(
+        join_lost_after,
+        join_lost_before + 3,
+        "the held call plus both pre-break sessions count lost"
+    );
+    assert_eq!(
+        fixture.unknown_terminals(),
+        [
+            unknown_before[0] + 1,
+            unknown_before[1],
+            unknown_before[2],
+            unknown_before[3]
+        ],
+        "the held call's observed completion stands as an unknown-key row"
+    );
+    let held = feed_state(&fixture, 1);
+    assert_eq!(
+        held.0,
+        FeedMode::S1Only,
+        "the void ended the held feed's Joint segment"
+    );
+    assert_eq!(held.1, 0, "the held feed stages nothing after the void");
+    assert_eq!(
+        held.2,
+        held_reduced_before + 1,
+        "the post-void call replays instead of disposing"
+    );
+    assert_eq!(held.3, 1, "the post-void call replays once");
+    assert!(held.4, "the fenced void ends as fallback");
+    assert!(!held.5, "replay is not loss");
+    assert!(
+        held.7.is_some(),
+        "the fallback ending records the void fence: {:?}",
+        held.7
+    );
+    let running = feed_state(&fixture, 0);
+    assert_eq!(
+        running.0,
+        FeedMode::S1Only,
+        "the void ended the running feed's Joint segment too"
+    );
+    assert!(
+        running.7.is_some(),
+        "the running feed records the void fence too: {:?}",
+        running.7
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the post-void audit frame took the void"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
 /// The void's own slot with the raw slot occupied: after the first break
 /// ends the bound feed, the bound caller's next call is admitted S1-only
 /// and its journal original is refused into the audit frame's raw slot.

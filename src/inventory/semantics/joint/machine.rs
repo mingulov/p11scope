@@ -67,9 +67,11 @@ pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 /// with sparse interruptions never stops for its age, while a dense
 /// storm (back-to-back re-arms) still stops. Sized from the heavy
 /// soaks: the stopping runs re-armed about 4 times per minute (32
-/// over eight minutes), so the window admits that pace, while a
-/// truly stuck lane re-arming every pass (tens per minute) still
-/// stops within about 80 s.
+/// over eight minutes), so the window admits that pace. The bound
+/// stops a lane interrupted more than 16 times a minute (those
+/// re-arms landing inside one 2-minute window); a slower lane, even
+/// one refusing every pass, may keep re-arming — the work stays
+/// bounded and each continuation is counted and named.
 pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
 /// Rolling window of the running re-arm bound: at most
 /// [`RUNNING_REARM_LIMIT`] re-arms per window, measured on the
@@ -109,6 +111,10 @@ pub(crate) enum RunningRearmRefusal {
     /// The re-arm rate bound is spent. The stop gap renders
     /// this as the count sentence, not [`Self::describe`].
     BoundSpent,
+    /// The boot-clock read the rate window needs failed: without
+    /// a stamp the window cannot bound, so the lane stops, named
+    /// for the clock rather than the spent bound.
+    ClockUnread,
     /// The lane is no longer live: not live, finished,
     /// exit-retained, or its domain moved.
     LaneNotLive,
@@ -135,6 +141,7 @@ impl RunningRearmRefusal {
             Self::FrameMissing => "the audited pass had nothing left to abandon",
             Self::WrongPhase => "only a refusal at the audit step can be continued past",
             Self::BoundSpent => "the interruption limit was already spent",
+            Self::ClockUnread => "the clock could not be read",
             Self::LaneNotLive => "the lane was no longer live",
             Self::CannotResync => "the journal stream could not re-sync",
             Self::PublicationPending => "the unfinished pass was still standing after the abandon",
@@ -1795,9 +1802,10 @@ impl LiveJointMachine {
             return None;
         }
         // An unreadable clock fails closed: without a stamp the
-        // window cannot bound, so the lane stops, named.
+        // window cannot bound, so the lane stops, named for the
+        // clock — never as the spent bound, which no re-arm spent.
         let Some(now) = self.rearm_now() else {
-            self.rearm_refusal = Some(RunningRearmRefusal::BoundSpent);
+            self.rearm_refusal = Some(RunningRearmRefusal::ClockUnread);
             return None;
         };
         self.prune_rearm_window(now);

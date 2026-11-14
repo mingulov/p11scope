@@ -14615,19 +14615,15 @@ fn joint_machine_unreadable_rearm_clock_stops_with_its_own_refusal() {
         0,
         "no re-arm ran, so no spent-rate sentence can be true"
     );
-    let refusal = fixture
-        .machine
-        .rearm_refusal_for_test()
-        .expect("the stop records why the re-arm was refused");
-    assert_ne!(
-        refusal,
-        crate::inventory_semantics::RunningRearmRefusal::BoundSpent,
-        "a clock-read failure is not the spent rate bound"
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::ClockUnread),
+        "the stop names the unreadable clock, not the spent rate bound"
     );
     assert_eq!(
-        refusal.describe(),
+        crate::inventory_semantics::RunningRearmRefusal::ClockUnread.describe(),
         "the clock could not be read",
-        "the stop names the unreadable clock in plain words"
+        "the refusal carries its own plain-words clause"
     );
 }
 

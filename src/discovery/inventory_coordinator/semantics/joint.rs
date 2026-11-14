@@ -1788,11 +1788,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .and_then(crate::semantics_objects::journal::endpoint_class)
                 == Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting)
         {
-            ingested
+            let marked = ingested
                 .disposition_s1only_original(adapter, producers, input)?
                 .consume_for(input)?;
-            // Diagnostic-only: the mark committed.
-            self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);
+            if marked {
+                // Diagnostic-only: the mark committed. A
+                // released-tainted disposition marks nothing and
+                // leaves the counter unchanged.
+                self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);
+            }
         }
         Ok(
             batch.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {
@@ -2133,12 +2137,14 @@ mod tests {
         let report = body
             .find("let marked = ingested")
             .expect("the disposition's mark report is bound");
-        let gate = body[report..]
-            .find("if marked {")
-            .expect("the report gates the counter");
-        let counted = body[gate..]
-            .find("self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);")
-            .expect("the counter increment follows its gate");
+        let gate = report
+            + body[report..]
+                .find("if marked {")
+                .expect("the report gates the counter");
+        let counted = gate
+            + body[gate..]
+                .find("self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);")
+                .expect("the counter increment follows its gate");
         assert!(
             report < gate && gate < counted,
             "the marks counter counts only dispositions that reported a mark"

@@ -21229,6 +21229,10 @@ mod tests {
                 "only a refusal at the audit step can be continued past",
             ),
             (
+                RunningRearmRefusal::ClockUnread,
+                "the clock could not be read",
+            ),
+            (
                 RunningRearmRefusal::LaneNotLive,
                 "the lane was no longer live",
             ),
@@ -21260,6 +21264,15 @@ mod tests {
             RunningRearmRefusal::BoundSpent.describe(),
             "the interruption limit was already spent",
             "the bound keeps its standalone clause",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("Auditing"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT,
+                Some(RunningRearmRefusal::ClockUnread),
+            ),
+            " at Auditing; after continuing past 32 interruptions, the lane could not continue: the clock could not be read",
+            "an unreadable clock renders its own clause, never the count sentence",
         );
     }
 

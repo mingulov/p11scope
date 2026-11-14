@@ -530,16 +530,25 @@ enum S1OriginalKind {
 }
 
 impl S1OriginalDisposition<'_, '_> {
+    /// Consume the disposition for its exact immutable input,
+    /// reporting whether a real mark committed: `true` only on the
+    /// strict retained path, which retains the S1 subject; a
+    /// released-tainted disposition consumes without marking and
+    /// reports `false`, so marks counters fed by this report count
+    /// only real marks.
     pub(crate) fn consume_for(
         self,
         input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
-    ) -> Result<(), RawQuantumRefusal> {
+    ) -> Result<bool, RawQuantumRefusal> {
         if !std::ptr::eq(self.original, input) {
             return Err(RawQuantumRefusal::Admission);
         }
         match self.kind {
-            S1OriginalKind::RetainedH8 => self.adapter.retain_s1only_subject(self.original),
-            S1OriginalKind::ReleasedTainted => Ok(()),
+            S1OriginalKind::RetainedH8 => self
+                .adapter
+                .retain_s1only_subject(self.original)
+                .map(|()| true),
+            S1OriginalKind::ReleasedTainted => Ok(false),
         }
     }
 }
@@ -4085,36 +4094,18 @@ mod tests {
             )
         }
 
-        /// What `consume_for` reported: `None` when it reported
-        /// nothing (a `()` result), `Some(marked)` when it reports
-        /// whether it marked.
-        trait ConsumedReport {
-            fn marked_report(&self) -> Option<bool>;
-        }
-        impl ConsumedReport for () {
-            fn marked_report(&self) -> Option<bool> {
-                None
-            }
-        }
-        impl ConsumedReport for bool {
-            fn marked_report(&self) -> Option<bool> {
-                Some(*self)
-            }
-        }
-
         let pool = SemanticResourcePool::default();
         let mut adapter = resource_adapter(&pool);
         let input = scripted_input(CallerId(7));
-        let outcome = S1OriginalDisposition {
+        let marked = S1OriginalDisposition {
             original: &input,
             adapter: &mut adapter,
             kind: S1OriginalKind::ReleasedTainted,
         }
-        .consume_for(&input)
-        .expect("the exact input consumes");
+        .consume_for(&input);
         assert_eq!(
-            outcome.marked_report(),
-            Some(false),
+            marked,
+            Ok(false),
             "a released-tainted disposition reports that it marked nothing"
         );
         let other = scripted_input(CallerId(8));

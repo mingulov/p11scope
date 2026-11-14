@@ -2794,7 +2794,7 @@ manifest document, and one manifest's objects share a 512 MiB batch byte
 allowance enforced incrementally as identify reads stream (no object is
 refused for its own size). Separately, one capture-wide 512 MiB attempted-I/O
 budget covers memory scanning and scan-sourced file hashing across every
-selected process, retry, and failed pin, with 256 MiB per scan operation
+selected process, retry, and failed pin, with 256 MiB per scan/hash operation
 enforced incrementally as bytes stream (measured 2026-09-17 against libxul.so
 at 183 MB on disk / 61 MiB readable data, the largest known real-world
 object). Provider export

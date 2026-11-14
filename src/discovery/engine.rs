@@ -865,6 +865,14 @@ pub struct Engine {
     exit_ended_by_route: [u64; 3],
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
+    /// Refreshed views a spent tick deep-scan quantum deferred, still owed
+    /// their rescan, and the deferral records announced for them. A
+    /// deferral postpones a rescan with its request retained; it is a gap
+    /// only when that rescan never completes. At capture end the records
+    /// stand while any view is still owed and are withdrawn otherwise.
+    /// Keyed by view, not pid, so a reused pid never settles a deferral.
+    quantum_deferred_views: BTreeSet<ProcessViewId>,
+    quantum_deferral_records: Vec<Skipped>,
     retirement_intents: PendingViewRetirements,
     ready_expected_removals: BTreeSet<ProcessViewId>,
     // Original custody and exact Session endpoint proof survive only the
@@ -13025,6 +13033,8 @@ impl Engine {
             exit_ended_by_route: [0, 0, 0],
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
+            quantum_deferred_views: BTreeSet::new(),
+            quantum_deferral_records: Vec::new(),
             retirement_intents: PendingViewRetirements::new(),
             ready_expected_removals: BTreeSet::new(),
             ended_pid_retirement: None,
@@ -23402,10 +23412,7 @@ impl Engine {
                     }
                     *additions_allowed = false;
                     retire = true;
-                    self.mark_partial(
-                        "live export hook",
-                        "the process generation changed around a dynamic export attachment",
-                    );
+                    self.mark_export_generation_change(view);
                 }
                 GenerationMutation::PrecheckFailed
                 | GenerationMutation::PostcheckFailed(Err(_)) => {
@@ -23415,14 +23422,25 @@ impl Engine {
                     }
                     *additions_allowed = false;
                     retire = true;
-                    self.mark_partial(
-                        "live export hook",
-                        "the process generation changed around a dynamic export attachment",
-                    );
+                    self.mark_export_generation_change(view);
                 }
             }
         }
         (retire, complete, skipped, attached)
+    }
+
+    /// The generation changed around a dynamic export attachment: loss,
+    /// unless its group exited or is in its final exit, which can make no
+    /// further call through the hook. Timing proof goes either way.
+    fn mark_export_generation_change(&mut self, view: ProcessViewId) {
+        if self.original_ending(view) {
+            self.invalidate_causal_timing();
+            return;
+        }
+        self.mark_partial(
+            "live export hook",
+            "the process generation changed around a dynamic export attachment",
+        );
     }
 
     fn attach_refreshed_exports(
@@ -23453,6 +23471,12 @@ impl Engine {
             })
             .collect();
         let [context] = contexts.as_slice() else {
+            // An ending group has no arm and needs no hook: it cannot call
+            // or load again, so there is nothing left to attach.
+            if contexts.is_empty() && self.original_ending(view) {
+                self.invalidate_causal_timing();
+                return (false, true, false, false);
+            }
             self.mark_partial(
                 "live export hook",
                 "a refreshed provider had no unique attached loader context",
@@ -23618,6 +23642,12 @@ impl Engine {
             self.file_handles_wait_gap();
             return Err(LoaderArmFailure::Deferred { changed: false });
         }
+        // The loader pin of a group in its final exit fails on its gone
+        // namespace or mappings: the group is ending, not refused.
+        if !loader_skips.is_empty() && self.original_ending(view_id) {
+            self.invalidate_causal_timing();
+            return Err(LoaderArmFailure::NotArmable);
+        }
         let skipped = loader_skips;
         for skip in &skipped {
             self.mark_partial(&skip.subject, &skip.reason);
@@ -23625,11 +23655,7 @@ impl Engine {
         let Some(local_loader_id) =
             loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         else {
-            self.mark_partial(
-                "live loader arming",
-                "the exact loader mapping could not be pinned",
-            );
-            return Ok(false);
+            return self.loader_arm_gap(view_id, "the exact loader mapping could not be pinned");
         };
         let (loader_facts, fresh_loader_facts) = loader_elf_facts(
             loader_pins
@@ -23647,26 +23673,21 @@ impl Engine {
         if pinned_loader_file != locator.authority.interpreter_file
             || loader_facts.abi != locator.authority.executable_abi
         {
-            self.mark_partial(
-                "live loader arming",
+            return self.loader_arm_gap(
+                view_id,
                 "the mapped loader did not match the retained PT_INTERP target",
             );
-            return Ok(false);
         }
         let Some(hook) = loader_facts.hook.clone().map_err(anyhow::Error::msg)? else {
-            self.mark_partial(
-                "live loader arming",
+            return self.loader_arm_gap(
+                view_id,
                 "the exact loader had no executable _dl_debug_state definition",
             );
-            return Ok(false);
         };
         let loader_mapping =
             match unique_mapping_for_offset(&locator.authority.loader_maps, hook.file_offset) {
                 Ok(mapping) => mapping,
-                Err(reason) => {
-                    self.mark_partial("live loader arming", &reason);
-                    return Ok(false);
-                }
+                Err(reason) => return self.loader_arm_gap(view_id, &reason),
             };
         let state_address = loader_facts
             .state_address
@@ -24334,7 +24355,20 @@ impl Engine {
             .views
             .get(position)
             .is_some_and(|view| view.id() == view_id && view.still_the_same());
-        let outcome = loader_arm_outcome(generation_valid, result);
+        let outcome = match loader_arm_outcome(generation_valid, result) {
+            // A group in its final exit fails its arm reads (`ENOENT` on
+            // its executable or mappings) while its pidfd is not yet
+            // ready. It can never load anything again, so the failure is
+            // the process ending, not a refused arm: no record and no gap,
+            // exactly like a gone executable.
+            LoaderArmOutcome::OrdinaryFailure(_)
+                if !self.loader_view_has_live_context(view_id) && self.original_ending(view_id) =>
+            {
+                self.invalidate_causal_timing();
+                LoaderArmOutcome::NotArmable
+            }
+            outcome => outcome,
+        };
         // NotArmable views stay out of the loader aggregate entirely: no
         // record, so they never inflate the `unavailable` count. So does a
         // generation lost to an expected exit when no context bound: the
@@ -24491,6 +24525,7 @@ impl Engine {
             &mut self.task_uprobe_link_losses,
         );
         self.withdraw_exited_counted_leader_exit_losses();
+        self.withdraw_completed_quantum_deferrals();
         self.pending_leader_exit_order.clear();
         for view in pending_views {
             self.close_owned_selection_for_view(view);
@@ -24504,6 +24539,26 @@ impl Engine {
         };
         self.counters.object_skips.retain(|skip| *skip != announced);
         self.plan.skipped.retain(|skip| *skip != announced);
+    }
+
+    /// Capture end: a tick-quantum deferral whose every deferred pid was
+    /// rescanned later postponed work that then completed, so its records
+    /// are withdrawn. Any view still owed keeps every record.
+    pub(crate) fn withdraw_completed_quantum_deferrals(&mut self) {
+        if !self.quantum_deferred_views.is_empty() {
+            return;
+        }
+        for record in std::mem::take(&mut self.quantum_deferral_records) {
+            self.counters.object_skips.retain(|skip| *skip != record);
+            self.plan.skipped.retain(|skip| *skip != record);
+            for input in self.scan_inputs.values_mut() {
+                input.counters.object_skips.retain(|skip| *skip != record);
+            }
+            self.capture_facts
+                .visible_history_mut()
+                .losses
+                .remove(&scan_gap_key(&record));
+        }
     }
 
     /// Drops terminal pending assessments whose retained generation
@@ -25491,9 +25546,64 @@ impl Engine {
     /// Whether this view's retained original pin *proves* its process exited.
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
+    /// Whether `view`'s original thread group has exited or is in its
+    /// final exit, so it can never run user code again: no further
+    /// provider call and no further load can come from it. A per-process
+    /// arm or hook that failed on such a group loses nothing a success at
+    /// the same moment would have covered. Unlike `original_exited`, it
+    /// never consumes a scripted pin answer.
+    fn original_ending(&self, view: ProcessViewId) -> bool {
+        #[cfg(test)]
+        if self.final_exit_views_for_test.contains(&view) {
+            return true;
+        }
+        self.views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .is_some_and(ProcessView::final_exit_in_progress)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_final_exit_for_test(&mut self, view: ProcessViewId) {
         self.final_exit_views_for_test.insert(view);
+    }
+
+    /// Whether a tick stopped by queued retirements postpones only the
+    /// cleanup of ended groups: no newcomer, no refreshed live view, no
+    /// rejected retry, and every queued retirement on a gone generation.
+    /// Only a leaving retirement (a proven exit, an accepted generation
+    /// loss, or a ready intake proof) queues a view that is no longer
+    /// retained, so a released view is a gone generation; a retained one
+    /// — an unscanned live context — counts only while its group is
+    /// ending.
+    pub(crate) fn postpones_only_ending_cleanup(
+        &self,
+        no_new_views: bool,
+        no_refreshed_views: bool,
+    ) -> bool {
+        no_new_views
+            && no_refreshed_views
+            && self.pending_rejected_keys.is_empty()
+            && self.pending_retirements.iter().all(|view| {
+                !self.views.iter().any(|retained| retained.id() == *view)
+                    || self.original_ending(*view)
+            })
+    }
+
+    /// A per-view loader-arm step could not complete. An ending group is
+    /// not armable — silent and unrecorded, like a gone executable — and
+    /// anything else is a disclosed arming gap.
+    fn loader_arm_gap(
+        &mut self,
+        view: ProcessViewId,
+        reason: &str,
+    ) -> std::result::Result<bool, LoaderArmFailure> {
+        if self.original_ending(view) {
+            self.invalidate_causal_timing();
+            return Err(LoaderArmFailure::NotArmable);
+        }
+        self.mark_partial("live loader arming", reason);
+        Ok(false)
     }
 
     fn original_exited(&self, view: ProcessViewId) -> bool {
@@ -27737,12 +27847,18 @@ impl Engine {
                 }
                 let left = ordered.len() - index;
                 let noun = if left == 1 { "view" } else { "views" };
-                skipped.push(Skipped {
+                let record = Skipped {
                     subject: "live discovery tick".into(),
                     reason: format!(
                         "tick deep-scan quantum exhausted; {left} refreshed {noun} deferred to the next tick"
                     ),
-                });
+                };
+                self.quantum_deferred_views
+                    .extend(ordered[index..].iter().copied());
+                if !self.quantum_deferral_records.contains(&record) {
+                    self.quantum_deferral_records.push(record.clone());
+                }
+                skipped.push(record);
                 break;
             }
             let Some(position) = self.views.iter().position(|view| view.id() == *view_id) else {
@@ -27810,6 +27926,8 @@ impl Engine {
                         self.views[position].view_admission(),
                         &modules,
                     );
+                    // The deferred rescan ran: that view is no longer owed.
+                    self.quantum_deferred_views.remove(view_id);
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -30538,10 +30656,19 @@ impl Engine {
         records.extend(deferred_new_view_records);
         changed |= pre_candidate_result?;
         if !self.pending_retirements.is_empty() || !self.pending_rejected_keys.is_empty() {
-            self.mark_partial(
-                "live inventory transaction",
-                "completed conservative retirement remains queued for a later current-state rebuild",
-            );
+            // The tick stops here and a later rebuild finishes the cleanup.
+            // When all it postpones is the cleanup of groups that exited or
+            // are in their final exit — no newcomer, no refreshed live view,
+            // no rejected retry — nothing observable waits: those groups can
+            // never call again. Anything else is a disclosed postponement.
+            if self.postpones_only_ending_cleanup(new_views.is_empty(), refreshed_ok.is_empty()) {
+                self.invalidate_causal_timing();
+            } else {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "completed conservative retirement remains queued for a later current-state rebuild",
+                );
+            }
             return Ok(changed);
         }
         #[cfg(feature = "h6-reexec-diagnostic")]

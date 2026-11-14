@@ -29,6 +29,12 @@ impl LeaderExitReadBudget {
         Self::new(128, Instant::now() + Duration::from_millis(2))
     }
 
+    /// One final-exit proof after a failed per-process operation: rare
+    /// (failures only), so it may walk a few hundred task entries.
+    pub(crate) fn for_final_exit_proof() -> Self {
+        Self::new(512, Instant::now() + Duration::from_millis(20))
+    }
+
     fn new(remaining: u32, deadline: Instant) -> Self {
         Self {
             remaining,
@@ -293,6 +299,218 @@ impl PidPin {
     }
 }
 
+/// `SIGKILL` (9) in a `SigPnd`/`ShdPnd` mask.
+const SIGKILL_PENDING_MASK: u64 = 1 << (libc::SIGKILL - 1);
+
+/// One task's exit-relevant state: its stat line plus whether `SIGKILL`
+/// is pending on it (private or shared).
+#[derive(Clone, Copy)]
+struct ExitingTask {
+    stat: TaskStat,
+    sigkill: bool,
+}
+
+impl ExitingTask {
+    /// Whether this task can never execute user code again: it is a
+    /// zombie or dead, it is already in `do_exit` (`PF_EXITING` is never
+    /// cleared), or an unblockable `SIGKILL` is pending, which the kernel
+    /// delivers before any return to user mode. Each of these is
+    /// irreversible.
+    fn past_user_mode(self) -> bool {
+        matches!(self.stat.state, b'Z' | b'X' | b'x')
+            || self.stat.flags & PF_EXITING != 0
+            || self.sigkill
+    }
+}
+
+trait FinalExitIo {
+    type Tasks: Iterator<Item = Result<u32, ()>>;
+    fn group_exited(&mut self) -> Result<bool, ()>;
+    fn leader(&mut self) -> Result<ExitingTask, ()>;
+    fn tasks(&mut self) -> Result<Self::Tasks, ()>;
+    /// `Ok(None)` only when the member's directory is provably gone
+    /// (`ENOENT`: the thread was released); any other failure is `Err`.
+    fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()>;
+}
+
+/// Whether the retained thread group is in its final exit: either the
+/// original pidfd reports the whole group gone, or the original leader
+/// (same birth) and every member listed under it are past user mode.
+///
+/// A task in that state never runs user code again, so the group can make
+/// no further provider call and no further `dlopen`. Thread creation needs
+/// a task still in user mode, and a group exit or exec kill marks every
+/// linked thread under the same lock that `clone` checks, so a member
+/// born during the walk always has a live creator the walk sees. An
+/// `exec` kill leaves the execing thread live, so it never qualifies.
+/// Any unreadable member, a reused leader, or an exhausted budget answers
+/// false: only a positive proof counts.
+fn final_exit_with<Io: FinalExitIo>(
+    io: &mut Io,
+    retained_birth: u64,
+    work: &mut LeaderExitReadBudget,
+) -> bool {
+    if !work.spend(1) {
+        return false;
+    }
+    match io.group_exited() {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(()) => return false,
+    }
+    let leader_dying = |io: &mut Io| {
+        io.leader()
+            .is_ok_and(|task| task.stat.birth == retained_birth && task.past_user_mode())
+    };
+    if !work.spend(1) || !leader_dying(io) || !work.spend(1) {
+        return false;
+    }
+    let Ok(tasks) = io.tasks() else {
+        return false;
+    };
+    for entry in tasks {
+        if !work.spend(2) {
+            return false;
+        }
+        let Ok(tid) = entry else {
+            return false;
+        };
+        match io.member(tid) {
+            Ok(None) => {}
+            Ok(Some(task)) if task.past_user_mode() => {}
+            Ok(Some(_)) | Err(()) => return false,
+        }
+    }
+    // Close the walk on the same original leader: a reused or recovered
+    // leader never inherits the proof.
+    if !work.spend(2) {
+        return false;
+    }
+    io.group_exited() == Ok(true) || leader_dying(io)
+}
+
+fn read_relative_io(
+    directory: BorrowedFd<'_>,
+    path: &std::ffi::CStr,
+    limit: u64,
+) -> io::Result<String> {
+    // SAFETY: live directory fd and NUL-terminated, internally selected path.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a newly owned fd.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::other("proc member exceeds its bound"));
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
+}
+
+fn parse_exiting_task(stat: &str, status: &str) -> Result<ExitingTask, ()> {
+    let end = stat.rfind(')').ok_or(())?;
+    let mask = |key: &str| -> Result<u64, ()> {
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .ok_or(())?;
+        u64::from_str_radix(value.trim(), 16).map_err(|_| ())
+    };
+    Ok(ExitingTask {
+        stat: TaskStat {
+            birth: start_time_from_stat(stat).map_err(|_| ())?,
+            state: stat[end + 1..]
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.as_bytes().first())
+                .copied()
+                .ok_or(())?,
+            flags: stat_flags_from_stat_text(stat).ok_or(())?,
+        },
+        sigkill: (mask("SigPnd:")? | mask("ShdPnd:")?) & SIGKILL_PENDING_MASK != 0,
+    })
+}
+
+impl FinalExitIo for OsExitIo<'_> {
+    type Tasks =
+        std::iter::Map<std::fs::ReadDir, fn(io::Result<std::fs::DirEntry>) -> Result<u32, ()>>;
+
+    fn group_exited(&mut self) -> Result<bool, ()> {
+        self.original.original_exited().map_err(|_| ())
+    }
+    fn leader(&mut self) -> Result<ExitingTask, ()> {
+        let directory = self.directory.directory.as_fd();
+        let stat = read_relative_io(directory, c"stat", STAT_BYTES).map_err(|_| ())?;
+        let status = read_relative_io(directory, c"status", STATUS_BYTES).map_err(|_| ())?;
+        parse_exiting_task(&stat, &status)
+    }
+    fn tasks(&mut self) -> Result<Self::Tasks, ()> {
+        ExitIo::tasks(self)
+    }
+    fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
+        let directory = self.directory.directory.as_fd();
+        let read = |name: &str, limit| {
+            let path = std::ffi::CString::new(format!("task/{tid}/{name}")).map_err(|_| None)?;
+            read_relative_io(directory, &path, limit).map_err(|error| {
+                (error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH))
+                .then_some(())
+            })
+        };
+        let stat = match read("stat", STAT_BYTES) {
+            Ok(stat) => stat,
+            Err(Some(())) => return Ok(None),
+            Err(None) => return Err(()),
+        };
+        let status = match read("status", STATUS_BYTES) {
+            Ok(status) => status,
+            Err(Some(())) => return Ok(None),
+            Err(None) => return Err(()),
+        };
+        parse_exiting_task(&stat, &status).map(Some)
+    }
+}
+
+impl PidPin {
+    /// Bounded final-exit proof for this retained generation (see
+    /// `final_exit_with`). A start-time fallback pin never qualifies.
+    pub(crate) fn final_exit_in_progress(&self, work: &mut LeaderExitReadBudget) -> bool {
+        if self.pidfd().is_err() || !work.spend(1) {
+            return false;
+        }
+        match self.original_exited() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let Some(birth) = self.start_time() else {
+            return false;
+        };
+        if !work.spend(8) {
+            return false;
+        }
+        let Ok(directory) = self.open_proc_dir() else {
+            return false;
+        };
+        final_exit_with(
+            &mut OsExitIo {
+                original: self,
+                directory,
+            },
+            birth,
+            work,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +644,153 @@ mod tests {
             ),
             LeaderExitObservation::Unresolved
         );
+    }
+
+    struct ScriptedFinalExit {
+        exited: bool,
+        leader: ExitingTask,
+        members: Vec<(u32, Result<Option<ExitingTask>, ()>)>,
+        reused_leader_after_walk: bool,
+        leader_reads: usize,
+    }
+    impl FinalExitIo for ScriptedFinalExit {
+        type Tasks = std::vec::IntoIter<Result<u32, ()>>;
+        fn group_exited(&mut self) -> Result<bool, ()> {
+            Ok(self.exited)
+        }
+        fn leader(&mut self) -> Result<ExitingTask, ()> {
+            self.leader_reads += 1;
+            let mut leader = self.leader;
+            if self.reused_leader_after_walk && self.leader_reads > 1 {
+                leader.stat.birth += 1;
+            }
+            Ok(leader)
+        }
+        fn tasks(&mut self) -> Result<Self::Tasks, ()> {
+            let mut tids = vec![Ok(7)];
+            tids.extend(self.members.iter().map(|(tid, _)| Ok(*tid)));
+            Ok(tids.into_iter())
+        }
+        fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
+            if tid == 7 {
+                return Ok(Some(self.leader));
+            }
+            self.members
+                .iter()
+                .find(|(member, _)| *member == tid)
+                .map(|(_, task)| *task)
+                .unwrap_or(Ok(None))
+        }
+    }
+    fn task(state: u8, flags: u32, sigkill: bool) -> ExitingTask {
+        ExitingTask {
+            stat: TaskStat {
+                birth: 500,
+                state,
+                flags,
+            },
+            sigkill,
+        }
+    }
+    fn dying_group() -> ScriptedFinalExit {
+        ScriptedFinalExit {
+            exited: false,
+            leader: task(b'Z', PF_EXITING, false),
+            members: vec![
+                (8, Ok(Some(task(b'R', PF_EXITING, false)))),
+                (9, Ok(Some(task(b'S', 0, true)))),
+                (10, Ok(None)),
+            ],
+            reused_leader_after_walk: false,
+            leader_reads: 0,
+        }
+    }
+    fn final_exit(io: &mut ScriptedFinalExit) -> bool {
+        final_exit_with(io, 500, &mut LeaderExitReadBudget::for_test(512))
+    }
+    #[test]
+    fn group_past_user_mode_is_in_final_exit() {
+        assert!(final_exit(&mut dying_group()));
+        let mut single = dying_group();
+        single.members.clear();
+        single.leader = task(b'R', PF_EXITING, false);
+        assert!(final_exit(&mut single), "a single task already in do_exit");
+        let mut exited = dying_group();
+        exited.exited = true;
+        exited.leader = task(b'S', 0, false);
+        assert!(
+            final_exit(&mut exited),
+            "the original pidfd proves it outright"
+        );
+    }
+    #[test]
+    fn any_task_still_in_user_mode_keeps_the_group_live() {
+        // A leader that left by pthread_exit while a worker runs.
+        let mut worker = dying_group();
+        worker.members.push((11, Ok(Some(task(b'S', 0, false)))));
+        assert!(!final_exit(&mut worker));
+        // An exec kill: the execing leader stays live.
+        let mut exec = dying_group();
+        exec.leader = task(b'R', 0, false);
+        assert!(!final_exit(&mut exec));
+        // An unreadable member is never proof.
+        let mut unreadable = dying_group();
+        unreadable.members.push((11, Err(())));
+        assert!(!final_exit(&mut unreadable));
+    }
+    #[test]
+    fn reused_leader_and_budgets_never_prove_final_exit() {
+        let mut reused = dying_group();
+        reused.leader.stat.birth = 501;
+        assert!(!final_exit(&mut reused));
+        let mut reused_late = dying_group();
+        reused_late.reused_leader_after_walk = true;
+        assert!(!final_exit(&mut reused_late));
+        for units in [0, 1, 2, 4, 8] {
+            assert!(
+                !final_exit_with(
+                    &mut dying_group(),
+                    500,
+                    &mut LeaderExitReadBudget::for_test(units)
+                ),
+                "{units}"
+            );
+        }
+    }
+    #[test]
+    fn exiting_task_reads_sigkill_from_either_pending_mask() {
+        let stat = "7 (x) R 1 7 7 0 -1 4194564 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0";
+        let status = |pnd: &str, shd: &str| format!("Name:\tx\nSigPnd:\t{pnd}\nShdPnd:\t{shd}\n");
+        let parsed =
+            parse_exiting_task(stat, &status("0000000000000000", "0000000000000000")).unwrap();
+        assert!(!parsed.sigkill);
+        assert_eq!(parsed.stat.birth, 500);
+        assert!(
+            parse_exiting_task(stat, &status("0000000000000100", "0000000000000000"))
+                .unwrap()
+                .sigkill
+        );
+        assert!(
+            parse_exiting_task(stat, &status("0000000000000000", "0000000000000100"))
+                .unwrap()
+                .sigkill
+        );
+        assert!(
+            parse_exiting_task(stat, "Name:\tx\n").is_err(),
+            "missing masks are not proof"
+        );
+    }
+    #[test]
+    fn real_live_group_is_not_in_final_exit_until_it_exits() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pin = PidPin::open(child.id()).unwrap();
+        assert!(pin.pidfd().is_ok(), "the proof needs a pidfd pin");
+        assert!(!pin.final_exit_in_progress(&mut LeaderExitReadBudget::for_test(512)));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(pin.final_exit_in_progress(&mut LeaderExitReadBudget::for_test(512)));
     }
 }

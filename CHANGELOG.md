@@ -27,6 +27,18 @@ versioned separately and are opaque, exact dispatch keys.
   first live-tick walk: initial discovery already listed them, so
   their exits are proved like walk-listed ones (was: unproved until
   first listed, one gap each).
+- System and cgroup captures no longer report a lossy observation when
+  a process that used the provider exits while discovery is arming or
+  hooking it: a thread group that has exited, or whose every thread is
+  already exiting or has a pending `SIGKILL`, can never call or load
+  again, so its failed loader arm, missing loader context, or changed
+  generation around an export hook is the process ending, not a gap
+  (was: an unbound `loader_discovery` context plus "discovery
+  unavailable" skips). The same failures on a live process stay named
+  gaps. A tick that stops only to finish cleaning up such ended
+  processes no longer files a postponement gap either, and a tick
+  deep-scan deferral is withdrawn at capture end once every deferred
+  process was rescanned (it stays when any rescan is still owed).
 
 ### Known limitations
 

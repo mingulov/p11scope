@@ -744,6 +744,13 @@ impl ProcessView {
         self.pin.original_generation_state()
     }
 
+    /// Whether this view's original thread group has exited or can never
+    /// run user code again (see `PidPin::final_exit_in_progress`).
+    pub(crate) fn final_exit_in_progress(&self) -> bool {
+        self.pin
+            .final_exit_in_progress(&mut leader_exit::LeaderExitReadBudget::for_final_exit_proof())
+    }
+
     pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
         run_while_same_with(|| self.still_the_same(), action)
     }

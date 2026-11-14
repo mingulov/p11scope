@@ -83455,3 +83455,71 @@ fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
         engine.counters.object_skips
     );
 }
+
+/// A tick stopped by queued retirements postpones nothing observable
+/// only when every queued retirement is an ending group and no newcomer,
+/// refreshed live view or rejected retry waits behind it.
+#[test]
+fn queued_retirement_postpones_only_ending_cleanup_exactly() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    engine.pending_retirements.insert(view);
+    assert!(
+        !engine.postpones_only_ending_cleanup(true, true),
+        "a live group's queued retirement is a disclosed postponement"
+    );
+    engine.set_final_exit_for_test(view);
+    assert!(engine.postpones_only_ending_cleanup(true, true));
+    assert!(
+        !engine.postpones_only_ending_cleanup(false, true),
+        "a waiting newcomer is postponed work"
+    );
+    assert!(
+        !engine.postpones_only_ending_cleanup(true, false),
+        "a waiting refreshed view is postponed work"
+    );
+    engine.pending_retirements.insert(ProcessViewId(99));
+    assert!(
+        engine.postpones_only_ending_cleanup(true, true),
+        "a released view was queued only by a leaving retirement"
+    );
+    engine.pending_rejected_keys.insert(ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 0, minor: 1 },
+        inode: 1,
+    });
+    assert!(
+        !engine.postpones_only_ending_cleanup(true, true),
+        "a rejected retry is postponed work"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// A tick-quantum deferral postpones rescans with their requests kept:
+/// withdrawn at capture end once every deferred pid was rescanned, kept
+/// while any deferred pid is still owed its rescan.
+#[test]
+fn quantum_deferral_records_stand_only_while_a_rescan_is_owed() {
+    let record = Skipped {
+        subject: "live discovery tick".into(),
+        reason: "tick deep-scan quantum exhausted; 2 refreshed views deferred to the next tick"
+            .into(),
+    };
+    let seed = |engine: &mut Engine, owed: &[ProcessViewId]| {
+        engine.quantum_deferred_views.extend(owed.iter().copied());
+        engine.quantum_deferral_records.push(record.clone());
+        engine.counters.object_skips.push(record.clone());
+        engine.plan.skipped.push(record.clone());
+    };
+    let mut owed = Engine::empty();
+    seed(&mut owed, &[ProcessViewId(41)]);
+    owed.withdraw_completed_quantum_deferrals();
+    assert!(owed.counters.object_skips.contains(&record));
+    assert!(owed.plan.skipped.contains(&record));
+
+    let mut settled = Engine::empty();
+    seed(&mut settled, &[]);
+    settled.withdraw_completed_quantum_deferrals();
+    assert!(!settled.counters.object_skips.contains(&record));
+    assert!(!settled.plan.skipped.contains(&record));
+}

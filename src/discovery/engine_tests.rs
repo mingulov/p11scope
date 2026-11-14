@@ -5601,21 +5601,24 @@ fn wait_until_zombie(pid: u32) {
 }
 
 /// One fixture `{proc_root}/{pid}/stat` line: `sleep` comm, `state`, `flags`,
-/// `starttime`. Mirrors a real stat line field for field so the user-process,
-/// kthread, and liveness filters parse it like live input; ppid is synthetic
-/// (nothing on this path reads parentage). User fixtures pass `4194304`
-/// (never `PF_KTHREAD`); kthread fixtures OR in `0x200000`.
+/// `num_threads` (field 20), `starttime`. Mirrors a real stat line field for
+/// field so the user-process, kthread, and liveness filters parse it like
+/// live input; ppid is synthetic (nothing on this path reads parentage).
+/// User fixtures pass `4194304` (never `PF_KTHREAD`); kthread fixtures OR
+/// in `0x200000`. A whole-group zombie reads field 20 as 1; a zombie
+/// leader with live workers reads 2 or more.
 fn write_proc_stat_fixture(
     dir: &std::path::Path,
     pid: u32,
     state: &str,
     flags: u32,
+    num_threads: u32,
     starttime: u64,
 ) {
     let pid_dir = dir.join(pid.to_string());
     std::fs::create_dir_all(&pid_dir).expect("fixture pid dir");
     let line = format!(
-        "{pid} (sleep) {state} 1 1 1 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0\n"
+        "{pid} (sleep) {state} 1 1 1 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 {num_threads} 0 {starttime} 0 0\n"
     );
     std::fs::write(pid_dir.join("stat"), line).expect("fixture stat");
 }
@@ -5641,7 +5644,7 @@ fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
     wait_until_zombie(pid);
     let procdir = tempfile::tempdir().expect("fixture proc root");
     let starttime = crate::process::process_start_time(pid).expect("zombie keeps starttime");
-    write_proc_stat_fixture(procdir.path(), pid, "Z", 4194304, starttime);
+    write_proc_stat_fixture(procdir.path(), pid, "Z", 4194304, 1, starttime);
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
     assert!(
@@ -5712,7 +5715,7 @@ fn tick_still_marks_running_newcomer_without_view() {
         !stat.contains(" Z "),
         "sleeper must be running, got: {stat}"
     );
-    write_proc_stat_fixture(procdir.path(), pid, "S", 4194304, starttime);
+    write_proc_stat_fixture(procdir.path(), pid, "S", 4194304, 1, starttime);
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
     // Marked, then possibly admitted in the same tick (admission consumes
@@ -5797,7 +5800,7 @@ fn pre_walk_kthread_exit_skips_after_initial_seed() {
         dir: Arc::new(File::open("/dev/null").unwrap()),
     };
     let procdir = tempfile::tempdir().expect("fixture proc root");
-    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 100);
+    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 1, 100);
     std::fs::write(procdir.path().join("4242").join("maps"), "").expect("empty maps");
     engine.proc_root = procdir.path().to_path_buf();
     engine.seed_initial_kernel_threads(&[4242]);
@@ -5828,7 +5831,7 @@ fn initial_kthread_seed_honours_engine_proc_root() {
     );
 
     let procdir = tempfile::tempdir().expect("fixture proc root");
-    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 100);
+    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 1, 100);
     std::fs::write(procdir.path().join("4242").join("maps"), "").expect("empty maps");
     engine.proc_root = procdir.path().to_path_buf();
     engine.seed_initial_kernel_threads(&[4242]);
@@ -5887,6 +5890,7 @@ fn tick_still_marks_reused_pid_with_pending_view() {
         pid,
         "R",
         4194304,
+        1,
         old_start.unwrap_or(0).wrapping_add(100),
     );
     engine.proc_root = procdir.path().to_path_buf();
@@ -5895,6 +5899,102 @@ fn tick_still_marks_reused_pid_with_pending_view() {
         engine.newcomer_first_seen.contains_key(&pid),
         "reused running pid with a pending view must still mark"
     );
+    child.wait().ok();
+}
+
+/// A `Z`-state pid whose stat line still counts live threads (field 20 >= 2)
+/// is a running zombie leader, not an ended generation: it must still mark
+/// (or admit) as a newcomer, or its calls are missed silently.
+#[test]
+fn tick_still_marks_zombie_leader_with_live_threads() {
+    let pid = 424243u32;
+    assert!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err(),
+        "test pid must stay absent"
+    );
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    write_proc_stat_fixture(procdir.path(), pid, "Z", 4194304, 2, 100);
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    // Marked, then possibly admitted in the same tick (admission consumes
+    // the mark): either way the zombie leader is processed, never skipped.
+    let marked = engine.newcomer_first_seen.contains_key(&pid);
+    let admitted = engine.views.iter().any(|view| view.pid() == pid);
+    assert!(
+        marked || admitted,
+        "zombie leader with live threads must still be processed (mark/admit)"
+    );
+}
+
+/// A real process whose main thread called `pthread_exit` while a worker
+/// keeps running reads `Z` with field 20 == 2 on live `/proc`: the tick
+/// must mark (or admit) it as a newcomer, never skip it as dead.
+#[test]
+fn tick_still_marks_real_zombie_leader_with_live_worker() {
+    let dir = tempfile::tempdir().expect("fixture build dir");
+    let source = dir.path().join("workers.c");
+    let executable = dir.path().join("workers");
+    std::fs::write(
+        &source,
+        r#"
+#include <pthread.h>
+#include <unistd.h>
+static void *worker(void *unused) {
+    (void)unused;
+    for (;;) pause();
+    return 0;
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, worker, 0) != 0) return 2;
+    pthread_exit(0);
+}
+"#,
+    )
+    .expect("fixture source");
+    let status = std::process::Command::new("gcc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-O1"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("gcc must be installed");
+    assert!(status.success(), "fixture must compile");
+    let mut child = std::process::Command::new(&executable)
+        .die_with_parent()
+        .spawn()
+        .expect("spawn zombie-leader fixture");
+    let pid = child.id();
+    wait_until_zombie(pid);
+    // Guard the shape: Z with live threads, or this test proves nothing.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("live stat");
+    let tail = stat.rsplit_once(')').expect("comm close").1;
+    let mut fields = tail.split_whitespace();
+    assert_eq!(
+        fields.next(),
+        Some("Z"),
+        "fixture must read zombie state, got: {stat}"
+    );
+    let threads: i64 = fields
+        .nth(16)
+        .expect("field 20 present")
+        .parse()
+        .expect("field 20 numeric");
+    assert!(
+        threads >= 2,
+        "fixture must keep live workers, got threads={threads}: {stat}"
+    );
+    // Live proc root: the tick parses the real field 20, not a fixture.
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
+    refresh_inventory_once(&mut engine);
+    let marked = engine.newcomer_first_seen.contains_key(&pid);
+    let admitted = engine.views.iter().any(|view| view.pid() == pid);
+    assert!(
+        marked || admitted,
+        "real zombie leader with a live worker must still be processed (mark/admit)"
+    );
+    child.kill().ok();
     child.wait().ok();
 }
 

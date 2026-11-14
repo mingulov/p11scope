@@ -2834,7 +2834,7 @@ impl CallerRegistry {
     /// Dispose the abandoned quantum's stranded staged Joint calls
     /// on every retained feed (running-rearm recovery only): an
     /// applied abandon strands staged-but-unreduced calls whose
-    /// keys the void refused, and the recovery's fallback
+    /// history the void fenced, and the recovery's fallback
     /// verification would trip over them. Staged calls are
     /// per-quantum transient — a finished quantum delivers all of
     /// them — so everything staged here is the abandoned

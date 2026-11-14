@@ -2676,7 +2676,7 @@ fn foreign_fold_display(stored: &str, group: &[&GapView]) -> (String, String) {
     let Some((cause, root)) = foreign_fold_parts(stored) else {
         let subject = group
             .first()
-            .map(|gap| gap_plain_subject(&gap.subject).to_string())
+            .map(|gap| gap_plain_subject(&gap.subject, stored).to_string())
             .unwrap_or_else(|| "mapped objects".to_string());
         return (subject, stored.to_string());
     };
@@ -2684,7 +2684,7 @@ fn foreign_fold_display(stored: &str, group: &[&GapView]) -> (String, String) {
     // width so the `--json` pointer survives; verbose and JSON carry the
     // full `target root … differs from the observer root` suffix.
     if group.len() == 1 {
-        let subject = gap_plain_subject(&group[0].subject).to_string();
+        let subject = gap_plain_subject(&group[0].subject, stored).to_string();
         let reason = format!("{cause} in root {root}");
         (subject, reason)
     } else {
@@ -2885,7 +2885,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         if gap.caller.is_none()
             && gap.module.is_none()
             && gap.pid.is_none()
-            && gap_plain_subject(&gap.subject) == "kernel threads"
+            && gap_plain_subject(&gap.subject, &gap.reason) == "kernel threads"
             && kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason)).is_some()
         {
             kthreads.push(gap);
@@ -2935,7 +2935,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         {
             reason_text = folded;
         }
-        let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
+        let subject = escape_controls(gap_plain_subject(&gap.subject, reason_text)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.subject, reason_text)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
         let entry = groups.entry((subject, reason)).or_insert((0, true));
@@ -3180,8 +3180,20 @@ fn key_observation_plain_reason(reason: &str) -> &str {
 /// One gap subject in plain words (text only; JSON keeps the stored
 /// subject). The Joint subjects map — the disclosed refusal, the
 /// silent-bootstrap one, and the unlinked-journal disclosure;
-/// everything else passes through verbatim.
-fn gap_plain_subject(subject: &str) -> &str {
+/// everything else passes through verbatim. The void and deferral
+/// rows share the Joint-unavailable stored subject with per-process
+/// seal gaps, so the reason disambiguates them: scope-wide void rows
+/// never claim a per-process non-start, and deferral rows read
+/// paused, never unstarted.
+fn gap_plain_subject<'a>(subject: &'a str, reason: &'a str) -> &'a str {
+    if subject == "Joint key operations unavailable; retained S1" {
+        if reason.strip_prefix("joint_void_").is_some() {
+            return "Per-key tracking lost history for every process; function counts above are unaffected";
+        }
+        if reason == "joint_resume_deferred_below_fence" {
+            return "Per-key tracking paused for this process; function counts above are unaffected";
+        }
+    }
     match subject {
         "Joint key operations unavailable; retained S1" | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
             "Per-key tracking did not start for this process; function counts above are unaffected"
@@ -3220,6 +3232,15 @@ fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
     }
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
+    }
+    // Scope-wide void gaps (every sub-cause) and the per-feed
+    // below-fence deferral: history loss with retained counts, and
+    // the wait to restart past it.
+    if reason.strip_prefix("joint_void_").is_some() {
+        return "per-key tracking lost part of its history; function counts are unaffected";
+    }
+    if reason == "joint_resume_deferred_below_fence" {
+        return "per-key tracking waits to restart after lost history";
     }
     // The deferred-admission note (a non-loss retry) names its retry;
     // every other semantic-unavailable site is plain unavailability.
@@ -4636,7 +4657,7 @@ fn render_snapshot_inner(
         // error text): escaped like every other snapshot field (DR-11).
         // Known machine subjects/reasons render in plain words with the
         // machine token beside them (JSON keeps the stored strings).
-        let plain_subject = gap_plain_subject(&gap.subject);
+        let plain_subject = gap_plain_subject(&gap.subject, &gap.reason);
         let plain_reason = gap_plain_reason(&gap.subject, &gap.reason);
         let mut subject = escape_controls(plain_subject).into_owned();
         if plain_subject != gap.subject {

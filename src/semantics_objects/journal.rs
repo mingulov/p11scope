@@ -2825,6 +2825,10 @@ impl JournalAdapter {
             .extend(self.fence_void(model, upper).effects);
         self.invalidated = true;
         self.void_staged();
+        // Bind future births at void time, like reject_audit: births
+        // naming a cut below the void refuse even when their key did
+        // not exist at the void, without waiting for the re-sync.
+        self.voided_through = self.voided_through.max(upper);
         SealFailure {
             scope: self.affected_failure_scope(),
             gap,

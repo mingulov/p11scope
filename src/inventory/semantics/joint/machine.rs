@@ -3215,11 +3215,11 @@ impl LiveJointMachine {
                 self.absence_entry = 0;
                 let work = budget.remaining_actions.min(MAX_PENDING);
                 // A Joint fault never stops S1: a linked stream broken
-                // while ingesting ends Joint for every existing key and
-                // re-syncs above a fence on this collect.
+                // while ingesting fences the consumed history and
+                // re-syncs above it on this collect, refusing no key.
                 // The void returns no seal failure, so it names its own
                 // ending here; the break quantum's seal gap and the
-                // refused keys' later seals are disclosed separately.
+                // fenced keys' later seals are disclosed separately.
                 // A void the semantic pool cannot pay for yet is retried on
                 // later running Idle ticks (it is idempotent and
                 // all-or-nothing): the tick yields instead of refusing, so

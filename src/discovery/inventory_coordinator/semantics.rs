@@ -2308,10 +2308,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         self.semantic_finalizer = None;
         self.refused_semantic_domains.insert(domain);
-        // Diagnostic-only (Task 0): the void counters are run-global
-        // and never reset, so the replacement owner adopts them. The
-        // snapshot copies the five counters directly, without the
-        // per-key gauge scan the full diagnosis runs.
+        // Diagnostic-only (Task 0 plus the scope-round split): the
+        // void counters are run-global and never reset, so the
+        // replacement owner adopts them. The snapshot copies all
+        // fourteen counters directly, without the per-key gauge scan
+        // the full diagnosis runs.
         let carried = self.joint_capture.adapter().joint_void_counts();
         self.joint_capture =
             crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(

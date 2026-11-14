@@ -44,15 +44,19 @@ pub(crate) struct IngestedJointQuantum {
     // Original bulk S1Only refusal and original audit result remain distinct.
     // Both buffers are precharged before the first taint/model mutation.
     raw_failure: Option<SealFailure>,
-    // A carried ingest-break void's own original failure (its pre-break
-    // keys' abandonment), in a slot of its own so any next frame, ingested
-    // or disposed, takes it whatever the other two slots hold.
+    // A carried ingest-break void's own original failure (its fenced
+    // pre-break ends: uncertain session outcomes, retired objects,
+    // voided bootstraps), in a slot of its own so any next frame,
+    // ingested or disposed, takes it whatever the other two slots hold.
     void_failure: Option<SealFailure>,
     failure: Option<SealFailure>,
     // Diagnostic-only per-void dedup (scope round): the (fence, gap) of
     // each void failure already counted as ending a Joint feed, so one
-    // void fanning out to many feeds counts once. Instrumentation only.
-    void_feed_ends_counted: Vec<(Option<u64>, JournalGap)>,
+    // void fanning out to many feeds counts once. Fixed-size and
+    // inline: at most one entry per original slot plus the selected
+    // failure, so four slots always suffice and no heap allocation
+    // escapes the frame's prepaid storage. Instrumentation only.
+    void_feed_ends_counted: [Option<(Option<u64>, JournalGap)>; 4],
     consumers: Vec<FrameConsumer>,
     bound: bool,
     cursor: usize,
@@ -824,7 +828,7 @@ impl IngestedJointQuantum {
             raw_failure,
             void_failure,
             failure,
-            void_feed_ends_counted: Vec::new(),
+            void_feed_ends_counted: [None; 4],
             consumers: Vec::new(),
             bound: false,
             cursor: 0,
@@ -930,7 +934,7 @@ impl IngestedJointQuantum {
             raw_failure,
             void_failure,
             failure,
-            void_feed_ends_counted: Vec::new(),
+            void_feed_ends_counted: [None; 4],
             consumers: Vec::new(),
             bound: false,
             cursor: 0,
@@ -1970,8 +1974,17 @@ impl IngestedJointQuantum {
                 if void_ending {
                     let ended = batch.audited().failure();
                     let key = (ended.fence, ended.gap);
-                    if !self.void_feed_ends_counted.contains(&key) {
-                        self.void_feed_ends_counted.push(key);
+                    if !self.void_feed_ends_counted.contains(&Some(key)) {
+                        // Four slots always suffice (see the field);
+                        // a full set still counts the ending rather
+                        // than dropping a void that ended a feed.
+                        if let Some(free) = self
+                            .void_feed_ends_counted
+                            .iter_mut()
+                            .find(|slot| slot.is_none())
+                        {
+                            *free = Some(key);
+                        }
                         adapter.note_void_ended_joint_feed();
                     }
                 }

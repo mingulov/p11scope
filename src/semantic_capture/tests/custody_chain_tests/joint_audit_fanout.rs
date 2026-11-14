@@ -9830,8 +9830,11 @@ fn joint_audit_resource_void_ending_joint_feeds_counts_once() {
         "one resource void ending two Joint feeds counts one ending"
     );
     assert!(
-        fixture.feeds().iter().all(|feed| feed.degraded),
-        "the resource void ended every Joint feed"
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.degraded && !feed.fallback),
+        "the resource void ends every Joint feed degraded, never fallen back"
     );
 }
 

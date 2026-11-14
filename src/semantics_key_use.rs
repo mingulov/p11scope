@@ -507,10 +507,14 @@ impl JointStaging {
     /// recorded fence while the retained receipt cuts below it, so the
     /// Task-1→3 interim (a voided but resumable feed that can only wait
     /// for re-selection) names one counted per-feed reason instead of
-    /// refusing silently. A new void re-arms it; a clean resume clears
-    /// it.
+    /// refusing silently. Only a resumable segment defers — a
+    /// never-resumable ending already names its own seal gap, and
+    /// calling its refusal "deferred" would promise a re-selection
+    /// that cannot land before Task 3. A new void re-arms it; a clean
+    /// resume clears it.
     pub(crate) fn take_below_fence_deferral(&mut self) -> bool {
-        if self.receipt_below_recorded_fence()
+        if self.segment_resumable
+            && self.receipt_below_recorded_fence()
             && self.resume_deferral_disclosed != self.segment_fence
         {
             self.resume_deferral_disclosed = self.segment_fence;

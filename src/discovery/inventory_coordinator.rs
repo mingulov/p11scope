@@ -3129,10 +3129,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// `joint_void_<subcause>_history_loss` gap per void since the last
     /// drain, like ingest-break voids. Scope-wide (not per process).
     /// Idempotent: the baseline tracks the adapter's run-global
-    /// counters, which retirement carries, so retries, replacement
-    /// owners and repeated stop disclosures neither repeat nor lose a
-    /// void. A replaced owner that recounts from zero re-baselines
-    /// instead of disclosing stale totals.
+    /// counters, which retirement carries, so retries and repeated
+    /// stop disclosures neither repeat nor lose a void. A replaced
+    /// owner must carry its counters over: one that recounts from
+    /// zero re-baselines instead, and the difference stays
+    /// undisclosed.
     pub(crate) fn disclose_audit_void_gaps(&mut self) {
         use crate::semantics_objects::journal::{AUDIT_VOID_GAPS, JournalGap};
         let split = self.joint_capture.adapter().joint_void_counts();

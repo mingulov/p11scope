@@ -1400,7 +1400,7 @@ pub(crate) struct LiveJointMachine {
     /// a fixed ring, so the window costs no heap past the machine's own
     /// pool reservation. `None` slots are free or expired.
     rearm_window: [Option<Instant>; RUNNING_REARM_LIMIT as usize],
-    /// Posed wall clock for the running re-arm window (tests only):
+    /// Posed monotonic clock for the running re-arm window (tests only):
     /// production always reads `Instant::now()`.
     #[cfg(test)]
     posed_rearm_now: Option<Instant>,
@@ -1554,7 +1554,7 @@ impl LiveJointMachine {
         self.finish_no_progress_since = since;
     }
 
-    /// Pose (or clear) the wall clock the running re-arm window
+    /// Pose (or clear) the monotonic clock the running re-arm window
     /// reads, so the twin can age re-arms past the window without
     /// waiting it out. Production never sets this.
     #[cfg(test)]
@@ -1562,8 +1562,8 @@ impl LiveJointMachine {
         self.posed_rearm_now = now;
     }
 
-    /// Wall clock for the running re-arm window: the posed test
-    /// clock when set, else `Instant::now()`.
+    /// Monotonic clock for the running re-arm window: the posed
+    /// monotonic test clock when set, else `Instant::now()`.
     pub(crate) fn rearm_now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = self.posed_rearm_now {
@@ -1842,7 +1842,8 @@ impl LiveJointMachine {
         self.finish_no_progress_polls = 0;
         self.finish_no_progress_since = None;
         self.unpaid_void_yields = 0;
-        self.running_rearms += 1;
+        // The window bounds; the total only counts, so it saturates, never wraps.
+        self.running_rearms = self.running_rearms.saturating_add(1);
         let slot = self
             .rearm_window
             .iter_mut()

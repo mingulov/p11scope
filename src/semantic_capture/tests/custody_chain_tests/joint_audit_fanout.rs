@@ -14272,6 +14272,9 @@ fn joint_machine_running_rearms_are_bounded() {
     let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(std::time::Instant::now()));
     for round in 0..limit {
         fixture.refuse_at_audited(2 + round as u64);
         assert_eq!(
@@ -14412,6 +14415,77 @@ fn joint_machine_dense_rearm_storm_stops_at_the_rate_bound() {
         fixture.machine.rearm_refusal_for_test(),
         Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
         "the exhausted stop names the spent rate bound"
+    );
+}
+
+/// Slide twin: a full window expires and admits again. Thirty-two
+/// re-arms at one posed instant fill the window; advancing the posed
+/// clock past the 600 s window expires every stamp, so the next
+/// refusal re-arms (total 33) and names one more gap. The slid stamp
+/// starts a fresh window: 31 more rapid re-arms refill it, and the
+/// next refusal stops at the rate bound again.
+#[test]
+fn joint_machine_full_rearm_window_expiry_admits_again() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let start = std::time::Instant::now();
+    fixture.machine.set_rearm_clock_for_test(Some(start));
+    for round in 0..limit {
+        fixture.refuse_at_audited(2 + round as u64);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "storm re-arm {round} is inside the window"
+        );
+    }
+    assert_eq!(fixture.machine.running_rearms_for_test(), limit);
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(start + std::time::Duration::from_secs(601)));
+    fixture.refuse_at_audited(2 + limit as u64);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the first re-arm past the window slides it and continues"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        limit + 1,
+        "the slid re-arm counts past the old per-run total"
+    );
+    assert_eq!(
+        fixture
+            .all_gap_subjects()
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        (limit + 1) as usize,
+        "one named gap per continued interruption"
+    );
+    for round in 0..(limit - 1) {
+        fixture.refuse_at_audited(3 + limit as u64 + round as u64);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "second-window re-arm {round} is inside the window"
+        );
+    }
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        2 * limit,
+        "the second window refills to the bound"
+    );
+    fixture.refuse_at_audited(2 + 2 * limit as u64);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "the second full window stops at the rate bound"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
+        "the second stop names the spent rate bound"
     );
 }
 

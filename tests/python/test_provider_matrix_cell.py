@@ -18,7 +18,11 @@ scripts/ci/provider_matrix_cell_compare.py. These tests pin the judge:
   exact 4-surface shape; an ambiguity refusal becomes an expected-failure
   pointing at the static-progs I2 fix, never a silent skip;
 - providers without pinned surfaces record nonqualifying rows, but a
-  discover crash still fails.
+  discover crash still fails;
+- in root mode the cells directory is handed to the suite user before
+  discover and the paced workload run: both create files directly in
+  $OUT (manifest.json, workload.ready) under the setpriv drop, and a
+  root-owned $OUT killed the CI cells with EACCES.
 
 Run: python3 -I tests/python/test_provider_matrix_cell.py -v
 """
@@ -819,6 +823,83 @@ class PreflightDropTests(unittest.TestCase):
                 0, proc.returncode, f"{proc.stderr}\npreflight.log={log}")
             self.assertIn("probe-exec-ran", log)
             self.assertNotIn("setpriv-shim", log)
+
+
+def out_setup_source():
+    """The verbatim $OUT setup from the shipped cell script."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    matches = re.findall(
+        r'(?ms)^mkdir -p "\$OUT" \|\| exit 2$\n(.*?)\n^COMPARE=', text)
+    assert len(matches) == 1, (
+        f"expected exactly one $OUT setup block in {SCRIPT}, "
+        f"found {len(matches)}; the ownership tests cannot run against "
+        "a refactored script")
+    return f'mkdir -p "$OUT" || exit 2\n{matches[0]}\n'
+
+
+class OutOwnershipTests(unittest.TestCase):
+    # Root-mode CI shape: run-cell-script.sh creates the cells directory
+    # as root, the cell script then runs discover and the paced workload
+    # under setpriv as the suite user, and both create files directly in
+    # $OUT with their own open() (manifest.json, workload.ready). A
+    # root-owned $OUT makes both writes fail EACCES; the workload dies
+    # instantly and the cell reports "workload never became ready"
+    # (rc=2). The leg directories are already handed over by make_leg;
+    # $OUT itself needs the same handover. A chown shim on PATH records
+    # the handover the block performs.
+
+    def run_setup(self, tmp, rootmode):
+        import subprocess
+        base = Path(tmp)
+        bin_dir = base / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        chown = bin_dir / "chown"
+        chown.write_text(
+            "#!/bin/bash\n"
+            'echo "chown-shim $*" >> "$CHOWN_LOG"\n'
+            "exit 0\n", encoding="utf-8")
+        chown.chmod(0o755)
+        log = base / "chown.log"
+        out = base / "cells"
+        env = {
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "CHOWN_LOG": str(log),
+            "ROOTMODE": rootmode, "RUNUID": "4242", "RUNGID": "4243",
+            "OUT": str(out),
+        }
+        proc = subprocess.run(
+            ["bash", "-c", out_setup_source()], capture_output=True,
+            text=True, env=env, timeout=60)
+        recorded = (log.read_text(encoding="utf-8")
+                    if log.exists() else "")
+        return proc, recorded, out
+
+    def test_root_mode_hands_out_to_the_suite_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, recorded, out = self.run_setup(tmp, "yes")
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertIn(
+                f"chown-shim 4242:4243 {Path(out).resolve()}", recorded,
+                "root mode must chown $OUT to RUNUID:RUNGID so the "
+                "dropped discover/workload writers can create files in it")
+
+    def test_user_mode_never_chowns_out(self):
+        # User (test-host) mode runs everything as one user: no handover.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, recorded, _ = self.run_setup(tmp, "no")
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertEqual("", recorded)
+
+    def test_dropped_writers_create_files_directly_in_out(self):
+        # Pins the two RUNUID writers that make the handover necessary:
+        # discover opens its -o output itself and the workload writes its
+        # ready file itself, both directly in $OUT (never inside the
+        # make_leg-chowned leg directories).
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'as_user "$DISCOVER" --module "$PKCS11_MODULE"'
+            ' -o "$OUT/manifest.json"', text)
+        self.assertIn("READY=$OUT/workload.ready", text)
 
 
 class ProviderNameValidationTests(unittest.TestCase):

@@ -16245,6 +16245,46 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_hides_the_handle_table_census_unless_verbose() {
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let report = PassReport {
+            pass: 6,
+            scanned: 128,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 128,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&coordinator, &report);
+        let is_census = |line: &&String| line.starts_with("p11scope: pass 6: handle table: ");
+        assert_eq!(
+            lines.iter().filter(is_census).count(),
+            1,
+            "the fixture must carry exactly one census line: {lines:?}"
+        );
+        let concise = dashboard_visible_lines(&lines, false);
+        assert!(
+            !concise.iter().any(is_census),
+            "concise dashboard drops the routine census: {concise:?}"
+        );
+        assert_eq!(
+            concise.first().copied(),
+            lines.first(),
+            "the headline always shows"
+        );
+        let verbose = dashboard_visible_lines(&lines, true);
+        assert_eq!(
+            verbose.len(),
+            lines.len(),
+            "verbose dashboard keeps every line"
+        );
+    }
+
+    #[test]
     fn progress_lines_groups_many_admissions_into_one_counted_line() {
         // A 210-admission pass renders one counted line, not 210
         // per-caller lines; the headline stays first.

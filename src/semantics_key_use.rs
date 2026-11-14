@@ -337,8 +337,9 @@ pub(crate) struct JointStaging {
     /// resume (see [`segment_resumable_after`]); ordered fallbacks
     /// always permit it. Cleared on resume.
     segment_resumable: bool,
-    /// The void fence recorded when the segment ended, if its ending
-    /// failure carried one. A retained receipt cut below it never
+    /// The running-maximum void fence recorded across endings (see
+    /// [`Self::record_fence`]): every void's fence joins it, fenceless
+    /// endings never lower it. A retained receipt cut below it never
     /// resumes Joint (see [`Self::resume_joint`]); cleared on resume.
     segment_fence: Option<u64>,
     /// Ledger releases pended by a ledger-less ordered fallback
@@ -636,15 +637,24 @@ impl JointStaging {
         self.dispose_pure_below_barrier(None, Some(ledger));
     }
 
+    /// Record a void fence as a running maximum: a later void raises
+    /// the bound, while a fenceless ending (local fallback, proof-only
+    /// refusal) never lowers or clears it. Only a clean resume clears.
+    fn record_fence(&mut self, fence: Option<u64>) {
+        if let Some(next) = fence {
+            self.segment_fence = Some(self.segment_fence.map_or(next, |kept| kept.max(next)));
+        }
+    }
+
     /// End the current Joint segment: degrade to S1Only and open
     /// the degraded window in which direct reductions count under
     /// this ending's reason until the next clean point resumes. The
-    /// ending failure's recorded void fence (if any) is stored: a
-    /// below-fence receipt never resumes onto it.
+    /// ending failure's void fence (if any) joins the running maximum:
+    /// a below-fence receipt never resumes onto it.
     fn close_segment(&mut self, loss: bool, resumable: bool, fence: Option<u64>) {
         self.mode = FeedMode::S1Only;
         self.segment_resumable = resumable;
-        self.segment_fence = fence;
+        self.record_fence(fence);
         if loss {
             self.degraded_loss = true;
             self.degraded_window = Some(DegradedWindow::Loss);
@@ -1220,6 +1230,11 @@ impl JointStaging {
                 self.degraded_loss = true;
                 self.degraded_window = Some(DegradedWindow::Loss);
             }
+            // A void that lands on an already-degraded feed still records
+            // its fence (running maximum): a below-fence receipt never
+            // resumes onto any voided interval, however the feed first
+            // degraded.
+            self.record_fence(fence);
             return (
                 batch.negative_delivered().map_or(
                     FailureBatchProgress::Held,

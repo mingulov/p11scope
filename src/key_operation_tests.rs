@@ -22024,7 +22024,8 @@ fn key_operation_ordered_fallback_keeps_recorded_void_fence() {
         outcome,
         crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
     ));
-    let (replayed, _) = staging.ordered_fallback(&mut edge, &mut keyuse, instance, &mut sink, None, None);
+    let (replayed, _) =
+        staging.ordered_fallback(&mut edge, &mut keyuse, instance, &mut sink, None, None);
     assert_eq!(replayed, 0, "staging already drained by the loss");
     assert!(
         !staging.resume_joint(),

@@ -9336,22 +9336,24 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
         "the pre-break key never resumes Joint; its calls stay S1"
     );
     // The void itself is named too, not only the break quantum's seal:
-    // its own refusal (every key ended, staged custody voided, a fence on
-    // the consumed history) is disclosed even when no seal fails with it.
+    // its own fenced loss (consumed history fenced, staged custody
+    // voided, no key refused) is disclosed even when no seal fails
+    // with it.
     assert!(
         gaps.contains(&(
             "Joint key operations unavailable; retained S1".to_string(),
-            "joint_void_adapter_invalidated_history_loss".to_string()
+            "joint_void_ingest_break_loss_history_loss".to_string()
         )),
         "the ingest-break void names its own gap: {gaps:?}"
     );
 }
 
-/// The ingest-break void abandons every pre-break key: its live sessions
-/// end Uncertain(Loss), its objects retire, its bootstrap voids. Those
-/// effects are the void's own original failure; they ride the next audit
-/// frame as its raw failure (never dropped), so the pre-break key's
-/// consumer sees its session end. S1 still joins the follow-up call.
+/// The ingest-break void fences every pre-break key's history: its live
+/// sessions end Uncertain(OutcomeLost), its objects retire, its bootstrap
+/// voids. Those effects are the void's own original failure; they ride
+/// the next audit frame as its raw failure (never dropped), so the
+/// pre-break key's consumer sees its session end. S1 still joins the
+/// follow-up call.
 #[test]
 fn joint_machine_break_void_carries_pre_break_session_ends() {
     use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
@@ -9421,7 +9423,7 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
                     effect,
                     ObjectEffect::SessionEnded {
                         session,
-                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                        end: SessionEnd::Uncertain(ObjectGap::OutcomeLost),
                     } if *session == live[0]
                 )
             }));
@@ -9436,7 +9438,7 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
     assert_eq!(
         carried,
         Some(true),
-        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+        "the void keeps the pre-break session's Uncertain(OutcomeLost) end for the next frame"
     );
     fixture.published_labeled("linked-break-followup", None);
     assert_eq!(
@@ -9536,7 +9538,7 @@ fn joint_machine_second_break_void_delivers_with_s1only_raw_occupied() {
                     effect,
                     ObjectEffect::SessionEnded {
                         session,
-                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                        end: SessionEnd::Uncertain(ObjectGap::OutcomeLost),
                     } if *session == live[0]
                 )
             }));
@@ -9551,7 +9553,7 @@ fn joint_machine_second_break_void_delivers_with_s1only_raw_occupied() {
     assert_eq!(
         carried,
         Some(true),
-        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+        "the void keeps the pre-break session's Uncertain(OutcomeLost) end for the next frame"
     );
     fixture.published_labeled("first-void", None);
     assert_eq!(
@@ -9762,7 +9764,7 @@ fn joint_machine_disposed_publish_with_pending_void_completes() {
                     effect,
                     ObjectEffect::SessionEnded {
                         session,
-                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                        end: SessionEnd::Uncertain(ObjectGap::OutcomeLost),
                     } if *session == live[0]
                 )
             }));
@@ -9777,7 +9779,7 @@ fn joint_machine_disposed_publish_with_pending_void_completes() {
     assert_eq!(
         carried,
         Some(true),
-        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+        "the void keeps the pre-break session's Uncertain(OutcomeLost) end for the next frame"
     );
     assert!(
         fixture
@@ -10025,8 +10027,13 @@ fn joint_disposed_audit_takes_pending_void_with_raw_occupied() {
         !failures[0].effects.effects.is_empty(),
         "the first slot carries the void's abandonment"
     );
+    assert_eq!(
+        failures[0].gap,
+        JournalGap::IngestBreakLoss,
+        "the void slot names the fenced loss"
+    );
     assert!(
-        failures
+        failures[1..]
             .iter()
             .all(|failure| failure.gap == JournalGap::AdapterInvalidated),
         "disposal and collection on the invalidated lane report the invalidation"
@@ -11371,6 +11378,7 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
         .coordinator
         .registry()
         .published_revision();
+    let disposed_before_recovery = fixture.disposed_total();
     fixture
         .scene
         .push(std::process::id(), 0, "C_CreateObject", 3);
@@ -11386,9 +11394,18 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
             > revision,
         "the next quantum publishes"
     );
-    assert!(
-        fixture.reduced_for(0) > reduced,
-        "calls after the re-arm are recorded"
+    // The fenced void disposes post-re-arm staging as loss instead of
+    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
+    // while the recovery call is disposed once as counted history.
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced,
+        "the fenced void ends fallback replay across the re-arm"
+    );
+    assert_eq!(
+        fixture.disposed_total() - disposed_before_recovery,
+        1,
+        "the recovery call is disposed once as history"
     );
     // Journal history ingested in the abandoned quantum never certifies
     // later rows: the next collect voided every existing key, named.
@@ -12445,6 +12462,7 @@ fn joint_machine_bound_demand_refusal_rearms_as_published() {
         .coordinator
         .registry()
         .published_revision();
+    let disposed_before_recovery = fixture.disposed_total();
     fixture
         .scene
         .push(std::process::id(), 0, "C_CreateObject", 3);
@@ -12460,9 +12478,18 @@ fn joint_machine_bound_demand_refusal_rearms_as_published() {
             > revision,
         "the next quantum publishes"
     );
-    assert!(
-        fixture.reduced_for(0) > reduced,
-        "calls after the re-arm are recorded"
+    // The fenced void disposes post-re-arm staging as loss instead of
+    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
+    // while the recovery call is disposed once as counted history.
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced,
+        "the fenced void ends fallback replay across the re-arm"
+    );
+    assert_eq!(
+        fixture.disposed_total() - disposed_before_recovery,
+        1,
+        "the recovery call is disposed once as history"
     );
 }
 
@@ -12610,6 +12637,8 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         .coordinator
         .registry()
         .published_revision();
+    let reduced_at_rearm = fixture.reduced_for(0);
+    let disposed_before_recovery = fixture.disposed_total();
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
     fixture.published_labeled("post-apply recovery", None);
     fixture.assert_no_staged_calls("the post-apply recovery publish");
@@ -12632,9 +12661,19 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
             > revision,
         "the next quantum publishes"
     );
-    assert!(
-        fixture.reduced_for(0) > reduced,
-        "calls after the re-arm are recorded"
+    // The fenced void disposes post-re-arm staging as loss instead of
+    // replaying it (HistoryLoss, not Fallback): `reduced` stays put
+    // past the re-arm while the recovery call is disposed once as
+    // counted history.
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_at_rearm,
+        "the fenced void replays nothing after the re-arm"
+    );
+    assert_eq!(
+        fixture.disposed_total() - disposed_before_recovery,
+        1,
+        "the recovery call is disposed once as history"
     );
     assert_eq!(
         api_returns(&fixture),

@@ -337,6 +337,10 @@ pub(crate) struct JointStaging {
     /// resume (see [`segment_resumable_after`]); ordered fallbacks
     /// always permit it. Cleared on resume.
     segment_resumable: bool,
+    /// The void fence recorded when the segment ended, if its ending
+    /// failure carried one. A retained receipt cut below it never
+    /// resumes Joint (see [`Self::resume_joint`]); cleared on resume.
+    segment_fence: Option<u64>,
     /// Ledger releases pended by a ledger-less ordered fallback
     /// (C4): flushed on the next ledger contact. One fallback drains
     /// staging, and re-staging after a clean-point resume flushes
@@ -388,6 +392,7 @@ impl JointStaging {
             degraded_loss: false,
             fell_back: false,
             segment_resumable: false,
+            segment_fence: None,
             pending_releases: Vec::new(),
         }
     }
@@ -438,20 +443,24 @@ impl JointStaging {
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,
-    /// and holds no staged remainder may resume. A clean resume
-    /// clears the loss/fallback latches and baselines disposed
-    /// history: current tracking is healthy again, so the reason
-    /// clears, while the retained counters keep counting the closed
-    /// segment beside it. Returns whether the mode changed.
+    /// and holds no staged remainder may resume — and never onto a
+    /// receipt cut below the recorded segment fence (see
+    /// [`Self::receipt_below_recorded_fence`]). A clean resume clears
+    /// the loss/fallback latches and baselines disposed history:
+    /// current tracking is healthy again, so the reason clears, while
+    /// the retained counters keep counting the closed segment beside
+    /// it. Returns whether the mode changed.
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
             && !self.watchdog_tripped
             && self.selected_receipt.is_some()
             && self.segment_resumable
             && self.staged.is_empty()
+            && !self.receipt_below_recorded_fence()
         {
             self.mode = FeedMode::Joint;
             self.segment_resumable = false;
+            self.segment_fence = None;
             self.degraded_window = None;
             self.degraded_loss = false;
             self.fell_back = false;
@@ -460,6 +469,18 @@ impl JointStaging {
         } else {
             false
         }
+    }
+
+    /// Whether the retained receipt cuts below the recorded segment
+    /// fence: such a receipt can never seal again (the seal and
+    /// attestation checks refuse it), so resuming onto it would only
+    /// end the next segment as `BootstrapMismatch`. Only a fresh
+    /// receipt at or above the fence (re-selection) resumes.
+    fn receipt_below_recorded_fence(&self) -> bool {
+        self.selected_receipt.as_ref().is_some_and(|receipt| {
+            self.segment_fence
+                .is_some_and(|fence| receipt.birth_cut() < fence)
+        })
     }
 
     /// Whether a later birth may still select Joint for this feed: it
@@ -593,8 +614,8 @@ impl JointStaging {
 
     /// Dispose every staged call without delivery (running-rearm
     /// recovery): the abandoned quantum's staged calls can never
-    /// reduce — the void refused their keys and fenced their
-    /// history — so the recovery verifies against exactly its own
+    /// reduce — the void fenced their history and dropped staged
+    /// custody — so the recovery verifies against exactly its own
     /// history. Releases each head's ledger charge, advances the
     /// frontier and counts each once as disposed history
     /// (`record_lost`), exactly like loss disposal: staged Joint
@@ -611,10 +632,13 @@ impl JointStaging {
 
     /// End the current Joint segment: degrade to S1Only and open
     /// the degraded window in which direct reductions count under
-    /// this ending's reason until the next clean point resumes.
-    fn close_segment(&mut self, loss: bool, resumable: bool) {
+    /// this ending's reason until the next clean point resumes. The
+    /// ending failure's recorded void fence (if any) is stored: a
+    /// below-fence receipt never resumes onto it.
+    fn close_segment(&mut self, loss: bool, resumable: bool, fence: Option<u64>) {
         self.mode = FeedMode::S1Only;
         self.segment_resumable = resumable;
+        self.segment_fence = fence;
         if loss {
             self.degraded_loss = true;
             self.degraded_window = Some(DegradedWindow::Loss);
@@ -1133,6 +1157,7 @@ impl JointStaging {
         }
         let disposition = audited.disposition();
         let gap = audited.failure().gap;
+        let fence = audited.failure().fence;
         let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
             staged_max, pending_floor: None,
         } if self.covered_by(*staged_max));
@@ -1198,7 +1223,7 @@ impl JointStaging {
             );
         }
         if self.staged.is_empty() {
-            self.close_segment(loss, segment_resumable_after(gap));
+            self.close_segment(loss, segment_resumable_after(gap), fence);
             return (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 0 }
@@ -1255,7 +1280,7 @@ impl JointStaging {
             }
         }
         if self.staged.is_empty() {
-            self.close_segment(loss, segment_resumable_after(gap));
+            self.close_segment(loss, segment_resumable_after(gap), fence);
             (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 1 }
@@ -1379,7 +1404,7 @@ impl JointStaging {
                     None,
                     assoc_fallback.as_deref_mut(),
                 );
-                self.close_segment(true, segment_resumable_after(failure.gap));
+                self.close_segment(true, segment_resumable_after(failure.gap), failure.fence);
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
             SealFailureDisposition::Fallback => {
@@ -1401,7 +1426,11 @@ impl JointStaging {
                             Some(&mut *ledger),
                             assoc_fallback.as_deref_mut(),
                         );
-                        self.close_segment(false, segment_resumable_after(failure.gap));
+                        self.close_segment(
+                            false,
+                            segment_resumable_after(failure.gap),
+                            failure.fence,
+                        );
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }
                     H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
@@ -1428,7 +1457,11 @@ impl JointStaging {
                             None,
                             assoc_fallback,
                         );
-                        self.close_segment(true, segment_resumable_after(failure.gap));
+                        self.close_segment(
+                            true,
+                            segment_resumable_after(failure.gap),
+                            failure.fence,
+                        );
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
                     _ => {
@@ -1606,7 +1639,7 @@ impl JointStaging {
             self.replay_staged(reducer, keyuse, instance, sink, ledger, assoc_fallback);
         // Ordered fallbacks are local capacity/shape endings: the
         // next clean point may resume Joint for a fresh segment.
-        self.close_segment(false, true);
+        self.close_segment(false, true, None);
         (replayed, refused)
     }
 

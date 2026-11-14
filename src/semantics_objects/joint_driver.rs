@@ -228,11 +228,12 @@ pub(crate) struct JointCaptureOwner {
     // still alive (transient underaccounting at teardown).
     model: ObjectSemantics,
     adapter: JournalAdapter,
-    // The ingest-break void's own original failure (every pre-break key's
-    // abandonment effects) with the storage it prepaid. The next ingested
-    // audit frame carries it as that frame's raw failure; until then the
-    // lease stays charged. Declared after the adapter: it holds no ledger
-    // charge, only a pool lease and the failure's own buffers.
+    // The ingest-break void's own original failure (the fenced loss's
+    // preserve/fence effects) with the storage it prepaid. The next
+    // ingested audit frame carries it as that frame's raw failure;
+    // until then the lease stays charged. Declared after the adapter:
+    // it holds no ledger charge, only a pool lease and the failure's
+    // own buffers.
     pending_void: Option<PendingVoid>,
 }
 
@@ -322,14 +323,17 @@ impl JointCaptureOwner {
     /// End Joint after a linked stream broke while ingesting (not by a
     /// raw disposal), so S1 can continue. The break may leave staged
     /// custody across the hole, so the lane is first brought to exactly
-    /// the state an unlocalized raw disposal leaves: every key refused
-    /// (later seals end their feeds as `DomainTainted`), all staged
-    /// custody voided, the stream invalidated. The next collect then
-    /// re-syncs above a fence on the consumed history, like any
-    /// unlocalized loss. The disposal's storage is prepaid from the
-    /// ledger's reserver as in `dispose_without_ingest`; a refusal keeps
-    /// the fail-closed refusal. Returns whether the lane was voided; the
-    /// caller then records the void's own gap ([`INGEST_BREAK_VOID_GAP`]).
+    /// the state a fenced loss leaves: staged unbounded abandonments
+    /// preserved as permanent refusals, the consumed history fenced on
+    /// every domain, all staged custody voided, the stream invalidated —
+    /// but no key refused. Later seals re-prove above the recorded
+    /// fence as `IngestBreakLoss` history loss; receipts cut below it
+    /// never resume. The next collect then re-syncs above the fence,
+    /// like any unlocalized loss. The void's storage is prepaid from
+    /// the ledger's reserver as in `dispose_without_ingest`; a refusal
+    /// keeps the fail-closed refusal. Returns whether the lane was
+    /// voided; the caller then records the void's own gap
+    /// ([`INGEST_BREAK_VOID_GAP`]).
     pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
         let adapter = &self.adapter;
         if !adapter.stream_broken
@@ -370,10 +374,11 @@ impl JointCaptureOwner {
 
     /// Break the linked stream after a running quantum was abandoned
     /// unsealed: its ingested history never passed a seal, so the next
-    /// running Idle collect voids every key open across it
-    /// ([`Self::void_ingest_break`], named) and re-syncs above a fence,
-    /// exactly like a stream broken while ingesting. A stopped adapter
-    /// takes nothing (the void refuses it anyway).
+    /// running Idle collect fences the abandoned quantum's history as
+    /// an explicitly lost interval ([`Self::void_ingest_break`], named)
+    /// and re-syncs above it, exactly like a stream broken while
+    /// ingesting. A stopped adapter takes nothing (the void refuses it
+    /// anyway).
     pub(crate) fn break_stream_after_running_abandon(&mut self) {
         if !self.adapter.stopped {
             self.adapter.stream_broken = true;
@@ -616,10 +621,11 @@ impl IngestedRaw {
     }
 }
 
-/// The refusal an ingest-break void applies
-/// ([`JointCaptureOwner::void_ingest_break`]); the caller names it in the
-/// void's own gap, since the void returns no seal failure to deliver.
-pub(crate) const INGEST_BREAK_VOID_GAP: JournalGap = JournalGap::AdapterInvalidated;
+/// The gap an ingest-break void names
+/// ([`JointCaptureOwner::void_ingest_break`]); the caller records it as
+/// the void's own gap, since the void's failure rides the next audit
+/// frame's raw slot instead of a seal.
+pub(crate) const INGEST_BREAK_VOID_GAP: JournalGap = JournalGap::IngestBreakLoss;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawDisposeReason {

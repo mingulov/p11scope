@@ -2663,14 +2663,33 @@ impl JournalAdapter {
         }
     }
 
-    /// RED-first shell (keyrows C1): the fenced ingest-break void.
-    /// The twin tests pin its contract; the real chain lands next.
+    /// End Joint after a linked stream broke while ingesting (keyrows
+    /// C1): preserve staged unbounded abandonments first (they refuse
+    /// their incarnations permanently), then fence the consumed
+    /// history on every domain, invalidate the stream, and drop staged
+    /// custody — refusing no key. Later seals re-prove above the
+    /// recorded fence; nothing re-covers fenced history. The
+    /// all-domain scope is kept: what is left after the break is a
+    /// missing stream position, which is stream-wide.
     pub(crate) fn void_ingest_break_inner(
         &mut self,
         model: &mut ObjectSemantics,
         gap: JournalGap,
     ) -> SealFailure {
-        self.refuse_disposed_raw(model, std::iter::empty(), true, gap)
+        let upper = self.consumed_through;
+        let mut effects = self.preserve_abandonment_refusals(model);
+        effects
+            .effects
+            .extend(self.fence_void(model, upper).effects);
+        self.invalidated = true;
+        self.void_staged();
+        SealFailure {
+            scope: self.affected_failure_scope(),
+            gap,
+            effects,
+            h3_voided: None,
+            fence: Some(upper),
+        }
     }
 
     fn has_s1only_subjects(&self) -> bool {
@@ -4196,9 +4215,11 @@ impl JournalAdapter {
             // disposal (`invalidated`), whatever its cause: a malformed
             // record, a changed or unreadable fault counter, a
             // non-contiguous cut, a failed collection or an image-0
-            // record. That disposal already refused every key (their
-            // Joint output stays lossy, never recovered), voided all
-            // staged custody and disclosed its named gap. Fencing the
+            // record. The dispose-side disposal already refused every
+            // key (their Joint output stays lossy, never recovered),
+            // while the ingest-break void fenced the consumed history
+            // without refusing; both voided all staged custody and
+            // disclosed their named gap. Fencing the
             // consumed interval makes every later birth name a cut at
             // or above it (births strictly below refuse), so nothing in
             // the lost window is ever certified. A break without that
@@ -5917,6 +5938,7 @@ impl JournalAdapter {
         self.last_audit_failure = Some(self.consumed_through);
         let mut effects = ObjectEffects::default();
         let mut h3_voided = None;
+        let mut fence = None;
         match gap {
             JournalGap::FaultSaturated => {
                 self.stopped = true;
@@ -5942,6 +5964,9 @@ impl JournalAdapter {
                 effects
                     .effects
                     .extend(self.fence_void(model, self.consumed_through).effects);
+                // Keyrows B1: the failure records the void's fence, so
+                // the feed it closes refuses below-fence receipts.
+                fence = Some(self.consumed_through);
                 self.void_staged();
                 // Diagnostic-only (Task 0): the audit above voided the
                 // seal. The refusal below is unchanged.
@@ -5977,9 +6002,7 @@ impl JournalAdapter {
             effects,
             h3_voided,
             scope,
-            // Keyrows B1 records the void arm's fence here; until then
-            // no failure carries one.
-            fence: None,
+            fence,
         }
     }
 

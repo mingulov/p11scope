@@ -866,6 +866,12 @@ fn native_semantic_resource_final_types_pinned() {
         crate::inventory_present::Presentation,
         1288 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 5 * size_of::<Vec<u8>>()
+            // a2 re-arm rate: joint_audit_subjects
+            + size_of::<
+                Option<
+                    crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis,
+                >,
+            >()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

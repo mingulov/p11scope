@@ -19887,11 +19887,14 @@ pub(crate) mod tests {
     /// B2 step 3: render adds at most one large section plus the evidence
     /// envelope over resident. Interim bound: the envelope carries the
     /// skipped/surfaces/aliased lists and is bounded only after B3. Two
-    /// halves: allocator-peak on a moderate profile fixture (the tree peak
-    /// must violate the bound for non-vacuity, the streamed peak must
-    /// satisfy it), and R5-estimate wins on the large fixture for both lanes
-    /// (no peak tracker there, so no block limit; both use the same
-    /// `json_value_bytes` estimator R5 publishes).
+    /// halves: a tight allocator-peak bound on a moderate fixture for both
+    /// lanes (the envelope build peaks at its live bytes plus a small
+    /// constant, so no hidden copy; the streamed peak is envelope live
+    /// plus the largest section peak plus a small constant; the tree peak
+    /// must violate that bound for non-vacuity), and R5-estimate wins on
+    /// the large fixture for both lanes (no peak tracker there, so no
+    /// block limit; both use the same `json_value_bytes` estimator R5
+    /// publishes).
     #[test]
     fn report_render_peak_stays_section_bounded() {
         use crate::metrics::ConsumerFixture;
@@ -19909,40 +19912,92 @@ pub(crate) mod tests {
                 Ok(())
             }
         }
-        // Allocator-peak slack (profile only) covers the intermediate
-        // Rust structs (Vec of MechanismOut/FunctionOut, each with Strings
-        // and maps) held simultaneously with their Values during `to_value`,
-        // plus BTree/Vec overallocation and formatter temps. The fixture
-        // sizes the win past it (see the violation assert); larger fixtures
-        // exceed the peak tracker's block limit.
-        const PROFILE_SLACK: u64 = 352 * 1024;
+        // Tight allocator-peak bound (no fixed slack): every part is
+        // measured with the same allocator probe. The envelope build must
+        // not hide a copy (its peak is its live bytes plus a small
+        // constant), and streaming must hold at most the envelope plus one
+        // section (its peak is envelope live plus the largest section peak
+        // plus a small constant). The small constant covers map nodes,
+        // formatter temps and the forwarding set — never a hidden evidence
+        // copy, which would add the whole envelope again.
+        const SMALL: u64 = 16 * 1024;
         let mut fixture = ConsumerFixture::new();
         let snapshot = fixture
             .fresh(CounterMode::Counts, 1, 5, None)
             .expect("counter fixture yields a snapshot");
         let ledger = SelectionLedger::new();
-        // Allocator-peak half (profile only): sized to stay under the peak
-        // tracker's 8192-block limit while still showing the tree-vs-sections
-        // win (see the violation assert). Metrics allocator-peak win is tiny
-        // (one large non-evidence section) and needs a sub-10 KiB window that
-        // no robust slack covers; metrics win rides the estimate half below,
-        // which has no block limit. Larger fixtures go incomplete here.
+        // Allocator-peak half (both lanes, moderate fixture): sized to stay
+        // under the peak tracker's 8192-block limit. Larger fixtures go
+        // incomplete here; their win rides the estimate half below, which
+        // has no block limit.
         let reports = large_reports(50);
         let state = large_state(25);
         let ev = large_evidence(50);
         let capture = capture_fixture();
         // Profile lane.
         {
-            let versioned = VersionedEvidence::wrap(&ev);
-            let envelope_for_bound =
-                super::profile_evidence_envelope(&versioned, Some(&snapshot), Some(&ledger));
-            let bound = super::profile_streamed_peak_bytes(
-                &reports,
-                &ev,
-                &envelope_for_bound,
-                &state,
-                &capture,
+            // Envelope build: the versioned value is built inside the
+            // probe, so a hidden clone shows as peak far above live.
+            let (envelope, envelope_peak) = crate::test_alloc::requested_peak_during(|| {
+                let versioned = VersionedEvidence::wrap(&ev);
+                super::profile_evidence_envelope(&versioned, Some(&snapshot), Some(&ledger))
+            });
+            assert!(
+                !envelope_peak.incomplete,
+                "profile envelope peak report must be complete"
             );
+            let envelope_live = envelope_peak.live_bytes as u64;
+            assert!(
+                envelope_live > 0,
+                "profile envelope must hold live bytes (non-vacuous)"
+            );
+            drop(envelope);
+            assert!(
+                envelope_peak.peak_bytes as u64 <= envelope_live.saturating_add(SMALL),
+                "profile envelope build must not hide a copy: peak={} live={} small={}",
+                envelope_peak.peak_bytes,
+                envelope_live,
+                SMALL,
+            );
+            // Largest section peak: build and serialize each non-evidence
+            // section on its own.
+            let forwarding = super::forwarding_module_ids(&ev, &reports);
+            let mut largest_section_peak = 0u64;
+            for key in super::PROFILE_KEYS_SORTED {
+                if *key == "evidence" {
+                    continue;
+                }
+                let (_, section_peak) = crate::test_alloc::requested_peak_during(|| {
+                    let value = super::profile_section_value(
+                        key,
+                        &reports,
+                        &ev,
+                        &state,
+                        &capture,
+                        &forwarding,
+                    );
+                    let mut writer = CountingWriter { bytes: 0 };
+                    serde_json::to_writer(&mut writer, &value).unwrap();
+                    writer.bytes
+                });
+                assert!(
+                    !section_peak.incomplete,
+                    "profile section {key} peak report must be complete"
+                );
+                assert_eq!(
+                    (section_peak.live_bytes, section_peak.live_blocks),
+                    (0, 0),
+                    "profile section {key} probe must not leak"
+                );
+                largest_section_peak = largest_section_peak.max(section_peak.peak_bytes as u64);
+            }
+            assert!(
+                largest_section_peak > 0,
+                "profile must have a non-empty largest section (non-vacuous)"
+            );
+            let section_bound = envelope_live
+                .saturating_add(largest_section_peak)
+                .saturating_add(SMALL);
             let (tree_bytes, tree_peak) = crate::test_alloc::requested_peak_during(|| {
                 let mut tree =
                     profile_json(&reports, VersionedEvidence::wrap(&ev), &state, &capture);
@@ -19964,12 +20019,13 @@ pub(crate) mod tests {
                 "profile tree probe must not leak"
             );
             assert!(
-                tree_peak.peak_bytes as u64 > bound.saturating_add(PROFILE_SLACK),
-                "profile tree must violate the section bound (non-vacuous): \
-                 tree_peak={} bound={} slack={}",
+                tree_peak.peak_bytes as u64 > section_bound,
+                "profile tree must violate the section bound (non-vacuous): tree_peak={} bound={} envelope_live={} largest_section={} small={}",
                 tree_peak.peak_bytes,
-                bound,
-                PROFILE_SLACK,
+                section_bound,
+                envelope_live,
+                largest_section_peak,
+                SMALL,
             );
             let (streamed_bytes, streamed_peak) = crate::test_alloc::requested_peak_during(|| {
                 let versioned = VersionedEvidence::wrap(&ev);
@@ -19999,12 +20055,131 @@ pub(crate) mod tests {
                 "profile streamed probe must not leak"
             );
             assert!(
-                streamed_peak.peak_bytes as u64 <= bound.saturating_add(PROFILE_SLACK),
-                "profile streamed must stay section-bounded: \
-                 streamed_peak={} bound={} slack={} tree_peak={}",
+                streamed_peak.peak_bytes as u64 <= section_bound,
+                "profile streamed must stay section-bounded: streamed_peak={} bound={} envelope_live={} largest_section={} small={} tree_peak={}",
                 streamed_peak.peak_bytes,
-                bound,
-                PROFILE_SLACK,
+                section_bound,
+                envelope_live,
+                largest_section_peak,
+                SMALL,
+                tree_peak.peak_bytes,
+            );
+        }
+        // Metrics lane: the same tight bound on its envelope and stream.
+        {
+            let (envelope, envelope_peak) = crate::test_alloc::requested_peak_during(|| {
+                super::metrics_evidence_envelope(&ev, Some(&snapshot), Some(&ledger))
+            });
+            assert!(
+                !envelope_peak.incomplete,
+                "metrics envelope peak report must be complete"
+            );
+            let envelope_live = envelope_peak.live_bytes as u64;
+            assert!(
+                envelope_live > 0,
+                "metrics envelope must hold live bytes (non-vacuous)"
+            );
+            drop(envelope);
+            assert!(
+                envelope_peak.peak_bytes as u64 <= envelope_live.saturating_add(SMALL),
+                "metrics envelope build must not hide a copy: peak={} live={} small={}",
+                envelope_peak.peak_bytes,
+                envelope_live,
+                SMALL,
+            );
+            let forwarding = super::forwarding_module_ids(&ev, &reports);
+            let mut largest_section_peak = 0u64;
+            for key in super::METRICS_KEYS_SORTED {
+                if *key == "evidence" {
+                    continue;
+                }
+                let (_, section_peak) = crate::test_alloc::requested_peak_during(|| {
+                    let value =
+                        super::metrics_section_value(key, &reports, &ev, &capture, &forwarding);
+                    let mut writer = CountingWriter { bytes: 0 };
+                    serde_json::to_writer(&mut writer, &value).unwrap();
+                    writer.bytes
+                });
+                assert!(
+                    !section_peak.incomplete,
+                    "metrics section {key} peak report must be complete"
+                );
+                assert_eq!(
+                    (section_peak.live_bytes, section_peak.live_blocks),
+                    (0, 0),
+                    "metrics section {key} probe must not leak"
+                );
+                largest_section_peak = largest_section_peak.max(section_peak.peak_bytes as u64);
+            }
+            assert!(
+                largest_section_peak > 0,
+                "metrics must have a non-empty largest section (non-vacuous)"
+            );
+            let section_bound = envelope_live
+                .saturating_add(largest_section_peak)
+                .saturating_add(SMALL);
+            let (tree_bytes, tree_peak) = crate::test_alloc::requested_peak_during(|| {
+                let mut tree = json(&reports, &ev, &capture);
+                tree = with_counter_snapshot(tree, &snapshot);
+                tree = with_legacy_snapshot(tree, &snapshot);
+                tree = crate::metrics::selected_detail_driver::with_selected_detail(tree, &ledger);
+                let mut writer = CountingWriter { bytes: 0 };
+                serde_json::to_writer_pretty(&mut writer, &tree).unwrap();
+                writer.bytes
+            });
+            assert!(tree_bytes > 0, "metrics tree serialization must run");
+            assert!(
+                !tree_peak.incomplete,
+                "metrics tree peak report must be complete"
+            );
+            assert_eq!(
+                (tree_peak.live_bytes, tree_peak.live_blocks),
+                (0, 0),
+                "metrics tree probe must not leak"
+            );
+            assert!(
+                tree_peak.peak_bytes as u64 > section_bound,
+                "metrics tree must violate the section bound (non-vacuous): tree_peak={} bound={} envelope_live={} largest_section={} small={}",
+                tree_peak.peak_bytes,
+                section_bound,
+                envelope_live,
+                largest_section_peak,
+                SMALL,
+            );
+            let (streamed_bytes, streamed_peak) = crate::test_alloc::requested_peak_during(|| {
+                let envelope =
+                    super::metrics_evidence_envelope(&ev, Some(&snapshot), Some(&ledger));
+                let streamed =
+                    super::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture);
+                let mut writer = CountingWriter { bytes: 0 };
+                serde_json::to_writer_pretty(&mut writer, &streamed).unwrap();
+                writer.bytes
+            });
+            assert!(
+                streamed_bytes > 0,
+                "metrics streamed serialization must run"
+            );
+            assert_eq!(
+                streamed_bytes, tree_bytes,
+                "metrics streamed must emit the same byte count as the tree"
+            );
+            assert!(
+                !streamed_peak.incomplete,
+                "metrics streamed peak report must be complete"
+            );
+            assert_eq!(
+                (streamed_peak.live_bytes, streamed_peak.live_blocks),
+                (0, 0),
+                "metrics streamed probe must not leak"
+            );
+            assert!(
+                streamed_peak.peak_bytes as u64 <= section_bound,
+                "metrics streamed must stay section-bounded: streamed_peak={} bound={} envelope_live={} largest_section={} small={} tree_peak={}",
+                streamed_peak.peak_bytes,
+                section_bound,
+                envelope_live,
+                largest_section_peak,
+                SMALL,
                 tree_peak.peak_bytes,
             );
         }

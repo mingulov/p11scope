@@ -1809,14 +1809,18 @@ fn table_probe_reads_only_the_header_and_section0() {
     let direct = d.join("direct.so");
     write_many_phdr_elf(&direct, 2048);
     let file = std::fs::File::open(&direct).unwrap();
+    let file_len = file.metadata().unwrap().len();
     let mut moved = 0usize;
     let mut calls = 0u32;
-    let (outcome, reported) = read_table_bounds_with(|buf, offset| {
-        calls += 1;
-        let read = file.read_at(buf, offset).unwrap();
-        moved += read;
-        Ok(read)
-    });
+    let (outcome, reported) = read_table_bounds_with(
+        |buf, offset| {
+            calls += 1;
+            let read = file.read_at(buf, offset).unwrap();
+            moved += read;
+            Ok(read)
+        },
+        file_len,
+    );
     assert!(outcome.is_err());
     assert_eq!(moved, 64);
     assert_eq!(reported, 64);
@@ -1824,14 +1828,18 @@ fn table_probe_reads_only_the_header_and_section0() {
     let extended = d.join("extended.so");
     write_extended_phnum_elf(&extended, 100_000);
     let file = std::fs::File::open(&extended).unwrap();
+    let file_len = file.metadata().unwrap().len();
     let mut moved = 0usize;
     let mut calls = 0u32;
-    let (outcome, reported) = read_table_bounds_with(|buf, offset| {
-        calls += 1;
-        let read = file.read_at(buf, offset).unwrap();
-        moved += read;
-        Ok(read)
-    });
+    let (outcome, reported) = read_table_bounds_with(
+        |buf, offset| {
+            calls += 1;
+            let read = file.read_at(buf, offset).unwrap();
+            moved += read;
+            Ok(read)
+        },
+        file_len,
+    );
     assert!(outcome.is_err());
     assert_eq!(moved, 128);
     assert_eq!(reported, 128);
@@ -1884,4 +1892,134 @@ fn corrupt_headers_keep_their_legacy_refusals() {
         error.contains("conventional x86") && !error.contains("table is"),
         "legacy refusal stands: {error}"
     );
+}
+
+// ---- C1: non-ELF and big-endian refuse before any parse --------------------
+
+/// Sparse Mach-O 64 with `nsects` section headers: the header and one
+/// LC_SEGMENT_64 command are written (104 bytes, one block on disk),
+/// the section headers are a sparse hole of zeros. Without the gate
+/// the Mach-O parse builds one entry per section (16M sections is
+/// 1.34 GB logical, 653 MB anonymous in the reviewer's probe).
+fn write_sparse_macho(path: &Path, nsects: u32) {
+    let mut header = [0u8; 32];
+    header[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+    header[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+    header[8..12].copy_from_slice(&3u32.to_le_bytes());
+    header[12..16].copy_from_slice(&2u32.to_le_bytes());
+    header[16..20].copy_from_slice(&1u32.to_le_bytes());
+    let sizeofcmds = 72u32.saturating_add(nsects.saturating_mul(80));
+    header[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+    let mut segment = [0u8; 72];
+    segment[0..4].copy_from_slice(&0x19u32.to_le_bytes());
+    segment[4..8].copy_from_slice(&sizeofcmds.to_le_bytes());
+    segment[56..60].copy_from_slice(&5u32.to_le_bytes());
+    segment[60..64].copy_from_slice(&5u32.to_le_bytes());
+    segment[64..68].copy_from_slice(&nsects.to_le_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::new(&file);
+    out.write_all(&header).unwrap();
+    out.write_all(&segment).unwrap();
+    out.flush().unwrap();
+    drop(out);
+    let logical = 32u64
+        .saturating_add(72)
+        .saturating_add(u64::from(nsects).saturating_mul(80));
+    file.set_len(logical).unwrap();
+}
+
+/// Sparse big-endian ELF64 with `real_shnum` sections via the extended
+/// encoding (`e_shnum == 0`, count in section 0's BE `sh_size`): the
+/// header and section 0 are written (128 bytes), the section table is
+/// a sparse hole. Without the gate the ELF parse walks the table
+/// three times (67M sections is 4 GiB logical, 2.9 s in the probe).
+fn write_sparse_bigendian_elf(path: &Path, real_shnum: u64) {
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 2;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_be_bytes());
+    header[18..20].copy_from_slice(&62u16.to_be_bytes());
+    header[20..24].copy_from_slice(&1u32.to_be_bytes());
+    header[40..48].copy_from_slice(&64u64.to_be_bytes());
+    header[52..54].copy_from_slice(&64u16.to_be_bytes());
+    header[54..56].copy_from_slice(&56u16.to_be_bytes());
+    header[58..60].copy_from_slice(&64u16.to_be_bytes());
+    let mut section0 = [0u8; 64];
+    section0[32..40].copy_from_slice(&real_shnum.to_be_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::new(&file);
+    out.write_all(&header).unwrap();
+    out.write_all(&section0).unwrap();
+    out.flush().unwrap();
+    drop(out);
+    let logical = 64u64.saturating_add(real_shnum.saturating_mul(64));
+    file.set_len(logical).unwrap();
+}
+
+/// C1: a sparse Mach-O refuses in the gate with header-only reads,
+/// never reaching the section-list parse. Keeps the legacy text.
+#[test]
+fn sparse_macho_refuses_before_parse_with_header_only_reads() {
+    use p11scope_manifest::elf::read_table_bounds_with;
+    let d = tmp("elf-c1-macho");
+    let path = d.join("sparse-macho");
+    write_sparse_macho(&path, 2_000_000);
+    let file = std::fs::File::open(&path).unwrap();
+    let file_len = file.metadata().unwrap().len();
+    let mut moved = 0usize;
+    let mut calls = 0u32;
+    let (outcome, reported) = read_table_bounds_with(
+        |buf, offset| {
+            calls += 1;
+            let read = file.read_at(buf, offset).unwrap();
+            moved += read;
+            Ok(read)
+        },
+        file_len,
+    );
+    let error = outcome.unwrap_err();
+    assert!(
+        error.contains("not an ELF object") && error.contains("MachO"),
+        "legacy text stands: {error}"
+    );
+    assert_eq!(moved, 64);
+    assert_eq!(reported, 64);
+    assert_eq!(calls, 1);
+}
+
+/// C1: a sparse big-endian ELF refuses in the gate with header-only
+/// reads, never walking the section table. The extended count rides
+/// section 0, but the big-endian entry sizes misread as little-endian
+/// never match, so only the header moves. Keeps the legacy text.
+#[test]
+fn sparse_bigendian_elf_refuses_before_parse_with_header_only_reads() {
+    use p11scope_manifest::elf::read_table_bounds_with;
+    let d = tmp("elf-c1-bigendian");
+    let path = d.join("sparse-bigendian.so");
+    write_sparse_bigendian_elf(&path, 10_000_000);
+    let file = std::fs::File::open(&path).unwrap();
+    let file_len = file.metadata().unwrap().len();
+    let mut moved = 0usize;
+    let mut calls = 0u32;
+    let (outcome, reported) = read_table_bounds_with(
+        |buf, offset| {
+            calls += 1;
+            let read = file.read_at(buf, offset).unwrap();
+            moved += read;
+            Ok(read)
+        },
+        file_len,
+    );
+    let error = outcome.unwrap_err();
+    assert!(
+        error.contains("little-endian") && !error.contains("table is"),
+        "legacy refusal stands: {error}"
+    );
+    assert_eq!(moved, 64);
+    assert_eq!(reported, 64);
+    assert_eq!(calls, 1);
 }

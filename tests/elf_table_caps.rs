@@ -167,6 +167,8 @@ fn giant_program_table_refuses_with_a_named_gap_under_an_rss_bound() {
         "5s",
     ]);
     let (output, peak) = spawn_with_peak(&mut cmd, &d.join("stderr.log"));
+    drop(target);
+    let _ = std::fs::remove_dir_all(&d);
     assert!(
         output.status.success(),
         "inventory must stay up: {}",
@@ -176,6 +178,77 @@ fn giant_program_table_refuses_with_a_named_gap_under_an_rss_bound() {
     assert!(
         stdout.contains("ELF program-header table is 112000000 bytes; limit is 65536"),
         "the named gap must surface, got:\n{stdout}"
+    );
+    assert!(
+        peak < 256 << 20,
+        "peak RSS {peak} exceeds the 256 MiB bound"
+    );
+}
+
+/// Sparse Mach-O 64 with `nsects` sections: 104 header bytes on disk,
+/// the section headers a sparse hole. 16M sections is 1.28 GB
+/// logical (4 KiB on disk); without the C1 gate the Mach-O parse
+/// builds one entry per section (653 MB anonymous, 2.0 GB peak RSS
+/// end to end in the reviewer's probe).
+fn write_sparse_macho(path: &Path, nsects: u32) {
+    let mut header = [0u8; 32];
+    header[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+    header[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+    header[8..12].copy_from_slice(&3u32.to_le_bytes());
+    header[12..16].copy_from_slice(&2u32.to_le_bytes());
+    header[16..20].copy_from_slice(&1u32.to_le_bytes());
+    let sizeofcmds = 72u32.saturating_add(nsects.saturating_mul(80));
+    header[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+    let mut segment = [0u8; 72];
+    segment[0..4].copy_from_slice(&0x19u32.to_le_bytes());
+    segment[4..8].copy_from_slice(&sizeofcmds.to_le_bytes());
+    segment[56..60].copy_from_slice(&5u32.to_le_bytes());
+    segment[60..64].copy_from_slice(&5u32.to_le_bytes());
+    segment[64..68].copy_from_slice(&nsects.to_le_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    let mut out = std::io::BufWriter::new(&file);
+    out.write_all(&header).unwrap();
+    out.write_all(&segment).unwrap();
+    out.flush().unwrap();
+    drop(out);
+    let logical = 32u64
+        .saturating_add(72)
+        .saturating_add(u64::from(nsects).saturating_mul(80));
+    file.set_len(logical).unwrap();
+}
+
+/// C1: a 1.28 GB sparse Mach-O (16M sections, 4 KiB on disk) refuses
+/// with its legacy gap before any parse; the observer's peak RSS
+/// stays under the 256 MiB bound (2.0 GB ungated in the probe).
+#[test]
+fn sparse_macho_refuses_with_a_named_gap_under_an_rss_bound() {
+    let d = tmp("elf-c1-macho-product");
+    let path = d.join("sparse-macho");
+    write_sparse_macho(&path, 16_000_000);
+    let target = spawn_mapper(&path);
+    let pid = target.0.id().to_string();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+    cmd.args([
+        "inventory",
+        "--pid",
+        &pid,
+        "--capture",
+        "scan",
+        "--duration",
+        "5s",
+    ]);
+    let (output, peak) = spawn_with_peak(&mut cmd, &d.join("stderr.log"));
+    drop(target);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(
+        output.status.success(),
+        "inventory must stay up: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not an ELF object (MachO)"),
+        "the legacy gap must surface, got:\n{stdout}"
     );
     assert!(
         peak < 256 << 20,

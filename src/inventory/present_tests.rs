@@ -2157,12 +2157,14 @@ fn snapshot_gap_lines_escape_target_controlled_control_characters() {
     );
 }
 
-/// Verbose Details renders identical object-size-cap gaps one line
-/// each: the size fold is retired with the size wording, so no
-/// process count is appended. JSON keeps every row.
+/// Verbose Details renders identical per-object gaps one line each:
+/// the size fold is retired with the size wording, so no process count
+/// is appended. Pins the real per-object allowance wording. JSON keeps
+/// every row.
 #[test]
 fn verbose_details_renders_identical_size_gaps_unfolded() {
     let (mut harness, _caller) = single_caller_harness("present-size-fold", 1);
+    let reason = crate::discovery::scan::PER_OBJECT_ALLOWANCE_REASON;
     for pid in [1001u32, 1002, 1003] {
         harness
             .coordinator_mut()
@@ -2172,7 +2174,7 @@ fn verbose_details_renders_identical_size_gaps_unfolded() {
                 module: None,
                 pid: Some(pid),
                 subject: "/opt/google/chrome/chrome".into(),
-                reason: "object is 600920136 bytes; limit is 536870912".into(),
+                reason: reason.into(),
                 budget: None,
             });
     }
@@ -2185,13 +2187,10 @@ fn verbose_details_renders_identical_size_gaps_unfolded() {
         .lines()
         .filter(|line| line.starts_with("gap ["))
         .collect();
+    let expected = format!("gap [/opt/google/chrome/chrome] {reason}");
     assert_eq!(
         gap_lines,
-        vec![
-            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
-            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
-            "gap [/opt/google/chrome/chrome] object is 600920136 bytes; limit is 536870912",
-        ],
+        vec![expected.as_str(), expected.as_str(), expected.as_str()],
         "three unfolded lines, never a folded count:\n{snapshot}"
     );
     assert!(!snapshot.contains("processes)"), "{snapshot}");
@@ -2199,11 +2198,13 @@ fn verbose_details_renders_identical_size_gaps_unfolded() {
     assert_eq!(document["gaps"].as_array().unwrap().len(), 3);
 }
 
-/// The Details fold is exact: a lone object-size gap renders bare
-/// (no count suffix), and identical non-size rows never fold.
+/// The Details fold is exact: a lone per-object gap renders bare (no
+/// count suffix), and identical non-size rows never fold. Pins the real
+/// per-object allowance wording for the lone row.
 #[test]
 fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
     let (mut harness, _caller) = single_caller_harness("present-size-nofold", 1);
+    let reason = crate::discovery::scan::PER_OBJECT_ALLOWANCE_REASON;
     harness
         .coordinator_mut()
         .registry_mut()
@@ -2212,7 +2213,7 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
             module: None,
             pid: Some(1001),
             subject: "/opt/big.so".into(),
-            reason: "object is 600920136 bytes; limit is 536870912".into(),
+            reason: reason.into(),
             budget: None,
         });
     for pid in [1002u32, 1003] {
@@ -2237,10 +2238,11 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
         .lines()
         .filter(|line| line.starts_with("gap ["))
         .collect();
+    let lone = format!("gap [/opt/big.so] {reason}");
     assert_eq!(
         gap_lines,
         vec![
-            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912",
+            lone.as_str(),
             "gap [/opt/other.so] some other refusal",
             "gap [/opt/other.so] some other refusal",
         ],
@@ -2248,12 +2250,13 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
     );
 }
 
-/// The Details fold skips budget rows: identical object-size-cap gaps
-/// carrying a budget refusal render one unfolded line each with the
-/// budget suffix, never a folded process count.
+/// The Details fold skips budget rows: identical per-object gaps carrying
+/// a budget refusal render one unfolded line each with the budget suffix,
+/// never a folded process count. Pins the real per-object wording.
 #[test]
 fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
     let (mut harness, _caller) = single_caller_harness("present-size-budget-nofold", 1);
+    let reason = crate::discovery::scan::PER_OBJECT_ALLOWANCE_REASON;
     for pid in [1001u32, 1002] {
         harness
             .coordinator_mut()
@@ -2263,7 +2266,7 @@ fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
                 module: None,
                 pid: Some(pid),
                 subject: "/opt/big.so".into(),
-                reason: "object is 600920136 bytes; limit is 536870912".into(),
+                reason: reason.into(),
                 budget: Some(crate::discovery::caller_registry::BudgetRefusal {
                     resource: "callers",
                     limit: 1,
@@ -2280,12 +2283,10 @@ fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
         .lines()
         .filter(|line| line.starts_with("gap ["))
         .collect();
+    let expected = format!("gap [/opt/big.so] {reason} (budget callers: limit 1, requested 2)");
     assert_eq!(
         gap_lines,
-        vec![
-            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912 (budget callers: limit 1, requested 2)",
-            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912 (budget callers: limit 1, requested 2)",
-        ],
+        vec![expected.as_str(), expected.as_str()],
         "two unfolded budget lines, never a folded count:\n{snapshot}"
     );
     assert!(!snapshot.contains("processes)"), "{snapshot}");

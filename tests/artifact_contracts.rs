@@ -10193,7 +10193,9 @@ fn release_docs_describe_the_built_version() {
     }
 }
 
-/// The per-operation scan/hash cap the docs quote is the one the code applies.
+/// The per-operation scan cap the docs quote is the one the code applies.
+/// Hashing draws only on the window allowance (no per-operation leg), so the
+/// docs name a per-scan cap, never per-scan/hash.
 #[test]
 fn documented_scan_operation_cap_matches_the_code() {
     let scan = read("src/discovery/scan.rs");
@@ -10207,11 +10209,15 @@ fn documented_scan_operation_cap_matches_the_code() {
         .map(|factor| factor.trim().parse::<u64>().expect("a numeric factor"))
         .product();
     assert_eq!(bytes % (1024 * 1024), 0, "{expression}");
-    let quoted = format!("{} MiB per scan/hash operation", bytes / (1024 * 1024));
+    let quoted = format!("{} MiB per scan operation", bytes / (1024 * 1024));
     for path in ["docs/overview.md", "docs/usage.md", "CHANGELOG.md"] {
         let flat = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("per scan/hash operation"),
+            "{path} must not state a per-hash operation cap"
+        );
         assert!(flat.contains(&quoted), "{path} must state {quoted:?}");
-        let stated = flat.matches("MiB per scan/hash operation").count();
+        let stated = flat.matches("MiB per scan operation").count();
         assert_eq!(
             stated,
             flat.matches(&quoted).count(),

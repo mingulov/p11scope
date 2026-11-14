@@ -1959,11 +1959,11 @@ impl CaptureWorkBudget {
         self.table_cap_refusals.get(key).cloned()
     }
 
-    /// Retains one header-table refusal under its file identity. Bounded
-    /// like the export facts (the same entry-limit value, counted
-    /// separately so facts-map fullness can never refuse refusal
-    /// retention); bytes share the one retained cache-bytes ceiling
-    /// with every other retained map.
+    /// Retains one gate refusal (table-cap or pre-parse format)
+    /// under its file identity. Bounded like the export facts (the
+    /// same entry-limit value, counted separately so facts-map
+    /// fullness can never refuse refusal retention); bytes share the
+    /// one retained cache-bytes ceiling with every other retained map.
     pub(crate) fn note_table_cap_refusal(&mut self, key: InspectedFileKey, reason: String) -> bool {
         if !self.may_mutate_retained_state() {
             return false;
@@ -5273,9 +5273,9 @@ pub(crate) fn witness_join_with_copyup(
 /// Read (or reuse the cached) ELF export facts for one opened file
 /// under its pin bracket. `key` is the group's maps identity. A repeat
 /// scan of the unchanged file reuses the cached facts — or the cached
-/// table-cap refusal — with zero reads. On filesystems without unique
-/// inode numbers the key cannot name one file, so neither is ever
-/// cached there: always read, never store.
+/// gate refusal (table-cap or pre-parse format) — with zero reads. On
+/// filesystems without unique inode numbers the key cannot name one
+/// file, so neither is ever cached there: always read, never store.
 fn provider_facts_for(
     file: &File,
     key: ObjectKey,
@@ -5300,7 +5300,7 @@ fn provider_facts_for(
     } else {
         None
     };
-    // A cached table-cap refusal reuses the same pin discipline: only
+    // A cached gate refusal reuses the same pin discipline: only
     // the still-unchanged file may skip its header re-probe.
     if cacheable
         && let Some(reason) = budget
@@ -5315,11 +5315,12 @@ fn provider_facts_for(
             let facts = match read_raw_scan_facts_budgeted(file, wanted, budget) {
                 Ok(facts) => facts,
                 Err(reason) => {
-                    // Cache the table-cap refusal under the stable pin
-                    // bracket, like the facts below; every other refusal
-                    // (ceilings, deadlines, corrupt bytes) re-reads.
+                    // Cache the gate refusal (table-cap or pre-parse
+                    // format) under the stable pin bracket, like the
+                    // facts below; every other refusal (ceilings,
+                    // deadlines, corrupt bytes) re-reads.
                     if cacheable
-                        && p11scope_manifest::elf::is_table_cap_reason(&reason)
+                        && p11scope_manifest::elf::is_gate_refusal_reason(&reason)
                         && check_pin_after_read(pin_of(file), &before).is_ok()
                     {
                         budget.note_table_cap_refusal(cache_key, reason.clone());
@@ -16138,9 +16139,10 @@ mod tests {
         budget.finish_window(window).unwrap();
     }
 
-    /// v0.8.0: a failed export parse charges nothing (post-read debit),
+    /// v0.8.0: a failed export parse charges nothing beyond its probe,
     /// and a starved window or a past deadline keeps its named gap —
-    /// never a size refusal.
+    /// never a size refusal. The C1 gate refuses malformed images before
+    /// any parse, charging only the 64-byte header probe it read.
     #[test]
     fn inventory_export_check_keeps_ceiling_and_deadline_gaps() {
         let malformed = tempfile::tempfile().unwrap();
@@ -16162,8 +16164,8 @@ mod tests {
         );
         assert_eq!(
             failed.attempted_io_bytes(),
-            0,
-            "a failed parse debits nothing post-read"
+            64,
+            "a gate refusal debits only its header probe, nothing post-read"
         );
         failed.finish_scan(scan).unwrap();
         failed.finish_window(window).unwrap();
@@ -16219,6 +16221,79 @@ mod tests {
         let mut bytes = header.to_vec();
         bytes.resize(64 + phnum as usize * 56, 0);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Tiny Mach-O 64 header (64 bytes): the gate refuses on the magic
+    /// alone, so no load commands are needed for the caching twin.
+    fn write_tiny_macho(path: &Path) {
+        let mut bytes = [0u8; 64];
+        bytes[0..4].copy_from_slice(&0xfeedfacfu32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Tiny big-endian ELF64 header (64 bytes): the gate refuses on the
+    /// data encoding alone.
+    fn write_tiny_bigendian_elf(path: &Path) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 2;
+        header[6] = 1;
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// Sparse ELF32 with a 2 GiB `.dynsym` (120-byte section table,
+    /// 4 KiB on disk): section 1 is DYNSYM (`sh_size` 2 GiB at offset
+    /// 4096, linked to section 2), section 2 is a 16-byte dynstr
+    /// doubling as the section-name table. 32-bit because 2 GiB is a
+    /// multiple of the 16-byte `Elf32_Sym` but not of the 24-byte
+    /// `Elf64_Sym`. Without the C2 gate the walk iterates 134M zero
+    /// symbols and charges 2 GiB after the walk, draining the pass
+    /// window.
+    fn write_sparse_huge_dynsym_elf(path: &Path) {
+        const DYNSYM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        const DYNSYM_OFF: u64 = 4096;
+        let mut header = [0u8; 52];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 1;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&3u16.to_le_bytes());
+        header[18..20].copy_from_slice(&3u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[28..32].copy_from_slice(&0u32.to_le_bytes());
+        header[32..36].copy_from_slice(&52u32.to_le_bytes());
+        header[40..42].copy_from_slice(&52u16.to_le_bytes());
+        header[42..44].copy_from_slice(&32u16.to_le_bytes());
+        header[46..48].copy_from_slice(&40u16.to_le_bytes());
+        header[48..50].copy_from_slice(&3u16.to_le_bytes());
+        header[50..52].copy_from_slice(&2u16.to_le_bytes());
+        let mut shdr1 = [0u8; 40];
+        shdr1[4..8].copy_from_slice(&11u32.to_le_bytes());
+        shdr1[8..12].copy_from_slice(&2u32.to_le_bytes());
+        shdr1[16..20].copy_from_slice(&(DYNSYM_OFF as u32).to_le_bytes());
+        shdr1[20..24].copy_from_slice(&(DYNSYM_BYTES as u32).to_le_bytes());
+        shdr1[24..28].copy_from_slice(&2u32.to_le_bytes());
+        shdr1[32..36].copy_from_slice(&4u32.to_le_bytes());
+        shdr1[36..40].copy_from_slice(&16u32.to_le_bytes());
+        let mut shdr2 = [0u8; 40];
+        shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr2[8..12].copy_from_slice(&2u32.to_le_bytes());
+        shdr2[16..20].copy_from_slice(&172u32.to_le_bytes());
+        shdr2[20..24].copy_from_slice(&16u32.to_le_bytes());
+        shdr2[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let file = std::fs::File::create(path).unwrap();
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(&file);
+        out.write_all(&header).unwrap();
+        out.write_all(&[0u8; 40]).unwrap();
+        out.write_all(&shdr1).unwrap();
+        out.write_all(&shdr2).unwrap();
+        out.write_all(&[0u8; 16]).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        file.set_len(DYNSYM_OFF + DYNSYM_BYTES).unwrap();
     }
 
     fn object_key_of(file: &File) -> ObjectKey {
@@ -16280,17 +16355,18 @@ mod tests {
         budget.finish_window(window).unwrap();
     }
 
-    /// B1: table work spends against the window before the parse: a
-    /// work allowance smaller than the table entries refuses with the
-    /// work ceiling owing only the tables, never the full structural
-    /// charge (dynsym, dynstr and dynamic ride the post-parse
-    /// remainder).
+    /// B1/C2: table work spends against the window before the parse:
+    /// a work allowance smaller than the table entries refuses with the
+    /// work ceiling owing only the pre-charged tables and dynamic spans,
+    /// never the full structural charge (only the section-name remainder
+    /// rides post-parse).
     #[test]
     fn inventory_table_precharge_spends_work_before_parsing() {
         let fixture = ElfExportFactsFixture::new_provider();
         let file = File::open(&fixture.path).unwrap();
         let key = object_key_of(&file);
-        let tables = header_table_bytes(&file);
+        let (gated, _) = p11scope_manifest::elf::read_table_bounds(&file);
+        let tables = gated.expect("the fixture parses").table_bytes();
         let mut budget =
             CaptureWorkBudget::for_inventory(inventory_limits(8 << 20, 1, 4096, 32768, 4096, 512));
         let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
@@ -16363,6 +16439,115 @@ mod tests {
             "the cached refusal rereads nothing"
         );
         assert_eq!(budget.work_units_count(), 0);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
+    /// C1: pre-parse format refusals cache per file identity like
+    /// table caps: Mach-O and big-endian twins each refuse once on the
+    /// header probe, then reread nothing.
+    #[test]
+    fn inventory_format_refusal_is_cached_per_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, writer, expected) in [
+            (
+                "tiny-macho",
+                write_tiny_macho as fn(&Path),
+                "not an ELF object (MachO)",
+            ),
+            (
+                "tiny-bigendian.so",
+                write_tiny_bigendian_elf as fn(&Path),
+                "not a little-endian ELF object",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            writer(&path);
+            let file = File::open(&path).unwrap();
+            assert!(
+                crate::discovery::identity::file_inodes_are_unique(&file),
+                "the lane TMPDIR must name one file per (device, inode)"
+            );
+            let key = object_key_of(&file);
+            let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+                8 << 20,
+                1 << 20,
+                4096,
+                32768,
+                4096,
+                512,
+            ));
+            let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+            let scan = budget.checkpoint(window.clone()).unwrap();
+            let first = provider_facts_for(&file, key, &[], &mut budget).unwrap_err();
+            assert_eq!(first, expected, "{name}");
+            assert_eq!(budget.attempted_io_bytes(), 64, "{name}");
+            let second = provider_facts_for(&file, key, &[], &mut budget).unwrap_err();
+            assert_eq!(second, first, "{name}");
+            assert_eq!(
+                budget.attempted_io_bytes(),
+                64,
+                "the cached {name} refusal rereads nothing"
+            );
+            assert_eq!(budget.work_units_count(), 0, "{name}");
+            budget.finish_scan(scan).unwrap();
+            budget.finish_window(window).unwrap();
+        }
+    }
+
+    /// C2: a sparse 2 GiB `.dynsym` refuses as a per-object named gap
+    /// without draining the pass window: a later object in the same
+    /// pass still scans, and the repeat rereads nothing.
+    #[test]
+    fn inventory_huge_dynsym_is_a_per_object_gap_that_leaves_the_pass_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge_path = dir.path().join("huge-dynsym.so");
+        write_sparse_huge_dynsym_elf(&huge_path);
+        let small_path = dir.path().join("small.so");
+        write_many_phdr_elf(&small_path, 1);
+        let huge = File::open(&huge_path).unwrap();
+        let small = File::open(&small_path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&huge)
+                && crate::discovery::identity::file_inodes_are_unique(&small),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let huge_key = object_key_of(&huge);
+        let small_key = object_key_of(&small);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            64 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let first = provider_facts_for(&huge, huge_key, &[], &mut budget).unwrap_err();
+        assert!(
+            first.contains("dynamic-symbol table is 2147483648 bytes")
+                && first.contains("limit is 8388608"),
+            "the oversized span names itself, got {first:?}"
+        );
+        assert!(
+            !first.contains("ceiling"),
+            "never the pass-wide ceiling, got {first:?}"
+        );
+        let after_huge = budget.attempted_io_bytes();
+        assert!(
+            after_huge < 1 << 20,
+            "the refused span must not drain the 64 MiB window, charged {after_huge}"
+        );
+        provider_facts_for(&small, small_key, &[], &mut budget)
+            .expect("a later object in the same pass still scans");
+        let repeat = provider_facts_for(&huge, huge_key, &[], &mut budget).unwrap_err();
+        assert_eq!(repeat, first);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            after_huge + header_table_bytes(&small),
+            "the cached span refusal rereads nothing beyond the small object"
+        );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
     }

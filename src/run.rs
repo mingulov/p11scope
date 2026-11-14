@@ -2129,6 +2129,11 @@ pub(crate) struct OwnedChild {
     release_writer: Option<OwnedFd>,
     exec_reader: Option<OwnedFd>,
     prepared: Option<PreparedExecutable>,
+    /// Whether the launch target exceeded [`MAX_LAUNCH_SNAPSHOT_BYTES`]:
+    /// `prepared` is `None` for size declines (as for non-ELF targets),
+    /// and the engine names the size decline truthfully instead of the
+    /// generic non-ELF reason.
+    launch_exceeds_snapshot_cap: bool,
     released: bool,
     /// `CLOCK_MONOTONIC` instant the barrier release completed (exec EOF
     /// observed), bounding pre-release attach stamps for the pre-arm
@@ -2419,6 +2424,13 @@ impl OwnedChild {
             release_writer: Some(release_writer),
             exec_reader: Some(exec_reader),
             prepared,
+            // TODO(P2): the architecture packet owns the bounded resolve
+            // (header + program-table + interpreter reads); until it lands,
+            // size declines fall back to ordinary live discovery with a
+            // truthful PARTIAL reason in the engine. The interpreter-size
+            // decline stays with P2's bounded read; only the target size
+            // is named here.
+            launch_exceeds_snapshot_cap: opened_identity.size > MAX_LAUNCH_SNAPSHOT_BYTES,
             released: false,
             release_ns: None,
             exec_confirmed: false,
@@ -2455,6 +2467,13 @@ impl OwnedChild {
 
     pub(crate) fn prepared_executable(&self) -> Option<&PreparedExecutable> {
         self.prepared.as_ref()
+    }
+
+    /// Whether the launch target exceeded the snapshot cap (so `prepared`
+    /// is `None` for size, not for kind): the engine names the size
+    /// decline truthfully.
+    pub(crate) fn launch_exceeds_snapshot_cap(&self) -> bool {
+        self.launch_exceeds_snapshot_cap
     }
 
     #[cfg(test)]
@@ -20338,6 +20357,40 @@ int main(int argc, char **argv) {
                 .is_none(),
             "a 300 MiB launch file must fall back to ordinary discovery"
         );
+    }
+
+    /// Important-1: a spawned size decline records its cause for the
+    /// engine's truthful PARTIAL reason (not the generic non-ELF text).
+    /// Small targets record no size decline.
+    #[test]
+    fn oversized_launch_records_its_size_decline_for_the_engine() {
+        let directory = tempfile::tempdir().unwrap();
+        let huge = directory.path().join("huge");
+        std::fs::copy("/bin/true", &huge).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&huge)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let mut child = spawn(huge.to_str().unwrap(), &[]);
+        assert!(
+            child.prepared_executable().is_none(),
+            "a 300 MiB target declines preparation"
+        );
+        assert!(
+            child.launch_exceeds_snapshot_cap(),
+            "the size decline must be recorded for the engine's PARTIAL reason"
+        );
+        child.release().unwrap();
+        child.terminate_and_reap().unwrap();
+        let mut small = spawn("/bin/true", &[]);
+        assert!(
+            !small.launch_exceeds_snapshot_cap(),
+            "a small target records no size decline"
+        );
+        small.release().unwrap();
+        small.terminate_and_reap().unwrap();
     }
 
     /// The launch classifier verifies huge files from bounded sniffs,

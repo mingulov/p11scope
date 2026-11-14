@@ -16623,15 +16623,19 @@ impl Engine {
                 .discovery(&self.plan, &excluded_records, &excludes, &forwarding);
         // The capture facts own no `--module` inputs, so the unmatched
         // narrowing disclosure matches here, against the projected
-        // modules, rather than inside `discovery()`.
-        let module_keys: Vec<(plan::ModuleId, String, (u64, u64), u64)> = self
-            .discovery
-            .modules
-            .iter()
-            .map(|module| (module.id, module.path.clone(), module.dev, module.ino))
-            .collect();
-        self.discovery.unmatched_modules =
-            render::match_module_inputs(&self.module_hints, &module_keys);
+        // modules, rather than inside `discovery()`. With no hints the
+        // match is empty: skip cloning every module path.
+        self.discovery.unmatched_modules = if self.module_hints.is_empty() {
+            Vec::new()
+        } else {
+            let module_keys: Vec<(plan::ModuleId, String, (u64, u64), u64)> = self
+                .discovery
+                .modules
+                .iter()
+                .map(|module| (module.id, module.path.clone(), module.dev, module.ino))
+                .collect();
+            render::match_module_inputs(&self.module_hints, &module_keys)
+        };
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "project_facts",
@@ -23501,10 +23505,17 @@ impl Engine {
         // May mutate loader contexts below; selection retainment re-derives.
         self.plan_rebuild_stable = false;
         let Some(prepared_executable) = child.prepared_executable() else {
-            self.mark_partial(
-                "owned initial-set discovery",
-                "the run target was not a revalidated direct ELF with one absolute PT_INTERP",
-            );
+            // TODO(P2): the architecture packet owns the bounded resolve
+            // (header + program-table + interpreter reads); until it lands,
+            // size declines fall back to ordinary live discovery here.
+            // Name the size decline truthfully instead of the generic
+            // non-ELF text.
+            let reason = if child.launch_exceeds_snapshot_cap() {
+                "the run target exceeded the 256 MiB launch snapshot cap; pre-exec loader arming declined"
+            } else {
+                "the run target was not a revalidated direct ELF with one absolute PT_INTERP"
+            };
+            self.mark_partial("owned initial-set discovery", reason);
             return Ok(OwnedLoaderPrearmOutcome::Unavailable);
         };
         crate::scope::scope_names_child(&self.scope, child.pid()).map_err(|error| {

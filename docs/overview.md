@@ -492,7 +492,7 @@ report format.
   `identity_budget_exhausted`) and forces `PARTIAL`.
 - Discovery has one capture-wide 512 MiB attempted-I/O allowance shared by
   memory scans and scan-sourced file hashes across all selected processes and
-  retries, with at most 256 MiB per scan/hash operation, both enforced
+  retries, with at most 256 MiB per scan operation, both enforced
   incrementally as bytes stream (no object is refused for its own size; a
   large object degrades through the I/O ceiling's named gap). It also stops at 512 accepted
   table candidates, 53,248 decoded entries, 512 interface records, 256 cgroup

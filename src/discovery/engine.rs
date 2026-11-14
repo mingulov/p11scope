@@ -21424,16 +21424,7 @@ impl Engine {
                         continue;
                     }
                     if staged_this_tick >= pin_budget {
-                        if self.pending_learned.len()
-                            >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
-                        {
-                            // Pending is bounded like staging: a provider
-                            // storm refuses loudly instead of holding fds
-                            // without bound.
-                            self.refuse_learned_candidate(candidate);
-                        } else {
-                            self.pending_learned.push(candidate);
-                        }
+                        self.requeue_learned_candidate(candidate);
                         continue;
                     }
                     self.stage_learned_candidate(candidate);
@@ -21454,6 +21445,21 @@ impl Engine {
             || self.learned_settled.contains(&identity)
         {
             self.learned_settled.insert(identity);
+        }
+    }
+
+    /// Re-queues one candidate into `pending_learned` under the staging
+    /// bound: past the cap the candidate refuses loudly through the
+    /// per-capture cap row instead of holding its fd in an unbounded
+    /// queue. Fresh over-budget staging and table-deferral push-back
+    /// share this one check, so the bound holds by construction.
+    fn requeue_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
+        if self.pending_learned.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+            // Pending is bounded like staging: a provider storm refuses
+            // loudly instead of holding fds without bound.
+            self.refuse_learned_candidate(candidate);
+        } else {
+            self.pending_learned.push(candidate);
         }
     }
 
@@ -21620,12 +21626,14 @@ impl Engine {
             // A budget wait is not a refusal: the candidate stays
             // learnable and rides the next drain instead of settling.
             // The learned gap above already filed through the merge.
+            // Past the pending bound the requeue refuses loudly instead
+            // (never an unbounded queue, never a silent close).
             if pinning
                 .skipped
                 .iter()
                 .any(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED)
             {
-                self.pending_learned.push(candidate);
+                self.requeue_learned_candidate(candidate);
                 return;
             }
             self.note_learned_settled(identity);

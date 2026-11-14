@@ -95,7 +95,9 @@ struct PendingExit {
 pub(crate) const EXIT_TAP_QUEUE_LIMIT: usize = 16_384;
 
 /// Position-passing drains an unmatched exit survives before it
-/// drops with the counted `exit_retire_unmatched` gap.
+/// drops with the counted `exit_retire_unmatched` gap. In the final
+/// drain (`final_drain == true`, end of run), unmatched exits are
+/// dropped on first look instead of retrying.
 const EXIT_UNMATCHED_RETRIES: u8 = 2;
 
 /// Whether an exit stamped with tap-time producer `tap_producer` is
@@ -137,9 +139,11 @@ pub(crate) struct Registry {
     /// The exit drops immediately with this counted outcome — no retry,
     /// never unmatched.
     exit_tie_skipped: u64,
-    /// Due exits dropped after [`EXIT_UNMATCHED_RETRIES`] retries with no
-    /// matching task and no tie (never-admitted processes own no rows).
-    /// Ties drop immediately and never count here.
+    /// Due exits dropped after [`EXIT_UNMATCHED_RETRIES`] retries (or
+    /// on first look in the final drain, `final_drain == true` at end
+    /// of run) with no matching task and no tie (never-admitted
+    /// processes own no rows). Ties drop immediately and never count
+    /// here.
     exit_retire_unmatched: u64,
     /// Events on a retired cookie timestamped after the exit: the
     /// task reopens, the exit timestamp clears, the event is admitted.

@@ -11409,6 +11409,388 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
     );
 }
 
+impl MachineScene {
+    /// Drive one quantum to Auditing: the quantum is ingested and its
+    /// admissions staged, but its audit has not run, so the machine
+    /// still holds the raw ingested quantum and the coordinator still
+    /// holds its untaken H3 disposition.
+    fn reach_auditing(&mut self) {
+        self.reach_phase("Auditing");
+        assert!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .reference_h3_audit_state()
+                .1,
+            "Auditing holds the quantum's untaken H3 disposition"
+        );
+    }
+
+    /// Drive one quantum to Auditing and refuse the audit's native
+    /// construction once: the busy-host transient at the audit step.
+    fn refuse_at_auditing_with(&mut self, reason: SemanticRefusal, counter: u64) {
+        self.scene
+            .push(std::process::id(), 0, "C_CreateObject", counter);
+        self.reach_auditing();
+        self.native.fail_native_once = Some(reason);
+        assert_eq!(
+            self.service(1024),
+            Err(reason),
+            "the posed native refusal latches the running machine"
+        );
+        assert_eq!(self.machine.disposition_reason(), Some(reason));
+        assert_eq!(
+            self.machine.diagnostic_snapshot_for_test().0,
+            "Auditing",
+            "the refusal latches at the audit step, with the raw quantum held"
+        );
+    }
+
+    /// Summed S1 API returns across every retained feed.
+    fn api_returns_total(&self) -> u64 {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    }
+
+    /// Whether the coordinator still holds an untaken H3 disposition.
+    fn h3_pending(&self) -> bool {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state()
+            .1
+    }
+
+    /// Recover after a re-arm: the next quantum commits and publishes,
+    /// staging nothing left over, and the lane never latches again.
+    fn assert_recovers(&mut self, label: &str, counter: u64) {
+        assert!(
+            self.machine.begin_commit(false).is_ok(),
+            "the re-armed lane accepts the next commit ({label})"
+        );
+        let revision = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        let preparations = self.native.preparations.len();
+        self.scene
+            .push(std::process::id(), 0, "C_CreateObject", counter);
+        self.published_labeled(label, None);
+        self.assert_no_staged_calls(label);
+        assert_eq!(
+            self.machine.disposition_reason(),
+            None,
+            "the recovered lane never latches ({label})"
+        );
+        assert!(
+            self.native.preparations.len() > preparations,
+            "the recovered quantum prepares anew, not a replay ({label})"
+        );
+        assert!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision()
+                > revision,
+            "the next quantum publishes ({label})"
+        );
+    }
+}
+
+/// Owner rule "partial, never stop", at the audit step: a busy-host
+/// transient can refuse a quantum's audit before it runs (the raw
+/// ingested quantum held, its H3 disposition untaken). The re-arm
+/// disposes that quantum through the same counted paths as an
+/// Audited refusal: the unapplied publication cancels, the untaken H3
+/// slot is taken exactly as the audit takes it, the raw quantum drops,
+/// and the next collect voids every key open across it (named) and
+/// re-syncs above a fence. The next quantum publishes, and every call
+/// stays accounted: reduced plus disposed equals the S1 returns.
+#[test]
+fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.assert_no_staged_calls("the prime publish");
+    let baseline_returns = fixture.api_returns_total();
+    let reduced = fixture.reduced_for(0);
+    let disposed_prime = fixture.disposed_total();
+    let unknown_before = fixture.unknown_terminals();
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    fixture.reach_auditing();
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the audit-step refusal latches"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the refused quantum's publication stands before the re-arm"
+    );
+    assert_eq!(
+        fixture.staged_total(),
+        0,
+        "an unaudited quantum applied nothing to the feeds"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Auditing refusal re-arms (no demand was bound)"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "a successful re-arm clears the recorded refusal"
+    );
+    assert_eq!(fixture.machine.running_rearms_for_test(), 1);
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the latch clears"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon cancelled the refused quantum's unapplied publication"
+    );
+    assert!(
+        !fixture.h3_pending(),
+        "the re-arm took the H3 disposition the refused audit left untaken"
+    );
+    let subjects = fixture.all_gap_subjects();
+    for subject in ["unfinished joint publication abandoned", QUANTUM_ABANDONED] {
+        assert!(
+            subjects.iter().any(|seen| seen == subject),
+            "{subject} is named: {subjects:?}"
+        );
+    }
+    fixture.assert_recovers("after auditing re-arm", 5);
+    assert!(
+        fixture.reduced_for(0) > reduced,
+        "calls after the re-arm are recorded"
+    );
+    assert_eq!(
+        fixture.api_returns_total(),
+        baseline_returns + 4,
+        "S1 joins every call including the abandoned three"
+    );
+    assert_eq!(
+        fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
+        fixture.api_returns_total() - baseline_returns,
+        "reduced and disposed calls cover every call across the re-arm"
+    );
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        (
+            unknown_after[1] - unknown_before[1],
+            unknown_after[2] - unknown_before[2],
+            unknown_after[3] - unknown_before[3],
+        ),
+        (0, 0, 0),
+        "the re-arm invents no failed, cancelled or unknown outcomes"
+    );
+    let subjects = fixture.all_gap_subjects();
+    assert!(
+        subjects
+            .iter()
+            .any(|seen| seen == "Joint key operations unavailable; retained S1"),
+        "the void of the keys open across the abandoned quantum is named: {subjects:?}"
+    );
+    assert_eq!(
+        subjects
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        1,
+        "one abandoned quantum, one gap"
+    );
+}
+
+/// The audit's own preflight refusal at the audit step, the pool
+/// shape of a busy host: the capture-wide semantic pool is full when
+/// the audit reserves its loss storage, so the audit refuses and
+/// returns the raw quantum unchanged. With a bound commit demand the
+/// re-arm reports the abandon as the demand's publication, and once
+/// the pool frees the next quantum publishes.
+#[test]
+fn joint_machine_auditing_pool_refusal_rearms_bound_demand_as_published() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let baseline_returns = fixture.api_returns_total();
+    let reduced = fixture.reduced_for(0);
+    let disposed_prime = fixture.disposed_total();
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.machine.begin_commit(true).unwrap();
+    fixture.reach_auditing();
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().1,
+        "Bound",
+        "the commit demand is bound before the refusal"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let snapshot = registry.semantic_resource_snapshot();
+    let hog = registry
+        .reserve_semantic_storage(snapshot.limit_bytes - snapshot.charged_bytes)
+        .expect("the test fills the remaining pool");
+    let refused_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .refused;
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the audit's refused reservation latches the running machine"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot()
+            .refused
+            > refused_before,
+        "the pool refused the audit's reservation"
+    );
+    drop(hog);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "a bound demand re-arms as published"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().1,
+        "None",
+        "the bound demand is cleared"
+    );
+    assert!(!fixture.h3_pending());
+    assert!(!fixture.scene.real.scene.coordinator.publication_pending());
+    fixture.assert_recovers("after auditing pool re-arm", 3);
+    assert_eq!(
+        fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
+        fixture.api_returns_total() - baseline_returns,
+        "reduced and disposed calls cover every call across the re-arm"
+    );
+    assert_eq!(fixture.api_returns_total(), baseline_returns + 2);
+}
+
+/// Failure twin at the audit step: a permanent refusal keeps the
+/// latch and disposes nothing (raw quantum and H3 slot still held for
+/// the hold). The eligibility comes from the latch itself, so an
+/// earlier successful Auditing re-arm leaves no stale admission.
+#[test]
+fn joint_machine_auditing_permanent_refusal_keeps_the_latch() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2);
+    assert_eq!(fixture.rearm("semantic_unavailable"), Some(false));
+    fixture.refuse_at_auditing_with(SemanticRefusal::Attachment, 3);
+    assert_eq!(fixture.rearm("semantic_attachment"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::NotTransient),
+        "the stop names the permanent refusal"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Attachment),
+        "the latch stands for the hold"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert!(fixture.h3_pending(), "the H3 slot stays for the hold");
+    assert!(fixture.scene.real.scene.coordinator.publication_pending());
+    assert_eq!(fixture.machine.running_rearms_for_test(), 1);
+    assert_eq!(
+        fixture.rearm("semantic_attachment"),
+        None,
+        "a refused re-arm stays refused"
+    );
+    assert_eq!(
+        fixture
+            .all_gap_subjects()
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        1,
+        "only the transient was continued past"
+    );
+}
+
+/// Bound twin across both steps: Audited and Auditing re-arms spend
+/// one shared per-run limit; past it an Auditing refusal keeps the
+/// latch with its raw quantum and H3 slot held.
+#[test]
+fn joint_machine_auditing_and_audited_rearms_share_the_bound() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    for round in 0..limit {
+        if round % 2 == 0 {
+            fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2 + round as u64);
+        } else {
+            fixture.refuse_at_audited(2 + round as u64);
+        }
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "re-arm {round} is inside the shared bound"
+        );
+    }
+    assert_eq!(fixture.machine.running_rearms_for_test(), limit);
+    fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2 + limit as u64);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "the shared bound holds at the audit step"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent)
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert!(fixture.h3_pending(), "the H3 slot stays for the hold");
+    assert_eq!(
+        fixture
+            .all_gap_subjects()
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        limit as usize,
+        "one named gap per re-arm inside the bound"
+    );
+}
+
 /// Healthy twin: no refusal, nothing latched, nothing to re-arm.
 #[test]
 fn joint_machine_healthy_quantum_needs_no_rearm() {

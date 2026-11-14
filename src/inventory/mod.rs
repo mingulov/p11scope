@@ -1657,6 +1657,13 @@ fn run_with_terminal_budget(
     let cgroup = matches!(scope, InventoryRunScope::Cgroup)
         .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source))
         .transpose()?;
+    // One --duration deadline for the startup drain and the classic
+    // loop below: both gates read the same Instant. (The dashboard
+    // path recomputes its own after its move; cgroup runs read the
+    // same driver deadline there.)
+    let deadline = cgroup
+        .as_ref()
+        .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
     let mut lane = match open_native_lane(
         capture,
         attach_backend,
@@ -1706,7 +1713,7 @@ fn run_with_terminal_budget(
         draining_lifecycle::<crate::process::PidPin, _, _, _>(
             lane.as_mut(),
             drain_stop_source.as_deref(),
-            None,
+            deadline,
             || {
                 start_semantic_lane(
                     &mut coordinator,
@@ -1792,9 +1799,6 @@ fn run_with_terminal_budget(
         started_ns,
         0,
     ));
-    let deadline = cgroup
-        .as_ref()
-        .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
     // The deferred scan seal consumes per-pass mint sources the
     // coordinator only retains when told an attempt will come.
     if manifests.is_empty() && key_operations && native_available {
@@ -5799,16 +5803,18 @@ fn note_semantic_lane_sealed() {
 /// size, not the drain, sets that headroom. Without a thread for the
 /// drainer, `start` runs undrained.
 ///
-/// `stop` is the operator-stop signal counter: every tick extends only
-/// while it is still zero, like the collection-tick gate, so a stop
-/// during the load turns every later tick drain-only and pass 0
-/// attaches the backlog instead. The drain itself always runs. `None`
+/// `stop` is the operator-stop signal counter and `deadline` the run's
+/// `--duration` end: every tick extends only while the counter is still
+/// zero and `now` is before the deadline, like the collection-tick
+/// gate, so a stop during the load turns every later tick drain-only;
+/// the backlog stays queued and the stopped run ends before pass 0
+/// (F9), so nothing attaches it. The drain itself always runs. `None`
 /// keeps the old always-extend behavior for seams without a stop
-/// source.
+/// source or deadline.
 pub(crate) fn draining_lifecycle<Pin, L, T, F>(
     lane: Option<&mut NativeLane<L>>,
     stop: Option<&std::sync::atomic::AtomicUsize>,
-    _deadline: Option<std::time::Instant>,
+    deadline: Option<std::time::Instant>,
     start: F,
 ) -> T
 where
@@ -5826,10 +5832,13 @@ where
         return start();
     };
     let done = std::sync::atomic::AtomicBool::new(false);
-    // A stop during the load turns every later tick drain-only; the
-    // check runs per tick, like the collection-tick gate.
-    let may_extend =
-        || stop.is_none_or(|stop| stop.load(std::sync::atomic::Ordering::Acquire) == 0);
+    // A stop or a passed deadline during the load turns every later
+    // tick drain-only; the check runs per tick, like the
+    // collection-tick gate.
+    let may_extend = || {
+        stop.is_none_or(|stop| stop.load(std::sync::atomic::Ordering::Acquire) == 0)
+            && deadline.is_none_or(|end| std::time::Instant::now() < end)
+    };
     std::thread::scope(|threads| {
         let drainer = std::thread::Builder::new()
             .name("p11scope-lifecycle-drain".into())

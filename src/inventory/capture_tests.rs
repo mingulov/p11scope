@@ -10118,11 +10118,12 @@ fn startup_drain_without_a_lane_runs_the_load_once() {
 }
 
 /// A stop during the semantic BPF load turns every later startup tick
-/// drain-only: the 600-endpoint pre-arm backlog stays queued for pass 0
-/// and zero drain extends start after the stop — while the ring drain
-/// continues. The lane classifies each extend by the flag at extend
-/// time, like the collection-tick twin; extends before the stop stay
-/// legal and uncounted.
+/// drain-only: the 600-endpoint pre-arm backlog stays queued, the
+/// stopped run ends before pass 0 (F9), and zero drain extends start
+/// after the stop — while the ring drain continues. The lane
+/// classifies each extend by the flag at extend time, like the
+/// collection-tick twin; extends before the stop stay legal and
+/// uncounted.
 #[test]
 fn startup_drain_extends_nothing_after_a_stop_during_the_load() {
     use std::sync::atomic::Ordering;

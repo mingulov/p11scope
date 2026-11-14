@@ -253,48 +253,82 @@ fn read_export_facts_budgeted(
     Ok((abi, exports))
 }
 
+/// Debit window bytes for one export-facts step: a window too small
+/// for the step drains its remainder and refuses with the I/O ceiling
+/// gap, never a partial debit.
+fn debit_window_io(budget: &mut CaptureWorkBudget, bytes: u64) -> Result<(), String> {
+    let remaining = budget.remaining_window_io().unwrap_or(0);
+    if bytes > remaining {
+        budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+        return Err(format!("read failed: {IO_CEILING_REASON}"));
+    }
+    budget.record_io(usize::try_from(bytes).unwrap_or(usize::MAX));
+    Ok(())
+}
+
 fn read_raw_scan_facts_budgeted(
     file: &File,
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
-    let (abi, exports, excluded_anchor_ranges, work_units, getter_present, witness_fault) =
-        if budget.retained_mapped_identity(file).is_some() {
-            let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
-            (
-                facts.abi,
-                facts.exports,
-                facts.excluded_anchor_ranges,
-                facts.work_units,
-                facts.getter_present,
-                facts.witness_fault,
-            )
-        } else {
-            // Both policies share the demand-paged structural post-read
-            // debit; no whole-file gate is introduced for sparse objects.
-            if matches!(budget.policy(), DiscoveryPolicy::Inventory(_))
-                && budget.active_scan.is_none()
-            {
-                return Err("read failed: inventory discovery requires an active scan".into());
+    let (abi, exports, excluded_anchor_ranges, work_rest, getter_present, witness_fault) = if budget
+        .retained_mapped_identity(file)
+        .is_some()
+    {
+        let snapshot = read_elf_snapshot(file, budget)?;
+        // The snapshot read charged the bytes incrementally; spend
+        // the table entries before the parse and the remainder after.
+        let pre_entries = snapshot.table_bounds().table_entries();
+        if pre_entries > 0 {
+            budget.spend(pre_entries).map_err(str::to_string)?;
+        }
+        let facts = snapshot.raw_scan_facts(wanted)?;
+        (
+            facts.abi,
+            facts.exports,
+            facts.excluded_anchor_ranges,
+            facts.work_units.saturating_sub(pre_entries),
+            facts.getter_present,
+            facts.witness_fault,
+        )
+    } else {
+        // Both policies bound the tables before the parse and debit
+        // the remainder after; no whole-file gate is introduced for
+        // sparse objects.
+        if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) && budget.active_scan.is_none()
+        {
+            return Err("read failed: inventory discovery requires an active scan".into());
+        }
+        // The header probe refuses over-cap tables with the named gap
+        // before any mapping, charging only the probe bytes it read.
+        let (gated, probe_bytes) = p11scope_manifest::elf::read_table_bounds(file);
+        let bounds = match gated {
+            Ok(bounds) => bounds,
+            Err(reason) => {
+                budget.record_io(usize::try_from(probe_bytes).unwrap_or(usize::MAX));
+                return Err(reason);
             }
-            let facts =
-                p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
-            let remaining = budget.remaining_window_io().unwrap_or(0);
-            if facts.structural_bytes > remaining {
-                budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
-                return Err(format!("read failed: {IO_CEILING_REASON}"));
-            }
-            budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
-            (
-                facts.abi,
-                facts.exports,
-                facts.excluded_anchor_ranges,
-                facts.work_units,
-                facts.getter_present,
-                facts.witness_fault,
-            )
         };
-    budget.spend(work_units).map_err(str::to_string)?;
+        let pre_bytes = bounds.table_bytes();
+        if pre_bytes > 0 {
+            debit_window_io(budget, pre_bytes)?;
+        }
+        let pre_entries = bounds.table_entries();
+        if pre_entries > 0 {
+            budget.spend(pre_entries).map_err(str::to_string)?;
+        }
+        let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+        debit_window_io(budget, facts.structural_bytes.saturating_sub(pre_bytes))?;
+        (
+            facts.abi,
+            facts.exports,
+            facts.excluded_anchor_ranges,
+            facts.work_units.saturating_sub(pre_entries),
+            facts.getter_present,
+            facts.witness_fault,
+        )
+    };
+    budget.spend(work_rest).map_err(str::to_string)?;
     if let Some(reason) = budget.check_deadline_now() {
         return Err(reason.into());
     }
@@ -972,6 +1006,15 @@ fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+fn table_refusal_cache_bytes(key: &InspectedFileKey, value: &str) -> u64 {
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(value.len()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
     let dynamic = value
         .exports
@@ -1063,6 +1106,10 @@ pub struct CaptureWorkBudget {
     runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), (u64, u64)>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
+    /// Over-cap ELF header-table refusals by file identity: a repeat
+    /// scan of the unchanged file reuses the named refusal with zero
+    /// reads instead of re-probing its header every pass.
+    table_cap_refusals: BTreeMap<InspectedFileKey, String>,
     /// Dynamic loader facts one completed loader arm read and revalidated.
     /// A later arm of the same unchanged loader file reuses them instead of
     /// re-reading the whole loader for its locator, snapshot and both
@@ -1148,6 +1195,7 @@ impl CaptureWorkBudget {
             runtime_table_contents: BTreeMap::new(),
             inspected_files: BTreeMap::new(),
             elf_export_facts: BTreeMap::new(),
+            table_cap_refusals: BTreeMap::new(),
             loader_elf_facts: BTreeMap::new(),
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
@@ -1875,6 +1923,43 @@ impl CaptureWorkBudget {
 
     pub(crate) fn elf_export_facts_for(&self, key: &InspectedFileKey) -> Option<ElfExportFacts> {
         self.elf_export_facts.get(key).cloned()
+    }
+
+    pub(crate) fn table_cap_refusal_for(&self, key: &InspectedFileKey) -> Option<String> {
+        self.table_cap_refusals.get(key).cloned()
+    }
+
+    /// Retains one header-table refusal under its file identity. Bounded
+    /// like the export facts (the same entry-limit value, counted
+    /// separately so facts-map fullness can never refuse refusal
+    /// retention); bytes share the one retained cache-bytes ceiling
+    /// with every other retained map.
+    pub(crate) fn note_table_cap_refusal(&mut self, key: InspectedFileKey, reason: String) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = table_refusal_cache_bytes(&key, &reason);
+        if !self.cache_can_replace(
+            self.table_cap_refusals
+                .get(&key)
+                .map(|old| table_refusal_cache_bytes(&key, old)),
+            bytes,
+            self.table_cap_refusals.len(),
+            self.inventory_limits()
+                .map(|limits| limits.retained.export_cache_entries)
+                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
+        ) {
+            return false;
+        }
+        let old = self
+            .table_cap_refusals
+            .insert(key, reason)
+            .map_or(0, |old| table_refusal_cache_bytes(&key, &old));
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        true
     }
 
     pub(crate) fn note_elf_export_facts(
@@ -5157,9 +5242,10 @@ pub(crate) fn witness_join_with_copyup(
 
 /// Read (or reuse the cached) ELF export facts for one opened file
 /// under its pin bracket. `key` is the group's maps identity. A repeat
-/// scan of the unchanged file reuses the cached facts with zero reads.
-/// On filesystems without unique inode numbers the key cannot name one
-/// file, so the facts are never cached there: always read, never store.
+/// scan of the unchanged file reuses the cached facts — or the cached
+/// table-cap refusal — with zero reads. On filesystems without unique
+/// inode numbers the key cannot name one file, so neither is ever
+/// cached there: always read, never store.
 fn provider_facts_for(
     file: &File,
     key: ObjectKey,
@@ -5168,7 +5254,8 @@ fn provider_facts_for(
 ) -> Result<ElfExportFacts, String> {
     let before = pin_of(file)?;
     // Neither policy gates this demand-paged export check on whole size;
-    // both charge the structural table bytes after the parse.
+    // both charge the header tables before the parse and the remainder
+    // after.
     let cache_key = InspectedFileKey::for_open_file(file, key.device, key.inode, before)?;
     // On filesystems without unique inode numbers the key cannot name
     // one file, so the facts are never cached there: always read, never
@@ -5183,10 +5270,34 @@ fn provider_facts_for(
     } else {
         None
     };
+    // A cached table-cap refusal reuses the same pin discipline: only
+    // the still-unchanged file may skip its header re-probe.
+    if cacheable {
+        if let Some(reason) = budget
+            .table_cap_refusal_for(&cache_key)
+            .filter(|_| pin_of(file).is_ok_and(|after| after == before))
+        {
+            return Err(reason);
+        }
+    }
     match cached {
         Some(facts) => Ok(facts),
         None => {
-            let facts = read_raw_scan_facts_budgeted(file, wanted, budget)?;
+            let facts = match read_raw_scan_facts_budgeted(file, wanted, budget) {
+                Ok(facts) => facts,
+                Err(reason) => {
+                    // Cache the table-cap refusal under the stable pin
+                    // bracket, like the facts below; every other refusal
+                    // (ceilings, deadlines, corrupt bytes) re-reads.
+                    if cacheable
+                        && p11scope_manifest::elf::is_table_cap_reason(&reason)
+                        && check_pin_after_read(pin_of(file), &before).is_ok()
+                    {
+                        budget.note_table_cap_refusal(cache_key, reason.clone());
+                    }
+                    return Err(reason);
+                }
+            };
             // File-derived anchor exclusions share the export pin bracket.
             check_pin_after_read(pin_of(file), &before)?;
             if cacheable {

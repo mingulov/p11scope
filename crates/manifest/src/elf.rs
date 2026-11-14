@@ -15,6 +15,279 @@ use object::{Architecture, BinaryFormat, Object as _, ObjectSegment as _, Object
 
 const MAX_INTERPRETER_BYTES: usize = 4096;
 
+/// Bound on an ELF program-header table any parse may walk: 64 KiB
+/// (1,170 entries at 56 bytes). Tables are demand-paged, but the
+/// export parse builds one map entry per load segment and one range
+/// per executable segment, so an unbounded table is unbounded memory
+/// (a 224 MiB / 4M-segment file reached about 1 GiB RSS). Real tables
+/// are tiny (896 bytes max over 9,467 system ELFs), so the cap refuses
+/// only crafted files — never a size gate on the file itself.
+pub const MAX_PROGRAM_TABLE_BYTES: u64 = 64 * 1024;
+
+/// Bound on an ELF section-header table any parse may walk: 1 MiB
+/// (16,384 entries at 64 bytes). Real tables are kilobytes (4 KiB max
+/// over 9,467 system ELFs, in libc), so the cap refuses only crafted
+/// files — never a size gate on the file itself.
+pub const MAX_SECTION_TABLE_BYTES: u64 = 1024 * 1024;
+
+/// Header-table sizes one ELF parse will walk, read from the ELF
+/// header (plus section 0 when the extended counts are used) before
+/// any table page is touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfTableBounds {
+    /// ELF header bytes (64 for 64-bit, 52 for 32-bit).
+    pub header_bytes: u64,
+    /// Program-header table bytes (`e_phnum * e_phentsize`).
+    pub program_table_bytes: u64,
+    /// Section-header table bytes (`e_shnum * e_shentsize`).
+    pub section_table_bytes: u64,
+    /// Program-header entries the parse will walk.
+    pub program_entries: u64,
+    /// Section-header entries the parse will walk.
+    pub section_entries: u64,
+}
+
+impl ElfTableBounds {
+    /// Bytes the admitted parse will walk: the header plus both tables.
+    pub fn table_bytes(&self) -> u64 {
+        self.header_bytes
+            .saturating_add(self.program_table_bytes)
+            .saturating_add(self.section_table_bytes)
+    }
+
+    /// Table entries the admitted parse will walk.
+    pub fn table_entries(&self) -> u64 {
+        self.program_entries.saturating_add(self.section_entries)
+    }
+
+    /// Bounds for a header this gate cannot read: admit with nothing
+    /// owed and let the legacy parser rule with its historical errors.
+    fn unreadable() -> Self {
+        Self {
+            header_bytes: 0,
+            program_table_bytes: 0,
+            section_table_bytes: 0,
+            program_entries: 0,
+            section_entries: 0,
+        }
+    }
+}
+
+fn program_table_reason(table_bytes: u64) -> String {
+    format!("ELF program-header table is {table_bytes} bytes; limit is {MAX_PROGRAM_TABLE_BYTES}")
+}
+
+fn section_table_reason(table_bytes: u64) -> String {
+    format!("ELF section-header table is {table_bytes} bytes; limit is {MAX_SECTION_TABLE_BYTES}")
+}
+
+/// Whether a refusal reason names an over-cap header table: the scan
+/// caches exactly these per file identity, so the prefix match cannot
+/// drift from the reasons above.
+pub fn is_table_cap_reason(reason: &str) -> bool {
+    reason.starts_with("ELF program-header table is ")
+        || reason.starts_with("ELF section-header table is ")
+}
+
+/// Table bounds from one ELF header plus section 0 when the extended
+/// counts are used. Mirrors `object` 0.39's extended-count rules
+/// (`FileHeader::phnum`/`shnum`): `e_phnum == PN_XNUM` reads the real
+/// count from section 0's `sh_info`; `e_shnum == 0` with a section
+/// table present reads it from section 0's `sh_size`. Anything this
+/// gate cannot read (short header, bad magic, a class other than
+/// 32/64-bit, big-endian, wrong entry sizes, missing section 0)
+/// admits with zero bounds: the legacy parser rules those with its
+/// historical errors, and a table the parser would reject never
+/// reaches the per-entry walks. Over-cap tables refuse with the named
+/// gap reason, identical on every entry point so identical files fold.
+pub fn table_bounds_from_header(
+    header: &[u8],
+    section0: Option<&[u8]>,
+) -> Result<ElfTableBounds, String> {
+    // 64-bit field offsets, then the 32-bit ones: (ehdr size,
+    // shoff, phentsize, phnum, shentsize, shnum, shdr size, sh_info,
+    // sh_size, sh_size width).
+    const LAYOUT64: (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) = (64, 40, 54, 56, 58, 60, 64, 44, 32, 8);
+    const LAYOUT32: (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) = (52, 32, 42, 44, 46, 48, 40, 28, 20, 4);
+    fn word<const N: usize>(bytes: &[u8], at: usize) -> Option<u64> {
+        let slice = bytes.get(at..at + N)?;
+        let mut padded = [0u8; 8];
+        padded[..N].copy_from_slice(slice);
+        Some(u64::from_le_bytes(padded))
+    }
+    let class = header.get(4).copied().unwrap_or(0);
+    let layout = match class {
+        1 => LAYOUT32,
+        2 => LAYOUT64,
+        _ => return Ok(ElfTableBounds::unreadable()),
+    };
+    let (ehdr, o_shoff, o_phentsize, o_phnum, o_shentsize, o_shnum, shdr, o_info, o_size, w_size) =
+        layout;
+    if header.len() < ehdr
+        || header.get(..4) != Some(b"\x7fELF".as_slice())
+        || header.get(5).copied() != Some(1)
+    {
+        return Ok(ElfTableBounds::unreadable());
+    }
+    let Some(phentsize) = word::<2>(header, o_phentsize) else {
+        return Ok(ElfTableBounds::unreadable());
+    };
+    let Some(e_phnum) = word::<2>(header, o_phnum) else {
+        return Ok(ElfTableBounds::unreadable());
+    };
+    let Some(shentsize) = word::<2>(header, o_shentsize) else {
+        return Ok(ElfTableBounds::unreadable());
+    };
+    let Some(e_shnum) = word::<2>(header, o_shnum) else {
+        return Ok(ElfTableBounds::unreadable());
+    };
+    // Extended counts need section 0 with the exact entry size the
+    // parser requires; anything else admits and the parser rules it.
+    let section0 = (e_phnum == 0xffff || e_shnum == 0).then(|| {
+        let bytes = section0?;
+        if shentsize as usize != shdr || bytes.len() < shdr {
+            return None;
+        }
+        Some(bytes)
+    });
+    let phnum = if e_phnum < 0xffff {
+        e_phnum
+    } else {
+        let Some(section0) = section0.flatten() else {
+            return Ok(ElfTableBounds::unreadable());
+        };
+        word::<4>(section0, o_info).unwrap_or(0)
+    };
+    let shnum = if e_shnum > 0 {
+        e_shnum
+    } else {
+        let shoff = if class == 2 {
+            word::<8>(header, o_shoff).unwrap_or(0)
+        } else {
+            word::<4>(header, o_shoff).unwrap_or(0)
+        };
+        if shoff == 0 {
+            0
+        } else {
+            let Some(section0) = section0.flatten() else {
+                return Ok(ElfTableBounds::unreadable());
+            };
+            if w_size == 8 {
+                word::<8>(section0, o_size).unwrap_or(0)
+            } else {
+                word::<4>(section0, o_size).unwrap_or(0)
+            }
+        }
+    };
+    let program_table_bytes = phnum.saturating_mul(phentsize);
+    if program_table_bytes > MAX_PROGRAM_TABLE_BYTES {
+        return Err(program_table_reason(program_table_bytes));
+    }
+    let section_table_bytes = shnum.saturating_mul(shentsize);
+    if section_table_bytes > MAX_SECTION_TABLE_BYTES {
+        return Err(section_table_reason(section_table_bytes));
+    }
+    Ok(ElfTableBounds {
+        header_bytes: ehdr as u64,
+        program_table_bytes,
+        section_table_bytes,
+        program_entries: phnum,
+        section_entries: shnum,
+    })
+}
+
+/// Section 0's file offset and size when the header's counts may need
+/// it (`e_phnum == PN_XNUM`, or `e_shnum == 0` with a section table
+/// present): `None` when unneeded or undeterminable, in which case
+/// the gate admits and the legacy parser rules.
+fn section0_location(header: &[u8]) -> Option<(u64, usize)> {
+    let class = header.get(4).copied()?;
+    let (ehdr, o_shoff, o_phnum, o_shentsize, o_shnum, shdr) = match class {
+        1 => (52usize, 32usize, 44usize, 46usize, 48usize, 40usize),
+        2 => (64usize, 40usize, 56usize, 58usize, 60usize, 64usize),
+        _ => return None,
+    };
+    if header.len() < ehdr {
+        return None;
+    }
+    let at = |offset: usize| -> Option<u16> {
+        u16::from_le_bytes(header.get(offset..offset + 2)?.try_into().ok()?).into()
+    };
+    let shoff = {
+        let width = if class == 2 { 8 } else { 4 };
+        let slice = header.get(o_shoff..o_shoff + width)?;
+        let mut padded = [0u8; 8];
+        padded[..width].copy_from_slice(slice);
+        u64::from_le_bytes(padded)
+    };
+    let extended = at(o_phnum)? == 0xffff || (at(o_shnum)? == 0 && shoff != 0);
+    if !extended {
+        return None;
+    }
+    // Extended counts need section 0 with the exact entry size the
+    // parser requires; anything else admits and the parser rules it.
+    if at(o_shentsize)? as usize != shdr || shoff == 0 {
+        return None;
+    }
+    Some((shoff, shdr))
+}
+
+/// Table bounds for one opened file, read before any mapping: the ELF
+/// header bytes, plus section 0 when the extended counts are used. At
+/// most 128 bytes move; over-cap tables refuse with the named gap
+/// reason. A header read failure refuses as a read error; anything
+/// else unreadable admits with zero bounds for the legacy parser.
+/// Returns the outcome plus the header probe bytes read, so refusals
+/// charge exactly what moved.
+pub fn read_table_bounds(file: &std::fs::File) -> (Result<ElfTableBounds, String>, u64) {
+    use std::os::unix::fs::FileExt as _;
+    read_table_bounds_with(|buf, offset| file.read_at(buf, offset))
+}
+
+/// [`read_table_bounds`] with an injectable positioned reader (tests
+/// count the probe bytes; production reads the file).
+pub fn read_table_bounds_with(
+    mut reader: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> (Result<ElfTableBounds, String>, u64) {
+    let mut header = [0u8; 64];
+    let len = match reader(&mut header, 0) {
+        Ok(len) => len,
+        Err(error) => return (Err(format!("read failed: {error}")), 0),
+    };
+    let header = &header[..len];
+    let mut moved = len as u64;
+    let mut section0 = [0u8; 64];
+    let section0 = section0_location(header).and_then(|(offset, size)| {
+        let buf = &mut section0[..size];
+        let read = reader(buf, offset).ok()?;
+        moved += read as u64;
+        (read == size).then_some(buf as &[u8])
+    });
+    (table_bounds_from_header(header, section0), moved)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SymbolFact {
     pub virtual_address: u64,
@@ -54,13 +327,30 @@ pub struct ElfSnapshot {
     abi: ElfAbi,
     interpreter: Option<Range<usize>>,
     executable_ranges: Vec<(u64, u64)>,
+    table_bounds: ElfTableBounds,
+}
+
+/// Table bounds for bytes already in memory (mappings, snapshots):
+/// the ELF header prefix plus section 0 sliced from the same bytes.
+/// Refuses over-cap tables with the named gap reason; anything
+/// unreadable admits for the legacy parser.
+fn gate_table_bounds(data: &[u8]) -> Result<ElfTableBounds, String> {
+    let header = data.get(..64).unwrap_or(data);
+    let section0 = section0_location(header).and_then(|(offset, size)| {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|offset| data.get(offset..offset.checked_add(size)?))
+    });
+    table_bounds_from_header(header, section0)
 }
 
 /// Structural classification only (ELF magic, endianness, class/machine);
 /// segment ranges are unchecked. Never translate addresses or offsets from
 /// the returned object — use `classified_validated_object` for any export
-/// walk or range query.
+/// walk or range query. The table gate runs first, so every entry point
+/// funnelling here refuses over-cap tables before the parser walks them.
 pub fn classified_object(data: &[u8]) -> Result<(object::File<'_>, ElfAbi), String> {
+    gate_table_bounds(data)?;
     let object = object::File::parse(data)
         .map_err(|error| format!("not parseable as an ELF object: {error}"))?;
     if object.format() != BinaryFormat::Elf {
@@ -237,6 +527,9 @@ impl ElfSnapshot {
     }
 
     fn from_data(data: Vec<u8>) -> Result<Self, String> {
+        // The bounds are kept for pre-parse charging; `classified_object`
+        // below re-runs the same header-only gate before parsing.
+        let table_bounds = gate_table_bounds(&data)?;
         let (object, abi) = classified_object(&data)?;
         let interpreter = interpreter(&object)?;
         let executable_ranges = validated_segment_ranges(&object, data.len() as u64)?;
@@ -246,11 +539,18 @@ impl ElfSnapshot {
             abi,
             interpreter,
             executable_ranges,
+            table_bounds,
         })
     }
 
     pub fn abi(&self) -> ElfAbi {
         self.abi
+    }
+
+    /// The header-table bounds this snapshot was admitted under, for
+    /// pre-parse charging by callers that read the bytes first.
+    pub fn table_bounds(&self) -> ElfTableBounds {
+        self.table_bounds
     }
 
     pub fn interpreter(&self) -> Option<&[u8]> {

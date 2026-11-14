@@ -1798,6 +1798,46 @@ fn elf32_program_table_is_gated() {
     );
 }
 
+/// The header probe moves at most 128 bytes however large the file:
+/// the 64-byte header, plus section 0 only when the extended counts
+/// are used. Both the actual reads and the reported charge basis.
+#[test]
+fn table_probe_reads_only_the_header_and_section0() {
+    use p11scope_manifest::elf::read_table_bounds_with;
+    use std::os::unix::fs::FileExt as _;
+    let d = tmp("elf-table-cap-probe");
+    let direct = d.join("direct.so");
+    write_many_phdr_elf(&direct, 2048);
+    let file = std::fs::File::open(&direct).unwrap();
+    let mut moved = 0usize;
+    let mut calls = 0u32;
+    let (outcome, reported) = read_table_bounds_with(|buf, offset| {
+        calls += 1;
+        let read = file.read_at(buf, offset).unwrap();
+        moved += read;
+        Ok(read)
+    });
+    assert!(outcome.is_err());
+    assert_eq!(moved, 64);
+    assert_eq!(reported, 64);
+    assert_eq!(calls, 1);
+    let extended = d.join("extended.so");
+    write_extended_phnum_elf(&extended, 100_000);
+    let file = std::fs::File::open(&extended).unwrap();
+    let mut moved = 0usize;
+    let mut calls = 0u32;
+    let (outcome, reported) = read_table_bounds_with(|buf, offset| {
+        calls += 1;
+        let read = file.read_at(buf, offset).unwrap();
+        moved += read;
+        Ok(read)
+    });
+    assert!(outcome.is_err());
+    assert_eq!(moved, 128);
+    assert_eq!(reported, 128);
+    assert_eq!(calls, 2);
+}
+
 #[test]
 fn corrupt_headers_keep_their_legacy_refusals() {
     use p11scope_manifest::elf::read_raw_scan_facts_bounded;

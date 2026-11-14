@@ -1574,15 +1574,24 @@ fn privileged_run_tree_non_member_provider_is_never_staged() {
     let (nonmember_ledger, nonmember_done) =
         (dir.path().join("nm-ledger"), dir.path().join("nm-done"));
     let nonmember_same_ledger = dir.path().join("nm-same-ledger");
+    // Both loops overlap the owned capture by construction: the
+    // non-member starts only after the owned command marks itself
+    // running (it runs inside the capture), and the owned command stays
+    // alive until the non-member marks itself done. Each wait is
+    // bounded (60 s); a timeout fails the cell on the missing marker.
+    let owned_started = dir.path().join("owned-started");
     let nm_script = format!(
-        "for i in 1 2 3 4 5 6 7 8; do {} {} {} 1; sleep 0.5; done; for i in 1 2 3 4; do {} {} {} 1; sleep 0.5; done; touch {}",
-        workload.display(),
-        copy.display(),
-        nonmember_ledger.display(),
-        workload.display(),
-        module.display(),
-        nonmember_same_ledger.display(),
-        nonmember_done.display()
+        "n=0; while [ ! -e {started} ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done; \
+         [ -e {started} ] || exit 3; \
+         for i in 1 2 3 4 5 6 7 8; do {w} {copy} {nml} 1; sleep 0.25; done; \
+         for i in 1 2 3 4; do {w} {module} {nms} 1; sleep 0.25; done; touch {done}",
+        started = owned_started.display(),
+        w = workload.display(),
+        copy = copy.display(),
+        nml = nonmember_ledger.display(),
+        module = module.display(),
+        nms = nonmember_same_ledger.display(),
+        done = nonmember_done.display()
     );
     let mut nonmember = Command::new("sh")
         .arg("-c")
@@ -1597,19 +1606,28 @@ fn privileged_run_tree_non_member_provider_is_never_staged() {
     // shape, without the wrapper's settle comment duplication).
     let (ledger1, ledger2) = (dir.path().join("l1"), dir.path().join("l2"));
     let script = format!(
-        "{} {} {} 3; {} {} {} 3; exec sleep 2",
-        workload.display(),
-        module.display(),
-        ledger1.display(),
-        workload.display(),
-        module.display(),
-        ledger2.display()
+        "touch {started}; {w} {module} {l1} 3; {w} {module} {l2} 3; \
+         n=0; while [ ! -e {done} ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done; \
+         [ -e {done} ] || exit 4; exec sleep 2",
+        started = owned_started.display(),
+        w = workload.display(),
+        module = module.display(),
+        l1 = ledger1.display(),
+        l2 = ledger2.display(),
+        done = nonmember_done.display()
     );
     let mut args = run_prefix(&module, &out);
     args.extend(["sh".to_string(), "-c".to_string(), script]);
     let mut capture = spawn_run(&args, &conf);
     let status = capture.wait_expect("run");
-    assert!(status.success(), "run exits with the shell's status");
+    assert!(
+        status.success(),
+        "run exits with the shell's status (4: the non-member never finished inside the capture)"
+    );
+    assert!(
+        nonmember_done.is_file(),
+        "the non-member finished while the owned capture still ran"
+    );
     // Reap the non-member (bounded): it must have run to make this cell
     // non-vacuous.
     let deadline = Instant::now() + TIMEOUT;

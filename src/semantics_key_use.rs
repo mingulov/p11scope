@@ -440,6 +440,12 @@ impl JointStaging {
         self.frontier
     }
 
+    /// Recorded void fence for fence tests.
+    #[cfg(test)]
+    pub(crate) fn segment_fence_for_test(&self) -> Option<u64> {
+        self.segment_fence
+    }
+
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,

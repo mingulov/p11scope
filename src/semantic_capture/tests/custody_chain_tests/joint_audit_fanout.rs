@@ -9545,6 +9545,58 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
     );
 }
 
+/// Scope-round fence twin: a void that lands on an already-S1Only feed
+/// records its fence too (running maximum) — the second void raises
+/// every feed's recorded fence even though no feed ever left S1Only.
+#[test]
+fn joint_s1only_feed_records_later_void_fence() {
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let mut frame = Some(original);
+    let fault = FrameFault::clean();
+    fault.epoch.set(1);
+    let old_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut frame, &fault, old_revision);
+    let fences = |fixture: &CanonicalFanoutScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.segment_fence_for_test())
+            .collect::<Vec<_>>()
+    };
+    let first = fences(&fixture);
+    assert_eq!(first.len(), 2, "two feeds behind one provider");
+    assert!(
+        first.iter().all(|fence| fence.is_some()),
+        "the first void fenced every feed: {first:?}"
+    );
+    fixture.push_two("C_SignInit", 2);
+    fault.epoch.set(2);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    let second = fences(&fixture);
+    assert!(
+        second
+            .iter()
+            .zip(first.iter())
+            .all(|(later, earlier)| later > earlier),
+        "the S1Only void raises every recorded fence: {first:?} -> {second:?}"
+    );
+}
+
 /// The ingest-break void fences every pre-break key's history: its live
 /// sessions end Uncertain(OutcomeLost), its objects retire, its bootstrap
 /// voids. Those effects are the void's own original failure; they ride

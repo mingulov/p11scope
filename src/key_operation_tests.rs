@@ -21983,6 +21983,61 @@ fn key_operation_below_fence_receipt_never_resumes() {
     assert_eq!(staging.mode(), crate::semantics_key_use::FeedMode::S1Only);
 }
 
+/// Scope-round fence twin: a later local ending (ordered fallback)
+/// never clears the recorded void fence — the fence is a running
+/// maximum, so a below-fence receipt still refuses after the fallback
+/// instead of resuming onto history the seal would refuse.
+#[test]
+fn key_operation_ordered_fallback_keeps_recorded_void_fence() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::IngestBreakLoss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let (replayed, _) = staging.ordered_fallback(&mut edge, &mut keyuse, instance, &mut sink, None, None);
+    assert_eq!(replayed, 0, "staging already drained by the loss");
+    assert!(
+        !staging.resume_joint(),
+        "the void fence survives the local ending"
+    );
+    assert_eq!(staging.mode(), crate::semantics_key_use::FeedMode::S1Only);
+    assert_eq!(
+        staging.segment_fence_for_test(),
+        Some(1),
+        "the local ending keeps the recorded fence value"
+    );
+}
+
 /// Healthy twin: a receipt cut AT the recorded fence resumes — the
 /// fence covers strictly below it, like the seal and attestation
 /// checks.

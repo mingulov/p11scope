@@ -82682,6 +82682,133 @@ fn handle_table_live_wait_gap_files_once_across_deferrals() {
     );
 }
 
+/// Repeated-deferral twin: only a new row dirties the publication
+/// inputs — a repeated wait under a full table files nothing and
+/// republishes nothing.
+#[test]
+fn handle_table_repeated_wait_leaves_facts_revision_unchanged() {
+    let mut engine = Engine::empty();
+    let before = engine.facts_revision;
+    engine.file_handles_wait_gap();
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "the first filing adds exactly one row"
+    );
+    assert_eq!(
+        engine.facts_revision,
+        before + 1,
+        "the first filing dirties the publication inputs once"
+    );
+    engine.file_handles_wait_gap();
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "the repeat deferral files no new row"
+    );
+    assert_eq!(
+        engine.facts_revision,
+        before + 1,
+        "a repeated deferral leaves facts_revision unchanged"
+    );
+}
+
+/// Learned share-first twin: a retry whose file has since become
+/// resident shares it instead of waiting for room. Cap 2: the first
+/// staging of one file defers under two fillers; one filler drops
+/// and the candidate's own file takes its row (kept alive: the table
+/// stays full); the retry must prove and share, not requeue. The
+/// resident row carries a scripted identity-filesystem proof — on
+/// btrfs/tmpfs real rows never lend, and the retry waits without
+/// proving (pinned by the table-level twin and the B2 twin).
+#[test]
+fn handle_table_learned_retry_shares_a_resident_row() {
+    use crate::discovery::identity::{FileIdentity, MappedFile, ProvedEntry};
+    let (fixture, _view, _module, seed_pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let summary = seed_pins.pinned().next().expect("the seed pins one file");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let dir = tempfile::tempdir().unwrap();
+    let mut live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 2);
+    let held = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&held).unwrap();
+    drop(held);
+    let stage = |engine: &mut Engine| {
+        let file = std::fs::File::open(&library).unwrap();
+        engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        });
+    };
+    stage(&mut engine);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the first staging defers under the full table"
+    );
+    assert!(
+        !engine.learned_settled.contains(&(dev, ino)),
+        "a wait never settles"
+    );
+    // Another path files the candidate's own file: one filler drops
+    // and the real key, digest and pin take its row, kept alive. The
+    // scripted ext4 proof models an identity filesystem's lender.
+    live.pop();
+    let maps = summary.key;
+    let major = u32::try_from(maps.device.major).unwrap();
+    let minor = u32::try_from(maps.device.minor).unwrap();
+    let proved = ProvedEntry::for_test(
+        std::fs::File::open(&library).unwrap(),
+        maps,
+        summary.sha256,
+        Some(MappedFile {
+            identity: FileIdentity {
+                dev: libc::makedev(major, minor),
+                ino: maps.inode,
+            },
+            fs_magic: Some(0xef53),
+        }),
+    );
+    let ProvedEntry { file, meta } = proved;
+    match engine.handle_table.acquire(
+        file,
+        &meta,
+        crate::discovery::handle_table::DeferredReason::Live,
+    ) {
+        crate::discovery::handle_table::AcquireOutcome::Held(resident) => {
+            assert!(resident.inserted);
+            live.push(resident);
+        }
+        crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+            panic!("the resident row admits: deferred with {reason:?}")
+        }
+    }
+    assert_eq!(engine.handle_table.len(), 2, "the table is full again");
+    let io_before = engine.budget.attempted_io_bytes();
+    stage(&mut engine);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the retry shares the resident row instead of requeueing"
+    );
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "the retry settles"
+    );
+    assert!(
+        engine.budget.attempted_io_bytes() > io_before,
+        "the retry proves to share"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    drop(live);
+    drop(fixture);
+}
+
 /// Learned retry twin: the first staging of one file under a full
 /// table proves once, defers, and files the one wait row; the retry
 /// under the still-full table proves nothing — no re-hash, no

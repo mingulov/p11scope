@@ -6019,6 +6019,105 @@ mod tests {
     }
 
     #[test]
+    fn count_manifest_fifo_counts_zero_without_blocking() {
+        // A count manifest replaced with a FIFO: the first pass
+        // consumes the writer's bytes; the next pass must refuse
+        // promptly — it is not a regular file, so it reserves nothing
+        // (the pin phase gaps it) — instead of blocking in open
+        // forever. The probe runs on a thread with a bounded wait; on
+        // failure a writer-side open releases the blocked reader, so
+        // RED never hangs the suite.
+        use std::os::unix::ffi::OsStrExt as _;
+        let (_dir, doc) = count_manifest_doc();
+        let bytes = std::fs::read(&doc).unwrap();
+        let fifo_dir = tempfile::tempdir().unwrap();
+        let fifo = fifo_dir.path().join("count.json");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-free path, mode bits only.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o644) }, 0);
+        let budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            let bytes = bytes.clone();
+            move || {
+                std::fs::write(&fifo, &bytes).unwrap();
+            }
+        });
+        assert_eq!(
+            super::count_manifest_objects_for_reservation(&fifo, &budget),
+            0,
+            "the consumed first pass counts nothing (length mismatch)"
+        );
+        writer.join().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                let budget = crate::discovery::scan::CaptureWorkBudget::default();
+                let _ = done_tx.send(super::count_manifest_objects_for_reservation(
+                    &fifo, &budget,
+                ));
+            }
+        });
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(15));
+        if got.is_err() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        let got = got.expect("the count must not block on a writerless FIFO");
+        probe.join().unwrap();
+        assert_eq!(got, 0, "a FIFO reserves nothing");
+    }
+
+    #[test]
+    fn count_manifest_growing_file_is_bounded() {
+        // Post-fstat growth must neither hang the count nor slurp
+        // unboundedly: the writer holds the manifest open past the size
+        // check with only half the bytes written and no EOF coming. A
+        // FIFO embodies the arrival deterministically — a regular
+        // file's growth cannot interleave deterministically — and the
+        // pinned fstat plus bounded exact-length read refuses both
+        // identically. The probe runs on a thread with a bounded wait;
+        // the writer closes on release, so RED never hangs the suite.
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let (_dir, doc) = count_manifest_doc();
+        let bytes = std::fs::read(&doc).unwrap();
+        assert!(bytes.len() > 1, "the doc has bytes to split");
+        let fifo_dir = tempfile::tempdir().unwrap();
+        let fifo = fifo_dir.path().join("count.json");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-free path, mode bits only.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o644) }, 0);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            let bytes = bytes.clone();
+            move || {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                file.write_all(&bytes[..bytes.len() / 2]).unwrap();
+                file.flush().unwrap();
+                let _ = stop_rx.recv();
+            }
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                let budget = crate::discovery::scan::CaptureWorkBudget::default();
+                let _ = done_tx.send(super::count_manifest_objects_for_reservation(
+                    &fifo, &budget,
+                ));
+            }
+        });
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(15));
+        drop(stop_tx);
+        let got = got.expect("the count must not wait out post-fstat growth");
+        probe.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(got, 0, "a growing file reserves nothing");
+    }
+
+    #[test]
     fn prepare_count_manifests_charges_retained_prearm_prior() {
         // Packet 6.13 round-3 (re-audit finding 3): per-pass count pins
         // charge already-retained pre-arm usage against the shared cap —

@@ -21643,6 +21643,68 @@ mod tests {
         );
     }
 
+    /// Census twin: a stop from the pre-open shortcut counts in the
+    /// census defers exactly like an acquire refusal — the `-v` census
+    /// must not under-report budget stops.
+    #[test]
+    fn handle_table_preopen_stop_counts_in_census_defers() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let modules = pin_wait_modules(&view, dir.path(), 1, &mut budget);
+        let mut table = HandleTable::new(1);
+        // One live row at the cap: the pin cannot share, so the
+        // pre-open shortcut stops the scan before any open.
+        let fill = dir.path().join("fill.so");
+        std::fs::write(&fill, b"fill-bytes").unwrap();
+        let metadata = std::fs::metadata(&fill).unwrap();
+        let maps = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let proved = ProvedEntry::for_test(
+            std::fs::File::open(&fill).unwrap(),
+            maps,
+            "fill-digest",
+            None,
+        );
+        let ProvedEntry { file, meta } = proved;
+        let live = match table.acquire(file, &meta, DeferredReason::Live) {
+            AcquireOutcome::Held(held) => held,
+            AcquireOutcome::Deferred(reason) => {
+                panic!("prefill admits: deferred with {reason:?}")
+            }
+        };
+        assert!(live.inserted);
+        let (_pins, skipped) = pin_scanned_view_objects_with_table(
+            &view,
+            &modules,
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains(PIN_BUDGET_STOP_DETAIL)),
+            "the shortcut stops the scan: {skipped:?}"
+        );
+        assert_eq!(table.stats().admits, 1, "no acquire ran past the shortcut");
+        assert_eq!(
+            table.stats().defers,
+            1,
+            "the pre-open stop counts in the census defers"
+        );
+        drop(live);
+    }
+
     /// One-shot wording twin: a one-shot lane never retries, so its
     /// budget stop says the run does not retry instead of waiting
     /// for a next tick that never comes.

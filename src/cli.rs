@@ -7586,4 +7586,31 @@ mod tests {
             "overview.md must not claim --json is universal"
         );
     }
+
+    #[test]
+    fn manifest_attested_paths_fifo_yields_no_candidates() {
+        // A --manifest FIFO must not hang the startup conflict check:
+        // it is not a regular file, so it attests nothing (discovery
+        // reports the manifest precisely). The writer feeds one valid
+        // document; the read must refuse it rather than parse it.
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("manifest.json");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-free path, mode bits only.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o644) }, 0);
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                std::fs::write(
+                    &fifo,
+                    br#"{"module_path": "/lib/a.so", "objects": [{"path": "/lib/b.so"}]}"#,
+                )
+                .unwrap();
+            }
+        });
+        let paths = manifest_attested_paths(&fifo);
+        writer.join().unwrap();
+        assert!(paths.is_empty(), "a FIFO attests no paths: {paths:?}");
+    }
 }

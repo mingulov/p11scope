@@ -990,14 +990,21 @@ impl Engine {
         let pinning_complete = self.budget.stopped_reason().is_none()
             && before_refusals == self.budget.refusal_counts()
             && counters.object_skips.is_empty();
-        // File the scan's pin skips into the capture skip list (deduped
-        // by exact row, like any mark): a stopped or failed pin is a
-        // named loss row in the committed plan, never a silent drop.
-        // The receipt's partiality below carries the coverage verdict
+        // File the scan's budget-stop rows into the capture skip
+        // list (deduped by exact row, like any mark): a stopped pin is
+        // a named loss row in the committed plan, never a silent drop.
+        // Every other scan/pin skip stays where it always was —
+        // dropped, never newly published ("memory scan refused" rows
+        // still publish through the absorb above, as before). The
+        // receipt's partiality below carries the coverage verdict
         // beside it. (Attribution already noted each row at the scan
         // loop, so this files without re-noting.)
         for skipped in self.absorb_scan_counters(counters) {
-            if !self.counters.object_skips.contains(&skipped) {
+            let budget_stop = skipped.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
+                && skipped
+                    .reason
+                    .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL);
+            if budget_stop && !self.counters.object_skips.contains(&skipped) {
                 self.counters.object_skips.push(skipped);
             }
         }
